@@ -179,7 +179,7 @@ def test_auto_harness_lands_an_arm_then_redirects_a_cross_family_spawn(
 
     # ── Best effort only: the child row, never the child's result ────────────
     def _child() -> dict[str, object] | None:
-        resp = routing_client.get("/v1/sessions", params={"limit": 100})
+        resp = routing_client.get("/v1/sessions", params={"visibility": "all", "limit": 100})
         if resp.status_code != 200:
             return None
         for row in resp.json().get("data", []):

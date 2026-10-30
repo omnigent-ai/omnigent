@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -15,10 +16,14 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    CAP_HARNESS_ACCOUNTS,
+    CAP_HARNESS_LOGIN,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
+    HostProbeAccountsFrame,
+    decode_host_frame,
     encode_host_frame,
 )
 from omnigent.server.auth import LEVEL_OWNER
@@ -32,36 +37,23 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "33296f9b15e02671c34e013dd711407e"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build an ASGI WebSocket scope.
-
-    :param path: WebSocket path.
-    :returns: Minimal ASGI WebSocket scope.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
+# Binding persistence can exceed two seconds under parallel CI load.
+# A receive timeout cancels the ASGI app and disconnects the fake host.
+_LAUNCH_FRAME_TIMEOUT_S = 10.0
 
 
 def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    harness_accounts: dict[str, dict[str, object]] | None = None,
+    capabilities: list[str] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -81,6 +73,8 @@ def _make_hello(
             name=name,
             configured_harnesses=configured_harnesses,
             gateway_inference=gateway_inference,
+            harness_accounts=harness_accounts,
+            capabilities=capabilities or [],
         )
     )
 
@@ -99,6 +93,8 @@ def host_api_app(
 
 def _build_host_api_app(
     db_uri: str,
+    *,
+    harness_install: bool | Callable[[], bool] | None = None,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """Build one replica's app over *db_uri*.
 
@@ -107,6 +103,7 @@ def _build_host_api_app(
     an empty registry.
 
     :param db_uri: SQLite URI from the shared fixture.
+    :param harness_install: Optional harness-repair feature override.
     :returns: Tuple of (app, registry, host_store, conv_store).
     """
     registry = HostRegistry()
@@ -115,11 +112,20 @@ def _build_host_api_app(
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
     app.include_router(
-        create_host_tunnel_router(registry, host_store),
+        create_host_tunnel_router(
+            registry,
+            host_store,
+            harness_install=False if harness_install is None else harness_install,
+        ),
         prefix="/v1",
     )
     app.include_router(
-        create_hosts_router(registry, host_store, conv_store),
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            harness_install=harness_install,
+        ),
         prefix="/v1",
     )
 
@@ -144,6 +150,8 @@ async def _connect_host(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    harness_accounts: dict[str, dict[str, object]] | None = None,
+    capabilities: list[str] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -160,13 +168,19 @@ async def _connect_host(
     path = f"/v1/hosts/{host_id}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     await comm.send_input(
         {
             "type": "websocket.receive",
-            "text": _make_hello(name, configured_harnesses, gateway_inference),
+            "text": _make_hello(
+                name,
+                configured_harnesses,
+                gateway_inference,
+                harness_accounts,
+                capabilities,
+            ),
         },
     )
     while registry.get(host_id) is None:
@@ -339,6 +353,80 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
 
     assert resp.status_code == 200
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
+
+
+async def test_harness_accounts_are_live_only_and_login_support_is_explicit(
+    db_uri: str,
+) -> None:
+    """Account PII follows the local tunnel and is never read from the host row."""
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, harness_install=True)
+    _comm = await _connect_host(
+        app,
+        registry,
+        configured_harnesses={"codex": True},
+        harness_accounts={"codex": {"kind": "chatgpt", "email": "person@example.test"}},
+        capabilities=[CAP_HARNESS_ACCOUNTS, CAP_HARNESS_LOGIN],
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        connected = (await client.get("/v1/hosts")).json()["hosts"][0]
+    assert connected["harness_accounts"] == {
+        "codex": {"kind": "chatgpt", "email": "person@example.test"}
+    }
+    assert connected["harness_accounts_supported"] is True
+    assert connected["harness_login_supported"] is True
+
+    other_app, _other_registry, _other_store, _other_conversations = _build_host_api_app(
+        db_uri, harness_install=True
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=other_app), base_url="http://test"
+    ) as client:
+        disconnected = (await client.get("/v1/hosts")).json()["hosts"][0]
+        detail = (await client.get(f"/v1/hosts/{_HOST_ID}")).json()
+    assert "harness_accounts" not in disconnected
+    assert "harness_accounts" not in detail
+    assert disconnected["harness_accounts_supported"] is False
+    assert detail["harness_accounts_supported"] is False
+    assert disconnected["harness_login_supported"] is False
+    assert detail["harness_login_supported"] is False
+
+
+@pytest.mark.parametrize(
+    ("harness_install", "capabilities", "expects_probe"),
+    [
+        (True, [CAP_HARNESS_ACCOUNTS], True),
+        (lambda: True, [CAP_HARNESS_ACCOUNTS], True),
+        (False, [CAP_HARNESS_ACCOUNTS], False),
+        (lambda: False, [CAP_HARNESS_ACCOUNTS], False),
+        (True, [], False),
+    ],
+    ids=["on", "callable-on", "off", "callable-off", "old-host"],
+)
+async def test_connect_requests_accounts_only_when_enabled_and_supported(
+    db_uri: str,
+    harness_install: bool | Callable[[], bool],
+    capabilities: list[str],
+    expects_probe: bool,
+) -> None:
+    """Registration stays non-blocking and only enabled capable hosts are probed."""
+    app, registry, _host_store, _conversations = _build_host_api_app(
+        db_uri,
+        harness_install=harness_install,
+    )
+    comm = await _connect_host(app, registry, capabilities=capabilities)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    for _ in range(20):
+        if conn.pending_harness_account_probes:
+            break
+        await asyncio.sleep(0.01)
+
+    assert bool(conn.pending_harness_account_probes) is expects_probe
+    if expects_probe:
+        output = await comm.receive_output(timeout=1)
+        assert output["type"] == "websocket.send"
+        assert isinstance(decode_host_frame(output["text"]), HostProbeAccountsFrame)
 
 
 async def test_hosts_api_surfaces_gateway_inference(
@@ -584,7 +672,7 @@ async def test_launch_runner_happy_path(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -708,7 +796,7 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -894,6 +982,7 @@ def multi_user_app(
             conv_store,
             auth_provider=auth,
             permission_store=permission_store,
+            harness_install=True,
         ),
         prefix="/v1",
     )
@@ -974,6 +1063,27 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+async def test_refresh_harness_accounts_requires_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Account probing cannot be triggered on another user's machine."""
+    app, registry, host_store, _conversations = multi_user_app
+    host_id = "294391bc835cde1130ef2a02dcd2b7b3"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+    _register_fake_host(registry, host_id, "alice@test.com")
+    conn = registry.get(host_id)
+    assert conn is not None
+    conn.hello.capabilities = [CAP_HARNESS_ACCOUNTS]
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/hosts/{host_id}/harnesses/accounts/refresh",
+            headers={"x-test-user": "bob@test.com"},
+        )
+
+    assert response.status_code == 403
 
 
 @pytest.mark.parametrize("user,status", [(None, 401), ("bob@test.com", 403)])
@@ -1164,7 +1274,7 @@ async def test_tunnel_rejects_unauthenticated_when_auth_enabled(
 
     # Unauthenticated peers are refused BEFORE the WS upgrade, so the
     # first (and only) output is the close — no accept, no frame exchange.
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close", (
         f"expected the tunnel to close on missing identity before accept, got {closed!r}"
     )
@@ -1192,7 +1302,7 @@ async def test_tunnel_accepts_authenticated_owner(
     scope["headers"] = [(b"x-test-user", b"alice@test.com")]
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
     await comm.send_input(
         {"type": "websocket.receive", "text": _make_hello()},
@@ -1382,11 +1492,11 @@ async def test_failed_connect_does_not_offline_another_users_host(
     await comm.send_input({"type": "websocket.connect"})
     # Refused before accept(); no denial extension in this scope, so the
     # server falls back to a pre-accept close (code 4009).
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4009
     with contextlib.suppress(Exception):
-        await comm.wait(timeout=2.0)
+        await comm.wait(timeout=budget(2.0))
 
     after = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert after is not None
@@ -1402,6 +1512,7 @@ async def test_failed_connect_does_not_offline_another_users_host(
 
 async def test_runner_exited_report_surfaces_in_runner_status(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A ``host.runner_exited`` frame from the daemon reaches the runner
@@ -1437,6 +1548,7 @@ async def test_runner_exited_report_surfaces_in_runner_status(
         "runner process exited with code 1 (log on host: ~/x.log)\n"
         "--- runner log tail ---\nModuleNotFoundError: No module named 'claude_agent_sdk'"
     )
+    caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _connect_host(app, registry)
     await _comm.send_input(
         {
@@ -1464,13 +1576,21 @@ async def test_runner_exited_report_surfaces_in_runner_status(
     # the actual failure — is surfaced verbatim for the waiting client.
     assert body["error"] == daemon_error
 
+    # No callback wired, so the tunnel itself logs the session-less event.
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
+    assert len(events) == 1
+    assert getattr(events[0], "session_id", None) is None
+    assert events[0].attributes["host_id"] == _HOST_ID
+    assert events[0].attributes["runner_id"] == "runner_dead"
+
 
 async def test_runner_exited_invokes_callback_with_runner_and_error(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A ``host.runner_exited`` frame fires the ``on_runner_exited``
-    callback with ``(runner_id, error)``.
+    callback with ``(host_id, runner_id, error)``.
 
     This callback is how the server marks the crashed runner's
     session(s) failed and pushes the cause to the open view (the
@@ -1483,12 +1603,13 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     registry = HostRegistry()
     host_store = HostStore(db_uri)
-    received: list[tuple[str, str]] = []
+    received: list[tuple[str, str, str]] = []
 
-    async def _record(runner_id: str, error: str) -> None:
-        received.append((runner_id, error))
+    async def _record(host_id: str, runner_id: str, error: str) -> None:
+        received.append((host_id, runner_id, error))
 
     app = FastAPI()
+    caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     app.include_router(
         create_host_tunnel_router(registry, host_store, on_runner_exited=_record),
         prefix="/v1",
@@ -1507,5 +1628,7 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
         while not received:
             await asyncio.sleep(0.01)
 
-    # The callback got the exact runner id and error string off the frame.
-    assert received == [("runner_x", "exited with code 1")]
+    # The callback got the reporting host plus the exact runner id and error.
+    assert received == [(_HOST_ID, "runner_x", "exited with code 1")]
+    # The callback owns the event; the tunnel must not log a session-less duplicate.
+    assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]

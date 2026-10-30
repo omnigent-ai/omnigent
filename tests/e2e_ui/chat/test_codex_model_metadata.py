@@ -165,9 +165,8 @@ def test_codex_native_picker_uses_raw_model_metadata(
     model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.5"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("Codex Pretty 5.5")
-    page.get_by_test_id("composer-agent-effort-select").click()
-    effort_trigger = page.get_by_test_id("composer-agent-efforts")
-    expect(effort_trigger).to_be_visible()
+    # The Effort section shares the Model submenu.
+    expect(page.get_by_test_id("composer-agent-efforts")).to_be_visible()
 
     effort_row = page.locator('[role="menuitemcheckbox"][data-effort-level="xhigh"]')
     expect(effort_row).to_be_visible()
@@ -232,7 +231,6 @@ def test_custom_codex_native_agent_keeps_model_and_effort_controls(
     gear.click()
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_test_id("composer-agent-models")).to_be_visible()
-    page.get_by_test_id("composer-agent-effort-select").click()
     expect(page.get_by_test_id("composer-agent-efforts")).to_contain_text("xHigh")
 
 
@@ -422,10 +420,10 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
 
     A fresh codex session's catalog only arrives once codex app-server
     answers ``model/list`` (seconds to ~15s cold) — until then the gear used
-    to show a sparse Model row and no Effort row at all. With the session
-    catalog empty, the gear rides the host's cached pre-launch probe rows:
-    the Model menu lists them and the Effort menu offers their reasoning
-    efforts immediately. The session's own catalog supersedes them when it
+    to show a sparse Model section and no Effort section at all. With the
+    session catalog empty, the gear rides the host's cached pre-launch probe
+    rows: the Model section lists them and the Effort section offers their
+    reasoning efforts immediately. The session's own catalog supersedes them when it
     lands (covered by the raw-metadata test above).
 
     :param page: Playwright page fixture.
@@ -445,17 +443,14 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
 
-    # The Effort row is present although the session catalog is still empty.
-    effort_trigger = page.get_by_test_id("composer-agent-effort-select")
-    expect(effort_trigger).to_be_visible(timeout=10_000)
+    # The Effort section is present although the session catalog is still empty.
+    expect(page.get_by_test_id("composer-agent-efforts")).to_be_visible(timeout=10_000)
 
-    # The Model menu lists the host probe row under its display name.
-
+    # The Model section lists the host probe row under its display name.
     model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("GPT-5.6-Luna")
-    # The Effort menu offers exactly the host row's reasoning efforts.
-    effort_trigger.click()
+    # The Effort section offers exactly the host row's reasoning efforts.
     for level in ("low", "medium", "xhigh"):
         expect(
             page.locator(f'[role="menuitemcheckbox"][data-effort-level="{level}"]')

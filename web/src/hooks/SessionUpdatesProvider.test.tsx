@@ -8,7 +8,7 @@
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
-import type { ReactNode } from "react";
+import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -22,22 +22,33 @@ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
 const setWatched = vi.fn();
+const start = vi.fn();
 const subscribe = vi.fn((_fn: () => void) => () => {});
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: {
-    start: vi.fn(),
+    start: (...args: unknown[]) => start(...args),
     stop: vi.fn(),
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
   },
 }));
 
-import { SidebarDataProvider, useSidebarView } from "./useSidebarData";
+import { SidebarDataContext, SidebarDataProvider, useSidebarView } from "./useSidebarData";
 import { useCanEdit } from "./usePermissions";
 import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
+
+type SidebarDataValue = NonNullable<ContextType<typeof SidebarDataContext>>;
+const identityPendingSidebarData = {
+  identityReady: false,
+  watchedIds: ["conv_a"],
+} as unknown as SidebarDataValue;
+const identityReadySidebarData = {
+  ...identityPendingSidebarData,
+  identityReady: true,
+};
 
 function conv(id: string): Conversation {
   return {
@@ -73,7 +84,7 @@ function seedProjectFolder(client: QueryClient, project: string, ids: string[]):
     last_id: ids.at(-1) ?? null,
     has_more: false,
   };
-  client.setQueryData(["project-sessions", project], {
+  client.setQueryData(["project-sessions", project, "updated_at", false], {
     pages: [page],
     pageParams: [undefined],
   } satisfies ConversationsInfiniteData);
@@ -97,6 +108,7 @@ function lastWatched(): string[] {
 
 beforeEach(() => {
   setWatched.mockClear();
+  start.mockClear();
   subscribe.mockClear();
 });
 
@@ -106,6 +118,33 @@ afterEach(() => {
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
+  it("waits for sidebar identity before starting session updates", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+
+    const { rerender } = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityPendingSidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(start).not.toHaveBeenCalled();
+
+    rerender(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityReadySidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(start).toHaveBeenCalledOnce();
+  });
+
   it("watches the cached sidebar ids when no session is open", () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_a", "conv_b"]);
@@ -113,15 +152,18 @@ describe("SessionUpdatesProvider watch-set", () => {
     expect(lastWatched()).toEqual(["conv_a", "conv_b"]);
   });
 
-  it("unions an off-sidebar open child into the watch-set", () => {
-    // The child is NOT in the conversations cache (children are filtered
-    // out of the sidebar list), yet it must be watched so the open-session
-    // view gets streamed liveness for it.
-    const client = new QueryClient();
-    seedConversations(client, ["conv_a"]);
-    renderProvider(client, ["/c/conv_child"]);
-    expect(lastWatched()).toEqual(["conv_a", "conv_child"]);
-  });
+  it.each(["/c/conv_child", "/canvas/c/conv_child?canvas=project"])(
+    "unions an off-sidebar open session into the watch-set at %s",
+    (route) => {
+      // The child is NOT in the conversations cache (children are filtered
+      // out of the sidebar list), yet it must be watched so the open-session
+      // view gets streamed liveness for it.
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      renderProvider(client, [route]);
+      expect(lastWatched()).toEqual(["conv_a", "conv_child"]);
+    },
+  );
 
   it("does not duplicate the open session when it's already a sidebar row", () => {
     const client = new QueryClient();
@@ -130,14 +172,18 @@ describe("SessionUpdatesProvider watch-set", () => {
     expect(lastWatched()).toEqual(["conv_b", "conv_open"]);
   });
 
-  it("does not send client-only temp ids in the watch-set", () => {
+  it.each([
+    "/c/temp:12345678",
+    "/canvas/c/temp:12345678?canvas=project",
+    "/canvas/c/temp%3A12345678?canvas=project",
+  ])("does not watch a client-only temp id at %s", (route) => {
     const client = new QueryClient();
     seedConversations(client, ["conv_real", "temp:12345678"]);
-    renderProvider(client, ["/c/temp:12345678"]);
+    renderProvider(client, [route]);
     expect(lastWatched()).toEqual(["conv_real"]);
   });
 
-  it("re-pushes the watch-set with the new open id on navigation", () => {
+  it.each(["/c", "/canvas/c"])("re-pushes the watch-set when navigating under %s", (prefix) => {
     // Navigating between off-sidebar children doesn't touch the
     // conversations cache, so the watch-set must re-push from the activeId
     // effect — otherwise the newly-opened child would never be watched.
@@ -152,7 +198,7 @@ describe("SessionUpdatesProvider watch-set", () => {
 
     render(
       <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={["/c/conv_child1"]}>
+        <MemoryRouter initialEntries={[`${prefix}/conv_child1`]}>
           <CaptureNavigate />
           <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
         </MemoryRouter>
@@ -163,7 +209,7 @@ describe("SessionUpdatesProvider watch-set", () => {
     setWatched.mockClear();
     // Navigate within the same router (no cache change) to a different
     // off-sidebar child.
-    act(() => navigate?.("/c/conv_child2"));
+    act(() => navigate?.(`${prefix}/conv_child2`));
     expect(lastWatched()).toEqual(["conv_a", "conv_child2"]);
   });
 });
@@ -289,8 +335,30 @@ describe("SessionUpdatesProvider project folders", () => {
     const folder = client.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Sprint 42",
+      "updated_at",
+      false,
     ]);
     expect(folder!.pages[0].data[0]!.pending_elicitations_count).toBe(1);
+  });
+
+  it("keeps streamed archived rows in archived folder caches and drops them from live caches", () => {
+    const client = new QueryClient();
+    const row = { ...conv("conv_filed"), archived: true };
+    const liveKey = ["project-sessions", "Sprint 42", "updated_at", false];
+    const archivedKey = ["project-sessions", "Sprint 42", "updated_at", true];
+    for (const key of [liveKey, archivedKey]) {
+      client.setQueryData(key, {
+        pages: [{ data: [row], has_more: false }],
+        pageParams: [undefined],
+      });
+    }
+    renderProvider(client, ["/"]);
+    act(() => frameHandler()({ type: "changed", items: [{ ...row, title: "Renamed archive" }] }));
+
+    expect(
+      client.getQueryData<ConversationsInfiniteData>(archivedKey)!.pages[0].data[0]?.title,
+    ).toBe("Renamed archive");
+    expect(client.getQueryData<ConversationsInfiniteData>(liveKey)!.pages[0].data).toEqual([]);
   });
 
   it("evicts a removed session from a project folder's cache", () => {
@@ -304,6 +372,8 @@ describe("SessionUpdatesProvider project folders", () => {
     const folder = client.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Sprint 42",
+      "updated_at",
+      false,
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
   });

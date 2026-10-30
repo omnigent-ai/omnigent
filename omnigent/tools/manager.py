@@ -56,15 +56,8 @@ from omnigent.tools.local import load_local_python_tools
 _logger = logging.getLogger(__name__)
 
 
-class _UCFunctionSchemaTool(Tool):
-    """Schema-only tool entry for UC function tools.
-
-    UC function tools are dispatched by the runner via the SQL
-    Statement Execution API — the tool manager only exposes the
-    schema to the LLM. This avoids the ``ClientSideTool`` path
-    (which routes to ``action_required`` / client tunneling)
-    and the ``LocalCallableTool`` path (which requires a
-    server-side callable).
+class _SchemaOnlyTool(Tool):
+    """Tool metadata without an execution environment or callable.
 
     :param tool_name: Tool name shown to the LLM, e.g.
         ``"classify_text"``.
@@ -100,6 +93,10 @@ class _UCFunctionSchemaTool(Tool):
         return self._schema
 
 
+class _UCFunctionSchemaTool(_SchemaOnlyTool):
+    """UC function metadata; execution uses the runner's SQL Statement Execution API."""
+
+
 class ToolManager:
     """Registry-based tool manager for a single workflow execution.
 
@@ -115,6 +112,8 @@ class ToolManager:
         workdir: Path | None = None,
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
+        *,
+        os_env_schema_only: bool = False,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -141,6 +140,9 @@ class ToolManager:
             tools use this shared instance instead of creating their
             own. ``None`` falls back to per-call creation via
             ``create_os_environment()``.
+        :param os_env_schema_only: Register static OS tool schemas without
+            creating an environment. For metadata callers only; OS tool
+            execution remains runner-owned. Preserves the ``os_env`` gate.
         """
         self._spec = spec
         self._workdir = workdir
@@ -159,7 +161,7 @@ class ToolManager:
         self._register_sub_agent_tools()
         self._register_session_tools()
         self._register_agent_mgmt_tools()
-        self._register_os_env_tools()
+        self._register_os_env_tools(schema_only=os_env_schema_only)
         self._register_terminal_tools()
         self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
@@ -183,29 +185,25 @@ class ToolManager:
         # at the end so any AP-created background handle can point
         # at a stable cancel tool.
         self._register_task_lifecycle_tools()
-        # Comment tools are always auto-registered so agents can
-        # list and update review comments without the spec opting in.
+        # The framework-owned groups below register without the spec
+        # opting in; a spec drops one it cannot use via ``tool_groups:``.
         self._register_comment_tools()
-        # Policy tool is always auto-registered so agents can add
-        # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
-        # Scheduled-task tools are always auto-registered so agents can
-        # manage recurring runs at runtime without the spec opting in.
         self._register_scheduled_task_tools()
-        # Embedded-browser tools are always auto-registered so any agent
-        # can drive the desktop app's browser without the spec opting in
-        # (framework-owned).
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
         """
         Auto-register ``sys_add_policy`` and ``sys_policy_registry``.
 
-        Always available so the agent can browse available policy
-        templates and add CEL or builtin policies to the current
-        session at runtime. The runner dispatches both tools via
-        the Omnigent server's REST endpoints.
+        Registered without spec opt-in so the agent can browse policy
+        templates and add CEL or builtin policies to the current session
+        at runtime; ``tool_groups.policies: false`` drops the pair. The
+        runner dispatches both tools via the Omnigent server's REST
+        endpoints.
         """
+        if not self._spec.tool_groups.policies:
+            return
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
 
         self._tools[SysAddPolicyTool.name()] = SysAddPolicyTool()
@@ -215,11 +213,14 @@ class ToolManager:
         """
         Auto-register the scheduled-task management builtins.
 
-        Always available so an agent can create, list, update, and delete
-        recurring scheduled tasks at runtime without the spec opting in. The
-        runner dispatches all four via the Omnigent server's
-        ``/v1/scheduled-tasks`` REST endpoints.
+        Registered without spec opt-in so an agent can create, list,
+        update, and delete recurring scheduled tasks at runtime;
+        ``tool_groups.scheduled_tasks: false`` drops all four. The runner
+        dispatches them via the Omnigent server's ``/v1/scheduled-tasks``
+        REST endpoints.
         """
+        if not self._spec.tool_groups.scheduled_tasks:
+            return
         for tool in (
             SysScheduledTaskCreateTool(),
             SysScheduledTaskListTool(),
@@ -331,8 +332,8 @@ class ToolManager:
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
-                    "Available: web_search, web_fetch, upload_file, "
-                    "list_files, download_file, "
+                    "Available: web_search, web_read, web_fetch, "
+                    "upload_file, list_files, download_file, "
                     "search_conversations, export_agent. "
                     "Note: list_comments and update_comment are "
                     "framework-owned and auto-registered; they cannot "
@@ -445,12 +446,17 @@ class ToolManager:
           tombstone the children it creates); without declared
           sub-agents, send's schema omits the named-mode parameters.
 
-        The spawn writes are child-only and ``sys_session_share`` is
-        owner-authority-bounded, both enforced at dispatch/server level;
-        the opt-ins control advertisement, not authority.
+        Send/close remain child-only. Create also supports independent
+        placements behind the orchestration gate. ``sys_session_message``
+        is always advertised; the deployment flag and server ownership/privacy
+        checks authorize peer sends. Sharing retains its separate opt-in.
+        Spec opt-ins control advertisement, not server authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
         """
+        from omnigent.tools.builtins.session_message import SysSessionMessageTool
+
+        self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
@@ -499,15 +505,19 @@ class ToolManager:
 
     def _register_session_tools(self) -> None:
         """Register framework-owned tools for the current session."""
+        from omnigent.tools.builtins.ui import UiOpenFileTool
+
         self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
+        self._tools[UiOpenFileTool.name()] = UiOpenFileTool()
 
     def _register_agent_mgmt_tools(self) -> None:
         """
         Register the read-only ``sys_agent_*`` discovery tools.
 
         ``sys_agent_get``, ``sys_agent_download``, and ``sys_agent_list``
-        are registered for **every** agent, mirroring the always-on
-        session reads in :meth:`_register_sub_agent_tools`. All three are
+        are registered without spec opt-in, mirroring the always-on
+        session reads in :meth:`_register_sub_agent_tools`;
+        ``tool_groups.agent_discovery: false`` drops all three. They are
         global reads bounded by the server's per-user permission model —
         they proxy auth-gated ``GET /v1/sessions/{id}/agent``,
         ``.../agent/contents``, and ``GET /v1/agents`` + ``/v1/sessions``
@@ -516,6 +526,8 @@ class ToolManager:
         already have. They are runner-dispatched and need no
         construction-time wiring.
         """
+        if not self._spec.tool_groups.agent_discovery:
+            return
         self._tools[SysAgentGetTool.name()] = SysAgentGetTool()
         self._tools[SysAgentDownloadTool.name()] = SysAgentDownloadTool()
         self._tools[SysAgentListTool.name()] = SysAgentListTool()
@@ -545,13 +557,16 @@ class ToolManager:
         """
         Auto-register ``list_comments`` and ``update_comment``.
 
-        Both tools are framework-owned and always available to the
-        agent so it can read and update review comments left by the
-        user without the spec explicitly opting in. They are session-
-        scoped at invoke time via ``ToolContext.conversation_id``
-        (W1/W2 multi-user guard — the agent cannot query another
-        session's comments by supplying a different id).
+        Both tools are framework-owned and register without the spec
+        opting in, so the agent can read and update review comments left
+        by the user; ``tool_groups.comments: false`` drops the pair. They
+        are session-scoped at invoke time via
+        ``ToolContext.conversation_id`` (W1/W2 multi-user guard — the
+        agent cannot query another session's comments by supplying a
+        different id).
         """
+        if not self._spec.tool_groups.comments:
+            return
         self._tools[ListCommentsTool.name()] = ListCommentsTool()
         self._tools[UpdateCommentTool.name()] = UpdateCommentTool()
 
@@ -561,14 +576,16 @@ class ToolManager:
         ``browser_snapshot`` / ``browser_click`` / ``browser_type`` /
         ``browser_screenshot``).
 
-        Framework-owned and always available so any agent can drive the
-        desktop app's embedded browser without the spec opting in. The
-        classes here are schema-only (``name`` / ``description`` /
-        ``get_schema``); execution lives in the runner ``_BROWSER_TOOLS``
-        dispatch branch (``omnigent/runner/tool_dispatch.py``), which
-        needs the runner's ``server_client`` that ``ToolContext`` does
-        not carry.
+        Framework-owned and registered without the spec opting in, so
+        any agent can drive the desktop app's embedded browser;
+        ``tool_groups.browser: false`` drops all five. The classes here
+        are schema-only (``name`` / ``description`` / ``get_schema``);
+        execution lives in the runner ``_BROWSER_TOOLS`` dispatch branch
+        (``omnigent/runner/tool_dispatch.py``), which needs the runner's
+        ``server_client`` that ``ToolContext`` does not carry.
         """
+        if not self._spec.tool_groups.browser:
+            return
         from omnigent.tools.builtins.browser import (
             BrowserClickTool,
             BrowserNavigateTool,
@@ -586,7 +603,7 @@ class ToolManager:
         ):
             self._tools[_cls.name()] = _cls()
 
-    def _register_os_env_tools(self) -> None:
+    def _register_os_env_tools(self, *, schema_only: bool = False) -> None:
         """
         Register ``sys_os_*`` tools when the spec declares ``os_env``.
 
@@ -598,24 +615,34 @@ class ToolManager:
         When the spec declares no os_env and no pre-resolved env
         was provided, this is a no-op.
 
+        :param schema_only: Expose metadata without creating an environment.
         :raises ValueError: If a ``sys_os_*`` name collides with
             an already-registered tool.
         """
-        from omnigent.tools.builtins.os_env import build_os_env_tools
+        from omnigent.tools.builtins.os_env import (
+            OS_ENV_TOOL_TYPES,
+            build_os_env_tools,
+        )
 
         os_env = self._pre_resolved_os_env
-        if os_env is None:
-            from omnigent.inner.os_env import create_os_environment
-
-            os_env_spec_obj = self._spec.os_env
-            if os_env_spec_obj is None:
-                return
-            os_env = create_os_environment(os_env_spec_obj)
+        if os_env is None and self._spec.os_env is None:
+            return
+        tools: list[Tool]
+        if schema_only:
+            tools = [
+                _SchemaOnlyTool(tool_cls.name(), tool_cls.get_schema())
+                for tool_cls in OS_ENV_TOOL_TYPES
+            ]
+        else:
             if os_env is None:
-                return
+                from omnigent.inner.os_env import create_os_environment
 
-        self._os_env = os_env
-        for tool in build_os_env_tools(os_env):
+                os_env = create_os_environment(self._spec.os_env)
+                if os_env is None:
+                    return
+            self._os_env = os_env
+            tools = build_os_env_tools(os_env)
+        for tool in tools:
             if tool.name() in self._tools:
                 raise ValueError(
                     f"sys_os_* tool {tool.name()!r} collides with an "

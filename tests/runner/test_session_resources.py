@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +41,8 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -772,6 +776,73 @@ async def test_get_terminal_by_id(
     assert body["metadata"]["terminal_name"] == "bash"
     assert body["metadata"]["tmux_socket"].endswith("bash-s1.sock")
     assert body["metadata"]["tmux_target"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_sign_in_link_reports_the_prompt_a_running_pane_shows(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    tmp_path: Path,
+) -> None:
+    """
+    GET /sign-in-link lifts the live sign-in prompt from the agent's own pane,
+    reading it with wrapped rows joined so a wide address comes back whole. A
+    saved link in an old error card is bound to a launcher process that has
+    moved on; the web asks here at click time instead. Only the native agent's
+    pane counts: a shell the person opened alongside it cannot supply the
+    address, however sign-in-like its output looks.
+    """
+    instance = _make_instance("codex", "main", tmp_path)
+    _seed_registry(registry, "conv_abc", [instance])
+    shell = registry.get("conv_abc", "bash", "s1")
+    assert shell is not None
+
+    async def _shell_read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        del scrollback, join_wrapped
+        return {
+            "screen": (
+                "! First copy your one-time code: 1A2B-3C4D\n"
+                "Press Enter to open https://github.com/login/device in your browser...\n"
+            )
+        }
+
+    shell.read = _shell_read  # type: ignore[method-assign]
+    reads: list[bool] = []
+
+    async def _read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        del scrollback
+        reads.append(join_wrapped)
+        return {
+            "screen": (
+                "Logging in via SSO...\n"
+                "please open the following URL:\n"
+                "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
+                "code: HQ7M-2KPD\n"
+            )
+        }
+
+    instance.read = _read  # type: ignore[method-assign]
+
+    resp = await client.get("/v1/sessions/conv_abc/sign-in-link")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "pending": True,
+        "url": "https://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz",
+        "code": "HQ7M-2KPD",
+        "terminal_id": "terminal_codex_main",
+    }
+    assert reads == [True]
+
+
+@pytest.mark.asyncio
+async def test_sign_in_link_reports_nothing_pending_without_a_prompt(
+    client: httpx.AsyncClient,
+) -> None:
+    """Panes showing no address (or none running) answer ``pending: false``."""
+    resp = await client.get("/v1/sessions/conv_abc/sign-in-link")
+    assert resp.status_code == 200
+    assert resp.json() == {"pending": False, "url": None, "code": None}
 
 
 @pytest.mark.asyncio
@@ -1651,6 +1722,7 @@ class _LaunchReturningRegistry:
         parent_os_env: Any | None = None,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
+        program_status_app: str | None = None,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
@@ -1661,6 +1733,7 @@ class _LaunchReturningRegistry:
         :param parent_os_env: Agent os_env (unused).
         :param cwd_override: cwd override (unused).
         :param sandbox_override: sandbox override (unused).
+        :param program_status_app: Runtime status application identity.
         :returns: The prepared terminal instance.
         """
         del (
@@ -1672,6 +1745,7 @@ class _LaunchReturningRegistry:
             cwd_override,
             sandbox_override,
         )
+        self._instance.program_status_app = program_status_app
         return self._instance
 
 
@@ -1949,6 +2023,12 @@ async def test_concurrent_resource_reads_share_one_session_snapshot(
         """
         nonlocal snapshot_count
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+                "include_live_status": "false",
+            }
             snapshot_count += 1
             snapshot_started.set()
             await release.wait()
@@ -2621,6 +2701,78 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
 
 
 @pytest.mark.asyncio
+async def test_slow_changed_files_listing_leaves_the_default_executor_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``git status`` stuck in the changes listing holds no default-executor worker.
+
+    A listing the browser abandons keeps its git call running; on the default
+    executor, enough of them starve every other offload, message delivery included.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+
+    conv = "conv_slow_changes"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    release_git = threading.Event()
+    listing_threads: list[str] = []
+
+    class _SlowGitRegistry:
+        """Stands in for a git status that takes minutes on a large tree."""
+
+        def __init__(self, watch_path: Path | None) -> None:
+            self.watch_path = watch_path
+
+        def start(self) -> None:
+            return None
+
+        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
+            del session_id, limit
+            listing_threads.append(threading.current_thread().name)
+            release_git.wait(budget(10))
+            return []
+
+    monkeypatch.setattr(
+        filesystem_registry_mod,
+        "create_filesystem_registry",
+        lambda *, watch_path=None: _SlowGitRegistry(watch_path),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(
+                200, json={"id": conv, "agent_id": None, "workspace": str(workspace)}
+            )
+        return httpx.Response(200, json={})
+
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    )
+    app = create_runner_app(runner_workspace=workspace, server_client=server_client)
+    path = f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            # As many stuck listings as the default executor has workers.
+            listings = [asyncio.create_task(client.get(path)) for _ in range(2)]
+            await poll_until_async(lambda: len(listing_threads) == 2, timeout_s=budget(5))
+
+            quick = asyncio.to_thread(lambda: "done")
+            assert await asyncio.wait_for(quick, timeout=budget(2)) == "done"
+            assert all(name.startswith("runner-slow-io_") for name in listing_threads)
+
+            release_git.set()
+            responses = await asyncio.gather(*listings)
+    finally:
+        release_git.set()
+        await server_client.aclose()
+
+    assert [response.status_code for response in responses] == [200, 200]
+
+
+@pytest.mark.asyncio
 async def test_reset_state_discards_a_snapshot_fill_already_in_flight(
     tmp_path: Path,
 ) -> None:
@@ -2734,6 +2886,7 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
 
     from omnigent.runner.resource_registry import TerminalLifecycle
     from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
     class _Terminal(TerminalInstance):
         closed: bool = False
@@ -2759,6 +2912,8 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
         private_dir=tmp_path / "dead",
         running=True,
     )
+    dead._remember_exit_status("1 2")
+    dead._last_exit_snapshot = "startup parser error"
     successor = _Terminal(
         name="claude",
         session_key="main",
@@ -2771,7 +2926,7 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
     terminal_registry._by_conversation["conv_evict"] = {("claude", "main"): successor}
     terminal_registry._instance_locks[("conv_evict", "claude", "main")] = threading.Lock()
 
-    with pytest.raises(RuntimeError, match="is not running"):
+    with pytest.raises(TerminalExitedDuringLaunch, match="exit status 2") as exited:
         await registry._observe_terminal_with_lifecycle(
             TerminalLifecycle.AUXILIARY,
             session_id="conv_evict",
@@ -2780,6 +2935,9 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
             instance=dead,
         )
 
+    assert exited.value.instance is dead
+    assert exited.value.instance.last_exit_status() == 2
+    assert exited.value.instance.last_exit_text() == "startup parser error"
     assert successor.closed is False, (
         "the live successor on this key must survive eviction of the dead instance"
     )

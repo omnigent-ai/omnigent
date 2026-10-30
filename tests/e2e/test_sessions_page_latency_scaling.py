@@ -97,12 +97,16 @@ async def _median_page_latency_ms(db_uri: str) -> float:
     async with BenchEnvironment(database_uri=db_uri) as env:
         assert env.client is not None
         for _ in range(_WARMUP_REQUESTS):
-            resp = await env.client.get("/v1/sessions", params={"limit": _PAGE_LIMIT})
+            resp = await env.client.get(
+                "/v1/sessions", params={"visibility": "all", "limit": _PAGE_LIMIT}
+            )
             resp.raise_for_status()
         samples: list[float] = []
         for _ in range(_SAMPLES):
             start = time.perf_counter()
-            resp = await env.client.get("/v1/sessions", params={"limit": _PAGE_LIMIT})
+            resp = await env.client.get(
+                "/v1/sessions", params={"visibility": "all", "limit": _PAGE_LIMIT}
+            )
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             resp.raise_for_status()
             # Both corpora exceed a page, so a full page proves the journey

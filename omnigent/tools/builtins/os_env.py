@@ -38,6 +38,7 @@ from typing import Any
 
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, OSEnvironment
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.json_serialization import json_dumps_transport_safe
 
 _logger = logging.getLogger(__name__)
 
@@ -170,9 +171,9 @@ class _OSEnvBackedTool(Tool):
         try:
             kwargs = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError as exc:
-            return json.dumps({"error": f"malformed arguments JSON: {exc}"})
+            return json_dumps_transport_safe({"error": f"malformed arguments JSON: {exc}"})
         if not isinstance(kwargs, dict):
-            return json.dumps({"error": "arguments must be a JSON object"})
+            return json_dumps_transport_safe({"error": "arguments must be a JSON object"})
         import asyncio
 
         # Surface every failure to the LLM as a structured error
@@ -182,8 +183,8 @@ class _OSEnvBackedTool(Tool):
             result = asyncio.run(self._invoke_async(kwargs))
         except Exception as exc:
             _logger.exception("%s failed", self.name())
-            return json.dumps({"error": str(exc)})
-        return json.dumps(result)
+            return json_dumps_transport_safe({"error": str(exc)})
+        return json_dumps_transport_safe(result)
 
     async def _invoke_async(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """
@@ -209,7 +210,8 @@ class SysOsReadTool(_OSEnvBackedTool):
         """:returns: Description shown to the LLM."""
         return "Read a text file from the OS environment."
 
-    def get_schema(self) -> dict[str, Any]:
+    @classmethod
+    def get_schema(cls) -> dict[str, Any]:
         """
         :returns: OpenAI Chat-Completions tool schema for
             ``sys_os_read``.
@@ -217,8 +219,8 @@ class SysOsReadTool(_OSEnvBackedTool):
         return {
             "type": "function",
             "function": {
-                "name": self.name(),
-                "description": self.description(),
+                "name": cls.name(),
+                "description": cls.description(),
                 "parameters": _OS_READ_SCHEMA,
             },
         }
@@ -257,7 +259,8 @@ class SysOsWriteTool(_OSEnvBackedTool):
         """:returns: Description shown to the LLM."""
         return "Write full contents of a text file in the OS environment."
 
-    def get_schema(self) -> dict[str, Any]:
+    @classmethod
+    def get_schema(cls) -> dict[str, Any]:
         """
         :returns: OpenAI Chat-Completions tool schema for
             ``sys_os_write``.
@@ -265,8 +268,8 @@ class SysOsWriteTool(_OSEnvBackedTool):
         return {
             "type": "function",
             "function": {
-                "name": self.name(),
-                "description": self.description(),
+                "name": cls.name(),
+                "description": cls.description(),
                 "parameters": _OS_WRITE_SCHEMA,
             },
         }
@@ -299,7 +302,8 @@ class SysOsEditTool(_OSEnvBackedTool):
         """:returns: Description shown to the LLM."""
         return "Perform exact text replacements in a file in the OS environment."
 
-    def get_schema(self) -> dict[str, Any]:
+    @classmethod
+    def get_schema(cls) -> dict[str, Any]:
         """
         :returns: OpenAI Chat-Completions tool schema for
             ``sys_os_edit``.
@@ -307,8 +311,8 @@ class SysOsEditTool(_OSEnvBackedTool):
         return {
             "type": "function",
             "function": {
-                "name": self.name(),
-                "description": self.description(),
+                "name": cls.name(),
+                "description": cls.description(),
                 "parameters": _OS_EDIT_SCHEMA,
             },
         }
@@ -346,7 +350,8 @@ class SysOsShellTool(_OSEnvBackedTool):
             "Run a shell command in the OS environment and return stdout, stderr, and exit_code."
         )
 
-    def get_schema(self) -> dict[str, Any]:
+    @classmethod
+    def get_schema(cls) -> dict[str, Any]:
         """
         :returns: OpenAI Chat-Completions tool schema for
             ``sys_os_shell``.
@@ -354,8 +359,8 @@ class SysOsShellTool(_OSEnvBackedTool):
         return {
             "type": "function",
             "function": {
-                "name": self.name(),
-                "description": self.description(),
+                "name": cls.name(),
+                "description": cls.description(),
                 "parameters": _OS_SHELL_SCHEMA,
             },
         }
@@ -375,15 +380,14 @@ class SysOsShellTool(_OSEnvBackedTool):
         )
 
 
+OS_ENV_TOOL_TYPES = (SysOsReadTool, SysOsWriteTool, SysOsEditTool, SysOsShellTool)
+
+
 def build_os_env_tools(os_env: OSEnvironment) -> list[Tool]:
     """
     Construct one of each ``sys_os_*`` tool against *os_env*.
 
-    Convenience for the
-    :class:`omnigent.tools.manager.ToolManager`'s registration
-    pass — keeps the tool list in one place so adding a new
-    ``sys_os_*`` is a one-line edit here rather than four
-    edits across the manager.
+    Uses the same tool types as metadata-only registration.
 
     :param os_env: The agent's :class:`OSEnvironment`. All four
         returned tools share this instance — they MUST share
@@ -391,9 +395,4 @@ def build_os_env_tools(os_env: OSEnvironment) -> list[Tool]:
     :returns: A list of four :class:`Tool` instances ready to
         register.
     """
-    return [
-        SysOsReadTool(os_env),
-        SysOsWriteTool(os_env),
-        SysOsEditTool(os_env),
-        SysOsShellTool(os_env),
-    ]
+    return [tool_cls(os_env) for tool_cls in OS_ENV_TOOL_TYPES]

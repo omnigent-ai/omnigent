@@ -1,0 +1,6 @@
+# Database migrations require approval from any one of these owners.
+/omnigent/db/migrations/ @Edwinhe03 @aravind-segu @dbczumar @bbqiu
+/omnigent/db/alembic.ini @Edwinhe03 @aravind-segu @dbczumar @bbqiu
+
+# Keep changes to the approval policy subject to the same review.
+/.github/CODEOWNERS @Edwinhe03 @aravind-segu @dbczumar @bbqiu

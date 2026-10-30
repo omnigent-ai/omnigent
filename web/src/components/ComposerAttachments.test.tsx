@@ -51,6 +51,18 @@ describe("ComposerAttachments", () => {
     expect(screen.queryByRole("img")).toBeNull();
   });
 
+  it.each([
+    ["bundle.zip", "ZIP"],
+    ["report.docx", "DOCX"],
+    ["app.sqlite", "SQLITE"],
+  ])("shows %s as an ordinary file card", (name, type) => {
+    renderList([new File([new Uint8Array(4)], name)]);
+    expect(screen.getByText(name)).toBeInTheDocument();
+    expect(screen.getByText(`${type} · 4 B`)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Remove ${name}` })).toBeInTheDocument();
+    expect(screen.queryByText("workspace")).toBeNull();
+  });
+
   it("removes the clicked attachment by index", () => {
     const { onRemove } = renderList([
       new File([new Uint8Array(4)], "a.png", { type: "image/png" }),

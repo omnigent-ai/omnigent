@@ -100,10 +100,13 @@ def test_bare_acp_falls_back_to_first_agent(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_COMMAND"] == "gemini --experimental-acp"
 
 
-def test_unknown_slug_falls_back_to_first_agent(_isolate_config: Path) -> None:
+@pytest.mark.parametrize("harness", ["acp:nonexistent", "acp:"])
+def test_unknown_slug_fails_instead_of_launching_first_agent(
+    _isolate_config: Path, harness: str
+) -> None:
     _write_acp_config(_isolate_config)
-    env = _build_acp_spawn_env(_make_spec(harness="acp:nonexistent"))
-    assert env["HARNESS_ACP_COMMAND"] == "gemini --experimental-acp"
+    with pytest.raises(OmnigentError, match="not configured on this runner"):
+        _build_acp_spawn_env(_make_spec(harness=harness))
 
 
 def test_no_agents_omits_command(_isolate_config: Path) -> None:
@@ -546,3 +549,38 @@ def test_env_unset_absent_by_default(_isolate_config: Path) -> None:
     _write_acp_config(_isolate_config)
     env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
     assert "HARNESS_ACP_ENV_UNSET" not in env
+
+
+@pytest.mark.parametrize("model_override", [None, "session-model"])
+@pytest.mark.parametrize("declared_harness", ["pi", "acp:gemini-cli"])
+def test_runner_override_selects_command_and_default_model(
+    _isolate_config: Path, model_override: str | None, declared_harness: str
+) -> None:
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_acp_config(_isolate_config)
+    spec = _make_spec(harness=declared_harness)
+    env = _build_spawn_env_from_spec(spec, "acp:goose", model_override=model_override)
+    assert env is not None
+    assert env["HARNESS_ACP_COMMAND"] == "goose acp"
+    assert env["HARNESS_ACP_MODEL"] == (model_override or "gpt-5.3")
+    assert env["HARNESS_ACP_DEFAULT_MODEL"] == "gpt-5.3"
+    assert spec.executor.config["harness"] == declared_harness
+    assert spec.executor.model is None
+
+
+@pytest.mark.asyncio
+async def test_runner_config_resolution_preserves_acp_selection(_isolate_config: Path) -> None:
+    from omnigent.runner.app import _resolve_harness_config
+
+    _write_acp_config(_isolate_config)
+    spec = _make_spec(harness="pi")
+
+    async def resolve(_agent_id: str, _session_id: str | None) -> AgentSpec:
+        return spec
+
+    harness, env = await _resolve_harness_config(
+        agent_id="agent", spec_resolver=resolve, session_id="session", harness_override="acp:goose"
+    )
+    assert harness == "acp"
+    assert env is not None and env["HARNESS_ACP_COMMAND"] == "goose acp"

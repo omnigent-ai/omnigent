@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 
@@ -48,6 +48,9 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     build_job_manifest,
 )
 from omnigent.onboarding.sandboxes.types import RepoWorkspace
+
+if TYPE_CHECKING:
+    from kubernetes import client as k8s_client
 
 _logger = logging.getLogger(__name__)
 EXTENSION_GROUP = "extensions.agents.x-k8s.io"
@@ -779,12 +782,15 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 namespace,
                 CLAIMS,
                 name,
-                body={
-                    "apiVersion": "v1",
-                    "kind": "DeleteOptions",
-                    "propagationPolicy": "Foreground",
-                    "preconditions": {"uid": uid},
-                },
+                body=cast(
+                    "k8s_client.V1DeleteOptions",
+                    {
+                        "apiVersion": "v1",
+                        "kind": "DeleteOptions",
+                        "propagationPolicy": "Foreground",
+                        "preconditions": {"uid": uid},
+                    },
+                ),
                 _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
             )
         except ApiException as exc:

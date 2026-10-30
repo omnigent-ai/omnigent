@@ -88,6 +88,37 @@ def test_pi_spawn_env_threads_cwd_separately_from_bundle_dir(tmp_path: Path) -> 
     assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
 
 
+@pytest.mark.parametrize("enabled", [None, True, False])
+def test_pi_spawn_env_sets_context_files(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool | None
+) -> None:
+    """The spec controls discovery even when the parent environment disagrees."""
+    spec = _make_spec()
+    if enabled is not None:
+        spec.executor.config["context_files"] = enabled
+    monkeypatch.setenv("HARNESS_PI_CONTEXT_FILES", "true" if enabled is False else "false")
+
+    env = _build_pi_spawn_env(spec)
+
+    assert env["HARNESS_PI_CONTEXT_FILES"] == ("false" if enabled is False else "true")
+
+
+@pytest.mark.parametrize("mode", [None, "append", "replace"])
+def test_pi_spawn_env_sets_system_prompt_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str | None
+) -> None:
+    spec = _make_spec()
+    if mode is not None:
+        spec.executor.config["system_prompt_mode"] = mode
+    monkeypatch.setenv(
+        "HARNESS_PI_SYSTEM_PROMPT_MODE", "append" if mode == "replace" else "replace"
+    )
+
+    env = _build_pi_spawn_env(spec)
+
+    assert env["HARNESS_PI_SYSTEM_PROMPT_MODE"] == (mode or "append")
+
+
 def _ucode_state_for_pi(
     monkeypatch: pytest.MonkeyPatch, *, model: str | None, with_pi_entry: bool
 ):
@@ -116,6 +147,7 @@ def _ucode_state_for_pi(
                     "openai": "https://example.databricks.com/ai-gateway/codex/v1",
                 },
                 auth_command="printf token",
+                auth_refresh_interval_ms=1234,
             )
         }
         if with_pi_entry
@@ -153,6 +185,14 @@ def test_ucode_state_without_model_falls_back_to_databricks_default(
     env = _build_pi_spawn_env(spec, workdir=None)
 
     assert env["HARNESS_PI_GATEWAY"] == "true"
+    assert env["HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS"] == "1234"
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OMNIGENT_PI_PATH", "/usr/bin/pi")
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 0, 4))
+    from omnigent.inner.pi_harness import _build_pi_executor
+
+    assert _build_pi_executor()._gateway_auth_refresh_interval_s == 1.234
     # The verified routable gateway endpoint name, not pi's own default.
     assert env["HARNESS_PI_MODEL"] == "catalog-databricks-claude-default"
 

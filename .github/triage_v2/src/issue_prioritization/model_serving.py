@@ -12,6 +12,8 @@ def serving_endpoint_classifier(
     areas: AreaCatalog,
     workspace: WorkspaceClient | None = None,
     duplicate_candidates: tuple[dict[str, object], ...] = (),
+    *,
+    review_bugs: bool = False,
 ) -> PromptClassifier:
     if not endpoint:
         raise ValueError("model_endpoint is required when issue classifications are missing")
@@ -21,15 +23,19 @@ def serving_endpoint_classifier(
         response = workspace.serving_endpoints.query(
             endpoint,
             messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-            max_tokens=2048,
+            max_tokens=8192 if review_bugs else 2048,
         )
         if not response.choices:
             raise RuntimeError("model endpoint returned no choices")
         choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError(
+                "model endpoint truncated the classification at its output token limit"
+            )
         if choice.message and choice.message.content:
             return choice.message.content
         if choice.text:
             return choice.text
         raise RuntimeError("model endpoint returned an empty response")
 
-    return PromptClassifier(query, areas, duplicate_candidates)
+    return PromptClassifier(query, areas, duplicate_candidates, review_bugs=review_bugs)

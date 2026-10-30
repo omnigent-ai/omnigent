@@ -198,12 +198,14 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             )
 
         sandbox_spec = spec.sandbox or OSEnvSandboxSpec(type=self.type_name)
+        if any(grant.copy_on_write for grant in sandbox_spec.write_path_specs):
+            raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
         _warn_no_fs_isolation_once()
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
             read_roots = [(cwd / r).resolve() for r in sandbox_spec.read_paths]
-        write_roots = [(cwd / w).resolve() for w in (sandbox_spec.write_paths or [])]
+        write_roots = [(cwd / grant.path).resolve() for grant in sandbox_spec.write_path_specs]
         write_files = [(cwd / f).resolve() for f in (sandbox_spec.write_files or [])]
 
         return SandboxPolicy(

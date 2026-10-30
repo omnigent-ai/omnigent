@@ -13,6 +13,8 @@ function loadMainHarness({
   sessionCookies = [],
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
+  saveDialogResult = { canceled: false, filePath: "/tmp/desktop-diagnostics.jsonl" },
+  exportError = null,
   serverShutdown = () => Promise.resolve(),
   isPackaged = false,
   platform = process.platform,
@@ -33,6 +35,8 @@ function loadMainHarness({
     quitAndInstall: [],
     sent: [],
     showMessageBox: [],
+    showSaveDialog: [],
+    exportedDiagnostics: [],
     setApplicationMenu: [],
     aboutOpens: [],
     expiredAccess: [],
@@ -96,6 +100,7 @@ function loadMainHarness({
       getPath: (name) => (name === "userData" ? userData : userData),
       getVersion: () => "0.3.0",
       setName: () => {},
+      setPath: () => {},
       requestSingleInstanceLock: () => true,
       on: (name, listener) => appEvents.set(name, listener),
       whenReady: () => ({ then: () => {} }),
@@ -119,6 +124,10 @@ function loadMainHarness({
     Notification: { isSupported: () => false },
     clipboard: {},
     dialog: {
+      showSaveDialog: (...args) => {
+        calls.showSaveDialog.push(args);
+        return Promise.resolve(saveDialogResult);
+      },
       showMessageBox: (dialogWin, options) => {
         calls.showMessageBox.push({ win: dialogWin, options });
         return Promise.resolve(dialogResponses.shift() ?? { response: 1, checkboxChecked: false });
@@ -154,6 +163,15 @@ function loadMainHarness({
   };
 
   const localRequires = {
+    "./diagnostics": {
+      diagnostics: {
+        record: () => {},
+        exportTo: (destination) => {
+          if (exportError) throw exportError;
+          calls.exportedDiagnostics.push(destination);
+        },
+      },
+    },
     "./about_window": {
       createAboutWindow: () => ({
         open: (parent) => calls.aboutOpens.push(parent),
@@ -327,6 +345,45 @@ describe("in-app navigation menu actions", () => {
   });
 });
 
+describe("diagnostics export menu wiring", () => {
+  it("exports from the production Server menu without renderer IPC", async (t) => {
+    const harness = loadMainHarness({ isPackaged: true, platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    assert.equal(hasDebugMenu(menu), false);
+    assert.ok(harness.ipcHandlers.size > 0);
+    const item = findMenuItem(menu, "export_diagnostics");
+    assert.equal(item.label, "Export Diagnostics…");
+    item.click();
+    await flushPromises();
+    assert.equal(harness.calls.showSaveDialog.length, 1);
+    assert.deepEqual(harness.calls.exportedDiagnostics, ["/tmp/desktop-diagnostics.jsonl"]);
+    assert.equal(harness.ipcHandlers.has("omnigent:export-diagnostics"), false);
+  });
+
+  it("does not export when the save dialog is cancelled", async (t) => {
+    const harness = loadMainHarness({ saveDialogResult: { canceled: true } });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "export_diagnostics").click();
+    await flushPromises();
+    assert.deepEqual(harness.calls.exportedDiagnostics, []);
+  });
+
+  it("shows an error if the chosen destination cannot be written", async (t) => {
+    const harness = loadMainHarness({ exportError: new Error("Destination is not writable") });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "export_diagnostics").click();
+    await flushPromises();
+    assert.deepEqual(harness.calls.exportedDiagnostics, []);
+    assert.equal(harness.calls.showMessageBox.length, 1);
+    assert.equal(harness.calls.showMessageBox[0].options.title, "Could not export diagnostics");
+  });
+});
+
 describe("About menu wiring", () => {
   it("opens the shell-owned About window from About and Check for Updates", async (t) => {
     const harness = loadMainHarness({
@@ -440,7 +497,7 @@ describe("developer-mode menu wiring", () => {
     assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), false);
   });
 
-  it("shows the Debug menu when a packaged macOS build opts in", (t) => {
+  it("shows authentication debugging when a packaged macOS build opts in", (t) => {
     const harness = loadMainHarness({
       isPackaged: true,
       platform: "darwin",
@@ -452,10 +509,15 @@ describe("developer-mode menu wiring", () => {
 
     const menu = harness.calls.setApplicationMenu.at(-1);
     assert.equal(hasDebugMenu(menu), true);
-    assert.equal(findMenuItem(menu, "simulate_session_expiry"), null);
-    assert.equal(findMenuItem(menu, "simulate_oauth_token_expiry"), null);
-    assert.equal(findMenuItem(menu, "invalidate_oauth_refresh_token"), null);
-    assert.equal(findMenuItem(menu, "debug_authentication"), null);
+    const authentication = findMenuItem(menu, "debug_authentication");
+    assert.equal(authentication.label, "Authentication");
+    for (const id of [
+      "simulate_session_expiry",
+      "simulate_oauth_token_expiry",
+      "invalidate_oauth_refresh_token",
+    ]) {
+      assert.equal(typeof findMenuItem(menu, id)?.click, "function");
+    }
   });
 });
 
@@ -677,6 +739,7 @@ describe("auto-update main-process wiring", () => {
     const harness = loadMainHarness({
       forceDevUpdateConfig: true,
       settings: { update_mode: "manual" },
+      platform: "linux",
     });
     t.after(harness.cleanup);
     harness.api.updater.init();
@@ -705,6 +768,36 @@ describe("auto-update main-process wiring", () => {
     });
     assert.equal(harness.calls.appExit, 1); // fallback forced the exit
     assert.equal(harness.calls.appQuit, 1); // never re-issued
+  });
+
+  it("waits on macOS for an async install (admin prompt) instead of force-exiting", async (t) => {
+    // Squirrel.Mac installs asynchronously and may show an admin password
+    // prompt for a root-owned bundle; a timed exit would kill that prompt.
+    const harness = loadMainHarness({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+      platform: "darwin",
+    });
+    t.after(harness.cleanup);
+    harness.api.updater.init();
+    harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+    harness.api.registerIpc();
+    await harness.ipcHandlers.get("omnigent:update-install")(harness.events.pinned);
+
+    harness.api.setQuitTimeouts({ installFallback: 10, cleanup: 10 });
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    await flushPromises();
+    harness.runMainImmediates();
+    assert.deepEqual(harness.calls.quitAndInstall, [[false, true]]);
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    assert.equal(harness.calls.appExit, 0); // still waiting on the install
+
+    // A failed/cancelled install still exits rather than leaving the app up.
+    harness.autoUpdater.emit("error", new Error("authorization canceled"));
+    assert.equal(harness.calls.appExit, 1);
   });
 
   it("force-exits if the re-issued normal quit does not terminate", async (t) => {

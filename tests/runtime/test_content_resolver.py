@@ -13,6 +13,10 @@ from omnigent.entities.conversation import (
     FunctionCallData,
     MessageData,
 )
+from omnigent.inner.native_attachments import (
+    DEFAULT_FILESYSTEM_ATTACHMENT_POLICY,
+    FilesystemAttachmentPolicy,
+)
 from omnigent.runtime.content_resolver import (
     extract_text_attachments,
     resolve_content_references,
@@ -670,6 +674,105 @@ def test_deleted_file_raises_clear_error(
         )
 
 
+def test_filesystem_attachment_rejected_by_generic_resolver() -> None:
+    """Generic resolvers reject filesystem attachments before fetching their bytes."""
+    zip_store, _ = _stores_with("file_zip", "archive.zip", "application/zip", b"PK\x03\x04")
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_zip", "filename": "archive.zip"}]
+    )
+
+    with pytest.raises(ValueError, match="filesystem-capable harness"):
+        resolve_content_references(
+            [item],
+            zip_store,
+            FakeArtifactStore(blobs={}),  # type: ignore[arg-type]
+        )
+
+
+def test_native_forward_defers_filesystem_files_and_resolves_the_rest() -> None:
+    """Native forwarding preserves filesystem references while resolving ordinary files."""
+    from omnigent.runtime.content_resolver import _resolve_message_content
+
+    store, artifacts = _stores_with("file_txt", "notes.txt", "text/plain", b"hello")
+    zip_store, _ = _stores_with("file_zip", "archive.zip", "application/zip", b"PK\x03\x04")
+    store.files.update(zip_store.files)
+    zip_block = {"type": "input_file", "file_id": "file_zip", "filename": "archive.zip"}
+    content = [zip_block, {"type": "input_file", "file_id": "file_txt", "filename": "notes.txt"}]
+
+    resolved = _resolve_message_content(
+        content,
+        store,
+        artifacts,  # type: ignore[arg-type]
+        defer_filesystem_files=True,
+    )
+
+    assert resolved[0] == zip_block
+    assert resolved[1]["file_data"].startswith("data:text/plain;base64,")
+    assert "file_id" not in resolved[1]
+
+
+def test_recorded_filesystem_delivery_routes_any_type_to_disk() -> None:
+    """The upload's recorded decision, not the default extensions, sends a file to disk."""
+    from dataclasses import replace
+
+    from omnigent.runtime.content_resolver import _resolve_message_content
+
+    store, artifacts = _stores_with("file_gz", "trace.gz", "application/gzip", b"\x1f\x8b")
+    store.files["file_gz"] = replace(
+        store.files["file_gz"], source_metadata={"delivery": "filesystem"}
+    )
+    block = {"type": "input_file", "file_id": "file_gz", "filename": "trace.gz"}
+
+    deferred = _resolve_message_content(
+        [block],
+        store,
+        artifacts,  # type: ignore[arg-type]
+        defer_filesystem_files=True,
+    )
+    assert deferred == [block]
+    with pytest.raises(ValueError, match="filesystem-capable harness"):
+        _resolve_message_content([block], store, artifacts)  # type: ignore[arg-type]
+
+
+_ALL_TYPES = FilesystemAttachmentPolicy(all_types=True)
+
+
+@pytest.mark.parametrize(
+    ("filename", "declared_type", "policy", "delivery"),
+    [
+        # Default policy: inline types stay inline; listed names win over the MIME.
+        ("notes.txt", "text/plain", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, "inline"),
+        ("photo.png", "image/png", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, "inline"),
+        ("data.csv", "application/vnd.ms-excel", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, "inline"),
+        ("bundle.zip", "text/plain", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, "filesystem"),
+        ("trace.gz", "application/gzip", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, None),
+        # All types: whatever can't be inlined goes to disk, including untyped compressed text.
+        ("notes.txt", "text/plain", _ALL_TYPES, "inline"),
+        ("photo.png", "image/png", _ALL_TYPES, "inline"),
+        ("trace.gz", "application/gzip", _ALL_TYPES, "filesystem"),
+        ("trace.json.gz", None, _ALL_TYPES, "filesystem"),
+        ("site.har", "", _ALL_TYPES, "filesystem"),
+        ("Makefile", None, _ALL_TYPES, "filesystem"),
+        # A list replaces the defaults, so a listed text type moves to disk.
+        ("big.log", "text/plain", FilesystemAttachmentPolicy(frozenset({".log"})), "filesystem"),
+        ("bundle.zip", "application/zip", FilesystemAttachmentPolicy(frozenset()), None),
+        # A default extension the list leaves out is refused, whatever its declared MIME.
+        ("bundle.zip", "text/plain", FilesystemAttachmentPolicy(frozenset()), None),
+        ("bundle.zip", "text/plain", FilesystemAttachmentPolicy(frozenset({".gz"})), None),
+    ],
+)
+def test_attachment_delivery(
+    filename: str,
+    declared_type: str | None,
+    policy: FilesystemAttachmentPolicy,
+    delivery: str | None,
+) -> None:
+    """Uploads are inlined, delivered as files, or refused according to the policy."""
+    from omnigent.runtime.content_resolver import attachment_delivery
+
+    assert attachment_delivery(filename, declared_type, policy) == delivery
+
+
 # ── _resolve_content_type tests ───────────────────────────────────────
 
 
@@ -686,6 +789,21 @@ def test_resolve_content_type_strips_mime_parameters() -> None:
     from omnigent.runtime.content_resolver import _resolve_content_type
 
     assert _resolve_content_type("image/png;charset=binary", "photo.png") == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("trace.json.gz", "application/gzip"),
+        ("logs.csv.bz2", "application/x-bzip2"),
+        ("perf.tar.xz", "application/x-xz"),
+    ],
+)
+def test_resolve_content_type_names_the_compression(filename: str, expected: str) -> None:
+    """A compressed name resolves to its compressed type, not the inner file's."""
+    from omnigent.runtime.content_resolver import _resolve_content_type
+
+    assert _resolve_content_type(None, filename) == expected
 
 
 def test_resolve_content_type_ignores_octet_stream() -> None:
@@ -1633,6 +1751,12 @@ def test_client_server_attachment_extension_parity() -> None:
     ]
     assert not rejected, f"client accepts but server would 415: {rejected}"
 
+    # Server-supported extensions must also pass the composer's upload gate.
+    from omnigent.runtime.content_resolver import _TEXT_CODE_EXTENSIONS
+
+    server_only = sorted(_TEXT_CODE_EXTENSIONS - set(client_exts))
+    assert not server_only, f"server accepts but the client gate rejects: {server_only}"
+
 
 # ── extract_text_attachments (request-phase PII scanning) ─────────
 
@@ -1643,6 +1767,7 @@ def _stores_with(
     content_type: str,
     blob: bytes,
     session_id: str | None = None,
+    source_metadata: dict[str, Any] | None = None,
 ) -> tuple[FakeFileStore, FakeArtifactStore]:
     """Build fake stores holding one attachment.
 
@@ -1657,6 +1782,7 @@ def _stores_with(
                 bytes=len(blob),
                 content_type=content_type,
                 session_id=session_id,
+                source_metadata=source_metadata,
             )
         }
     )
@@ -1664,12 +1790,7 @@ def _stores_with(
 
 
 def test_extracts_text_from_csv_attachment() -> None:
-    """A text/csv ``input_file`` attachment's content is decoded for scanning.
-
-    Regression for #2906: an attached CSV is base64-inlined to the model and
-    never appears in the typed message, so its PII must be surfaced here for
-    the request-phase PII policy to catch it.
-    """
+    """Policy receives decoded CSV text even when it is absent from the typed message."""
     csv = b"id,full_name,credit_card\n1,Alice,4111 1111 1111 1111\n"
     fs, arts = _stores_with("file_csv", "data.csv", "text/csv", csv)
     content = [
@@ -1677,16 +1798,72 @@ def test_extracts_text_from_csv_attachment() -> None:
         {"type": "input_file", "file_id": "file_csv"},
     ]
     out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
-    assert len(out) == 1
-    assert out[0]["filename"] == "data.csv"
-    assert out[0]["content_type"] == "text/csv"
-    assert "4111 1111 1111 1111" in out[0]["text"]
+    assert out == [{"filename": "data.csv", "content_type": "text/csv", "text": csv.decode()}]
 
 
-def test_skips_binary_attachments() -> None:
+@pytest.mark.parametrize(
+    ("filename", "content_type", "block_type", "source_metadata"),
+    [
+        ("bundle.zip", "application/zip", "input_file", None),
+        ("bundle.zip", "text/plain", "input_file", None),
+        ("bundle.zip", "image/png", "input_image", None),
+        # A text type recorded for filesystem delivery is not decoded either.
+        ("big.log", "text/plain", "input_file", {"delivery": "filesystem"}),
+    ],
+)
+def test_archive_is_announced_to_policy_without_text(
+    filename: str,
+    content_type: str,
+    block_type: str,
+    source_metadata: dict[str, Any] | None,
+) -> None:
+    """Policy sees filesystem files without decoding, even with misleading MIME/block types."""
+    fs, arts = _stores_with(
+        "file_disk", filename, content_type, b"PK\x03\x04data", source_metadata=source_metadata
+    )
+    content = [
+        {"type": "input_text", "text": "unpack this"},
+        {"type": block_type, "file_id": "file_disk"},
+    ]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert out == [{"filename": filename, "content_type": content_type, "text": ""}]
+
+
+def test_resolved_inline_block_drops_client_delivery() -> None:
+    """A client's delivery claim can't send a file the store inlines to disk."""
+    fs, arts = _stores_with("file_txt", "notes.txt", "text/plain", b"hello")
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_txt", "delivery": "filesystem"}]
+    )
+
+    result = resolve_content_references([item], fs, arts)  # type: ignore[arg-type]
+
+    assert isinstance(result[0].data, MessageData)
+    block = result[0].data.content[0]
+    assert "delivery" not in block
+    assert block["file_data"].startswith("data:text/plain;base64,")
+
+
+def test_resolved_block_takes_its_filename_from_the_stored_file() -> None:
+    """Delivery uses the stored filename even when the message supplies another extension."""
+    fs, arts = _stores_with("file_txt", "payload.txt", "text/plain", b"hello")
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_txt", "filename": "payload.db"}]
+    )
+
+    result = resolve_content_references([item], fs, arts)  # type: ignore[arg-type]
+
+    assert isinstance(result[0].data, MessageData)
+    assert result[0].data.content[0]["filename"] == "payload.txt"
+
+
+@pytest.mark.parametrize("block_type", ["input_file", "input_image"])
+def test_skips_binary_attachments(block_type: str) -> None:
     """Non-text attachments (image/PDF) are not decoded."""
     fs, arts = _stores_with("file_png", "photo.png", "image/png", PNG_BYTES)
-    content = [{"type": "input_file", "file_id": "file_png"}]
+    content = [{"type": block_type, "file_id": "file_png"}]
     assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
 
 

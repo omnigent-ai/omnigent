@@ -30,7 +30,7 @@ def test_right_click_opens_session_actions_menu(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Right-clicking a row opens the kebab actions and drives the same handlers.
+    """Right-clicking the row or kebab opens and drives the shared actions.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -42,6 +42,16 @@ def test_right_click_opens_session_actions_menu(
 
     link = _row_link(page, session_id)
     expect(link).to_be_visible()
+    row = page.locator(f'li[data-sidebar-session-id="{session_id}"]')
+    row.hover()
+
+    # The nested kebab remains a context-menu trigger rather than swallowing
+    # the right click before it reaches the row.
+    row.get_by_test_id("conversation-actions").click(button="right")
+    expect(page.get_by_test_id("rename-conversation")).to_be_visible()
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
 
     # Right-click the row surface. Radix's ContextMenuTrigger preventDefaults
     # the native contextmenu event and opens the app menu at the cursor.

@@ -45,8 +45,8 @@ directly instead of going through `data_dir()`.
 | `telemetry.json` | Telemetry state, including the persistent `installation_id`. | `omnigent/telemetry/installation_id.py` |
 | `.update_check.json` **†** | Cached result of the (potentially slow) update check. | `omnigent/update_check.py` |
 | `install_ledger.json` | Record of what the installer wrote, used by uninstall/purge. | `omnigent/install_ledger.py` |
-| `admins`, `allowed_domains` | OSS server operator state: admin list and OIDC allowed-domains, co-located so operator-editable files live together. Operator-managed input files — the cited modules read them. | Read by `omnigent/server/admin_list.py`, `omnigent/server/oidc_access.py` |
-| `sharing_mode`, `public_sharing` | Server-side sharing settings. | `omnigent/server/sharing_settings.py` |
+| `admins`, `allowed_domains` | OSS server operator state: admin list and OIDC allowed-domains, co-located so operator-editable files live together. Operator-managed input files — the cited modules read them. A listed identity is promoted to the database admin flag on login (OIDC, accounts) or on first page load (header auth); removing it from `admins` does not revoke that flag, which must be cleared separately. | Read by `omnigent/server/admin_list.py`, `omnigent/server/oidc_access.py` |
+| `sharing_mode`, `public_sharing`, `default_public_sessions` | Server-side sharing settings, written from Settings > Sharing. Each overrides its boot default: `OMNIGENT_SHARING_MODE`, `OMNIGENT_PUBLIC_SHARING` and `OMNIGENT_DEFAULT_PUBLIC_SESSIONS` (`off` / `sandbox` / `all`, which new sessions start with public read access). | `omnigent/server/sharing_settings.py` |
 
 ## Directories
 
@@ -54,6 +54,7 @@ directly instead of going through `data_dir()`.
 |-----------|---------|------------|
 | `logs/` | Process logs split by role: `cli/`, `host/`, `runner/`, `server/`. | `logs_root()` / `process_log_dir()` in `omnigent/process_logging.py` |
 | `artifacts/` | Stored artifacts, one directory per artifact ID; paired with `chat.db`. | `omnigent/chat.py`, `omnigent/host/local_server.py` |
+| `attachments/` | Native harness attachment copies, grouped by an opaque session cache key. The original uploads remain in the server's configured artifact store. | `attachment_cache_dir()` in `omnigent/inner/native_attachments.py` |
 | `runners/` | Runner identity: `runner_id` (stable per-machine id), created by `identity.py`. Also holds per-runner workspace subdirs — `runner_<id>/` and, for token-bound remote `run --server` runners, `runner_token_<hash>/` — each with a `pending-tokens/` dir; those are created by the host/runner launch path, not `identity.py`. | `omnigent/runner/identity.py` (`runner_id`) |
 | `daemons/` | Daemon lifecycle registry, one JSON record per target. | `daemon_registry_dir()` in `omnigent/host/daemon_lifecycle.py` |
 | `crashes/` | Crash reports, `crash-<timestamp>.md`. | `omnigent/crash_handler.py` |
@@ -90,12 +91,55 @@ clean it up:
    repair disk-space or permission problems, and restart the server. Future
    cache misses re-extract bundles from the ArtifactStore.
 
+### Attached files
+
+Claude Code and Codex accept ZIP archives, Office documents (`.docx`, `.xlsx`,
+`.pptx`), and SQLite files (`.db`, `.sqlite`, `.sqlite3`). The composer shows
+ordinary file cards with an icon, filename, type, and size; images keep their
+thumbnail and preview. There is no attachment storage selector or workspace
+badge.
+
+The server keeps the original upload in its configured artifact store and a
+session-owned file record referenced by `file_id`. The runner materializes
+files needed by native harnesses under
+`~/.omnigent/attachments/<session-key>/<filename>`, or
+`$OMNIGENT_DATA_DIR/attachments/<session-key>/<filename>` when overridden. This
+path is on the execution host, which may differ from the server or browser's
+machine. The harness receives an absolute path. Attaching a file adds no file,
+directory, or symlink to the working checkout, and archives are not extracted.
+
+The cache key derives from the session's native bridge path. Claude Code and
+Codex can recreate copies from the artifact store when rebuilding session
+history. Native session cleanup removes the corresponding cache; the cache
+is not the durable copy of an upload. Other native harnesses use the same
+cache for their existing supported attachment types.
+
+Custom sandbox and provider configurations must allow the runner to write
+this cache and the harness's file-reading tools to read the emitted absolute
+path. Permission to read the working directory, or an older bridge-local
+`uploads/` directory, does not grant access to `attachments/`. If the harness
+uses a separate filesystem namespace, expose the session cache at the same
+absolute path. Scope any added access to the required cache, rather than the
+whole data directory, which also contains credentials. Runtime capability
+checks require an updated host/runner; they do not change sandbox access.
+
+See [attachment admission controls](POLICIES.md#attachment-admission-controls)
+for filename-based limits and their scope.
+
 ### Native harness state
 
-Some native (TUI) harnesses keep resumable session state under `~/.omnigent`:
-`claude-native/`, `codex-native/`, `opencode-native/` (all via `data_dir()`),
-and `pi-native/` **†** and `antigravity-native/` **†** (pinned to
-`~/.omnigent`).
+Native TUI harnesses keep resumable session state in these roots:
+`claude-native/` and `opencode-native/` via `data_dir()`, `codex-native/`
+**†** via `bridge_root()` (pinned to `~/.omnigent`), and `pi-native/` **†**
+and `antigravity-native/` **†** (also pinned to `~/.omnigent`).
+The Codex bridge root is producer-owned and is not relocated by
+`OMNIGENT_DATA_DIR` or `OMNIGENT_CONFIG_HOME`.
+
+Each Codex-native session directory also contains a private `codex-home/` with
+its `sessions/` and `archived_sessions/` rollout JSONL. Local session import
+reads those transcript trees plus the matching home's `session_index.jsonl` and
+`state_*.sqlite` for thread metadata; it does not scan the surrounding data
+directory or read Codex credential files.
 
 Within each, session state lives in a subdirectory named by a digest of the
 conversation id (a leading `conv_` is normalized before hashing, and a legacy
@@ -116,7 +160,8 @@ data dir. See e.g. `omnigent/harnesses/qwen_native/bridge.py`.
 ## Notes
 
 - The canonical source of truth is the code, not this document. Start at
-  `data_dir()` in `omnigent/process_logging.py` and follow its callers; each
+  `data_dir()` in `omnigent/process_logging.py` and `bridge_root()` in
+  `omnigent/harnesses/codex_native/bridge.py`, then follow their callers; each
   subsystem documents its own path in a docstring.
 - An existing `~/.omnigent` may also contain files this document doesn't list:
   backups you created by hand (e.g. `chat.db.bak*`, `chat1.db`) and leftovers

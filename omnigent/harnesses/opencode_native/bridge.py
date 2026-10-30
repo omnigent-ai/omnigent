@@ -32,8 +32,12 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent.native import native_bridge_common
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
@@ -456,25 +460,26 @@ def user_opencode_auth_path() -> Path:
     return base / "opencode" / "auth.json"
 
 
-def user_opencode_config_path() -> Path | None:
+def user_opencode_config_paths() -> list[Path]:
     """
-    Return the user's real OpenCode config path (not the per-session one).
+    Return the user's real OpenCode config paths (not the per-session ones).
 
     Honors ``XDG_CONFIG_HOME`` (the runner's own env, which is the user's real
     config home — the per-session override is set only on the spawned server),
-    defaulting to ``~/.config/opencode/opencode.jsonc``.
+    defaulting to ``~/.config/opencode``.
 
-    OpenCode accepts both ``.jsonc`` (with comments) and ``.json`` extensions;
-    the ``.jsonc`` variant is checked first.
+    OpenCode deep-merges ``config.json``, ``opencode.json`` and
+    ``opencode.jsonc`` in that order (later files win), so every existing file
+    is returned in that order.
     """
     xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     base = Path(xdg) if xdg else Path.home() / ".config"
     cfg_dir = base / "opencode"
-    for name in ("opencode.jsonc", "opencode.json"):
-        path = cfg_dir / name
-        if path.is_file():
-            return path
-    return None
+    return [
+        path
+        for name in ("config.json", "opencode.json", "opencode.jsonc")
+        if (path := cfg_dir / name).is_file()
+    ]
 
 
 def seed_opencode_auth(bridge_dir: Path) -> Path | None:
@@ -742,3 +747,20 @@ def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
     normalized = model_override.strip() if isinstance(model_override, str) else None
     write_bridge_state(bridge_dir, dataclasses.replace(state, model_override=normalized or None))
     return True
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: ``opencode serve`` is bound to *session_id*.
+
+    Web turns go to the server over HTTP, which the runner records in bridge
+    state (cleared at each launch) once the server is up.
+
+    :param session_id: Omnigent conversation id currently owning the terminal.
+    :param instance: The live attach terminal; its ``XDG_DATA_HOME`` locates the
+        bridge directory (see :func:`xdg_data_home_for_bridge_dir`).
+    """
+    xdg_data_home = instance.env.get("XDG_DATA_HOME")
+    if not xdg_data_home:
+        return False
+    state = read_bridge_state(Path(xdg_data_home).parent)
+    return state is not None and state.session_id == session_id

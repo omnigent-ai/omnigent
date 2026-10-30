@@ -1,6 +1,7 @@
 import {
   type ComponentProps,
   type KeyboardEvent,
+  type ReactElement,
   type ReactNode,
   type SyntheticEvent,
   createContext,
@@ -12,7 +13,7 @@ import {
   useState,
 } from "react";
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
-import { ComposerHarnessTrigger } from "./ComposerControls";
+import { ComposerHarnessTrigger, ComposerMenuTooltip } from "./ComposerControls";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   HARNESS_MENU_CLASS_NAME,
@@ -29,8 +30,9 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { ComposerConfigSections, type ComposerConfigSection } from "./ComposerConfigSections";
 
 type TriggerProps = ComponentProps<typeof ComposerHarnessTrigger> & { "data-testid"?: string };
 const PickerInteractionContext = createContext<{
@@ -80,6 +82,8 @@ function HarnessPickerContent({
   configOpen: boolean;
   menuOpen: boolean;
   onInitialSelectionFocus?: () => void;
+  // ponytail: Radix forwards this callback but omits it from its dropdown types.
+  onOpenAutoFocus?: (event: Event) => void;
 }) {
   const interactionProps = useMenuInteractionProps(configOpen);
   const initialFocusHandled = useRef(false);
@@ -147,6 +151,25 @@ export function HarnessPickerSubContent({
   return <DropdownMenuSubContent {...props} {...interactionProps} ref={setContent} />;
 }
 
+function CyclePreview({ section, hint }: { section: ComposerConfigSection; hint?: string }) {
+  const content = useRef<HTMLDivElement>(null);
+  const selected = section.choices.find((choice) => choice.checked);
+  useEffect(() => {
+    content.current?.querySelector('[aria-checked="true"]')?.scrollIntoView?.({ block: "nearest" });
+  }, [selected?.key]);
+  return (
+    <div ref={content} data-cycle-preview className="[&_[aria-checked=true]]:bg-muted">
+      <span role="status" className="sr-only">
+        {section.header}: {selected?.label}
+      </span>
+      <ComposerConfigSections models={section} browseModels={false} />
+      {hint && (
+        <div className="whitespace-normal px-2 py-1.5 text-xs text-muted-foreground">{hint}</div>
+      )}
+    </div>
+  );
+}
+
 export function HarnessPicker({
   open,
   onOpenChange,
@@ -154,11 +177,17 @@ export function HarnessPicker({
   trigger,
   tooltip,
   tooltipTestId,
+  tooltipVariant = "default",
   contentClassName,
   contentAlign = "end",
+  contentSide = "top",
+  contentSideOffset,
   testId,
   configOpen = false,
   onInitialSelectionFocus,
+  cyclePreview,
+  cyclePreviewHint,
+  onDismissCyclePreview,
   children,
 }: {
   open: boolean;
@@ -167,14 +196,24 @@ export function HarnessPicker({
   trigger: TriggerProps;
   tooltip?: ReactNode;
   tooltipTestId?: string;
+  tooltipVariant?: "default" | "session-info";
   contentClassName?: string;
   contentAlign?: "start" | "center" | "end";
+  contentSide?: "top" | "bottom";
+  contentSideOffset?: number;
   testId?: string;
   configOpen?: boolean;
   onInitialSelectionFocus?: () => void;
+  cyclePreview?: ComposerConfigSection;
+  cyclePreviewHint?: string;
+  onDismissCyclePreview?: () => void;
   children: ReactNode;
 }) {
-  const guardedTooltip = useMenuGuardedTooltip(open);
+  const previewOnly = cyclePreview !== undefined && !open;
+  const menuOpen = open || previewOnly;
+  const previewFocus = useRef<HTMLElement | null>(null);
+  const previewActive = useRef(previewOnly);
+  previewActive.current = previewOnly;
   // Programmatic focus can retain :focus-visible during pointer-only interaction.
   const [pointerInteraction, setPointerInteraction] = useState(false);
   const [hasMenuInteraction, setHasMenuInteraction] = useState(false);
@@ -200,9 +239,12 @@ export function HarnessPicker({
         setPointerInteraction(false);
         setHasMenuInteraction(true);
       },
-      closeMenu: () => onOpenChange(false),
+      closeMenu: () => {
+        onDismissCyclePreview?.();
+        onOpenChange(false);
+      },
     }),
-    [open, pointerInteraction, hasMenuInteraction, onOpenChange],
+    [open, pointerInteraction, hasMenuInteraction, onOpenChange, onDismissCyclePreview],
   );
   const menuTrigger = (
     <DropdownMenuTrigger asChild>
@@ -213,6 +255,11 @@ export function HarnessPicker({
         onPointerDownCapture={(event) => {
           setPointerInteraction(true);
           trigger.onPointerDownCapture?.(event);
+          if (previewOnly && !trigger.disabled && event.button === 0 && !event.ctrlKey) {
+            event.preventDefault();
+            onDismissCyclePreview?.();
+            onOpenChange(true);
+          }
         }}
         onPointerMoveCapture={(event) => {
           if (open) setPointerInteraction(true);
@@ -221,6 +268,11 @@ export function HarnessPicker({
         onKeyDownCapture={(event) => {
           setPointerInteraction(false);
           trigger.onKeyDownCapture?.(event);
+          if (previewOnly && !trigger.disabled && ["Enter", " ", "ArrowDown"].includes(event.key)) {
+            event.preventDefault();
+            onDismissCyclePreview?.();
+            onOpenChange(true);
+          }
         }}
         onBlur={(event) => {
           if (!open) setPointerInteraction(false);
@@ -232,48 +284,68 @@ export function HarnessPicker({
   return (
     <PickerInteractionContext.Provider value={interaction}>
       <DropdownMenu
-        open={open}
+        open={menuOpen}
         onOpenChange={(next) => {
+          onDismissCyclePreview?.();
           if (!next || !trigger.disabled) {
             if (next) setHasMenuInteraction(false);
             onOpenChange(next);
           }
         }}
-        modal={modal}
+        modal={previewOnly ? false : modal}
       >
         {tooltip == null ? (
           menuTrigger
         ) : (
-          <TooltipProvider>
-            <Tooltip open={guardedTooltip.open} onOpenChange={guardedTooltip.onOpenChange}>
-              <TooltipTrigger asChild>
-                <span className="flex min-w-0" {...guardedTooltip.triggerProps}>
-                  {menuTrigger}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent
-                side="top"
-                className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
-                data-testid={tooltipTestId}
-              >
-                {tooltip}
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+          <ComposerMenuTooltip
+            menuOpen={menuOpen}
+            content={tooltip}
+            variant={tooltipVariant}
+            testId={tooltipTestId}
+          >
+            {menuTrigger}
+          </ComposerMenuTooltip>
         )}
         <HarnessPickerContent
+          key={previewOnly ? "preview" : "menu"}
           configOpen={configOpen}
-          menuOpen={open}
-          side="top"
+          menuOpen={menuOpen}
+          side={contentSide}
+          sideOffset={contentSideOffset}
           align={contentAlign}
           collisionPadding={12}
           avoidCollisions
           className={cn(HARNESS_MENU_CLASS_NAME, COMPOSER_HARNESS_MENU_SIZE, contentClassName)}
           data-testid={testId}
           onPointerDownOutside={interaction.onPointerInteraction}
-          onInitialSelectionFocus={onInitialSelectionFocus}
+          onInitialSelectionFocus={previewOnly ? undefined : onInitialSelectionFocus}
+          onOpenAutoFocus={(event) => {
+            if (!previewOnly) return;
+            previewFocus.current =
+              document.activeElement instanceof HTMLElement ? document.activeElement : null;
+            event.preventDefault();
+          }}
+          onCloseAutoFocus={(event) => {
+            // A previous menu's delayed cleanup must not steal preview focus.
+            if (!previewOnly) {
+              if (previewActive.current) event.preventDefault();
+              return;
+            }
+            event.preventDefault();
+            if (
+              document.activeElement === document.body ||
+              document.activeElement?.closest("[data-cycle-preview]")
+            )
+              previewFocus.current?.focus();
+          }}
+          onEscapeKeyDown={(event) => {
+            if (!previewOnly) return;
+            event.preventDefault();
+            event.stopPropagation();
+            onDismissCyclePreview?.();
+          }}
         >
-          {children}
+          {previewOnly ? <CyclePreview section={cyclePreview} hint={cyclePreviewHint} /> : children}
         </HarnessPickerContent>
       </DropdownMenu>
     </PickerInteractionContext.Provider>
@@ -288,6 +360,8 @@ export function HarnessPickerEntry({
   editable = true,
   isMobile = false,
   disabled,
+  tooltip,
+  tooltipTestId,
   testId,
   configTestId,
   editTestId,
@@ -302,6 +376,8 @@ export function HarnessPickerEntry({
   editable?: boolean;
   isMobile?: boolean;
   disabled?: boolean;
+  tooltip?: ReactNode;
+  tooltipTestId?: string;
   testId?: string;
   configTestId?: string;
   editTestId?: string;
@@ -318,15 +394,18 @@ export function HarnessPickerEntry({
   const isEditTarget = (target: EventTarget) =>
     target instanceof Element && target.closest("[data-harness-edit]") !== null;
   const rowProps = {
-    className: "composer-agent-select min-w-0 flex-1 [&>svg]:hidden",
+    className: cn(
+      "composer-agent-select min-w-0 flex-1 [&>svg]:hidden",
+      disabled && "cursor-not-allowed opacity-60",
+    ),
     "data-testid": testId,
     "data-active": row.active ? "true" : undefined,
     "aria-label": row.label,
+    "aria-disabled": disabled || undefined,
     "aria-description": editable
       ? "Enter to select; Right Arrow to edit configuration."
       : undefined,
     textValue: row.label,
-    disabled,
   };
   const content = (
     <>
@@ -342,7 +421,7 @@ export function HarnessPickerEntry({
           aria-hidden="true"
           className={cn(
             "composer-agent-edit flex h-8 shrink-0 cursor-pointer items-center text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline",
-            showDetails || isMobile
+            row.active || showDetails || isMobile
               ? "opacity-100"
               : cn(
                   "opacity-0",
@@ -357,6 +436,22 @@ export function HarnessPickerEntry({
       )}
     </>
   );
+  const withTooltip = (trigger: ReactElement) =>
+    disabled && tooltip != null ? (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="flex min-w-0 flex-1">{trigger}</span>
+        </TooltipTrigger>
+        <TooltipContent
+          className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+          data-testid={tooltipTestId}
+        >
+          <span className="text-xs leading-5 text-popover-foreground">{tooltip}</span>
+        </TooltipContent>
+      </Tooltip>
+    ) : (
+      trigger
+    );
   return (
     <div
       className={HARNESS_MENU_ROW_CLASS_NAME}
@@ -373,43 +468,46 @@ export function HarnessPickerEntry({
             allowConfigOpen.current = false;
           }}
         >
-          <DropdownMenuSubTrigger
-            {...rowProps}
-            onPointerMove={() => {
-              allowConfigOpen.current = false;
-            }}
-            onClick={(event) => {
-              if (disabled) {
-                event.preventDefault();
-              } else if (isEditTarget(event.target)) {
-                if (open) {
+          {withTooltip(
+            <DropdownMenuSubTrigger
+              {...rowProps}
+              onPointerMove={() => {
+                allowConfigOpen.current = false;
+              }}
+              onClick={(event) => {
+                if (disabled) {
                   event.preventDefault();
-                  onOpenChange(false);
+                } else if (isEditTarget(event.target)) {
+                  if (open) {
+                    event.preventDefault();
+                    onOpenChange(false);
+                  } else {
+                    allowConfigOpen.current = true;
+                  }
                 } else {
-                  allowConfigOpen.current = true;
+                  event.preventDefault();
+                  selectAndClose();
                 }
-              } else {
-                event.preventDefault();
-                selectAndClose();
-              }
-            }}
-            onKeyDown={(event) => {
-              if (event.target !== event.currentTarget) return;
-              if (disabled) event.preventDefault();
-              else if (event.key === "Enter" || event.key === " ") {
-                event.preventDefault();
-                selectAndClose();
-              } else if (event.key === "ArrowRight") {
-                allowConfigOpen.current = !open;
-              }
-            }}
-          >
-            {content}
-          </DropdownMenuSubTrigger>
+              }}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) return;
+                if (disabled) event.preventDefault();
+                else if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  selectAndClose();
+                } else if (event.key === "ArrowRight") {
+                  allowConfigOpen.current = !open;
+                }
+              }}
+            >
+              {content}
+            </DropdownMenuSubTrigger>,
+          )}
           <HarnessPickerSubContent
             focusSelected={focusConfig}
             onSelectedFocus={onConfigFocused}
-            className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+            className="composer-agent-menu composer-agent-config-menu max-h-[min(clamp(20rem,40vh,36rem),var(--radix-dropdown-menu-content-available-height))] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+            sideOffset={-4}
             data-testid={configTestId}
             onFocusOutside={(event) => {
               if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
@@ -420,29 +518,36 @@ export function HarnessPickerEntry({
           </HarnessPickerSubContent>
         </DropdownMenuSub>
       ) : (
-        <DropdownMenuItem
-          {...rowProps}
-          onSelect={() => onSelect?.()}
-          onClick={(event) => {
-            if (editable && !disabled && isEditTarget(event.target)) {
-              event.preventDefault();
-              onOpenChange(true);
-            }
-          }}
-          onKeyDown={(event) => {
-            if (
-              editable &&
-              !disabled &&
-              event.target === event.currentTarget &&
-              event.key === "ArrowRight"
-            ) {
-              event.preventDefault();
-              onOpenChange(true);
-            }
-          }}
-        >
-          {content}
-        </DropdownMenuItem>
+        withTooltip(
+          <DropdownMenuItem
+            {...rowProps}
+            onSelect={(event) => {
+              if (disabled) event.preventDefault();
+              else onSelect?.();
+            }}
+            onClick={(event) => {
+              if (disabled) {
+                event.preventDefault();
+              } else if (editable && isEditTarget(event.target)) {
+                event.preventDefault();
+                onOpenChange(true);
+              }
+            }}
+            onKeyDown={(event) => {
+              if (
+                editable &&
+                !disabled &&
+                event.target === event.currentTarget &&
+                event.key === "ArrowRight"
+              ) {
+                event.preventDefault();
+                onOpenChange(true);
+              }
+            }}
+          >
+            {content}
+          </DropdownMenuItem>,
+        )
       )}
     </div>
   );
@@ -519,7 +624,8 @@ export function HarnessPickerConfigRow({
         {content}
       </DropdownMenuSubTrigger>
       <HarnessPickerSubContent
-        className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+        className="composer-agent-menu composer-agent-config-menu max-h-[min(clamp(20rem,40vh,36rem),var(--radix-dropdown-menu-content-available-height))] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+        sideOffset={-4}
         data-testid={configTestId}
         onFocusOutside={(event) => {
           if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
@@ -559,32 +665,4 @@ export function HarnessPickerConfigPage({
       <div data-testid={testId}>{children}</div>
     </div>
   );
-}
-
-const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
-
-function useMenuGuardedTooltip(menuOpen: boolean) {
-  const [wantsOpen, setWantsOpen] = useState(false);
-  // Epoch millis until which open requests are ignored; Infinity while the
-  // menu is open. A ref, not state: it is only read when Radix requests an
-  // open, so changing it never needs a re-render.
-  const suppressedUntil = useRef(0);
-  useEffect(() => {
-    if (menuOpen) {
-      setWantsOpen(false);
-      suppressedUntil.current = Number.POSITIVE_INFINITY;
-    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
-      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
-    }
-  }, [menuOpen]);
-  return {
-    open: wantsOpen && !menuOpen,
-    onOpenChange: (next: boolean) =>
-      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
-    triggerProps: {
-      onPointerEnter: () => {
-        if (!menuOpen) suppressedUntil.current = 0;
-      },
-    },
-  } as const;
 }

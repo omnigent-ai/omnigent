@@ -76,8 +76,11 @@ from typing import Any
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
+    UnsupportedShellSyntax,
+    is_shell_interpreter,
     is_unresolved_invocation,
     real_invocation_tokens,
+    spawns_gated_command_as_child,
     split_command_segments,
     unwrap_shell_command,
 )
@@ -553,6 +556,63 @@ def _classify_mcp_tool(canonical: str, use_verb_heuristic: bool) -> str:
 _GIT_READ_SUBCMDS: frozenset[str] = frozenset({"clone", "fetch", "pull", "ls-remote"})
 _GIT_WRITE_SUBCMDS: frozenset[str] = frozenset({"push"})
 
+# Global options may consume an operand before the subcommand.
+_GIT_GLOBAL_VALUE_OPTS: frozenset[str] = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source"}
+)
+_GIT_GLOBAL_FLAG_OPTS: frozenset[str] = frozenset(
+    {
+        "-v",
+        "--version",
+        "-h",
+        "--help",
+        "-p",
+        "--paginate",
+        "-P",
+        "--no-pager",
+        "--html-path",
+        "--man-path",
+        "--info-path",
+        "--bare",
+        "--no-replace-objects",
+        "--no-lazy-fetch",
+        "--no-optional-locks",
+        "--no-advice",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+    }
+)
+
+
+def _git_subcommand_index(tokens: list[str]) -> int | None:
+    """Find the subcommand, rejecting incomplete or unsupported global options."""
+    i = 1
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--exec-path":
+            # Without an attached value, Git prints its exec path and exits.
+            return None
+        if token in _GIT_GLOBAL_VALUE_OPTS:
+            if i + 1 == len(tokens):
+                raise ValueError("Missing Git global option value")
+            i += 2
+            continue
+        option, separator, _ = token.partition("=")
+        if (
+            token in _GIT_GLOBAL_FLAG_OPTS
+            or (separator and (option in _GIT_GLOBAL_VALUE_OPTS or option == "--exec-path"))
+            or (token.startswith(("-C", "-c")) and len(token) > 2)
+        ):
+            i += 1
+            continue
+        if token.startswith("-"):
+            raise ValueError("Unsupported Git global option")
+        return i
+    return None
+
+
 # gh top-level command groups → the set of actions under each that write.
 # Any action NOT listed here (and not an unknown group) is treated as a read.
 _GH_WRITE_ACTIONS: dict[str, frozenset[str]] = {
@@ -659,8 +719,8 @@ class _ShellOp:
     One git / gh remote operation parsed from a shell command segment.
 
     :param kind: Access kind — ``"read"``, ``"write"``, ``"ignore"`` (local /
-        non-repo command, no gating), or ``"unparseable"`` (a git/gh write we
-        could not tokenize — fail to ASK).
+        non-repo command, no gating), or ``"unparseable"`` (a git/gh command
+        that requires approval because its invocation could not be classified).
     :param repo: Normalized ``owner/repo`` target, or ``None`` when the command
         relied on a local remote alias / cwd remote we cannot resolve.
     :param branches: Branch names the write targets (empty when none could be
@@ -729,14 +789,26 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
     Classify a ``git`` invocation into a remote :class:`_ShellOp`.
 
     :param tokens: Tokens starting at ``git``, e.g. ``["git", "push", "origin", "main"]``.
-    :returns: A :class:`_ShellOp` for remote read/write subcommands, or ``None``
-        for local-only git commands (status / commit / diff / branch / …),
-        which are never gated.
+    :returns: A :class:`_ShellOp` for remote read/write subcommands or an
+        unparseable invocation; ``None`` for local-only commands with
+        recognized global options (status / commit / diff / branch / …).
     """
     if len(tokens) < 2:
         return None
-    sub = tokens[1]
-    args = tokens[2:]
+    try:
+        idx = _git_subcommand_index(tokens)
+    except ValueError:
+        return _ShellOp(
+            kind="unparseable",
+            repo=None,
+            branches=frozenset(),
+            branch_targeted=False,
+            detail="incomplete or unsupported Git global options",
+        )
+    if idx is None:
+        return None
+    sub = tokens[idx]
+    args = tokens[idx + 1 :]
     if sub in _GIT_READ_SUBCMDS:
         return _ShellOp(
             kind="read",
@@ -888,9 +960,30 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
         an ``"unparseable"`` op so the caller can ASK rather than silently allow.
     """
     if _depth > MAX_SHELL_NESTING:
-        return []
+        return [
+            _ShellOp(
+                kind="unparseable",
+                repo=None,
+                branches=frozenset(),
+                branch_targeted=False,
+                detail="shell command exceeds the nesting limit",
+            )
+        ]
     ops: list[_ShellOp] = []
-    for segment in split_command_segments(command):
+    try:
+        segments = split_command_segments(command)
+    except UnsupportedShellSyntax as exc:
+        segments = exc.completed_segments
+        ops.append(
+            _ShellOp(
+                kind="unparseable",
+                repo=None,
+                branches=frozenset(),
+                branch_targeted=False,
+                detail=str(exc),
+            )
+        )
+    for segment in segments:
         unreadable = False
         try:
             tokens = shlex.split(segment)
@@ -903,8 +996,11 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
             tokens = real_invocation_tokens(tokens)
             # A leading option means some wrapper's own flags were not modelled,
             # so the real command was never reached. Same fail-safe as an
-            # un-tokenizable segment rather than a silent abstain.
-            unreadable = is_unresolved_invocation(tokens)
+            # un-tokenizable segment rather than a silent abstain. A
+            # process-spawning utility (find -exec, xargs, perl -e, python -c,
+            # awk, make) likewise runs the gated command as a child whose argv is
+            # not modelled here, so route it through the same fail-safe.
+            unreadable = is_unresolved_invocation(tokens) or spawns_gated_command_as_child(tokens)
         if unreadable:
             if re.search(r"\b(git|gh)\b", segment):
                 ops.append(
@@ -924,6 +1020,23 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
         inner = unwrap_shell_command(tokens)
         if inner is not None:
             ops.extend(_classify_shell_command(inner, _depth + 1))
+            continue
+        # A shell interpreter with no ``-c`` reads its program from stdin or a
+        # script file (``printf '…' | sh``, ``sh script.sh``), which this parser
+        # cannot see. The gated git/gh could be in that opaque program — for
+        # ``… | sh`` the payload is even in a different segment — so its absence
+        # from this segment's tokens is not safe evidence. Surface it for
+        # approval rather than abstain → ALLOW.
+        if is_shell_interpreter(tokens):
+            ops.append(
+                _ShellOp(
+                    kind="unparseable",
+                    repo=None,
+                    branches=frozenset(),
+                    branch_targeted=False,
+                    detail=segment[:60],
+                )
+            )
             continue
         if tokens[0] == "git":
             op = _classify_git(tokens)

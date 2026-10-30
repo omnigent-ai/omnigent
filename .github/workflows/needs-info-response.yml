@@ -14,10 +14,16 @@ concurrency:
 
 jobs:
   retriage:
+    # A called workflow cannot exceed this grant; it mirrors priority onto PRs.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     if: >-
       !endsWith(github.event.sender.login, '[bot]') &&
       !github.event.issue.pull_request &&
       github.event.comment.user.login == github.event.issue.user.login &&
+      !startsWith(github.event.comment.body, '<!-- omnigent-issue-prioritization-v2 ') &&
       contains(github.event.issue.labels.*.name, 'needs-info')
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:

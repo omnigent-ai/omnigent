@@ -24,6 +24,7 @@ afterEach(() => {
 function PickerFixture({
   mobile = false,
   disabled = false,
+  tooltipVariant = "default",
   nested = false,
   active = true,
   modal,
@@ -31,6 +32,7 @@ function PickerFixture({
   modal?: boolean;
   mobile?: boolean;
   disabled?: boolean;
+  tooltipVariant?: "default" | "session-info";
   nested?: boolean;
   active?: boolean;
 }) {
@@ -68,6 +70,7 @@ function PickerFixture({
       trigger={{ label: "Harness", model: "Opus 4.8 (1M)", disabled }}
       tooltip="Current harness configuration"
       tooltipTestId="tooltip"
+      tooltipVariant={tooltipVariant}
       testId="menu"
       configOpen={configOpen}
     >
@@ -121,6 +124,88 @@ function GraceAreaPicker() {
 }
 
 describe("HarnessPicker", () => {
+  it.each(["click", "Enter", " ", "ArrowDown"])(
+    "opens the full picker directly from a cycle preview with %s",
+    async (gesture) => {
+      function PreviewPicker() {
+        const [open, setOpen] = useState(false);
+        const [preview, setPreview] = useState(true);
+        return (
+          <HarnessPicker
+            open={open}
+            onOpenChange={setOpen}
+            trigger={{ label: "Harness", model: "Opus" }}
+            onDismissCyclePreview={() => setPreview(false)}
+            cyclePreview={
+              preview
+                ? {
+                    testId: "preview-models",
+                    header: "Models",
+                    choices: [{ key: "opus", label: "Opus", checked: true }],
+                  }
+                : undefined
+            }
+          >
+            <DropdownMenuItem data-active="true">Full configuration</DropdownMenuItem>
+          </HarnessPicker>
+        );
+      }
+      render(<PreviewPicker />);
+      const trigger = screen.getByRole("button", { name: "Harness" });
+      if (gesture === "click") fireEvent.pointerDown(trigger, { button: 0 });
+      else fireEvent.keyDown(trigger, { key: gesture });
+      await waitFor(() => expect(screen.getByText("Full configuration")).toHaveFocus());
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Opus" })).toBeNull();
+    },
+  );
+
+  it.each(["preview choice", "outside input", "full menu"])(
+    "preserves the intended focus when leaving a cycle preview for %s",
+    async (destination) => {
+      const picker = (mode: "closed" | "preview" | "menu") => (
+        <>
+          <input aria-label="Draft" />
+          <input aria-label="Other input" />
+          <HarnessPicker
+            open={mode === "menu"}
+            onOpenChange={vi.fn()}
+            trigger={{ label: "Harness", model: "Opus" }}
+            cyclePreview={
+              mode === "preview"
+                ? {
+                    testId: "preview-models",
+                    header: "Models",
+                    choices: [{ key: "opus", label: "Opus", checked: true, onSelect: vi.fn() }],
+                  }
+                : undefined
+            }
+          >
+            <DropdownMenuItem data-active="true">Full configuration</DropdownMenuItem>
+          </HarnessPicker>
+        </>
+      );
+      const { rerender } = render(picker("closed"));
+      const draft = screen.getByRole("textbox", { name: "Draft" });
+      act(() => draft.focus());
+      rerender(picker("preview"));
+      const choice = await screen.findByRole("menuitemcheckbox", { name: "Opus" });
+      expect(draft).toHaveFocus();
+
+      if (destination === "full menu") {
+        rerender(picker("menu"));
+        await waitFor(() => expect(screen.getByText("Full configuration")).toHaveFocus());
+      } else {
+        const outside = screen.getByRole("textbox", { name: "Other input" });
+        act(() => (destination === "preview choice" ? choice : outside).focus());
+        rerender(picker("closed"));
+        await waitFor(() =>
+          expect(destination === "preview choice" ? draft : outside).toHaveFocus(),
+        );
+        expect(screen.queryByRole("menu")).toBeNull();
+      }
+    },
+  );
+
   it.each(["right", "left"])(
     "keeps a %s submenu open while crossing a harness row toward its lower items",
     (side) => {
@@ -129,6 +214,7 @@ describe("HarnessPicker", () => {
       const other = screen.getByTestId("other");
       fireEvent.click(other);
       const submenu = screen.getByTestId("other-menu");
+      expect(submenu).toHaveClass("menu-surface");
       // Mirror the diagonal path for flyouts flipped by viewport collisions.
       vi.spyOn(submenu, "getBoundingClientRect").mockReturnValue(
         new DOMRect(side === "right" ? 200 : 0, 0, 100, 300),
@@ -183,11 +269,18 @@ describe("HarnessPicker", () => {
   it.each([false, true])("shares row geometry and config navigation on mobile=%s", (mobile) => {
     render(<PickerFixture mobile={mobile} />);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
-    expect(screen.getByTestId("menu")).toHaveClass("w-max", "min-w-[17.5rem]", "p-2");
+    expect(screen.getByTestId("menu")).toHaveClass(
+      "menu-surface",
+      "w-[17.5rem]",
+      "min-w-[17.5rem]",
+      "p-2",
+    );
     expect(screen.getByTestId("entry").closest("[data-harness-menu-row]")).toHaveClass("min-h-8");
     expect(screen.getByTestId("entry")).toHaveAttribute("data-active", "true");
     expect(screen.getByTestId("model")).toHaveClass("text-right");
     expect(screen.getByTestId("edit")).toHaveTextContent("Edit");
+    expect(screen.getByTestId("edit")).toHaveClass("opacity-100");
+    expect(screen.getByTestId("edit")).toHaveClass("hover:underline");
     expect(screen.queryByTestId("tooltip")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("edit"));
     expect(screen.getByText("Model configuration")).toBeInTheDocument();
@@ -354,6 +447,20 @@ describe("HarnessPicker", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
     expect(screen.queryByTestId("menu")).not.toBeInTheDocument();
   });
+
+  it("can use the light session-info tooltip surface without changing tooltip defaults", async () => {
+    render(<PickerFixture tooltipVariant="session-info" />);
+    fireEvent.focus(screen.getByRole("button", { name: "Harness" }));
+    expect(await screen.findByTestId("tooltip")).toHaveClass(
+      "w-64",
+      "rounded-lg",
+      "bg-popover",
+      "p-2.5",
+      "text-popover-foreground",
+      "shadow-menu",
+      "ring-1",
+    );
+  });
 });
 
 describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
@@ -363,6 +470,13 @@ describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
     fireEvent.click(screen.getByTestId("edit"));
     expect(screen.getByText("Model configuration")).toBeInTheDocument();
   }
+
+  it("keeps the config flyout closed when the row is clicked", () => {
+    render(<PickerFixture />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+    fireEvent.click(screen.getByTestId("entry"));
+    expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
+  });
 
   it("closes the config flyout on a second click of Edit (pointer toggle)", () => {
     openConfig();

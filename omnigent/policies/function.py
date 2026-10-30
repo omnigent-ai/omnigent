@@ -21,10 +21,7 @@ policy attachment time (the ``config:`` block in the YAML spec).
 
 The callable must return a dict shaped::
 
-    {
-        "result": "ALLOW" | "DENY" | "ASK",
-        "reason": "human-readable string or null"
-    }
+    {"result": "ALLOW" | "DENY" | "ASK", "reason": "human-readable string or null"}
 
 Two YAML shapes parse into a :class:`FunctionRef`:
 
@@ -45,6 +42,8 @@ from collections.abc import Awaitable, Callable
 from typing import Protocol, cast
 
 from omnigent.policies.base import Policy
+from omnigent.policies.builtins.orchestration import spawn_bounds
+from omnigent.policies.builtins.safety import detect_loop, max_tool_calls_per_session
 from omnigent.policies.schema import PolicyEvent
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
@@ -95,6 +94,8 @@ class FunctionPolicy(Policy):
         self,
         spec: FunctionPolicySpec,
         callable_obj: object,
+        *,
+        runtime_state_keys: frozenset[str] = frozenset(),
     ) -> None:
         """
         Wrap a resolved callable in the Policy contract.
@@ -104,6 +105,7 @@ class FunctionPolicy(Policy):
             unwrapped from any factory).
         """
         self.spec = spec
+        self.runtime_state_keys = runtime_state_keys
         self._callable = cast(_DynamicCallable, callable_obj)
         self._is_async = inspect.iscoroutinefunction(self._callable)
         self._arity = _callable_arity(callable_obj)
@@ -223,7 +225,9 @@ def _build_event(ctx: EvaluationContext) -> PolicyEvent:
             # ({"cost_usd", "ask_approved_usd"}), injected by the engine
             # only when the per-user daily cost-budget policy is present;
             # empty dict otherwise (that policy treats it as $0 → never trips).
-            "user_daily_cost": dict(ctx.user_daily_cost) if ctx.user_daily_cost else {},
+            "user_daily_cost": [dict(r) for r in ctx.user_daily_cost]
+            if ctx.user_daily_cost
+            else [],
             # The session's current model (model_override or spec llm.model),
             # injected by the engine. ``None`` when undeterminable — cost
             # policies treat that as "cannot confirm a cheaper model".
@@ -238,6 +242,15 @@ def _build_event(ctx: EvaluationContext) -> PolicyEvent:
             # descendants only), injected by the engine only when a
             # subagent_cost_budget policy is present; empty dict otherwise.
             "subtree_usage": dict(ctx.subtree_usage) if ctx.subtree_usage else {},
+            # The conversation this event belongs to, injected by
+            # the engine.
+            "conversation_id": ctx.conversation_id,
+            # The conversation's readable title. None when untitled.
+            "conversation_title": ctx.conversation_title,
+            # RESPONSE phase only: whether this text ends a successful
+            # turn. None on other phases and on callers
+            # that don't distinguish segments.
+            "turn_final": ctx.turn_final,
         },
         # Mutable per-conversation state readable by the callable.
         # Empty dict when no policy has written state yet; the engine
@@ -314,7 +327,19 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
 
     if _has_legacy_signature(callable_obj):
         callable_obj = _wrap_legacy(callable_obj)
-    return FunctionPolicy(spec, callable_obj)
+    # Only the resolved builtin callable can grant counter-write authority;
+    # policy names and factory arguments cannot grant it.
+
+    runtime_state_keys = frozenset(
+        key
+        for factory, key in (
+            (spawn_bounds, "_policy_spawn_bounds_dispatches"),
+            (max_tool_calls_per_session, "_policy_tool_call_count"),
+            (detect_loop, "_policy_loop_recent_hashes"),
+        )
+        if target is factory
+    )
+    return FunctionPolicy(spec, callable_obj, runtime_state_keys=runtime_state_keys)
 
 
 def _resolve_dotted_path(path: str) -> object:
@@ -546,8 +571,13 @@ def _policy_result_from_dict(
 
     Accepts the flat shape::
 
-        {"result": "ALLOW"|"DENY"|"ASK", "reason": "...",
-         "data": ..., "state_updates": [...], "set_labels": {...}}
+        {
+            "result": "ALLOW" | "DENY" | "ASK",
+            "reason": "...",
+            "data": ...,
+            "state_updates": [...],
+            "set_labels": {...},
+        }
 
     :param raw: The callable's dict return.
     :param spec_name: Policy name for error messages.
@@ -614,12 +644,16 @@ def _coerce_state_updates(
     if raw is None:
         return None
     if isinstance(raw, dict):
+        if any(not isinstance(key, str) for key in raw):
+            raise TypeError(f"FunctionPolicy {spec_name!r}: state keys must be strings")
         # Legacy compat: {"call_count": 5} → [SET("call_count", 5)]
         return [StateUpdate(key=k, action=StateUpdateAction.SET, value=v) for k, v in raw.items()]
     if isinstance(raw, list):
         result: list[StateUpdate] = []
         for entry in raw:
             if isinstance(entry, StateUpdate):
+                if not isinstance(entry.key, str):
+                    raise TypeError(f"FunctionPolicy {spec_name!r}: state keys must be strings")
                 result.append(entry)
                 continue
             if not isinstance(entry, dict):
@@ -634,6 +668,8 @@ def _coerce_state_updates(
                     f"FunctionPolicy {spec_name!r}: state_updates entry "
                     f"missing required 'key' or 'action' field",
                 )
+            if not isinstance(key, str):
+                raise TypeError(f"FunctionPolicy {spec_name!r}: state keys must be strings")
             try:
                 action = StateUpdateAction(str(action_raw).lower())
             except ValueError as exc:

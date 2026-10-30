@@ -2,10 +2,11 @@
 Unit + integration tests for :mod:`omnigent.terminals.control_bridge`.
 
 Covers the pure helpers (``unescape_control_output`` octal round-trip,
-``_hex_send_keys_commands`` chunking) and an end-to-end drive of
+``_WindowNameFilter`` escape stripping, ``_hex_send_keys_commands`` chunking)
+and an end-to-end drive of
 ``bridge_tmux_control_to_websocket`` against a real private tmux server via a
-fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input,
-and the detach close code.
+fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input
+without window-name escapes, and the detach close code.
 """
 
 from __future__ import annotations
@@ -15,22 +16,31 @@ import base64
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from fastapi import WebSocketDisconnect
 
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.terminal import create_terminal_instance
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
     _hex_send_keys_commands,
     _read_tmux_buffer,
+    _run_tmux_capture,
+    _WindowNameFilter,
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
+from omnigent.terminals.query_replies import tmux_answered_queries
+from tests._helpers.polling import poll_until_async
 
 _HAS_TMUX = shutil.which("tmux") is not None
 
@@ -63,6 +73,39 @@ def test_unescape_control_output_round_trips_control_bytes() -> None:
     assert unescape_control_output(rb"a\134b") == b"a\\b"
     # Printable bytes pass through untouched.
     assert unescape_control_output(b"plain text 123") == b"plain text 123"
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected"),
+    [
+        # oh-my-zsh names the window after each command it runs.
+        (b"\x1bkecho\x1b\\tmux-256color\r\n", b"\x1b\\tmux-256color\r\n"),
+        # Other escapes, OSC strings, and UTF-8 text pass through unchanged.
+        (
+            "\x1b[31mré\x1b[0m\x1b]7;file://host/tmp\x1b\\\x1b(B".encode(),
+            "\x1b[31mré\x1b[0m\x1b]7;file://host/tmp\x1b\\\x1b(B".encode(),
+        ),
+        # A name ended by another escape keeps that escape.
+        (b"\x1bkname\x1b[0mtext", b"\x1b\\\x1b[0mtext"),
+        # CAN and SUB end a name and are dropped with it.
+        (b"\x1bkone\x18a\x1bktwo\x1ab", b"\x1b\\a\x1b\\b"),
+        # An OSC that the name's ESC ended still ends there.
+        (b"\x1b]0;T\x1bkname\x1b\\text", b"\x1b]0;T\x1b\\text"),
+        # At the end of the stream, a held ESC and an owed ST are flushed,
+        # and an unterminated name stays dropped.
+        (b"text\x1b", b"text\x1b"),
+        (b"\x1bkname\x1b", b"\x1b\\"),
+        (b"text\x1bkname", b"text"),
+    ],
+)
+def test_window_name_filter_drops_window_names(stream: bytes, expected: bytes) -> None:
+    """Window names are dropped whole, however tmux splits the stream."""
+    whole_filter = _WindowNameFilter()
+    assert whole_filter.feed(stream) + whole_filter.finish() == expected
+    # tmux can end an %output line anywhere, including mid-sequence.
+    byte_filter = _WindowNameFilter()
+    by_byte = b"".join(byte_filter.feed(stream[i : i + 1]) for i in range(len(stream)))
+    assert by_byte + byte_filter.finish() == expected
 
 
 def test_clipboard_buffer_name_accepts_only_safe_notifications() -> None:
@@ -152,6 +195,15 @@ class _FakeWebSocket:
             await asyncio.sleep(self._send_delay_s)
         self.sent_text.append(data)
 
+    @property
+    def clipboard_messages(self) -> list[str]:
+        """Clipboard frames, skipping the list of tmux-answered queries sent first."""
+        return [
+            message
+            for message in self.sent_text
+            if json.loads(message).get("type") == "clipboard-write"
+        ]
+
     async def receive(self) -> dict[str, object]:
         if self._inbound:
             return self._inbound.pop(0)
@@ -214,6 +266,20 @@ async def _kill_tmux(sock: Path) -> None:
         )
         await proc.communicate()
     shutil.rmtree(sock.parent, ignore_errors=True)
+
+
+async def _capture_when(
+    sock: Path, target: str, ready: Callable[[bytes], bool], timeout_s: float = 15
+) -> bytes:
+    """Capture the pane until *ready* accepts it; the shell writes on its own schedule."""
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    seed = b""
+    async with asyncio.timeout(timeout_s):
+        while not ready(seed):
+            await asyncio.sleep(0.05)
+            seed = await _run_tmux_capture(str(sock), target) or b""
+    return seed
 
 
 async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
@@ -417,7 +483,9 @@ async def test_control_bridge_coalesces_burst_when_send_lags() -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
-async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
+async def test_control_bridge_burst_then_exit_delivers_full_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A burst-then-exit program's tail isn't dropped when %exit races the drain.
 
     The reader and forwarder are separate tasks; shutdown keys on the reader.
@@ -425,28 +493,53 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
     build output), ``%exit`` arrives while the slow browser send is still
     draining the queued backlog. The bridge must let the forwarder finish
     draining the sentinel-terminated queue before teardown, or the tail is
-    silently lost. Emit the burst then exit (no trailing sleep) behind a slow
-    send and assert the FULL payload still reaches the browser.
+    silently lost. Hold browser sends until the reader ends and assert the
+    FULL payload still reaches the browser.
     """
-    # The backlog must be too big to fully drain before the reader hits %exit,
-    # or the forwarder finishes on its own and the race never triggers. 2 MB
-    # behind a 5 ms/frame send leaves a large queued tail at %exit time — the
-    # pre-fix code (cancel forwarder on reader-done) drops ~35% of it.
     payload_len = 2_000_000
-    sock, target = await _new_private_tmux(
-        # Sleep first so the control client attaches BEFORE the burst — the
-        # payload then arrives as live %output. Then burst and exit immediately
-        # (no trailing sleep) so %exit races the still-draining slow send: the
-        # regression window. (A burst emitted before attach is gone at the tmux
-        # layer, not a bridge concern.)
-        f'python3 -c \'import sys,time; time.sleep(1.5); sys.stdout.write("Y"*{payload_len}); '
-        "sys.stdout.flush()'"
-    )
-    await asyncio.sleep(0.2)
-
-    ws = _FakeWebSocket(inbound=[], send_delay_s=0.005)
+    payload_read = asyncio.Event()
     reader_done = asyncio.Event()
     forward_done = asyncio.Event()
+    decoded_y = 0
+
+    def _record_output(value: bytes) -> bytes:
+        nonlocal decoded_y
+        data = unescape_control_output(value)
+        decoded_y += data.count(b"Y")
+        if decoded_y == payload_len:
+            payload_read.set()
+        return data
+
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge.unescape_control_output", _record_output
+    )
+
+    class _GatedWebSocket(_FakeWebSocket):
+        async def receive(self) -> dict[str, object]:
+            if len(self._inbound) == 1:
+                # tmux can discard its own pending output when a pane exits.
+                # Exit only after the bridge has queued the complete burst.
+                await payload_read.wait()
+            return await super().receive()
+
+        async def send_bytes(self, data: bytes) -> None:
+            if b"Y" in data:
+                # Keep the full burst backlogged until the reader exits.
+                await reader_done.wait()
+            await super().send_bytes(data)
+
+    sock, target = await _new_private_tmux(
+        # Browser input starts the burst after attach, then permits pane exit.
+        f'python3 -c \'import sys; sys.stdin.readline(); sys.stdout.write("Y"*{payload_len}); '
+        "sys.stdout.flush(); sys.stdin.readline()'"
+    )
+    ws = _GatedWebSocket(
+        inbound=[
+            {"type": "websocket.receive", "bytes": b"\r"},
+            {"type": "websocket.receive", "bytes": b"\r"},
+        ],
+        send_delay_s=0.005,
+    )
     task = asyncio.create_task(
         bridge_tmux_control_to_websocket(
             ws,
@@ -457,28 +550,34 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
             forward_done=forward_done,
         )
     )
-    # Deterministically wait until the reader has queued the whole backlog plus
-    # the EOF sentinel, then until the forwarder has fully drained it — no
-    # arbitrary wall-clock sleep. Timeouts are generous backstops, not timing.
-    await asyncio.wait_for(reader_done.wait(), timeout=20.0)
-    await asyncio.wait_for(forward_done.wait(), timeout=20.0)
+    try:
+        await asyncio.wait_for(reader_done.wait(), timeout=20.0)
+        await asyncio.wait_for(forward_done.wait(), timeout=20.0)
 
-    total_y = sum(f.count(b"Y") for f in ws.sent)
-    assert total_y >= payload_len, (
-        f"burst-then-exit dropped the tail: got {total_y} Y bytes of {payload_len} "
-        "— forwarder was cancelled before draining the queued backlog"
-    )
-
-    await _kill_and_join(sock, task)
+        total_y = sum(f.count(b"Y") for f in ws.sent)
+        assert total_y == payload_len, (
+            f"burst-then-exit dropped the tail: got {total_y} Y bytes of {payload_len} "
+            "— forwarder was cancelled before draining the queued backlog"
+        )
+    finally:
+        await _kill_and_join(sock, task)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
 async def test_control_bridge_seeds_streams_and_detaches() -> None:
-    """End-to-end: seed the pre-attach screen, stream typed input, detach clean."""
-    # `cat` echoes input back to the pane (→ %output); the printf lands before
-    # attach so it can only reach the browser via the capture-pane seed.
-    sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
+    """End-to-end: seed the pre-attach screen, stream typed input, detach clean.
+
+    The pane answers the input with an ``ESC k`` window name, which tmux
+    streams raw; the browser must get the text after it but not the name.
+    """
+    # The first printf lands before attach so it can only reach the browser via
+    # the capture-pane seed. The tty echoes the typed input (→ %output), then
+    # the reply starts with the window name oh-my-zsh sets before a command.
+    sock, target = await _new_private_tmux(
+        "printf 'SEEDED-LINE\\n'; read -r line; "
+        "printf '\\033kWINDOW-NAME\\033\\\\after-name\\n'; cat"
+    )
     await asyncio.sleep(0.3)  # let the printf render before we attach
 
     ws = _FakeWebSocket(
@@ -494,12 +593,13 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
         )
 
     task = asyncio.create_task(_run())
-    # Give it time to seed, resize, inject input, and observe the echo.
-    await asyncio.sleep(1.2)
+    # The reply follows the seed, the resize, and the echoed input.
+    await poll_until_async(lambda: b"after-name" in b"".join(ws.sent), timeout_s=10)
 
     joined = b"".join(ws.sent)
     assert b"SEEDED-LINE" in joined, "seed-on-attach did not paint pre-attach screen"
     assert b"typed-input" in joined, "send-keys input was not echoed via %output"
+    assert b"WINDOW-NAME" not in joined, "the pane's window name reached the browser as text"
 
     # The seed frame must not carry bare-LF row separators: capture-pane -p
     # joins rows with a lone \n, which would staircase the whole screen to the
@@ -511,6 +611,65 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
     )
 
     # Kill the server → the control client's stdout closes → bridge exits.
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_lists_tmux_answers_before_any_pane_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The browser learns which queries tmux answers before a query can reach it.
+
+    The probe also finishes before the screen capture, so a slow first probe
+    can't leave pane output between the capture and the attach.
+    """
+    sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
+    await asyncio.sleep(0.3)
+
+    steps: list[str] = []
+
+    async def _probe(tmux: str, client_env: dict[str, str]) -> frozenset[str] | None:
+        steps.append("probe")
+        answers = await tmux_answered_queries(tmux, client_env)
+        steps.append("probed")
+        return answers
+
+    async def _capture(socket_path: str, tmux_target: str) -> bytes | None:
+        steps.append("capture")
+        return await _run_tmux_capture(socket_path, tmux_target)
+
+    monkeypatch.setattr("omnigent.terminals.control_bridge.tmux_answered_queries", _probe)
+    monkeypatch.setattr("omnigent.terminals.control_bridge._run_tmux_capture", _capture)
+    frames: list[str | bytes] = []
+
+    class _OrderedWebSocket(_FakeWebSocket):
+        async def send_bytes(self, data: bytes) -> None:
+            frames.append(data)
+            await super().send_bytes(data)
+
+        async def send_text(self, data: str) -> None:
+            frames.append(data)
+            await super().send_text(data)
+
+    ws = _OrderedWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    await poll_until_async(
+        lambda: b"SEEDED-LINE" in b"".join(frame for frame in frames if isinstance(frame, bytes)),
+        timeout_s=10,
+    )
+
+    first = frames[0]
+    assert isinstance(first, str), f"pane output reached the browser first: {first!r}"
+    message = json.loads(first)
+    assert message["type"] == "tmux-replies"
+    assert {"da1", "dsr:6"} <= set(message["queries"])
+    assert steps[:3] == ["probe", "probed", "capture"]
+
     await _kill_and_join(sock, task)
 
 
@@ -587,10 +746,9 @@ async def test_seed_full_height_pane_does_not_scroll_or_shift_cursor() -> None:
 @pytest.mark.asyncio
 async def test_seed_recovers_primary_screen_scrollback() -> None:
     """On the primary screen the seed captures full history, not just the screen."""
-    from omnigent.terminals.control_bridge import _run_tmux_capture
-
     sock, target = await _new_private_tmux("bash --norc")
-    await asyncio.sleep(0.2)
+    # Type only once bash shows its prompt.
+    await _capture_when(sock, target, lambda seed: b"$" in seed or b"#" in seed)
     tmux = shutil.which("tmux")
     assert tmux
     # Emit 100 history lines — far more than the 24-row visible screen.
@@ -609,10 +767,8 @@ async def test_seed_recovers_primary_screen_scrollback() -> None:
         tmux, "-S", str(sock), "send-keys", "-t", target, "Enter"
     )
     await proc.communicate()
-    await asyncio.sleep(0.6)
     try:
-        seed = await _run_tmux_capture(str(sock), target)
-        assert seed is not None
+        seed = await _capture_when(sock, target, lambda seed: b"hist-100" in seed)
         # Full history recovered (a visible-only capture would show ~23 lines).
         assert seed.count(b"hist-") >= 100, (
             f"scrollback not recovered: only {seed.count(b'hist-')} history lines"
@@ -837,13 +993,13 @@ async def test_control_bridge_forwards_recent_copy_buffer_as_text_frame() -> Non
 
     async def _clipboard_arrived() -> bool:
         for _ in range(50):
-            if ws.sent_text:
+            if ws.clipboard_messages:
                 return True
             await asyncio.sleep(0.05)
         return False
 
     assert await _clipboard_arrived(), "clipboard control frame was not sent"
-    message = json.loads(ws.sent_text[-1])
+    message = json.loads(ws.clipboard_messages[-1])
     assert message["type"] == "clipboard-write"
     assert message["encoding"] == "base64"
     assert base64.b64decode(message["data"]) == copied
@@ -873,9 +1029,125 @@ async def test_control_bridge_ignores_copy_without_recent_input() -> None:
     )
     await proc.communicate()
     await asyncio.sleep(0.3)
-    assert ws.sent_text == []
+    assert ws.clipboard_messages == []
 
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.parametrize(
+    ("read_only", "recent_input", "sandbox"),
+    [
+        (False, True, "none"),
+        (False, False, "none"),
+        (True, True, "none"),
+        pytest.param(
+            False,
+            True,
+            "darwin_seatbelt",
+            marks=pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox"),
+        ),
+    ],
+)
+async def test_native_pbcopy_uses_consent_transport_not_host_clipboard(
+    tmp_path: Path, read_only: bool, recent_input: bool, sandbox: str
+) -> None:
+    """A real pane's pbcopy reaches only the eligible browser attachment."""
+    native_bin = tmp_path / "host-bin"
+    native_bin.mkdir()
+    bypass_marker = tmp_path / "host-clipboard-written"
+    native_copy = native_bin / "pbcopy"
+    native_copy.write_text(f"#!/bin/sh\ncat > {shlex.quote(str(bypass_marker))}\n")
+    native_copy.chmod(0o700)
+    read_paths = [str(Path(__file__).resolve().parents[2])]
+    if sandbox != "none":
+        # An isolated worktree may share an editable venv with another checkout.
+        source_query = (
+            "from pathlib import Path; import omnigent; "
+            "print(Path(omnigent.__file__).resolve().parent.parent)"
+        )
+        installed_source = subprocess.check_output(
+            [sys.executable, "-I", "-c", source_query],
+            text=True,
+            timeout=5,
+        ).strip()
+        read_paths.append(installed_source)
+    created = create_terminal_instance(
+        name="copy-test",
+        session_key="main",
+        spec=TerminalEnvSpec(
+            command="bash",
+            args=["--noprofile", "--norc"],
+            env={"PATH": f"{native_bin}{os.pathsep}{os.environ['PATH']}"},
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type=sandbox, read_paths=read_paths),
+            ),
+        ),
+    )
+    instance = created.instance
+    ws = _FakeWebSocket(
+        inbound=[{"type": "websocket.receive", "bytes": b"\r"}] if recent_input else []
+    )
+    task: asyncio.Task[None] | None = None
+    try:
+        await instance.launch(cwd=created.cwd)
+        task = asyncio.create_task(
+            bridge_tmux_control_to_websocket(
+                ws,
+                socket_path=str(instance.socket_path),
+                tmux_target=instance.tmux_target,
+                read_only=read_only,
+            )
+        )
+        for _ in range(100):
+            if ws.sent:
+                break
+            await asyncio.sleep(0.02)
+        assert ws.sent, "terminal did not attach"
+        await asyncio.sleep(0.1)
+        copied = "native copy λ\nsecond line\n"
+        done = instance.private_dir / "copy-done"
+        await instance.send(
+            text=f"printf %s {shlex.quote(copied)} | pbcopy && touch {shlex.quote(str(done))}"
+        )
+        for _ in range(100):
+            if done.exists():
+                break
+            await asyncio.sleep(0.03)
+        assert done.exists(), b"".join(ws.sent).decode(errors="replace")
+        assert not bypass_marker.exists(), "native pbcopy bypassed browser consent"
+        if recent_input and not read_only:
+            for _ in range(100):
+                if ws.clipboard_messages:
+                    break
+                await asyncio.sleep(0.02)
+            assert ws.clipboard_messages, "native copy never reached the browser consent transport"
+            message = json.loads(ws.clipboard_messages[-1])
+            assert message["type"] == "clipboard-write"
+            assert base64.b64decode(message["data"]).decode() == copied
+        else:
+            await asyncio.sleep(0.2)
+            assert not ws.clipboard_messages
+        if sandbox != "none":
+            probe = instance.private_dir / "control-socket-probe"
+            await instance.send(
+                text=(
+                    f"if tmux -S {shlex.quote(str(instance.socket_path))} show-options -g "
+                    f">/dev/null 2>&1; then printf exposed; else printf denied; fi "
+                    f"> {shlex.quote(str(probe))}"
+                )
+            )
+            for _ in range(100):
+                if probe.exists() and probe.read_text():
+                    break
+                await asyncio.sleep(0.02)
+            assert probe.read_text() == "denied"
+    finally:
+        if task is not None:
+            await _kill_and_join(instance.socket_path, task)
+        await instance.close()
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
@@ -901,9 +1173,74 @@ async def test_control_bridge_read_only_drops_input() -> None:
     )
     await proc.communicate()
     await asyncio.sleep(0.2)
-    assert ws.sent_text == []
+    assert ws.clipboard_messages == []
 
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_read_only_viewer_does_not_block_harness_send_keys() -> None:
+    """A read-only viewer must not stop the harness from typing into the pane.
+
+    tmux >= 3.7 rejects ``send-keys`` with "client is read-only" when the
+    implicit target client (the most recently active one) was attached with
+    ``-r``. Harnesses run plain ``send-keys -t <pane>``, so a viewer attached
+    with ``-r`` broke chat delivery for the owner.
+    """
+    tmux = shutil.which("tmux")
+    assert tmux
+    sock, target = await _new_private_tmux("cat")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=True
+        )
+    )
+    try:
+        flags = ""
+        for _ in range(50):
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                str(sock),
+                "list-clients",
+                "-F",
+                "#{client_flags}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            flags = out.decode().strip()
+            if flags:
+                break
+            await asyncio.sleep(0.1)
+        client_flags = flags.split(",")
+        # Checked directly because tmux < 3.7 accepts the send-keys below
+        # even from behind a ``-r`` viewer.
+        assert "read-only" not in client_flags, flags
+        assert "ignore-size" in client_flags, flags
+
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            str(sock),
+            "send-keys",
+            "-t",
+            target,
+            "-l",
+            "typed-by-harness",
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        assert proc.returncode == 0, err.decode()
+        for _ in range(50):
+            if b"typed-by-harness" in b"".join(ws.sent):
+                break
+            await asyncio.sleep(0.1)
+        assert b"typed-by-harness" in b"".join(ws.sent)
+    finally:
+        await _kill_and_join(sock, task)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")

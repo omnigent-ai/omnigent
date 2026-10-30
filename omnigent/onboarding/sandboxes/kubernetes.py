@@ -64,6 +64,7 @@ from omnigent.host.identity import (
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
 )
+from omnigent.host.identity_env import MANAGED_SANDBOX_ENV_VAR
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     SandboxHostLauncher,
@@ -254,7 +255,7 @@ _SENSITIVE_KEY_SEGMENTS: frozenset[str] = frozenset(
 # Reserved env names the Pod sets itself — an env passthrough naming one is an
 # operator error (a duplicate entry could shadow the writable-HOME emptyDir).
 _RESERVED_ENV_NAMES: frozenset[str] = frozenset(
-    {"HOME", "IS_SANDBOX", HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR}
+    {"HOME", MANAGED_SANDBOX_ENV_VAR, HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR}
 )
 
 # PID-1 reaper, run as the host container's entrypoint. It spawns its argv
@@ -585,10 +586,15 @@ def _render_workspace_prep_command(
         for repo, dirname, staging in zip(repos, dirnames, staging_names, strict=True):
             clone_dir = f"{workspace}/{dirname}"
             staging_dir = f"{workspace}/{staging}"
-            branch = (
-                f"--branch {shlex.quote(repo.branch)} --single-branch "
-                if repo.branch is not None
-                else ""
+            clone = shlex.join(
+                [
+                    "git",
+                    "clone",
+                    *repo.git_clone.clone_args(repo.branch),
+                    "--",
+                    repo.url,
+                    f"{staging_dir}/clone",
+                ]
             )
             target = shlex.quote(clone_dir)
             gitfile = shlex.quote(f"{clone_dir}/.git")
@@ -627,7 +633,7 @@ def _render_workspace_prep_command(
             script += f"  mkdir -- {target}\n  mkdir -- {temporary}\n  touch -- {marker}\n"
             script += '  if [ -z "$wired" ]; then wire_credentials; wired=1; fi\n'
             script += (
-                f"  (git clone {branch}-- {shlex.quote(repo.url)} {staged_clone} "
+                f"  ({clone} "
                 f"&& replace_empty_dir {staged_clone} {target} "
                 f"&& rm -f -- {marker} && rmdir -- {temporary} "
                 f"|| {{ rmdir -- {target} 2>/dev/null || true; exit 1; }}) "
@@ -958,7 +964,7 @@ def build_job_manifest(
 
     host_env: list[dict[str, object]] = [
         {"name": "HOME", "value": _HOME_DIR},
-        {"name": "IS_SANDBOX", "value": "1"},
+        {"name": MANAGED_SANDBOX_ENV_VAR, "value": "1"},
         {"name": HOST_ID_ENV_VAR, "value": host_id},
         {"name": HOST_NAME_ENV_VAR, "value": host_name},
         {
@@ -1255,6 +1261,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             # are on the exec-model branch and stay single-repo until they
             # opt in themselves.
             multi_repo=True,
+            git_clone_options=True,
         )
 
     def __init__(
@@ -1599,8 +1606,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 # immediately.
                 core.create_namespaced_secret(
                     namespace,
-                    build_token_secret_manifest(
-                        secret_name=secret_name, namespace=namespace, token=token
+                    cast(
+                        "k8s_client.V1Secret",
+                        build_token_secret_manifest(
+                            secret_name=secret_name, namespace=namespace, token=token
+                        ),
                     ),
                     _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )
@@ -1639,7 +1649,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param manifest: The manifest from :func:`build_job_manifest`.
         """
         self._load_batch().create_namespaced_job(
-            namespace, manifest, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
+            namespace,
+            cast("k8s_client.V1Job", manifest),
+            _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
         )
 
     def _find_job_pod(self, namespace: str, job_name: str) -> str | None:

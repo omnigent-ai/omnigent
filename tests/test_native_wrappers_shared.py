@@ -34,6 +34,7 @@ class _Wrapper:
     module: ModuleType
     cold_resume: bool  # tracks a cold-resumed terminal separately from a reattach
     reattached_on_resume: bool  # resuming an existing session reports reattached
+    host_scoped_picker: bool  # the resume picker is scoped to this machine's host id
 
     def fn(self, template: str) -> Any:
         return getattr(self.module, template.format(k=self.key, L=self.label))
@@ -43,15 +44,22 @@ class _Wrapper:
         return f"OMNIGENT_{self.key.upper()}_PATH"
 
 
-def _wrapper(key: str, label: str, *, cold_resume: bool, reattached_on_resume: bool) -> _Wrapper:
+def _wrapper(
+    key: str,
+    label: str,
+    *,
+    cold_resume: bool,
+    reattached_on_resume: bool,
+    host_scoped_picker: bool = False,
+) -> _Wrapper:
     module = importlib.import_module(f"omnigent.harnesses.{key}_native.main")
-    return _Wrapper(key, label, module, cold_resume, reattached_on_resume)
+    return _Wrapper(key, label, module, cold_resume, reattached_on_resume, host_scoped_picker)
 
 
 _WRAPPERS = [
     _wrapper("goose", "Goose", cold_resume=True, reattached_on_resume=False),
     _wrapper("kimi", "Kimi", cold_resume=True, reattached_on_resume=False),
-    _wrapper("pi", "Pi", cold_resume=False, reattached_on_resume=True),
+    _wrapper("pi", "Pi", cold_resume=False, reattached_on_resume=True, host_scoped_picker=True),
 ]
 
 
@@ -289,7 +297,11 @@ def test_resolve_session_id_short_circuits_without_picker(w: _Wrapper) -> None:
     assert resolve(base_url="http://s", headers={}, session_id=None, resume_picker=False) is None
 
 
-def test_resolve_session_id_runs_the_picker(w: _Wrapper, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("host_id", ["host_local", None], ids=["registered-host", "no-host"])
+def test_resolve_session_id_runs_the_picker(
+    w: _Wrapper, monkeypatch: pytest.MonkeyPatch, host_id: str | None
+) -> None:
+    """A host-scoped wrapper hands the picker this machine's host id; others list unscoped."""
     opened: dict[str, Any] = {}
 
     class _Client:
@@ -304,11 +316,13 @@ def test_resolve_session_id_runs_the_picker(w: _Wrapper, monkeypatch: pytest.Mon
 
     picked: dict[str, Any] = {}
 
-    async def fake_picker(client: object, *, wrapper_value: str, agent_name: str) -> str | None:
-        picked.update(wrapper_value=wrapper_value, agent_name=agent_name)
+    async def fake_picker(client: object, **kwargs: Any) -> str | None:
+        picked.update(kwargs)
         return "conv_picked"
 
+    identity = SimpleNamespace(host_id=host_id, name="laptop") if host_id else None
     monkeypatch.setattr("omnigent_client.OmnigentClient", _Client)
+    monkeypatch.setattr("omnigent.host.identity.load_host_identity_if_present", lambda: identity)
     monkeypatch.setattr(
         "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk", fake_picker
     )
@@ -322,6 +336,7 @@ def test_resolve_session_id_runs_the_picker(w: _Wrapper, monkeypatch: pytest.Mon
     assert picked == {
         "wrapper_value": w.module._WRAPPER_LABEL_VALUE,
         "agent_name": f"{w.key}-native-ui",
+        **({"host_id": host_id} if w.host_scoped_picker else {}),
     }
 
 

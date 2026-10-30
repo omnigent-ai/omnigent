@@ -23,7 +23,9 @@ import json
 import logging
 import os
 import queue
+import shlex
 import socket
+import subprocess
 import threading
 import time
 import traceback
@@ -33,20 +35,24 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
 from omnigent.errors import ErrorPhase, OmnigentError, classify_exception
 from omnigent.process_logging import redact_log_text
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 from omnigent.version import VERSION
+
+CAPTURED_STACK_TRACE_FIELD = "captured_stack_trace"
 
 # ── environment contract ────────────────────────────────────────────────────
 # The insert endpoint carries the table (in its path) and the workspace id (in
 # its host), so only four values are needed. See config_from_env.
 CLIENT_ID_ENV_VAR = "OMNIGENT_DEBUG_LOG_CLIENT_ID"
 CLIENT_SECRET_ENV_VAR = "OMNIGENT_DEBUG_LOG_CLIENT_SECRET"
+CLIENT_SECRET_COMMAND_ENV_VAR = "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND"
 WORKSPACE_URL_ENV_VAR = "OMNIGENT_DEBUG_LOG_WORKSPACE_URL"
 ENDPOINT_ENV_VAR = "OMNIGENT_DEBUG_LOG_ENDPOINT"
 
@@ -63,14 +69,13 @@ PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
 _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
 
-# Request-scoped session attribution on the server. The HTTP middleware binds
-# this for the duration of a request whose matched route carries a
-# ``{session_id}`` path param, so records emitted while handling it inherit the
-# session even when the callsite did not thread it explicitly. Unset on the
-# runner/host (they use the ``OMNIGENT_RUNNER_PRIMARY_SESSION_ID`` env instead),
-# so this never changes runner attribution. An explicit ``extra`` session id
-# always wins over this ambient value.
+# Session attribution for HTTP handlers and scoped lifecycle work on every
+# process. Explicit record fields win; runner environment IDs are fallbacks.
 _session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id", default=None)
+
+_runner_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_runner_id", default=None)
+_request_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_request_id", default=None)
+
 
 # Ambient lifecycle phase for the code currently executing. Set with
 # ``phase_scope`` around each region (runner launch, harness setup/startup, turn)
@@ -104,6 +109,22 @@ _FLUSH_INTERVAL_S = 2.0
 _QUEUE_MAX_RECORDS = 10_000
 _TOKEN_REFRESH_SKEW_S = 300.0
 _HTTP_TIMEOUT_S = 10.0
+_SECRET_COMMAND_TIMEOUT_S = 30.0
+# At shutdown, don't start a request with less time than this left.
+_MIN_POST_BUDGET_S = 0.1
+# Transport errors raised before the request was fully sent, so a retry can't
+# duplicate it. Any other transport error (e.g. a read timeout) may mean the
+# insert already landed, so the batch is dropped rather than resent.
+_NOT_SENT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+    httpx.LocalProtocolError,
+)
 # Logger-name prefixes the sink drops as noise: httpx/httpcore emit an
 # "HTTP Request: …" line per call — high-volume plumbing the debug view doesn't
 # want (and the sink's own uploads go through httpx).
@@ -154,7 +175,8 @@ class DebugLogConfig:
     """Resolved configuration for the debug-log sink."""
 
     client_id: str
-    client_secret: str
+    client_secret: str | None
+    client_secret_command: tuple[str, ...] | None
     workspace_url: str  # OIDC token-mint host, e.g. https://dbc-….cloud.databricks.com
     insert_url: str  # full ZeroBus …/tables/<table>/insert URL
     table: str  # catalog.schema.table, parsed from insert_url
@@ -188,27 +210,46 @@ def _parse_insert_url(insert_url: str) -> tuple[str, str] | None:
 def config_from_env() -> DebugLogConfig | None:
     """Build the sink config from the environment, or ``None`` when disabled.
 
-    All four variables must be set for the sink to run. When none are set it
-    stays silently off (the default for OSS/customers); a *partial* or malformed
-    set logs one warning naming the problem, then disables — that partial case
-    almost always means someone tried to enable it and slipped.
+    The client secret may be supplied directly or by a command. The command is
+    invoked lazily by the uploader thread, so a slow credential provider never
+    delays process startup. When no variables are set the sink stays silently
+    off; a partial or ambiguous configuration logs one warning and disables it.
     """
     client_id = os.environ.get(CLIENT_ID_ENV_VAR)
     client_secret = os.environ.get(CLIENT_SECRET_ENV_VAR)
+    client_secret_command_text = os.environ.get(CLIENT_SECRET_COMMAND_ENV_VAR)
     workspace_url = os.environ.get(WORKSPACE_URL_ENV_VAR)
     insert_url = os.environ.get(ENDPOINT_ENV_VAR)
-    if not (client_id and client_secret and workspace_url and insert_url):
-        present = {
-            CLIENT_ID_ENV_VAR: client_id,
-            CLIENT_SECRET_ENV_VAR: client_secret,
-            WORKSPACE_URL_ENV_VAR: workspace_url,
-            ENDPOINT_ENV_VAR: insert_url,
-        }
-        missing = [name for name, value in present.items() if not value]
-        # A partial set almost always means someone tried to enable it and slipped.
-        if len(missing) < len(present):
-            _logger.warning("debug-log sink disabled: missing env var(s): %s", ", ".join(missing))
+    values = (client_id, client_secret, client_secret_command_text, workspace_url, insert_url)
+    if not any(values):
         return None
+    if client_secret and client_secret_command_text:
+        _logger.warning(
+            "debug-log sink disabled: set only one of %s and %s",
+            CLIENT_SECRET_ENV_VAR,
+            CLIENT_SECRET_COMMAND_ENV_VAR,
+        )
+        return None
+    if not (
+        client_id
+        and (client_secret or client_secret_command_text)
+        and workspace_url
+        and insert_url
+    ):
+        _logger.warning("debug-log sink disabled: incomplete OMNIGENT_DEBUG_LOG_* configuration")
+        return None
+    client_secret_command = None
+    if client_secret_command_text:
+        try:
+            client_secret_command = tuple(shlex.split(client_secret_command_text))
+        except ValueError:
+            _logger.warning(
+                "debug-log sink disabled: could not parse %s", CLIENT_SECRET_COMMAND_ENV_VAR
+            )
+            return None
+        if not client_secret_command:
+            _logger.warning("debug-log sink disabled: %s is empty", CLIENT_SECRET_COMMAND_ENV_VAR)
+            return None
     parsed = _parse_insert_url(insert_url)
     if parsed is None:
         _logger.warning("debug-log sink disabled: could not parse %s", ENDPOINT_ENV_VAR)
@@ -217,6 +258,7 @@ def config_from_env() -> DebugLogConfig | None:
     return DebugLogConfig(
         client_id=client_id,
         client_secret=client_secret,
+        client_secret_command=client_secret_command,
         workspace_url=workspace_url.rstrip("/"),
         insert_url=insert_url,
         table=table,
@@ -264,8 +306,30 @@ def current_user_id() -> str | None:
     return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
 
 
+def set_current_request_id(request_id: str | None) -> None:
+    """Bind the server HTTP request id; host-frame request ids are separate."""
+    _request_id_var.set(request_id or None)
+
+
+def set_current_runner_id(runner_id: str | None) -> None:
+    """Bind a known runner without looking up a session on every log record."""
+    _runner_id_var.set(runner_id or None)
+
+
+@contextlib.contextmanager
+def runner_log_scope(session_id: str | None, runner_id: str | None) -> Iterator[None]:
+    """Attribute a launch, callback, or relay and restore the caller's context."""
+    session_token = _session_id_var.set(session_id or None)
+    runner_token = _runner_id_var.set(runner_id or None)
+    try:
+        yield
+    finally:
+        _runner_id_var.reset(runner_token)
+        _session_id_var.reset(session_token)
+
+
 def set_current_session_id(session_id: str | None) -> None:
-    """Bind the current request's session (server middleware, session-scoped routes only)."""
+    """Bind a known session in the current request or lifecycle task."""
     _session_id_var.set(session_id or None)
 
 
@@ -280,13 +344,7 @@ def current_session_id_scope(session_id: str | None) -> Iterator[None]:
 
 
 def current_session_id() -> str | None:
-    """Best-available request-scoped session attribution (server only).
-
-    Bound by the HTTP middleware only for a request whose matched route carries a
-    ``{session_id}`` path param, so it never mis-attributes a non-session route.
-    Unset on the runner/host. An explicit ``extra`` session id always wins over
-    this (see :func:`record_to_row`).
-    """
+    """Return the session bound to the current request or lifecycle scope."""
     return _session_id_var.get() or None
 
 
@@ -406,6 +464,58 @@ def _process_identity() -> tuple[str | None, str | None]:
     return workspace_id, app_name
 
 
+# Workspace-id probe results by API base, success or not, so a process probes a
+# server at most once.
+_probed_workspace_ids: dict[str, str | None] = {}
+_WORKSPACE_ID_PROBE_TIMEOUT_S = 3.0
+
+
+def _probe_workspace_id(api_base: str) -> str | None:
+    """Read the workspace id a workspace-hosted server's proxy stamps on responses.
+
+    The Databricks API proxy sets ``x-databricks-org-id`` even on a 401, so this
+    unauthenticated request needs no credential and can run before any exists.
+    """
+    if api_base in _probed_workspace_ids:
+        return _probed_workspace_ids[api_base]
+    workspace_id: str | None = None
+    try:
+        resp = httpx.get(f"{api_base}/v1/me", timeout=_WORKSPACE_ID_PROBE_TIMEOUT_S)
+        header = _clean(resp.headers.get("x-databricks-org-id"))
+        workspace_id = header if header and header.isdecimal() else None
+    except httpx.HTTPError:
+        workspace_id = None
+    _probed_workspace_ids[api_base] = workspace_id
+    return workspace_id
+
+
+def publish_origin_identity(server_url: str) -> str | None:
+    """Publish the workspace id a client process's debug-log rows carry.
+
+    Host and CLI processes call this at startup, before anything they log or
+    spawn. The id comes from the URL's ``?o=`` or the stored login record, else
+    a one-time unauthenticated probe. Attribution never changes saved login
+    details; only an authenticated command may persist a workspace selector.
+
+    :param server_url: The server API base, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :returns: The workspace id, e.g. ``"2850744067564480"``, or ``None`` on a
+        non-Databricks server or when it cannot be resolved.
+    """
+    try:
+        from omnigent.util.server_url import ServerUrl
+
+        resolved = ServerUrl.from_api_base(server_url)
+        workspace_id = resolved.org_id
+        if workspace_id is None and resolved.is_workspace_hosted:
+            workspace_id = _probe_workspace_id(resolved.api_base)
+        if workspace_id:
+            os.environ[ORIGIN_WORKSPACE_ID_ENV_VAR] = workspace_id
+        return workspace_id
+    except Exception:  # noqa: BLE001 — attribution is best-effort
+        return None
+
+
 def debug_event(
     event_name: str,
     *,
@@ -420,19 +530,18 @@ def debug_event(
     string-valued attributes map, and pass ``session_id`` (and ``turn_id`` once
     it is wired) explicitly so the row is correlated to its session, e.g.::
 
-        _logger.info("dispatching tool", extra=debug_event(
-            "tool_call_dispatched", session_id=session_id,
-            tool_call_id=tc.id, model=model))
+        _logger.info(
+            "dispatching tool",
+            extra=debug_event(
+                "tool_call_dispatched", session_id=session_id, tool_call_id=tc.id, model=model
+            ),
+        )
 
-    ``turn_id`` is populated only from what the callsite passes. ``session_id``
-    is likewise callsite-driven, but the sink additionally falls back to the
-    runner's primary (parent) conversation id when a record carries none (see
-    :func:`record_to_row`); that fallback is runner-only, so on the server an
-    unthreaded ``session_id`` stays null. ``user_id`` has its own ambient
-    fallback (a request-scoped ContextVar on the server, the ``OMNIGENT_USER_ID``
-    env on the runner/host). Freeform ``_logger.debug("…")`` calls need no
-    ``extra``; they ship with null correlation columns and an empty attributes
-    map.
+    Explicit fields win over ambient lifecycle context. The sink enriches
+    ordinary logs too: session/request/runner scopes on the server and host,
+    primary-session and runner environment defaults on runner/harness rows.
+    ``turn_id`` remains callsite-driven. ``user_id`` uses its existing request
+    scope or process-owner environment fallback.
     """
     extra: dict[str, object] = {"event_name": event_name, "attributes": dict(attributes)}
     if session_id is not None:
@@ -447,10 +556,10 @@ def debug_event(
 def _stack_trace(record: logging.LogRecord) -> str | None:
     if record.exc_info:
         return "".join(traceback.format_exception(*record.exc_info))
-    return record.exc_text or None
+    return record.exc_text or getattr(record, CAPTURED_STACK_TRACE_FIELD, None)
 
 
-def _attributes(record: logging.LogRecord) -> dict[str, str]:
+def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
     attrs: dict[str, str] = {}
     if isinstance(raw, dict):
@@ -458,6 +567,17 @@ def _attributes(record: logging.LogRecord) -> dict[str, str]:
         # and drop nulls. Event attributes share the same privacy boundary as
         # messages.
         attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+    for key, value in (
+        ("request_id", getattr(record, "request_id", None) or _request_id_var.get()),
+        (
+            "runner_id",
+            getattr(record, "runner_id", None)
+            or _runner_id_var.get()
+            or (os.environ.get(RUNNER_ID_ENV_VAR) if source in {"runner", "harness"} else None),
+        ),
+    ):
+        if value:
+            attrs.setdefault(key, redact_log_text(str(value)))
     _stamp_error_dimensions(attrs, record)
     return attrs
 
@@ -519,17 +639,12 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
 
-    ``session_id`` is taken from what the callsite threaded via ``extra`` first,
-    then the server's request-scoped :func:`current_session_id` (bound by the
-    HTTP middleware only for a request whose matched route carries a
-    ``{session_id}`` path param -- so it never mis-attributes a non-session
-    route, and an explicit id always wins), and finally the runner's primary
-    (parent) conversation id (:func:`runner_primary_session_id`). The
-    request-scoped var is unset on the runner (which uses the primary-session
-    env), and the primary-session env is absent on the server, so the two
-    fallbacks never collide. A server record on a non-session route stays null.
-    On a runner, a co-located subagent turn whose log is not threaded can be
-    attributed to the parent conversation, an accepted trade-off.
+    Session attribution prefers an explicit record field, then the active
+    request/lifecycle scope, then the primary-session environment on runner
+    and harness rows only. Runner child-session requests bind their own ID;
+    process-wide runner logs can still fall back to the primary session.
+    Request and runner IDs follow the same explicit-before-ambient rule in
+    ``attributes``. Server and host rows never use runner environment defaults.
 
     ``workspace_id``/``app_name`` describe the record's origin deployment: the
     managed service stamps ``record.workspace_id`` per request (so it wins),
@@ -543,7 +658,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "session_id": (
             getattr(record, "session_id", None)
             or current_session_id()
-            or runner_primary_session_id()
+            or (runner_primary_session_id() if source in {"runner", "harness"} else None)
         ),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
@@ -556,7 +671,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "func_name": record.funcName,
         "app_version": VERSION,
         "stack_trace": redact_log_text(stack_trace) if stack_trace is not None else None,
-        "attributes": _attributes(record),
+        "attributes": _attributes(record, source),
         "log_id": uuid.uuid4().hex,
         "user_id": getattr(record, "user_id", None) or current_user_id(),
         "workspace_id": _clean(getattr(record, "workspace_id", None)) or workspace_id,
@@ -578,12 +693,23 @@ class _TokenSource:
         self._lock = threading.Lock()
         self._token: str | None = None
         self._expires_at = 0.0
+        self._client_secret = config.client_secret
 
-    def token(self) -> str | None:
+    def token(self, *, deadline: float | None = None) -> str | None:
+        """Return a cached token or mint one.
+
+        With a monotonic shutdown *deadline*, the mint's HTTP call is bounded
+        by it, and an unresolved client-secret command (an unbounded
+        subprocess) is not run.
+        """
         with self._lock:
             if self._token and time.time() < self._expires_at - _TOKEN_REFRESH_SKEW_S:
                 return self._token
-            minted = self._mint()
+            if deadline is not None and (
+                self._client_secret is None and self._config.client_secret_command is not None
+            ):
+                return None
+            minted = self._mint(deadline=deadline)
             if minted is None:
                 return None
             self._token, self._expires_at = minted
@@ -593,6 +719,40 @@ class _TokenSource:
         with self._lock:
             self._token = None
             self._expires_at = 0.0
+            if self._config.client_secret_command is not None:
+                self._client_secret = None
+
+    def _resolve_client_secret(self) -> str | None:
+        if self._client_secret is not None:
+            return self._client_secret
+        command = self._config.client_secret_command
+        if command is None:
+            return None
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=_SECRET_COMMAND_TIMEOUT_S,
+            )
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+            _diag("secret_command", "client-secret command failed: %s", type(exc).__name__)
+            return None
+        if completed.returncode != 0:
+            _diag(
+                "secret_command_status",
+                "client-secret command exited with status %d",
+                completed.returncode,
+            )
+            return None
+        secret = completed.stdout.strip()
+        if not secret:
+            _diag("secret_command_empty", "client-secret command returned no credential")
+            return None
+        self._client_secret = secret
+        return secret
 
     def _authorization_details(self) -> str:
         parts = self._config.table.split(".")
@@ -621,19 +781,22 @@ class _TokenSource:
             ]
         )
 
-    def _mint(self) -> tuple[str, float] | None:
+    def _mint(self, *, deadline: float | None = None) -> tuple[str, float] | None:
+        client_secret = self._resolve_client_secret()
+        if client_secret is None:
+            return None
         resource = f"api://databricks/workspaces/{self._config.workspace_id}/zerobusDirectWriteApi"
         try:
             response = self._client.post(
                 f"{self._config.workspace_url}/oidc/v1/token",
-                auth=(self._config.client_id, self._config.client_secret),
+                auth=(self._config.client_id, client_secret),
                 data={
                     "grant_type": "client_credentials",
                     "scope": "all-apis",
                     "resource": resource,
                     "authorization_details": self._authorization_details(),
                 },
-                timeout=_HTTP_TIMEOUT_S,
+                timeout=_bounded_timeout(deadline),
             )
         except httpx.HTTPError as exc:
             _diag(
@@ -644,6 +807,11 @@ class _TokenSource:
             )
             return None
         if response.status_code != 200:
+            if (
+                response.status_code in (401, 403)
+                and self._config.client_secret_command is not None
+            ):
+                self._client_secret = None
             # The body carries the OAuth error (invalid_client, unauthorized
             # authorization_details, …) — the actionable part.
             _diag(
@@ -669,6 +837,34 @@ class _TokenSource:
 DebugLogRow = dict[str, object]
 DebugLogSend = Callable[[list[DebugLogRow]], None]
 
+# Queued by DebugLogHandler.close() to wake its worker; never sent.
+_CLOSE_WAKEUP: DebugLogRow = {}
+
+
+def _remaining(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - time.monotonic()
+
+
+class _ShutdownDeadline(Exception):
+    """A sender ran out of shutdown budget before sending *rows* rows."""
+
+    def __init__(self, rows: int) -> None:
+        super().__init__(rows)
+        self.rows = rows
+
+
+def _bounded_timeout(deadline: float | None) -> float:
+    """The HTTP timeout, cut to what is left before *deadline*."""
+    remaining = _remaining(deadline)
+    if remaining is None:
+        return _HTTP_TIMEOUT_S
+    return max(0.01, min(_HTTP_TIMEOUT_S, remaining))
+
+
+def _bounded_sleep(seconds: float, deadline: float | None) -> None:
+    remaining = _remaining(deadline)
+    time.sleep(seconds if remaining is None else max(0.0, min(seconds, remaining)))
+
 
 class DebugLogHandler(logging.Handler):
     """Non-blocking handler that queues rows and sends them in batches.
@@ -683,8 +879,9 @@ class DebugLogHandler(logging.Handler):
         self._source = source
         self._send = send
         self._closed = False
+        self._terminal = False
         self._start_worker()
-        atexit.register(self.close)
+        atexit.register(self.shutdown)
 
     def _start_worker(self) -> None:
         """Create the queue and launch the sender thread.
@@ -697,6 +894,8 @@ class DebugLogHandler(logging.Handler):
         """
         self._queue: queue.Queue[DebugLogRow] = queue.Queue(maxsize=_QUEUE_MAX_RECORDS)
         self._stop = threading.Event()
+        # Stop starting drain work after this deadline; in-flight requests may finish later.
+        self._drain_deadline: float | None = None
         self._thread = threading.Thread(target=self._run, name="omnigent-debug-log", daemon=True)
         self._thread.start()
 
@@ -716,76 +915,119 @@ class DebugLogHandler(logging.Handler):
         # logging.shutdown() on every handler — which close()s this one and stops
         # its uploader thread while leaving it attached to root; os.fork() (the
         # runner _zygote) likewise kills the thread. Receiving a record means the
-        # handler is still live, so revive it with fresh worker state. A real
-        # shutdown emits nothing afterward, so this never fights atexit. emit()
-        # is serialized by the Handler lock, so the restart happens once.
-        if self._closed or not self._thread.is_alive():
-            try:
-                self._closed = False
-                self._start_worker()
-            except Exception:  # noqa: BLE001 — never break logging over the sink
+        # handler is still live, so revive it with fresh worker state. During
+        # a close, drop new rows until the old worker has fully stopped: its
+        # queue, transport and deadline must not be replaced while it runs.
+        lock = self.lock
+        assert lock is not None
+        with lock:
+            if self._terminal or (self._closed and self._thread.is_alive()):
                 return
-        try:
-            row = record_to_row(record, self._source)
-        except Exception:  # noqa: BLE001 — a logging handler must never raise into the app
-            return
-        try:
-            self._queue.put_nowait(row)
-        except queue.Full:
-            # Shed the oldest row to keep the newest under sustained overflow.
+            if self._closed or not self._thread.is_alive():
+                try:
+                    self._closed = False
+                    self._start_worker()
+                except Exception:  # noqa: BLE001 — never break logging over the sink
+                    return
             try:
-                self._queue.get_nowait()
+                row = record_to_row(record, self._source)
+            except Exception:  # noqa: BLE001 — a logging handler must never raise into the app
+                return
+            try:
                 self._queue.put_nowait(row)
-            except queue.Empty:
-                # The uploader drained the queue between our full put and this
-                # get — there is room now and this one row is dropped, which is
-                # acceptable for a best-effort sink shedding under overflow.
-                pass
+            except queue.Full:
+                # Shed the oldest row to keep the newest under sustained overflow.
+                try:
+                    self._queue.get_nowait()
+                    self._queue.put_nowait(row)
+                except queue.Empty:
+                    # The uploader drained the queue between our full put and
+                    # get; dropping this row is acceptable for a best-effort sink.
+                    pass
 
     def _run(self) -> None:
+        dropped = 0  # rows lost to the shutdown deadline, reported once
         try:
             while not self._stop.is_set():
                 try:
                     batch = self._collect_batch(self._FLUSH_WAIT)
                     if batch:
                         self._send(batch)
+                except _ShutdownDeadline as exc:
+                    dropped += exc.rows
                 except Exception:  # noqa: BLE001 — the uploader thread must never die
                     # A sender failure must not kill the worker: emit()'s
                     # self-heal only revives a *stopped* thread, so a crash would
                     # silently end delivery for the process. Drop and continue.
                     time.sleep(0.1)
-            # Best-effort drain of whatever is left on shutdown.
-            remaining = self._collect_batch(0.0)
-            if remaining:
-                self._send(remaining)
+            # Best-effort drain until close()'s deadline; an in-flight request
+            # may delay drop accounting until after close() returns.
+            while remaining := self._collect_batch(0.0):
+                left = _remaining(self._drain_deadline)
+                if left is not None and left < _MIN_POST_BUDGET_S:
+                    dropped += len(remaining)
+                    continue  # keep collecting, only to count
+                try:
+                    self._send(remaining)
+                except _ShutdownDeadline as exc:
+                    dropped += exc.rows
         except Exception:  # noqa: BLE001 — shutdown drain is best-effort
             pass
+        if dropped:
+            _diag("close_dropped", "shutdown deadline passed; dropped %d row(s)", dropped)
 
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
+    # Set per worker by close(); None outside the shutdown drain.
+    _drain_deadline: float | None = None
 
     def _collect_batch(self, wait: float) -> list[DebugLogRow]:
         batch: list[DebugLogRow] = []
         try:
-            batch.append(self._queue.get(timeout=wait) if wait else self._queue.get_nowait())
+            first = self._queue.get(timeout=wait) if wait else self._queue.get_nowait()
         except queue.Empty:
             return batch
+        if first is not _CLOSE_WAKEUP:
+            batch.append(first)
         while len(batch) < _BATCH_MAX_RECORDS:
             try:
-                batch.append(self._queue.get_nowait())
+                item = self._queue.get_nowait()
             except queue.Empty:
                 break
+            if item is not _CLOSE_WAKEUP:
+                batch.append(item)
         return batch
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        # Capture the worker being stopped: a concurrent emit() can revive the
-        # handler during the join and replace self._stop/self._thread.
-        stop, thread = self._stop, self._thread
-        self._closed = True
-        stop.set()
-        thread.join(timeout=5.0)
-        super().close()
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop the sender thread after it drains queued rows.
+
+        :param timeout: Max seconds to wait for the final drain, e.g. ``5.0``.
+            New requests and retries stop at the deadline. An in-flight request
+            can outlive it, so the worker may report dropped rows after this
+            method returns; immediate process exit may lose that diagnostic.
+        """
+        lock = self.lock
+        assert lock is not None
+        with lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._drain_deadline = time.monotonic() + timeout
+            stop, thread, work_queue = self._stop, self._thread, self._queue
+            stop.set()
+            # Wake a worker blocked waiting for rows; never hold the handler
+            # lock while waiting for a potentially slow upload.
+            with contextlib.suppress(queue.Full):
+                work_queue.put_nowait(_CLOSE_WAKEUP)
+            super().close()
+        thread.join(timeout=timeout)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Permanently stop delivery when the process is exiting."""
+        lock = self.lock
+        assert lock is not None
+        with lock:
+            self._terminal = True
+        self.close(timeout=timeout)
 
 
 class ZerobusLogHandler(DebugLogHandler):
@@ -813,14 +1055,28 @@ class ZerobusLogHandler(DebugLogHandler):
             with contextlib.suppress(Exception):
                 client.close()
 
+    def _require_budget(self, batch: list[DebugLogRow]) -> None:
+        left = _remaining(self._drain_deadline)
+        if left is not None and left < _MIN_POST_BUDGET_S:
+            raise _ShutdownDeadline(len(batch))
+
     def _post(self, batch: list[DebugLogRow]) -> None:
+        """POST *batch*, retrying only while ZeroBus cannot have accepted it.
+
+        Once close() sets a deadline, new requests and backoffs use the
+        remaining budget; an in-flight request is not cancelled. Running out
+        raises :class:`_ShutdownDeadline` for the worker to count.
+        """
         payload = json.dumps(batch)
         for attempt in range(3):
-            token = self._tokens.token()
+            self._require_budget(batch)
+            token = self._tokens.token(deadline=self._drain_deadline)
+            self._require_budget(batch)  # a slow mint may have used it up
             if not token:
                 # Mint failed — _mint already logged why; note the data loss.
                 _diag("no_token", "no auth token (mint failing); dropping %d row(s)", len(batch))
                 return
+            deadline = self._drain_deadline
             try:
                 response = self._client.post(
                     self._config.insert_url,
@@ -829,14 +1085,22 @@ class ZerobusLogHandler(DebugLogHandler):
                         "Content-Type": "application/json",
                     },
                     content=payload,
-                    timeout=_HTTP_TIMEOUT_S,
+                    timeout=_bounded_timeout(deadline),
                 )
-            except httpx.HTTPError as exc:
+            except _NOT_SENT_ERRORS as exc:
                 _diag(
                     "post_transport", "insert POST to %s failed: %s", self._config.insert_url, exc
                 )
-                time.sleep(min(0.5 * 2**attempt, 3.0))
+                _bounded_sleep(min(0.5 * 2**attempt, 3.0), self._drain_deadline)
                 continue
+            except httpx.HTTPError as exc:
+                _diag(
+                    "post_unknown",
+                    "insert POST outcome unknown (%s); dropped %d row(s) to avoid duplicates",
+                    exc,
+                    len(batch),
+                )
+                return
             if response.status_code == 200:
                 if not self._delivered_any:
                     self._delivered_any = True
@@ -862,7 +1126,7 @@ class ZerobusLogHandler(DebugLogHandler):
                 response.status_code,
                 _body_snippet(response),
             )
-            time.sleep(min(0.5 * 2**attempt, 3.0))
+            _bounded_sleep(min(0.5 * 2**attempt, 3.0), self._drain_deadline)
         _diag("post_dropped", "dropped %d row(s) after 3 failed insert attempts", len(batch))
 
 
@@ -1090,7 +1354,7 @@ class SseFileHandler(logging.Handler):
 
     def _format_line(self, item: _SseFileItem) -> bytes:
         row = {
-            "ts": datetime.fromtimestamp(item.created, tz=timezone.utc).isoformat(),
+            "ts": datetime.fromtimestamp(item.created, tz=UTC).isoformat(),
             "source": self._source,
             "level": item.level,
             "conversation_id": item.session_id,
@@ -1168,6 +1432,19 @@ def debug_sink_enabled() -> bool:
     return _active_sink is not None and not _active_sink.closed
 
 
+def close_debug_log_sink(timeout: float = 5.0) -> None:
+    """Drain and close the active debug-log sink, if any.
+
+    For processes that leave via ``os._exit`` (zygote-forked children), which
+    skips the ``atexit`` drain and would drop the final batch.
+
+    :param timeout: Max seconds to wait for the drain, e.g. ``2.0``.
+    """
+    sink = _active_sink
+    if sink is not None:
+        sink.shutdown(timeout=timeout)
+
+
 def sse_event_logger() -> logging.Logger:
     """Return the table-only logger for SSE events (see :data:`SSE_LOGGER_NAME`).
 
@@ -1218,7 +1495,7 @@ def attach_debug_log_sink(
                     _active_sink = ZerobusLogHandler(config, source)
                 else:
                     return
-            except Exception:  # noqa: BLE001 — the sink must never break logging setup
+            except Exception:  # the sink must never break logging setup
                 # Handler construction must not take down process logging setup.
                 _logger.warning("debug-log sink disabled: handler init failed", exc_info=True)
                 return
@@ -1293,7 +1570,7 @@ def attach_sse_file_sink(*, source: str, level: int) -> None:
         log_dir = process_log_dir(source)
         try:
             handler = SseFileHandler(log_dir, source)
-        except Exception:  # noqa: BLE001 — the sink must never break logging setup
+        except Exception:  # the sink must never break logging setup
             _logger.warning("SSE file sink disabled: handler init failed", exc_info=True)
             return
         handler.setLevel(level)

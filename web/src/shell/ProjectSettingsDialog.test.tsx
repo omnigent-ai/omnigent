@@ -4,6 +4,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import {
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
@@ -33,7 +38,7 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
     name: "hello",
     display_name: "Hello",
     description: null,
-    harness: null,
+    harness: "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -41,14 +46,13 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ managed_sandboxes_enabled: false, sandbox_provider: null }),
 }));
-// The filesystem browser owns its own data-fetching; stub it to a marker plus
-// a button that reports a navigated path, so we can drive the disclosure and
-// the live workspace update without the host-filesystem plumbing.
+// The filesystem browser owns its own data-fetching; stub its explicit commit
+// action so this suite can drive the shared dialog without filesystem plumbing.
 vi.mock("./WorkspacePicker", () => ({
   isNavigablePath: (p: string) => p.startsWith("/"),
-  WorkspacePicker: ({ onNavigate }: { onNavigate: (p: string) => void }) => (
+  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
     <div data-testid="mock-workspace-picker">
-      <button type="button" onClick={() => onNavigate("/picked/dir")}>
+      <button type="button" onClick={() => onSelect("/picked/dir")}>
         pick dir
       </button>
     </div>
@@ -63,7 +67,14 @@ function renderDialog(projectId: string | null = "p_1") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <ProjectSettingsDialog open onOpenChange={vi.fn()} projectId={projectId} projectName="Work" />
+      <TooltipProvider>
+        <ProjectSettingsDialog
+          open
+          onOpenChange={vi.fn()}
+          projectId={projectId}
+          projectName="Work"
+        />
+      </TooltipProvider>
     </QueryClientProvider>,
   );
 }
@@ -79,7 +90,10 @@ beforeEach(() => {
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 describe("ProjectSettingsDialog", () => {
   it("seeds fields from the project's stored config", async () => {
@@ -249,7 +263,7 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
-  it("opens the working-directory browser, updates the path, then closes on outside click", async () => {
+  it("opens the working-directory dialog and commits the confirmed path", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
     renderDialog();
     // A stored online host makes the working directory browsable — a compact
@@ -257,14 +271,11 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(screen.getByText("Browse…")).toBeInTheDocument());
     expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
 
-    // Expand → the browser mounts; navigating updates the trigger label live.
+    // Open the shared modal; confirming updates the trigger and closes it.
     fireEvent.click(screen.getByText("Browse…"));
     expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
     fireEvent.click(screen.getByText("pick dir"));
     expect(screen.getByText("/picked/dir")).toBeInTheDocument();
-
-    // The click-away backdrop closes the browser, keeping the picked path.
-    fireEvent.click(screen.getByRole("button", { name: /close directory browser/i }));
     expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("project-settings-save"));
@@ -309,7 +320,7 @@ describe("ProjectSettingsDialog", () => {
     );
 
     // Open the agent picker dropdown (Radix opens on pointerdown), then the
-    // "Custom agents" submenu where composed agents are listed.
+    // custom-agent "Other..." submenu where composed agents are listed.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     expect(screen.getByTestId("new-chat-landing-agent-ag_1")).toBeInTheDocument();
@@ -344,7 +355,7 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
     await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
 
-    // Switch the default to a plain bundle agent (under "Custom agents") → the
+    // Switch the default to a plain bundle agent (under "Other...") → the
     // model field goes away.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
@@ -403,7 +414,7 @@ describe("ProjectSettingsDialog", () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
-      config: { agent_id: "ag_claude", model: "opus" },
+      config: { agent_id: "ag_claude", model: "opus", effort: "high" },
     });
     renderDialog();
     await waitFor(() =>
@@ -413,7 +424,357 @@ describe("ProjectSettingsDialog", () => {
     );
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_claude",
+        model: "opus",
+        effort: "high",
+      }),
     );
+  });
+
+  // Effort default: offered beside the model for harnesses with an effort
+  // ladder, stored as `effort`, and dropped when it no longer applies.
+  async function pickSelectOption(testId: string, option: string | RegExp): Promise<void> {
+    fireEvent.pointerDown(screen.getByTestId(testId), { button: 0, pointerType: "mouse" });
+    fireEvent.click(await screen.findByRole("option", { name: option }));
+  }
+
+  const codexAgent = () =>
+    pickerAgent({
+      id: "ag_codex",
+      name: "codex-native-ui",
+      display_name: "Codex",
+      harness: "codex-native",
+    });
+  const ladder = (...efforts: string[]) => efforts.map((reasoningEffort) => ({ reasoningEffort }));
+
+  it("stores a picked effort for Claude Code and hides the field for an agent without one", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-effort")).toBeInTheDocument());
+
+    await pickSelectOption("project-settings-effort", "High");
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", effort: "high" }),
+    );
+
+    // A bundle agent has no create-time effort → no field.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_1"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("project-settings-effort")).not.toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenLastCalledWith("p_1", { agent_id: "ag_1" }));
+  });
+
+  it("treats a malformed stored effort as no default", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", effort: 3 as unknown as string },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default"),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude" }));
+  });
+
+  it("offers Pi's own effort ladder and stores a Pi-only level", async () => {
+    const piAgent = pickerAgent({
+      id: "ag_pi",
+      name: "pi-native-ui",
+      display_name: "Pi",
+      harness: "pi-native",
+    });
+    availableAgentsMock.mockReturnValue({ data: [piAgent] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_pi" } });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-effort")).toBeInTheDocument());
+
+    await pickSelectOption("project-settings-effort", "Minimal");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_pi", effort: "minimal" }),
+    );
+  });
+
+  it("drops a stored Codex effort the loaded ladder lacks, even after a model change", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+    hostModelOptionsMock.mockReturnValue({
+      data: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          supportedReasoningEfforts: ladder("low", "xhigh"),
+        },
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+    });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_codex", model: "gpt-mini", effort: "xhigh" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent("GPT mini"),
+    );
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    expect(screen.getByText(/saved effort \(xHigh\) isn't available/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenLastCalledWith("p_1", {
+        agent_id: "ag_codex",
+        model: "gpt-mini",
+      }),
+    );
+
+    // Switching to a model that has xhigh must not bring the hidden level back.
+    await pickSelectOption("project-settings-model", "GPT-5.5");
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    expect(screen.queryByText(/saved effort/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenLastCalledWith("p_1", {
+        agent_id: "ag_codex",
+        model: "gpt-5.5",
+      }),
+    );
+  });
+
+  it.each([
+    {
+      label: "is cleared",
+      change: () => fireEvent.click(screen.getByRole("button", { name: "Clear" })),
+      saved: {},
+    },
+    {
+      label: "changes",
+      change: () => {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_codex"));
+      },
+      saved: { agent_id: "ag_codex" },
+    },
+  ])("drops the effort default when the default agent $label", async ({ change, saved }) => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", effort: "max" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("Max"),
+    );
+    change();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", saved));
+  });
+
+  it("offers the Codex model's effort ladder and drops an effort the new model lacks", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+    hostModelOptionsMock.mockReturnValue({
+      data: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          isDefault: true,
+          supportedReasoningEfforts: ladder("low", "medium", "high", "xhigh"),
+        },
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+    });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_codex" } });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-effort")).toBeInTheDocument());
+
+    // No model pinned → the catalog default's ladder.
+    await pickSelectOption("project-settings-effort", "xHigh");
+    // A model whose ladder lacks xhigh resets the effort to no default.
+    await pickSelectOption("project-settings-model", "GPT mini");
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    fireEvent.pointerDown(screen.getByTestId("project-settings-effort"), {
+      button: 0,
+      pointerType: "mouse",
+    });
+    expect(screen.queryByRole("option", { name: "xHigh" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("option", { name: "Low" }));
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_codex",
+        model: "gpt-mini",
+        effort: "low",
+      }),
+    );
+  });
+
+  it.each([
+    { label: "the catalog is unavailable, plain save", catalog: [], clearModel: false },
+    { label: "the catalog is unavailable, model cleared", catalog: [], clearModel: true },
+    {
+      label: "the catalog lists neither model nor a default, model cleared",
+      catalog: [
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+      clearModel: true,
+    },
+  ])(
+    "keeps a stored Codex effort while its ladder is unknown ($label)",
+    async ({ catalog, clearModel }) => {
+      availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+      hostModelOptionsMock.mockReturnValue({ data: catalog });
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { agent_id: "ag_codex", model: "gpt-5.5", effort: "high" },
+      });
+      renderDialog();
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High"),
+      );
+      if (clearModel) await pickSelectOption("project-settings-model", "No default");
+      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High");
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          agent_id: "ag_codex",
+          ...(clearModel ? {} : { model: "gpt-5.5" }),
+          effort: "high",
+        }),
+      );
+    },
+  );
+
+  // The project's last start (remembered in this browser) fills the fields, so
+  // the dialog shows what the project's next session opens with.
+  it("fills the fields from the project's last start and saves them as the settings", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults(
+      "p_1",
+      {
+        agentId: "ag_claude",
+        pickedHarness: null,
+        harness: "claude-native",
+        harnessOptions: { model: "opus", effort: "high", mode: "default" },
+        hostId: "h1",
+        workspace: "/repo-b",
+      },
+      { agent_id: "ag_1" },
+    );
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent(/opus/i),
+    );
+    expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_claude",
+        host_id: "h1",
+        workspace: "/repo-b",
+        model: "opus",
+        effort: "high",
+      }),
+    );
+  });
+
+  it("keeps the stored agent when the last start's agent no longer exists", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults("p_1", { agentId: "ag_gone", hostId: "h1" }, { agent_id: "ag_1" });
+    renderDialog();
+
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1", host_id: "h1" }),
+    );
+  });
+
+  it("replaces the last start even when the saved settings match the stored ones", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults(
+      "p_1",
+      { agentId: "ag_claude", pickedHarness: null },
+      { agent_id: "ag_1" },
+    );
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+
+    // Restore the stored agent, so the saved settings match the stored ones.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_1"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1" }));
+    await waitFor(() => expect(readProjectLaunchDefaults("p_1", { agent_id: "ag_1" })).toBeNull());
+  });
+
+  it("saves a last-start agent still resolving with its own model and effort", async () => {
+    // Discovery so far holds only catalog rows, without the remembered agent.
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()], isPlaceholderData: true });
+    const stored = { agent_id: "ag_claude", model: "opus", effort: "low" };
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: stored });
+    writeProjectLaunchDefaults(
+      "p_1",
+      {
+        agentId: "ag_custom",
+        harness: "claude-native",
+        harnessOptions: { model: "sonnet", effort: "high" },
+      },
+      stored,
+    );
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_custom",
+        model: "sonnet",
+        effort: "high",
+      }),
+    );
+  });
+
+  it("leaves the last start in place when the filled-in dialog is cancelled", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    const launch = { agentId: "ag_1", hostId: "h1", workspace: "/repo-b" };
+    writeProjectLaunchDefaults("p_1", launch, {});
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(readProjectLaunchDefaults("p_1", {})).toEqual(launch);
   });
 });

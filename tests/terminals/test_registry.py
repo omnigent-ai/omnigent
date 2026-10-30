@@ -301,6 +301,7 @@ async def test_launch_replaces_stale_running_entry(
     assert result is created
     assert stale.closed is True
     assert reg.get("conv_x", "shell", "s1") is created
+    assert created.lifecycle_trace.session_id == "conv_x"
 
 
 def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:

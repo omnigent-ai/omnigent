@@ -15,12 +15,18 @@
 #   success  | success  | all required checks green
 #   failure  | failure  | a required check is red
 #
-# Env in: EVAL, FAILED
-# Out:    state, short_desc, long_desc on $GITHUB_OUTPUT
+# Env in: EVAL, FAILED, DEPENDENCY_EVAL, DEPENDENCY_REQUIRED, POST_RED
+# Out:    state, short_desc, long_desc, post_status on $GITHUB_OUTPUT
 
 set -euo pipefail
 
-if [[ "$EVAL" == "success" ]]; then
+DEPENDENCY_FAILED=false
+if [[ "$DEPENDENCY_REQUIRED" != "false" && "$DEPENDENCY_EVAL" != "success" ]]; then
+  DEPENDENCY_FAILED=true
+  FAILED+=$'\n- Dependency policy/reports (see Evaluate dependency reports)\n'
+fi
+
+if [[ "$EVAL" == "success" && "$DEPENDENCY_FAILED" == "false" ]]; then
   STATE=success
   SHORT="All required checks green"
   LONG=":white_check_mark: gate is green, merging now."
@@ -29,6 +35,12 @@ else
   SHORT="Required checks not all green"
   LONG=$':hourglass: gate not green yet. Required checks not satisfied:\n\n'"$FAILED"$'\nThe merge will fire once these turn green.'
 fi
+
+POST_STATUS=false
+if [[ "$STATE" == "success" || "$POST_RED" == "true" || "$DEPENDENCY_FAILED" == "true" ]]; then
+  POST_STATUS=true
+fi
+echo "post_status=$POST_STATUS" >> "$GITHUB_OUTPUT"
 
 # GitHub commit-status descriptions max out at 140 chars.
 if [[ ${#SHORT} -gt 140 ]]; then

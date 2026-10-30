@@ -39,6 +39,7 @@ import {
   slashCommandEchoText,
   structuredErrorFields,
 } from "./blocks";
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import { routingExtras } from "./routingDecision";
 import type { Response } from "./types";
@@ -259,9 +260,13 @@ function* closeReasoning(state: ReducerState): Generator<AnyBlock> {
  * `TextDone.ctx.itemId` so renderers can correlate the streamed text
  * back to its persisted item. `null` when the closure is fired by a
  * non-message boundary (tool call, terminal event without a preceding
- * message_done).
+ * message_done). `phase` is that message's harness label, when present.
  */
-function* closeText(state: ReducerState, itemId: string | null = null): Generator<AnyBlock> {
+function* closeText(
+  state: ReducerState,
+  itemId: string | null = null,
+  phase?: AssistantMessagePhase,
+): Generator<AnyBlock> {
   if (!state.inText) return;
   if (state.accumulated) {
     yield {
@@ -276,6 +281,7 @@ function* closeText(state: ReducerState, itemId: string | null = null): Generato
     ctx: ctx(state, itemId),
     fullText: state.fullText,
     hasCodeBlocks: state.fullText.includes("```"),
+    ...(phase !== undefined ? { phase } : {}),
   } satisfies TextDone;
   state.inText = false;
   state.fullText = "";
@@ -621,7 +627,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
 
     // ── Native tools ────────────────────────────────
     case "native_tool_call": {
-      adoptResponseIdIfUnset(state, event.responseId);
+      if (event.toolType !== "subagent_activity") adoptResponseIdIfUnset(state, event.responseId);
       yield {
         type: "native_tool",
         ctx: ctx(state, event.itemId || null, event.responseId || null),
@@ -706,13 +712,21 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // either empty or carries the previous turn's id, so isResponseSwitch
       // spuriously fires for an in-fact same-response message_done.
       const accumulatedFromDeltas = state.fullText;
+      const text = outputTextFromMessageContent(event.content);
+      // A switch whose content equals the closing deltas is that same message
+      // (see the dedup below), so it keeps the event's item id and phase.
+      const closesSameMessage = !isResponseSwitch || text === accumulatedFromDeltas;
 
       // Close prior blocks under the OLD responseId before stamping the new one.
       yield* closeReasoning(state);
       if (hadOpenText) {
-        // On a response switch, event.itemId belongs to the new message — don't
-        // attach it to the old text block being closed.
-        yield* closeText(state, isResponseSwitch ? null : event.itemId || null);
+        // On a genuine response switch, event.itemId belongs to the new message —
+        // don't attach it to the old text block being closed.
+        yield* closeText(
+          state,
+          closesSameMessage ? event.itemId || null : null,
+          closesSameMessage ? event.phase : undefined,
+        );
       }
 
       // A message_done with a new id is a genuine turn transition (the
@@ -732,8 +746,6 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // avoid duplication. Response-switch: emit event.content as the new body.
       if (hadOpenText && !isResponseSwitch) return;
 
-      const text = outputTextFromMessageContent(event.content);
-
       // Race-safe dedup: even on a perceived response switch, if the deltas
       // that just closed accumulated EXACTLY the text in ``event.content``,
       // both belong to the same response and emitting a second ``text_done``
@@ -748,6 +760,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           ctx: ctx(state, event.itemId || null),
           fullText: text,
           hasCodeBlocks: text.includes("```"),
+          ...(event.phase !== undefined ? { phase: event.phase } : {}),
         } satisfies TextDone;
       }
       return;
@@ -820,6 +833,8 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
     }
 
     case "error": {
+      const agentName =
+        !event.responseId || event.responseId === state.responseId ? state.agent : null;
       // Pass `code` through too — renderers need it as a fallback
       // label when `message` is empty (otherwise the error panel
       // shows just `[llm]` with no hint as to what went wrong).
@@ -830,7 +845,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         source: event.source,
         code: event.error.code,
         ...(event.error.level ? { level: event.error.level } : {}),
-        ...structuredErrorFields(event.error),
+        ...structuredErrorFields({ ...event.error, source: event.source }, agentName),
       } satisfies ErrorBlock;
       return;
     }
@@ -857,13 +872,20 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // Without this, a policy DENY that fires before any text
       // delta leaves the user staring at an empty bubble.
       if (event.type === "response_failed" && event.response.error) {
+        const agentName =
+          event.response.model.trim() ||
+          (!event.response.id || event.response.id === state.responseId ? state.agent : null);
+        const code = event.response.error.code ?? "response_failed";
         yield {
           type: "error",
           ctx: ctx(state),
           message: event.response.error.message ?? "",
-          source: "",
-          code: event.response.error.code ?? "response_failed",
-          ...structuredErrorFields(event.response.error),
+          source: event.source ?? "",
+          code,
+          ...structuredErrorFields(
+            { ...event.response.error, code, source: event.source },
+            agentName,
+          ),
         } satisfies ErrorBlock;
       }
       yield {
@@ -904,6 +926,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
             ? ctx(state, null, `${ELICITATION_RESPONSE_PREFIX}${event.elicitationId}`)
             : ctx(state),
         elicitationId: event.elicitationId,
+        ...(event.nativeDelivery ? { nativeDelivery: event.nativeDelivery } : {}),
         targetSessionId: event.targetSessionId,
         message: event.message,
         phase: event.phase,
@@ -918,8 +941,10 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
         allowAutoMode: event.allowAutoMode,
+        permissionDirectories: event.permissionDirectories,
         rememberScope: event.rememberScope,
         codexPersistModes: event.codexPersistModes,
+        agyPermission: event.agyPermission,
       } satisfies ElicitationBlock;
       return;
     }

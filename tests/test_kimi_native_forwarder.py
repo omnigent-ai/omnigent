@@ -3095,20 +3095,23 @@ class TestForwardLoopUsage:
         home = tmp_path / "home"
         bridge = tmp_path / "bridge"
         bridge.mkdir()
-        now_ms = int(time.time() * 1000)
-        # History includes rows only 9s and 1ms before launch — inside the
-        # discovery mtime skew, which must NOT leak into billing.
+        # ``_discover_wire`` skips a wire whose mtime predates the launch
+        # epoch, so the epoch trails "now" by seconds: pinned to the write
+        # instant, clock/mtime jitter hid the wire and the loop never posted.
+        launch_epoch_ms = int(time.time() * 1000) - 5_000
+        # Rows sit seconds either side of the epoch, so the billing floor
+        # holds without millisecond-accurate wall-clock ordering.
         _loop_wire(
             home,
             [
-                _usage_row(input_other=90000, output=9000, time_ms=now_ms - 9_000),
-                _usage_row(input_other=99999, output=9999, time_ms=now_ms - 1),
+                _usage_row(input_other=90000, output=9000, time_ms=launch_epoch_ms - 60_000),
+                _usage_row(input_other=99999, output=9999, time_ms=launch_epoch_ms - 1_000),
                 {
                     "type": "turn.prompt",
                     "input": [{"type": "text", "text": "hi"}],
                     "origin": {"kind": "user"},
                 },
-                _usage_row(input_other=11, output=2, time_ms=now_ms),
+                _usage_row(input_other=11, output=2, time_ms=launch_epoch_ms + 1_000),
             ],
         )
         client = _FakeAsyncClient()
@@ -3118,7 +3121,7 @@ class TestForwardLoopUsage:
             bridge_dir=bridge,
             home=home,
             client=client,
-            launch_epoch_ms=now_ms,
+            launch_epoch_ms=launch_epoch_ms,
             until=lambda: any(b["type"] == "external_session_usage" for b in client.posts),
         )
 

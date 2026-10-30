@@ -12,13 +12,20 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { sessionActionRestrictions, type SessionActionSource } from "@/lib/sessionCapabilities";
+
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: (_id: string, source: SessionActionSource) =>
+    sessionActionRestrictions(source),
+}));
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -74,71 +81,51 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-    variables: undefined,
-  }),
-  // Reactive server pinned set: subscribes to the hoisted store so a toggle
-  // re-renders, mapping pinned ids onto the loaded conversations.
-  usePinnedConversations: () => {
-    const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
-    const idSet = new Set(ids);
-    return {
-      data: {
-        conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
-        filterHonored: true,
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    usePinnedConversations: () => {
+      const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
+      const idSet = new Set(ids);
+      return {
+        data: {
+          conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+          filterHonored: true,
+        },
+        isSuccess: true,
+      };
+    },
+    useTogglePinnedConversation: () => ({
+      mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
+        mocks.pinnedStore.toggle(id, pinned),
+      // Unpin goes through mutateAsync so the Undo pill waits for the write.
+      mutateAsync: ({ id, pinned }: { id: string; pinned: boolean }) => {
+        mocks.pinnedStore.toggle(id, pinned);
+        return Promise.resolve({});
       },
-      isSuccess: true,
-    };
-  },
-  useTogglePinnedConversation: () => ({
-    mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      mocks.pinnedStore.toggle(id, pinned),
-  }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => mocks.rename,
-  useLeaveSession: () => mocks.leave,
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({
-    data: mocks.projects.map((name: string) => ({
-      id: `p_${name}`,
-      name,
-      icon: mocks.projectIcons[name],
-    })),
-  }),
-  // A non-empty `useProjects` renders a project folder, which queries its
-  // sessions — return the collapsed (disabled) shape so the folder is inert
-  // (this suite keeps its test row unfiled; the picker only needs the name).
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  }),
-  useMoveToProject: () => mocks.moveToProject,
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+    }),
+    useRenameConversation: () => mocks.rename,
+    useLeaveSession: () => mocks.leave,
+    useProjects: () => ({
+      data: mocks.projects.map((name: string) => ({
+        id: `p_${name}`,
+        name,
+        icon: mocks.projectIcons[name],
+      })),
+    }),
+    useProjectSessions: () => ({
+      data: undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+    }),
+    useMoveToProject: () => mocks.moveToProject,
+  };
+});
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this
 // test stays scoped to the conversation row.
@@ -331,21 +318,15 @@ describe("quick pin/unpin hover button", () => {
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
-    // The folder-header pencil + kebab share the right-edge column with the
-    // session-row kebab, so they must be the same compact `icon-xs` (size-6)
-    // button — not the larger `icon-sm` (size-7) — or their glyphs sit in
-    // different columns and read as misaligned.
+    // Project and session menu buttons share the same compact right-edge slot.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const projectActions = screen.getByTestId("project-actions");
-    const projectNewSession = screen.getByTestId("project-new-session");
-    for (const button of [projectActions, projectNewSession]) {
-      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
-      expect(button).not.toHaveClass("size-7");
-      expect(button.querySelector("svg")).toHaveClass("size-3.5");
-      expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
-    }
+    expect(projectActions).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+    expect(projectActions).not.toHaveClass("size-7");
+    expect(projectActions.querySelector("svg")).toHaveClass("size-3.5");
+    expect(projectActions.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
     // Same compact size as the session-row kebab it aligns with.
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });
@@ -365,6 +346,15 @@ describe("quick pin/unpin hover button", () => {
       expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
       expect(button).not.toHaveClass("size-7");
     }
+  });
+
+  it("tints the new-project icon selector with the active theme accent", () => {
+    renderSidebar();
+    fireEvent.click(screen.getByTestId("new-project"));
+
+    const iconSelector = screen.getByTestId("new-project-icon");
+    expect(iconSelector).toHaveClass("bg-primary/10");
+    expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
   });
 
   it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
@@ -440,6 +430,17 @@ describe("quick pin/unpin hover button", () => {
     // Clicking again unpins: the Pinned section disappears.
     fireEvent.click(screen.getByTestId("quick-pin-conversation"));
     expect(screen.queryByText("Pinned")).toBeNull();
+  });
+
+  it.each([
+    ["quick-pin-conversation", "Pin"],
+    ["quick-archive-conversation", "Archive"],
+  ])("shows the %s action in a styled tooltip on hover", async (testId, label) => {
+    const user = userEvent.setup();
+    renderSidebar();
+
+    await user.hover(screen.getByTestId(testId));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
   });
 
   it("also offers Pin in the kebab menu (mobile affordance) and toggles the same pin state", () => {
@@ -678,6 +679,83 @@ describe("double-click to rename", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("rename under the iOS soft keyboard", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Stub the iOS shell on an 844px layout. The returned function raises the
+   * keyboard through UIKit's keyboard-viewport bridge or, for shells without
+   * it, through WebKit's shrinking visualViewport.
+   */
+  function stubIOSShell(source: "native" | "visualViewport"): (visibleHeight: number) => void {
+    const viewport = Object.assign(new EventTarget(), { height: 844, offsetTop: 0 });
+    let nativeViewport: { width: number; height: number } | null = null;
+    const nativeListeners = new Set<() => void>();
+    vi.stubGlobal("innerHeight", 844);
+    vi.stubGlobal("visualViewport", viewport);
+    vi.stubGlobal("omnigentNative", {
+      kind: "ios",
+      ...(source === "native" && {
+        getKeyboardViewport: () => nativeViewport,
+        onKeyboardViewportChanged: (callback: () => void) => {
+          nativeListeners.add(callback);
+          return () => nativeListeners.delete(callback);
+        },
+      }),
+    });
+    return (visibleHeight) => {
+      act(() => {
+        if (source === "native") {
+          nativeViewport = { width: window.innerWidth, height: visibleHeight };
+          nativeListeners.forEach((callback) => callback());
+        } else {
+          viewport.height = visibleHeight;
+          viewport.dispatchEvent(new Event("resize"));
+        }
+      });
+    };
+  }
+
+  it.each(["native", "visualViewport"] as const)(
+    "re-centers the focused rename field once the %s keyboard inset shrinks the list",
+    (source) => {
+      // The field focuses (raising the keyboard) while still visible; the
+      // drawer's keyboard-inset padding then shrinks the list underneath it.
+      const openKeyboard = stubIOSShell(source);
+      renderSidebar();
+      fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+      const input = screen.getByTestId("rename-conversation-input");
+      expect(input).toHaveFocus();
+      const scrollIntoView = vi.fn();
+      input.scrollIntoView = scrollIntoView;
+
+      openKeyboard(508);
+
+      expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveStyle({
+        paddingBottom: "336px",
+      });
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+    },
+  );
+
+  it("re-centers a rename field that opens while the keyboard is already up", () => {
+    const openKeyboard = stubIOSShell("native");
+    renderSidebar();
+    openKeyboard(508);
+    const scrollIntoView = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+
+    const input = screen.getByTestId("rename-conversation-input");
+    expect(input).toHaveFocus();
+    expect(scrollIntoView.mock.contexts).toContain(input);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
   });
 });
 
@@ -1144,6 +1222,18 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("keeps Fork visible but unavailable for a managed source", () => {
+    mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByRole("menu")).toHaveClass("menu-surface");
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
+
   it("opens the fork dialog for the selected session", () => {
     renderSidebar();
 
@@ -1155,6 +1245,17 @@ describe("right-click context menu", () => {
       "conv_1",
     );
   });
+
+  it.each(["quick-pin-conversation", "quick-archive-conversation", "conversation-actions"])(
+    "opens the session menu when right-clicking the %s button",
+    (testId) => {
+      renderSidebar();
+
+      expect(fireEvent.contextMenu(screen.getByTestId(testId))).toBe(false);
+
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    },
+  );
 
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();

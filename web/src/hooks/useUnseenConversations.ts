@@ -262,6 +262,42 @@ export function markConversationSeen(conversationId: string, atSeconds?: number)
 }
 
 /**
+ * Seed just below the conversation timestamp without setting an explicit-unread
+ * override, so opening the conversation clears it. A read at or after
+ * `updatedAt` is newer than this completion and is kept.
+ */
+export function seedRunUnreadBaseline(conversationId: string, updatedAt: number): void {
+  const stored = lastSeenMap[conversationId];
+  if (stored !== undefined && stored >= updatedAt) return;
+  lastSeenMap[conversationId] = updatedAt - 1;
+  persistToStorage();
+  notifySubscribers();
+}
+
+/**
+ * Unread state for a conversation whose read state the server sent outside the
+ * session list, e.g. with an automation's run history. Uses the sidebar's merge:
+ * the newer of this client's and the server's last-seen. When this client has
+ * read state, the server's unread flag is ignored: it may predate a read made
+ * here since that snapshot. Without local read state, the flag applies.
+ */
+export function isConversationUnread(
+  conversationId: string,
+  updatedAt: number,
+  status: string | undefined,
+  server: { lastSeen: number | null; unread: boolean | null },
+): boolean {
+  if (explicitlyUnread.has(conversationId)) return true;
+  const local = lastSeenMap[conversationId];
+  const serverLastSeen = server.lastSeen ?? undefined;
+  if (local === undefined) {
+    return server.unread === true || isUnseenSince(serverLastSeen, updatedAt, status);
+  }
+  const baseline = serverLastSeen === undefined ? local : Math.max(local, serverLastSeen);
+  return isUnseenSince(baseline, updatedAt, status);
+}
+
+/**
  * Forces a conversation back to "unseen" — the inverse of
  * {@link markConversationSeen}, backing the kebab's "Mark as unread".
  * The dot's condition is `updated_at > stored`, so the baseline is
@@ -309,16 +345,18 @@ export function markConversationRead(conversationId: string, updatedAt: number):
  * Subscribes the caller to read-state mirror writes and returns the current
  * write version, so a component re-renders (and recomputes
  * `isConversationUnseen`) the instant the user marks a row read/unread — not
- * on the next conversations poll.
+ * on the next conversations poll. When disabled, returns 0 without subscribing.
  */
-export function useUnseenTick(): number {
+export function useUnseenTick(enabled = true): number {
+  const version = () => (enabled ? writeVersion : 0);
   return useSyncExternalStore(
     (onChange) => {
+      if (!enabled) return () => {};
       subscribers.add(onChange);
       return () => subscribers.delete(onChange);
     },
-    () => writeVersion,
-    () => writeVersion,
+    version,
+    version,
   );
 }
 
@@ -356,10 +394,17 @@ export function isConversationUnseen(
   updatedAt: number,
   status: string | undefined,
 ): boolean {
+  return isUnseenSince(lastSeenMap[conversationId], updatedAt, status);
+}
+
+function isUnseenSince(
+  baseline: number | undefined,
+  updatedAt: number,
+  status: string | undefined,
+): boolean {
   if (status === "running" || status === undefined) return false;
-  const stored = lastSeenMap[conversationId];
-  if (stored === undefined) return false;
-  return updatedAt > stored;
+  if (baseline === undefined) return false;
+  return updatedAt > baseline;
 }
 
 /** True when the app window currently has focus (SSR-safe default true). */

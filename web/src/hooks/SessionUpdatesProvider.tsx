@@ -32,6 +32,7 @@ import {
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  filtersFromProjectQueryKey,
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
@@ -46,12 +47,6 @@ import { isTempConvId } from "@/lib/tempConversationId";
 // action. 250 ms is short enough to feel live, long enough to batch the
 // flurry of cache writes a single frame can trigger.
 const DEBOUNCE_MS = 250;
-
-// A project folder's ["project-sessions", <name>] query is always the
-// non-archived, unsearched slice of that project (see useProjectSessions).
-// Live frames overlay those caches with these fixed filters so archived rows
-// drop out the same way they do from the default sidebar list.
-const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
 
 /**
  * Overlay wire items onto every cached `["conversations", ...]` variant.
@@ -119,9 +114,8 @@ function applyItemsToCache(
   // Each project folder fetches its own ["project-sessions", <name>] list, so
   // streamed field updates (pending_elicitations_count → "Needs response",
   // status, runner_online, …) must overlay those caches too — otherwise a
-  // filed session's row stays frozen at fetch time. Folders are non-archived,
-  // unsearched lists; an archived/label-changed row converges via the
-  // debounced ["project-sessions"] invalidation the caller schedules.
+  // filed session's row stays frozen at fetch time. Each unsearched folder
+  // cache retains its own live or archived slice.
   const projectEntries = queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   });
@@ -130,7 +124,7 @@ function applyItemsToCache(
       data: next,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, activeId);
+    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key), activeId);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);
@@ -196,6 +190,7 @@ function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
 export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const sidebarData = useContext(SidebarDataContext);
+  const identityReady = sidebarData?.identityReady ?? true;
   const sidebarIds = sidebarData?.watchedIds;
   const sidebarIdsRef = useRef(sidebarIds);
   sidebarIdsRef.current = sidebarIds;
@@ -291,6 +286,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // anyway). The session list itself is NOT gated on the modal (it populates the
   // map the modal reads; gating it on the modal would deadlock).
   useEffect(() => {
+    if (!identityReady) return;
     let cacheUnsub: (() => void) | null = null;
     const tryResolveAndStart = (): boolean => {
       const succeeded = queryClient
@@ -475,7 +471,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       if (watchTimer !== null) clearTimeout(watchTimer);
       sessionUpdatesSocket.stop();
     };
-  }, [queryClient, pushWatched]);
+  }, [identityReady, queryClient, pushWatched]);
 
   return children;
 }

@@ -30,7 +30,6 @@ import contextlib
 import json
 import os
 import signal
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +40,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -59,13 +59,6 @@ _DB_PASSWORD = "s3cretpw-hunter2"
 _ENV_PREFIXES_TO_CLEAR = ("DATABRICKS_", "ANTHROPIC_", "OPENAI_", "OMNIGENT_")
 
 _TXN_KEYWORDS = {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"}
-
-
-def _free_port() -> int:
-    """Bind port 0 and return the OS-assigned free TCP port."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _make_d1_emulator(db_path: Path) -> ThreadingHTTPServer:
@@ -205,7 +198,7 @@ def test_server_startup_banner_does_not_print_db_password(tmp_path: Path) -> Non
     home.mkdir()
 
     db_uri = f"cloudflare_d1://omnigent:{_DB_PASSWORD}@omnigentdb"
-    server_port = _free_port()
+    server_port = find_free_port()
     log_path = tmp_path / "server-stdout.log"
 
     proc: subprocess.Popen[bytes] | None = None

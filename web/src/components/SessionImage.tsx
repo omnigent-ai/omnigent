@@ -17,21 +17,10 @@ export interface SessionImageProps {
   className?: string;
 }
 
-/**
- * Fixed-height box every inline preview renders into, reserved before the bytes
- * arrive and unchanged once they land. The chat scroller runs with
- * `overflow-anchor: none` (history prepends own the anchoring) and its
- * resize-compensating observer is iOS-only, so an image that grew on decode
- * would shove the transcript down under the reader with nothing to absorb it.
- */
-const PREVIEW_BOX = "flex h-64 max-w-full shrink-0 items-center justify-center";
+// Size the box to the image so short screenshots don't leave empty rows.
+const PREVIEW_BOX = "flex max-w-full shrink-0 items-start justify-center";
 
-/**
- * Cap on the image itself, in the same absolute unit as the box's height so the
- * two can't drift apart. It has to be absolute rather than `max-h-full`: the
- * lightbox wraps the image in an auto-height button, and a percentage height
- * resolves against that wrapper, leaving a tall image free to overflow the box.
- */
+// An absolute cap also constrains images inside the auto-height zoom button.
 const PREVIEW_IMAGE = "max-h-64 max-w-full";
 
 /** Placeholder width, so the box holds a slot on the row before its image lands. */
@@ -71,8 +60,7 @@ export function SessionImage({ path, alt, className }: SessionImageProps) {
   // Host config is installed once at embed startup and never changes, so it's
   // safe to branch on it before any hooks. Hooks live in the embedded child.
   if (!getOmnigentHostConfig().fetcher) {
-    // Same reserved box and failure chip as a transcript-carried image; only the
-    // source differs, so the two must not drift apart.
+    // Share sizing and error handling with transcript-carried images.
     return <InlineImage src={path ? withBasePath(path) : path} alt={alt} className={className} />;
   }
   return <EmbeddedSessionImage path={path} alt={alt} className={className} />;
@@ -82,14 +70,8 @@ export function SessionImage({ path, alt, className }: SessionImageProps) {
  * Preview for an image the browser can load straight from `src`: a `data:` URI
  * the transcript carries, or a same-origin session file path.
  *
- * Owns the reserved box and the failure chip for both, so a sizing or loading
- * fix lands on every direct-`<img>` preview at once. `src` may be undefined
- * while a session is still resolving; the box holds its place until it lands.
- *
- * Only a corrupt `data:` URI collapses to the chip — its bytes are the source,
- * so the failure is final. A fetched path can fail transiently (blocked or
- * slow bytes), and swapping its reserved box for a chip would shift everything
- * below it mid-read; that box stays reserved.
+ * Shares sizing and failure handling with same-origin session images.
+ * Only corrupt data URIs collapse to a chip; fetched paths can fail transiently.
  */
 export function InlineImage({
   src,
@@ -105,7 +87,7 @@ export function InlineImage({
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
 
   // A truncated or corrupt `data:` URI decodes to nothing; showing the chip
-  // keeps it out of the reserved box and off the lightbox.
+  // keeps it off the lightbox.
   if (src !== undefined && failedSrc === src) {
     return <UnavailableImage alt={alt} className={className} />;
   }
@@ -122,7 +104,7 @@ export function InlineImage({
         decoding="async"
         // An absent src never resolved, so nothing has failed yet — latching
         // here would strand the slot on a chip once the path arrives. A
-        // non-data src keeps its reserved box on error (see the doc comment).
+        // non-data src remains available for retry on error.
         onError={() => {
           if (src !== undefined && src.startsWith("data:")) setFailedSrc(src);
         }}

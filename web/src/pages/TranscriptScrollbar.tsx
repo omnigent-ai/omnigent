@@ -36,11 +36,11 @@ export interface TranscriptScrollbarDragDetail {
 /**
  * Smallest scroll range worth a thumb. Fractional content heights round into
  * `scrollHeight`, and LatestTurnSpacer's 1px write-hysteresis can leave the
- * document a couple of pixels taller than the viewport — painting a thumb for
- * that noise advertises hidden content that does not exist. The trade: a real
- * range under 4px also goes unindicated — imperceptible at these sizes.
+ * document eight pixels taller than the viewport — painting a thumb for that
+ * noise advertises hidden content that does not exist. The trade: a real
+ * range under 9px also goes unindicated — imperceptible at these sizes.
  */
-const MIN_SCROLL_RANGE_PX = 4;
+const MIN_SCROLL_RANGE_PX = 9;
 /** Track inset from the top, clearing the ChatHeader overlay's controls. */
 const TRACK_TOP_PX = 64;
 const TRACK_BOTTOM_PX = 12;

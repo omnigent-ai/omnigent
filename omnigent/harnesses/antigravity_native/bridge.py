@@ -10,14 +10,19 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent.native import native_bridge_common
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 _logger = logging.getLogger(__name__)
 
@@ -32,6 +37,7 @@ _STATE_FILE = "state.json"
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 # Prefix of the launcher-minted placeholder conversation id (see
 # ``antigravity_native._mint_agy_conversation_id``). agy mints its own real
@@ -179,9 +185,8 @@ class AntigravityNativeBridgeState:
         There is intentionally no durable read cursor. The retired transcript
         forwarder persisted a ``forwarded_steps`` set (+ a ``forwarded_step_index``
         mirror) so a tail (re)start did not re-mirror the whole JSONL. The RPC read
-        driver that superseded it (:mod:`omnigent.harnesses.antigravity_native.reader`) keeps
-        an *in-memory* seen-set only and is recreated per session by the runner, so
-        no on-disk cursor is needed. Legacy ``forwarded_step_index`` /
+        driver uses an in-memory seen-set within a run and stable item source ids
+        for server-side deduplication across restarts. Legacy ``forwarded_step_index`` /
         ``forwarded_steps`` keys in an on-disk ``state.json`` are tolerated and
         ignored on read.
 
@@ -258,16 +263,62 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 
 def prune_orphaned_bridge_dirs() -> int:
     """
-    Remove antigravity-native bridge dirs whose owner process is provably dead.
+    Remove inactive antigravity-native bridge dirs whose owner is provably dead.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    agy keeps the session's conversation store inside the bridge dir (see
+    :func:`agy_gemini_dir`), and a runner restart is a normal resume boundary,
+    so owner death alone cannot imply that the bridge is disposable. Keep the
+    whole bridge for 7 days after its latest bridge preparation or conversation
+    activity, then remove it intact.
+    Explicit session deletion remains immediate. Global maintenance calls this via
+    ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(bridge_root())
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(),
+        should_prune=_agy_orphan_retention_expired,
+    )
+
+
+def _agy_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Return whether a dead-owner agy bridge has been inactive for 7 days."""
+    activity_cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
+    owner_marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
+    try:
+        if owner_marker.stat().st_mtime > activity_cutoff:
+            return False
+    except OSError:
+        return False
+
+    conversations_dir = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    try:
+        conversations_mode = conversations_dir.stat().st_mode
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    # A non-directory at the store path holds no conversation history, so treat
+    # it like a missing store rather than leaking the bridge forever.
+    if not stat.S_ISDIR(conversations_mode):
+        return True
+
+    # Each conversation is ``<id>.db`` plus SQLite ``-wal``/``-shm`` sidecars; in
+    # WAL mode the sidecar, not the main file, carries the latest write.
+    try:
+        for filename in os.listdir(conversations_dir):
+            if not filename.endswith((".db", ".db-wal", ".db-shm")):
+                continue
+            try:
+                if (conversations_dir / filename).stat().st_mtime > activity_cutoff:
+                    return False
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+    except OSError:
+        return False
+    return True
 
 
 # ── Omnigent MCP relay wiring (sys_* tools) ──────────────────────────────────
@@ -762,7 +813,9 @@ _AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
 _AGY_MODEL_PROVIDER_SETTING = "modelProvider"
 
 
-def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+def ensure_agy_feedback_survey_disabled(
+    home: Path, *, launch_env: dict[str, str] | None = None
+) -> None:
     """
     Disable agy's feedback survey in the launch HOME's ``settings.json``.
 
@@ -784,6 +837,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     :param home: The HOME agy launches under (the per-session isolated home, or
         the real home when the harness runs agy under it). Settings live at
         ``<home>/.gemini/antigravity-cli/settings.json``.
+    :param launch_env: Resolved child environment; None uses the current process.
     :returns: None.
     """
     # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
@@ -834,7 +888,8 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             return
         data = loaded
     desired: dict[str, object] = {_AGY_FEEDBACK_SURVEY_SETTING: False}
-    if (os.environ.get("GEMINI_API_KEY") or "").strip():
+    environment = os.environ if launch_env is None else launch_env
+    if (environment.get("GEMINI_API_KEY") or "").strip():
         desired[_AGY_MODEL_PROVIDER_SETTING] = "gemini"
     provider_removed = False
     current_provider = data.get(_AGY_MODEL_PROVIDER_SETTING)
@@ -1801,3 +1856,14 @@ def send_interaction_keys_via_tui(
             "the agy terminal is no longer running (the TUI exited); restart the session"
         )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: agy's input footer is rendered (idle or mid-turn).
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live terminal; the watcher already captured its pane.
+    """
+    del session_id
+    pane = instance.last_pane_text() or ""
+    return _AGY_IDLE_MARKER in pane or _AGY_ACTIVE_MARKER in pane

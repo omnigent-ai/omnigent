@@ -36,6 +36,20 @@ export interface RememberScope {
 export type CodexPersistMode = "session" | "always";
 
 /**
+ * Antigravity (agy) permission-prompt details the approval card must
+ * surface to match agy's own TUI prompt. ``actionDescription`` is what
+ * agy says it wants to do (e.g. "Running pwd command");
+ * ``alwaysAllowPattern`` is the persist pattern agy's prompt offers to
+ * always-allow, when it offers one. Shared by the elicitation event
+ * (`events.ts`), the reduced block (`blocks.ts`), and the ApprovalCard
+ * that renders the description and the "Always allow" button.
+ */
+export interface AgyPermission {
+  actionDescription: string | null;
+  alwaysAllowPattern: string | null;
+}
+
+/**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at
  * POST time (the transcript forwarder is the single writer), so the
@@ -260,6 +274,7 @@ export interface BackgroundTaskInfo {
 }
 
 export interface Session {
+  projectId?: string | null;
   id: string;
   agentId: string;
   /**
@@ -269,6 +284,8 @@ export interface Session {
    */
   agentName: string | null;
   runnerId?: string | null;
+  /** Current runner reachability; absent when the snapshot omits liveness. */
+  runnerOnline?: boolean;
   /**
    * Host that launched (or should launch) the runner, e.g.
    * ``"host_a1b2"``; ``null`` for CLI/local sessions. Carried on the
@@ -281,6 +298,8 @@ export interface Session {
    * older recorded fixtures may omit it (treated as `null`).
    */
   hostId?: string | null;
+  /** Current host reachability; absent when the snapshot omits liveness. */
+  hostOnline?: boolean;
   /**
    * Whether this session's host is a dormant resumable managed host the
    * server can wake on the next message. Carried on the snapshot so the open
@@ -375,7 +394,7 @@ export interface Session {
   subagentRoutingOverride?: "on" | "off" | null;
   /**
    * Whether the owner opted into letting people with *view* (read-only)
-   * access browse this session's workspace files (the Files/Changes/GitHub
+   * access browse this session's workspace files (the Files/Changes/Pull Requests
    * surfaces and the file contents behind them). `false` by default — a
    * read grant shares the conversation, not the raw filesystem. Owner-set
    * from the share dialog; the rail reads it to decide whether to mount the
@@ -390,11 +409,12 @@ export interface Session {
    * render immediately on conversation resume.
    */
   lastTotalTokens?: number | null;
+  /** False when subtree usage was skipped and must be fetched separately. */
+  usageIncluded?: boolean;
   /**
    * Cumulative session spend in USD, server-computed (the cost-budget
-   * total). ``null``/absent when the session is **unpriced** (no turn
-   * priced yet), so the UI renders "—" rather than ``$0.00``. Lets the
-   * cost indicator render immediately on conversation resume.
+   * total). ``null``/absent when usage was skipped or the session is
+   * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
   /**
@@ -414,9 +434,12 @@ export interface Session {
   lastTaskError?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;
+    /** For `runner_rejected_event`: the persisted item the runner refused (newer servers). */
+    item_id?: string;
   } | null;
   /**
    * Outstanding `response.elicitation_request` event payloads on
@@ -481,6 +504,8 @@ export interface Session {
   }[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** Whether the connected runner supports settings on this native side chat. */
+  sideChatSettingsSupported?: boolean;
   /** A saved sandbox inference policy owns the model catalog. */
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
@@ -524,11 +549,13 @@ export interface Session {
 /**
  * Stages of a managed-sandbox launch, in pipeline order. `cloning`
  * only occurs when the session requested a repository workspace;
- * `ready` and `failed` are terminal (`ready` is delivered via SSE
- * only — the snapshot field clears to null on success).
+ * `action_required` is a warning while provisioning: the user needs to
+ * do something, described by the status's `details`. `ready` and
+ * `failed` are terminal (`ready` is delivered via SSE only — the
+ * snapshot field clears to null on success).
  */
 export type SandboxLaunchStage =
-  "provisioning" | "cloning" | "starting" | "connecting" | "ready" | "failed";
+  "provisioning" | "action_required" | "cloning" | "starting" | "connecting" | "ready" | "failed";
 
 /**
  * Managed-sandbox launch progress — mirrors
@@ -541,14 +568,27 @@ export interface SandboxStatus {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error?: string | null;
+  /** Sandbox provider being launched, e.g. `"arclet"`; absent from older servers. */
+  provider?: string | null;
+  /** What the user needs to do when `stage === "action_required"`; `null` otherwise. */
+  details?: string | null;
 }
 
 /** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */
 export interface SkillSummary {
-  /** Lowercase kebab-case identifier, e.g. ``"triage-issues"``. */
+  /** Invocation identifier (the skill's directory name), e.g. ``"triage-issues"``. */
   name: string;
   /** One-line summary from the SKILL.md frontmatter. */
   description: string;
+  /** Frontmatter ``name`` label, e.g. ``"Triage Issues"``; absent from older servers. */
+  display_name?: string | null;
+}
+
+/** A host's discovered catalog plus the sources it could not read. */
+export interface SkillsCatalog {
+  skills: SkillSummary[];
+  /** User-facing notes, e.g. a failed `codex plugin list`; empty when complete. */
+  warnings: string[];
 }
 
 export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";

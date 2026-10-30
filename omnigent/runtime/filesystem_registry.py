@@ -51,6 +51,36 @@ _logger = logging.getLogger(__name__)
 _DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
 
 
+# GIT_* variables that would redirect repository discovery or inject config
+# into a git subprocess. Dropped from anchored invocations so an inherited
+# environment cannot point them at another repository.
+_GIT_DISCOVERY_ENV = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_PARAMETERS",
+    }
+)
+
+
+def _anchored_git_env() -> dict[str, str]:
+    """Return this process's environment minus repository-redirecting ``GIT_*``.
+
+    :returns: A copy of ``os.environ`` without :data:`_GIT_DISCOVERY_ENV`
+        and without ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_KEY_n`` /
+        ``GIT_CONFIG_VALUE_n``.
+    """
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _GIT_DISCOVERY_ENV and not k.startswith("GIT_CONFIG_")
+    }
+
+
 def _git_timeout_seconds() -> float:
     """Return the git-subprocess timeout, honoring the env override.
 
@@ -131,6 +161,17 @@ _SKIP_DIRS: frozenset[str] = frozenset(
     }
 )
 
+# Cursor plumbing Omnigent writes into ``<workspace>/.cursor`` at session launch
+# (cursor-agent reads project config only there). Session infrastructure, not
+# user edits; only these exact paths are hidden, other ``.cursor`` content shows.
+_CURSOR_PLUMBING_PATHS: frozenset[str] = frozenset(
+    {
+        ".cursor/hooks.json",
+        ".cursor/mcp.json",
+        ".cursor/omnigent-hook.sh",
+    }
+)
+
 
 def _is_ephemeral(path: str) -> bool:
     """Return ``True`` if the filename matches a known ephemeral artifact pattern.
@@ -143,6 +184,15 @@ def _is_ephemeral(path: str) -> bool:
     """
     filename = Path(path).name
     return any(fnmatch.fnmatch(filename, pat) for pat in _EPHEMERAL_PATTERNS)
+
+
+def _is_harness_plumbing(path: str) -> bool:
+    """Return ``True`` when *path* is Omnigent-written harness plumbing.
+
+    :param path: Workspace-relative path, e.g. ``".cursor/mcp.json"``.
+    :returns: ``True`` when the path is in :data:`_CURSOR_PLUMBING_PATHS`.
+    """
+    return Path(path).as_posix() in _CURSOR_PLUMBING_PATHS
 
 
 def _net_operation(first: str, last: str) -> str | None:
@@ -252,6 +302,22 @@ def _resolve_gitfile(git_entry: Path) -> Path | None:
         git_dir = git_entry.parent / git_dir
     git_dir = git_dir.resolve()
     return git_dir if git_dir.is_dir() else None
+
+
+def detect_git_root(path: Path) -> Path | None:
+    """Return the root of the repository containing *path*, if any.
+
+    Callers that cache a registry compare this against the registry's
+    ``git_root`` to notice a repository created or removed since.
+
+    :param path: Directory to start discovery from.
+    :returns: The repository root, or ``None`` when there is none or its
+        metadata cannot be read.
+    """
+    try:
+        return _find_git_root(path)
+    except OSError:
+        return None
 
 
 def _is_git_repo(git_root: Path) -> bool:
@@ -486,6 +552,11 @@ class FilesystemRegistry(ABC):
         """The workspace root directory being watched."""
         return self._cwd
 
+    @property
+    def git_root(self) -> Path | None:
+        """Root of the repository this registry reads, or ``None`` without one."""
+        return None
+
     # ── Concrete: record_change (no-op default) ────────────────────
 
     def record_change(
@@ -545,6 +616,30 @@ class FilesystemRegistry(ABC):
     def stop(self) -> None:
         """Stop any background observers.  Idempotent."""
         return
+
+    # ── Concrete: index-backed enumeration (no-op default) ─────────
+
+    def list_tracked_files(self, subdir: str = "") -> list[str] | None:
+        """Return every path the workspace's index knows about under *subdir*.
+
+        ``None`` means there is no index to consult, so callers must walk the
+        filesystem instead. Only :class:`GitFilesystemRegistry` has one.
+
+        :param subdir: Directory relative to the workspace root, e.g.
+            ``"src/app"``; ``""`` for the whole workspace.
+        :returns: Paths relative to *subdir*, or ``None``.
+        """
+        return None
+
+    def last_changed_files(self) -> list[str] | None:
+        """Return the on-disk paths the latest :meth:`list_changed_files` found.
+
+        Every created or modified path git reported, regardless of the
+        ``limit`` applied to the page that call returned. ``None`` until that
+        method has run in this process. Lets search reuse an answer the
+        Changed tab already paid for.
+        """
+        return None
 
     # ── Abstract: must be implemented by subclasses ───────────────
 
@@ -694,10 +789,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         last_op: dict[str, str] = {}
         by_path: dict[str, _FileEvent] = {}
         for e in events:
-            # Ephemeral artifacts are filtered here as a second line of
-            # defence, primarily for events injected without going through
-            # record_change (e.g. in tests).
-            if _is_ephemeral(e.path):
+            # Ephemeral artifacts are filtered here as a second line of defence
+            # (events injected without record_change, e.g. in tests). Harness
+            # plumbing is hidden only at read time so the raw event is kept.
+            if _is_ephemeral(e.path) or _is_harness_plumbing(e.path):
                 continue
             # Events are appended chronologically, so the last write wins for
             # metadata (bytes, modified_at) without any timestamp comparison.
@@ -745,6 +840,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
+            return None
+        if _is_ephemeral(norm) or _is_harness_plumbing(norm):
             return None
         with self._lock:
             events = [e for e in self._session_events.get(session_id, []) if e.path == norm]
@@ -832,6 +929,11 @@ class GitFilesystemRegistry(FilesystemRegistry):
         self._git_root = git_root
         self._optimization_start_lock = threading.Lock()
         self._optimization_started = False
+        self._last_changes: list[str] | None = None
+
+    @property
+    def git_root(self) -> Path:
+        return self._git_root
 
     def start(self) -> None:
         """Start optional Git performance setup without blocking the caller."""
@@ -905,8 +1007,11 @@ class GitFilesystemRegistry(FilesystemRegistry):
         probe_started_at = time.perf_counter()
         try:
             probe = subprocess.run(
-                ["git", "update-index", "--test-untracked-cache"],
+                # A hook-based fsmonitor would run here with this process's
+                # privileges; the probe does not need it.
+                ["git", "-c", "core.fsmonitor=false", "update-index", "--test-untracked-cache"],
                 cwd=str(self._git_root),
+                env=_anchored_git_env(),
                 capture_output=True,
                 timeout=_git_timeout_seconds(),
             )
@@ -947,6 +1052,64 @@ class GitFilesystemRegistry(FilesystemRegistry):
             (time.perf_counter() - config_started_at) * 1000,
             config.returncode,
         )
+
+    def list_tracked_files(self, subdir: str = "") -> list[str] | None:
+        """Return every path in git's index under *subdir*, relative to it.
+
+        One index read covers a repo of any size, where a filesystem walk has
+        to be budgeted. Failures return ``None`` so callers fall back to the
+        walk.
+
+        Git runs anchored at this registry's repository root, with the scope
+        passed as a pathspec rather than as the working directory: a
+        repository nested under the workspace (``sub/.git``, which a sandboxed
+        agent can create) is then never discovered, so its config cannot name
+        commands for this unsandboxed process to run. The fsmonitor hook is
+        disabled and repository-redirecting ``GIT_*`` variables are dropped
+        for the same reason.
+
+        :param subdir: Directory relative to the workspace root, e.g.
+            ``"src/app"``; ``""`` for the whole workspace.
+        :returns: Paths relative to *subdir*, or ``None`` when git could not
+            answer.
+        """
+        scope = self._cwd / subdir if subdir else self._cwd
+        try:
+            pathspec = scope.resolve().relative_to(self._git_root).as_posix()
+        except (ValueError, OSError, RuntimeError):
+            # Outside the repository, or unresolvable (a symlink loop raises
+            # RuntimeError on Python 3.12 and OSError on later versions).
+            return None
+        argv = ["git", "-C", str(self._git_root), "-c", "core.fsmonitor=false", "ls-files", "-z"]
+        if pathspec != ".":
+            argv += ["--", f":(literal){pathspec}"]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+                env=_anchored_git_env(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _logger.warning("GitFilesystemRegistry.list_tracked_files: %r failed: %s", argv, exc)
+            return None
+        if result.returncode != 0:
+            _logger.warning(
+                "GitFilesystemRegistry.list_tracked_files: %r exited %d: %s",
+                argv,
+                result.returncode,
+                result.stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return None
+        prefix = "" if pathspec == "." else pathspec + "/"
+        return [
+            p[len(prefix) :]
+            for p in result.stdout.decode("utf-8", errors="replace").split("\0")
+            if len(p) > len(prefix) and p.startswith(prefix)
+        ]
+
+    def last_changed_files(self) -> list[str] | None:
+        return self._last_changes
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
@@ -1025,7 +1188,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             rel_path = self._git_to_rel(git_path)
             if rel_path is None:
                 continue
-            if _is_ephemeral(rel_path):
+            if _is_ephemeral(rel_path) or _is_harness_plumbing(rel_path):
                 continue
             # Skip runner-internal and build directories (e.g. terminals/,
             # node_modules/).  These are never agent-edited source files.
@@ -1037,6 +1200,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
             counts = numstat.get(rel_path, (None, None))
             records.append(self._make_record(rel_path, operation, counts))
 
+        # Search reuses this answer for untracked files instead of paying for
+        # its own ``git status``, which can take tens of seconds on a big repo.
+        self._last_changes = [r["path"] for r in records if r["status"] != "deleted"]
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
 
@@ -1054,7 +1220,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         norm = _normalize_path(path, self._cwd)
         if norm is None:
             return None
-        if _is_ephemeral(norm):
+        if _is_ephemeral(norm) or _is_harness_plumbing(norm):
             return None
         try:
             cwd_prefix = self._cwd.relative_to(self._git_root)

@@ -19,7 +19,7 @@ vi.mock("@/shell/AppShell", () => ({
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
-vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas page</div> }));
+vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation } = await import("react-router-dom");
   return {
@@ -155,19 +155,29 @@ describe("Canvas route", () => {
     renderRoute("/canvas", {}, "loading");
     expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
     expect(screen.queryByText("not found")).toBeNull();
-    expect(screen.queryByText("canvas page")).toBeNull();
   });
 
   it("renders not found once server info says the canvas feature is off", async () => {
     renderRoute("/canvas");
     expect(await screen.findByText("not found")).toBeInTheDocument();
-    expect(screen.queryByText("canvas page")).toBeNull();
   });
 
-  it("renders the native Canvas page inside the shell when the feature is on", async () => {
+  it("leaves the Canvas landing surface to the shell when the feature is on", () => {
     renderRoute("/canvas", { canvas: true });
-    expect(await screen.findByText("canvas page")).toBeInTheDocument();
     expect(screen.getByText("app shell")).toBeInTheDocument();
+    expect(screen.queryByText("not found")).toBeNull();
+  });
+
+  it("opens a normal chat inside the Canvas route when enabled", async () => {
+    renderRoute("/canvas/c/session-one?canvas=project", { canvas: true });
+    expect(await screen.findByText("chat page")).toBeInTheDocument();
+    expect(screen.getByText("app shell")).toBeInTheDocument();
+  });
+
+  it("gates Canvas conversation deep links with the same feature flag", async () => {
+    renderRoute("/canvas/c/session-one?canvas=project");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("chat page")).toBeNull();
   });
 });
 
@@ -220,6 +230,19 @@ describe("Usage release feature route", () => {
     renderUsageRoute(true);
     expect(await screen.findByText("usage page")).toBeInTheDocument();
     expect(screen.queryByText("not found")).toBeNull();
+  });
+});
+
+describe("Automation detail release feature route", () => {
+  it("does not register /tasks/:taskId while automations_v2 is off", async () => {
+    renderRoute("/tasks/st_1");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("task detail page")).toBeNull();
+  });
+
+  it("registers /tasks/:taskId while automations_v2 is on", async () => {
+    renderRoute("/tasks/st_1", { automations_v2: true });
+    expect(await screen.findByText("task detail page")).toBeInTheDocument();
   });
 });
 

@@ -13,10 +13,17 @@ from __future__ import annotations
 import base64
 import copy
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.entities import ConversationItem, MessageData
-from omnigent.inner.native_attachments import framework_notice_block, resize_dimensions
+from omnigent.inner.native_attachments import (
+    DELIVERY_KEY,
+    FilesystemAttachmentPolicy,
+    framework_notice_block,
+    requires_filesystem,
+    resize_dimensions,
+    uses_filesystem_delivery,
+)
 from omnigent.stores import ArtifactStore, FileStore
 
 _logger = logging.getLogger(__name__)
@@ -89,6 +96,14 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
     # Dotfiles
     ".env": "text/plain",
     ".lock": "text/plain",
+}
+
+# MIME types for the compression encodings ``mimetypes.guess_type`` reports.
+_COMPRESSION_MIME_TYPES: dict[str, str] = {
+    "gzip": "application/gzip",
+    "bzip2": "application/x-bzip2",
+    "xz": "application/x-xz",
+    "compress": "application/x-compress",
 }
 
 
@@ -619,6 +634,37 @@ def attachment_text_type_for_extension(filename: str | None) -> str | None:
     return "text/plain"
 
 
+def attachment_delivery(
+    filename: str,
+    declared_type: str | None,
+    policy: FilesystemAttachmentPolicy,
+) -> Literal["inline", "filesystem"] | None:
+    """
+    Decide how an upload reaches the agent, or ``None`` when it is refused.
+
+    Listed extensions are matched by name first, so a misleading MIME cannot
+    send one inline; a default filesystem extension the policy leaves out is
+    refused for the same reason. Everything else accepted inline stays inline;
+    with ``policy.all_types``, the remaining files are delivered as files.
+
+    :param filename: The upload's filename, e.g. ``"trace.gz"``.
+    :param declared_type: The MIME the client declared, e.g. ``"application/gzip"``.
+    :param policy: The deployment's filesystem attachment policy.
+    :returns: ``"filesystem"``, ``"inline"``, or ``None``.
+    """
+    if policy.matches(filename):
+        return "filesystem"
+    if requires_filesystem(filename):
+        return None
+    content_type = _resolve_content_type(declared_type, filename)
+    if (
+        attachment_upload_limit(content_type) is not None
+        or attachment_text_type_for_extension(filename) is not None
+    ):
+        return "inline"
+    return "filesystem" if policy.all_types else None
+
+
 # ── Text-attachment extraction for input-phase policy scanning ─────────
 
 
@@ -648,25 +694,28 @@ def extract_text_attachments(
 
     Used by the request-phase policy gate so that PII (and other) policies
     scan the *content* of an attached text file — not just the typed
-    message. Attachments arrive as ``input_file`` blocks that are base64-
-    inlined straight to the model (see :func:`resolve_content_references`),
-    so without this an attached CSV of card numbers reaches the LLM
-    unscanned. Non-text attachments (images, PDFs, binaries) are skipped;
-    text files are decoded in full (uploads are already bounded — text ≤
-    :data:`MAX_TEXT_UPLOAD_BYTES`, 10 MB). Best-effort: a missing/foreign file
-    or a fetch error is skipped, never raised, so a scan failure can't break
-    message delivery.
+    message. Without this an attached CSV of card numbers reaches the agent
+    unscanned. Images and PDFs are skipped; text files are decoded in full
+    (uploads are already bounded — text ≤ :data:`MAX_TEXT_UPLOAD_BYTES`,
+    10 MB). Archives, Office documents, and databases are listed by
+    name, since they reach the agent's filesystem and a policy may want to
+    refuse one on its extension. Best-effort: a missing/foreign file or a fetch
+    error is skipped, never raised, so a scan failure can't break message
+    delivery.
 
     :param content: The message's content blocks (``body.data["content"]``).
     :param file_store: Store for file metadata (``content_type`` / ``filename``).
     :param artifact_store: Store for the file's binary content.
     :param session_id: Owning session id, to enforce file ownership.
-    :returns: A list of ``{"filename", "content_type", "text"}`` entries — one
-        per scannable text attachment, in order — or ``[]`` when there are none.
+    :returns: A list of ``{"filename", "content_type", "text"}`` entries
+        in order. Files requiring filesystem tools carry an empty ``text``.
     """
     attachments: list[dict[str, str]] = []
     for block in content:
-        if not isinstance(block, dict) or block.get("type") != "input_file":
+        # Both block types are considered: delivery follows the stored filename,
+        # so a filesystem attachment a client sent as an image still reaches the
+        # sandbox and must be announced. Images stay skipped by the text test.
+        if not isinstance(block, dict) or block.get("type") not in ("input_file", "input_image"):
             continue
         file_id = block.get("file_id")
         if not isinstance(file_id, str):
@@ -684,6 +733,19 @@ def extract_text_attachments(
         ):
             continue
         content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
+        # Checked before the text-like test: delivery follows the upload's recorded
+        # decision, so an archive stored under a text MIME still reaches the
+        # filesystem. It has no scannable text, but is announced by name so a
+        # policy can refuse it.
+        if uses_filesystem_delivery(file_meta.filename, file_meta.source_metadata):
+            attachments.append(
+                {
+                    "filename": file_meta.filename or "",
+                    "content_type": content_type,
+                    "text": "",
+                }
+            )
+            continue
         if not _is_text_like_attachment(content_type, file_meta.filename):
             continue
         try:
@@ -773,6 +835,7 @@ def _resolve_message_content(
     cache: dict[str, str] | None = None,
     *,
     session_id: str | None = None,
+    defer_filesystem_files: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Resolve ``file_id`` references in a list of content blocks.
@@ -788,6 +851,8 @@ def _resolve_message_content(
         :func:`resolve_content_references`).
     :param session_id: Optional owning session id used to verify
         session-scoped file ownership, e.g. ``"conv_abc123"``.
+    :param defer_filesystem_files: Leave files requiring filesystem tools as
+        ``file_id`` references for a native runner to fetch, instead of raising.
     :returns: The original list (unchanged) or a new list with
         ``file_id`` references resolved to inline content.
     """
@@ -801,6 +866,7 @@ def _resolve_message_content(
                 artifact_store,
                 cache,
                 session_id=session_id,
+                defer_filesystem_files=defer_filesystem_files,
             )
             resolved.append(resolved_block)
             if notice is not None:
@@ -835,6 +901,7 @@ def _resolve_file_id_block(
     cache: dict[str, str] | None = None,
     *,
     session_id: str | None = None,
+    defer_filesystem_files: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int] | None]:
     """
     Resolve a single content block's ``file_id`` to inline content.
@@ -855,12 +922,16 @@ def _resolve_file_id_block(
         :func:`resolve_content_references`).
     :param session_id: Optional owning session id used to verify
         session-scoped file ownership, e.g. ``"conv_abc123"``.
+    :param defer_filesystem_files: Return a filesystem block
+        unchanged, ``file_id`` kept, for a native runner to fetch.
     :returns: ``(block, notice)`` — a new dict with ``file_id`` replaced by
         inline content (all other fields preserved), and an optional resize
         source dimensions to emit alongside a downscaled image (``None`` otherwise).
     :raises ValueError: If ``file_id`` is not found in the file
         store — the file was deleted between request validation
-        and agent loop execution.
+        and agent loop execution. Also raised when the referenced file is a
+        filesystem type this (non-native) adapter can't inline,
+        unless *defer_filesystem_files* is set.
     """
     file_id = block["file_id"]
     owner_session_id = session_id or _session_id_from_block(block)
@@ -871,6 +942,17 @@ def _resolve_file_id_block(
         raise ValueError(
             f"Referenced file '{file_id}' no longer exists — "
             f"it may have been deleted after the request was accepted"
+        )
+    # Types requiring filesystem tools never reach a model as bytes (a native
+    # harness reads them off disk instead), so inlining one here would send
+    # a payload the provider can't interpret. Fail with an actionable error.
+    if uses_filesystem_delivery(file_meta.filename, file_meta.source_metadata):
+        if defer_filesystem_files:
+            # The runner sets delivery from the stored record when it fetches the file.
+            return {k: v for k, v in block.items() if k != DELIVERY_KEY}, None
+        raise ValueError(
+            f"Attachment '{file_meta.filename}' requires a filesystem-capable "
+            "harness (e.g. Claude Code, Codex) and cannot be used with this model."
         )
 
     # Use cached base64 if available; otherwise fetch, encode, and cache.
@@ -884,8 +966,15 @@ def _resolve_file_id_block(
         if cache is not None:
             cache[file_id] = encoded
 
-    # Copy all fields except file_id.
-    resolved: dict[str, Any] = {k: v for k, v in block.items() if k != "file_id"}
+    # Copy all fields except file_id, and any delivery the client claimed:
+    # the stored record above already decided this file is inlined.
+    resolved: dict[str, Any] = {
+        k: v for k, v in block.items() if k not in ("file_id", DELIVERY_KEY)
+    }
+    if file_meta.filename:
+        # The stored name decides delivery; the block's own filename is
+        # client-supplied and must not be able to relabel the file.
+        resolved["filename"] = file_meta.filename
 
     content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
 
@@ -984,7 +1073,10 @@ def _resolve_content_type(
         # video/mp2t, .rs → application/rls-services+xml).
         if suffix in _EXTRA_MIME_TYPES:
             return _EXTRA_MIME_TYPES[suffix]
-        guessed = _mt.guess_type(filename)[0]
+        guessed, encoding = _mt.guess_type(filename)
+        # ``trace.json.gz`` guesses as JSON; its bytes are the compressed stream.
+        if encoding is not None:
+            return _COMPRESSION_MIME_TYPES.get(encoding, "application/octet-stream")
         if guessed and guessed != "application/octet-stream":
             return guessed
         # Text-like extensions default to text/plain rather than

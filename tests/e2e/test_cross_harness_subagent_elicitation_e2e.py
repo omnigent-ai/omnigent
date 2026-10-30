@@ -125,6 +125,18 @@ def cross_harness_rig(
     claude_home = native_home / ".claude"
     for directory in (workspace, config_dir, codex_home, claude_home):
         directory.mkdir(parents=True)
+    # Seed before any Claude process (including model probes) can cache
+    # an incomplete config and later overwrite the runner's onboarding state.
+    (native_home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "hasCompletedOnboarding": True,
+                "theme": "dark",
+                "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
     (config_dir / "config.yaml").write_text(
         yaml.safe_dump(
             {
@@ -361,7 +373,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
     tmp_path: Path,
 ) -> None:
     """A different parent harness preserves the child's prompt and native answer."""
-    client, workspace, runner_id, mock_url = cross_harness_rig
+    client, _workspace, runner_id, mock_url = cross_harness_rig
     name = f"cross-harness-parent-{uuid.uuid4().hex[:8]}"
     parent = {
         "spec_version": 1,
@@ -376,7 +388,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
         "async": True,
         "os_env": {
             "type": "caller_process",
-            "cwd": str(workspace),
+            "cwd": ".",
             "sandbox": {"type": "none"},
         },
         "tools": {"agents": ["claude_code"]},

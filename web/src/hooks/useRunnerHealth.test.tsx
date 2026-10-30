@@ -6,9 +6,11 @@
 // with the server and blocked resuming auto-resumable host-bound sessions
 // whose runner was reaped.
 
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type RunnerHealthInput, useRunnerHealth } from "./useRunnerHealth";
+
+import * as nativeBridge from "@/lib/nativeBridge";
 
 const fetchMock = vi.fn();
 
@@ -37,6 +39,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("useRunnerHealth", () => {
@@ -109,6 +112,62 @@ describe("useRunnerHealth", () => {
       host_online: null,
       host_version: null,
     });
+  });
+
+  it("refreshes host liveness immediately on desktop status changes", async () => {
+    let notify!: () => void;
+    const unsubscribe = vi.fn();
+    vi.spyOn(nativeBridge, "onHostStatusChanged").mockImplementation((callback) => {
+      notify = callback;
+      return unsubscribe;
+    });
+    fetchMock.mockResolvedValueOnce(
+      mockHealth({ conv_a: { runner_online: false, host_online: false } }),
+    );
+    const sessions = [input("conv_a")];
+    const { result, unmount } = renderHook(() => useRunnerHealth(sessions));
+    await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(false));
+
+    let finishHealth!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        finishHealth = resolve;
+      }),
+    );
+    act(() => notify());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.current.get("conv_a")?.host_online).toBe(false);
+    await act(async () => {
+      finishHealth(mockHealth({ conv_a: { runner_online: false, host_online: true } }));
+    });
+    expect(result.current.get("conv_a")?.host_online).toBe(true);
+    unmount();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("ignores a stale poll that finishes after a desktop-triggered refresh", async () => {
+    let notify!: () => void;
+    vi.spyOn(nativeBridge, "onHostStatusChanged").mockImplementation((callback) => {
+      notify = callback;
+      return () => {};
+    });
+    let finishOldPoll!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        finishOldPoll = resolve;
+      }),
+    );
+    const sessions = [input("conv_a")];
+    const { result } = renderHook(() => useRunnerHealth(sessions));
+    fetchMock.mockResolvedValueOnce(
+      mockHealth({ conv_a: { runner_online: false, host_online: true } }),
+    );
+    act(() => notify());
+    await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(true));
+    await act(async () => {
+      finishOldPoll(mockHealth({ conv_a: { runner_online: false, host_online: false } }));
+    });
+    expect(result.current.get("conv_a")?.host_online).toBe(true);
   });
 
   it("polls nothing and stays empty when the session set is empty", async () => {

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.models.model_fallbacks import (
     SMART_ROUTING_CLAUDE_LADDER,
+    SMART_ROUTING_CODEX_NATIVE_EXCLUDED,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
     SMART_ROUTING_FAMILY_FALLBACKS,
     SMART_ROUTING_GPT_LADDER,
@@ -613,9 +614,13 @@ class LLMRoutingClient:
             # INFO; the chosen model is logged by the caller either way.
             _logger.debug("LLMRoutingClient: raw response: %s", text[:500])
             verdict = json.loads(text)
-        except Exception as exc:  # noqa: BLE001  # fail-open
+        except Exception as exc:  # fail-open
             _logger.warning("LLMRoutingClient: judge call failed", exc_info=True)
             self.last_error = f"routing judge call failed: {failure_detail(exc)}"
+            return None
+
+        if not isinstance(verdict, dict):
+            self.last_error = "routing judge returned a non-object verdict"
             return None
 
         model = verdict.get("model")
@@ -693,7 +698,7 @@ def _config_bearer(
     """
     try:
         headers = config.authenticate()
-    except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+    except Exception:  # auth failure degrades to unauthenticated
         _logger.warning(
             "ExternalRoutingClient: could not resolve auth from %s", label, exc_info=True
         )
@@ -1112,11 +1117,15 @@ class ResolvedRoute:
 # outright — only used when no single-vendor harness fits.
 _MULTI_MODEL_FAMILY = "pi"
 
-# (harness, model) pairs the harness's own gateway 400s on: under pi, Claude
-# models on its ``eager_input_streaming`` field and gpt-5.5/5.6 reasoning models
-# on its openai-completions default ``reasoning_effort``. Probed against a
-# live gateway; tests/e2e/routing/ exercises the exclusions.
-_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {"pi": SMART_ROUTING_PI_EXCLUDED}
+# Canonical harness names required by routers such as task_v3.
+_ROUTER_HARNESS_BY_FAMILY: dict[str, str] = {"claude": "claude", "gpt": "codex"}
+
+# Availability catalogs omit harness request-shape limits. Correct known
+# incompatible pairs before applying an automatic routing decision.
+_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
+    "pi": SMART_ROUTING_PI_EXCLUDED,
+    "codex-native": SMART_ROUTING_CODEX_NATIVE_EXCLUDED,
+}
 
 
 def _configured_prefixes(prefixes: Sequence[str] | None) -> Sequence[str]:
@@ -1404,7 +1413,9 @@ class TaskV1RouteOptionSource:
                 router_id = self.to_router_id(model)
                 offered.setdefault(
                     _bare_id(router_id, self._model_prefixes),
-                    RouteOptionSpec(model=router_id, harness=harness),
+                    RouteOptionSpec(
+                        model=router_id, harness=self._router_harness(harness, router_id)
+                    ),
                 )
         for arm in self.menu(harnesses or list(catalog)):
             key = _bare_id(arm, self._model_prefixes)
@@ -1413,7 +1424,7 @@ class TaskV1RouteOptionSource:
                 model=arm,
                 harness=existing.harness
                 if existing is not None
-                else self._tag_harness(arm, harnesses, catalog),
+                else self._router_harness(self._tag_harness(arm, harnesses, catalog), arm),
             )
         return list(offered.values())
 
@@ -1425,11 +1436,9 @@ class TaskV1RouteOptionSource:
     ) -> ResolvedRoute | None:
         """Translate *pick* into a servable (harness, model) pair.
 
-        :param pick: The router's selection as received; its ``harness`` is
-            ignored because the router echoes the tag verbatim without ever
-            reading it. An id that already carries a catalog prefix is mapped
-            back to router vocabulary first, so re-resolving an id this seam
-            already resolved is a no-op rather than a miss.
+        :param pick: The router's selection. Its harness tag is ignored; the
+            local harness is derived from the model and catalog. Prefixed model
+            ids are normalized first so resolving an id twice is a no-op.
         :param harnesses: Harnesses the decision may land on.
         :param catalog: Harness → servable model ids.
         :returns: A :class:`ResolvedRoute`, or ``None`` when the pick was
@@ -1514,17 +1523,26 @@ class TaskV1RouteOptionSource:
             return "codex"
         return "both"
 
+    def _router_harness(self, harness: str | None, model: str) -> str | None:
+        """Map a harness to its canonical router name, using the model's family for pi.
+
+        Unknown families keep the original harness tag.
+
+        Examples: ``("codex-native", "glm-5-3") -> "codex"``;
+        ``("pi", "claude-sonnet-5") -> "claude"``.
+        """
+        family = _HARNESS_FAMILY.get(harness or "")
+        if family == _MULTI_MODEL_FAMILY:
+            family = _model_family(model)
+        return _ROUTER_HARNESS_BY_FAMILY.get(family or "", harness)
+
     def _tag_harness(
         self,
         arm: str,
         harnesses: Sequence[str],
         catalog: dict[str, list[str]],
     ) -> str | None:
-        """Pick a plausible harness tag for an injected arm.
-
-        The tag is decoration — no router reads it — so a family match is
-        enough, falling back to the first harness on offer.
-        """
+        """Pick a harness by model family, falling back to the first one offered."""
         order = list(catalog) or list(harnesses)
         family = _model_family(arm)
         match = next((h for h in order if _HARNESS_FAMILY.get(h) == family), None)
@@ -1737,7 +1755,7 @@ class ExternalRoutingClient:
         """Call the injected provider for this request's auth headers."""
         try:
             headers = self._auth_provider() if self._auth_provider is not None else None
-        except Exception:  # noqa: BLE001 — a caller with no credential still routes
+        except Exception:  # a caller with no credential still routes
             _logger.warning(
                 "ExternalRoutingClient: auth_provider raised; sending no credential",
                 exc_info=True,
@@ -1752,7 +1770,7 @@ class ExternalRoutingClient:
                 from databricks.sdk.config import Config
 
                 self._sdk_config = Config(profile=self._databricks_profile)
-            except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+            except Exception:  # auth failure degrades to unauthenticated
                 _logger.warning(
                     "ExternalRoutingClient: could not resolve auth for profile %r",
                     self._databricks_profile,
@@ -1786,7 +1804,7 @@ class ExternalRoutingClient:
                 from databricks.sdk.config import Config
 
                 config = Config()
-            except Exception:  # noqa: BLE001 — no ambient credential is the normal case
+            except Exception:  # no ambient credential is the normal case
                 _logger.debug(
                     "ExternalRoutingClient: no ambient Databricks credential", exc_info=True
                 )
@@ -2272,9 +2290,9 @@ async def route_turn(
         AI-Gateway-backed inference on its host. ``False`` takes the external
         router out of play and the built-in judge answers instead.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
-        may supply candidates. Callers pass ``gateway_backed``: that table is
-        all ``databricks-*`` ids, so off the gateway it would route the turn
-        onto a model the pane cannot switch to. ``False`` declines instead.
+        may supply candidates. Callers pass ``gateway_backed`` because those
+        Unity Catalog ids are unreachable off the gateway. ``False`` declines
+        instead.
     """
     try:
         from omnigent.runtime._globals import _caps
@@ -2320,9 +2338,9 @@ async def route_turn(
             if in_family:
                 available = {harness or "self": in_family}
     if not available:
-        # The static table is every ``databricks-*`` id, so off the gateway it
-        # names models this pane cannot be switched to. Decline the turn rather
-        # than route it onto an unreachable endpoint.
+        # The static table contains Unity Catalog model-service ids, so off the
+        # gateway it names models this pane cannot be switched to. Decline the
+        # turn rather than route it onto an unreachable endpoint.
         models = infer_models(harness) if allow_static_fallback else None
         if models is None:
             _logger.info(
@@ -2379,8 +2397,18 @@ async def route_turn(
     # accepts. Nothing servable means no routing: the turn keeps its model.
     model = result.model
     raw_model = result.raw_model
+    candidates = available.get(harness or "", [])
+    catalog_model = next(
+        (
+            candidate
+            for candidate in candidates
+            if _bare_id(candidate, prefixes) == _bare_id(model, prefixes)
+        ),
+        None,
+    )
+    if catalog_model is not None:
+        model = apply_servable_alias(catalog_model, prefixes)
     if harness_bars_model(harness, model, prefixes=prefixes):
-        candidates = available.get(harness or "", [])
         substitute = substitute_model(
             raw_model or model,
             candidates,

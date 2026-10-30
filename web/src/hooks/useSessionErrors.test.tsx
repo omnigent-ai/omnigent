@@ -2,13 +2,18 @@ import type { ReactNode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MessageItem } from "@/lib/conversationItems";
+import type { ErrorBlock } from "@/lib/blocks";
+import type { ErrorItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { latestActivityErrorState } from "@/lib/sessionError";
 import { fetchSessionItemsPage, type SessionItemsPage } from "@/lib/sessionsApi";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { useSessionErrors } from "./useSessionErrors";
+import { useSessionErrors, useSessionErrorStates } from "./useSessionErrors";
 
-vi.mock("@/lib/sessionsApi", () => ({ fetchSessionItemsPage: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  ApiError: class ApiError extends Error {},
+  fetchSessionItemsPage: vi.fn(),
+}));
 const fetchPage = vi.mocked(fetchSessionItemsPage);
 const session = { id: "session1", updated_at: 100, status: "idle" as const };
 const message = (text: string): MessageItem => ({
@@ -28,6 +33,29 @@ const errorPage: SessionItemsPage = {
   hasMore: true,
 };
 const normalPage: SessionItemsPage = { items: [message("Recovered.")], hasMore: true };
+const disconnectPage: SessionItemsPage = {
+  items: [
+    {
+      id: "disconnect1",
+      response_id: "response1",
+      type: "error",
+      status: "completed",
+      source: "execution",
+      code: "runner_disconnected",
+      message: "Runner disconnected unexpectedly.",
+    },
+  ],
+  hasMore: true,
+};
+const runnerError: ErrorItem = {
+  id: "error1",
+  response_id: "response1",
+  type: "error",
+  status: "completed",
+  source: "execution",
+  code: "runner_error",
+  message: "The runner failed before its connection dropped.",
+};
 
 function harness() {
   const client = new QueryClient({
@@ -58,6 +86,94 @@ afterEach(() => {
 });
 
 describe("useSessionErrors", () => {
+  it("clears a live runner disconnect as soon as host liveness recovers", () => {
+    const entry = conversationRegistry.acquire(session.id);
+    entry.setState({
+      blocks: itemsToBlocks(disconnectPage.items),
+      loadingConversation: false,
+      abortController: new AbortController(),
+    });
+    const { wrapper } = harness();
+    const hook = renderHook(
+      ({ host_online }) => useSessionErrorStates([{ ...session, host_online }]),
+      { wrapper, initialProps: { host_online: false } },
+    );
+
+    expect(hook.result.current).toEqual(["disconnected"]);
+    hook.rerender({ host_online: true });
+    expect(hook.result.current).toEqual(["recovered_disconnect"]);
+    expect(fetchPage).not.toHaveBeenCalled();
+  });
+
+  it("reads a failed unopened row so a recovered disconnect does not stay red", async () => {
+    fetchPage.mockResolvedValue({ ...disconnectPage, hasMore: false });
+    const { wrapper } = harness();
+    const hook = renderHook(
+      () => useSessionErrorStates([{ ...session, status: "failed", host_online: true }]),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(hook.result.current).toEqual(["recovered_disconnect"]));
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { hostOnline: true, label: "online" },
+    { hostOnline: false, label: "offline" },
+  ])(
+    "matches the full mixed-fault classification for an unopened $label host",
+    async ({ hostOnline }) => {
+      const disconnect = disconnectPage.items[0]!;
+      const fullItems = [runnerError, disconnect];
+      fetchPage
+        .mockResolvedValueOnce({ items: [disconnect], hasMore: true })
+        .mockResolvedValueOnce({ items: [runnerError], hasMore: false });
+      const fullState = latestActivityErrorState(itemsToBlocks(fullItems), hostOnline);
+      const { wrapper } = harness();
+      const hook = renderHook(
+        () => useSessionErrorStates([{ ...session, status: "failed", host_online: hostOnline }]),
+        { wrapper },
+      );
+
+      expect(fullState).toBe("error");
+      await waitFor(() => expect(hook.result.current).toEqual([fullState]));
+      expect(fetchPage).toHaveBeenNthCalledWith(2, session.id, {
+        olderThan: "disconnect1",
+        limit: 8,
+        signal: expect.any(AbortSignal),
+      });
+    },
+  );
+
+  it("keeps a conservative fault when the disconnect boundary exceeds the bounded read", async () => {
+    const disconnect = disconnectPage.items[0]!;
+    fetchPage
+      .mockResolvedValueOnce({ items: [disconnect], hasMore: true })
+      .mockResolvedValueOnce({ items: [], hasMore: true });
+    const { wrapper } = harness();
+    const hook = renderHook(
+      () => useSessionErrorStates([{ ...session, status: "failed", host_online: true }]),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(hook.result.current).toEqual(["error"]));
+  });
+
+  it("keeps partial disconnect evidence when its pagination request returns 503", async () => {
+    const disconnect = disconnectPage.items[0]!;
+    fetchPage
+      .mockResolvedValueOnce({ items: [disconnect], hasMore: true })
+      .mockRejectedValueOnce(new Error("503 Service Unavailable"));
+    const { wrapper } = harness();
+    const hook = renderHook(
+      () => useSessionErrorStates([{ ...session, status: "failed", host_online: true }]),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(hook.result.current).toEqual(["error"]));
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
   it("flags an unopened idle session from its latest native message and reuses the cache", async () => {
     fetchPage.mockResolvedValue(errorPage);
     const { wrapper } = harness();
@@ -85,6 +201,45 @@ describe("useSessionErrors", () => {
     hook.rerender({ updated_at: 101 });
     await waitFor(() => expect(fetchPage).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(hook.result.current).toEqual([false]));
+  });
+
+  it("drops tail caches superseded by a newer updated_at", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { wrapper, client } = harness();
+      const hook = renderHook(({ updated_at }) => useSessionErrors([{ ...session, updated_at }]), {
+        wrapper,
+        initialProps: { updated_at: 100 },
+      });
+      for (let updated_at = 101; updated_at <= 105; updated_at++) {
+        hook.rerender({ updated_at });
+      }
+      await waitFor(() => expect(client.isFetching()).toBe(0));
+      act(() => vi.advanceTimersByTime(60_000));
+      const cached = client
+        .getQueryCache()
+        .findAll({ queryKey: ["session-latest-error", session.id] });
+      expect(cached.map((query) => query.queryKey[2])).toEqual([105]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses the tail cache when the sidebar remounts within the gc window", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      fetchPage.mockResolvedValue(errorPage);
+      const { wrapper } = harness();
+      const first = renderHook(() => useSessionErrors([session]), { wrapper });
+      await waitFor(() => expect(first.result.current).toEqual([true]));
+      first.unmount();
+      act(() => vi.advanceTimersByTime(10_000));
+      const reopened = renderHook(() => useSessionErrors([session]), { wrapper });
+      expect(reopened.result.current).toEqual([true]);
+      expect(fetchPage).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not let an older tail request resurrect an error after a newer message", async () => {
@@ -129,6 +284,30 @@ describe("useSessionErrors", () => {
     expect(hook.result.current).toEqual([true]);
     act(() => entry.setState({ status: "streaming" }));
     expect(hook.result.current).toEqual([false]);
+    expect(fetchPage).not.toHaveBeenCalled();
+  });
+
+  it("clears a live status-only failure once a resume moves the session off failed", () => {
+    const statusCard = {
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      message: "Required terminal exited unexpectedly.",
+      source: "",
+      code: "required_terminal_exited",
+      fromSessionStatus: true,
+    } satisfies ErrorBlock;
+    const entry = conversationRegistry.acquire(session.id);
+    entry.setState({
+      blocks: [...itemsToBlocks(normalPage.items), statusCard],
+      sessionStatus: "failed",
+      loadingConversation: false,
+      abortController: new AbortController(),
+    });
+    const { wrapper } = harness();
+    const hook = renderHook(() => useSessionErrorStates([session]), { wrapper });
+    expect(hook.result.current).toEqual(["error"]);
+    act(() => entry.setState({ sessionStatus: "idle" }));
+    expect(hook.result.current).toEqual([null]);
     expect(fetchPage).not.toHaveBeenCalled();
   });
 
@@ -219,13 +398,12 @@ describe("useSessionErrors", () => {
     expect(hook.result.current).toEqual([false]);
   });
 
-  it("does not request tails for running, failed, awaiting, or provisional rows", async () => {
+  it("does not request tails for running, awaiting, or provisional rows", async () => {
     const { wrapper } = harness();
     renderHook(
       () =>
         useSessionErrors([
           { ...session, id: "running", status: "running" },
-          { ...session, id: "failed", status: "failed" },
           { ...session, id: "awaiting", pending_elicitations_count: 1 },
           { ...session, id: "temp:pending" },
           { ...session, id: "provisional", provisional: true },

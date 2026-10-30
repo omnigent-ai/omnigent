@@ -22,8 +22,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.errors import OmnigentError
-from omnigent.server.bundles import validate_agent_bundle
+from omnigent.db.utils import generate_agent_id
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, ErrorCode, OmnigentError
+from omnigent.server.bundles import agent_for_user, copy_agent_bundle, validate_agent_bundle
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 _SECRET_ENV_VAR = "OMNIGENT_W7_BUNDLE_SECRET"
 _SECRET_VALUE = "server-side-secret-token"
@@ -141,11 +144,8 @@ def test_validate_bundle_accepts_clean_agent() -> None:
 def test_validate_bundle_allows_custom_handler_when_not_enforced() -> None:
     """``enforce_handler_allowlist=False`` accepts a custom handler.
 
-    This is the trusted single-user / local-server path: ``omnigent
-    run`` uploads the operator's own bundle through this same function,
-    so an unregistered custom handler must still load. The routes pass
-    ``enforce_handler_allowlist=not local_single_user_enabled()``, so
-    this mode is what a local server uses.
+    Direct trusted callers retain an explicit opt-out. HTTP routes never
+    select it, including on local single-user servers.
     """
     spec = validate_agent_bundle(
         _single_file_yaml_bundle(
@@ -334,8 +334,8 @@ def test_validate_agent_bundle_allows_contained_relative_cwd(ok_cwd: str) -> Non
     assert spec.name == "uploaded-agent"
 
 
-def test_validate_agent_bundle_allows_absolute_cwd_for_trusted_local_server() -> None:
-    """The trusted single-user/local path keeps the documented absolute-cwd
+def test_validate_agent_bundle_allows_absolute_cwd_for_direct_trusted_caller() -> None:
+    """Direct trusted in-process validation keeps the absolute-cwd
     behavior.
 
     With ``enforce_handler_allowlist=False`` the operator uploads their OWN
@@ -387,7 +387,7 @@ def test_validate_bundle_rejects_server_callable_tool() -> None:
 def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None:
     """``enforce_handler_allowlist=False`` accepts a server ``callable:`` tool.
 
-    The trusted single-user / local-server path uploads the operator's own
+    A direct trusted in-process caller loads the operator's own
     bundle through this same function; Python callable tools are the intended
     operator feature there (the operator already has code execution), so the
     guard must not block them — mirroring the handler-allowlist exemption.
@@ -399,22 +399,56 @@ def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None
     assert spec.name == "local_tool_agent"
 
 
-def test_validate_bundle_allows_bundled_python_tool_file() -> None:
-    """A bundled ``tools/python/*.py`` tool file is not a ``callable:`` and is allowed.
-
-    File tools ship the agent's own code (path ``tools/python/echo.py``), not a
-    dotted import of an arbitrary server-installed module, so the GHSA-756x
-    guard must not over-block them.
-    """
+@pytest.mark.parametrize("trusted", [False, True])
+@pytest.mark.parametrize(
+    "tool_path,content",
+    [
+        ("tools/python/echo.py", "def echo(text: str) -> str:\n    return text\n"),
+        ("tools/typescript/echo.ts", "export function echo(text: string) { return text; }\n"),
+    ],
+)
+def test_validate_bundle_source_tools_require_trusted_upload(
+    trusted: bool, tool_path: str, content: str
+) -> None:
+    """Operator-authored bundles retain source-file tools."""
     bundle = _make_bundle_bytes(
         {
             "config.yaml": _MIN_CONFIG.format(name="filetool_agent"),
-            "tools/python/echo.py": "def echo(text: str) -> str:\n    return text\n",
+            tool_path: content,
         }
     )
-    spec = validate_agent_bundle(bundle)
+    if not trusted:
+        with pytest.raises(OmnigentError, match="may not ship a server-side Python/TS tool file"):
+            validate_agent_bundle(bundle)
+        return
+    spec = validate_agent_bundle(bundle, enforce_handler_allowlist=False)
     assert spec.name == "filetool_agent"
     assert any(t.name == "echo" for t in spec.local_tools)
+
+
+@pytest.mark.parametrize("suffix", ["py", "ts"])
+@pytest.mark.parametrize("runtime", ["server", "client"])
+def test_uploaded_source_tool_validation_covers_nested_agents(suffix: str, runtime: str) -> None:
+    from omnigent.server.bundles import _reject_uploaded_callable_tools
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import LocalToolInfo, ToolRuntime
+
+    sub = AgentSpec(name="child", spec_version=1)
+    sub.local_tools = [
+        LocalToolInfo(
+            name="echo",
+            path=f"tools/echo.{suffix}",
+            language="python" if suffix == "py" else "typescript",
+            runtime=ToolRuntime(runtime),
+        )
+    ]
+    root = AgentSpec(name="root", spec_version=1)
+    root.sub_agents = [sub]
+    if runtime == "server":
+        with pytest.raises(OmnigentError, match="may not ship a server-side Python/TS tool file"):
+            _reject_uploaded_callable_tools(root)
+    else:
+        _reject_uploaded_callable_tools(root)
 
 
 def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:
@@ -442,3 +476,117 @@ def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:
     root.sub_agents = [sub]
     with pytest.raises(OmnigentError, match=r"may not declare a server-side Python callable tool"):
         _reject_uploaded_callable_tools(root)
+
+
+def _tar(
+    entries: list[tuple[str, bytes | None, int]], *, mtime: int = 0, owner: str = ""
+) -> bytes:
+    """
+    Build a ``.tar.gz`` from ``(path, content, mode)`` in order; ``None`` content is a directory.
+
+    :param mtime: Timestamp for the gzip header and every entry.
+    :param owner: User name recorded on every entry.
+    """
+    import gzip
+
+    buf = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=buf, mode="wb", mtime=mtime) as gz,
+        tarfile.open(fileobj=gz, mode="w") as tar,
+    ):
+        for path, content, mode in entries:
+            info = tarfile.TarInfo(path)
+            info.mtime, info.mode, info.uname = mtime, mode, owner
+            if content is None:
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            else:
+                info.size = len(content)
+                tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+_SPEC = (b"name: codex\nexecutor:\n  harness: codex\n", 0o644)
+
+
+def test_content_digest_ignores_how_the_files_were_tarred() -> None:
+    """The CLI re-tars on every run, so timestamps, owners, order, and ``./`` vary."""
+    from omnigent.server.bundles import bundle_content_digest
+
+    first = _tar([("codex.yaml", *_SPEC), ("tools", None, 0o755)], mtime=1, owner="a")
+    again = _tar(
+        [("./tools/", None, 0o700), ("./codex.yaml", _SPEC[0], 0o600)], mtime=2, owner="b"
+    )
+    assert first != again
+    assert bundle_content_digest(first) == bundle_content_digest(again) is not None
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        [("codex.yaml", b"name: codex\nexecutor:\n  harness: pi\n", 0o644)],
+        [("other.yaml", *_SPEC)],
+        [("codex.yaml", _SPEC[0], 0o755)],
+        [("codex.yaml", *_SPEC), ("tools", None, 0o755)],
+    ],
+    ids=["content", "path", "executable", "extra-entry"],
+)
+def test_content_digest_tells_different_files_apart(changed: list) -> None:
+    from omnigent.server.bundles import bundle_content_digest
+
+    assert bundle_content_digest(_tar(changed)) != bundle_content_digest(
+        _tar([("codex.yaml", *_SPEC)])
+    )
+
+
+def test_content_digest_follows_extraction_when_a_path_repeats() -> None:
+    """Extraction keeps a path's last entry, so the order of repeats matters."""
+    from omnigent.server.bundles import bundle_content_digest
+
+    v1, v2 = (b"name: a\n", 0o644), (b"name: b\n", 0o644)
+    assert bundle_content_digest(
+        _tar([("a.yaml", *v1), ("a.yaml", *v2)])
+    ) == bundle_content_digest(_tar([("a.yaml", *v2)]))
+    assert bundle_content_digest(
+        _tar([("a.yaml", *v2), ("a.yaml", *v1)])
+    ) != bundle_content_digest(_tar([("a.yaml", *v1), ("a.yaml", *v2)]))
+
+
+def test_content_digest_is_none_for_an_unreadable_bundle() -> None:
+    from omnigent.server.bundles import bundle_content_digest, content_bundle_location
+
+    assert bundle_content_digest(b"not a tarball") is None
+    # The location still names the bytes, so nothing is ever stored keyless.
+    assert content_bundle_location("ag", b"not a tarball").startswith("ag/")
+
+
+def test_copy_agent_bundle_reports_a_missing_source_blob(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    artifacts = LocalArtifactStore(str(root))
+
+    with pytest.raises(OmnigentError) as excinfo:
+        copy_agent_bundle(
+            artifacts, "30f9aa4d441e344d3eb273f8cc13e4a5/e70dc208", generate_agent_id()
+        )
+
+    assert excinfo.value.code == ErrorCode.SESSION_AGENT_MISSING
+    assert excinfo.value.http_status == 410
+    assert excinfo.value.message == SESSION_AGENT_BUNDLE_MISSING_MESSAGE
+    assert [p for p in root.rglob("*") if p.is_file()] == [], "nothing is written without a source"
+
+
+def test_agent_for_user_creates_no_row_when_the_bundle_is_missing(
+    db_uri: str, tmp_path: Path
+) -> None:
+    agents = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    source = agents.create_user_agent(
+        agent_id, "orion", f"{agent_id}/e70dc208", owner="alice@example.com"
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        agent_for_user(agents, artifacts, source, "bob@example.com")
+
+    assert excinfo.value.code == ErrorCode.SESSION_AGENT_MISSING
+    assert agents.list_user_agents("bob@example.com").data == []

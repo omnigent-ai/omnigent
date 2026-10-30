@@ -51,6 +51,10 @@ import uuid
 import httpx
 from playwright.sync_api import Browser, Page, expect
 
+from tests._helpers.browser import user_page
+from tests._helpers.session import post_session_bundle
+from tests.e2e_ui.conftest import _build_hello_world_bundle
+
 # Unique per test run to avoid cross-test pollution in a long-lived
 # server process.
 _RUN_TAG = uuid.uuid4().hex[:8]
@@ -183,9 +187,7 @@ def test_author_badge_skips_own_messages_and_marks_peers(
     _grant_edit(base_url, session_id, _BOB)
 
     marker = f"shared-author-{uuid.uuid4().hex[:8]}"
-    alice_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": _ALICE})
-    try:
-        alice = alice_ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": _ALICE}) as alice:
         alice.goto(f"{base_url}/c/{session_id}")
         _send(alice, f"Say 'ack' in one word. {marker}")
 
@@ -201,12 +203,8 @@ def test_author_badge_skips_own_messages_and_marks_peers(
 
         # Still no badge on Alice's own committed bubble.
         expect(_user_bubble(alice, marker).get_by_test_id("message-author")).to_have_count(0)
-    finally:
-        alice_ctx.close()
 
-    bob_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": _BOB})
-    try:
-        bob = bob_ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": _BOB}) as bob:
         bob.goto(f"{base_url}/c/{session_id}")
 
         # KEY ASSERTION: Bob (a different authenticated viewer) sees the
@@ -216,8 +214,6 @@ def test_author_badge_skips_own_messages_and_marks_peers(
         badge = _user_bubble(bob, marker).get_by_test_id("message-author")
         expect(badge).to_be_visible(timeout=15_000)
         expect(badge).to_have_attribute("aria-label", _ALICE)
-    finally:
-        bob_ctx.close()
 
 
 def test_terminal_typed_message_shows_author_badge_to_peers(
@@ -241,51 +237,68 @@ def test_terminal_typed_message_shows_author_badge_to_peers(
     :param seeded_session: ``(base_url, session_id)`` from the pre-created
         session fixture.
     """
-    base_url, session_id = seeded_session
-    _grant_edit(base_url, session_id, _ALICE)
-    _grant_edit(base_url, session_id, _BOB)
-
-    marker = f"terminal-direct-{uuid.uuid4().hex[:8]}"
-    # POST as Alice, simulating the transcript forwarder authenticating
-    # with her credentials when she types directly in the native terminal.
-    httpx.post(
-        f"{base_url}/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_conversation_item",
-            "data": {
-                "item_type": "message",
-                "item_data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": f"hi from terminal {marker}"}],
-                },
-                "response_id": f"resp_terminal_{uuid.uuid4().hex[:8]}",
-            },
-        },
+    base_url, _ = seeded_session
+    # Terminal transcripts come from the session owner, so Alice owns this one.
+    created = post_session_bundle(
+        httpx.post,
+        f"{base_url}/v1/sessions",
+        _build_hello_world_bundle(),
+        headers={"X-Forwarded-Email": _ALICE},
+        timeout=30.0,
+    )
+    created.raise_for_status()
+    session_id = created.json()["session_id"]
+    httpx.put(
+        f"{base_url}/v1/sessions/{session_id}/permissions",
+        json={"user_id": _BOB, "level": _LEVEL_EDIT},
         headers={"X-Forwarded-Email": _ALICE},
         timeout=10.0,
     ).raise_for_status()
 
-    bob_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": _BOB})
     try:
-        bob = bob_ctx.new_page()
-        # Attribution must work even while the Shared list is inactive.
-        bob.route(
-            "**/v1/sessions?*",
-            lambda route: route.fulfill(json={"data": [], "has_more": False}),
-        )
-        bob.goto(f"{base_url}/c/{session_id}")
+        marker = f"terminal-direct-{uuid.uuid4().hex[:8]}"
+        # POST as Alice, simulating the transcript forwarder authenticating
+        # with her credentials when she types directly in the native terminal.
+        httpx.post(
+            f"{base_url}/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": f"hi from terminal {marker}"}],
+                    },
+                    "response_id": f"resp_terminal_{uuid.uuid4().hex[:8]}",
+                },
+            },
+            headers={"X-Forwarded-Email": _ALICE},
+            timeout=10.0,
+        ).raise_for_status()
 
-        # The committed bubble from external_conversation_item should
-        # appear in the initial history load (no pending-input round-trip).
-        bubble = _user_bubble(bob, marker)
-        expect(bubble).to_be_visible(timeout=15_000)
+        with user_page(browser, headers={"X-Forwarded-Email": _BOB}) as bob:
+            # Attribution must work even while the Shared list is inactive.
+            bob.route(
+                "**/v1/sessions?*",
+                lambda route: route.fulfill(json={"data": [], "has_more": False}),
+            )
+            bob.goto(f"{base_url}/c/{session_id}")
 
-        # The badge must be present with Alice's email as its accessible
-        # label: sessionOwner="local" ≠ viewerId=Bob → shared, and the
-        # author (Alice) differs from the viewer (Bob). Before the
-        # created_by fix the badge was absent because created_by was None.
-        badge = bubble.get_by_test_id("message-author")
-        expect(badge).to_be_visible()
-        expect(badge).to_have_attribute("aria-label", _ALICE)
+            # The committed bubble from external_conversation_item should
+            # appear in the initial history load (no pending-input round-trip).
+            bubble = _user_bubble(bob, marker)
+            expect(bubble).to_be_visible(timeout=15_000)
+
+            # The badge must be present with Alice's email as its accessible
+            # label: sessionOwner=Alice ≠ viewerId=Bob → shared, and the
+            # author (Alice) differs from the viewer (Bob). Without
+            # ``created_by``, the badge is absent.
+            badge = bubble.get_by_test_id("message-author")
+            expect(badge).to_be_visible()
+            expect(badge).to_have_attribute("aria-label", _ALICE)
     finally:
-        bob_ctx.close()
+        httpx.delete(
+            f"{base_url}/v1/sessions/{session_id}",
+            headers={"X-Forwarded-Email": _ALICE},
+            timeout=10.0,
+        )

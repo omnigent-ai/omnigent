@@ -85,7 +85,20 @@ type label. Its artifacts expose both values and a `type_label_mismatch` flag.
 For bugs they also record `evidence_kind`, `information_status`, and the
 structured `missing_information` categories. A report can be sufficient without
 a reproduction heading when it contains an intermittent observation, controlled
-test, diagnostics, or concrete code-path analysis.
+test, or diagnostics.
+
+The event workflow also closes confidently code-only bugs as **not planned**.
+The same classification must identify an explicit source-only basis, quote it
+from the report, and establish that no observed failure or plausible user-facing
+reproduction is provided. Observed failures stay open; unexecuted user steps or
+uncertainty go through the existing clarification flow. No summaries or rewritten
+steps are generated. The periodic ranking job keeps its existing policy.
+
+Closure reviews the full report and author replies, skips oversized reports and
+security/duplicate/pinned issues, and checks for changes before and after posting
+the explanation. The comment asks reporters who encounter the problem to open a
+new issue. Dry runs record the proposed comment, supporting quote, operation, and
+status in `event.json`; they do not change GitHub.
 
 On the event path, V2 uses the assessment to keep the Bug, Feature, or Docs
 label aligned with the classified content. An incomplete bug receives

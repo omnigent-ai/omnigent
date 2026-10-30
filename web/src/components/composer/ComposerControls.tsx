@@ -12,35 +12,67 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { cn } from "@/lib/utils";
+import { permissionModeConcept } from "@/lib/nativeHarnessModes";
 import {
   COMPOSER_COLLAPSED_LABEL_CLASS,
+  COMPOSER_CONTENT_INSET_CLASS,
+  COMPOSER_TRAY_INSET_CLASS,
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
   useCollapsedWorkspaceLabels,
 } from "./ChatComposer";
 
-export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+/**
+ * The workspace tray docked above the composer card. A tray nests inside the
+ * card's outer edges by the shared inset rather than sharing its border box
+ * (see the layout contract in ChatComposer); its chips sit on the card's
+ * content inset line via the shared content inset; a chip's box starts there, and its
+ * own px-1 keeps the glyph off the edge.
+ */
+export function ComposerWorkspaceBar({
+  className,
+  children,
+  trailingContent,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { trailingContent?: ReactNode }) {
   const barRef = useRef<HTMLDivElement>(null);
   useCollapsedWorkspaceLabels(barRef);
   return (
     <div
       ref={barRef}
       className={cn(
-        "composer-workspace-surface group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border px-2 py-1.5 md:gap-2",
+        "composer-context-bar group/composer-workspace relative z-0 -mb-px flex h-7 min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
+        COMPOSER_CONTENT_INSET_CLASS,
+        COMPOSER_TRAY_INSET_CLASS,
         className,
       )}
       {...props}
-    />
+    >
+      {children}
+      {trailingContent}
+    </div>
   );
 }
 
 export const ComposerWorkspaceTrigger = forwardRef<
   HTMLButtonElement,
-  ComponentPropsWithoutRef<"button"> & { kind: "directory" | "worktree"; label: string }
->(function ComposerWorkspaceTrigger({ kind, label, className, ...props }, ref) {
+  ComponentPropsWithoutRef<"button"> & {
+    kind: "directory" | "worktree";
+    label: string;
+    icon?: ReactNode;
+    /** Hide the visible label; it stays the accessible name. */
+    iconOnly?: boolean;
+  }
+>(function ComposerWorkspaceTrigger(
+  { kind, label, icon, iconOnly = false, className, ...props },
+  ref,
+) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
   return (
     <button
@@ -49,18 +81,20 @@ export const ComposerWorkspaceTrigger = forwardRef<
       // Icon-only while the bar is collapsed, so the label is the name.
       aria-label={label}
       className={cn(
-        "relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-0.5 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11 md:px-1",
+        "relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
         className,
       )}
       {...props}
     >
-      <Icon className="size-3.5 shrink-0" />
-      <span
-        data-workspace-collapse-label=""
-        className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
-      >
-        {label}
-      </span>
+      {icon ?? <Icon className="size-3.5 shrink-0" />}
+      {!iconOnly && (
+        <span
+          data-workspace-collapse-label=""
+          className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+        >
+          {label}
+        </span>
+      )}
       <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
     </button>
   );
@@ -70,7 +104,7 @@ export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
     label: string;
-    status: "online" | "offline" | "unknown";
+    status?: "online" | "offline" | "unknown";
     cloud?: boolean;
     testIdPrefix?: string;
   }
@@ -84,7 +118,6 @@ export const ComposerHostTrigger = forwardRef<
       ref={ref}
       type="button"
       aria-label={label}
-      title={label}
       className={cn(
         "flex h-8 w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
         className,
@@ -92,16 +125,18 @@ export const ComposerHostTrigger = forwardRef<
       {...props}
     >
       <span className="flex items-center">
-        <span className="flex size-4 shrink-0 items-center justify-center">
-          <span
-            aria-hidden
-            className={cn(
-              "size-2 rounded-full",
-              status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
-            )}
-            data-testid={`${testIdPrefix}-host-status`}
-          />
-        </span>
+        {status && (
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <span
+              aria-hidden
+              className={cn(
+                "size-2 rounded-full",
+                status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
+              )}
+              data-testid={`${testIdPrefix}-host-status`}
+            />
+          </span>
+        )}
         <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />
       </span>
     </button>
@@ -111,8 +146,12 @@ export const ComposerHostTrigger = forwardRef<
 export function ComposerPermissionPicker({
   label,
   value,
+  harness,
+  selectedValue,
   options,
   disabled = false,
+  disabledReason,
+  iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
   onSelect,
@@ -120,8 +159,14 @@ export function ComposerPermissionPicker({
 }: {
   label: string;
   value: string;
+  harness?: string | null;
+  selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  /** Hover text explaining why the picker is disabled. */
+  disabledReason?: string;
+  /** Hide the visible value; it stays in the accessible name. */
+  iconOnly?: boolean;
   loading?: boolean;
   interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
@@ -139,15 +184,18 @@ export function ComposerPermissionPicker({
             loading && "disabled:opacity-100",
           )}
           aria-label={`${label}: ${value}`}
-          title={`${label}: ${value}`}
+          title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
+          data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span
-            className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
-          >
-            {value}
-          </span>
+          {!iconOnly && (
+            <span
+              className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+            >
+              {value}
+            </span>
+          )}
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
@@ -163,16 +211,19 @@ export function ComposerPermissionPicker({
         }}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
-        {options.map((option) => (
-          <DropdownMenuItem
-            key={option.value}
-            onSelect={() => onSelect(option.value)}
-            data-testid={`${testIdPrefix}-permission-option-${option.value}`}
-            className="whitespace-normal break-words"
-          >
-            {option.label}
-          </DropdownMenuItem>
-        ))}
+        <DropdownMenuRadioGroup value={selectedValue ?? undefined} onValueChange={onSelect}>
+          {options.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.value}
+              value={option.value}
+              data-testid={`${testIdPrefix}-permission-option-${option.value}`}
+              data-permission-concept={permissionModeConcept(harness, option.value)}
+              className="whitespace-normal break-words"
+            >
+              {option.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -195,6 +246,55 @@ export function ComposerConfigTooltipRows({
         </span>
       ))}
     </>
+  );
+}
+
+/**
+ * Hover tooltip for a composer control that opens a menu. It stays hidden
+ * while the menu is open and doesn't reopen as focus returns on close.
+ */
+export function ComposerMenuTooltip({
+  menuOpen,
+  content,
+  variant = "default",
+  testId,
+  className,
+  contentClassName,
+  children,
+}: {
+  menuOpen: boolean;
+  content: ReactNode;
+  variant?: "default" | "session-info";
+  testId?: string;
+  /** Classes for the wrapper that receives the hover. */
+  className?: string;
+  /** Classes for the tooltip surface. */
+  contentClassName?: string;
+  children: ReactNode;
+}) {
+  const guardedTooltip = useMenuGuardedTooltip(menuOpen);
+  return (
+    <TooltipProvider>
+      <Tooltip open={guardedTooltip.open} onOpenChange={guardedTooltip.onOpenChange}>
+        <TooltipTrigger asChild>
+          <span className={cn("flex min-w-0", className)} {...guardedTooltip.triggerProps}>
+            {children}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          className={cn(
+            "max-w-80 flex-col items-start gap-0.5 px-3 py-2",
+            variant === "session-info" &&
+              "w-64 max-w-[calc(100vw-2rem)] items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10",
+            contentClassName,
+          )}
+          data-testid={testId}
+        >
+          {content}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 

@@ -9,8 +9,11 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 from fastapi import FastAPI
 
@@ -319,3 +322,386 @@ async def test_drain_session_streams_enqueues_done_sentinel() -> None:
     finally:
         _session_event_queues_ref.pop("conv_drain_a", None)
         _session_event_queues_ref.pop("conv_drain_b", None)
+
+
+async def _native_app_with_session(conv_id: str, harness: str = "pi-native") -> FastAPI:
+    """Build a runner app whose spec resolves to *harness* for *conv_id*.
+
+    :param conv_id: Session id the caller will create, e.g. ``"conv_native"``.
+    :param harness: Executor harness the spec declares, e.g. ``"pi-native"``.
+    :returns: Fresh FastAPI runner app.
+    """
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _ScriptedHarnessClient,
+        _spec_resolver_returning,
+        _sse,
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="native-idle-test",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": f"resp_{conv_id}"}}),
+            _sse({"type": "response.completed", "response": {"id": f"resp_{conv_id}"}}),
+        ]
+    )
+    return create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+
+async def _post_status(client: Any, conv_id: str, status: str) -> None:
+    """POST one forwarder-style ``external_session_status`` edge.
+
+    :param client: Runner test client.
+    :param conv_id: Session id, e.g. ``"conv_native"``.
+    :param status: Native status, e.g. ``"running"`` or ``"idle"``.
+    :returns: None.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{conv_id}/events",
+        json={"type": "external_session_status", "data": {"status": status}},
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "waiting"])
+async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: str) -> None:
+    """A native terminal's in-flight status holds the watchdog until it settles.
+
+    Native delivery leaves ``active_turns`` once the prompt is typed, so the
+    terminal's ``running`` / ``waiting`` edge is the only sign of live work.
+
+    :param status: In-flight native status to exercise.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_in_flight"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, status)
+        assert conv_id not in app.state.active_turns
+        assert app.state.has_active_work() is True
+
+        async def _release() -> None:
+            await _post_status(client, conv_id, "idle")
+
+        await _assert_monitor_blocked_then_shuts_down(
+            has_active_work=app.state.has_active_work,
+            release=_release,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "waiting"])
+@pytest.mark.parametrize(
+    "native_role,settle",
+    [
+        (True, "idle"),
+        (True, "failed"),
+        (True, "terminal-delete"),
+        (True, "session-delete"),
+        (False, None),
+    ],
+)
+async def test_terminal_only_native_work_idle_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    native_role: bool,
+    settle: str | None,
+) -> None:
+    """Terminal ensure can own live work before any harness initialization or web turn."""
+    from omnigent.runner.native import NativeLaunchContext
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "conv_terminal_only"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
+    monkeypatch.setattr(instance, "close", AsyncMock())
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def launch(ctx: NativeLaunchContext):
+        assert ctx.agent_spec is spec
+        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+        return await ctx.resource_registry.observe_required_terminal(
+            conv_id,
+            "claude",
+            "main",
+            instance,
+            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE if native_role else None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as server_client:
+        app = create_runner_app(
+            spec_resolver=await _spec_resolver_returning(spec),
+            server_client=server_client,
+            terminal_registry=terminals,
+        )
+        async with _runner_client(app) as client:
+            ensured = await client.post(
+                f"/v1/sessions/{conv_id}/resources/terminals",
+                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert ensured.status_code == 200, ensured.text
+            assert not app.state.active_turns
+            publish = app.state.session_resource_registry._session_status_publisher
+            publish(conv_id, status, None)
+            if not native_role:
+                assert app.state.has_active_work() is False
+                return
+            assert app.state.has_active_work() is True
+
+            async def release() -> None:
+                if settle in {"idle", "failed"}:
+                    publish(conv_id, settle, None)
+                else:
+                    path = f"/v1/sessions/{conv_id}"
+                    if settle == "terminal-delete":
+                        path += "/resources/terminals/terminal_claude_main"
+                    response = await client.delete(path)
+                    assert response.status_code == 200, response.text
+                    assert terminals.get(conv_id, "claude", "main") is None
+                    publish(conv_id, status, None)
+                assert app.state.has_active_work() is False
+
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work, release=release
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_source", ["forwarder", "pane"])
+async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
+    """A native ``failed`` edge settles the turn for the watchdog."""
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_failed"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is True
+        if status_source == "pane":
+            from omnigent.runner.app import _session_event_queues_ref
+
+            queue = _session_event_queues_ref[conv_id]
+            while not queue.empty():
+                queue.get_nowait()
+            publish = app.state.session_resource_registry._session_status_publisher
+            assert publish is not None
+            publish(conv_id, "failed", None)
+            events = []
+            while not queue.empty():
+                events.append(queue.get_nowait())
+            failures = [event for event in events if event and event.get("status") == "failed"]
+            assert len(failures) == 1
+            assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
+            assert "Open the terminal" in failures[0]["error"]["message"]
+        else:
+            await _post_status(client, conv_id, "failed")
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
+    """A follow-up bound mid-turn does not strand the pin on the pane's one idle edge.
+
+    The pane watcher dedups edges, so a prompt queued while the terminal is
+    already running produces no fresh ``running`` — only the final ``idle``.
+    """
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_follow_up"
+    app = await _native_app_with_session(conv_id)
+    publish_pane_status = app.state.session_resource_registry._session_status_publisher
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        publish_pane_status(conv_id, "running", None)
+        assert app.state.has_active_work() is True
+        app.state.begin_turn_slot(conv_id)
+        app.state.active_turns.pop(conv_id, None)
+        publish_pane_status(conv_id, "idle", None)
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_required_native_terminal_exit_releases_idle_pin() -> None:
+    """A required terminal that dies after delivery cannot leave the runner pinned."""
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_exit"
+    app = await _native_app_with_session(conv_id)
+    registry = app.state.session_resource_registry
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is True
+        registry._terminal_exit_publisher(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal:pi:main",
+                terminal_name="pi",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                session_was_idle=True,
+            )
+        )
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_deleted_native_session_late_status_does_not_pin() -> None:
+    """A status callback that lands after DELETE cannot keep the runner alive."""
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_deleted"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "running")
+        deleted = await client.delete(f"/v1/sessions/{conv_id}")
+        assert deleted.status_code == 200, deleted.text
+        assert app.state.has_active_work() is False
+        await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
+    """An SDK harness's published status is covered by ``active_turns`` alone."""
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_sdk_status"
+    app = await _native_app_with_session(conv_id, harness="openai-agents")
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-model",
+                "agent_id": "agent_idle_test",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        for _ in range(100):
+            if conv_id not in app.state.active_turns:
+                break
+            await asyncio.sleep(0.01)
+        app.state.native_pane_status[conv_id] = "running"
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence", ["permission_prompt", "pane_output", "pane_input", "no_evidence"]
+)
+async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    """A pane that reads idle but shows live work keeps the idle watchdog open.
+
+    The pane watcher publishes ``idle`` once the pane goes quiet, which a
+    permission prompt does too. The pane reaper spares such a pane for the
+    prompt marker or recent output and input; the watchdog must do the same.
+
+    :param tmp_path: Pytest temp dir for the approval-wait marker root.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param evidence: Live-work signal to stage, e.g. ``"permission_prompt"``. ``"no_evidence"``
+        leaves the pane idle.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner.native import NativeLaunchContext
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "conv_idle_edge_live_pane"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
+    monkeypatch.setattr(instance, "close", AsyncMock())
+    monkeypatch.setattr(
+        instance, "screen_changed_within", Mock(return_value=evidence == "pane_output")
+    )
+    monkeypatch.setattr(
+        instance, "client_interaction_within", Mock(return_value=evidence == "pane_input")
+    )
+    approval_root = tmp_path / "approval-waits"
+    approval_root.mkdir()
+    monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", approval_root)
+    if evidence == "permission_prompt":
+        bridge.touch_approval_wait_marker(bridge.approval_wait_marker_path(conv_id))
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def launch(ctx: NativeLaunchContext):
+        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+        return await ctx.resource_registry.observe_required_terminal(
+            conv_id,
+            "claude",
+            "main",
+            instance,
+            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as server_client:
+        app = create_runner_app(
+            spec_resolver=await _spec_resolver_returning(spec),
+            server_client=server_client,
+            terminal_registry=terminals,
+        )
+        async with _runner_client(app) as client:
+            ensured = await client.post(
+                f"/v1/sessions/{conv_id}/resources/terminals",
+                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert ensured.status_code == 200, ensured.text
+            publish = app.state.session_resource_registry._session_status_publisher
+            publish(conv_id, "running", None)
+            publish(conv_id, "idle", None)
+            assert app.state.native_pane_status[conv_id] == "idle"
+            assert app.state.has_active_work() is (evidence != "no_evidence")

@@ -36,14 +36,17 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from PIL import Image, ImageSequence, UnidentifiedImageError
 
 from omnigent.server.admin_list import resolve_data_dir
+
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +203,150 @@ def image_compression_concurrency() -> int:
     return _config_positive_int("image_compression_concurrency", MAX_IMAGE_COMPRESSION_CONCURRENCY)
 
 
+def filesystem_attachment_upload_limit() -> int:
+    """Max byte size of a single filesystem attachment.
+
+    Config key ``filesystem_attachment_max_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES`.
+    """
+    from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
+
+    return _config_positive_int(
+        "filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
+    )
+
+
+def filesystem_attachment_file_limit() -> int:
+    """Max number of filesystem attachments one session may hold.
+
+    Config key ``filesystem_attachment_max_files``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENTS`.
+    """
+    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENTS
+
+    return _config_positive_int(
+        "filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS
+    )
+
+
+def filesystem_attachment_total_bytes_limit() -> int:
+    """Max summed bytes of filesystem attachments per session.
+
+    Config key ``filesystem_attachment_max_total_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES`.
+    """
+    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+
+    return _config_positive_int(
+        "filesystem_attachment_max_total_bytes", MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+    )
+
+
+def filesystem_attachment_denied_extensions() -> frozenset[str]:
+    """Extensions a deployment refuses to materialize, beyond the allowlist.
+
+    Config key ``filesystem_attachment_denied_extensions``, a list of
+    extensions with or without the leading dot (``[".zip", "docx"]``).
+    Lets an operator narrow the built-in allowlist (e.g. deny archives
+    while still accepting office documents) without a code change.
+    Unparseable entries are skipped rather than failing the upload path.
+    """
+    raw = load_server_config().get("filesystem_attachment_denied_extensions")
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, list):
+        logger.warning(
+            "server config filesystem_attachment_denied_extensions=%r is not a list, ignoring",
+            raw,
+        )
+        return frozenset()
+    denied: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            logger.warning(
+                "server config filesystem_attachment_denied_extensions entry %r is not a "
+                "non-empty string, skipping",
+                entry,
+            )
+            continue
+        value = entry.strip().lower()
+        denied.add(value if value.startswith(".") else f".{value}")
+    return frozenset(denied)
+
+
+def parse_filesystem_attachment_policy(raw: object) -> FilesystemAttachmentPolicy:
+    """Build the filesystem attachment policy from a configured value.
+
+    ``None`` keeps the default extensions. A list replaces them, with or
+    without leading dots (``[".gz", "har"]``), and ``[]`` delivers nothing as
+    a file. ``"*"``, alone or as a list entry, adds the default extensions and
+    every other file that can't be inlined. An unusable value keeps the
+    defaults, so a typo cannot turn off attachments that worked before.
+
+    :param raw: The configured value, e.g. ``"*"`` or ``[".zip", ".gz"]``.
+    :returns: The policy the upload route applies.
+    """
+    from omnigent.inner.native_attachments import (
+        DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS,
+        DEFAULT_FILESYSTEM_ATTACHMENT_POLICY,
+        FilesystemAttachmentPolicy,
+    )
+
+    if raw is None:
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    entries = [raw] if isinstance(raw, str) else raw
+    if not isinstance(entries, list):
+        logger.warning(
+            "filesystem_attachment_allowed_extensions=%r is not a list, using the defaults",
+            raw,
+        )
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    extensions: set[str] = set()
+    all_types = False
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            logger.warning(
+                "filesystem_attachment_allowed_extensions entry %r is not a "
+                "non-empty string, skipping",
+                entry,
+            )
+            continue
+        value = entry.strip().lower()
+        if value == "*":
+            all_types = True
+            continue
+        extension = value if value.startswith(".") else f".{value}"
+        if PurePath(f"file{extension}").suffix != extension:
+            # Files match on their last extension only, so ".tar.gz" would match nothing.
+            logger.warning(
+                "filesystem_attachment_allowed_extensions entry %r is not a single "
+                "extension such as '.gz', skipping",
+                entry,
+            )
+            continue
+        extensions.add(extension)
+    if entries and not extensions and not all_types:
+        logger.warning(
+            "filesystem_attachment_allowed_extensions=%r has no usable entry, using the defaults",
+            raw,
+        )
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    if all_types:
+        extensions |= DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
+    return FilesystemAttachmentPolicy(extensions=frozenset(extensions), all_types=all_types)
+
+
+def filesystem_attachment_policy() -> FilesystemAttachmentPolicy:
+    """Which uploads this deployment delivers through native filesystem tools.
+
+    Config key ``filesystem_attachment_allowed_extensions``; see
+    :func:`parse_filesystem_attachment_policy` for the accepted values.
+    """
+    return parse_filesystem_attachment_policy(
+        load_server_config().get("filesystem_attachment_allowed_extensions")
+    )
+
+
 def _branding_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     """Return the ``branding:`` mapping, or ``{}`` when absent/not a map."""
     section = config.get("branding")
@@ -246,12 +393,19 @@ class BrandingAsset:
 
 @dataclass(frozen=True)
 class BrandingSnapshot:
-    """Immutable branding metadata and validated assets for one app instance."""
+    """Immutable branding metadata and validated assets for one app instance.
+
+    ``server_name`` names this deployment for clients that list several
+    servers (the desktop's server list). It is published in the
+    ``/.well-known/omnigent.json`` manifest, not in the ``/v1/info``
+    branding block, and has no fallback to ``app_name``.
+    """
 
     app_name: str | None
     heading: str | None
     logo_assets: Mapping[str, BrandingAsset]
     powered_by: bool
+    server_name: str | None = None
 
     def config(self) -> dict[str, Any]:
         """Return the public branding block surfaced by ``GET /v1/info``."""
@@ -623,6 +777,7 @@ def load_branding_snapshot(config: Mapping[str, Any] | None = None) -> BrandingS
         heading=_branding_heading(section),
         logo_assets=MappingProxyType(logo_assets),
         powered_by=_branding_powered_by(section),
+        server_name=_branding_str(section, "server_name"),
     )
 
 

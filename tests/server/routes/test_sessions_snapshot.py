@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,7 +13,14 @@ import pytest
 from sqlalchemy.exc import StatementError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
+from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
+from omnigent.native.native_coding_agents import (
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+)
 from omnigent.server.routes import sessions as _sessions_mod
+from omnigent.server.routes._sessions.helpers import _truncate_error_message_label
+from omnigent.server.routes._sessions.orchestration import _build_session_response
 from omnigent.server.routes.sessions import (
     _LABEL_VALUE_MAX_LEN,
     SessionLiveness,
@@ -21,6 +29,7 @@ from omnigent.server.routes.sessions import (
     _publish_subtree_cost_to_ancestors,
     _truncate_label,
 )
+from omnigent.server.schemas import SessionResponse
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
@@ -301,6 +310,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    "operator_authored": True,
                 },
             )()
 
@@ -336,6 +346,80 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spec_config", "harness_override", "expected_harness"),
+    [
+        pytest.param({"harness": "claude-sdk"}, "grok", "grok", id="grok-override"),
+        pytest.param(
+            {"harness": "acp", "acp_agent": {"name": "Grok Build", "command": "grok"}},
+            None,
+            "acp",
+            id="spec-embedded-acp",
+        ),
+    ],
+)
+async def test_session_snapshot_does_not_claim_agent_model_for_own_auth_acp(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_config: dict[str, Any],
+    harness_override: str | None,
+    expected_harness: str,
+) -> None:
+    """A self-authenticated ACP session must not inherit the spec's unrelated model pin.
+
+    Both routes into own-auth ACP are covered: a Grok override on a provider-routed
+    spec, and a spec whose own harness is the generic ACP wrap.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="polly",
+        executor=ExecutorSpec(config=spec_config, model="claude-opus-5", context_window=1_000_000),
+    )
+    conv = Conversation(
+        id="conv_acp",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_acp",
+        agent_id="ag_polly",
+        harness_override=harness_override,
+    )
+    store = _ConversationStore([], conversations={conv.id: conv})
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "polly",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                    "operator_authored": False,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return type("LoadedAgent", (), {"spec": spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    snapshot = await _get_session_snapshot(
+        store,  # type: ignore[arg-type]
+        conv.id,
+        agent_store=_AgentStore(),  # type: ignore[arg-type]
+        agent_cache=_AgentCache(),  # type: ignore[arg-type]
+    )
+
+    assert snapshot.harness == expected_harness
+    assert snapshot.llm_model is None
+    assert snapshot.context_window is None
 
 
 @pytest.mark.asyncio
@@ -406,6 +490,7 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    "operator_authored": True,
                 },
             )()
 
@@ -435,6 +520,82 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
     assert child.agent_name == "advisor"
     assert child.llm_model == "openai-codex/gpt-5.6-sol:high"
     assert child.context_window == 200_000
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_native_sub_agent_reports_parent_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A native sub-agent's CLI-chosen name never resolves in the parent spec.
+
+    Claude Code names its Task sub-agents (``general-purpose``, ``Explore``) and
+    Codex its spawned agents; the parent spec doesn't list them, so the parent's
+    identity is the expected answer and is not worth a warning on every snapshot.
+    """
+    parent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(config={"harness": "claude-native"}, model="claude-sonnet"),
+    )
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_claude",
+        ),
+        "conv_child": Conversation(
+            id="conv_child",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            parent_conversation_id="conv_parent",
+            agent_id="ag_claude",
+            kind="sub_agent",
+            sub_agent_name="general-purpose",
+            labels={"omnigent.wrapper": "claude-code-native-ui-subagent"},
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "claude-native-ui",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                    "operator_authored": False,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
+            return type("LoadedAgent", (), {"spec": parent_spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes._sessions.orchestration"):
+        child = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            "conv_child",
+            agent_store=_AgentStore(),  # type: ignore[arg-type]
+            agent_cache=_AgentCache(),  # type: ignore[arg-type]
+        )
+
+    assert "did not resolve" not in caplog.text
+    assert child.agent_name == "claude-native-ui"
+    assert child.labels.get("omnigent.ui") is None
+    assert child.llm_model == "claude-sonnet"
 
 
 @pytest.mark.asyncio
@@ -511,6 +672,105 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
     assert snapshot.last_task_error["code"] == "runner_failed_to_start"
     # The daemon's full cause (incl. log tail) rides through verbatim.
     assert snapshot.last_task_error["message"] == daemon_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
+@pytest.mark.parametrize("live_status", ["failed", "running"])
+async def test_session_snapshot_existing_failure_survives_runner_exit(
+    monkeypatch: pytest.MonkeyPatch, cached: bool, live_status: str
+) -> None:
+    """A saved failure cause outlives the exit report; an interrupted turn still takes it."""
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "30cc5cfcaab3427698d56838f8b636cd"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_exit_after_failure",
+        agent_id="synthetic-agent",
+        live_status=None if cached else live_status,
+        labels={
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+        },
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    if cached:
+        monkeypatch.setitem(sessions_module._session_status_cache, session_id, live_status)
+    else:
+        monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    reports = RunnerExitReports()
+    reports.record(conv.runner_id, "Synthetic runner exit", owner=None)
+
+    snapshot = await _get_session_snapshot(
+        store,
+        session_id,
+        runner_exit_reports=reports,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == (
+        original
+        if live_status == "failed"
+        else {"code": "runner_failed_to_start", "message": "Synthetic runner exit"}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_matches", [True, False], ids=["same_runner", "replacement_runner"])
+async def test_session_snapshot_scopes_existing_failure_to_owning_runner(
+    monkeypatch: pytest.MonkeyPatch, owner_matches: bool
+) -> None:
+    """A failed cause owned by a prior runner yields to the current runner's exit.
+
+    When a session is rebound to a new runner that then dies before connecting,
+    the snapshot surfaces that runner's startup failure instead of the previous
+    runner's stale cause; a cause owned by the current runner still survives.
+    """
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "4d9f2c1b7a0e4d5e8c1f2a3b4c5d6e7f"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    owner_runner = "runner_current" if owner_matches else "runner_previous"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_current",
+        agent_id="synthetic-agent",
+        live_status="failed",
+        labels={
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+            "omnigent.last_task_error_runner_id": owner_runner,
+        },
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    reports = RunnerExitReports()
+    reports.record("runner_current", "Synthetic runner exit", owner=None)
+
+    snapshot = await _get_session_snapshot(
+        store,
+        session_id,
+        runner_exit_reports=reports,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == (
+        original
+        if owner_matches
+        else {"code": "runner_failed_to_start", "message": "Synthetic runner exit"}
+    )
 
 
 @pytest.mark.asyncio
@@ -598,6 +858,46 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ('API Error: 499 {"error_code":"CANCELLED","message":""}', "transient_upstream_error"),
+        (
+            'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+            'version 2.1.280 or newer is required."}',
+            "client_update_required",
+        ),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(
+    message: str,
+    expected_code: str,
+) -> None:
+    """Failures saved as generic native errors pick up the new codes on reload."""
+    session_id = "7c1f0a52d3b94e6c8a5d2e9f4b6a1c30"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": "native_turn_error",
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_native_error", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == "native_turn_error"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     """A session whose runner has no exit report is not marked failed.
 
@@ -629,6 +929,98 @@ async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     # No report for runner_live → no forced failure, no synthetic error.
     assert snapshot.status != "failed"
     assert snapshot.last_task_error is None
+
+
+_RUNNER_EXIT_ERROR = "runner process exited with code 254"
+
+
+async def _snapshot_after_runner_exit(
+    monkeypatch: pytest.MonkeyPatch, *, live_status: str, connection_source: str = "replica"
+) -> SessionResponse:
+    """Snapshot a session whose runner connected to this server, then reported an exit.
+
+    :param monkeypatch: Used to stamp the runner's liveness and to keep the
+        snapshot from probing a leaked process-wide runner client.
+    :param live_status: The session's persisted ``live_status``, e.g. ``"idle"``.
+    :returns: The session snapshot read while the exit report is still held.
+    """
+    from omnigent.server import session_live_state
+    from omnigent.server.host_registry import RunnerExitReports
+
+    session_id = "2d7a5c9e1b3f4a6c8e0d1f2a3b4c5d6e"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        runner_id="runner_ran",
+        live_status=live_status,
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+    _use_runner_client(monkeypatch, None)
+    if connection_source == "replica":
+        monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_ran", 1)
+    else:
+        monkeypatch.delitem(session_live_state._last_liveness_stamp, "runner_ran", raising=False)
+    reports = RunnerExitReports()
+    reports.record(
+        "runner_ran",
+        _RUNNER_EXIT_ERROR,
+        owner=None,
+        had_connected=True if connection_source == "host" else None,
+    )
+
+    return await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        runner_exit_reports=reports,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
+async def test_session_snapshot_idle_session_of_connected_runner_ignores_exit_report(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_source: str,
+) -> None:
+    """An idle session whose runner connected is not repainted failed by the exit report.
+
+    When the host dies after its runner ran, ``_on_runner_exited`` leaves the
+    idle session idle (no work was lost). The snapshot must agree while the
+    report is held, instead of showing a crash banner on every reload.
+    """
+    snapshot = await _snapshot_after_runner_exit(
+        monkeypatch, live_status="idle", connection_source=connection_source
+    )
+
+    assert snapshot.status == "idle"
+    assert snapshot.last_task_error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_status", ["running", "waiting", "failed"])
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
+async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_connected_runner(
+    monkeypatch: pytest.MonkeyPatch, live_status: str, connection_source: str
+) -> None:
+    """A session caught mid-turn (or already failed) still surfaces the exit report.
+
+    The host dying interrupts in-flight work, so the liveness stamp that spares
+    an idle session must not hide the crash cause from these.
+    """
+    snapshot = await _snapshot_after_runner_exit(
+        monkeypatch, live_status=live_status, connection_source=connection_source
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == {
+        "code": "runner_process_crash",
+        "message": _RUNNER_EXIT_ERROR,
+    }
 
 
 @pytest.mark.asyncio
@@ -688,6 +1080,462 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
         f"got {len(status_calls)}. If 2, the cache "
         f"wasn't populated after the first query."
     )
+
+
+class _HangingRunnerClient:
+    """Fake runner whose status GET never answers, like a stalled runner behind a live tunnel."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        await asyncio.Future()
+
+
+class _NotFoundRunnerClient:
+    """Fake runner that does not know the session."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+
+class _GatedRunnerClient:
+    """Fake runner whose status GET blocks until released, so callers provably overlap."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.arrived = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        self.arrived.set()
+        await self.release.wait()
+        return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+
+def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_skips_runner_status_probe_when_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``include_live_status=False`` reports cached/persisted status without probing.
+
+    Runner-owned session reads pass the flag because the probe targets the
+    very runner waiting on this response.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "3db1c2a4e5f60718293a4b5c6d7e8f90"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+
+    class _RunningRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    runner_client = _RunningRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    trimmed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        include_live_status=False,
+    )
+    assert runner_client.get_calls == []
+    assert trimmed.status == "idle"
+
+    # Same cold cache without the flag: the probe fires and reports.
+    full = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert full.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A runner that never answers costs one bounded probe, then none until the backoff ends.
+
+    The tunnel transport ignores httpx timeouts, so an unanswered probe used to
+    hold every snapshot of the session until the runner spoke or its tunnel
+    dropped, and nothing was cached, so the next snapshot waited again.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "0a4d2f9c6b1e4e8f9c3a7d5b2e1f0a9c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert first.status == "idle"
+    assert second.status == "idle"
+    # One probe, cut off at the budget; the second snapshot skipped it entirely.
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "no answer within 0.05s" in warnings[0].getMessage()
+    assert "skipping it for 30s" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_concurrent_cache_misses_share_one_status_probe() -> None:
+    """Callers racing on a cold status cache await one shared in-flight probe.
+
+    The runner's answer is gated on an event the test controls, so the second
+    caller provably attaches while the first probe is still in flight; the pass
+    cannot come from two probes merely running back to back.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "4e8b6d3a0f5c4c2d9a7e9b6f5c3d4e1a"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _GatedRunnerClient()
+
+    first = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    # One yield schedules `second` onto the shared probe; only then may it finish.
+    await asyncio.sleep(0)
+    runner_client.release.set()
+
+    assert await asyncio.gather(first, second) == ["running", "running"]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) == "running"
+    assert _mod._runner_status_probe_inflight.get(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_cancelled_caller_does_not_abort_shared_status_probe() -> None:
+    """Cancelling one caller's snapshot leaves the shared probe running for the rest."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "5f9c7e4b1a2d4d3e8b0f1c9d6e5a7b2c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _GatedRunnerClient()
+
+    first = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    runner_client.release.set()
+
+    assert await second == "running"
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_resumes_after_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the backoff has elapsed the next snapshot probes the runner again."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "1b5e3a0d7c2f4f9a8d4b6e3c2f0a1b8d"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_BACKOFF_S", 0.0)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert len(runner_client.get_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_asks_again_after_non_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that does not know the session yet is asked again on the next snapshot.
+
+    A freshly bound runner answers 404 until session init lands; that answer is
+    cheap, so it must not put the session in the slow-probe backoff.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "2c6f4b1e8d3a4a0b9e5c7f4d3a1b2c9e"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _NotFoundRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert first.status == "idle"
+    assert second.status == "idle"
+    assert len(runner_client.get_calls) == 2
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+
+
+class _SlowNotFoundRunnerClient:
+    """Fake runner that answers 404 only after a delay: stalled, and without the session."""
+
+    def __init__(self, delay_s: float) -> None:
+        self.delay_s = delay_s
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        await asyncio.sleep(self.delay_s)
+        return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_slow_non_200_probe_enters_backoff(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-200 that took longer than the slow threshold is treated like a failed probe."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "6a0d8f5c2b7e4e4f9c1a3b8d7e6f5a4b"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_SLOW_S", 0.01)
+    runner_client = _SlowNotFoundRunnerClient(delay_s=0.05)
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert len(runner_client.get_calls) == 1
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "HTTP 404 after" in warnings[0].getMessage()
+
+
+class _SwitchableRunnerClient:
+    """Fake runner that hangs until told to answer 200."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.answer = False
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        if self.answer:
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "idle"})
+        await asyncio.Future()
+        return None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_probe_backoff_doubles_per_slow_probe_and_resets_on_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive slow probes double the skip window up to the cap; a prompt answer clears it."""
+    import time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "7b1e9a6d3c8f4f5a0d2b4c9e8f7a6b5c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _SwitchableRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    def _window_s() -> float:
+        return _mod._runner_status_probe_backoff.get(session_id).skip_until - time.monotonic()
+
+    def _expire_window() -> None:
+        _mod._runner_status_probe_backoff.get(session_id).skip_until = time.monotonic() - 1.0
+
+    expected_windows = [30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
+    for failures, expected in enumerate(expected_windows, start=1):
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        entry = _mod._runner_status_probe_backoff.get(session_id)
+        assert entry.failures == failures
+        assert abs(_window_s() - expected) < 2.0, (failures, _window_s())
+        _expire_window()
+    assert len(runner_client.get_calls) == len(expected_windows)
+
+    runner_client.answer = True
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.status == "idle"
+    assert _mod._session_status_cache.get(session_id) == "idle"
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+
+
+class _MalformedRunnerClient:
+    """Fake runner whose 200 carries a body that is not a JSON object."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        return SimpleNamespace(status_code=200, json=lambda: ["not", "an", "object"])
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_malformed_200_probe_fails_softly_for_every_waiter(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 200 without a status object is a failed probe, not an exception every waiter sees."""
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "8c2f0b7e4d9a4a6b1e3c5d0f9a8b7c6d"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _MalformedRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first, second = await asyncio.gather(
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+        )
+
+    assert (first.status, second.status) == ("idle", "idle")
+    assert len(runner_client.get_calls) == 1
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "malformed body" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_probe_backoff_is_discarded_when_the_runner_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skip window recorded against one runner does not silence probes of its replacement."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "9d3a1c8f6b5e4e7d0f2a4b6c8e1d3f5a"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    stalled = _HangingRunnerClient()
+
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    assert await orchestration._probe_runner_live_status(stalled, session_id, "runner_old") is None  # type: ignore[arg-type]
+    assert _mod._runner_status_probe_backoff.get(session_id).runner_id == "runner_old"
+
+    class _HealthyRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    replacement = _HealthyRunnerClient()
+    status = await orchestration._probe_runner_live_status(replacement, session_id, "runner_new")  # type: ignore[arg-type]
+
+    assert status == "running"
+    assert replacement.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+    assert _mod._session_status_cache.get(session_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_bound_holds_over_the_tunnel_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over the real tunnel an unanswered probe ends at the budget with nothing in flight."""
+    import time
+
+    import httpx
+
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    class _IdleWS:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    session_id = "3d7a5c2f9e4b4b1c8f6d8a5e4b2c3d0f"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.1)
+    registry = TunnelRegistry()
+    registry.register(
+        "runner_one",
+        _IdleWS(),
+        HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[]),
+    )
+    runner_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"), base_url="http://runner"
+    )
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    try:
+        started = time.monotonic()
+        snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        elapsed = time.monotonic() - started
+    finally:
+        await runner_client.aclose()
+
+    assert snapshot.status == "idle"
+    assert elapsed < 1.0
+    tunnel = registry.get("runner_one")
+    assert tunnel is not None
+    assert tunnel.in_flight == {}
+    assert _mod._runner_status_probe_backoff.get(session_id) is not None
 
 
 @pytest.mark.asyncio
@@ -807,7 +1655,15 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         def __init__(self) -> None:
             self.resolved_for: list[str] = []
 
-        def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> RoutedRunner:
+            # Mirrors the real router: callers hand over the row they already
+            # authorized so it need not re-read the conversation.
+            del conversation
             self.resolved_for.append(conversation_id)
             return RoutedRunner(runner_id="runner_test", client=fake_client)  # type: ignore[arg-type]
 
@@ -1843,7 +2699,14 @@ async def test_session_snapshot_prefers_router_over_singleton(
     singleton_client = _Client("idle")
 
     class _FakeRouter:
-        def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> RoutedRunner:
+            """Mirrors the real router's already-authorized-row parameter."""
+            del conversation_id, conversation
             return RoutedRunner(runner_id="runner_test", client=router_client)  # type: ignore[arg-type]
 
     monkeypatch.setattr(
@@ -2211,7 +3074,141 @@ def test_truncate_label_empty_string() -> None:
     assert _truncate_label("") == ""
 
 
+# ── _truncate_error_message_label ────────────────────────────────────────────
+
+_REJECTED_TUNNEL_ERROR = (
+    "error: runner tunnel rejected by server (HTTP 401 persisted across 3 attempts); "
+    "run `omnigent login https://omnigent.example.com/omnigent` to re-authenticate"
+)
+_TRACEBACK_LINES = (
+    "Traceback (most recent call last):",
+    *(f'  File "/venv/site-packages/pkg/module_{n}.py", line {n}, in call' for n in range(10)),
+    "asyncio.exceptions.CancelledError",
+)
+_RUNNER_SHUTDOWN_LOG_LINES = (
+    "INFO  10-28 23:03:02.662 debug_logging                    _post              | "
+    "debug-log sink: first batch delivered to example.default.debug_logs (1 row(s))",
+    "DEBUG 10-28 23:03:02.663 runner._zygote                   _flush_child       | "
+    "flushing runner output",
+    "WARN  10-28 23:03:02.664 debug_logging                    _diag              | "
+    "debug-log sink: flush timed out",
+)
+
+
+def _runner_exit_report(summary: str, *tail_lines: str) -> str:
+    """Build a host runner-exit report: summary, log-tail heading, tail lines."""
+    return "\n".join([summary, RUNNER_LOG_TAIL_HEADING, *tail_lines])
+
+
+@pytest.mark.parametrize(
+    ("cause", "trailing_lines"),
+    [
+        pytest.param(_REJECTED_TUNNEL_ERROR, (), id="last-line"),
+        pytest.param(_REJECTED_TUNNEL_ERROR, _RUNNER_SHUTDOWN_LOG_LINES[:1], id="debug-upload"),
+        pytest.param(
+            _REJECTED_TUNNEL_ERROR, ("", *_RUNNER_SHUTDOWN_LOG_LINES), id="shutdown-logs"
+        ),
+        pytest.param(
+            "OSError: [Errno 28] No space left on device: '/tmp/runner-specs-example'",
+            _RUNNER_SHUTDOWN_LOG_LINES,
+            id="disk-full-traceback",
+        ),
+        pytest.param(
+            "ERROR 10-28 23:03:02.660 runner._zygote _child_main | runner child failed",
+            _RUNNER_SHUTDOWN_LOG_LINES,
+            id="error-record",
+        ),
+    ],
+)
+def test_truncate_error_message_label_keeps_runner_exit_cause(
+    cause: str, trailing_lines: tuple[str, ...]
+) -> None:
+    """Shutdown diagnostics must not displace the failure in a saved report."""
+    summary = "runner process exited with code 1 (log on host: ~/logs/runner-a1.log)"
+    report = _runner_exit_report(summary, *_TRACEBACK_LINES, cause, *trailing_lines)
+    assert len(report) > _LABEL_VALUE_MAX_LEN
+
+    result = _truncate_error_message_label(report)
+
+    # The traceback is dropped; the line naming the cause survives whole.
+    assert result == f"{summary}\n…\n{cause}"
+    assert len(result) <= _LABEL_VALUE_MAX_LEN
+
+
+@pytest.mark.parametrize("trailing_lines", [(), _RUNNER_SHUTDOWN_LOG_LINES])
+def test_truncate_error_message_label_trims_an_oversized_last_line(
+    trailing_lines: tuple[str, ...],
+) -> None:
+    """An oversized cause is trimmed so the summary's start still fits."""
+    report = _runner_exit_report(
+        "runner process exited with code 1 (log on host: ~/x.log)",
+        "error: " + "y" * 400,
+        *trailing_lines,
+    )
+
+    result = _truncate_error_message_label(report)
+
+    assert len(result) == _LABEL_VALUE_MAX_LEN
+    assert result.startswith("runner process exited with code 1")
+    assert "…\n…\nerror: yyy" in result
+    assert result.endswith("y…")
+
+
+def test_truncate_error_message_label_keeps_last_log_when_no_cause_is_available() -> None:
+    summary = "runner process exited with code 1"
+    report = _runner_exit_report(summary, *_RUNNER_SHUTDOWN_LOG_LINES)
+
+    result = _truncate_error_message_label(report)
+
+    assert result == f"{summary}\n…\n{_RUNNER_SHUTDOWN_LOG_LINES[-1]}"
+    assert len(result) <= _LABEL_VALUE_MAX_LEN
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param("Runner MCP execute failed: " + "x" * 300, id="no-log-tail"),
+        pytest.param(_runner_exit_report("x" * 300, ""), id="empty-log-tail"),
+    ],
+)
+def test_truncate_error_message_label_head_truncates_other_messages(message: str) -> None:
+    """Without a runner log tail line to keep, the message keeps its head."""
+    assert _truncate_error_message_label(message) == _truncate_label(message)
+
+
+def test_truncate_error_message_label_short_report_unchanged() -> None:
+    """A report that fits the column is stored verbatim, log tail included."""
+    report = _runner_exit_report("runner process exited with code 1", "error: boom")
+    assert _truncate_error_message_label(report) == report
+
+
 # ── _persist_session_status_error_labels ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("response_id", "names", "expected"),
+    [
+        ("failed_turn", ["claude-native-ui"], "claude-native-ui"),
+        ("failed_turn", ["claude-native-ui", "codex-native-ui"], None),
+        ("other_turn", ["claude-native-ui"], None),
+        (None, ["claude-native-ui"], None),
+    ],
+)
+def test_status_error_identity_requires_an_unambiguous_response(
+    response_id: str | None, names: list[str], expected: str | None
+) -> None:
+    from omnigent.entities import MessageData
+    from omnigent.server.routes._sessions.helpers import _response_agent_name_from_store
+
+    items = [
+        SimpleNamespace(
+            response_id="failed_turn",
+            data=MessageData(role="assistant", agent=name, content=[]),
+        )
+        for name in names
+    ]
+    store = SimpleNamespace(list_items=lambda *args, **kwargs: SimpleNamespace(data=items))
+    assert _response_agent_name_from_store(store, "session", response_id) == expected
 
 
 @pytest.mark.asyncio
@@ -2237,6 +3234,42 @@ async def test_persist_error_labels_truncates_long_message() -> None:
     assert len(stored) <= _LABEL_VALUE_MAX_LEN
     # The diagnostic prefix survives so the reload-visible reason is still useful.
     assert stored.startswith("Runner MCP execute failed: ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trailing_lines", [(), _RUNNER_SHUTDOWN_LOG_LINES])
+async def test_persist_error_labels_keeps_host_runner_exit_cause(
+    tmp_path: Path, trailing_lines: tuple[str, ...]
+) -> None:
+    """A host's runner-exit report still names its cause once stored.
+
+    The live failure event carries the whole report, but a reloaded session
+    shows the stored label, so the runner's final error line must survive it.
+    """
+    from omnigent.host.connect import _runner_exit_error
+    from omnigent.server.schemas import ErrorDetail
+
+    log_path = tmp_path / "runner.log"
+    log_path.write_text(
+        "\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR, *trailing_lines]) + "\n"
+    )
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_failed_to_start", message=_runner_exit_error(1, log_path))
+    assert len(error.message) > _LABEL_VALUE_MAX_LEN
+
+    await _persist_session_status_error_labels(
+        "d397345925f08ea06e7303c01686efff", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    stored = captured["d397345925f08ea06e7303c01686efff"]["omnigent.last_task_error_message"]
+    assert len(stored) <= _LABEL_VALUE_MAX_LEN
+    assert stored.startswith("runner process exited with code 1")
+    assert stored.endswith(f"\n…\n{_REJECTED_TUNNEL_ERROR}")
 
 
 @pytest.mark.asyncio
@@ -2345,12 +3378,13 @@ async def test_persist_and_project_structured_error_round_trip() -> None:
         remediation="Run the host as a non-root user (uid != 0).",
     )
     await _persist_session_status_error_labels(
-        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore()
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore(), agent_name="claude-native-ui"
     )  # type: ignore[arg-type]
 
     labels = captured["aa11bb22cc33dd44ee55ff6677889900"]
     projected = _last_task_error_from_labels(labels)
     assert projected == {
+        "agent_name": "claude-native-ui",
         "code": "required_terminal_exited",
         "message": "Claude Code can't run as root\n\n...diagnostics...",
         "title": "Claude Code can't run as root",
@@ -2386,6 +3420,7 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
     assert labels["omnigent.last_task_error_title"] == ""
     assert labels["omnigent.last_task_error_cause"] == ""
     assert labels["omnigent.last_task_error_remediation"] == ""
+    assert labels["omnigent.last_task_error_agent_name"] == ""
     assert _last_task_error_from_labels(labels) == {
         "code": "runner_error",
         "message": "turn setup failed",
@@ -2530,3 +3565,61 @@ async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
     assert "skills_status" not in snapshot.model_dump()
     assert all(not url.endswith("/skills") for url in calls)
     assert all(event.get("type") != "session.skills" for event in published)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_status", "online", "lost"),
+    [
+        ("dead", False, True),
+        ("unknown", False, True),
+        ("alive", False, False),
+        (None, False, False),
+        ("dead", True, False),
+    ],
+)
+async def test_side_chat_fork_lost_trusts_only_a_host_verdict(
+    monkeypatch: pytest.MonkeyPatch, host_status: str | None, online: bool, lost: bool
+) -> None:
+    """Only the launching host can prove an offline runner is gone; no reply proves nothing."""
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _status(_conn: Any, _registry: Any, _runner_id: str) -> str | None:
+        return host_status
+
+    monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
+    monkeypatch.setattr("omnigent.runner.routing.routing_host_id", lambda _c, _s: "host-1")
+    registry = SimpleNamespace(get=lambda host_id: object() if host_id == "host-1" else None)
+    router = SimpleNamespace(runner_is_online=lambda _runner_id: online)
+    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))  # parent not relaunched yet
+    child = _side_chat_child(runner_id="runner-birth")
+
+    assert await orchestration._codex_side_chat_fork_lost(child, store, router, registry) is lost  # type: ignore[arg-type]
+
+    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
+    assert (
+        await orchestration._codex_side_chat_fork_lost(ordinary, store, router, registry) is False
+    )  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("agent", [CODEX_NATIVE_CODING_AGENT, CLAUDE_NATIVE_CODING_AGENT])
+@pytest.mark.parametrize("ownership", ["root", "mirror", "explicit_child"])
+def test_native_terminal_fallback_respects_child_ownership(agent, ownership: str) -> None:
+    parent_id = None if ownership == "root" else "parent"
+    labels = {}
+    if ownership == "mirror":
+        labels = {"omnigent.wrapper": agent.wrapper_label + "-subagent"}
+    elif ownership == "explicit_child":
+        labels = {"omnigent.wrapper": agent.wrapper_label, "omnigent.ui": "terminal"}
+    conversation = Conversation(
+        id="session",
+        root_conversation_id=parent_id or "session",
+        parent_conversation_id=parent_id,
+        agent_id="agent",
+        created_at=0,
+        updated_at=0,
+        labels=labels,
+    )
+    response = _build_session_response(conversation, [], "running", agent_name=agent.agent_name)
+    assert response.labels.get("omnigent.ui") == (None if ownership == "mirror" else "terminal")
+    assert conversation.labels == labels

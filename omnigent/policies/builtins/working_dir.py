@@ -57,6 +57,7 @@ from omnigent.policies.builtins._shell import (
     SHELL_TOOLS,
     is_unresolved_invocation,
     real_invocation_tokens,
+    spawns_gated_command_as_child,
     split_command_segments,
     unwrap_shell_command,
 )
@@ -74,7 +75,7 @@ _WORKTREE_SWITCH_SUBCMDS: frozenset[str] = frozenset({"add", "move", "remove"})
 # so the scanner skips both when locating the subcommand. ``-C`` additionally
 # names a directory the command runs in.
 _GIT_VALUE_OPTS: frozenset[str] = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source"}
 )
 
 # Shell tools whose command string this policy parses, by default: every
@@ -161,13 +162,20 @@ def _classify_git(tokens: list[str], block_cd: bool, block_worktree: bool) -> _D
     """
     rest = tokens[1:]
     c_path: str | None = None
+    work_tree_path: str | None = None
     positionals: list[str] = []
     i = 0
     while i < len(rest):
         token = rest[i]
+        if token.startswith("--work-tree="):
+            work_tree_path = token.split("=", 1)[1]
+            i += 1
+            continue
         if token in _GIT_VALUE_OPTS and i + 1 < len(rest):
             if token == "-C":
                 c_path = rest[i + 1]
+            elif token == "--work-tree":
+                work_tree_path = rest[i + 1]
             i += 2
             continue
         if token.startswith("-"):
@@ -183,6 +191,8 @@ def _classify_git(tokens: list[str], block_cd: bool, block_worktree: bool) -> _D
             return _DirOp(kind="worktree", target=None, detail=f"git worktree {action_word}")
     if block_cd and c_path is not None:
         return _DirOp(kind="cd", target=c_path, detail=f"git -C {c_path}")
+    if block_cd and work_tree_path is not None:
+        return _DirOp(kind="cd", target=work_tree_path, detail=f"git --work-tree {work_tree_path}")
     return None
 
 
@@ -351,9 +361,13 @@ def block_working_dir_changes(
             when nothing in the command is gated.
         """
         if _depth > MAX_SHELL_NESTING:
-            return None
+            return _violation("Blocked: shell command exceeds the nesting limit.")
         worst: PolicyResponse | None = None
-        for segment in split_command_segments(command):
+        try:
+            segments = split_command_segments(command)
+        except ValueError as exc:
+            return _violation(f"Blocked: could not classify shell syntax ({exc}).")
+        for segment in segments:
             unreadable = False
             try:
                 tokens = shlex.split(segment)
@@ -366,8 +380,13 @@ def block_working_dir_changes(
                 tokens = real_invocation_tokens(tokens)
                 # A leading option means some wrapper's own flags were not
                 # modelled, so the real command was never reached. Same fail-safe
-                # as an un-tokenizable segment rather than a silent abstain.
-                unreadable = is_unresolved_invocation(tokens)
+                # as an un-tokenizable segment rather than a silent abstain. A
+                # process-spawning utility (find -exec, xargs, perl -e, python -c,
+                # awk, make) likewise runs the gated command as a child whose argv
+                # is not modelled here, so route it through the same fail-safe.
+                unreadable = is_unresolved_invocation(tokens) or spawns_gated_command_as_child(
+                    tokens
+                )
             if unreadable:
                 if _looks_like_dir_op(segment, block_cd, block_worktree):
                     worst = _worse(

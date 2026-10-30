@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
@@ -380,6 +381,61 @@ def _unattended_auth_method_id(initialize_result: _AcpJsonObject) -> str | None:
     return None
 
 
+def _resolve_cwd(cwd: str | None, *, session_id: str | None = None) -> str:
+    """Resolve and validate the working directory for the ACP agent subprocess.
+
+    Called from :meth:`AcpExecutor.__init__` (where *cwd* may be ``None``) and
+    from :meth:`AcpExecutor._start_process` (where *cwd* is always a string, to
+    re-validate before every spawn and respawn). Raises a clear
+    :class:`RuntimeError` so the failure goes through the normal startup-error
+    path and surfaces with the harness-log suffix.
+
+    On Linux, reads ``/proc/self/cwd`` to recover a deleted inherited path
+    (shown as ``<path> (deleted)``).
+
+    :param cwd: Caller-supplied directory, or ``None`` to inherit from the process.
+    :param session_id: Session id for the structured WARNING, when available.
+    :returns: The resolved working directory path.
+    :raises RuntimeError: When the directory is missing or the process cwd was deleted.
+    """
+    if cwd is not None:
+        if not os.path.isdir(cwd):
+            logger.warning(
+                "acp executor cwd does not exist: %s",
+                cwd,
+                extra=debug_event(
+                    "acp_executor_cwd_missing",
+                    session_id=session_id,
+                    cwd=cwd,
+                    reason="not_a_directory",
+                ),
+            )
+            raise RuntimeError(f"ACP executor working directory does not exist: {cwd!r}")
+        return cwd
+
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        deleted_path: str | None = None
+        with contextlib.suppress(OSError):
+            deleted_path = os.readlink("/proc/self/cwd").removesuffix(" (deleted)")
+        path_detail = f" ({deleted_path})" if deleted_path else ""
+        logger.warning(
+            "acp executor inherited working directory was deleted%s",
+            path_detail,
+            extra=debug_event(
+                "acp_executor_cwd_missing",
+                session_id=session_id,
+                cwd=deleted_path,
+                reason="inherited_cwd_deleted",
+            ),
+        )
+        raise RuntimeError(
+            f"Runner working directory was deleted{path_detail}; "
+            "restart the runner in a valid directory or pass an explicit cwd"
+        ) from None
+
+
 class AcpExecutor(Executor):
     """Executor that drives any ACP agent over JSON-RPC 2.0 on stdio."""
 
@@ -406,7 +462,7 @@ class AcpExecutor(Executor):
         """
         self._config = config
         self._extension = extension
-        self._cwd = cwd or os.getcwd()
+        self._cwd = _resolve_cwd(cwd)
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
         # reads/writes back to us (executed through the Omnigent OSEnvironment,
@@ -420,6 +476,7 @@ class AcpExecutor(Executor):
         # and the live model value, both learned from ``config_option_update``.
         self._config_option_ids: set[str] = set()
         self._active_model: str | None = None
+        self._model_config_option_id: str | None = None
         self._initial_model: str | None = None
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
@@ -502,6 +559,14 @@ class AcpExecutor(Executor):
         The StreamReader limit is raised to 16 MiB so a large ``session/new``
         response or tool-output line can't hit the default 64 KiB per-line cap.
         """
+        # Re-validate cwd before every spawn and respawn: the workspace may have
+        # been deleted after __init__, and this error flows through
+        # _startup_error_message so the UI also shows the harness-log path.
+        _resolve_cwd(self._cwd, session_id=self._session_id)
+        # If the cwd is relative the spawn resolves it against the process cwd;
+        # fail early with a clear message if that directory was also deleted.
+        if not os.path.isabs(self._cwd):
+            _resolve_cwd(None, session_id=self._session_id)
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
@@ -536,7 +601,7 @@ class AcpExecutor(Executor):
         startup) when no sandbox is requested or the backend is unavailable.
 
         ponytail: a sandboxed *generic* agent gets only its binary dir (read),
-        the cwd, and ``/tmp`` (write) — we can't know an arbitrary agent's config
+        the cwd, and private scratch space (write) — we can't know an arbitrary agent's config
         dir. An agent that must write its own config under a sandbox needs
         ``sandbox: none`` (the default) for now; per-agent write roots is a
         documented follow-up.
@@ -554,7 +619,6 @@ class AcpExecutor(Executor):
                 create_exec_launcher,
                 resolve_sandbox,
                 with_additional_read_roots,
-                with_additional_write_roots,
                 with_spawn_env_allowlist,
             )
 
@@ -565,7 +629,6 @@ class AcpExecutor(Executor):
             resolved_bin = Path(binary)
             if resolved_bin.parent != Path(".") and resolved_bin.exists():
                 sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
-            sandbox = with_additional_write_roots(sandbox, [Path("/tmp")])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(binary, sandbox), rest
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -695,7 +758,7 @@ class AcpExecutor(Executor):
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             self._pending.pop(req_id, None)
             # asyncio.TimeoutError carries no message, so a caller reporting it
             # by str() would surface a blank failure. Name the stalled call.
@@ -1565,7 +1628,7 @@ class AcpExecutor(Executor):
         """
         if not isinstance(options, list):
             return None
-        model_value: str | None = None
+        model_option: _AcpJsonObject | None = None
         for opt in options:
             if not isinstance(opt, dict):
                 continue
@@ -1573,12 +1636,20 @@ class AcpExecutor(Executor):
             if not isinstance(opt_id, str):
                 continue
             self._config_option_ids.add(opt_id)
-            if opt_id == _CONFIG_OPTION_MODEL:
-                current = opt.get("currentValue")
-                if isinstance(current, str) and current:
-                    self._active_model = current
-                    model_value = current
-        return model_value
+            # An option literally named ``model`` wins; otherwise the first one
+            # in the model category, so several matches resolve deterministically.
+            if opt_id == _CONFIG_OPTION_MODEL or (
+                model_option is None and opt.get("category") == _CONFIG_OPTION_MODEL
+            ):
+                model_option = opt
+        if model_option is None:
+            return None
+        self._model_config_option_id = model_option["id"]
+        current = model_option.get("currentValue")
+        if not isinstance(current, str) or not current:
+            return None
+        self._active_model = current
+        return current
 
     async def _apply_model_override(self, session_id: str, model: str | None) -> None:
         """Warm-switch the agent's model via ACP ``session/set_config_option``.
@@ -1623,7 +1694,7 @@ class AcpExecutor(Executor):
             await self._set_model_via_catalog(session_id, model)
             return
         # Before the first config update, the RPC response determines support.
-        if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+        if self._config_option_ids and self._model_config_option_id is None:
             if available:
                 raise _AcpModelSwitchError(
                     f"ACP agent exposes no model option for switching to {model!r}."
@@ -1638,7 +1709,11 @@ class AcpExecutor(Executor):
 
         response = await self._rpc(
             _AGENT_METHOD_SET_CONFIG_OPTION,
-            {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
+            {
+                "sessionId": session_id,
+                "configId": self._model_config_option_id or _CONFIG_OPTION_MODEL,
+                "value": model,
+            },
         )
         if "error" in response:
             if available:
@@ -1719,6 +1794,31 @@ class AcpExecutor(Executor):
             _AGENT_METHOD_SET_MODEL,
         )
 
+    async def _drain_stale_queue(self) -> None:
+        """Drain items queued before the next prompt without losing what they carry.
+
+        Leftover agent requests are answered; a queued ``config_option_update``
+        (agents often report their model right after ``session/new``) is noted
+        rather than lost, so the model it names and its option id are current.
+        """
+        while not self._queue.empty():
+            try:
+                stale = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not isinstance(stale, dict):
+                continue
+            if stale.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                params = stale.get("params")
+                update = params.get("update") if isinstance(params, dict) else None
+                if (
+                    isinstance(update, dict)
+                    and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                ):
+                    self._note_config_options(update.get("configOptions"))
+            elif stale.get("id") is not None and stale.get("method"):
+                await self._respond_to_agent_request(stale)
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1752,8 +1852,10 @@ class AcpExecutor(Executor):
             return
 
         # Apply a ``/model`` pick to the live session before prompting, so the
-        # switch takes effect on this turn with the transcript intact.
+        # switch takes effect on this turn with the transcript intact. Drain first:
+        # a report queued behind ``session/new`` names the option id to target.
         requested_model = config.model if config is not None else None
+        await self._drain_stale_queue()
         try:
             await self._apply_model_override(session_id, requested_model)
         except Exception as exc:  # noqa: BLE001
@@ -1824,14 +1926,8 @@ class AcpExecutor(Executor):
             prompt_blocks.append({"type": "text", "text": user_text})
         prompt_blocks.extend(image_blocks)
 
-        # Drain stale items from a prior turn; answer any leftover server request.
-        while not self._queue.empty():
-            try:
-                stale = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
-                await self._respond_to_agent_request(stale)
+        # Drain stale items from a prior turn, plus anything the switch above queued.
+        await self._drain_stale_queue()
 
         self._rpc_id += 1
         req_id = self._rpc_id
@@ -1882,7 +1978,7 @@ class AcpExecutor(Executor):
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             method = notification.get("method", "")

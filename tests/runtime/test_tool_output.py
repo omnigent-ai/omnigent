@@ -6,7 +6,14 @@ Each assertion is chosen so the corresponding production breakage turns it red.
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES, cap_tool_output
+from omnigent.runtime.tool_result_replay import tool_result_content_blocks
+from tests._image_fixtures import _TINY_PNG_BASE64
 
 _TRUNCATION_MARKER = "[output truncated by omnigent:"
 
@@ -55,3 +62,53 @@ def test_cap_tool_output_truncates_on_a_character_boundary() -> None:
     # The kept prefix is the largest whole-char run within the byte cap.
     assert len(kept.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES
     assert len(kept.encode("utf-8")) > MAX_TOOL_OUTPUT_BYTES - 3
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+def test_cap_image_history_preserves_text_after_oversized_image(is_error: bool) -> None:
+    output = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": "A" * MAX_TOOL_OUTPUT_BYTES},
+            {"type": "text", "text": "Required trailing instruction: choose blue."},
+        ],
+        is_error=is_error,
+    )
+    capped = cap_tool_output(output)
+    assert len(capped.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES
+    blocks = tool_result_content_blocks(capped).blocks
+    assert blocks is not None
+    if is_error:
+        assert blocks.pop(0) == {"type": "text", "text": "Error:"}
+    assert blocks[0] == {"type": "text", "text": "before"}
+    assert "omitted from history" in blocks[1]["text"]
+    assert blocks[2] == {"type": "text", "text": "Required trailing instruction: choose blue."}
+
+
+def test_cap_image_history_retains_images_that_fit_in_order() -> None:
+    output = encode_mcp_image_result(
+        [
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "text", "text": "between"},
+            {"type": "image", "mimeType": "image/png", "data": "A" * MAX_TOOL_OUTPUT_BYTES},
+            {"type": "text", "text": "after"},
+        ],
+        is_error=True,
+    )
+    capped = cap_tool_output(output)
+    assert len(capped.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES
+    assert json.loads(capped)["isError"] is True
+    blocks = tool_result_content_blocks(capped).blocks
+    assert blocks is not None
+    assert blocks[0] == {"type": "text", "text": "Error:"}
+    assert blocks[1]["source"]["data"] == _TINY_PNG_BASE64
+    assert blocks[2] == {"type": "text", "text": "between"}
+    assert "omitted from history" in blocks[3]["text"]
+    assert blocks[4] == {"type": "text", "text": "after"}
+    assert cap_tool_output(capped) == capped
+
+
+def test_cap_ordinary_json_with_image_field_uses_existing_byte_cap() -> None:
+    output = json.dumps({"content": "A" * MAX_TOOL_OUTPUT_BYTES, "image": "ordinary data"})
+    assert cap_tool_output(output).startswith(output[:MAX_TOOL_OUTPUT_BYTES])
+    assert _TRUNCATION_MARKER in cap_tool_output(output)

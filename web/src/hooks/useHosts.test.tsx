@@ -1,16 +1,24 @@
 import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
-import { useState, type ReactNode } from "react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { startTransition, Suspense, useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  cancelHarnessLogin,
+  fetchHarnessLogin,
+  installHarnessOnHost,
+  logoutHarnessOnHost,
+  refreshHarnessAccountsOnHost,
+  startHarnessLogin,
   useDetectedCredentials,
   useHostModelOptions,
   useHosts,
+  useRefreshHarnessAccounts,
   useInstallHarness,
   useInstallingHarnesses,
   useStoreCredential,
 } from "./useHosts";
+import { ApiError } from "@/lib/sessionsApi";
 
 const fetchMock = vi.fn();
 
@@ -20,6 +28,7 @@ function mockResponse(body: unknown, status = 200): Response {
     status,
     statusText: status === 200 ? "OK" : "Error",
     json: async () => body,
+    clone: () => mockResponse(body, status),
   } as unknown as Response;
 }
 
@@ -41,6 +50,156 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+});
+
+describe("harness account routes", () => {
+  it("uses the encoded account refresh route and ignores old servers", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ harness_accounts: { codex: { kind: "chatgpt" } } }))
+      .mockResolvedValueOnce(mockResponse({}, 404))
+      .mockResolvedValueOnce(mockResponse({}, 405));
+
+    await expect(refreshHarnessAccountsOnHost("host/1")).resolves.toEqual({
+      harness_accounts: { codex: { kind: "chatgpt" } },
+    });
+    await expect(refreshHarnessAccountsOnHost("old-host")).resolves.toBeNull();
+    await expect(refreshHarnessAccountsOnHost("older-host")).resolves.toBeNull();
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/hosts/host%2F1/harnesses/accounts/refresh",
+      "/v1/hosts/old-host/harnesses/accounts/refresh",
+      "/v1/hosts/older-host/harnesses/accounts/refresh",
+    ]);
+  });
+
+  it("uses encoded login, poll, cancel, and logout routes", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          login_id: "login/1",
+          verification_url: "https://auth.example.test/device",
+          user_code: "ABCD-EFGH",
+          expires_at: 1_798_761_600,
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ status: "pending", error: null, expired: false }))
+      .mockResolvedValueOnce(mockResponse({}, 204))
+      .mockResolvedValueOnce(mockResponse({ configured_harnesses: null, harness_accounts: null }));
+
+    await expect(startHarnessLogin("host/1", "codex-native")).resolves.toEqual({
+      kind: "started",
+      login_id: "login/1",
+      verification_url: "https://auth.example.test/device",
+      user_code: "ABCD-EFGH",
+      expires_at: 1_798_761_600,
+    });
+    await expect(fetchHarnessLogin("host/1", "codex-native", "login/1")).resolves.toEqual({
+      status: "pending",
+      error: null,
+      expired: false,
+    });
+    await cancelHarnessLogin("host/1", "codex-native", "login/1");
+    await expect(logoutHarnessOnHost("host/1", "codex-native")).resolves.toEqual({
+      configured_harnesses: null,
+      harness_accounts: null,
+    });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/hosts/host%2F1/harnesses/codex/login",
+      "/v1/hosts/host%2F1/harnesses/codex/login/login%2F1",
+      "/v1/hosts/host%2F1/harnesses/codex/login/login%2F1",
+      "/v1/hosts/host%2F1/harnesses/codex/logout",
+    ]);
+    expect(fetchMock.mock.calls.map(([, init]) => init.method ?? "GET")).toEqual([
+      "POST",
+      "GET",
+      "DELETE",
+      "POST",
+    ]);
+  });
+
+  it("preserves login_unsupported as an ApiError", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { code: "login_unsupported", message: "Update the host." } }, 409),
+    );
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toMatchObject({
+      status: 409,
+      code: "login_unsupported",
+      message: "Update the host.",
+    });
+  });
+
+  it("rejects a javascript verification URL", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        login_id: "login-1",
+        verification_url: "javascript:alert(1)",
+        user_code: "ABCD-EFGH",
+        expires_at: 1_798_761_600,
+      }),
+    );
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toThrow(
+      "invalid sign-in link",
+    );
+  });
+
+  it("uses the shared API error parser for non-string FastAPI detail", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ detail: [{ msg: "invalid" }] }, 422));
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toMatchObject({
+      status: 422,
+      message: "422 Error",
+    });
+  });
+
+  it.each([
+    { code: "login_busy", login_id: "busy/1" },
+    { error: { code: "login_busy", login_id: "busy/1" } },
+  ])("returns an active login id from a busy response", async (body) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(body, 409));
+
+    await expect(startHarnessLogin("host_1", "native-codex")).resolves.toEqual({
+      kind: "busy",
+      login_id: "busy/1",
+    });
+  });
+});
+
+describe("useRefreshHarnessAccounts", () => {
+  it("fetches once per selected host and never while setup is disabled", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ harness_accounts: {} }))
+      .mockResolvedValueOnce(mockResponse({ harness_accounts: {} }));
+    const { rerender } = renderHook(
+      ({ hostId, enabled }) => useRefreshHarnessAccounts(hostId, enabled),
+      {
+        initialProps: { hostId: "host-1" as string | null, enabled: false },
+        wrapper,
+      },
+    );
+
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+    rerender({ hostId: "host-1", enabled: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    rerender({ hostId: "host-1", enabled: true });
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    rerender({ hostId: "host-2", enabled: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("treats a 404 from an older server as a successful no-op", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, 404));
+    const { result } = renderHook(() => useRefreshHarnessAccounts("old-host", true), {
+      wrapper,
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toBeNull();
+  });
 });
 
 describe("useHosts", () => {
@@ -298,8 +457,28 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
   }
 
   const HOST = "host_1";
-  const installResult = (harness: string, readiness: Record<string, boolean | string>) =>
-    mockResponse({ object: "harness_install", harness, configured_harnesses: readiness });
+  const installResult = (
+    harness: string,
+    readiness: Record<string, boolean | string>,
+    gateway: Record<string, boolean>,
+  ) =>
+    mockResponse({
+      object: "harness_install",
+      harness,
+      configured_harnesses: readiness,
+      gateway_inference: gateway,
+      version: null,
+    });
+
+  it("throws ApiError for a failed install request", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { code: "install_failed", message: "npm failed" } }, 502),
+    );
+
+    const error = await installHarnessOnHost(HOST, "codex-native").catch((reason) => reason);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ code: "install_failed", status: 502 });
+  });
 
   it("keeps the first install's in-flight state and cache patch when a second starts", async () => {
     // Both hooks share ONE QueryClient — exactly the dialog's single instance.
@@ -341,30 +520,49 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
     // the /install route), so Codex's response already reflects Pi still
     // installing (binary-missing).
     codex.resolve(
-      installResult("codex-native", {
-        "codex-native": "needs-auth",
-        "pi-native": "binary-missing",
-      }),
+      installResult(
+        "codex-native",
+        {
+          "codex-native": "needs-auth",
+          "pi-native": "binary-missing",
+        },
+        { "codex-native": false },
+      ),
     );
     await waitFor(() => expect(result.current.installing.has("codex-native")).toBe(false));
     expect(result.current.installing.has("pi-native")).toBe(true); // Pi still going
-    const hosts = client.getQueryData<{ configured_harnesses?: Record<string, unknown> }[]>([
-      "hosts",
-      { includeSandbox: false },
-    ]);
+    const hosts = client.getQueryData<
+      {
+        configured_harnesses?: Record<string, unknown>;
+        gateway_inference?: Record<string, boolean> | null;
+      }[]
+    >(["hosts", { includeSandbox: false }]);
     expect(hosts?.[0].configured_harnesses?.["codex-native"]).toBe("needs-auth");
+    expect(hosts?.[0].gateway_inference).toEqual({ "codex-native": false });
 
     // Resolve Pi: it clears too and its response (again the full map) reflects
     // both harnesses' final readiness.
-    pi.resolve(installResult("pi-native", { "codex-native": "needs-auth", "pi-native": true }));
+    pi.resolve(
+      installResult(
+        "pi-native",
+        { "codex-native": "needs-auth", "pi-native": true },
+        { "codex-native": false, "pi-native": true },
+      ),
+    );
     await waitFor(() => expect(result.current.installing.has("pi-native")).toBe(false));
-    const hosts2 = client.getQueryData<{ configured_harnesses?: Record<string, unknown> }[]>([
-      "hosts",
-      { includeSandbox: false },
-    ]);
+    const hosts2 = client.getQueryData<
+      {
+        configured_harnesses?: Record<string, unknown>;
+        gateway_inference?: Record<string, boolean> | null;
+      }[]
+    >(["hosts", { includeSandbox: false }]);
     expect(hosts2?.[0].configured_harnesses?.["pi-native"]).toBe(true);
     // Codex's readiness is still present (the server's full map carries it).
     expect(hosts2?.[0].configured_harnesses?.["codex-native"]).toBe("needs-auth");
+    expect(hosts2?.[0].gateway_inference).toEqual({
+      "codex-native": false,
+      "pi-native": true,
+    });
   });
 });
 
@@ -432,6 +630,298 @@ describe("useHostModelOptions", () => {
 
       await vi.advanceTimersByTimeAsync(15_000);
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("prefetches once, polls when selected, and stops when deselected", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ models: [{ id: "swe-2" }] }));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result, rerender } = renderHook(
+        ({ enabled, poll }) => useHostModelOptions("host_1", "devin-native", enabled, { poll }),
+        { wrapper, initialProps: { enabled: false, poll: false } },
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      rerender({ enabled: true, poll: false });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      await vi.advanceTimersByTimeAsync(30_000);
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      rerender({ enabled: true, poll: true });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+      rerender({ enabled: true, poll: false });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.data).toEqual([{ id: "swe-2" }]);
+    } finally {
+      focusManager.setFocused(undefined);
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry a failed inactive prefetch", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ detail: "CLI unavailable" }, 502));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(
+        () => useHostModelOptions("host_1", "devin-native", true, { poll: false }),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])(
+    "immediately recovers a failed prefetch on selection (StrictMode: %s)",
+    async (reactStrictMode) => {
+      fetchMock
+        .mockResolvedValueOnce(mockResponse({ detail: "catalog warming up" }, 502))
+        .mockResolvedValue(mockResponse({ models: [{ id: "swe-2" }] }));
+      const { result, rerender } = renderHook(
+        ({ poll }) => useHostModelOptions("host_1", "devin-native", true, { poll }),
+        { wrapper, reactStrictMode, initialProps: { poll: false } },
+      );
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      rerender({ poll: true });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.data).toEqual([{ id: "swe-2" }]);
+    },
+  );
+
+  it.each([false, true])(
+    "retries a shared request while another observer is active (initiator started active: %s)",
+    async (initiallyActive) => {
+      let finishRequest!: (response: Response) => void;
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            finishRequest = resolve;
+          }),
+        )
+        .mockResolvedValue(mockResponse({ models: [{ id: "swe-2" }] }));
+      const client = new QueryClient();
+      const sharedWrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const initiator = renderHook(
+        ({ poll }) => useHostModelOptions("host_1", "devin-native", true, { poll }),
+        { wrapper: sharedWrapper, initialProps: { poll: initiallyActive } },
+      );
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      const active = renderHook(() => useHostModelOptions("host_1", "devin-native"), {
+        wrapper: sharedWrapper,
+      });
+      initiator.rerender({ poll: false });
+      finishRequest(mockResponse({ detail: "catalog warming up" }, 502));
+
+      await waitFor(() => expect(active.result.current.isSuccess).toBe(true), { timeout: 3_000 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(initiator.result.current.data).toEqual([{ id: "swe-2" }]);
+    },
+  );
+
+  it.each(["host", "harness", "client"])(
+    "does not borrow retries from an active observer of another %s",
+    async (scope) => {
+      let finishRequest!: (response: Response) => void;
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            finishRequest = resolve;
+          }),
+        )
+        .mockResolvedValue(mockResponse({ models: [{ id: "other-model" }] }));
+      const client = new QueryClient();
+      const sharedWrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const inactive = renderHook(
+          () => useHostModelOptions("host_1", "devin-native", true, { poll: false }),
+          { wrapper: sharedWrapper },
+        );
+        const active = renderHook(
+          () =>
+            useHostModelOptions(
+              scope === "host" ? "host_2" : "host_1",
+              scope === "harness" ? "claude-native" : "devin-native",
+            ),
+          { wrapper: scope === "client" ? wrapper : sharedWrapper },
+        );
+        await waitFor(() => expect(active.result.current.isSuccess).toBe(true));
+        finishRequest(mockResponse({ detail: "CLI unavailable" }, 502));
+        await waitFor(() => expect(inactive.result.current.isError).toBe(true));
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["unmounts", "switches hosts"])(
+    "stops retries when the last active observer %s",
+    async (change) => {
+      let finishRequest!: (response: Response) => void;
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            finishRequest = resolve;
+          }),
+        )
+        .mockResolvedValue(mockResponse({ models: [{ id: "other-model" }] }));
+      const client = new QueryClient();
+      const sharedWrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const inactive = renderHook(
+          () => useHostModelOptions("host_1", "devin-native", true, { poll: false }),
+          { wrapper: sharedWrapper },
+        );
+        const active = renderHook(({ hostId }) => useHostModelOptions(hostId, "devin-native"), {
+          wrapper: sharedWrapper,
+          initialProps: { hostId: "host_1" },
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        if (change === "unmounts") active.unmount();
+        else active.rerender({ hostId: "host_2" });
+        finishRequest(mockResponse({ detail: "CLI unavailable" }, 502));
+        await waitFor(() => expect(inactive.result.current.isError).toBe(true));
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(fetchMock).toHaveBeenCalledTimes(change === "unmounts" ? 1 : 2);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("does not restart exhausted retries while the failed harness stays selected", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ detail: "catalog unavailable" }, 502));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result, rerender } = renderHook(
+        ({ poll }) => useHostModelOptions("host_1", "devin-native", true, { poll }),
+        { wrapper, initialProps: { poll: false } },
+      );
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      rerender({ poll: true });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      await vi.advanceTimersByTimeAsync(23_000);
+      expect(result.current.isError).toBe(true);
+      expect(result.current.isFetching).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(8);
+
+      rerender({ poll: true });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fetchMock).toHaveBeenCalledTimes(8);
+      rerender({ poll: false });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(8);
+
+      rerender({ poll: true });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(9));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the committed retry policy when a deselection render suspends", async () => {
+    let finishRequest!: (response: Response) => void;
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finishRequest = resolve;
+        }),
+      )
+      .mockResolvedValue(mockResponse({ models: [{ id: "swe-2" }] }));
+    const QueryWrapper = wrapper;
+    const suspended = new Promise<never>(() => {});
+    const onRender = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ poll, suspend }) => {
+        const query = useHostModelOptions("host_1", "devin-native", true, { poll });
+        onRender(poll);
+        if (suspend) throw suspended;
+        return query;
+      },
+      {
+        wrapper: ({ children }) => (
+          <QueryWrapper>
+            <Suspense fallback={null}>{children}</Suspense>
+          </QueryWrapper>
+        ),
+        initialProps: { poll: true, suspend: false },
+      },
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    act(() => startTransition(() => rerender({ poll: false, suspend: true })));
+    expect(onRender).toHaveBeenCalledWith(false);
+
+    finishRequest(mockResponse({ detail: "catalog warming up" }, 502));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true), { timeout: 3_000 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["deselected", "unavailable"])(
+    "stops retrying when the harness becomes %s during a request",
+    async (state) => {
+      let finishRequest!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((resolve) => {
+          finishRequest = resolve;
+        }),
+      );
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const { result, rerender } = renderHook(
+          ({ enabled, poll }) => useHostModelOptions("host_1", "devin-native", enabled, { poll }),
+          { wrapper, initialProps: { enabled: true, poll: true } },
+        );
+        await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+        rerender({ enabled: state !== "unavailable", poll: state !== "deselected" });
+        finishRequest(mockResponse({ detail: "CLI unavailable" }, 502));
+        await waitFor(() => expect(result.current.isError).toBe(true));
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("ends a retry sequence when deselected during backoff", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ detail: "CLI unavailable" }, 502));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result, rerender } = renderHook(
+        ({ poll }) => useHostModelOptions("host_1", "devin-native", true, { poll }),
+        { wrapper, initialProps: { poll: true } },
+      );
+      await waitFor(() => expect(result.current.failureCount).toBe(1));
+      rerender({ poll: false });
+      await vi.advanceTimersByTimeAsync(60_000);
+      // The already-scheduled retry may finish, but must not schedule more.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.isError).toBe(true);
     } finally {
       vi.useRealTimers();
     }

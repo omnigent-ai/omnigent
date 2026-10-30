@@ -1,6 +1,10 @@
 import {
+  closestCenter,
   DndContext,
+  type CollisionDetection,
   type DragEndEvent,
+  KeyboardSensor,
+  type Modifier,
   MouseSensor,
   pointerWithin,
   TouchSensor,
@@ -16,10 +20,11 @@ import {
   ImageIcon,
   PaperclipIcon,
   PencilIcon,
-  Trash2Icon,
+  XIcon,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
 import { attachmentFilename } from "@/lib/attachments";
@@ -27,9 +32,32 @@ import { cn } from "@/lib/utils";
 
 /** Keep touch targets large without enlarging the visible glyphs. */
 const ACTION_BUTTON_CLASS =
-  "flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground max-md:size-11 max-md:text-muted-foreground";
+  "shrink-0 text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:size-11";
 
 const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
+
+/**
+ * Keep the dragged row vertical and inside the scrolling list, which would
+ * otherwise clip it. A fixed-position overlay is avoided on purpose: Mobile
+ * Safari draws it offset from the finger once the page has shifted for the
+ * keyboard.
+ */
+export const restrictToQueuedList: Modifier = ({
+  transform,
+  draggingNodeRect,
+  scrollableAncestorRects,
+}) => {
+  const list = scrollableAncestorRects[0];
+  if (!draggingNodeRect || !list) return { ...transform, x: 0 };
+  const y = Math.min(
+    Math.max(transform.y, list.top - draggingNodeRect.top),
+    list.bottom - draggingNodeRect.bottom,
+  );
+  return { ...transform, x: 0, y };
+};
+
+export const queuedMessageCollisionDetection: CollisionDetection = (args) =>
+  args.pointerCoordinates ? pointerWithin(args) : closestCenter(args);
 
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
@@ -63,28 +91,38 @@ function QueuedRow({
   onDelete,
   onEdit,
   onSteer,
+  steerBlocked,
   reorderable,
 }: {
   message: QueuedMessage;
   onDelete: (queueId: string) => void;
   onEdit: (queueId: string) => void;
   onSteer?: (queueId: string) => void;
+  /** The conversation waits for its host, so nothing can be sent now. */
+  steerBlocked: boolean;
   reorderable: boolean;
 }) {
+  // The whole row drags (via its grip) and is the drop target, so the row
+  // follows the finger and dropping anywhere on another row reorders.
   const {
     attributes,
     listeners,
     setNodeRef: setDragRef,
+    setActivatorNodeRef,
+    transform,
     isDragging,
   } = useDraggable({
     id: message.queueId,
     disabled: !reorderable,
   });
-  // The whole row is the drop target so dropping anywhere on it reorders.
   const { setNodeRef: setDropRef, isOver } = useDroppable({
     id: message.queueId,
     disabled: !reorderable,
   });
+  const setRowRef = (node: HTMLDivElement | null) => {
+    setDragRef(node);
+    setDropRef(node);
+  };
   const hasText = message.text.trim().length > 0;
   const files = message.files ?? [];
   const attachmentNames = files.map(attachmentFilename);
@@ -94,29 +132,37 @@ function QueuedRow({
 
   return (
     <div
-      ref={setDropRef}
+      ref={setRowRef}
+      role="listitem"
+      style={transform ? { transform: `translate3d(0, ${transform.y}px, 0)` } : undefined}
       className={cn(
-        "flex items-center gap-1.5 text-sm text-muted-foreground max-md:gap-0.5",
-        isDragging && "opacity-40",
-        isOver && "rounded bg-foreground/5",
+        // WebKit's long-press text selection and callout cancel the touch
+        // gesture dnd-kit's TouchSensor relies on, so suppress them on the row.
+        "relative flex min-w-0 items-center gap-1 py-0.5 text-sm text-foreground select-none [-webkit-touch-callout:none]",
+        isDragging && "z-10 rounded-md bg-background shadow-md ring-1 ring-border ring-inset",
+        isOver &&
+          !isDragging &&
+          "after:absolute after:inset-x-0 after:-bottom-0.5 after:h-0.5 after:rounded-full after:bg-muted-foreground/60",
       )}
     >
       {reorderable ? (
-        <button
+        <Button
+          ref={setActivatorNodeRef}
           type="button"
-          ref={setDragRef}
+          variant="ghost"
+          size="icon-xs"
           aria-label="Reorder queued message"
-          className={cn(
-            ACTION_BUTTON_CLASS,
-            "cursor-grab touch-none text-muted-foreground/50 active:cursor-grabbing max-md:text-muted-foreground/80",
-          )}
+          className={cn(ACTION_BUTTON_CLASS, "cursor-grab touch-none active:cursor-grabbing")}
           {...attributes}
           {...listeners}
         >
           <GripVerticalIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
-        </button>
+        </Button>
       ) : (
-        <ClockIcon className={cn(ACTION_ICON_CLASS, "shrink-0")} aria-hidden="true" />
+        <ClockIcon
+          className={cn(ACTION_ICON_CLASS, "mx-1 shrink-0 text-muted-foreground")}
+          aria-hidden="true"
+        />
       )}
       <div className="flex min-w-0 flex-1 items-center gap-2 max-md:flex-col max-md:items-start max-md:gap-0.5">
         {hasText && (
@@ -138,7 +184,7 @@ function QueuedRow({
               className={cn("shrink-0", attachmentNames.length > 1 && "max-sm:hidden")}
               aria-hidden="true"
             />
-            <span className="truncate">{attachmentNames[0]}</span>
+            <span className="min-w-6 truncate">{attachmentNames[0]}</span>
             {attachmentNames.length > 1 && (
               <>
                 <span
@@ -156,41 +202,55 @@ function QueuedRow({
       {message.requiresRetry && (
         <span className="shrink-0 text-xs text-destructive">Send failed</span>
       )}
+      {message.waitingForHost && !message.requiresRetry && (
+        <span className="shrink-0 text-xs text-muted-foreground">Waiting for host</span>
+      )}
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
-      {onSteer ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label={
-                message.requiresRetry ? "Retry queued message" : "Send queued message now"
-              }
-              className={ACTION_BUTTON_CLASS}
-              onClick={() => onSteer(message.queueId)}
-            >
-              <ArrowUpIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="top">{message.requiresRetry ? "Retry" : "Send now"}</TooltipContent>
-        </Tooltip>
-      ) : null}
-      <button
-        type="button"
-        aria-label="Edit queued message"
-        className={ACTION_BUTTON_CLASS}
-        onClick={() => onEdit(message.queueId)}
-      >
-        <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
-      </button>
-      <button
-        type="button"
-        aria-label="Remove queued message"
-        className={ACTION_BUTTON_CLASS}
-        onClick={() => onDelete(message.queueId)}
-      >
-        <Trash2Icon className={ACTION_ICON_CLASS} aria-hidden="true" />
-      </button>
+      <span className="flex shrink-0 items-center gap-0">
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Edit queued message"
+          className={ACTION_BUTTON_CLASS}
+          onClick={() => onEdit(message.queueId)}
+        >
+          <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
+        </Button>
+        {onSteer ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={
+                  message.requiresRetry ? "Retry queued message" : "Send queued message now"
+                }
+                className={ACTION_BUTTON_CLASS}
+                disabled={steerBlocked}
+                onClick={() => onSteer(message.queueId)}
+              >
+                <ArrowUpIcon className="size-4 max-md:size-4" aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {message.requiresRetry ? "Retry" : "Send now"}
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Remove queued message"
+          className={ACTION_BUTTON_CLASS}
+          onClick={() => onDelete(message.queueId)}
+        >
+          <XIcon className="size-4 max-md:size-4" aria-hidden="true" />
+        </Button>
+      </span>
     </div>
   );
 }
@@ -213,11 +273,13 @@ export function QueuedMessagesStrip({
   onReorder,
   widthClassName,
 }: QueuedMessagesStripProps) {
-  // Pointer-only sensors with a small activation distance, matching the
-  // sidebar's DnD, so a click on the grip still reaches the row's buttons.
+  // Pointer sensors use activation constraints so pressing the grip does not
+  // accidentally start a drag. KeyboardSensor keeps reordering operable
+  // without a mouse or touch input.
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
+    useSensor(KeyboardSensor),
   );
 
   if (messages.length === 0) return null;
@@ -235,6 +297,7 @@ export function QueuedMessagesStrip({
     onReorder(String(active.id), beforeQueueId);
   };
 
+  const steerBlocked = messages.some((m) => m.waitingForHost);
   const rows = messages.map((message) => (
     <QueuedRow
       key={message.queueId}
@@ -242,27 +305,36 @@ export function QueuedMessagesStrip({
       onDelete={onDelete}
       onEdit={onEdit}
       onSteer={onSteer}
+      steerBlocked={steerBlocked}
       reorderable={onReorder !== undefined}
     />
   ));
 
+  // Desktop shares the card's content inset (COMPOSER_CONTENT_INSET_CLASS);
+  // the literal md:px-3 repeats it because the token has no responsive
+  // variant. Narrow phones keep the compact px-2.
   return (
     <div
       data-testid="composer-queued-strip"
       className={cn(
-        "mx-auto -mb-4 flex w-full flex-col rounded-t-2xl bg-tray/40 px-4 pt-1.5 pb-5.5 max-sm:px-2",
+        "composer-queued-surface mx-auto -mb-4 flex w-full flex-col rounded-t-2xl px-2 pt-1.5 pb-5.5 md:px-3",
         widthClassName,
       )}
     >
       {/* Cap the list height and scroll when the queue is long, so a big
-          backlog never pushes the composer off-screen. */}
-      <div className="flex max-h-32 flex-col gap-1 overflow-y-auto">
+          backlog never pushes the composer off-screen. ~5 rows tall. */}
+      <div
+        role="list"
+        aria-label="Queued messages"
+        className="flex max-h-32 flex-col gap-1 overflow-y-auto overscroll-contain"
+      >
         {onReorder === undefined ? (
           rows
         ) : (
           <DndContext
             sensors={sensors}
-            collisionDetection={pointerWithin}
+            collisionDetection={queuedMessageCollisionDetection}
+            modifiers={[restrictToQueuedList]}
             onDragEnd={handleDragEnd}
           >
             {rows}

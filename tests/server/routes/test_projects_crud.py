@@ -469,7 +469,7 @@ async def test_rejected_project_mutation_announces_nothing(
         assert bob_events == []
 
 
-async def test_project_order_round_trip(project_client: httpx.AsyncClient) -> None:
+async def test_project_order_round_trip(project_client: httpx.AsyncClient, db_uri: str) -> None:
     """Custom order affects both discovery APIs and survives rename/delete/reset."""
 
     async def names(path: str) -> list[str]:
@@ -492,6 +492,15 @@ async def test_project_order_round_trip(project_client: httpx.AsyncClient) -> No
     )
     assert response.status_code == 200
     assert response.json() == {"ordered_project_ids": ordered, "sort_mode": "manual"}
+    # A fresh store reads the persisted preference without a users-table column.
+    from sqlalchemy import inspect
+
+    from omnigent.db.utils import get_or_create_engine
+
+    assert "project_order" not in {
+        column["name"] for column in inspect(get_or_create_engine(db_uri)).get_columns("users")
+    }
+    assert SqlAlchemyProjectStore(db_uri).get_order_preference(user_id=None) == response.json()
     for path in ["/v1/projects", "/v1/sessions/projects"]:
         assert await names(path) == ["WORK", "BUG", "DOC"]
     await project_client.patch(f"/v1/projects/{ids[2]}", json={"name": "ZZZ"})
@@ -532,8 +541,9 @@ async def test_project_order_rejects_oversized_or_malformed_ids(
 async def test_corrupt_order_does_not_break_project_discovery(
     project_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    from sqlalchemy import text
+    from sqlalchemy import LargeBinary, bindparam, update
 
+    from omnigent.db.db_models import SqlPreference
     from omnigent.db.utils import get_or_create_engine
 
     for name in ("Z", "A"):
@@ -543,7 +553,13 @@ async def test_corrupt_order_does_not_break_project_discovery(
     ).raise_for_status()
     with get_or_create_engine(db_uri).begin() as connection:
         connection.execute(
-            text("UPDATE users SET project_order=:raw WHERE workspace_id=0 AND id='local'"),
+            update(SqlPreference)
+            .where(
+                SqlPreference.workspace_id == 0,
+                SqlPreference.user_id == "local",
+                SqlPreference.key == "project_order",
+            )
+            .values(value=bindparam("raw", type_=LargeBinary)),
             {"raw": b"\x00\x01broken compression"},
         )
     preference = await project_client.get("/v1/projects/order")

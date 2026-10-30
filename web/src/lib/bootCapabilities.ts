@@ -19,8 +19,12 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  archive_worktree_cleanup: false,
   branding: null,
 };
+
+/** How long a boot probe may stall before its fallback stands in. */
+export const BOOT_PROBE_TIMEOUT_MS = 1500;
 
 /**
  * Race a boot probe against a timeout so first paint never waits on a
@@ -29,7 +33,11 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
  * so a fast boot doesn't leave a pending handle behind (which would hold
  * the event loop open in tests).
  */
-export function withBootTimeout<T>(settled: Promise<T>, fallback: T, timeoutMs = 1500): Promise<T> {
+export function withBootTimeout<T>(
+  settled: Promise<T>,
+  fallback: T,
+  timeoutMs = BOOT_PROBE_TIMEOUT_MS,
+): Promise<T> {
   let timeout: ReturnType<typeof setTimeout>;
   const timer = new Promise<T>((resolve) => {
     timeout = setTimeout(() => resolve(fallback), timeoutMs);
@@ -43,7 +51,7 @@ export function withBootTimeout<T>(settled: Promise<T>, fallback: T, timeoutMs =
 
 export function createBootServerInfo(
   settled: Promise<ServerInfo>,
-  timeoutMs = 1500,
+  timeoutMs = BOOT_PROBE_TIMEOUT_MS,
 ): { initial: Promise<ServerInfo>; settled: Promise<ServerInfo> } {
   return {
     initial: withBootTimeout(settled, SERVER_INFO_OFFLINE_FALLBACK, timeoutMs),

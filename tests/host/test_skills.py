@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
+import os
+import subprocess
 import tarfile
 from dataclasses import replace
 from pathlib import Path
@@ -14,7 +17,11 @@ import pytest
 import yaml
 
 from omnigent.host.frames import HostSkillsFrame
-from omnigent.host.skills import HostSkillDiscovery
+from omnigent.host.skills import (
+    INCOMPLETE_CATALOG_TTL_SECONDS,
+    SKILLS_CACHE_TTL_SECONDS,
+    HostSkillDiscovery,
+)
 from omnigent.spec import load
 from omnigent.spec.skill_sources import resolve_session_skills
 
@@ -96,6 +103,52 @@ def test_session_catalog_matches_invocation_scope(
     assert resolved[0].skill_dir == runner_bundle / "skills" / "bundled"
 
 
+@pytest.mark.parametrize("remove_link", [True, False], ids=["removed", "permission-denied"])
+def test_session_catalog_handles_host_skill_symlink_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    remove_link: bool,
+) -> None:
+    skills_dir = Path.home() / ".codex" / "skills"
+    local = skills_dir / "local"
+    local.mkdir(parents=True)
+    (local / "SKILL.md").write_text(_skill("local"))
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / "SKILL.md").write_text(_skill("changing"))
+    changing = skills_dir / "changing"
+    changing.symlink_to(installed, target_is_directory=True)
+    readlink = os.readlink
+
+    def readlink_during_update(path: str, *, dir_fd: int | None = None) -> str:
+        if path == str(changing):
+            if not remove_link:
+                raise PermissionError("synthetic access denial")
+            # The provider already read SKILL.md; resolve has just seen a symlink.
+            changing.unlink()
+        return readlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "readlink", readlink_during_update)
+    bundle = _bundle(
+        {"skills/bundled/SKILL.md": _skill("bundled")},
+        executor={"config": {"harness": "codex-native"}},
+    )
+    discovery = HostSkillDiscovery(lambda _: _response(bundle))
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+    if not remove_link:
+        with pytest.raises(PermissionError, match="synthetic access denial"):
+            discovery.discover(frame, tmp_path)
+        return
+
+    assert discovery.discover(frame, tmp_path) == [
+        {"name": "bundled", "description": "bundled description"},
+        {"name": "local", "description": "local description"},
+    ]
+    assert "Skipping host skill whose directory disappeared during discovery" in caplog.text
+    assert str(changing) not in caplog.text
+
+
 def test_nested_subagent_uses_directory_name_and_own_filter(tmp_path: Path) -> None:
     child_config = yaml.safe_dump(
         {
@@ -144,6 +197,13 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     directory.mkdir(parents=True)
     (directory / "SKILL.md").write_text(_skill("custom"))
     monkeypatch.setenv(variable, str(config_dir))
+    expected_names = {"custom"}
+    if harness == "claude-native":
+        for tier, name in ((".claude", "native"), (".agents", "portable")):
+            skill = tmp_path / tier / "skills" / name / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(_skill(name))
+            expected_names.add(name)
     discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
     frame = HostSkillsFrame("request", harness, str(tmp_path))
     host_catalog = discovery.discover(frame, tmp_path)
@@ -161,7 +221,7 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     spec = load(bundle, dest=tmp_path / "runner-bundle", expand_env=False)
     resolved = resolve_session_skills(spec, (tmp_path,), None)
     assert host_catalog == [{"name": s.name, "description": s.description} for s in resolved]
-    assert "custom" in {s["name"] for s in host_catalog}
+    assert {s["name"] for s in host_catalog} == expected_names
 
 
 def test_directory_cache_separates_agent_filters(tmp_path: Path) -> None:
@@ -227,3 +287,71 @@ def test_directory_catalog_never_downloads_a_session_bundle(tmp_path: Path) -> N
         HostSkillsFrame("request", "claude-native", str(tmp_path)), tmp_path
     ) == [{"name": "local", "description": "local description"}]
     fetch.assert_not_called()
+
+
+def test_incomplete_codex_catalog_reports_warnings_and_is_cached_only_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr("omnigent.host.skills.time", SimpleNamespace(monotonic=lambda: now[0]))
+    codex_home = tmp_path / "home" / ".codex"
+    for directory in (codex_home / "skills" / "local", codex_home / "skills" / "later"):
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(_skill(directory.name))
+    plugin = codex_home / "plugins" / "cache" / "market" / "toolkit" / "1.0.0"
+    (plugin / ".codex-plugin").mkdir(parents=True)
+    (plugin / ".codex-plugin" / "plugin.json").write_text(json.dumps({"name": "toolkit"}))
+    (plugin / "skills" / "review").mkdir(parents=True)
+    (plugin / "skills" / "review" / "SKILL.md").write_text(_skill("review"))
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "/test/codex")
+    cli = Mock(side_effect=subprocess.CalledProcessError(1, "codex", stderr="Error: broken"))
+    monkeypatch.setattr("omnigent.spec.codex_plugin_skills.subprocess.run", cli)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.skill_discovery.loaded_codex_skills",
+        Mock(side_effect=RuntimeError("Codex skills/list connection failed")),
+    )
+    discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
+    frame = HostSkillsFrame("request", "codex-native", str(tmp_path))
+
+    def names(warnings: list[str]) -> list[str]:
+        return [skill["name"] for skill in discovery.discover(frame, tmp_path, warnings=warnings)]
+
+    # Standalone skills survive both failed plugin sources, and the catalog says why.
+    warning = (
+        "Codex plugin skills unavailable: `codex plugin list` exited 1 and "
+        "`codex app-server` could not list skills; see the host log for details."
+    )
+    assert names(warnings := []) == ["later", "local"]
+    assert warnings == [warning]
+
+    # Within its short TTL the incomplete catalog is served from the cache, warning included.
+    cli.side_effect = None
+    cli.return_value = subprocess.CompletedProcess(
+        [],
+        0,
+        stdout=json.dumps(
+            {
+                "installed": [
+                    {
+                        "marketplaceName": "market",
+                        "name": "toolkit",
+                        "version": "1.0.0",
+                        "enabled": True,
+                    }
+                ]
+            }
+        ),
+    )
+    assert names(warnings := []) == ["later", "local"]
+    assert warnings == [warning]
+    assert cli.call_count == 1
+
+    # Once that expires a retry rescans, and the complete catalog is cached for the full TTL.
+    now[0] = INCOMPLETE_CATALOG_TTL_SECONDS + 1
+    assert names(warnings := []) == ["later", "local", "toolkit:review"]
+    assert warnings == []
+    cli.side_effect = OSError("gone")
+    now[0] += SKILLS_CACHE_TTL_SECONDS - 1
+    assert names(warnings := []) == ["later", "local", "toolkit:review"]
+    assert warnings == []
+    assert cli.call_count == 2

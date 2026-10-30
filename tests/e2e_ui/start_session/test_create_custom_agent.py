@@ -13,48 +13,21 @@ capture the multipart request body for assertion.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Stubbed host the composer auto-selects.
 _HOST_ID = "host_e2e"
 # Bare create endpoint — intercepts POST but lets GET through.
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
 def _agents_body() -> str:
@@ -133,7 +106,7 @@ async def _register_routes(
         # Neutralize agent discovery so only the stubbed Claude agent feeds the
         # picker. On the shared e2e_ui server, sessions other tests left behind
         # would otherwise leak in as discovered custom agents — flipping the
-        # picker's "Custom agents" group on and folding "Create custom agent"
+        # picker's custom-agent "Other..." group on and folding "Create custom agent"
         # into a submenu, so the top-level create row this test clicks is absent.
         await route.fulfill(
             status=200,
@@ -151,6 +124,7 @@ async def _register_routes(
     await page.route(
         re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
     )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
 
 async def _seed_workspace(page) -> None:
@@ -167,7 +141,7 @@ async def _open_create_agent(page) -> None:
     """Open the agent picker and click "Create custom agent".
 
     With no custom agents registered, the create action is a top-level row in
-    the picker (it only folds into a "Custom agents" submenu once custom agents
+    the picker (it only folds into an "Other..." submenu once custom agents
     exist), so open the dropdown and click the create item directly.
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()
@@ -232,7 +206,7 @@ async def _drive_create_and_submit(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-submit").click()
 
             # The create POST should have been a multipart request (the bundle).
-            await _wait_until(lambda: len(create_requests) == 1)
+            await poll_until_async(lambda: len(create_requests) == 1)
             assert create_requests[0].get("__multipart__") is True, (
                 f"Expected multipart POST, got: {create_requests[0]}"
             )
@@ -297,7 +271,7 @@ async def _drive_mcp_server(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("list repos")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_requests) == 1)
+            await poll_until_async(lambda: len(create_requests) == 1)
             assert create_requests[0].get("__multipart__") is True
         finally:
             await browser.close()

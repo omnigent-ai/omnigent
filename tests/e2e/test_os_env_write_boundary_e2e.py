@@ -65,22 +65,6 @@ _WORKTREE_GUARD_CONFIG: dict[str, Any] = {
 }
 
 
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """Concatenate all assistant output_text blocks from a terminal body.
-
-    :param body: The terminal response body.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
-
-
 def _collect_tool_results(body: dict[str, Any]) -> list[str]:
     """Collect all function_call_output result strings from a terminal body.
 

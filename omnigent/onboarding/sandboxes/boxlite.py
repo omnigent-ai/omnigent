@@ -205,6 +205,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             file_copy=False,
             streaming_exec=False,
             foreground_exec=False,
+            git_clone_options=super().capabilities.git_clone_options,
         )
 
     def __init__(

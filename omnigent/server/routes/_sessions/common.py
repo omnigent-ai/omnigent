@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +21,11 @@ import httpx
 from pydantic import TypeAdapter
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent._wrapper_labels import (
+    ACP_SUBAGENT_ID_LABEL_KEY,
+    ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    WRAPPER_LABEL_KEY,
+)
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
@@ -49,6 +56,10 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
+)
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -65,6 +76,10 @@ _MCP_ELICITATION_TYPE: str = "mcp_elicitation"
 
 
 _COMPACT_TYPE: str = "compact"
+
+
+# Starts a fresh context in a native session's own terminal (the vendor /clear).
+_CLEAR_TYPE: str = "clear"
 
 
 _SLASH_COMMAND_TYPE: str = "slash_command"
@@ -111,11 +126,11 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 
 
-# "quiesced": the claude-native sub-agent transcript-quiescence badge — a
-# UI signal only, never a terminal edge (the runner must not deliver a
-# parent-inbox completion from it).
+_SUBAGENT_STATUS_TYPE: str = "subagent.status"
+
+
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed", "quiesced"}
+    {"idle", "running", "waiting", "failed"}
 )
 
 
@@ -139,6 +154,9 @@ _EXTERNAL_MCP_STARTUP_STATUS_VALUES: frozenset[str] = frozenset(
 
 
 _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
+
+# PRs a runner discovered for its session, as ``{"prs": [...]}``; the server merges them.
+_EXTERNAL_PULL_REQUESTS_TYPE: str = "external_pull_requests"
 
 
 _EXTERNAL_MODEL_CHANGE_TYPE: str = "external_model_change"
@@ -168,7 +186,7 @@ _EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
 # parent, so leaving the wrapper unset lets the child's harness resolve to the
 # parent's (e.g. ``devin``) and the UI label it accordingly, instead of
 # mislabeling it as another vendor.
-_ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+_ACP_SUBAGENT_ID_LABEL_KEY = ACP_SUBAGENT_ID_LABEL_KEY
 
 
 _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
@@ -210,7 +228,7 @@ _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nicknam
 _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 
 
-_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 
 
 # Current approval/sandbox mode of a live codex-native session. ``terminal_launch_args``
@@ -242,10 +260,11 @@ _CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
     {"default", "acceptEdits", "plan", "auto"}
 )
 # Modes the forwarder can read off the pane footer. A session launched into
-# ``bypassPermissions`` reports it so the label and picker show the real mode;
-# it is still not a PATCH target.
+# ``bypassPermissions`` or ``dontAsk`` reports it so the label and picker show
+# the real mode; neither is a PATCH target.
 _CLAUDE_NATIVE_READABLE_PERMISSION_MODES: frozenset[str] = _CLAUDE_NATIVE_PERMISSION_MODES | {
-    "bypassPermissions"
+    "bypassPermissions",
+    "dontAsk",
 }
 
 
@@ -255,7 +274,7 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE: str = "external_antigravity_subagent_start"
 
 
-_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "antigravity-native-ui-subagent"
+_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE
 
 
 _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY = (
@@ -290,6 +309,9 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 
+_LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: str = "omnigent.last_task_error_agent_name"
+
+
 # Optional structured failure fields (present when the runner classified the
 # failure — see ``omnigent.runner.launch_failure``), persisted so a reload
 # renders the same clear failure card instead of only the raw code + message.
@@ -302,13 +324,25 @@ _LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
 _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
 
 
+# The persisted item a ``runner_rejected_event`` failure refers to, so a client
+# whose POST answer was lost can tell its own refused send from another message's
+# rejection when the snapshot comes back. Empty for failures without an item.
+_LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
+
+
+# The runner bound when this failure was recorded, so a later exit from a
+# different runner attempt surfaces its own startup failure instead of hiding
+# behind this stale cause. Empty when unknown (treated as the current runner's).
+_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: str = "omnigent.last_task_error_runner_id"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
 _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
 
 
-_CLAUDE_NATIVE_WRAPPER_LABEL_KEY = "omnigent.wrapper"
+_CLAUDE_NATIVE_WRAPPER_LABEL_KEY = WRAPPER_LABEL_KEY
 
 
 _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = CLAUDE_NATIVE_CODING_AGENT.wrapper_label
@@ -396,6 +430,9 @@ _NATIVE_POLICY_NOT_ENFORCED_CODE = "native_policy_not_enforced"
 _HOST_BOUND_RUNNER_CONNECT_GRACE_S = 10.0
 
 
+_HOST_RECONNECT_GRACE_S = 30.0
+
+
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
 
 
@@ -406,6 +443,13 @@ _MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
 
 
 _RUNNER_CONVICTION_POLL_S = 0.25
+
+
+# Lookups, and the gap between them, when resolving a connected runner's client.
+_RUNNER_CLIENT_RESOLVE_ATTEMPTS = 3
+
+
+_RUNNER_CLIENT_RESOLVE_RETRY_S = 2.0
 
 
 _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
@@ -469,6 +513,9 @@ _CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 _NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 
 
+_PI_EXTENSION_UI_HOOK_TIMEOUT_S = 86400.0
+
+
 _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = 300.0
 
 
@@ -481,6 +528,20 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 # flipped to "Resolved elsewhere" between polls; a hook that died for real just
 # leaves the card up this much longer.
 _HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
+
+
+# How long an archive defers tearing down the session's runner, giving an Undo's
+# unarchive time to land first. When the teardown fires it re-reads the persisted
+# archived flag and skips if the session was unarchived, so any Undo whose
+# unarchive PERSISTS before this fires keeps the runner — across replicas, since
+# the guard is the shared row, not an in-memory timer.
+#
+# MUST stay above the client Undo pill's total lifetime, which the pill caps at
+# ARCHIVE_UNDO_MAX_LIFETIME_MS (5s) in web/src/shell/archiveUndoToast.tsx. The
+# pill merges successive archives, so without that cap it could linger past this
+# grace and offer an Undo AFTER the teardown already ran — and the re-check
+# can't un-stop a runner. The cap keeps the pill's Undo window inside this grace.
+_ARCHIVE_STOP_UNDO_GRACE_S = 8.0
 
 
 _HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
@@ -504,41 +565,56 @@ _RUNNER_RELAY_READY_TIMEOUT_S = 5.0
 _RUNNER_FORWARD_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=10.0)
 
 
-_ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) | {
+# Event types clients post; ``/v1/info`` advertises these as ``session_event_types``.
+CLIENT_SESSION_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) | {
     _INTERRUPT_TYPE,
     _APPROVAL_TYPE,
     _MCP_ELICITATION_TYPE,
     _COMPACT_TYPE,
+    _CLEAR_TYPE,
     _STOP_SESSION_TYPE,
     _RETRY_SESSION_TYPE,
-    _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
-    _EXTERNAL_CONVERSATION_ITEM_TYPE,
-    _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
-    _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
-    _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
-    _EXTERNAL_SESSION_INTERRUPTED_TYPE,
-    _EXTERNAL_SESSION_SUPERSEDED_TYPE,
-    _EXTERNAL_BTW_SIDECHAT_TYPE,
+    # The web posts this when the user closes its /btw side chat.
     _EXTERNAL_BTW_DISMISS_TYPE,
-    _EXTERNAL_ELICITATION_RESOLVED_TYPE,
-    _EXTERNAL_SESSION_STATUS_TYPE,
-    _EXTERNAL_SESSION_USAGE_TYPE,
-    _EXTERNAL_COMPACTION_STATUS_TYPE,
-    _EXTERNAL_MCP_STARTUP_TYPE,
-    _EXTERNAL_MODEL_CHANGE_TYPE,
-    _EXTERNAL_MODEL_OPTIONS_TYPE,
-    _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
-    _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
-    _EXTERNAL_SESSION_TITLE_TYPE,
-    _EXTERNAL_SESSION_TODOS_TYPE,
-    _EXTERNAL_SUBAGENT_START_TYPE,
-    _EXTERNAL_ACP_SUBAGENT_START_TYPE,
-    _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
-    _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
-    _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
-    _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
-    _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
 }
+
+
+# Event types only hosts and harness forwarders post.
+_RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+        _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+        _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+        _EXTERNAL_BTW_SIDECHAT_TYPE,
+        _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+        _EXTERNAL_SESSION_STATUS_TYPE,
+        _SUBAGENT_STATUS_TYPE,
+        _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_PULL_REQUESTS_TYPE,
+        _EXTERNAL_COMPACTION_STATUS_TYPE,
+        _EXTERNAL_MCP_STARTUP_TYPE,
+        _EXTERNAL_MODEL_CHANGE_TYPE,
+        _EXTERNAL_MODEL_OPTIONS_TYPE,
+        _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
+        _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        _EXTERNAL_SESSION_TITLE_TYPE,
+        _EXTERNAL_SESSION_TODOS_TYPE,
+        _EXTERNAL_SUBAGENT_START_TYPE,
+        _EXTERNAL_ACP_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+        _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
+        _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+        _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
+    }
+)
+
+
+_ALLOWED_EVENT_TYPES: frozenset[str] = CLIENT_SESSION_EVENT_TYPES | _RUNNER_SESSION_EVENT_TYPES
 
 
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
@@ -549,6 +625,33 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+@dataclass
+class _RunnerStatusProbeBackoff:
+    """
+    Skip window for a session's runner status probe after slow probes.
+
+    :param skip_until: Monotonic time before which the probe is skipped.
+    :param failures: Consecutive slow or failed probes; sets the next window.
+    :param runner_id: Runner the slow probes were against, e.g.
+        ``"runner_0123456789abcdef"``; a rebind to another runner discards
+        the window.
+    """
+
+    skip_until: float
+    failures: int
+    runner_id: str | None
+
+
+_runner_status_probe_backoff: WorkspaceScopedCache[str, _RunnerStatusProbeBackoff] = (
+    WorkspaceScopedCache()
+)
+
+# The one runner status probe in flight per session; concurrent snapshots await it.
+_runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None]] = (
+    WorkspaceScopedCache()
+)
 
 
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
@@ -574,7 +677,18 @@ _read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCach
 _interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
-_intentional_stop_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+# Markers belong to one runner and expire after teardown plus disconnect grace.
+# Do not evict live markers under load: each one suppresses an expected drop.
+_intentional_stop_sessions: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(
+        maxsize=math.inf, ttl=2 * RUNNER_LIVENESS_TTL_S, timer=lambda: time.monotonic()
+    )
+)
+
+
+_intentional_runner_stop_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
+    weakref.WeakValueDictionary
+)
 
 
 _TERMINAL_RESPONSE_EVENT_TYPES: frozenset[str] = frozenset(
@@ -697,6 +811,7 @@ class _PendingPolicyAskWrites:
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
     :param reviewed_arguments: Original MCP arguments shown for approval.
     :param transformed_arguments: Policy transform stored with that approval.
+    :param mcp_call_identity: Session, tool, policy actor and credential user.
     """
 
     state_updates: list[StateUpdate] | None
@@ -704,6 +819,7 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
+    mcp_call_identity: tuple[str, str, str | None, str | None] | None = None
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be
@@ -736,11 +852,32 @@ _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Loc
     weakref.WeakValueDictionary()
 )
 
+# Serializes native transcript mirrors per conversation so a retried mirror sees
+# the first attempt's commit before it touches the pending-input queue.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_native_mirror_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
 
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _policy_evaluation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
+
+
+@dataclass(frozen=True)
+class _RelayStatusSnapshot:
+    """Saved status and diagnostics without retaining a full conversation's payloads."""
+
+    live_status: str
+    kind: str
+    parent_conversation_id: str | None
+    runner_id: str
+    host_id: str | None
+    updated_at: int
+    # Mirrors an in-process sub-agent whose native parent owns its turn.
+    parent_owned: bool = False
 
 
 @dataclass
@@ -755,11 +892,20 @@ class _RelayHandle:
     :param ready: Event set after the relay observes the runner
         stream's ready heartbeat, proving the runner-side
         no-replay subscription is registered.
+    :param status_snapshot: Saved status read when adopting this binding,
+        used only when live status and a fresh row are unavailable.
+    :param intentional_stop_turn_ended: A terminal response arrived while the
+        current stop marker was pending; reset by each Stop request.
+    :param running_event_count: Running notifications observed by this relay,
+        used to preserve intervening activity when a Stop is rejected.
     """
 
     runner_id: str
     task: asyncio.Task[None]
     ready: asyncio.Event
+    status_snapshot: _RelayStatusSnapshot | None = None
+    intentional_stop_turn_ended: bool = False
+    running_event_count: int = 0
 
 
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
@@ -787,6 +933,11 @@ _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
+# The subset not yet bound to their host. Shutdown waits for these: once a
+# session is bound, whichever replica its host tunnels to finishes the launch.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_unbound_managed_launch_tasks: set[asyncio.Task[Any]] = set()
+_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S = 5.0
 
 
 _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
@@ -943,6 +1094,7 @@ def get_server_host_registry() -> HostRegistry | None:
 
 
 __all__ = [
+    "CLIENT_SESSION_EVENT_TYPES",
     "COST_CONTROL_OVERRIDE_VALUES",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
@@ -977,6 +1129,7 @@ __all__ = [
     "_CLAUDE_NATIVE_UI_LABEL_VALUE",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_KEY",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_CLEAR_TYPE",
     "_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY",
     "_CODEX_NATIVE_COLLABORATION_MODES",
     "_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY",
@@ -1024,6 +1177,7 @@ __all__ = [
     "_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE",
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
     "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
+    "_EXTERNAL_PULL_REQUESTS_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",
@@ -1043,6 +1197,7 @@ __all__ = [
     "_HOOK_ELICITATION_ID_RE",
     "_HOST_BOUND_RUNNER_CONNECT_GRACE_S",
     "_HOST_LAUNCH_RESULT_TIMEOUT_S",
+    "_HOST_RECONNECT_GRACE_S",
     "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
     "_HOST_RUNNER_STATUS_TIMEOUT_S",
     "_INTERRUPT_TYPE",
@@ -1056,6 +1211,7 @@ __all__ = [
     "_LAST_TASK_ERROR_MESSAGE_LABEL_KEY",
     "_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY",
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
+    "_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
@@ -1068,9 +1224,12 @@ __all__ = [
     "_NATIVE_TERMINAL_ENSURE_FAILED_CODE",
     "_NATIVE_TERMINAL_START_FAILED_CODE",
     "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_PI_EXTENSION_UI_HOOK_TIMEOUT_S",
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",
     "_RETRY_SESSION_TYPE",
+    "_RUNNER_CLIENT_RESOLVE_ATTEMPTS",
+    "_RUNNER_CLIENT_RESOLVE_RETRY_S",
     "_RUNNER_CONVICTION_POLL_S",
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
@@ -1086,6 +1245,7 @@ __all__ = [
     "_STOP_RUNNER_RESULT_TIMEOUT_S",
     "_STOP_SESSION_TYPE",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
+    "_SUBAGENT_STATUS_TYPE",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
@@ -1094,12 +1254,15 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RelayStatusSnapshot",
+    "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
     "_browser_action_registry",
     "_catalog_prefetch_tasks",
     "_deferred_elicitation_clear_tasks",
+    "_intentional_runner_stop_locks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
     "_llm_response_denied_turns",
@@ -1116,6 +1279,8 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
+    "_runner_status_probe_backoff",
+    "_runner_status_probe_inflight",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
@@ -1125,6 +1290,7 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
+    "_unbound_managed_launch_tasks",
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",

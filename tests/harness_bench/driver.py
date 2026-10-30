@@ -194,6 +194,7 @@ class SdkInprocDriver:
     """Drive turns through a harness wrap subprocess."""
 
     transport = "sdk-inproc"
+    applied_model_override = True
 
     def __init__(self, profile: BenchProfile, *, databricks_profile: str | None) -> None:
         self._profile = profile
@@ -279,7 +280,7 @@ class SdkInprocDriver:
                 ),
                 timeout=timeout,
             )
-        except (asyncio.TimeoutError, httpx.ReadTimeout):
+        except (TimeoutError, httpx.ReadTimeout):
             result.timed_out = True
         return result
 

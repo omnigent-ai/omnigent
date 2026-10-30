@@ -21,9 +21,9 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → live CLI discovery for Cursor; curated static aliases for
   CLIs without a listing API (source ``"static"``, ``verified: false``).
-- ``cli-config`` → the codex curated static list (source ``"static"``,
-  ``verified: false`` — the credential lives in the CLI's own config
-  file and is resolved by the CLI at launch).
+- ``cli-config`` → native Claude/Codex shared probe catalogs (source ``"cli"``)
+  when available, otherwise an empty static listing. Credentials are
+  resolved by the CLI at launch.
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -55,7 +55,11 @@ from omnigent.models.model_metadata import (
     ModelMetadata,
     ModelWireAPI,
 )
-from omnigent.models.model_override import is_codex_compatible_model, model_family_mismatch
+from omnigent.models.model_override import (
+    is_codex_compatible_model,
+    is_databricks_model_id,
+    model_family_mismatch,
+)
 from omnigent.models.model_resolver import (
     ModelResolution,
     ModelResolutionError,
@@ -249,7 +253,9 @@ class ResolvedModelProvider:
     :param auth_command: Shell command printing a bearer token, for
         providers configured with a dynamic credential.
     :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
-        ``kind="subscription"``; ``"codex"`` for ``kind="cli-config"``.
+        ``kind="subscription"``; ``"claude"`` / ``"codex"`` for
+        ``kind="cli-config"``.
+    :param model_provider: Codex config.toml provider id for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
     """
@@ -261,6 +267,7 @@ class ResolvedModelProvider:
     api_key: str | None = None
     auth_command: str | None = None
     cli: str | None = None
+    model_provider: str | None = None
     detail: str = ""
 
 
@@ -584,7 +591,7 @@ def resolve_model_provider(spec: object, harness: str | None) -> ResolvedModelPr
     """
     try:
         return _resolve_model_provider_unsafe(spec, harness)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         from omnigent.errors import OmnigentError
 
         _logger.debug("model provider resolution failed for harness %r", harness, exc_info=True)
@@ -636,9 +643,33 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
             agent_spec, harness_type=harness_type, actual_harness=harness
         )
     )
-    if entry is not None:
-        return _provider_from_entry(entry, harness_type)
-    return _provider_from_legacy_auth(agent_spec, harness_type)
+    provider = (
+        _provider_from_entry(entry, harness_type)
+        if entry is not None
+        else _provider_from_legacy_auth(agent_spec, harness_type)
+    )
+    # Managed settings own routing over a global ``auth:`` (as in
+    # ``resolve_native_claude_config``); a subscription label would strip gateway ids.
+    from_global_auth = (
+        provider.detail == "databricks auth"
+        and agent_spec.executor.auth is None
+        and not (agent_spec.executor.profile or agent_spec.executor.config.get("profile"))
+    )
+    if canonical_harness in ("claude-native", "native-claude") and (
+        provider.kind == SUBSCRIPTION_KIND
+        or (entry is None and (provider.kind == NONE_KIND or from_global_auth))
+    ):
+        from omnigent.onboarding.ambient import claude_managed_gateway_routes
+
+        base_url = claude_managed_gateway_routes()
+        if base_url:
+            return ResolvedModelProvider(
+                kind=CLI_CONFIG_KIND,
+                cli="claude",
+                base_url=base_url,
+                detail="Claude Code managed settings",
+            )
+    return provider
 
 
 def _provider_from_legacy_auth(
@@ -675,21 +706,21 @@ def _provider_from_legacy_auth(
 
 
 def _databricks_prefix_provider(spec: AgentSpec) -> ResolvedModelProvider | None:
-    """Map a ``databricks-*`` spec model to the runner-env-profile gateway.
+    """Map a Databricks model id to the runner-env-profile gateway.
 
     Mirrors the builders' shared model-prefix heuristic; the native
     launch paths read the same ``DATABRICKS_CONFIG_PROFILE`` fallback.
 
     :param spec: The worker's (sub-)agent spec.
-    :returns: A databricks provider, or ``None`` when the model carries
-        no ``databricks-`` / ``databricks/`` prefix.
+    :returns: A databricks provider, or ``None`` when the model carries no
+        legacy Databricks or Unity Catalog model prefix.
     """
     model = spec.executor.model
-    if isinstance(model, str) and model.startswith(("databricks-", "databricks/")):
+    if isinstance(model, str) and is_databricks_model_id(model):
         return ResolvedModelProvider(
             kind=DATABRICKS_KIND,
             profile=os.environ.get("DATABRICKS_CONFIG_PROFILE"),
-            detail="databricks-* model prefix",
+            detail="Databricks model prefix",
         )
     return None
 
@@ -1021,6 +1052,7 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
         return ResolvedModelProvider(
             kind=CLI_CONFIG_KIND,
             cli=entry.cli,
+            model_provider=entry.model_provider,
             detail=(
                 f"provider {entry.name!r} (codex config.toml model provider "
                 f"{entry.model_provider!r})"
@@ -1093,30 +1125,35 @@ def list_models_for_worker(
                 note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
             )
     provider = resolve_model_provider(spec, harness)
-    # Pi harnesses use system.ai.* ids (via the Unity Catalog model-services API)
-    # so supervisors see the ids Pi can actually route. Other harnesses use the
-    # serving-endpoints listing which returns databricks-* ids.
-    _pi_harnesses = frozenset({"pi", "pi-native", "native-pi"})
-    canonical = (harness or "").lower().replace("-", "").replace("_", "")
-    use_uc = canonical in {h.replace("-", "").replace("_", "") for h in _pi_harnesses}
-    if use_uc and provider.kind == DATABRICKS_KIND:
+    if provider.kind == DATABRICKS_KIND:
         uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:
-            cached = cast(ModelListing | None, _listing_cache.get(uc_key))
-        if cached is not None:
-            listing = cached
-        else:
+            uc_listing = cast(ModelListing | None, _listing_cache.get(uc_key))
+        if uc_listing is None:
             try:
-                listing = _fetch_databricks_uc_listing(provider, transport=transport)
+                uc_listing = _fetch_databricks_uc_listing(provider, transport=transport)
                 with _listing_cache_lock:
-                    _listing_cache[uc_key] = listing
+                    _listing_cache[uc_key] = uc_listing
             except (httpx.HTTPError, OSError):
                 _logger.debug(
-                    "UC model listing failed for pi harness, falling back", exc_info=True
+                    "UC model listing failed for Databricks provider, falling back",
+                    exc_info=True,
                 )
-                listing = _listing_for_provider(provider, transport=transport)
+        listing = (
+            _with_custom_serving_endpoints(uc_listing, provider, transport=transport)
+            if uc_listing is not None
+            else _listing_for_provider(provider, transport=transport)
+        )
     else:
         listing = _listing_for_provider(provider, transport=transport)
+    canonical_harness = (harness or "").lower().replace("-", "").replace("_", "")
+    if canonical_harness in {"pi", "pinative", "nativepi"}:
+        listing = replace(
+            listing,
+            models=tuple(
+                model for model in listing.models if not unsupported_in_pi(model.id.lower())
+            ),
+        )
     if harness is None:
         return listing
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
@@ -1177,7 +1214,7 @@ def _worker_row(
     harness = spec_harness(spec)
     try:
         listing = list_models_for_worker(spec, harness, transport=transport)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.debug("worker model enumeration failed", exc_info=True)
         listing = ModelListing(
             source=NONE_KIND,
@@ -1427,17 +1464,53 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 
 
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the curated static listing for a ``cli-config`` provider.
+    """Read a CLI-owned catalog, or report that it has not been probed yet.
 
-    A ``cli-config`` provider pins a custom ``[model_providers.X]`` table in
-    the codex CLI's own ``config.toml``; its credential (an auth command /
-    env key in that file) is resolved by codex at launch, so the listing is
-    the codex curated ids with a note saying the credential is the CLI's to
-    resolve — not a "no credentials" preflight failure.
+    Claude managed gateways and Codex config.toml providers share their
+    native launch catalogs. Credentials remain the CLI's responsibility.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
-    :returns: A ``source="static"`` listing with no models.
+    :returns: A probe-backed listing when cached, else an empty static listing.
     """
+    from omnigent.models import model_catalog_store
+
+    probe: tuple[str, str, str] | None = None
+    if provider.cli == "claude":
+        from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+
+        probe = ("claude-native", claude_catalog_fingerprint(None), "Claude Code")
+    elif provider.cli == "codex" and provider.model_provider:
+        from omnigent.harnesses.codex_native.app_server import (
+            NativeCodexLaunch,
+            codex_catalog_fingerprint,
+        )
+
+        # Pin the worker's selected provider rather than resolving the ambient default.
+        launch = NativeCodexLaunch(
+            config_overrides=[f"model_provider={json.dumps(provider.model_provider)}"],
+            model=None,
+            profile=None,
+        )
+        probe = ("codex-native", codex_catalog_fingerprint(launch), "Codex")
+    if probe is not None:
+        harness, fingerprint, label = probe
+        rows = model_catalog_store.read_catalog(harness, fingerprint)
+        if rows is not None:
+            stale = model_catalog_store.catalog_is_stale(harness, fingerprint)
+            model_ids = dict.fromkeys(str(row.get("model") or row["id"]) for row in rows)
+            return ModelListing(
+                source="cli",
+                verified=not stale,
+                models=tuple(
+                    ModelEntry(id=model_id, family=model_family_token(model_id))
+                    for model_id in model_ids
+                ),
+                note=(
+                    f"cached {label} model probe; catalog needs refreshing"
+                    if stale
+                    else f"models advertised by the {label} model probe"
+                ),
+            )
     return ModelListing(
         source="static",
         verified=False,
@@ -1505,6 +1578,8 @@ def _fetch_databricks_listing(
         # state field stays included (the API may omit it).
         if isinstance(ready, str) and ready and ready.upper() != "READY":
             continue
+        if name.startswith("databricks-"):
+            name = f"system.ai.{name.removeprefix('databricks-')}"
         models.append(ModelEntry(id=name, family=model_family_token(name)))
     return ModelListing(
         source="gateway",
@@ -1517,6 +1592,33 @@ def _fetch_databricks_listing(
     )
 
 
+def _with_custom_serving_endpoints(
+    listing: ModelListing,
+    provider: ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None,
+) -> ModelListing:
+    """Add the workspace's custom LLM serving endpoints to a model-services listing.
+
+    Model services cover only the ``system.ai`` foundation models; customer-created
+    serving endpoints appear only in the serving-endpoints listing. Its foundation
+    entries are dropped because the model-services listing already names them.
+
+    :param listing: The Unity Catalog model-services listing.
+    :param provider: A ``kind="databricks"`` provider descriptor.
+    :param transport: Optional httpx transport override for tests.
+    :returns: *listing*, extended with any custom endpoints.
+    """
+    endpoints = _listing_for_provider(provider, transport=transport)
+    listed = {model.id for model in listing.models}
+    custom = tuple(
+        model
+        for model in endpoints.models
+        if not is_databricks_model_id(model.id) and model.id not in listed
+    )
+    return replace(listing, models=(*listing.models, *custom)) if custom else listing
+
+
 def _fetch_databricks_uc_listing(
     provider: ResolvedModelProvider,
     *,
@@ -1525,7 +1627,7 @@ def _fetch_databricks_uc_listing(
     """List LLM model services via the Unity Catalog model-services API.
 
     Returns ``system.ai.*`` model ids directly — the ids that work with the
-    AI Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
+    Unity Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
 
     :param provider: A ``kind="databricks"`` provider descriptor.
     :param transport: Optional httpx transport override for tests.
@@ -1534,14 +1636,10 @@ def _fetch_databricks_uc_listing(
     :raises OSError: When the profile resolves no credentials.
     """
     creds = resolve_databricks_workspace(provider.profile)
-    models = tuple(
-        model
-        for model in fetch_databricks_model_service_entries(
-            creds.host,
-            creds.token,
-            transport=transport,
-        )
-        if not unsupported_in_pi(model.id.lower())
+    models = fetch_databricks_model_service_entries(
+        creds.host,
+        creds.token,
+        transport=transport,
     )
     return ModelListing(
         source="gateway",
@@ -1648,7 +1746,9 @@ def fetch_databricks_model_service_entries(
         wire_apis: set[ModelWireAPI] = set()
         if any("chat/completions" in api_type for api_type in normalized_api_types):
             wire_apis.add(ModelWireAPI.OPENAI_CHAT)
-        if "openai/v1/responses" in normalized_api_types:
+        # ``codex/v1/responses`` is the Codex flavor of the same Responses
+        # wire (see ``databricks_model_discovery._CODEX_RESPONSES_API_TYPE``).
+        if normalized_api_types & {"openai/v1/responses", "codex/v1/responses"}:
             wire_apis.add(ModelWireAPI.OPENAI_RESPONSES)
         if any(
             "anthropic" in api_type and "messages" in api_type for api_type in normalized_api_types
@@ -1743,10 +1843,13 @@ def _models_url(base_url: str) -> str:
         ``"https://openrouter.ai/api/v1"`` or
         ``"https://api.anthropic.com"``.
     :returns: The listing URL — ``<base>/models`` when the base already
-        ends in ``/v1``, else ``<base>/v1/models``.
+        ends in a version segment (``/v1``, ``/v4``, …), else
+        ``<base>/v1/models``.
     """
     trimmed = base_url.rstrip("/")
-    if trimmed.endswith("/v1"):
+    # A base that already names its API version lists at <base>/models;
+    # appending /v1 again builds a path no server serves.
+    if re.search(r"/v[0-9]+\Z", urlsplit(trimmed).path):
         return f"{trimmed}/models"
     return f"{trimmed}/v1/models"
 

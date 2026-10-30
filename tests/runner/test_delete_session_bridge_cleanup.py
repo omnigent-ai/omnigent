@@ -67,6 +67,7 @@ from omnigent.harnesses.pi_native.bridge import (
 from omnigent.harnesses.qwen_native.bridge import (
     bridge_dir_for_session_id as qwen_bridge_dir,
 )
+from omnigent.inner.native_attachments import attachment_cache_dir, materialize_attachment
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import _runner_client
@@ -115,17 +116,29 @@ async def test_delete_session_removes_native_bridge_dir(
     assert bridge_dir == bridge_dir_for_bridge_id(session_id)
     # prepare_bridge_dir writes a bridge.json holding the bridge token.
     assert (bridge_dir / "bridge.json").exists()
+    cached = materialize_attachment(
+        {
+            "type": "input_file",
+            "filename": "hello.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+        },
+        bridge_dir,
+    )
+    assert cached is not None
 
     resp = await client.delete(f"/v1/sessions/{session_id}")
     assert resp.status_code == 200
 
     assert not bridge_dir.exists(), "bridge dir (with token) must be deleted"
+    assert not cached.exists()
 
 
 @pytest.mark.parametrize("family", sorted(BRIDGE_DIR_RESOLVERS))
+@pytest.mark.parametrize("bridge_present", [True, False])
 async def test_cleanup_resources_removes_native_bridge_dir(
     client: httpx.AsyncClient,
     family: str,
+    bridge_present: bool,
 ) -> None:
     """The PRODUCTION delete path must remove every family's bridge dir.
 
@@ -138,9 +151,18 @@ async def test_cleanup_resources_removes_native_bridge_dir(
     session_id = f"conv_{uuid.uuid4().hex}"
     bridge_dir = BRIDGE_DIR_RESOLVERS[family](session_id)
     # Materialize the token-bearing dir the harness would have left behind.
-    bridge_dir.mkdir(parents=True, exist_ok=True)
-    (bridge_dir / "bridge.json").write_text("{}")
-    assert bridge_dir.exists()
+    if bridge_present:
+        bridge_dir.mkdir(parents=True, exist_ok=True)
+        (bridge_dir / "bridge.json").write_text("{}")
+    cached = materialize_attachment(
+        {
+            "type": "input_file",
+            "filename": "bundle.zip",
+            "file_data": "data:application/zip;base64,UEsDBA==",
+        },
+        bridge_dir,
+    )
+    assert cached is not None
 
     resp = await client.delete(f"/v1/sessions/{session_id}/resources")
     assert resp.status_code == 200
@@ -148,6 +170,7 @@ async def test_cleanup_resources_removes_native_bridge_dir(
     assert not bridge_dir.exists(), (
         f"{family} bridge dir must be deleted on the real /resources path"
     )
+    assert not attachment_cache_dir(bridge_dir).exists()
 
 
 # ── #3728: spec-fill generation guard ───────────────────────────────────────

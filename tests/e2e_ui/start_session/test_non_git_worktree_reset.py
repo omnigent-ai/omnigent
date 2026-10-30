@@ -17,12 +17,12 @@ import pytest
 from playwright.async_api import Route, async_playwright, expect
 
 from omnigent.host.git_worktree import WorktreeError, list_worktrees
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _WORKTREES_RE,
     _register_common_routes,
     _run_in_fresh_loop,
-    _wait_until,
 )
 
 
@@ -34,6 +34,11 @@ def test_non_git_workspace_clears_worktree_request(
     repo = tmp_path / "git-repo"
     subprocess.run(
         ["git", "init", "--initial-branch=main", str(repo)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/acme/repo.git"],
+        check=True,
+        capture_output=True,
     )
     plain = tmp_path / "plain-folder"
     plain.mkdir()
@@ -104,13 +109,12 @@ async def _drive_workspace_switch(
             await workspace_chip.click()
             await page.get_by_role("button", name=str(plain), exact=True).click()
             await expect(workspace_chip).to_contain_text("plain-folder")
-            await expect(branch_chip).to_be_disabled()
-            await expect(branch_chip).to_have_text("Worktree")
+            await expect(branch_chip).to_have_count(0)
             await expect(branch_input).to_be_hidden()
 
             await page.get_by_test_id("new-chat-landing-input").fill("Work in the plain folder")
             await page.get_by_test_id("new-chat-landing-submit").click()
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == str(plain), body

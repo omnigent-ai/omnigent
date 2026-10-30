@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from issue_prioritization.comments import COMMENT_MARKER
+
 ROOT = Path(__file__).parents[1]
 WORKFLOWS = ROOT.parent / "workflows"
 
@@ -37,10 +39,31 @@ def test_github_events_share_one_v2_workflow() -> None:
     assert "--remove-label needs-info" not in response
     assert "reopen_closed:" in response
     assert "reopen_closed: true" in response
+    response_guard = response.split("    if: >-\n", 1)[1].split("    uses:", 1)[0]
+    assert f"!startsWith(github.event.comment.body, '<!-- {COMMENT_MARKER} ') &&" in response_guard
     assert "group: issue-prioritization-v2-${{ inputs.issue_number }}" in reusable
     assert "  prioritize:\n    if: vars.ISSUE_PRIORITIZATION_V2_ENABLED" not in reusable
     assert reusable.count("if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'") == 3
     assert "if: always() && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'" in reusable
+
+
+def test_v2_mirrors_priority_onto_linked_prs() -> None:
+    intake = (WORKFLOWS / "issue-triage.yml").read_text()
+    response = (WORKFLOWS / "needs-info-response.yml").read_text()
+    reusable = (WORKFLOWS / "issue-prioritization-v2.yml").read_text()
+    grading, sync = reusable.split("  sync-linked-prs:", 1)
+
+    assert "needs: prioritize" in sync
+    assert (
+        "if: ${{ !cancelled() && inputs.apply && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' }}"
+    ) in sync
+    assert "ISSUE_NUMBER: ${{ inputs.issue_number }}" in sync
+    assert "pull-requests: write" in sync
+    assert "pull-requests" not in grading
+    # A called workflow cannot exceed its caller's token, so a caller without
+    # this grant fails every V2 run at startup.
+    for caller in (intake.split("  prioritize-v2:", 1)[1], response):
+        assert "pull-requests: write" in caller
 
 
 def test_v2_still_runs_when_legacy_intake_fails() -> None:

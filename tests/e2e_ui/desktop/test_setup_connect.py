@@ -21,6 +21,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import Page, expect
 
 # Repo-root-relative path to the Electron setup page. Loading it via file://
@@ -85,16 +86,12 @@ def test_bare_workspace_url_connects_without_http_warning(page: Page) -> None:
     expect(page.locator("#err")).to_have_text("")
 
 
-def test_explicit_http_remote_still_warns_then_proceeds(page: Page) -> None:
-    """Explicit ``http://`` to a remote host still warns once, then proceeds.
-
-    The security warning must survive the scheme-default change: a user who
-    types ``http://`` to a remote host is warned on the first click and only
-    connects when they click again.
-    """
+@pytest.mark.parametrize("url", ["http://example.com", "http://example.databricks.com:8080"])
+def test_explicit_http_remote_still_warns_then_proceeds(page: Page, url: str) -> None:
+    """Remote servers that remain on HTTP warn once before connecting."""
     _open_setup_page(page)
 
-    page.fill("#url", "http://example.databricks.com")
+    page.fill("#url", url)
     page.click("#connect")
 
     # First click: warned, not connected.
@@ -104,7 +101,25 @@ def test_explicit_http_remote_still_warns_then_proceeds(page: Page) -> None:
     # Second click on the same value: proceeds past the warning.
     page.click("#connect")
     page.wait_for_function("() => window.__connectCalls.length === 1")
-    assert page.evaluate("() => window.__connectCalls") == ["http://example.databricks.com"]
+    assert page.evaluate("() => window.__connectCalls") == [url]
+
+
+@pytest.mark.parametrize("port", ["", ":80"])
+def test_http_workspace_upgrades_without_warning(page: Page, port: str) -> None:
+    """Standard HTTP workspace URLs connect once with HTTPS and retain the organization."""
+    _open_setup_page(page)
+    url = f"http://example.databricks.com{port}/omnigent?o=123"
+
+    page.fill("#url", url)
+    page.click("#connect")
+
+    page.wait_for_function("() => window.__connectCalls.length === 1")
+    assert page.evaluate("() => window.__connectCalls") == [url]
+    expect(page.locator("#err")).to_have_text("")
+    assert (
+        page.evaluate("url => window.omnigentUrl.normalizeUrl(url)", url)
+        == "https://example.databricks.com/?o=123"
+    )
 
 
 def test_loopback_connects_over_http_without_warning(page: Page) -> None:

@@ -72,6 +72,14 @@ Issues with no activity for 30 days are marked `stale` and close after another
 14 days without activity. New activity restarts that inactivity window. Issues
 labeled `pinned`, `security`, or `bug` are exempt.
 
+Pull requests with no activity for 60 days are marked `stale` and close after
+another 14 days without activity. New activity clears the label and restarts
+the inactivity window. This applies to both contributor and maintainer PRs,
+including drafts. PRs labeled `pinned` or `security` are exempt. Source branches
+are kept, and authors can comment `/reopen` to resume work after an automated
+closure. This policy also applies to older PRs that predate the review-state
+labels below.
+
 If a bug is labeled `needs-info`, the automation asks its author for the
 specific missing information and gives them 7 days to respond. An author reply
 triggers another triage pass; the label clears only when the new information is
@@ -127,6 +135,27 @@ Repository-only dependencies use PEP 735 groups: `lint` for static checks and
 code generation, `test` for pytest, and `dev` for both. Product capabilities
 remain installable extras. Plain `uv sync` installs neither group by default.
 
+Package mirrors that embargo new releases, such as the Databricks PyPI proxy
+used for internal builds, install omnigent from the requirements declared in
+`pyproject.toml`, not from `uv.lock`. When you raise a dependency floor or add a
+dependency, keep the floor at a release those mirrors already serve and let
+`uv.lock` pin anything newer. With Databricks network access, run
+`just check-internal-mirror` before merging; it resolves through the proxy
+without writing `uv.lock`. The `young-dependency-floor` custom lint fails when a
+floor needs a release inside the uv cooldown. An urgent bump, such as a security
+fix, may keep that floor once the mirror serves the release: suppress the lint
+on the requirement with a `custom-lint: disable-next` comment that says why.
+Adding or changing that waiver keeps the required Maintainer Approval check red
+until a maintainer, the author included, runs `just check-internal-mirror` and
+adds the `dependency-floor-approved` label.
+
+Install the git hooks once per clone so the checks below also run on every
+commit and push (`just ensure` does this as part of setup):
+
+```bash
+just hooks            # or: uv run --no-sync pre-commit install
+```
+
 Common checks:
 
 Pyrefly is the canonical Python type checker for the repository.
@@ -137,6 +166,17 @@ uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
 uv run --no-sync pyrefly check               # Python type checking (core and client SDK)
 uv run --no-sync pre-commit run --all-files
 ```
+
+The `session-list-visibility` custom rule checks Python, JavaScript/TypeScript,
+and shell clients for explicit visibility on session-list requests. It follows
+local query builders and same-file helpers; direct server tests and mock
+fixtures are excluded so they can exercise the API's compatibility default.
+Install web dependencies (`pnpm install --frozen-lockfile --filter web`) before
+running the full custom lint, then use
+`uv run --no-sync python -m dev.lint.custom_lint`. A request built outside the
+checker's supported patterns needs a `custom-lint: disable=session-list-visibility
+-- <reason>` comment on its request line (or `disable-next` on the preceding
+line), after verifying that its query builder sends visibility.
 
 When touching `web/`:
 
@@ -333,17 +373,21 @@ Two cross-cutting suites sit on top of these:
   reserve them for genuine end-to-end behaviour — but a PR that adds new
   user-facing functionality **must** include at least one e2e happy-path test
   (see `.github/copilot-instructions.md`).
+  Frontend-only changes follow the guidance below instead.
 
 ### Frontend (`web/`)
 
 Frontend changes follow the same expectation with a different toolchain:
 
-- Add or update a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file
-  next to the component or module you changed — and run it with `pnpm test`.
-- A change to **user-facing UI behaviour** also needs a Playwright test under
-  `tests/e2e_ui/`. This one is enforced mechanically by the `E2E UI Required`
-  check, so a UI PR won't merge without a covering test (or a maintainer
-  waiver) — see `.github/workflows/e2e-ui-required.yml`.
+- Prefer a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file next to
+  the component or module you changed — and run it with `pnpm test`.
+  Existing tests count when they already cover the changed behaviour; add or
+  update tests for concrete gaps.
+- Use Playwright tests under `tests/e2e_ui/` for browser behaviour or full user
+  flows that unit or component tests cannot adequately cover. Extend an existing
+  test where practical, and explain what the browser test uniquely verifies.
+  UI changes do not automatically require a new or modified E2E test. The
+  existing E2E UI suite continues to run in CI.
 - Styling/formatting-only changes, copy tweaks with no flow change, and
   refactors with no behaviour change are exempt, same as the backend.
 
@@ -374,11 +418,44 @@ request enforces this, so unsigned commits will block merging.
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
+- Under **Release notes**, choose exactly one Yes/No checkbox and keep both
+  rows. Choose Yes only for outstanding user-facing features, bug fixes, UX
+  changes, and breaking changes; write one line for users in **Changelog**.
+  Breaking changes must choose Yes and describe the compatibility impact.
+  Features behind a feature flag are eligible only once the flag is enabled for
+  users. Choose No for small fixes or improvements, features behind disabled
+  flags, and internal changes with no user impact, and delete the Changelog
+  section. The complete changelog still credits the PR using its title. This
+  records your recommendation; maintainers curate the release notes.
 
-### Every PR needs an issue
+### Database migration reviews
 
-We require an issue for every pull request. Issues are how work gets
-prioritized, so a PR without one arrives unsorted and waits longer.
+Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when
+changing schemas, queries, transactions, or storage code. Polly uses this
+reference in its reviews and treats violations of mandatory requirements as
+blocking findings.
+
+Changes under `omnigent/db/migrations/`, to `omnigent/db/alembic.ini`, or to
+[`.github/CODEOWNERS`](.github/CODEOWNERS) require a GitHub approval from at
+least one of Edwin He (`@Edwinhe03`), Aravind Segu (`@aravind-segu`), Corey
+Zumar (`@dbczumar`), or Bryan Qiu (`@bbqiu`). The reviewer must be someone
+other than the PR author, including for maintainer-authored PRs.
+
+GitHub requests these reviews automatically. The `main-no-force-push` ruleset
+requires code-owner approval and dismisses stale approvals after changes are
+pushed. This requirement is enforced by GitHub alongside the CI checks.
+
+<a name="every-pr-needs-an-issue"></a>
+
+### When a PR needs an issue
+
+We require an issue for contributor-authored pull requests, with the exceptions
+below. Issues are how work gets prioritized, so a PR without one arrives
+unsorted and waits longer.
+
+**Maintainer-authored pull requests are exempt, regardless of the type of
+change.** Maintainers may link an existing issue when useful, but do not need
+to create one solely to satisfy this requirement.
 
 Reference it in the description. Which keyword you use depends on whether the PR
 finishes the issue:
@@ -399,17 +476,17 @@ saying anything about this PR, so pair it with one of the keywords above. The
 reference also has to point at an **issue**: naming another pull request does not
 count, since a PR is not a tracking record.
 
-**No issue for your change yet?** Open one first, then reference it. That is also
-the faster path for anything non-trivial: it lets a maintainer confirm the
-approach before you write code.
+**No issue for your change yet?** If your PR requires one, open it first, then
+reference it. This lets a maintainer confirm the approach before you write code.
 
-The only exceptions are changes with no user-visible behaviour: pure
-**Refactor / chore**, **Docs**, or **Test / CI** work. If that is genuinely what
-your PR is, check that box under *Type of change* and no issue is needed.
-Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
-even when it also touches docs or tests.
+Contributor-authored PRs are also exempt for changes with no user-visible
+behaviour: pure **Refactor / chore**, **Docs**, or **Test / CI** work. If that
+describes your PR, check that box under *Type of change* and no issue is needed.
+Other contributor-authored PRs that fix a bug, add a feature, or change the UI
+need an issue, even when they also touch docs or tests.
 
-A bot comments once on PRs that reference no issue and labels them `needs-issue`.
+A bot comments once on non-exempt PRs that reference no issue and labels them
+`needs-issue`.
 Reference an issue and the label clears automatically. A PR still labeled
 `needs-issue` after **7 days** is closed, the same way and for the same reason as
 `waiting-on-author` below: to keep the review queue readable, not as a judgement
@@ -427,8 +504,8 @@ need to apply them.
 | `waiting-for-review` | You have responded. It is back in the reviewer's queue. |
 
 A third label, `needs-issue`, is separate from these two: it says the PR
-references no issue, not that anyone is waiting on a reply. See [Every PR needs an
-issue](#every-pr-needs-an-issue).
+references no issue, not that anyone is waiting on a reply. See [When a PR needs
+an issue](#when-a-pr-needs-an-issue).
 
 A maintainer reviewing or commenting on your PR sets `waiting-on-author`. When
 you push a commit, comment, or reply to a review, that clears automatically and

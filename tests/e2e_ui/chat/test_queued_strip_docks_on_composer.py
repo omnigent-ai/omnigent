@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
 from playwright.sync_api import Browser, Route, expect
 
 _MSG1 = "sentinel-steer-dock-msg1 holds the turn open"
@@ -54,6 +55,7 @@ def test_queued_strip_attaches_to_composer(
     """
     base_url, session_id = seeded_session
     context = browser.new_context(
+        color_scheme="light",
         record_video_dir=os.environ.get("OMNIGENT_E2E_RECORD_DIR"),
     )
     page = context.new_page()
@@ -134,6 +136,107 @@ def test_queued_strip_attaches_to_composer(
         if bar.count() > 0 and bar.first.is_visible():
             bar_box = bar.first.bounding_box()
             if bar_box is not None:
+                strip_list = strip.get_by_role("list", name="Queued messages")
+                strip_list_box = strip_list.bounding_box()
+                assert strip_list_box is not None, "queued message list has no bounding box"
+                bar_insets = bar.first.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return {
+                            left: parseFloat(style.paddingLeft),
+                            right:
+                                parseFloat(style.paddingRight) +
+                                parseFloat(style.borderRightWidth),
+                        };
+                    }"""
+                )
+                strip_insets = strip.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return {
+                            left: parseFloat(style.paddingLeft),
+                            right: parseFloat(style.paddingRight),
+                        };
+                    }"""
+                )
+                drag_handle_box = (
+                    strip.get_by_role("button", name="Reorder queued message")
+                    .first.locator("svg")
+                    .bounding_box()
+                )
+                workspace_icon_box = bar.first.locator(
+                    '[data-testid="composer-workspace-dir"] svg'
+                ).bounding_box()
+                assert drag_handle_box is not None, "queued drag handle has no bounding box"
+                assert workspace_icon_box is not None, "workspace icon has no bounding box"
+                assert abs(strip_box["x"] - bar_box["x"]) <= _EPSILON
+                assert abs(strip_box["width"] - bar_box["width"]) <= _EPSILON
+                strip_surface = strip.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return [style.backgroundColor, style.backgroundImage];
+                    }"""
+                )
+                bar_surface = bar.first.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return [style.backgroundColor, style.backgroundImage];
+                    }"""
+                )
+                bar_top_radii = bar.first.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        const divider = getComputedStyle(element, "::before");
+                        return {
+                            radii: [style.borderTopLeftRadius, style.borderTopRightRadius],
+                            dividerWidth: style.borderTopWidth,
+                            divider: {
+                                left: divider.left,
+                                right: divider.right,
+                                height: divider.height,
+                                backgroundColor: divider.backgroundColor,
+                            },
+                        };
+                    }"""
+                )
+                assert strip_surface == bar_surface, (
+                    "light-theme queued rows and workspace metadata must share "
+                    f"one surface: strip={strip_surface}, bar={bar_surface}"
+                )
+                assert bar_top_radii["radii"] == ["0px", "0px"], (
+                    "the docked queue owns the outer rounded top; the workspace bar "
+                    f"must not draw an inner arc: {bar_top_radii}"
+                )
+                assert bar_top_radii["dividerWidth"] == "0px", (
+                    "the docked workspace bar must not draw a full-width top border"
+                )
+                divider = bar_top_radii["divider"]
+                assert divider["left"] == "16px"
+                assert divider["right"] == "16px"
+                assert divider["height"] == "1px"
+                assert divider["backgroundColor"] not in {
+                    "rgba(0, 0, 0, 0)",
+                    "transparent",
+                }, (
+                    "the queue/workspace divider must be the prototype's faint 16px-inset line: "
+                    f"{divider}"
+                )
+                drag_handle_center = drag_handle_box["x"] + drag_handle_box["width"] / 2
+                workspace_icon_center = workspace_icon_box["x"] + workspace_icon_box["width"] / 2
+                compact_inset_delta = strip_insets["left"] - bar_insets["left"]
+                assert drag_handle_center - workspace_icon_center == pytest.approx(
+                    compact_inset_delta, abs=_EPSILON
+                ), (
+                    "workspace icon follows the compact context-bar inset relative to "
+                    f"the queued drag column: drag={drag_handle_center:.1f}, "
+                    f"workspace={workspace_icon_center:.1f}, inset={compact_inset_delta:.1f}"
+                )
+                strip_content_right = strip_list_box["x"] + strip_list_box["width"]
+                bar_content_right = bar_box["x"] + bar_box["width"] - bar_insets["right"]
+                compact_right_delta = strip_insets["right"] - bar_insets["right"]
+                assert bar_content_right - strip_content_right == pytest.approx(
+                    compact_right_delta, abs=_EPSILON
+                )
                 bar_bottom = bar_box["y"] + bar_box["height"]
                 covers_left = bar_box["x"] <= strip_box["x"] + _EPSILON
                 covers_right = (

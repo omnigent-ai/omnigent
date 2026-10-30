@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+import omnigent.host.git_worktree as git_worktree_module
 from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
@@ -150,20 +154,68 @@ def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
     # Path proves the sibling layout + slash->dash dir sanitization;
     # a regression in _resolve_worktree_path would change this.
     assert created.worktree_path == str(expected)
+    assert created.workspace == str(expected)
     assert Path(created.worktree_path).is_dir()
     # The branch is actually checked out in the worktree (not just the dir made).
     assert _current_branch(Path(created.worktree_path)) == "feature/login"
     assert isinstance(created, CreatedWorktree)
 
 
-def test_create_worktree_resolves_repo_root_from_subdir(git_repo: Path) -> None:
-    """Picking a subdir still anchors the worktree at the repo root's sibling."""
-    sub = git_repo / "src"
-    sub.mkdir()
+@pytest.mark.parametrize("linked", [False, True])
+def test_create_worktree_resolves_repo_root_from_subdir(git_repo: Path, linked: bool) -> None:
+    """Preserve a nested workspace from either the main checkout or a linked worktree."""
+    relative = Path("packages") / "my app"
+    sub = git_repo / relative
+    sub.mkdir(parents=True)
+    (sub / "README.md").write_text("nested project")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-qm", "add nested project")
+    if linked:
+        first = create_worktree(repo_path=str(git_repo), branch_name="first")
+        sub = Path(first.worktree_path) / relative
     created = create_worktree(repo_path=str(sub), branch_name="wip")
-    # Sibling of the repo ROOT, not of the picked subdir — proves
-    # rev-parse --show-toplevel is used rather than the raw repo_path.
+    # Worktree placement stays anchored at the main repository.
     assert created.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+    assert created.workspace == str(Path(created.worktree_path) / relative)
+    assert (Path(created.workspace) / "README.md").read_text() == "nested project"
+    assert _current_branch(Path(created.workspace)) == "wip"
+
+    with pytest.raises(WorktreeError, match="expected worktree root"):
+        remove_worktree(worktree_path=created.workspace, branch="wip", delete_branch=True)
+    remove_worktree(worktree_path=created.worktree_path, branch="wip", delete_branch=True)
+    assert not Path(created.worktree_path).exists()
+    assert not _branch_exists(git_repo, "wip")
+
+
+@pytest.mark.parametrize("existing_branch", [False, True])
+@pytest.mark.parametrize("base_path_kind", ["missing", "file"])
+def test_create_worktree_missing_subdir_leaves_no_worktree(
+    git_repo: Path, existing_branch: bool, base_path_kind: str
+) -> None:
+    """A directory missing from the target revision fails before creating a worktree."""
+    sub = git_repo / "new-project"
+    if base_path_kind == "file":
+        sub.write_text("a file in the old revision")
+        _git(git_repo, "add", ".")
+        _git(git_repo, "commit", "-qm", "add file")
+    _git(git_repo, "branch", "old-base")
+    if base_path_kind == "file":
+        sub.unlink()
+    sub.mkdir()
+    (sub / "README.md").write_text("new project")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-qm", "add project")
+    message = "does not exist" if base_path_kind == "missing" else "is not a directory"
+    with pytest.raises(WorktreeError, match=message):
+        create_worktree(
+            repo_path=str(sub),
+            branch_name="old-base" if existing_branch else "new-worktree",
+            base_branch=None if existing_branch else "old-base",
+            existing_branch=existing_branch,
+        )
+    assert _worktree_count(git_repo) == 1
+    assert not _branch_exists(git_repo, "new-worktree")
+    assert _branch_exists(git_repo, "old-base")
 
 
 def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Path) -> None:
@@ -324,6 +376,19 @@ def test_create_worktree_existing_branch_rejects_base_branch(git_repo: Path) -> 
     assert "base_branch" in exc.value.message
 
 
+def test_create_worktree_checkout_outlasting_command_timeout_completes(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large repo's slow checkout finishes instead of hitting the per-command git timeout."""
+    _commit_slow_smudge_file(git_repo, delay_s=3)
+    monkeypatch.setattr(git_worktree_module, "_GIT_TIMEOUT_S", 1.0)
+
+    created = create_worktree(repo_path=str(git_repo), branch_name="large-checkout")
+
+    assert (Path(created.worktree_path) / "slow.bin").read_text() == "payload\n"
+    assert _current_branch(Path(created.worktree_path)) == "large-checkout"
+
+
 def test_create_worktree_non_repo_fails(tmp_path: Path) -> None:
     """A directory that isn't a git repo is rejected."""
     plain = tmp_path / "plain"
@@ -377,6 +442,27 @@ def test_list_worktrees_returns_main_first(git_repo: Path) -> None:
     assert main.branch == "main"
     assert main.is_main is True
     assert main.detached is False
+    assert isinstance(main.updated_at, int)
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "https://github.com/omnigent-ai/omnigent.git",
+        "https://gitlab.com/acme/repo.git",
+        "git@github-personal:omnigent-ai/omnigent.git",
+        "ssh://git@github.enterprise.example/omnigent-ai/omnigent.git",
+        "https://[invalid/repo",
+    ],
+)
+def test_list_worktrees_does_not_depend_on_remote_url(git_repo: Path, remote_url: str) -> None:
+    """Local worktree support is independent of the configured remote."""
+    _git(git_repo, "remote", "add", "origin", remote_url)
+    result = list_worktrees(repo_path=str(git_repo))
+    assert len(result) == 1
+    assert result[0].path == str(git_repo)
+    assert result[0].branch == "main"
+    assert result[0].is_main is True
 
 
 def test_list_worktrees_includes_linked(git_repo: Path) -> None:
@@ -389,13 +475,41 @@ def test_list_worktrees_includes_linked(git_repo: Path) -> None:
     assert linked.path == created.worktree_path
     assert linked.branch == "feature/login"
     assert linked.detached is False
+    assert isinstance(linked.updated_at, int)
+
+
+def test_list_worktrees_fetches_all_timestamps_with_one_git_command(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timestamp metadata stays O(1) as the number of worktrees grows."""
+    for index in range(4):
+        create_worktree(repo_path=str(git_repo), branch_name=f"feature/{index}")
+
+    original_run_git = git_worktree_module._run_git
+    show_calls: list[list[str]] = []
+
+    def run_git(args: list[str], *, cwd: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["show", "-s", "--format=%H%x00%ct"]:
+            show_calls.append(args)
+        return original_run_git(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
+
+    result = list_worktrees(repo_path=str(git_repo))
+
+    assert len(result) == 5
+    assert len(show_calls) == 1
+    assert len(show_calls[0][3:]) == len({_rev_parse(Path(worktree.path)) for worktree in result})
+    assert all(isinstance(worktree.updated_at, int) for worktree in result)
 
 
 def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:
     """Listing from inside a linked worktree resolves the main repo's full list."""
     created = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
-    # Query from the linked worktree — should still see BOTH worktrees.
-    result = list_worktrees(repo_path=created.worktree_path)
+    nested = Path(created.worktree_path) / "nested"
+    nested.mkdir()
+    # A subdirectory of the linked worktree resolves both checkouts.
+    result = list_worktrees(repo_path=str(nested))
     paths = {w.path for w in result}
     assert str(git_repo) in paths
     assert created.worktree_path in paths
@@ -455,6 +569,9 @@ def test_list_worktrees_preserves_probe_failure(
     suffix = f": {stderr}" if stderr else ""
     assert exc.value.message == f"git worktree list failed (exit 128){suffix}"
     assert run.call_args.kwargs["env"]["LC_ALL"] == "C"
+    # Git must never wait on a credential prompt the server cannot show.
+    assert run.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert run.call_args.kwargs["stdin"] is subprocess.DEVNULL
 
 
 @pytest.mark.parametrize(
@@ -483,3 +600,338 @@ def test_validate_branch_name_rejects_bad(bad: str) -> None:
 def test_validate_branch_name_accepts_good(good: str) -> None:
     """Well-formed branch names pass validation."""
     validate_branch_name(good)  # must not raise
+
+
+@pytest.mark.parametrize("branch_has_directory", [True, False])
+def test_existing_branch_directory_probe_ignores_same_named_tag(
+    git_repo: Path, branch_has_directory: bool
+) -> None:
+    """Directory validation must inspect the branch that worktree add checks out."""
+    before = _rev_parse(git_repo)
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "add web")
+    after = _rev_parse(git_repo)
+    _git(git_repo, "branch", "feature", after if branch_has_directory else before)
+    _git(git_repo, "tag", "feature", before if branch_has_directory else after)
+    if branch_has_directory:
+        created = create_worktree(
+            repo_path=str(source), branch_name="feature", existing_branch=True
+        )
+        assert Path(created.workspace).is_dir()
+        assert (
+            next(
+                tree.branch
+                for tree in list_worktrees(repo_path=created.worktree_path)
+                if tree.path == created.worktree_path
+            )
+            == "feature"
+        )
+    else:
+        with pytest.raises(WorktreeError, match="does not exist"):
+            create_worktree(repo_path=str(source), branch_name="feature", existing_branch=True)
+
+
+@pytest.mark.parametrize("replacement", ["file", "symlink"])
+def test_remove_worktree_rejects_replaced_root(git_repo: Path, replacement: str) -> None:
+    """A stale cleanup path must not remove a symlink target or raise an unhandled OS error."""
+    original = create_worktree(repo_path=str(git_repo), branch_name="original")
+    target = create_worktree(repo_path=str(git_repo), branch_name="target")
+    remove_worktree(worktree_path=original.worktree_path)
+    path = Path(original.worktree_path)
+    if replacement == "file":
+        path.write_text("replacement")
+    else:
+        path.symlink_to(target.worktree_path, target_is_directory=True)
+    with pytest.raises(WorktreeError):
+        remove_worktree(worktree_path=str(path), branch="original", delete_branch=True)
+    assert Path(target.worktree_path).is_dir()
+    assert _branch_exists(git_repo, "original")
+    assert _branch_exists(git_repo, "target")
+
+
+def test_worktree_picker_accepts_symlinked_prefix(git_repo: Path) -> None:
+    """Picker paths may include a legitimate symlink such as macOS /tmp."""
+    alias = git_repo.parent / "alias"
+    alias.symlink_to(git_repo.parent, target_is_directory=True)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature")
+    trees = list_worktrees(repo_path=str(alias / git_repo.name))
+    assert [tree.path for tree in trees] == [str(git_repo), created.worktree_path]
+
+
+@pytest.mark.parametrize("mode", ["base", "head", "existing"])
+def test_directory_validation_survives_revision_moving(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Ref movement cannot make creation succeed with a missing session directory."""
+    before = _rev_parse(git_repo)
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    validated = _rev_parse(git_repo)
+    _git(git_repo, "branch", "moving")
+    real_run = git_worktree_module._run_git
+    moved = False
+
+    def move_after_validation(
+        args: list[str], *, cwd: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal moved
+        result = real_run(args, cwd=cwd, **kwargs)
+        if args[:2] == ["cat-file", "-t"] and not moved:
+            ref = "main" if mode == "head" else "moving"
+            _git(git_repo, "update-ref", f"refs/heads/{ref}", before)
+            moved = True
+        return result
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", move_after_validation)
+    if mode == "existing":
+        with pytest.raises(WorktreeError, match="changed during worktree creation"):
+            create_worktree(repo_path=str(source), branch_name="moving", existing_branch=True)
+        assert len(list_worktrees(repo_path=str(git_repo))) == 1
+        assert _rev_parse(git_repo, "refs/heads/moving") == before
+    else:
+        created = create_worktree(
+            repo_path=str(source),
+            branch_name="new",
+            base_branch="moving" if mode == "base" else None,
+        )
+        assert Path(created.workspace).is_dir()
+        assert _rev_parse(Path(created.worktree_path)) == validated
+    assert moved
+
+
+@pytest.mark.parametrize("auto_track", ["true", "false", "always", "simple", "inherit"])
+def test_subdirectory_creation_preserves_remote_tracking(git_repo: Path, auto_track: str) -> None:
+    """Pinned checkouts retain Git's native tracking policy for the requested start ref."""
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    _git(git_repo, "remote", "add", "origin", str(git_repo))
+    _git(git_repo, "fetch", "origin")
+    _git(git_repo, "config", "branch.autoSetupMerge", auto_track)
+    root_created = create_worktree(
+        repo_path=str(git_repo), branch_name="root-pick", base_branch="origin/main"
+    )
+    nested_created = create_worktree(
+        repo_path=str(source), branch_name="nested-pick", base_branch="origin/main"
+    )
+    root_upstream = _rev_parse(Path(root_created.worktree_path), "@{upstream}")
+    nested_upstream = _rev_parse(Path(nested_created.worktree_path), "@{upstream}")
+    assert nested_upstream == root_upstream
+    assert Path(nested_created.workspace).is_dir()
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_failed_pinned_checkout_rolls_back_without_hiding_original_error(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, rollback_fails: bool
+) -> None:
+    """Checkout errors remain visible even when rollback also fails."""
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    real_run = git_worktree_module._run_git
+
+    def fail_checkout(
+        args: list[str], *, cwd: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["checkout", "--force"]:
+            return subprocess.CompletedProcess(args, 1, "", "checkout failed")
+        if rollback_fails and args[:2] == ["worktree", "remove"]:
+            return subprocess.CompletedProcess(args, 1, "", "rollback failed")
+        return real_run(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", fail_checkout)
+    with pytest.raises(WorktreeError, match="could not check out validated"):
+        create_worktree(repo_path=str(source), branch_name="new")
+    assert _branch_exists(git_repo, "new") is rollback_fails
+    assert len(list_worktrees(repo_path=str(git_repo))) == (2 if rollback_fails else 1)
+
+
+def _commit_slow_smudge_file(repo: Path, delay_s: int) -> None:
+    """Commit ``slow.bin`` behind a smudge filter that sleeps on every checkout.
+
+    :param repo: Repository to commit into.
+    :param delay_s: Seconds each checkout of the file takes.
+    """
+    (repo / ".gitattributes").write_text("slow.bin filter=slow\n")
+    (repo / "slow.bin").write_text("payload\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "slow file")
+    _git(repo, "config", "filter.slow.smudge", f"sh -c 'exec 2>/dev/null; sleep {delay_s}; cat'")
+    _git(repo, "config", "filter.slow.clean", "cat")
+    _git(repo, "config", "filter.slow.required", "true")
+
+
+def test_create_worktree_slow_checkout_beyond_budget_times_out(git_repo: Path) -> None:
+    """The create budget still bounds a slow checkout, and the error names it."""
+    _commit_slow_smudge_file(git_repo, delay_s=3)
+
+    with pytest.raises(WorktreeError, match="worktree creation timed out after 1s"):
+        create_worktree(repo_path=str(git_repo), branch_name="feature/slow", timeout_s=1.0)
+
+
+@dataclass
+class _TimedGit:
+    """Real git under a fake clock that advances by a set time per command.
+
+    :param elapsed_s: Simulated seconds per command, keyed like ``"fetch"``
+        or ``"worktree add"``.
+    :param fail: Commands to report as failed instead of running.
+    :param time_out: Commands that use their whole timeout and are killed.
+    :param hang_after: Every command after the first one with this key also
+        uses its whole timeout and is killed, e.g. ``"fetch"``.
+    :param bounds: ``(command, timeout)`` each git process was given, in order.
+    :param windows: ``(command, start, latest end)`` on the fake clock for
+        each git process, where the latest end is when its timeout kills it.
+    """
+
+    elapsed_s: dict[str, float] = field(default_factory=dict)
+    fail: set[str] = field(default_factory=set)
+    time_out: set[str] = field(default_factory=set)
+    hang_after: str | None = None
+    bounds: list[tuple[str, float]] = field(default_factory=list)
+    windows: list[tuple[str, float, float]] = field(default_factory=list)
+
+
+@pytest.fixture
+def timed_git(monkeypatch: pytest.MonkeyPatch) -> _TimedGit:
+    """Run git processes against a controllable monotonic clock."""
+    timed = _TimedGit()
+    clock = [1000.0]
+    real_exec = git_worktree_module._exec_git
+    monkeypatch.setattr(git_worktree_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def run(argv: list[str], *, cwd: str, timeout: float) -> subprocess.CompletedProcess[str]:
+        command = f"worktree {argv[1]}" if argv[0] == "worktree" else argv[0]
+        hangs = command in timed.time_out or timed.hang_after in {c for c, _ in timed.bounds}
+        timed.bounds.append((command, timeout))
+        timed.windows.append((command, clock[0], clock[0] + timeout))
+        if hangs:
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+        clock[0] += timed.elapsed_s.get(command, 0.0)
+        if command in timed.fail:
+            return subprocess.CompletedProcess(argv, 1, "", f"{command} failed")
+        return real_exec(argv, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(git_worktree_module, "_exec_git", run)
+    return timed
+
+
+def _subdirectory_repo_with_unfetched_base(repo: Path) -> Path:
+    """Add ``web/`` and an ``origin`` whose ``main`` must be fetched first.
+
+    :returns: The ``web`` directory, so create pins and checks out a commit.
+    """
+    (repo / "web").mkdir()
+    (repo / "web" / "index.html").write_text("<html></html>")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "add web")
+    _git(repo, "remote", "add", "origin", str(repo))
+    return repo / "web"
+
+
+def test_create_worktree_size_scaling_commands_share_one_budget(
+    git_repo: Path, timed_git: _TimedGit
+) -> None:
+    """Fetch, ``worktree add`` and ``checkout`` draw on one budget; metadata keeps its bound."""
+    source = _subdirectory_repo_with_unfetched_base(git_repo)
+    timed_git.elapsed_s.update({"fetch": 100.0, "worktree add": 200.0})
+
+    create_worktree(
+        repo_path=str(source),
+        branch_name="feature/budget",
+        base_branch="origin/main",
+        timeout_s=1000.0,
+    )
+
+    # The pinned checkout's rollback keeps min(120 s, a quarter of the budget) in reserve.
+    size_scaling = {"fetch", "worktree add", "checkout"}
+    assert [bound for bound in timed_git.bounds if bound[0] in size_scaling] == [
+        ("fetch", 880.0),
+        ("worktree add", 780.0),
+        ("checkout", 580.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "fetch_elapsed_s", "hang_after"),
+    [(1000.0, 1000.0, None), (1000.0, 870.0, "fetch"), (140.0, 100.0, "fetch")],
+    ids=["fetch-spends-budget", "metadata-after-fetch", "legacy-metadata-after-fetch"],
+)
+def test_create_worktree_stops_once_budget_is_spent(
+    git_repo: Path,
+    timed_git: _TimedGit,
+    timeout_s: float,
+    fetch_elapsed_s: float,
+    hang_after: str | None,
+) -> None:
+    """Once fetch, or a metadata command after it, reaches the deadline, the create fails
+    before ``worktree add`` starts, without overrunning the budget's reserve."""
+    source = _subdirectory_repo_with_unfetched_base(git_repo)
+    timed_git.elapsed_s["fetch"] = fetch_elapsed_s
+    timed_git.hang_after = hang_after
+    reserve = min(git_worktree_module._GIT_TIMEOUT_S, timeout_s / 4)
+
+    with pytest.raises(WorktreeError, match=f"worktree creation timed out after {timeout_s:.0f}s"):
+        create_worktree(
+            repo_path=str(source),
+            branch_name="feature/budget",
+            base_branch="origin/main",
+            timeout_s=timeout_s,
+        )
+
+    assert "worktree add" not in {command for command, _ in timed_git.bounds}
+    assert not _branch_exists(git_repo, "feature/budget")
+    assert max(end for _, _, end in timed_git.windows) <= 1000.0 + timeout_s
+    if hang_after is not None:
+        # The stalled metadata command was cut off where the work part of the budget ends.
+        assert timed_git.windows[-1][2] == 1000.0 + timeout_s - reserve
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "checkout_elapsed_s", "checkout_times_out", "expected_remove_bound", "error"),
+    [
+        (1000.0, 100.0, False, 900.0, "could not check out validated"),
+        (1000.0, 880.0, False, 120.0, "could not check out validated"),
+        # An older server omits timeout_s and waits 150 s for the reply.
+        (140.0, 0.0, True, 35.0, "worktree creation timed out after 140s"),
+        (140.0, 100.0, False, 40.0, "could not check out validated"),
+    ],
+    ids=["budget-left", "reserve-only", "legacy-checkout-timeout", "legacy-late-failure"],
+)
+def test_create_worktree_rollback_gets_remaining_budget_or_metadata_bound(
+    git_repo: Path,
+    timed_git: _TimedGit,
+    timeout_s: float,
+    checkout_elapsed_s: float,
+    checkout_times_out: bool,
+    expected_remove_bound: float,
+    error: str,
+) -> None:
+    """A failed checkout's rollback uses the rest of the budget, and a reserve kept back
+    from fetch, add and checkout lets the whole failure path finish within ``timeout_s``."""
+    source = _subdirectory_repo_with_unfetched_base(git_repo)
+    timed_git.elapsed_s["checkout"] = checkout_elapsed_s
+    if checkout_times_out:
+        timed_git.time_out.add("checkout")
+    else:
+        timed_git.fail.add("checkout")
+    deadline = 1000.0 + timeout_s
+
+    with pytest.raises(WorktreeError, match=error):
+        create_worktree(repo_path=str(source), branch_name="feature/rollback", timeout_s=timeout_s)
+
+    assert ("worktree remove", expected_remove_bound) in timed_git.bounds
+    assert not _branch_exists(git_repo, "feature/rollback")
+    # Every git call, rollback included, is killed by the deadline at the latest.
+    assert max(end for _, _, end in timed_git.windows) <= deadline

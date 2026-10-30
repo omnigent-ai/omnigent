@@ -19,6 +19,7 @@ The race is exercised via two paths:
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -172,11 +173,22 @@ def _assert_browser_tools_hidden(body: dict[str, Any]) -> None:
     )
 
 
+def _init_rows(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    """Return the ``runner_session_initialized`` attributes in emission order."""
+    return [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_session_initialized"
+    ]
+
+
 # ── tests ──────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_suppress_recovery_turn_prevents_recovery_turn_from_history() -> None:
+async def test_suppress_recovery_turn_prevents_recovery_turn_from_history(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """suppress_recovery_turn=True: create_session must not start a recovery turn.
 
     When the runner loads history and finds a pending user message, it would
@@ -189,6 +201,7 @@ async def test_suppress_recovery_turn_prevents_recovery_turn_from_history() -> N
     - A subsequent message-forward triggers exactly one turn.
     """
     app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
 
     async with _runner_client(app) as client:
         init_resp = await client.post(
@@ -208,6 +221,10 @@ async def test_suppress_recovery_turn_prevents_recovery_turn_from_history() -> N
             "Session must be idle after session-init with suppress_recovery_turn=True; "
             "a recovery turn was started from history instead."
         )
+        (init_row,) = _init_rows(caplog)
+        assert init_row["recovery_turn"] == "none"
+        assert init_row["suppress_recovery_turn"] is True
+        assert init_row["history_len"] == 1
 
         # Now forward the message — this should trigger exactly one turn.
         forward_resp = await client.post(
@@ -232,7 +249,9 @@ async def test_suppress_recovery_turn_prevents_recovery_turn_from_history() -> N
 
 
 @pytest.mark.asyncio
-async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history() -> None:
+async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Without suppress_recovery_turn the runner starts a recovery turn from history.
 
     This documents the pre-fix behaviour: when the session-init envelope does
@@ -243,6 +262,7 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
     message as a second turn, so the harness is called twice.
     """
     app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
 
     async with _runner_client(app) as client:
         init_resp = await client.post(
@@ -260,6 +280,7 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
             f"without suppress_recovery_turn; got {len(harness.posted_bodies)}"
         )
         _assert_browser_tools_hidden(harness.posted_bodies[0])
+        assert _init_rows(caplog)[0]["recovery_turn"] == "history_resume"
 
         # Now forward the message: since the recovery turn already ran and
         # _active_turns is now empty, the forward triggers a second turn.
@@ -367,9 +388,12 @@ async def test_suppressed_reinitialization_preserves_active_turn(
 
 
 @pytest.mark.asyncio
-async def test_explicit_recovery_deduplicates_history_heuristic() -> None:
+async def test_explicit_recovery_deduplicates_history_heuristic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Retrying a continuation must not also replay a trailing user item."""
     app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
     payload = _session_init_payload(suppress_recovery_turn=False)
     payload["session_init"].update(resume_interrupted_turn=True, recovery_id="same-interruption")
     async with _runner_client(app) as client:
@@ -383,6 +407,11 @@ async def test_explicit_recovery_deduplicates_history_heuristic() -> None:
     content = str(harness.posted_bodies[0]["content"])
     assert "hello from history" in content
     assert "Continue the existing task" in content
+    # The first init started the continuation; the retry saw the consumed
+    # recovery id and started nothing.
+    rows = _init_rows(caplog)
+    assert [row["recovery_turn"] for row in rows] == ["recovery_prompt", "none"]
+    assert [row["recovery_id"] for row in rows] == ["same-interruption"] * 2
 
 
 @pytest.mark.asyncio
@@ -430,6 +459,75 @@ async def test_newer_turn_finishing_during_initialization_supersedes_recovery() 
         assert _session_histories_ref[SESSION_ID] is history
         await client.post("/v1/sessions", json=payload)
         assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_in_flight_during_initialization_skips_history_recovery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner-connect init must not start a second turn for an in-flight forward.
+
+    The server's runner-connect init sends no suppress flag, while the first
+    message for an already-connected runner is forwarded without waiting for
+    it. If init's history load sees that persisted message while the forward
+    is past its active-turn check, a history_resume turn and the forward's turn
+    both reach the harness; a real harness answers the second with 204, which
+    the runner reports as ``turn failed (status 204)``.
+    """
+    from omnigent.runner.app import _session_histories_ref
+
+    # The history cache is module-global; a leftover entry would let the
+    # forward skip the history read this test parks on.
+    _session_histories_ref.pop(SESSION_ID, None)
+    parked = 0
+    init_parked, both_parked, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class PausedHistoryServer(_HistoryServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            nonlocal parked
+            response = await super().get(url, **kwargs)
+            if url.endswith(f"/{SESSION_ID}/items") and not release.is_set():
+                parked += 1
+                (init_parked if parked == 1 else both_parked).set()
+                await release.wait()
+            return response
+
+    app, _pm, harness = _build_sdk_app(PausedHistoryServer())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    async with _runner_client(app) as client:
+        init = asyncio.create_task(
+            client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=False))
+        )
+        # Init must hold the first history read so it decides after the forward
+        # has passed its active-turn check but before that turn starts.
+        await asyncio.wait_for(init_parked.wait(), timeout=5)
+        forward = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                params={"stream": "true"},
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hello from history"}],
+                    "persisted_item_id": "msg_001",
+                },
+            )
+        )
+        await asyncio.wait_for(both_parked.wait(), timeout=5)
+        release.set()
+        assert (await init).status_code == 201
+        assert (await forward).status_code == 200
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+
+    assert len(harness.posted_bodies) == 1, (
+        f"expected only the forward's turn; got {len(harness.posted_bodies)} turn-starts"
+    )
+    (init_row,) = _init_rows(caplog)
+    assert init_row["recovery_turn"] == "none"
+    assert init_row["forward_in_flight"] is True
 
 
 @pytest.mark.asyncio

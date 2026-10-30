@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import hmac
 import logging
 import os
@@ -50,7 +51,7 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
@@ -60,6 +61,7 @@ from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestEvent,
     ElicitationRequestParams,
+    ElicitationResolvedEvent,
     ElicitationResult,
     FailedEvent,
     HarnessStreamEvent,
@@ -102,6 +104,12 @@ _SHUTDOWN_GRACE_S = 4.5
 # (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
 _POLICY_EVAL_TIMEOUT_S = 86400.0
 
+# Only these phases can park server-side on a human ASK (see the
+# ``policies/evaluate`` route). The others answer in seconds, so a verdict
+# lost in delivery must not stall the turn for the full human-wait budget.
+_HUMAN_GATED_POLICY_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_LLM_REQUEST", "PHASE_REQUEST"})
+_UNGATED_POLICY_EVAL_TIMEOUT_S = 120.0
+
 # Stable, client-visible error code for a turn-context desync (the inner SDK
 # generation outlived its turn — an orphaned tool/policy callback, or a turn
 # torn down on a dead harness channel). Deliberately ABSENT from AP's
@@ -141,6 +149,41 @@ _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S
 # Retry only pre-output wedges after confirmed teardown. Replaying a turn
 # with progress can duplicate tool effects; retries never extend the hard cap.
 _WEDGED_TURN_RECOVERY_RETRIES = 1
+
+# Set by the harness subprocess entrypoint. Executors import their SDKs lazily
+# on the first turn, so that graph is only static once a turn has completed.
+_freeze_gc_after_first_turn = False
+
+
+def arm_gc_freeze_after_first_turn() -> None:
+    """Collect and freeze GC-tracked objects once, after this process's first completed turn.
+
+    Only the harness subprocess arms this; an embedding process keeps normal
+    GC. A failed or cancelled turn leaves the freeze armed, so a later turn
+    still freezes the lazily imported SDK.
+    """
+    global _freeze_gc_after_first_turn
+    _freeze_gc_after_first_turn = True
+
+
+def _freeze_gc_if_armed(run_task: asyncio.Task[None], ctx: TurnContext) -> None:
+    """Run the armed freeze once *run_task* has completed without error.
+
+    Called after the turn's terminal event is sent and its state torn down, so
+    the one-time collection (~25 ms) is off the turn's path and frees the
+    turn's cycles instead of pinning them. A harness that observes
+    ``ctx.cancelled`` and returns normally ended a cancelled turn, not a completed one.
+    """
+    global _freeze_gc_after_first_turn
+    if not _freeze_gc_after_first_turn or not run_task.done() or run_task.cancelled():
+        return
+    if ctx.cancelled.is_set():
+        return
+    if run_task.exception() is not None:
+        return
+    _freeze_gc_after_first_turn = False
+    gc.collect()
+    gc.freeze()
 
 
 @dataclass(frozen=True)
@@ -581,6 +624,8 @@ class TurnContext:
         resolves the parked Future when upstream sends the reply.
         See §Elicitation in the design doc.
 
+        Always emits ``response.elicitation_resolved`` on exit; idempotent.
+
         :param elicitation_id: Unique correlation id for this
             elicitation, e.g. ``"elicit_abc123"``. Must appear
             in the URL of the upstream reply.
@@ -600,11 +645,21 @@ class TurnContext:
                 params=params,
             )
         )
+        result: ElicitationResult | None = None
         try:
-            return await future
+            result = await future
+            return result
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
             self._pending_human_waits -= 1
+            self.emit(
+                ElicitationResolvedEvent(
+                    type="response.elicitation_resolved",
+                    elicitation_id=elicitation_id,
+                    action=result.action if result is not None else None,
+                    reason="unanswered" if result is None else None,
+                )
+            )
 
     async def next_injection(self, timeout: float | None = None) -> CreateResponseRequest | None:
         """
@@ -629,7 +684,7 @@ class TurnContext:
             if timeout is None:
                 return await self._injection_queue.get()
             return await asyncio.wait_for(self._injection_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     def _complete_tool(self, call_id: str, output: str) -> bool:
@@ -691,9 +746,18 @@ class TurnContext:
         """
         future: asyncio.Future[PolicyVerdictPayload] = asyncio.get_running_loop().create_future()
         self._pending_policy_evaluations[evaluation_id] = future
+        human_gated = phase in _HUMAN_GATED_POLICY_PHASES
+        timeout_s = (
+            _POLICY_EVAL_TIMEOUT_S
+            if human_gated
+            else min(_POLICY_EVAL_TIMEOUT_S, _UNGATED_POLICY_EVAL_TIMEOUT_S)
+        )
         # Unlike elicit's unbounded park, this wait is already bounded by
-        # the wait_for below; the counter only holds the idle window open.
-        self._pending_human_waits += 1
+        # the wait_for below; the counter only holds the idle window open,
+        # and only for phases that can actually wait on a human.
+        if human_gated:
+            self._pending_human_waits += 1
+        _logger.info("Policy evaluation %s requested (phase=%s)", evaluation_id, phase)
         self.emit(
             PolicyEvaluationRequestEvent(
                 type="policy_evaluation.requested",
@@ -703,8 +767,10 @@ class TurnContext:
             )
         )
         try:
-            return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
-        except asyncio.TimeoutError:
+            verdict = await asyncio.wait_for(future, timeout=timeout_s)
+            _logger.info("Policy evaluation %s resolved: %s", evaluation_id, verdict.action)
+            return verdict
+        except TimeoutError:
             # Phase-aware default: advisory LLM phases and TOOL_RESULT (the
             # tool already ran) fail OPEN so a missing verdict never hangs the
             # turn, but TOOL_CALL is the authoritative gate for
@@ -714,7 +780,7 @@ class TurnContext:
             _logger.warning(
                 "Policy evaluation %s timed out after %ds; defaulting to %s",
                 evaluation_id,
-                _POLICY_EVAL_TIMEOUT_S,
+                timeout_s,
                 _action,
             )
             return PolicyVerdictPayload(
@@ -727,7 +793,8 @@ class TurnContext:
             )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
-            self._pending_human_waits -= 1
+            if human_gated:
+                self._pending_human_waits -= 1
 
     def _complete_policy_evaluation(
         self, evaluation_id: str, verdict: PolicyVerdictPayload
@@ -786,12 +853,9 @@ class HarnessApp:
     .. code-block:: python
 
         class MyHarnessApp(HarnessApp):
-            async def run_turn(
-                self, request: CreateResponseRequest, ctx: TurnContext
-            ) -> None:
-                ctx.emit(OutputTextDeltaEvent(
-                    type="response.output_text.delta", delta="hi"
-                ))
+            async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+                ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="hi"))
+
 
         def create_app() -> FastAPI:
             return MyHarnessApp().build()
@@ -1267,6 +1331,13 @@ class HarnessApp:
         for ctx in self._in_flight.values():
             if ctx._complete_policy_evaluation(body.evaluation_id, verdict):
                 break
+        else:
+            # A dropped verdict leaves its turn parked until the eval timeout.
+            _logger.warning(
+                "Policy verdict %s matched no pending evaluation (%d in-flight turns)",
+                body.evaluation_id,
+                len(self._in_flight),
+            )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
@@ -1281,8 +1352,11 @@ class HarnessApp:
         1. ``previous_response_id`` matches an in-flight turn →
            in-band injection: enqueue the request body on that
            turn's injection queue, return 204.
-        2. Scaffold is shutting down → refuse with 503.
-        3. Otherwise → start a new turn: allocate ``response_id``,
+        2. A runner steer (``injection_id`` set) with no live turn to
+           inject into → refuse with 409; the runner replays it as its
+           continuation turn.
+        3. Scaffold is shutting down → refuse with 503.
+        4. Otherwise → start a new turn: allocate ``response_id``,
            build a :class:`TurnContext`, register it in
            ``_in_flight``, and return a streaming SSE response
            that runs ``run_turn`` to completion.
@@ -1291,7 +1365,8 @@ class HarnessApp:
         :returns: Either a :class:`StreamingResponse` for the new
             turn or a 204 :class:`Response` for an in-band
             injection.
-        :raises OmnigentError: 503 on shutdown.
+        :raises OmnigentError: 409 for a steer with no live turn; 503 on
+            shutdown.
         """
         if (
             request.previous_response_id is not None
@@ -1315,6 +1390,15 @@ class HarnessApp:
             ):
                 self._active_turn_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+            if request.injection_id is not None:
+                # The steered turn already ended or was interrupted. The runner
+                # keeps the message buffered for its continuation turn, so a turn
+                # started here would run unseen and make that continuation a 204.
+                raise OmnigentError(
+                    "no active turn to inject into",
+                    code=ErrorCode.CONFLICT,
+                )
 
             if self._shutting_down.is_set():
                 raise OmnigentError(
@@ -1426,6 +1510,7 @@ class HarnessApp:
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
+            _freeze_gc_if_armed(run_task, ctx)
 
     def _initial_envelope_events(
         self, ctx: TurnContext, model: str, start_seq: int
@@ -1538,8 +1623,8 @@ class HarnessApp:
           the idle watchdog; only with the idle watchdog disabled does
           this act as a strict wall-clock cap.
 
-        Retry a wedged invocation only before output or side-effectful work
-        has begun, and only after the subclass confirms executor cleanup.
+        Retry a wedged invocation or confirmed transport loss only before
+        progress and after the subclass confirms executor cleanup.
         Replaying the original request after progress would duplicate output
         and tool effects. Recovery is bounded by the retry count and the
         remaining absolute budget; it never extends that budget.
@@ -1603,8 +1688,11 @@ class HarnessApp:
                         async with idle_wd:
                             await self.run_turn(request, ctx)
                         return
-                    except TimeoutError as exc:
-                        if not idle_wd.expired():
+                    except (TimeoutError, HarnessTransportClosedError) as exc:
+                        transport_closed = isinstance(exc, HarnessTransportClosedError)
+                        if transport_closed and not exc.replay_safe:
+                            raise
+                        if not transport_closed and not idle_wd.expired():
                             # An inner ``run_turn`` TimeoutError (not the
                             # watchdog); pass it through unchanged.
                             raise
@@ -1625,6 +1713,8 @@ class HarnessApp:
                             or ctx.cancelled.is_set()
                             or ctx._has_progress
                         ):
+                            if transport_closed:
+                                raise
                             raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
                         # Cleanup and retry notices must not extend the absolute ceiling.
                         ctx._reset_idle_watchdog = None
@@ -1641,13 +1731,24 @@ class HarnessApp:
                                 and absolute_deadline - loop.time() < idle_timeout
                             )
                         ):
+                            if transport_closed:
+                                raise
                             raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
+                        if transport_closed:
+                            retry_message = (
+                                f"native harness transport closed before progress ({exc}); "
+                                "the stopped invocation is being retried"
+                            )
+                        else:
+                            retry_message = (
+                                f"turn made no progress for {idle_timeout:.0f}s "
+                                "(likely a wedged LLM or tool call); the wedged call "
+                                "was abandoned and the turn is being retried"
+                            )
                         _logger.warning(
-                            "run_turn for %s made no progress for %.0fs (idle turn "
-                            "watchdog); abandoning the wedged call and retrying the "
-                            "turn (attempt %d/%d)",
+                            "%s for %s (attempt %d/%d)",
+                            retry_message,
                             ctx.response_id,
-                            idle_timeout,
                             attempt + 2,
                             attempts,
                         )
@@ -1659,13 +1760,8 @@ class HarnessApp:
                                 max_attempts=attempts,
                                 delay_seconds=0.0,
                                 error=RetryErrorDetail(
-                                    code="timeout",
-                                    message=(
-                                        f"turn made no progress for "
-                                        f"{idle_timeout:.0f}s (likely a wedged LLM or "
-                                        f"tool call); the wedged call was abandoned "
-                                        f"and the turn is being retried"
-                                    ),
+                                    code="connection_error" if transport_closed else "timeout",
+                                    message=retry_message,
                                 ),
                             )
                         )
@@ -1948,7 +2044,7 @@ def _utc_now_iso() -> str:
     """
     import datetime
 
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # Note: ``HarnessApp._build_error_detail`` is the canonical

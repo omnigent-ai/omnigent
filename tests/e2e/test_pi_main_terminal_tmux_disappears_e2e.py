@@ -49,7 +49,6 @@ in tmux to kill. Launching the real Pi terminal needs ``pi`` / ``tmux`` /
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import io
 import json
 import os
@@ -72,6 +71,14 @@ from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.helpers import POLL_INTERVAL_S
+from tests.e2e.test_pi_native_unmanaged_model import (
+    _OBSERVER_EXTENSION_NAME,
+    _OBSERVER_EXTENSION_SOURCE,
+    _bridge_dir,
+    _bridge_marker,
+    _live_observed_pid,
+    _read_argv_observation,
+)
 
 # Worktree root (this file lives at <worktree>/tests/e2e/). Used to build an
 # absolute PYTHONPATH for the daemon so the runner it spawns -- whose cwd is
@@ -106,73 +113,6 @@ pytestmark = [
         reason=f"pi-native extension needs 'node'; {_node}.",
     ),
 ]
-
-
-def _bridge_marker(session_id: str) -> str:
-    """Return the hashed bridge-dir path segment for *session_id*.
-
-    The harness writes a session's Pi bridge under
-    ``~/.omnigent/pi-native/<sha256(session_id)[:32]>``; the launched ``pi``
-    process references that dir via ``--extension`` / ``--session-dir``, so
-    the segment is a reliable needle for finding the process in ``/proc``.
-
-    :param session_id: The session/conversation id.
-    :returns: ``"pi-native/<32-hex>"``.
-    """
-    digest = hashlib.sha256(session_id.encode()).hexdigest()[:32]
-    return f"pi-native/{digest}"
-
-
-def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
-    """Scan ``/proc`` for the launched ``pi`` CLI naming *marker*.
-
-    The pi CLI runs as ``node .../pi --extension <bridge>/... --approve
-    --session-dir <bridge>/...``. Two *other* processes also name the bridge
-    marker and must be skipped: the ``tmux new-session ... '<pi command>'``
-    launcher (which embeds the whole pi command as ONE argv element, so
-    ``--extension`` is not a standalone token there) and the ``python -m
-    omnigent.runner...`` runner that spawned it.
-
-    After Pi sets its process title, argv contains only ``pi``. Its bridge
-    environment variable still identifies the session in that case.
-
-    :param marker: The ``pi-native/<hash>`` bridge segment.
-    :returns: ``(pid, argv)`` of the pi process, or ``None`` if not found yet.
-    """
-    for pid, argv in _iter_session_processes(marker):
-        if argv == ["pi"] or (
-            "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux")
-        ):
-            return pid, argv
-    return None
-
-
-def _iter_session_processes(marker: str) -> Iterator[tuple[int, list[str]]]:
-    """Yield processes tied to the test session by argv or Pi's launch environment."""
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        argv = [chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk]
-        if not argv:
-            continue
-        if needle in raw:
-            yield int(pid_dir.name), argv
-        elif argv == ["pi"]:
-            try:
-                environ = (pid_dir / "environ").read_bytes().split(b"\x00")
-            except OSError:
-                continue
-            if any(
-                entry.startswith(b"OMNIGENT_PI_NATIVE_BRIDGE_DIR=")
-                and entry.endswith(b"/" + needle)
-                for entry in environ
-            ):
-                yield int(pid_dir.name), argv
 
 
 def _marker_processes(marker: str) -> str:
@@ -229,30 +169,9 @@ def _capture_terminal_panes() -> str:
     return "\n".join(blocks) if blocks else "<no omnigent tmux terminals present>"
 
 
-def _kill_pi_processes(marker: str) -> None:
-    """Best-effort SIGKILL of any process still naming *marker*.
-
-    :param marker: The bridge segment; kills the pi CLI and any child that
-        inherited it so the test leaves no orphaned tmux/pi tree.
-    """
-    for pid, _ in _iter_session_processes(marker):
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, signal.SIGKILL)
-
-
-def _scan_home_logs_for(home: Path, pattern: re.Pattern[str]) -> str | None:
-    """Return the first log line under *home* matching *pattern*, else ``None``.
-
-    The "tmux unavailable ... pi:main" signature is emitted by the RUNNER
-    process (the idle-watcher daemon thread), whose process log lands under
-    ``<home>/.omnigent/logs/runner/``. Scanning every ``*.log`` under the
-    daemon HOME finds it wherever the runner routed it.
-
-    :param home: The daemon HOME whose ``.omnigent/logs`` tree holds the logs.
-    :param pattern: The compiled signature regex.
-    :returns: The matching line, or ``None``.
-    """
-    for log_path in home.rglob("*.log"):
+def _scan_home_logs_for(home: Path, pattern: re.Pattern[str], *, session_id: str) -> str | None:
+    """Find the signature in this session's runner logs, excluding earlier retries."""
+    for log_path in home.rglob(f"runner-{session_id}-*.log"):
         try:
             text = log_path.read_text(errors="replace")
         except OSError:
@@ -261,6 +180,17 @@ def _scan_home_logs_for(home: Path, pattern: re.Pattern[str]) -> str | None:
             if pattern.search(line):
                 return line
     return None
+
+
+def test_log_scan_ignores_previous_session(tmp_path: Path) -> None:
+    """A failed earlier attempt must not contaminate the current session."""
+    signature = "tmux unavailable after 3 consecutive probes for terminal pi:main"
+    (tmp_path / "runner-previous-20260916.log").write_text(signature)
+    current = tmp_path / "runner-current-20260916.log"
+    current.write_text("pi terminal started")
+    assert _scan_home_logs_for(tmp_path, _TMUX_UNAVAILABLE_RE, session_id="current") is None
+    current.write_text(signature)
+    assert _scan_home_logs_for(tmp_path, _TMUX_UNAVAILABLE_RE, session_id="current") == signature
 
 
 class _PiHost:
@@ -311,6 +241,9 @@ def _seed_pi_home(home: Path) -> str:
     )
     pi_agent = home / ".pi" / "agent"
     pi_agent.mkdir(parents=True, exist_ok=True)
+    extensions_dir = pi_agent / "extensions"
+    extensions_dir.mkdir(parents=True, exist_ok=True)
+    (extensions_dir / _OBSERVER_EXTENSION_NAME).write_text(_OBSERVER_EXTENSION_SOURCE)
     (pi_agent / "auth.json").write_text(
         json.dumps({"anthropic": {"type": "api_key", "key": "test-token"}})
     )
@@ -514,10 +447,12 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
         pi_pid: int | None = None
         deadline = time.monotonic() + 150.0
         while time.monotonic() < deadline:
-            found = _find_pi_process(marker)
-            if found is not None:
-                pi_pid = found[0]
-                break
+            # Pi rewrites its process title, so launch argv cannot be polled reliably.
+            observation = _read_argv_observation(_bridge_dir(host.home, session_id))
+            if observation is not None:
+                pi_pid = _live_observed_pid(observation, marker=marker, workspace=workspace)
+                if pi_pid is not None:
+                    break
             if host.proc.poll() is not None:
                 raise AssertionError(
                     f"host daemon exited (rc={host.proc.returncode}) before pi launched; "
@@ -556,7 +491,7 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
         terminal_gone = False
         scan_deadline = time.monotonic() + 25.0
         while time.monotonic() < scan_deadline:
-            hit = _scan_home_logs_for(host.home, _TMUX_UNAVAILABLE_RE)
+            hit = _scan_home_logs_for(host.home, _TMUX_UNAVAILABLE_RE, session_id=session_id)
             if hit is not None:
                 signature_line = hit
                 break
@@ -582,4 +517,6 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
             f"diagnosable pane-dead exit:\n    {signature_line}"
         )
     finally:
-        _kill_pi_processes(marker)
+        # Let the runner stop its watchers before tearing down its tmux server.
+        with contextlib.suppress(httpx.HTTPError):
+            http_client.delete(f"/v1/sessions/{session_id}", timeout=15.0)

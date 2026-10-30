@@ -5,19 +5,19 @@ composer shows the Interrupt square), then an ``AskUserQuestion`` permission
 request parks a pending elicitation into that window — the same shape as an
 agent raising an interactive question or tool approval mid-turn. The pending
 card locks the send path, but the turn is still active server-side, so the
-composer's Interrupt control must remain visible and enabled until the prompt
-is answered. This synthetic hook tests button visibility; cancellation of
-the prompt itself belongs to the harness that owns it.
+composer's Interrupt control must remain visible and enabled. Clicking it must
+also end the runner turn from that parked state.
 """
 
 from __future__ import annotations
 
 import threading
-import time
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _COMPOSER = "Send a message…"
@@ -32,16 +32,6 @@ def _session_snapshot(base_url: str, session_id: str) -> dict:
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     resp.raise_for_status()
     return resp.json()
-
-
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
 
 
 def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> threading.Thread:
@@ -83,7 +73,7 @@ def test_stop_control_survives_pending_elicitation(
     page: Page,
     paused_mid_turn_session: tuple[str, str, str],
 ) -> None:
-    """A pending elicitation must not hide the Interrupt control of an active turn."""
+    """A pending elicitation keeps Interrupt available, and Interrupt ends the turn."""
     base_url, session_id, mock_url = paused_mid_turn_session
 
     page.goto(f"{base_url}/c/{session_id}")
@@ -94,7 +84,7 @@ def test_stop_control_survives_pending_elicitation(
 
     # The turn is genuinely in flight: blocked on the mock gate between its
     # two tool calls, so it stays active for as long as the test needs.
-    _wait_for(
+    poll_until(
         lambda: httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json()["pending"],
         timeout_s=_TURN_START_TIMEOUT_MS / 1000,
     )
@@ -124,3 +114,14 @@ def test_stop_control_survives_pending_elicitation(
         "pending elicitation hid the Stop/Interrupt control of an active turn",
     ).to_be_visible()
     expect(interrupt_button).to_be_enabled()
+
+    with page.expect_request(
+        lambda request: (
+            request.method == "POST" and request.url.endswith(f"/v1/sessions/{session_id}/events")
+        )
+    ) as request_info:
+        interrupt_button.click()
+
+    assert request_info.value.post_data_json == {"type": "interrupt", "data": {}}
+    expect(interrupt_button).not_to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    poll_until(lambda: _session_snapshot(base_url, session_id).get("status") == "idle")

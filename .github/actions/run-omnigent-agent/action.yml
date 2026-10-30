@@ -46,12 +46,12 @@ runs:
   steps:
     - name: Set up uv
       # This action also runs from repositories checked out below the workspace root.
-      uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+      uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
       with:
         enable-cache: true
 
     - name: Cache virtualenv
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ inputs.workdir }}/.venv
         key: venv-${{ runner.os }}-${{ hashFiles(format('{0}/.python-version', inputs.workdir)) }}-${{ hashFiles(format('{0}/uv.lock', inputs.workdir)) }}
@@ -63,7 +63,7 @@ runs:
       run: uv sync --extra all
 
     - name: Install Claude Code CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
       with:
         harness: claude
         version: ${{ inputs.claude-code-version }}

@@ -10,6 +10,7 @@ import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.dialects import mysql
 
+from omnigent.db.compression import CompressedText
 from omnigent.db.db_models import (
     ConversationBase,
     OmnigentBase,
@@ -37,13 +38,13 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
         command.downgrade(config, revision)
 
 
-def test_snapshot_model_uses_omnigent_text_without_changing_ap_schema() -> None:
+def test_snapshot_model_uses_compressed_blob_without_changing_ap_schema() -> None:
     metadata_table = SqlConversationMetadata.__table__
     assert metadata_table.metadata is OmnigentBase.metadata
     snapshot = metadata_table.c.inference_snapshot
     assert snapshot.nullable
-    assert isinstance(snapshot.type, sa.Text)
-    assert snapshot.type.compile(dialect=mysql.dialect()) == "LONGTEXT"
+    assert isinstance(snapshot.type, CompressedText)
+    assert snapshot.type.compile(dialect=mysql.dialect()) == "BLOB"
 
     conversation_table = SqlConversation.__table__
     assert conversation_table.metadata is ConversationBase.metadata

@@ -405,7 +405,9 @@ def _register_pwd_agent(
             },
         },
     )
-    resp = http_client.get("/v1/sessions", params={"agent_name": agent_name, "limit": 1})
+    resp = http_client.get(
+        "/v1/sessions", params={"visibility": "all", "agent_name": agent_name, "limit": 1}
+    )
     resp.raise_for_status()
     rows = resp.json()["data"]
     assert rows, f"agent {agent_name!r} not registered"

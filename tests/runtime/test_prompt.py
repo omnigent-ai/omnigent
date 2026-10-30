@@ -7,7 +7,10 @@ from typing import cast
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
-from omnigent.runner.app import _format_subagent_wake_notice
+from omnigent.runner.subagent_work import (
+    _format_subagent_wake_notice,
+)
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
@@ -19,6 +22,7 @@ from omnigent.runtime.prompt import (
     raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
+from tests._image_fixtures import _TINY_PNG_BASE64
 
 _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
 
@@ -29,6 +33,7 @@ def _spec(
     agents: tuple[str, ...] = (),
     spawn: bool = False,
     builtins: tuple[str, ...] = (),
+    browser: bool = True,
 ) -> AgentSpec:
     """
     Stub only the AgentSpec fields the instruction builders read.
@@ -43,6 +48,7 @@ def _spec(
                 builtins=[SimpleNamespace(name=name) for name in builtins],
             ),
             spawn=spawn,
+            tool_groups=SimpleNamespace(browser=browser),
         ),
     )
 
@@ -201,6 +207,46 @@ def test_history_replay_leaves_non_image_json_output_unchanged() -> None:
     stored = json.dumps([{"type": "text", "text": "hello"}], separators=(",", ":"))
     result = history_to_input_items([_output_item(stored)])
     assert result[0]["output"] == stored
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+def test_text_history_replay_omits_envelope_images_but_preserves_text(is_error: bool) -> None:
+    stored = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "text", "text": "Required trailing fact: blue."},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+        ],
+        is_error=is_error,
+    )
+    output = history_to_input_items([_output_item(stored)])[0]["output"]
+    assert _TINY_PNG_BASE64 not in output
+    blocks = json.loads(output)
+    if is_error:
+        assert blocks.pop(0) == {"type": "text", "text": "Error:"}
+    assert blocks[0] == {"type": "text", "text": "before"}
+    assert "omitted from history" in blocks[1]["text"]
+    assert blocks[2] == {"type": "text", "text": "Required trailing fact: blue."}
+    assert "omitted from history" in blocks[3]["text"]
+
+
+def test_text_history_replay_recovers_old_clipped_envelope() -> None:
+    stored = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+        ],
+        is_error=True,
+    )
+    clipped = stored[: stored.rindex(_TINY_PNG_BASE64) + 12] + "[truncated]"
+    output = history_to_input_items([_output_item(clipped)])[0]["output"]
+    assert _TINY_PNG_BASE64 not in output
+    assert _TINY_PNG_BASE64[:12] not in output
+    assert "before" in output
+    assert "Error:" in output
+    assert "omitted from history" in output
 
 
 def test_framework_instructions_append_after_custom_prompts() -> None:
@@ -391,3 +437,26 @@ def test_raw_author_instructions_verbatim_and_none() -> None:
 
     whitespace_only = cast(AgentSpec, SimpleNamespace(instructions="   \n  "))
     assert raw_author_instructions(whitespace_only) is None
+
+
+# ─── ``tool_groups.browser: false`` drops the browser guidance ────
+
+
+def test_browser_guidance_omitted_when_browser_group_disabled() -> None:
+    """
+    With the ``browser_*`` tools unregistered, the prompt must not steer
+    the model toward them: author text composes alone, and an unauthored
+    spec yields ``None`` rather than guidance for tools it lacks.
+    """
+    spec = _spec("You are a helpful assistant.", browser=False)
+    assert build_instructions_nullable(spec, None, []) == "You are a helpful assistant."
+    assert build_instructions_nullable(_spec(None, browser=False), None, []) is None
+
+
+def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
+    """Only the browser guidance follows the browser gate; the sub-agent
+    wake notice still rides its own dispatch gate."""
+    spec = _spec(None, spawn=True, browser=False)
+    result = build_instructions_nullable(spec, None, [])
+    assert result == SUBAGENT_WAKE_NOTICE_INSTRUCTION
+    assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
