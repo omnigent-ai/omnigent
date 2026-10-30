@@ -10,7 +10,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useContext } from "react";
+import { useContext, useState } from "react";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -64,7 +64,11 @@ vi.mock("@/hooks/useAgents", () => ({
   useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
 vi.mock("./Sidebar", () => ({
-  Sidebar: () => <div data-testid="sidebar" />,
+  Sidebar: () => (
+    <div data-testid="sidebar">
+      <Link to="/inbox">Inbox</Link>
+    </div>
+  ),
   isMobileViewport: vi.fn(() => false),
 }));
 vi.mock("./PullRequestPanel", () => ({
@@ -104,9 +108,10 @@ import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
 
 const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
+const routeError = new Error("Route rendering failed");
 
 function suppressPullRequestFault(event: ErrorEvent) {
-  if (event.error === pullRequestFault.error) event.preventDefault();
+  if (event.error === pullRequestFault.error || event.error === routeError) event.preventDefault();
 }
 
 afterEach(() => {
@@ -159,12 +164,17 @@ beforeEach(() => {
 const LINKED_FOLDER = "/home/u/ws/experimental/data";
 
 function ChatLinkProbe() {
+  const [broken, setBroken] = useState(false);
   const openGithubTab = useOpenGithubTab();
   const openFolder = useFolderOpener();
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  if (broken) throw routeError;
   return (
     <>
       <input aria-label="Chat draft" defaultValue="" />
+      <button type="button" onClick={() => setBroken(true)}>
+        Crash route
+      </button>
       <button type="button" onClick={() => registerNavigationGuard?.(() => {})}>
         Hold navigation
       </button>
@@ -189,6 +199,7 @@ function renderShell() {
             <Routes>
               <Route element={<AppShell />}>
                 <Route path="c/:conversationId" element={<ChatLinkProbe />} />
+                <Route path="inbox" element={<p>Healthy inbox</p>} />
               </Route>
             </Routes>
           </MemoryRouter>
@@ -309,6 +320,42 @@ describe("opening Pull Requests from the composer", () => {
     fireEvent.click(screen.getByRole("link", { name: "Another session" }));
 
     expect(screen.getByTestId("github-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+});
+
+describe("route render failures", () => {
+  it("keeps the sidebar and workspace mounted and recovers through navigation", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+    const sidebar = screen.getByTestId("sidebar");
+    const workspace = screen.getByRole("complementary", { name: "Workspace" });
+    const panel = within(workspace).getByTestId("github-panel");
+
+    fireEvent.click(screen.getByRole("button", { name: "Crash route" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Unable to display this page.");
+    expect(screen.getByTestId("sidebar")).toBe(sidebar);
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBe(workspace);
+    expect(within(workspace).getByTestId("github-panel")).toBe(panel);
+    fireEvent.mouseDown(within(workspace).getByRole("tab", { name: /^Files$/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(within(workspace).getByTestId("files-panel")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "Inbox" }));
+    expect(screen.getByText("Healthy inbox")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByTestId("sidebar")).toBe(sidebar);
+  });
+
+  it("preserves the healthy route's draft when the pathname changes", () => {
+    renderShell();
+    const draft = screen.getByRole("textbox", { name: "Chat draft" });
+    fireEvent.change(draft, { target: { value: "Unsent message" } });
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+    expect(screen.getByRole("textbox", { name: "Chat draft" })).toBe(draft);
+    expect(draft).toHaveValue("Unsent message");
   });
 });
 

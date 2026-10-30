@@ -2703,7 +2703,9 @@ function AppShellImpl() {
                   data-session-id={conversationId}
                 >
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
-                    <Outlet />
+                    <RenderErrorBoundary name="this page" resetKey={location.pathname}>
+                      <Outlet />
+                    </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
 

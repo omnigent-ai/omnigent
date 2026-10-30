@@ -1,5 +1,5 @@
-import { cleanup, render, screen } from "@testing-library/react";
-import { Outlet, MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { Link, Outlet, MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -16,7 +16,15 @@ vi.mock("@/shell/AppShell", () => ({
     </div>
   ),
 }));
-vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
+vi.mock("@/pages/ChatPage", () => ({
+  ChatPage: () => (
+    <div>
+      chat page
+      <input aria-label="Page draft" />
+      <Link to="/c/other">Another chat</Link>
+    </div>
+  ),
+}));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
@@ -68,14 +76,15 @@ import App from "./App";
 const chunkError = vi.hoisted(
   () => new TypeError("Failed to fetch dynamically imported module: /assets/old.js"),
 );
+const pageFault = vi.hoisted(() => ({ error: null as Error | null }));
 vi.mock("@/pages/TasksPage", () => ({
   TasksPage: () => {
-    throw chunkError;
+    throw pageFault.error ?? chunkError;
   },
 }));
 vi.mock("@/pages/SetupPage", () => ({
   SetupPage: () => {
-    throw chunkError;
+    throw pageFault.error ?? chunkError;
   },
 }));
 
@@ -122,6 +131,49 @@ describe("chunk load recovery", () => {
   });
 });
 
+describe("ordinary page render failures", () => {
+  const reload = vi.fn();
+  const renderError = new Error("Page render failed");
+  const suppressExpectedError = (event: ErrorEvent) => {
+    if (event.error === renderError) event.preventDefault();
+  };
+
+  beforeEach(() => {
+    pageFault.error = renderError;
+    reload.mockReset();
+    vi.stubGlobal("location", { reload });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    window.addEventListener("error", suppressExpectedError);
+  });
+
+  afterEach(() => {
+    cleanup();
+    pageFault.error = null;
+    window.removeEventListener("error", suppressExpectedError);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    { path: "/tasks", basename: undefined, needsSetup: false },
+    { path: "/mount/tasks", basename: "/mount", needsSetup: false },
+    { path: "/setup", basename: undefined, needsSetup: true },
+  ])("offers recovery at $path without reloading", async ({ path, basename, needsSetup }) => {
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, accounts_enabled: needsSetup, needs_setup: needsSetup }}
+      >
+        <MemoryRouter initialEntries={[path]}>
+          <App basename={basename} />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to display this page.");
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(reload).not.toHaveBeenCalled();
+  });
+});
+
 function renderUsageRoute(enabled: boolean) {
   const info: typeof FALLBACK_SERVER_INFO = {
     ...FALLBACK_SERVER_INFO,
@@ -151,6 +203,15 @@ function renderRoute(
 }
 
 describe("Canvas route", () => {
+  it("preserves healthy chat state across pathname changes", () => {
+    renderRoute("/c/first");
+    const draft = screen.getByRole("textbox", { name: "Page draft" });
+    fireEvent.change(draft, { target: { value: "Unsent work" } });
+    fireEvent.click(screen.getByRole("link", { name: "Another chat" }));
+    expect(screen.getByRole("textbox", { name: "Page draft" })).toBe(draft);
+    expect(draft).toHaveValue("Unsent work");
+  });
+
   it("shows a spinner, not 'not found', while server info is still loading", () => {
     renderRoute("/canvas", {}, "loading");
     expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
