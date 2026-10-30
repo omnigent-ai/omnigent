@@ -881,6 +881,45 @@ def test_try_install_names_the_npm_failure_cause(
     assert reason is not None and expected in reason
 
 
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (1, NPM_EACCES, "permission denied writing the global install directory (npm EACCES)"),
+        (0, "", "installer completed but 'codex' is still 0.1.0 (requires "),
+    ],
+)
+def test_try_install_reports_an_upgrade_that_left_the_old_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    stderr: str,
+    expected: str,
+) -> None:
+    """An upgrade that leaves the outdated CLI in place is a failure, not an install.
+
+    The old binary still resolves, so only the version check tells the two apart.
+    """
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv == [str(binary), "--version"], f"only version probes run here: {argv!r}"
+        return subprocess.CompletedProcess(argv, 0, "codex-cli 0.1.0\n", "")
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    monkeypatch.setattr(
+        hi.subprocess, "Popen", fake_installer(returncode=returncode, stderr=stderr)
+    )
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason is not None and expected in reason
+
+
 def test_try_install_falls_back_to_the_exit_code_for_unrecognized_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Typed client for the four `/v1/sessions` endpoints introduced in
 // commit `e64a490` ("Migrate session ↔ client interactions to
 // /v1/sessions"). Mirrors `omnigent/server/routes/sessions.py`.
@@ -104,6 +105,7 @@ interface ModelUsageWire {
  * camelCase `Session` type at the parse boundary.
  */
 interface SessionResponseWire {
+  sandbox_profile?: SandboxProfile | null;
   id: string;
   agent_id: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
@@ -377,6 +379,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       : {}),
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    sandboxProfile: wire.sandbox_profile ?? null,
     mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
@@ -831,7 +834,12 @@ export async function forkSession(
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; hostId?: string } & (
+    sandbox?: {
+      provider?: string | null;
+      hostId?: string;
+      profileId?: string;
+      profileRevision?: string;
+    } & (
       | { workspace?: string | null; workspaces?: never }
       | { workspace?: never; workspaces?: string[] | null }
     );
@@ -850,6 +858,8 @@ export async function forkSession(
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
     host_id?: string;
     workspace?: string | null;
     workspaces?: string[] | null;
@@ -886,6 +896,10 @@ export async function forkSession(
     // A provider the server didn't name is omitted so it picks its first.
     if (sandbox.provider != null) {
       body.sandbox_provider = sandbox.provider;
+    }
+    if (sandbox.profileId !== undefined) {
+      body.sandbox_profile_id = sandbox.profileId;
+      body.sandbox_profile_revision = sandbox.profileRevision;
     }
     // Key presence is the signal here: an explicit null means "empty
     // sandbox", while omitting it inherits the source's repository.

@@ -25,6 +25,7 @@ from omnigent.harnesses.claude_native.status_file import (
     read_session_status,
     resolve_status_file,
     session_has_live_process,
+    session_pids,
     sessions_dir,
 )
 
@@ -613,6 +614,19 @@ def test_session_has_live_process_counts_interactive_holders(tmp_path: Path) -> 
     assert session_has_live_process("SID-1", config_dir=tmp_path) is True
     assert session_has_live_process("sid-2", config_dir=tmp_path) is False
     assert session_has_live_process("sid-3", config_dir=tmp_path) is False
+
+
+def test_session_pids_names_the_live_processes_holding_a_session(tmp_path: Path) -> None:
+    """Every live record naming the session counts; dead and other sessions don't."""
+    sessions = tmp_path / "sessions"
+    _write_registry_record(
+        sessions, str(os.getppid()), {"sessionId": "sid-1", "kind": "interactive"}
+    )
+    _write_registry_record(sessions, "999999999", {"sessionId": "sid-1", "kind": "interactive"})
+    _write_registry_record(sessions, "1", {"sessionId": "sid-2", "kind": "interactive"})
+
+    assert session_pids("SID-1", config_dir=tmp_path) == [os.getppid()]
+    assert session_pids("sid-3", config_dir=tmp_path) == []
 
 
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs procfs")

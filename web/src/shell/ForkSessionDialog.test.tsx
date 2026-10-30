@@ -16,6 +16,8 @@ import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog, ForkSessionForm } from "./ForkSessionDialog";
 import { beginClone, cloneKey, pendingClones } from "./cloneRequests";
 import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
+import { fetchSandboxProfiles, SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
@@ -48,6 +50,10 @@ vi.mock("sonner", () => ({
     vi.fn(() => "cloning"),
     { success: vi.fn(), error: vi.fn(), dismiss: vi.fn() },
   ),
+}));
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
@@ -259,6 +265,11 @@ function openAdvanced(): void {
 }
 
 beforeEach(() => {
+  vi.mocked(fetchSandboxProfiles).mockReset().mockResolvedValue({
+    profiles: [],
+    managed_providers: [],
+    next_cursor: null,
+  });
   fetchSessionRepositoryBranchesMock.mockReset().mockResolvedValue({ repositories: [] });
   forkSessionMock.mockReset();
   launchRunnerMock.mockReset();
@@ -1764,12 +1775,239 @@ describe("ForkSessionDialog", () => {
       sourceWorkspace: "/repo",
       sourceHostId: "host_1",
     };
+    const PROFILE = {
+      id: "large",
+      name: "Large workspace",
+      provider: "modal",
+      revision: "revision-1",
+      description: "",
+    };
+    const CATALOG = {
+      profiles: [PROFILE],
+      managed_providers: ["modal"],
+      next_cursor: null,
+    };
 
     /** Pick the (first) sandbox row in the host <Select>. */
     function selectSandbox(): void {
       openHostSelect();
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
     }
+
+    it.each([undefined, "resp_branch"])(
+      "requires an explicit provider-scoped profile when cloning through %s",
+      async (upToResponseId) => {
+        vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+          ...CATALOG,
+          managed_providers: ["modal", "agent_sandbox"],
+          profiles: [
+            PROFILE,
+            {
+              ...PROFILE,
+              provider: "agent_sandbox",
+              name: "Other workspace",
+              revision: "other-revision",
+            },
+          ],
+        });
+        forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+          ReturnType<typeof forkSession>
+        >);
+        renderDialog({
+          ...CODING,
+          upToResponseId,
+          info: {
+            features: { sandbox_profiles: true },
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            sandbox_providers: ["modal", "agent_sandbox"],
+          },
+        });
+        selectSandbox();
+        const picker = await screen.findByRole("button", {
+          name: "Sandbox profile: Choose profile",
+        });
+        expect(screen.getByText("Choose a sandbox profile to continue.")).toBeVisible();
+        const submit = screen.getByTestId("fork-session-submit");
+        expect(submit).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(submit);
+        expect(forkSessionMock).not.toHaveBeenCalled();
+        expect(picker).toHaveFocus();
+        fireEvent.click(picker);
+        expect(screen.queryByRole("option", { name: /^Default/ })).toBeNull();
+        expect(screen.queryByRole("option", { name: "Other workspace" })).toBeNull();
+        fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+        await waitFor(() =>
+          expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-disabled"),
+        );
+        await waitFor(() => expect(submit).not.toHaveAttribute("aria-disabled"));
+        openHostSelect();
+        fireEvent.click(screen.getByTestId("fork-session-sandbox-option-agent_sandbox"));
+        expect(submit).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+        );
+        expect(screen.queryByRole("option", { name: "Large workspace" })).toBeNull();
+        fireEvent.click(screen.getByRole("option", { name: "Other workspace" }));
+        await waitFor(() => expect(submit).not.toHaveAttribute("aria-disabled"));
+        fireEvent.click(submit);
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock).toHaveBeenCalledWith(
+          "conv_src",
+          expect.objectContaining({
+            upToResponseId,
+            sandbox: {
+              provider: "agent_sandbox",
+              profileId: "large",
+              profileRevision: "other-revision",
+              workspaces: [],
+            },
+          }),
+        );
+        expect(launchRunnerMock).not.toHaveBeenCalled();
+        expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it("blocks a sandbox-only fork during a catalog error and allows retry", async () => {
+      vi.mocked(fetchSandboxProfiles).mockRejectedValue(new Error("Unavailable"));
+      setHosts([]);
+      renderDialog({
+        ...CODING,
+        info: {
+          features: { sandbox_profiles: true },
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+        },
+      });
+      const picker = await screen.findByRole("button", {
+        name: "Sandbox profile: Profiles unavailable",
+      });
+      expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      fireEvent.click(picker);
+      expect(screen.queryByRole("option", { name: /^Default/ })).toBeNull();
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue(CATALOG);
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await screen.findByRole("button", { name: "Sandbox profile: Choose profile" });
+      expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-disabled", "true");
+    });
+
+    it("refreshes the fork catalog after rejection and requires explicit reselection", async () => {
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue(CATALOG);
+      forkSessionMock.mockRejectedValueOnce(new Error("Sandbox profile changed. Choose again."));
+      const { invalidateSpy } = renderDialog({
+        ...CODING,
+        info: {
+          features: { sandbox_profiles: true },
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+        },
+      });
+      selectSandbox();
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+      );
+      fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-disabled"),
+      );
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+        ...CATALOG,
+        profiles: [{ ...PROFILE, revision: "revision-2" }],
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(await screen.findByTestId("fork-session-error")).toHaveTextContent(
+        "Sandbox profile changed.",
+      );
+      await screen.findByText(
+        "This profile changed or is unavailable. Choose a profile again before launching.",
+      );
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+      expect(fetchSandboxProfiles).toHaveBeenCalledWith(
+        "modal",
+        expect.objectContaining({ profileId: "large" }),
+      );
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(forkSessionMock).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByRole("button", { name: "Sandbox profile: Large workspace" }));
+      fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-disabled"),
+      );
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+        ReturnType<typeof forkSession>
+      >);
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(2));
+      expect(forkSessionMock.mock.calls[1][1]?.sandbox).toMatchObject({
+        profileId: "large",
+        profileRevision: "revision-2",
+      });
+    });
+
+    it.each(["unchanged", "updated", "revoked", "other-provider"])(
+      "seeds the source profile for a %s catalog",
+      async (scenario) => {
+        const workspaces = ["https://github.com/org/api#main", "https://github.com/org/web#dev"];
+        useSessionMock.mockReturnValue({
+          session: {
+            labels: { [SANDBOX_REPO_LABEL_KEY]: workspaces.join(" ") },
+            sandboxProfile: {
+              ...PROFILE,
+              provider: scenario === "other-provider" ? "company" : "modal",
+            },
+          },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        const current = {
+          ...PROFILE,
+          revision: scenario === "updated" ? "revision-2" : PROFILE.revision,
+        };
+        vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+          ...CATALOG,
+          profiles: scenario === "revoked" ? [] : [current],
+        });
+        forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+          ReturnType<typeof forkSession>
+        >);
+        renderDialog({
+          ...CODING,
+          info: {
+            features: { sandbox_profiles: true },
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            sandbox_provider_capabilities: { modal: { multi_repo: true } },
+          },
+        });
+        selectSandbox();
+        const submit = screen.getByTestId("fork-session-submit");
+        if (scenario === "other-provider") {
+          await screen.findByRole("button", { name: "Sandbox profile: Choose profile" });
+          expect(submit).toHaveAttribute("aria-disabled", "true");
+        } else if (scenario === "revoked") {
+          await screen.findByText(
+            "This profile changed or is unavailable. Choose a profile again before launching.",
+          );
+          expect(submit).toHaveAttribute("aria-disabled", "true");
+        } else {
+          await waitFor(() => expect(submit).not.toHaveAttribute("aria-disabled"));
+          if (scenario === "updated")
+            expect(
+              screen.getByText("This profile has been updated since the original session."),
+            ).toBeVisible();
+          fireEvent.click(submit);
+          await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+          expect(forkSessionMock.mock.calls[0][1]?.sandbox).toMatchObject({
+            profileId: "large",
+            profileRevision: current.revision,
+            workspaces,
+          });
+        }
+      },
+    );
 
     it("hides the sandbox option on a server that can't provision one", () => {
       // Fails closed, mirroring the new-session picker: a server with no
@@ -1863,6 +2101,9 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-advanced-content")).not.toBeInTheDocument();
       expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("repo");
       expect(screen.getByRole("textbox", { name: "Branch for repo" })).toHaveValue("release-1.2");
+
+      expect(screen.queryByRole("button", { name: /Sandbox profile:/ })).toBeNull();
+      expect(fetchSandboxProfiles).not.toHaveBeenCalled();
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 

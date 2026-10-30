@@ -141,6 +141,7 @@ def _tunnel_route_app(
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    admit_managed_runner: Callable[[str], bool] | None = None,
 ) -> TunnelRouteApp:
     """Create a minimal app containing only the runner tunnel route.
 
@@ -163,6 +164,7 @@ def _tunnel_route_app(
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
             resolve_managed_runner_owner=resolve_managed_runner_owner,
+            admit_managed_runner=admit_managed_runner,
         ),
         prefix="/v1",
     )
@@ -1432,7 +1434,13 @@ async def test_ws_tunnel_registers_authenticated_non_loopback_owner(
 
     :returns: None.
     """
-    route_app = _tunnel_route_app(auth_provider=_CredentialHeaderAuthProvider())
+
+    def reject_delegated(_rid):
+        raise AssertionError("User-authenticated runners must bypass profile admission")
+
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(), admit_managed_runner=reject_delegated
+    )
 
     token = "alice-runner-token"
     runner_id = token_bound_runner_id(token)
@@ -1459,8 +1467,10 @@ async def test_ws_tunnel_registers_authenticated_non_loopback_owner(
             await communicator.wait(timeout=budget(1.0))
 
 
+@pytest.mark.parametrize("admission", [None, True, False])
 async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token(
     debug_log_rows: list[dict[str, Any]],
+    admission: bool | None,
 ) -> None:
     """A managed-sandbox runner registers under its launch owner.
 
@@ -1485,11 +1495,18 @@ async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token(
     """
     token = "managed-runner-binding-token"
     runner_id = token_bound_runner_id(token)
+    admitted = []
+
+    def admit(rid):
+        admitted.append(rid)
+        return admission
+
     route_app = _tunnel_route_app(
         auth_provider=_CredentialHeaderAuthProvider(),
         resolve_managed_runner_owner=(
             lambda rid: "owner@example.com" if rid == runner_id else None
         ),
+        admit_managed_runner=admit if admission is not None else None,
     )
     communicator = await _connect_route(
         route_app.app,
@@ -1500,8 +1517,26 @@ async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token(
         client_host="203.0.113.7",
     )
 
+    if admission is False:
+        await communicator.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(HelloFrame(runner_version="test", frame_protocol_version=1)),
+            }
+        )
+        close = await communicator.receive_output(timeout=budget(1.0))
+        assert close == {
+            "type": "websocket.close",
+            "code": 4004,
+            "reason": "runner binding was replaced",
+        }
+        assert route_app.registry.get(runner_id) is None
+        assert admitted == [runner_id]
+        await communicator.wait(timeout=budget(1.0))
+        return
     await _send_hello(communicator, route_app.registry, runner_id=runner_id)
     try:
+        assert admitted == ([runner_id] if admission is True else [])
         assert route_app.registry.online_runner_ids() == [runner_id]
         # Registered under the launch owner the resolver returned — not
         # rejected, and not the owner-less registration the gate forbids.

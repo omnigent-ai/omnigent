@@ -1812,6 +1812,30 @@ describe("FileViewer view-settings menu", () => {
     expect(revealFile).toHaveBeenCalledWith("this-mac", "/repo/file1.py");
   });
 
+  it("opens the selected file directly beside Copy link", async () => {
+    const openEditor = vi.fn();
+    vi.stubGlobal("open", openEditor);
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "this-mac" }),
+    });
+    const context = localDesktopContext();
+    render(
+      <FileViewerContext.Provider value={context}>
+        {viewerTree({ open: true })}
+      </FileViewerContext.Provider>,
+    );
+    const openIn = await screen.findByRole("button", { name: "Open in VS Code" });
+    const copy = screen.getByRole("button", { name: "Copy link to file" });
+    expect(copy.compareDocumentPosition(openIn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(openIn);
+    expect(openEditor).toHaveBeenCalledWith(
+      "vscode://file/repo/file1.py",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+
   it("adds the wrap-lines and whitespace toggles in diff view", async () => {
     render(viewerTree({ open: true, initialSearch: "diff=1" }));
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();

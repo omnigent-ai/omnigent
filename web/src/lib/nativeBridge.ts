@@ -90,6 +90,11 @@ interface NativeShellApi {
    */
   onOpenPath?: (callback: (path: string) => void) => () => void;
   /**
+   * Subscribe to the desktop find bar opening, from the shortcut or the Edit
+   * menu. Absent on older shells / outside Electron; returns an unsubscribe.
+   */
+  onFindOpened?: (callback: () => void) => () => void;
+  /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
    * can drive its sidebar as an interactive drawer: `begin`/`move` carry a 0→1
@@ -793,6 +798,21 @@ export function onOpenPath(callback: (path: string) => void): () => void {
     return native.onOpenPath(callback);
   } catch (err) {
     console.warn("[nativeBridge] native onOpenPath failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to the desktop find bar opening. A no-op outside the Electron
+ * shell or under a shell too old to send it.
+ */
+export function onFindOpened(callback: () => void): () => void {
+  const native = nativeApi();
+  if (!native?.onFindOpened) return () => {};
+  try {
+    return native.onFindOpened(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onFindOpened failed:", err);
     return () => {};
   }
 }
