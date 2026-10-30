@@ -3777,11 +3777,14 @@ def claude_turn_in_progress(bridge_dir: Path) -> bool:
     A ``UserPromptSubmit`` opens the turn and ``Stop``, ``StopFailure`` or
     ``SessionEnd`` closes it. A ``SessionStart`` begins a new session unless
     it is the compaction that continues the open turn. A child agent's hooks
-    don't move the parent's turn (see :func:`_from_parent_claude`).
+    don't move the parent's turn (see :func:`_from_parent_claude`). Only hooks
+    since the terminal's launch (:func:`write_tmux_target`) count: a turn an
+    earlier Claude left open ended with its pane.
 
     :param bridge_dir: Bridge directory path.
     :returns: ``True`` when the parent's last turn edge opened a turn.
     """
+    launched_at = _read_json_file(bridge_dir / _TMUX_FILE).get("updated_at")
     parent_session_ids = read_seen_claude_session_ids(bridge_dir)
     in_progress = False
     try:
@@ -3791,7 +3794,14 @@ def claude_turn_in_progress(bridge_dir: Path) -> bool:
                     envelope = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                if not isinstance(envelope, dict):
+                    continue
+                recorded_at = envelope.get("recorded_at")
+                if isinstance(launched_at, (int, float)) and not (
+                    isinstance(recorded_at, (int, float)) and recorded_at >= launched_at
+                ):
+                    continue
+                payload = envelope.get("payload")
                 if not isinstance(payload, dict) or not _from_parent_claude(
                     payload, parent_session_ids
                 ):

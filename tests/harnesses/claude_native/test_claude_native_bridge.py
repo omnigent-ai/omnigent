@@ -752,6 +752,26 @@ def test_claude_turn_in_progress_follows_the_parent_turn(
     assert claude_turn_in_progress(bridge_dir) is in_progress
 
 
+@pytest.mark.parametrize(("launch_offset_s", "in_progress"), [(-60.0, True), (60.0, False)])
+def test_claude_turn_in_progress_ignores_turns_from_before_the_launch(
+    tmp_path: Path, launch_offset_s: float, in_progress: bool
+) -> None:
+    """A turn a previous Claude left open ended with its pane; a relaunch starts clean."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "s1"})
+    (bridge_dir / "tmux.json").write_text(
+        json.dumps(
+            {
+                "socket_path": "/tmp/omnigent-terminal-x/tmux.sock",
+                "tmux_target": "main",
+                "updated_at": time.time() + launch_offset_s,
+            }
+        )
+    )
+
+    assert claude_turn_in_progress(bridge_dir) is in_progress
+
+
 def test_record_hook_event_ignores_foreign_identity(tmp_path: Path) -> None:
     """
     A side-channel event cannot re-aim the bridge at a foreign transcript.
