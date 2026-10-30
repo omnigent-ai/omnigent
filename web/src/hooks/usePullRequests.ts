@@ -34,7 +34,14 @@
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
 
-import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  queryOptions,
+  skipToken,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -466,6 +473,39 @@ export function computePullRequestPollInterval(
   return pr.checks.pending > 0 || pr.checks.total === 0 ? PULL_REQUEST_POLL_MS : false;
 }
 
+function usePullRequestQueryContext(rawConversationId: string | undefined) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session.
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  const serveable = useWorkspaceServeable(conversationId);
+  // Gate on the health poll rather than the session snapshot: the sidebar
+  // tooltip reuses this hook, and must not load every hovered session.
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return { conversationId, enabled: !!conversationId && serveable !== false, retry };
+}
+
+function pullRequestInfoQueryOptions(
+  { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
+  options?: { poll?: boolean | "list"; prUrl?: string },
+) {
+  return queryOptions({
+    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
+    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
+    enabled,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    staleTime: 30_000,
+    refetchInterval: options?.poll
+      ? (query) =>
+          options.poll === "list"
+            ? computePullRequestPollInterval(query.state.data, true)
+            : query.state.data?.tracking_available
+              ? 10_000
+              : computePullRequestPollInterval(query.state.data)
+      : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
 /**
  * Fetch GitHub context (repo, branch, base ref, PR + CI summary) for a session.
  *
@@ -490,32 +530,21 @@ export function usePullRequestInfo(
   rawConversationId: string | undefined,
   options?: { poll?: boolean | "list"; prUrl?: string },
 ) {
-  // A `temp:*` id (navigate-first new-chat window) has no server session.
-  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
-  const serveable = useWorkspaceServeable(conversationId);
-  // Gate on the health poll rather than the session snapshot: the sidebar
-  // tooltip reuses this hook, and must not load every hovered session.
-  const retry = useRunnerOfflineRetry(serveable !== false);
-  // Turn-end backstop: refetch when the focused session goes active→idle, so a
-  // just-opened PR appears without opening the tab. Keys off the turn lifecycle,
-  // so it works for every harness (no per-harness tool detection).
-  useTrailingInvalidate(conversationId, useSessionActive(conversationId), "github-info");
-  return useQuery({
-    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
-    enabled: !!conversationId && serveable !== false,
-    retry,
-    retryDelay: runnerOfflineRetryDelay,
-    staleTime: 30_000,
-    refetchInterval: options?.poll
-      ? (query) =>
-          options.poll === "list"
-            ? computePullRequestPollInterval(query.state.data, true)
-            : query.state.data?.tracking_available
-              ? 10_000
-              : computePullRequestPollInterval(query.state.data)
-      : false,
-    refetchIntervalInBackground: false,
+  const context = usePullRequestQueryContext(rawConversationId);
+  // A turn end refreshes the default query and every linked PR's cached info.
+  useTrailingInvalidate(
+    context.conversationId,
+    useSessionActive(context.conversationId),
+    "github-info",
+  );
+  return useQuery(pullRequestInfoQueryOptions(context, options));
+}
+
+/** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
+export function usePullRequestInfos(rawConversationId: string | undefined, prUrls: string[]) {
+  const context = usePullRequestQueryContext(rawConversationId);
+  return useQueries({
+    queries: prUrls.map((prUrl) => pullRequestInfoQueryOptions(context, { poll: "list", prUrl })),
   });
 }
 

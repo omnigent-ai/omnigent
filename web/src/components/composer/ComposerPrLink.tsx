@@ -1,7 +1,18 @@
 import { GitPullRequestIcon, Loader2Icon } from "lucide-react";
+import { PullRequestStatusIcon } from "@/components/PullRequestStatusIcon";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { gitProviderCopy } from "@/lib/gitProviders";
+import {
+  getPullRequestStatus,
+  pullRequestStatusPresentation,
+  type PullRequestStatus,
+} from "@/lib/pullRequestStatus";
 import { cn } from "@/lib/utils";
 
 export type ComposerPrState = "loading" | "ready" | "unknown";
+const NO_PULL_REQUESTS: readonly ComposerPullRequest[] = [];
 
 /**
  * PR chip for the composer workspace bar: the session's associated pull
@@ -19,6 +30,8 @@ export function ComposerPrLink({
   prCount,
   prNumber,
   prNumberPrefix = "#",
+  prs = NO_PULL_REQUESTS,
+  prStatus = null,
   onOpen,
   className,
 }: {
@@ -26,9 +39,12 @@ export function ComposerPrLink({
   prCount: number;
   prNumber: number | null;
   prNumberPrefix?: string;
+  prs?: readonly ComposerPullRequest[];
+  prStatus?: PullRequestStatus | null;
   onOpen: (() => void) | null;
   className?: string;
 }) {
+  const isCoarsePointer = useIsCoarsePointer();
   // Status belongs to a known PR; lookup and setup errors remain in the GitHub tab.
   if (prCount <= 0 || !onOpen) return null;
 
@@ -56,34 +72,95 @@ export function ComposerPrLink({
   }
   const label =
     prCount > 1 ? `${prCount} PRs` : prNumber == null ? "1 PR" : `${prNumberPrefix}${prNumber}`;
+  const status = prStatus ?? "unknown";
+  const presentation = pullRequestStatusPresentation(status);
 
-  return (
+  const trigger = (
     <button
       type="button"
       data-testid="composer-pr-link"
+      data-pr-status={status}
       onClick={() => onOpen()}
       aria-label={label}
+      aria-description={prStatus ? presentation.label : undefined}
       title={
-        prCount > 1
-          ? "View these PRs in the Pull Requests tab"
-          : "View this PR in the Pull Requests tab"
+        prs.length > 0
+          ? undefined
+          : prCount > 1
+            ? "View these PRs in the Pull Requests tab"
+            : "View this PR in the Pull Requests tab"
       }
       className={cn(
-        "group flex min-w-0 items-center gap-1 rounded text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+        "group flex min-w-0 items-center gap-1 rounded text-sm transition-colors hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+        presentation.className,
         className,
       )}
     >
-      <GitPullRequestIcon className="size-3.5 shrink-0" aria-hidden />
+      <PullRequestStatusIcon status={status} colored={false} className="size-3.5 shrink-0" />
       {/* Short and informative, so it stays when the bar collapses; a PR
           number that would truncate still asks the bar to collapse the
           directory and branch text, which frees the room it needs. */}
       <span
         data-workspace-collapse-label=""
         className="truncate tabular-nums underline-offset-2 group-hover:underline group-focus-visible:underline"
-        title={label}
+        title={prs.length > 0 ? undefined : label}
       >
         {label}
       </span>
     </button>
+  );
+
+  // HoverCard prevents touchstart; touch devices need the button's native tap.
+  if (prs.length === 0 || isCoarsePointer) return trigger;
+
+  return (
+    <HoverCard openDelay={200} closeDelay={150}>
+      <HoverCardTrigger asChild>{trigger}</HoverCardTrigger>
+      <HoverCardContent
+        data-testid="composer-pr-preview"
+        role="tooltip"
+        side="top"
+        align="start"
+        collisionPadding={16}
+        className="w-96 max-w-[calc(100vw-2rem)] p-0"
+      >
+        <div className="border-b border-border/50 px-3 py-2 text-xs font-medium text-muted-foreground">
+          Pull requests
+        </div>
+        <ul aria-label="Pull requests by status" className="max-h-80 overflow-y-auto p-1">
+          {prs.map((pr) => {
+            const rowStatus = getPullRequestStatus(pr);
+            const rowPresentation = pullRequestStatusPresentation(rowStatus);
+            const copy = gitProviderCopy(pr.provider, undefined, pr.provider_display);
+            const identity = `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
+            return (
+              <li
+                key={pr.url}
+                data-pr-url={pr.url}
+                data-pr-status={rowStatus}
+                className="flex items-start gap-2 rounded-md px-2 py-2"
+              >
+                <PullRequestStatusIcon status={rowStatus} className="mt-0.5 size-4 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="truncate text-xs text-muted-foreground" title={identity}>
+                      {identity}
+                    </span>
+                    <span className={cn("shrink-0 text-xs", rowPresentation.className)}>
+                      {rowPresentation.label}
+                    </span>
+                  </div>
+                  {pr.title?.trim() && (
+                    <div className="truncate text-ui font-medium" title={pr.title.trim()}>
+                      {pr.title.trim()}
+                    </div>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      </HoverCardContent>
+    </HoverCard>
   );
 }

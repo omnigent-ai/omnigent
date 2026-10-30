@@ -18,7 +18,7 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { usePullRequestInfo } from "./usePullRequests";
+import { usePullRequestInfo, usePullRequestInfos } from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -47,8 +47,9 @@ function pullRequestInfoResponse(): Response {
   } as unknown as Response;
 }
 
-function Probe({ id }: { id: string | undefined }) {
+function Probe({ id, batch = false }: { id: string | undefined; batch?: boolean }) {
   usePullRequestInfo(id);
+  usePullRequestInfos(id, batch ? ["https://github.com/org/repo/pull/1"] : []);
   return null;
 }
 
@@ -67,26 +68,36 @@ afterEach(() => {
 });
 
 describe("usePullRequestInfo turn-end invalidate", () => {
-  it("refetches github info when the focused session goes running → idle", async () => {
-    stubChatStore("conv_live", "running");
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
-    const { rerender } = render(
-      <QueryClientProvider client={qc}>
-        <Probe id="conv_live" />
-      </QueryClientProvider>,
-    );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  it.each([false, true])(
+    "refetches info when the focused session goes running → idle (batch=%s)",
+    async (batch) => {
+      stubChatStore("conv_live", "running");
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+      const { rerender } = render(
+        <QueryClientProvider client={qc}>
+          <Probe id="conv_live" batch={batch} />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(batch ? 2 : 1));
 
-    // Turn ends: the trailing invalidate fires one more github-info fetch.
-    stubChatStore("conv_live", "idle");
-    rerender(
-      <QueryClientProvider client={qc}>
-        <Probe id="conv_live" />
-      </QueryClientProvider>,
-    );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(fetchMock.mock.calls[1][0]).toBe("/v1/sessions/conv_live/resources/github");
-  });
+      // Turn ends: the trailing invalidate fires one more github-info fetch.
+      stubChatStore("conv_live", "idle");
+      rerender(
+        <QueryClientProvider client={qc}>
+          <Probe id="conv_live" batch={batch} />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(batch ? 4 : 2));
+      expect(fetchMock.mock.calls[batch ? 2 : 1][0]).toBe(
+        "/v1/sessions/conv_live/resources/github",
+      );
+      if (batch) {
+        expect(fetchMock.mock.calls[3][0]).toBe(
+          "/v1/sessions/conv_live/resources/github?pr_url=https%3A%2F%2Fgithub.com%2Forg%2Frepo%2Fpull%2F1",
+        );
+      }
+    },
+  );
 
   it("does not refetch when status stays idle across renders", async () => {
     // Guard against a spurious refetch on every render — only the

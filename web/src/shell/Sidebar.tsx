@@ -49,9 +49,6 @@ import {
   FolderOpenIcon,
   GitBranchIcon,
   GitForkIcon,
-  GitMergeIcon,
-  GitPullRequestClosedIcon,
-  GitPullRequestDraftIcon,
   GitPullRequestIcon,
   InboxIcon,
   ListChecksIcon,
@@ -282,7 +279,8 @@ import {
 import AntigravityColor from "@lobehub/icons/es/Antigravity/components/Color";
 import DevinColor from "@lobehub/icons/es/Devin/components/Color";
 import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
-import { type PullRequest, usePullRequestInfo } from "@/hooks/usePullRequests";
+import { usePullRequestInfo } from "@/hooks/usePullRequests";
+import { getPullRequestStatus, pullRequestStatusPresentation } from "@/lib/pullRequestStatus";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import {
@@ -4559,18 +4557,6 @@ function SessionTooltipDetail({
   );
 }
 
-// GitHub's glyph and label for a PR state; gh reports a draft as OPEN + is_draft.
-function pullRequestStatus(pr: Pick<PullRequest, "state" | "is_draft">): {
-  icon: LucideIcon;
-  label: string;
-} {
-  const state = pr.state.toUpperCase();
-  if (state === "MERGED") return { icon: GitMergeIcon, label: "Merged" };
-  if (state === "CLOSED") return { icon: GitPullRequestClosedIcon, label: "Closed" };
-  if (pr.is_draft) return { icon: GitPullRequestDraftIcon, label: "Draft" };
-  return { icon: GitPullRequestIcon, label: "Open" };
-}
-
 // The tooltip's detail rows. Repo, PR and a non-worktree branch come from the
 // session's GitHub info, fetched only while the tooltip is open (Radix mounts
 // its content on open) and shared with the GitHub panel's cache.
@@ -4593,11 +4579,12 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
     github?.prs?.find((p) => p.url === github.selected_pr_url) ?? github?.prs?.[0] ?? null;
   const prNumber = pr?.number ?? association?.number ?? stored?.number ?? null;
   const fromStored = !pr && !association && !!stored?.state;
-  const prStatus = pr
-    ? pullRequestStatus(pr)
-    : fromStored && stored?.state
-      ? pullRequestStatus({ state: stored.state, is_draft: stored.is_draft === true })
-      : null;
+  const statusSource = pr ?? (fromStored ? stored : null);
+  const prStatus = statusSource
+    ? pullRequestStatusPresentation(
+        getPullRequestStatus({ state: statusSource.state, is_draft: statusSource.is_draft }),
+      )
+    : null;
   // The stored state may be old while the host is offline; say how old.
   const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
@@ -4621,7 +4608,7 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
       {prNumber !== null && (
         <SessionTooltipDetail
           label="PR"
-          icon={prStatus?.icon ?? GitPullRequestIcon}
+          icon={prStatus?.Icon ?? GitPullRequestIcon}
           testId="session-tooltip-pr"
         >
           #{prNumber}
