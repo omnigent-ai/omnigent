@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnigent-sandbox-actions-example"
+version = "0.1.0"
+description = "Executable example of experimental sandbox provider actions"
+requires-python = ">=3.12"
+dependencies = ["omnigent>=0.18.0.dev0,<1"]
+
+[project.entry-points."omnigent.sandbox_providers"]
+example = "omnigent.community.sandbox.action_example:get_contribution"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["omnigent.community.sandbox.action_example*"]
