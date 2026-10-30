@@ -19,6 +19,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.types import Message, Receive, Scope, Send
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
@@ -40,6 +41,12 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes._gzip_route import (
+    GZIP_COMPRESSLEVEL,
+    GZIP_MINIMUM_SIZE,
+    SKIP_GZIP_STATE_KEY,
+    _StateAwareGZipResponder,
+)
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -10419,6 +10426,52 @@ async def test_sibling_environment_routes_are_not_gzipped(
 
     assert resp.status_code == 200
     assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_skip_gzip_responder_forwards_start_before_bodies() -> None:
+    """An opted-out response is forwarded as soon as each message is sent.
+
+    Holding the start message ties the opt-out to when a Starlette version
+    flushes it; 1.8.0 drops it, so the server answers 500.
+
+    :returns: None.
+    """
+    start: Message = {
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"application/json")],
+    }
+    first_body: Message = {
+        "type": "http.response.body",
+        "body": b"x" * (GZIP_MINIMUM_SIZE * 2),
+        "more_body": True,
+    }
+    final_body: Message = {"type": "http.response.body", "body": b"", "more_body": False}
+    sent: list[Message] = []
+    sent_when_start_returned: list[Message] = []
+
+    async def handler(scope: Scope, receive: Receive, send: Send) -> None:
+        scope["state"][SKIP_GZIP_STATE_KEY] = True
+        await send(start)
+        sent_when_start_returned.extend(sent)
+        await send(first_body)
+        await send(final_body)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def record(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {"type": "http", "headers": [(b"accept-encoding", b"gzip")], "state": {}}
+    responder = _StateAwareGZipResponder(
+        handler, GZIP_MINIMUM_SIZE, GZIP_COMPRESSLEVEL, scope["state"]
+    )
+    await responder(scope, receive, record)
+
+    assert sent == [start, first_body, final_body]
+    assert sent_when_start_returned == [start]
 
 
 @pytest.mark.parametrize(
