@@ -4,6 +4,8 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as IdentityModule from "@/lib/identity";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
@@ -50,14 +52,27 @@ function hostsResponse(provider: string | null = null) {
   );
 }
 
-function renderRestrictions(fallback?: SessionActionSource, cachedSession?: Session) {
+function renderRestrictions(
+  fallback?: SessionActionSource,
+  cachedSession?: Session,
+  // Omitted leaves server capabilities loading.
+  info?: Partial<ServerInfo>,
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   });
   if (cachedSession) client.setQueryData(["session", "session-1"], cachedSession);
   clients.add(client);
   const wrapper = ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    <QueryClientProvider client={client}>
+      {info === undefined ? (
+        children
+      ) : (
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
+          {children}
+        </CapabilitiesProvider>
+      )}
+    </QueryClientProvider>
   );
   return {
     client,
@@ -87,14 +102,48 @@ describe("useSessionActionRestrictions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it.each(["arclet", "lakebox"])(
-    "uses the fetched %s provider without a managed label",
-    async (provider) => {
-      fetchMock.mockImplementation(async () => hostsResponse(provider));
-      const { result } = renderRestrictions();
-      await waitFor(() => expect(result.current).toEqual(unsupported));
+  it("uses the fetched lakebox provider without a managed label", async () => {
+    fetchMock.mockImplementation(async () => hostsResponse("lakebox"));
+    const { result } = renderRestrictions();
+    await waitFor(() => expect(result.current).toEqual(unsupported));
+  });
+
+  it.each<Record<string, string>>([{}, { "omnigent.host_type": "managed" }])(
+    "offers an Arclet source a fork onto a fresh Arclet with labels %j",
+    async (labels) => {
+      getSessionMock.mockResolvedValue(session(labels));
+      fetchMock.mockImplementation(async () => hostsResponse("arclet"));
+      const { result } = renderRestrictions(undefined, undefined, {
+        managed_sandboxes_enabled: true,
+        sandbox_providers: ["lakebox", "arclet"],
+      });
+      await waitFor(() =>
+        expect(result.current).toEqual({
+          forkDisabledReason: undefined,
+          forkSandboxProvider: "arclet",
+          switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+        }),
+      );
     },
   );
+
+  it.each([
+    ["offers no Arclet", { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox"] }],
+    ["can't launch sandboxes", { managed_sandboxes_enabled: false, sandbox_providers: ["arclet"] }],
+  ])("keeps an Arclet fork unavailable on a server that %s", async (_server, info) => {
+    fetchMock.mockImplementation(async () => hostsResponse("arclet"));
+    const { result } = renderRestrictions(undefined, undefined, info);
+    await waitFor(() =>
+      expect(result.current).toEqual({ ...unsupported, forkSandboxProvider: "arclet" }),
+    );
+  });
+
+  it("keeps an Arclet fork disabled until server capabilities load", async () => {
+    fetchMock.mockImplementation(async () => hostsResponse("arclet"));
+    const { result } = renderRestrictions();
+    await waitFor(() => expect(result.current.forkSandboxProvider).toBe("arclet"));
+    expect(result.current.forkDisabledReason).toBe(SESSION_ACTIONS_LOADING);
+  });
 
   it("retains a known managed restriction when both lookups fail", async () => {
     getSessionMock.mockRejectedValue(new Error("Session unavailable"));
@@ -103,7 +152,8 @@ describe("useSessionActionRestrictions", () => {
       hostId: "host-1",
       labels: { "omnigent.host_type": "managed" },
     });
-    expect(result.current).toEqual(unsupported);
+    // Until the host lookup settles, the provider could still be a forkable Arclet.
+    expect(result.current).toEqual({ ...unsupported, forkDisabledReason: SESSION_ACTIONS_LOADING });
     await waitFor(() =>
       expect(client.getQueryState(["session", "session-1"])?.status).toBe("error"),
     );
@@ -111,6 +161,27 @@ describe("useSessionActionRestrictions", () => {
       expect(client.getQueryState(["hosts", { includeSandbox: true }])?.status).toBe("error"),
     );
     expect(result.current).toEqual(unsupported);
+  });
+
+  it("reports a managed source as loading, not unsupported, while its host loads", async () => {
+    let resolveHosts: (response: Response) => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveHosts = resolve;
+        }),
+    );
+    const { result } = renderRestrictions(undefined, session({ "omnigent.host_type": "managed" }), {
+      managed_sandboxes_enabled: true,
+      sandbox_providers: ["arclet"],
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(result.current.forkDisabledReason).toBe(SESSION_ACTIONS_LOADING);
+
+    act(() => resolveHosts(hostsResponse("arclet")));
+
+    await waitFor(() => expect(result.current.forkSandboxProvider).toBe("arclet"));
+    expect(result.current.forkDisabledReason).toBeUndefined();
   });
 
   it("explains a failed snapshot lookup instead of enabling actions", async () => {
