@@ -1,12 +1,13 @@
 """
 PTY test: the inline question selector answers with real keystrokes.
 
-The driver (``_question_selector_driver.py``) asks five questions through
+The driver (``_question_selector_driver.py``) asks seven questions through
 :meth:`TerminalHost.ask_questions` and prints each result. This test drives
 them the way a person would: arrows and Enter for a single choice, Space to
 check multi-select options, typing for a custom answer, editing a prefilled
 answer, and Esc to dismiss. Answers must never be submitted as chat or saved
-to the input history.
+to the input history, whatever key accepts them, and undo in the chat line
+never brings one back.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ _BOOT_TIMEOUT = 10.0
 _RENDER_TIMEOUT = 5.0
 _DOWN = "\x1b[B"
 _ESC = "\x1b"
+_ALT_HASH = "\x1b#"
+_UNDO = "\x1f"  # Ctrl+_
 
 
 @pytest.fixture
@@ -86,14 +89,34 @@ def test_selector_answers_with_real_keystrokes(
     wait('ANSWER 3 {"Name?": "qa"}')
 
     wait("Release notes?")
-    wait("draft notes")  # the prefill is in the input line, editable
+    wait("draft notes")  # the prefill is in the answer line, editable
     child.send(" v2\r")
     wait('ANSWER 4 {"0": "draft notes v2"}')
 
     wait("Dismiss me")
     child.send(_ESC)
-    rendered = wait("ANSWER 5 null")
+    wait("ANSWER 5 null")
 
-    assert "CHAT" not in rendered, f"a selector answer was submitted as chat:\n{rendered}"
+    # Alt+# accepts the line (as a comment): it answers, never sends chat.
+    wait("Comment me")
+    child.send("synthetic-answer")
+    wait("▸ 2. Type something")
+    child.send(_ALT_HASH)
+    wait('ANSWER 6 {"Comment?": "#synthetic-answer"}')
+
+    # Undo in the chat line can't bring back a dismissed answer.
+    wait("Discard me")
+    child.send("synthetic-discarded-answer")
+    wait("▸ 2. Type something")
+    child.send(_ESC)
+    wait("ANSWER 7 null")
+    child.send(_UNDO)
+    child.send("\r")
+    child.send("probe\r")
+    rendered = wait('CHAT "probe"')
+
+    chat = [line.strip() for line in rendered.splitlines() if line.strip().startswith("CHAT")]
+    assert chat == ['CHAT "probe"'], f"an answer reached the chat:\n{rendered}"
     saved = history.read_text() if history.exists() else ""
-    assert "qa" not in saved and "draft notes" not in saved, saved
+    for answer in ("qa", "draft notes", "synthetic"):
+        assert answer not in saved, saved

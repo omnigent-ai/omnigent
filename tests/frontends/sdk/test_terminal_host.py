@@ -1805,10 +1805,8 @@ async def test_question_picker_answers_follow_the_web_form() -> None:
     assert closed.row_count() == 3 and not closed.on_custom_row()
     assert "Type something" not in _picker_text(closed)
     # Typed text is never turned into the highlighted option ("No" must not
-    # submit a highlighted "Yes"); the selector says why Enter did nothing.
+    # submit a highlighted "Yes").
     assert closed.answer("No, stay in Plan mode") is False
-    assert "typing isn't accepted here" in _picker_text(closed)
-    closed.note_typing("")
     assert closed.answer("") is True
     assert await closed.future == {"Env?": "dev"}
 
@@ -1853,110 +1851,129 @@ async def test_question_picker_scrolls_long_lists_and_truncates_wide_lines() -> 
     assert "1. dev box — a b" in _picker_text(multiline)
 
 
+async def _press(host: TerminalHost, raw: str = "", *presses: Any) -> None:
+    """Feed *raw* terminal input, then *presses*, through the prompt's merged bindings."""
+    from prompt_toolkit.application.current import create_app_session
+    from prompt_toolkit.input.vt100_parser import Vt100Parser
+
+    app = host._prompt.app
+    app.timeoutlen = None  # no prefix-key flush task: every sequence here is complete
+    parsed: list[Any] = []
+    parser = Vt100Parser(parsed.append)
+    parser.feed(raw)
+    parser.flush()
+    with create_app_session() as session:
+        session.app = app
+        for press in [*parsed, *presses]:
+            app.key_processor.feed(press)
+        app.key_processor.process_keys()
+    await asyncio.sleep(0)
+
+
+async def _open(host: TerminalHost, *questions: Any) -> asyncio.Task[Any]:
+    asking = asyncio.create_task(host.ask_questions(list(questions)))
+    await asyncio.sleep(0)
+    return asking
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dismissed", [False, True], ids=["answered", "dismissed"])
-async def test_ask_questions_sets_the_draft_aside_and_restores_it(dismissed: bool) -> None:
+async def test_answers_never_reach_the_chat_line_or_its_undo(dismissed: bool) -> None:
     host = TerminalHost(model_name="test")
-    buffer = host._prompt.default_buffer
-    buffer.text = "half-typed chat message"
+    chat = host._prompt.default_buffer
+    await _press(host, "draft")
 
-    asking = asyncio.create_task(host.ask_questions([_env_question()]))
-    await asyncio.sleep(0)
-    assert host._question_picker is not None
-    assert buffer.text == "", "the selector starts with an empty input line"
+    asking = await _open(host, _env_question())
+    assert host._prompt.app.layout.current_buffer is host._answer_buffer
+    await _press(host, "synthetic")
+    assert chat.text == "draft", "typing reached the chat line"
     if dismissed:
-        buffer.text = "typed into the selector"
-        host.dismiss_questions()
+        host.dismiss_questions()  # what Esc does
     else:
-        host._move_question_highlight(1)
-        host._answer_question(buffer)
+        await _press(host, "\r")
 
-    assert await asking == (None if dismissed else {"Env?": "staging"})
-    assert host._question_picker is None
-    assert buffer.text == "half-typed chat message"
+    assert await asking == (None if dismissed else {"Env?": "synthetic"})
+    assert host._prompt.app.layout.current_buffer is chat
+    assert chat.text == "draft"
+    await _press(host, "\x1f")  # Ctrl+_ undoes the draft's own typing
+    assert chat.text and "draft".startswith(chat.text), chat.text
+    assert host._answer_buffer.text == ""
 
 
 @pytest.mark.asyncio
-async def test_draft_pastes_survive_a_question() -> None:
-    # The draft's pasted blocks belong to the draft: answering a question
-    # (or failing to) must not expand or drop them.
-    host = TerminalHost(model_name="test")
-    buffer = host._prompt.default_buffer
-    draft_paste = host._register_pasted_block("draft paste " * 30)
-    buffer.text = f"see {draft_paste.placeholder}"
+async def test_answer_pastes_and_clears_leave_the_chat_pastes_alone() -> None:
+    # Placeholders belong to the chat draft's registry; an answer takes the
+    # pasted text itself, and Ctrl+C on an answer clears only the answer.
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
 
-    asking = asyncio.create_task(host.ask_questions([_env_question()]))
-    await asyncio.sleep(0)
-    host._move_question_highlight(-1)  # "Type something"
-    answer_paste = host._register_pasted_block("answer paste " * 30)
-    buffer.text = ""
-    host._answer_question(buffer)  # empty custom answer: not taken
-    assert host._pasted_blocks == [answer_paste], "a rejected answer dropped its paste"
-    buffer.text = answer_paste.placeholder
-    host._answer_question(buffer)
+    host = TerminalHost(model_name="test")
+    draft_paste = host._register_pasted_block("draft paste " * 30)
+    host._prompt.default_buffer.text = f"see {draft_paste.placeholder}"
+
+    asking = await _open(host, _env_question())
+    await _press(host, "typo\x03")  # Ctrl+C
+    assert host._answer_buffer.text == ""
+    assert host._pasted_blocks == [draft_paste]
+    await _press(host, "", KeyPress(Keys.BracketedPaste, "answer paste " * 30))
+    await _press(host, "\r")
 
     assert await asking == {"Env?": ("answer paste " * 30).strip()}
-    assert buffer.text == f"see {draft_paste.placeholder}"
-    assert host._expand_pasted_blocks(buffer.text) == f"see {'draft paste ' * 30}"
+    assert host._pasted_blocks == [draft_paste]
+    assert host._prompt.default_buffer.text == f"see {draft_paste.placeholder}"
 
 
 @pytest.mark.asyncio
-async def test_replacing_an_open_selector_keeps_the_original_draft() -> None:
+async def test_a_question_that_only_takes_its_options_rejects_typing() -> None:
     host = TerminalHost(model_name="test")
-    buffer = host._prompt.default_buffer
-    buffer.text = "half-typed chat message"
-    first = asyncio.create_task(host.ask_questions([_env_question()]))
-    await asyncio.sleep(0)
-    buffer.text = "typed into the first selector"
-    second = asyncio.create_task(host.ask_questions([_env_question(key="Region?")]))
-    await asyncio.sleep(0)
+    asking = await _open(host, _env_question(allow_custom=False))
+    await _press(host, "No")
+    assert host._answer_buffer.text == "" and host._prompt.default_buffer.text == ""
+    await _press(host, "\r")
+    assert await asking == {"Env?": "dev"}
+
+
+@pytest.mark.asyncio
+async def test_replacing_an_open_selector_starts_a_fresh_answer_line() -> None:
+    host = TerminalHost(model_name="test")
+    first = await _open(host, _env_question())
+    await _press(host, "typed into the first selector")
+    second = await _open(host, _env_question(key="Region?"))
     assert await first is None
-    host._answer_question(buffer)
+    assert host._answer_buffer.text == ""
+    await _press(host, "\x1f")  # nothing of the first answer to undo back into
+    assert host._answer_buffer.text == ""
+    await _press(host, "\r")
     assert await second == {"Region?": "dev"}
-    assert buffer.text == "half-typed chat message"
 
 
 @pytest.mark.asyncio
 async def test_selector_owns_the_arrow_keys_while_open() -> None:
-    # Down on an empty line would otherwise open the sub-agents menu (and Up
-    # would recall history); the selector's bindings must win.
+    # Down on an empty line would otherwise open the sub-agents menu.
     host = TerminalHost(model_name="test")
     host.has_any_subagents = lambda: True  # type: ignore[method-assign]
-
-    def _active(key: str) -> str:
-        matches = [
-            b for b in host._kb.bindings if [str(k) for k in b.keys] == [key] and b.filter()
-        ]
-        return matches[-1].handler.__name__  # prompt_toolkit runs the last match
-
-    assert _active("Keys.Down") == "_open_menu"
-    asking = asyncio.create_task(host.ask_questions([_env_question()]))
-    await asyncio.sleep(0)
-    assert _active("Keys.Down") == "_picker_next"
-    assert _active("Keys.Up") == "_picker_prev"
+    asking = await _open(host, _env_question())
+    await _press(host, "\x1b[B")  # Down
+    assert host._question_picker is not None and host._question_picker.row == 1
+    assert not host._subagent_menu_open
+    await _press(host, "\x1b[A")  # Up
+    assert host._question_picker.row == 0
     host.dismiss_questions()
     await asking
 
 
 @pytest.mark.asyncio
-async def test_editor_question_leaves_the_arrows_to_its_text() -> None:
-    # No rows to move through, so Up/Down must move the cursor in a
-    # multi-line prefill instead of being swallowed.
-    host = TerminalHost(model_name="test")
-    asking = asyncio.create_task(
-        host.ask_questions([_env_question(options=(), text_default="line one\nline two")])
-    )
-    await asyncio.sleep(0)
-    active = [
-        b.handler.__name__
-        for b in host._kb.bindings
-        if [str(k) for k in b.keys] in (["Keys.Up"], ["Keys.Down"]) and b.filter()
-    ]
-    # Cursor movement only: falling through to history would swap the answer
-    # for an old chat message.
-    assert active == ["_picker_text_up", "_picker_text_down"]
-    host.dismiss_questions()
-    await asking
+async def test_editor_question_leaves_the_arrows_to_its_text(tmp_path: Any) -> None:
+    # No rows to move through: Up moves the cursor in a multi-line prefill,
+    # and never swaps the answer for an old chat message from history.
+    host = TerminalHost(model_name="test", history_file=str(tmp_path / "history"))
+    host._prompt.default_buffer.history.append_string("an old chat message")
+    asking = await _open(host, _env_question(options=(), text_default="line one\nline two"))
+    await _press(host, "\x1b[A\x1b[A")
+    assert host._answer_buffer.text == "line one\nline two"
+    assert host._answer_buffer.document.cursor_position_row == 0
+    await _press(host, "\r")
+    assert await asking == {"Env?": "line one\nline two"}
 
 
 @pytest.mark.asyncio
@@ -1964,9 +1981,7 @@ async def test_question_with_options_ignores_a_prefill() -> None:
     # A prefill would read as typing and move the highlight to "Type
     # something"; only option-less (editor) questions start prefilled.
     host = TerminalHost(model_name="test")
-    buffer = host._prompt.default_buffer
-    asking = asyncio.create_task(host.ask_questions([_env_question(text_default="draft")]))
-    await asyncio.sleep(0)
-    assert buffer.text == ""
-    host._answer_question(buffer)
+    asking = await _open(host, _env_question(text_default="draft"))
+    assert host._answer_buffer.text == ""
+    await _press(host, "\r")
     assert await asking == {"Env?": "dev"}

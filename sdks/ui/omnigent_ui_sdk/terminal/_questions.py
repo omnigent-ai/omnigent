@@ -4,7 +4,7 @@ Agents ask questions with options (Claude's ``AskUserQuestion``, Pi dialogs,
 Codex and Cursor questions). The host shows one question at a time below the
 toolbar: arrows move the highlight, Space toggles an option in multi-select,
 Enter answers, Esc dismisses. When typed answers are allowed, a
-"Type something" row takes the text in the input line.
+"Type something" row takes the text in the selector's answer line.
 """
 
 from __future__ import annotations
@@ -58,7 +58,6 @@ class QuestionPicker:
         self.answers: Answers = {}
         self.future: asyncio.Future[Answers | None] = asyncio.get_running_loop().create_future()
         self._scroll = 0
-        self._typed = ""
 
     @property
     def current(self) -> QuestionSpec:
@@ -100,14 +99,8 @@ class QuestionPicker:
 
     def note_typing(self, text: str) -> None:
         """Typing means a custom answer, so highlight its row (as the web form does)."""
-        self._typed = text
         if text and self.current.options and self.current.allow_custom:
             self.row = len(self.current.options)
-
-    def _typed_but_closed(self) -> bool:
-        """Text is typed on a question that only accepts its options."""
-        question = self.current
-        return bool(question.options) and not question.allow_custom and bool(self._typed.strip())
 
     def answer(self, text: str) -> bool:
         """Answer the current question from the highlight and the typed *text*.
@@ -171,13 +164,6 @@ class QuestionPicker:
         for text_line in textwrap.wrap(question.question, max(width - 4, 20)) or [""]:
             lines.append(("", f"   {text_line}"))
         lines.extend(self._option_lines(width))
-        if self._typed_but_closed():
-            lines.append(
-                (
-                    "class:question-warning",
-                    "   typing isn't accepted here: clear it and choose with ↑↓",
-                )
-            )
         lines.append(("class:model-name", f" {self._hint()}"))
         return [(style, _truncate(text, width) + "\n") for style, text in lines]
 
@@ -205,7 +191,7 @@ class QuestionPicker:
                 if description:
                     text += f" — {description}"
             else:
-                text = f" {marker} {row + 1}. {CUSTOM_ROW_LABEL} (type it in the input above)"
+                text = f" {marker} {row + 1}. {CUSTOM_ROW_LABEL} (type it below)"
             lines.append(("class:prompt-marker" if selected else "class:model-name", text))
         return lines
 
@@ -213,8 +199,8 @@ class QuestionPicker:
         question = self.current
         if not question.options:
             if question.text_default is not None:
-                return "edit the answer in the input above · ⏎ send · esc dismiss"
-            return "type the answer in the input above · ⏎ send · esc dismiss"
+                return "edit the answer below · ⏎ send · esc dismiss"
+            return "type the answer below · ⏎ send · esc dismiss"
         if question.multi_select:
             return "↑↓ move · space check · ⏎ send checked (or the highlighted one) · esc dismiss"
         return "↑↓ move · ⏎ choose · esc dismiss"

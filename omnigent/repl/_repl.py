@@ -1492,6 +1492,7 @@ class _SessionsChatReplAdapter:
         harness: str | None = None,
         attach_only: bool = False,
         field_input_state: _FieldInputState | None = None,
+        approval_state: _ApprovalState | None = None,
         host: TerminalHost | None = None,
         fmt: RichBlockFormatter | None = None,
         registered_agent: RegisteredAgent | None = None,
@@ -1539,6 +1540,8 @@ class _SessionsChatReplAdapter:
             ``False`` (default) is the runner-owning ``run`` path.
         :param field_input_state: Shared state for collecting schema
             field values interactively via the main input loop.
+        :param approval_state: The y/a/n approval gate, so a request
+            re-asked under its id can release the old card.
         :param host: Terminal output channel for rendering field prompts.
         :param fmt: Formatter for styling field prompts.
         :param registered_agent: Catalog identity selected for a new remote session.
@@ -1550,6 +1553,7 @@ class _SessionsChatReplAdapter:
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
         self._field_input_state = field_input_state
+        self._approval_state = approval_state
         # Prompts queued or open, by elicitation id: a repeat request for one
         # is dropped, and another client's verdict settles it.
         self._prompt_tickets: dict[str, _PromptTicket] = {}
@@ -2851,12 +2855,23 @@ class _SessionsChatReplAdapter:
         if current is not None:
             if current.event == event:
                 return None
-            # Re-asked under the same id: the old request's verdict must not answer it.
-            self.note_elicitation_resolved(elicitation_id)
+            self._release_replaced(elicitation_id)
         ticket = _PromptTicket(elicitation_id, event)
         if elicitation_id:
             self._prompt_tickets[elicitation_id] = ticket
         return asyncio.create_task(self._answer_prompt(session_id, ticket))
+
+    def _release_replaced(self, elicitation_id: str) -> None:
+        """Release the old prompt of a request re-asked under *elicitation_id*.
+
+        Its verdict must not answer the new request, so nothing is posted for
+        it, whichever prompt it holds: the selector, a y/a/n card or a form.
+        """
+        self.note_elicitation_resolved(elicitation_id)
+        if self._approval_state is not None:
+            self._approval_state.resolve_elsewhere(elicitation_id, None)
+        if self._field_input_state is not None:
+            self._field_input_state.resolve_elsewhere(elicitation_id)
 
     async def _handle_elicitation(
         self,
@@ -3767,6 +3782,7 @@ async def run_repl(
         harness=harness,
         attach_only=attach_only,
         field_input_state=field_input_state,
+        approval_state=approval_state,
         host=host,
         fmt=fmt,
     )

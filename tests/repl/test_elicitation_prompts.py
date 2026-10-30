@@ -79,6 +79,7 @@ def _adapter() -> tuple[_SessionsChatReplAdapter, _SelectorHost, _FieldInputStat
         hooks=StreamHooks(on_elicitation_request=approval_hook),
         session_id="conv_abc",
         field_input_state=fis,
+        approval_state=_ApprovalState(),
         host=host,  # type: ignore[arg-type]
         fmt=_FakeFmt(),  # type: ignore[arg-type]
     )
@@ -117,7 +118,21 @@ def _approval_event(elicitation_id: str = "elicit_approve") -> Any:
 
 def _resolved_elsewhere(adapter: Any, fis: _FieldInputState, elicitation_id: str) -> None:
     """Deliver another client's verdict the way run_repl's resolved-event branch does."""
-    _settle_resolved_elsewhere(adapter, _ApprovalState(), fis, elicitation_id, "accept", None)
+    _settle_resolved_elsewhere(
+        adapter, adapter._approval_state, fis, elicitation_id, "accept", None
+    )
+
+
+def _gate_approvals_on_the_user(adapter: Any, approval_hook: Any) -> None:
+    """Make the y/a/n hook wait on the adapter's approval gate, as run_repl's does."""
+
+    async def _wait_for_the_user(ctx: Any) -> bool:
+        gate = adapter._approval_state.begin(
+            ctx.policy_name, ctx.phase, elicitation_id=ctx.elicitation_id
+        )
+        return await gate
+
+    approval_hook.side_effect = _wait_for_the_user
 
 
 def _posted(client: Any) -> list[tuple[Any, ...]]:
@@ -339,16 +354,29 @@ async def test_a_later_request_reusing_a_settled_id_opens(
     )
 
 
-async def test_a_re_ask_under_an_open_id_replaces_the_old_question() -> None:
+@pytest.mark.parametrize("old_prompt", ["selector", "approval", "form"])
+async def test_a_re_ask_under_an_open_id_replaces_the_old_prompt(old_prompt: str) -> None:
     # A sub-agent can re-ask under the same id with no resolved event between;
-    # the old question's answer must not resolve the new one.
-    adapter, host, _, client, _ = _adapter()
-    old = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event("elicit_x")))
-    await _until(lambda: host.selector_open, "the first question never opened")
+    # whatever the old prompt is, its answer must not resolve the new request.
+    adapter, host, fis, client, approval_hook = _adapter()
+    old_event = {
+        "selector": _question_event("elicit_x"),
+        "approval": _approval_event("elicit_x"),
+        "form": _form_event("elicit_x", {"properties": {"name": {"type": "string"}}}),
+    }[old_prompt]
+    if old_prompt == "approval":
+        _gate_approvals_on_the_user(adapter, approval_hook)
+    old = asyncio.create_task(adapter._handle_elicitation("conv_abc", old_event))
+    opened = {
+        "selector": lambda: host.selector_open,
+        "approval": lambda: adapter._approval_state.pending,
+        "form": lambda: fis.pending,
+    }[old_prompt]
+    await _until(opened, "the first prompt never opened")
     question_b = _question_event("elicit_x", [{"question": "Region?", "options": ["us", "eu"]}])
     new = adapter.queue_elicitation("conv_abc", question_b)
     assert new is not None
-    await _until(lambda: old.done(), "the replaced question stayed open")
+    await _until(lambda: old.done(), "the replaced prompt kept holding the terminal")
     await _until(lambda: host.selector_open, "the new question never opened")
     host.answer({"Region?": "eu"})
     await new
@@ -356,6 +384,30 @@ async def test_a_re_ask_under_an_open_id_replaces_the_old_question() -> None:
     assert [q.question for q in host.asked[-1]] == ["Region?"]
     assert _posted(client) == [
         ("conv_abc", "elicit_x", {"action": "accept", "content": {"Region?": "eu"}})
+    ]
+
+
+async def test_a_failing_selector_declines_and_frees_the_queue() -> None:
+    adapter, host, _, client, _ = _adapter()
+    asked: list[Any] = []
+
+    async def _broken(questions: list[Any]) -> Any:
+        asked.append(questions)
+        if len(asked) == 1:
+            raise RuntimeError("selector failed")
+        return {"Env?": "prod"}
+
+    host.ask_questions = _broken  # type: ignore[method-assign]
+    first = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+    second = asyncio.create_task(
+        adapter._handle_elicitation("conv_abc", _question_event("elicit_next"))
+    )
+    await first
+    await second
+
+    assert _posted(client) == [
+        ("conv_abc", "elicit_q", {"action": "decline"}),
+        ("conv_abc", "elicit_next", {"action": "accept", "content": {"Env?": "prod"}}),
     ]
 
 

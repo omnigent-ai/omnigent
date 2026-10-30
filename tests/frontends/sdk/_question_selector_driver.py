@@ -43,6 +43,8 @@ QUESTIONS: list[list[QuestionSpec]] = [
     [QuestionSpec(key="Name?", question="Which name?", options=(("alpha", ""), ("beta", "")))],
     [QuestionSpec(key="0", question="Release notes?", text_default="draft notes")],
     [QuestionSpec(key="Skip?", question="Dismiss me", options=(("a", ""),))],
+    [QuestionSpec(key="Comment?", question="Comment me", options=(("a", ""),))],
+    [QuestionSpec(key="Discard?", question="Discard me", options=(("a", ""),))],
 ]
 
 
