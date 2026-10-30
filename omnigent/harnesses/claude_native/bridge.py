@@ -333,6 +333,10 @@ _DIALOG_FOOTER_RE = re.compile(
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
+# A pane whose prompt has not rendered for this long is asked to repaint
+# (see :func:`_request_claude_repaint`), then again at the interval.
+_CLAUDE_REPAINT_AFTER_S = 5.0
+_CLAUDE_REPAINT_INTERVAL_S = 20.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # Ctrl+K and Ctrl+U as CSI-u sequences, so Claude Code reads them as keys
 # rather than as text when they arrive in one burst.
@@ -5892,6 +5896,60 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     return _ClaudePaneState(None)
 
 
+def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
+    """
+    Ask Claude Code to redraw its whole screen.
+
+    Another process writing to the terminal Claude Code renders on (say, a
+    launcher's background thread logging to the stderr they share) overwrites
+    rows Claude Code's differential renderer believes are unchanged, so it
+    never redraws them. Text over the input box's frame hides a live composer
+    from :func:`_composer_row`, and the readiness wait would reap a healthy
+    pane. ``SIGCONT`` runs Claude Code's resume handler, which drops its
+    cached frame and repaints everything, as after ``fg``. A running process
+    without a handler ignores it, so the whole tree under the pane gets it: a
+    launcher may run Claude Code as its child.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: How many processes were signalled; ``0`` when the pane's
+        process could not be found.
+    """
+    import signal
+    import subprocess
+
+    import psutil
+
+    if IS_WINDOWS:
+        return 0
+    _check_injection_cancelled()
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return 0
+    fields = proc.stdout.split() if proc.returncode == 0 else []
+    if not fields or not fields[0].isdigit():
+        return 0
+    try:
+        root = psutil.Process(int(fields[0]))
+        tree = [root, *root.children(recursive=True)]
+    except psutil.Error:
+        return 0
+    signalled = 0
+    for process in tree:
+        with contextlib.suppress(psutil.Error):
+            process.send_signal(signal.SIGCONT)
+            signalled += 1
+    return signalled
+
+
 def claude_pane_ready(bridge_dir: Path) -> bool:
     """
     Report whether the Claude pane is showing a usable input box right now.
@@ -6838,7 +6896,9 @@ def _wait_for_claude_prompt_ready(
     dropped, so the first web-UI message silently vanishes. This gate
     polls ``capture-pane`` for the input prompt before injection;
     it returns immediately once mounted, so 2nd+ messages are
-    unaffected.
+    unaffected. While the prompt stays missing it periodically asks
+    Claude Code to repaint (:func:`_request_claude_repaint`), which
+    restores an input box another process's output drew over.
 
     Claude-native only — this is called from :func:`inject_user_message`
     and :func:`inject_slash_command`, which exclusively serve the Claude
@@ -6881,7 +6941,8 @@ def _wait_for_claude_prompt_ready(
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
-        count, how many of those polls saw an empty capture, and the tail
+        count, how many of those polls saw an empty capture, how many
+        repaints were requested, and the tail
         of the last non-empty capture the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a startup crash, a torn/empty capture under a mid-turn repaint, or
@@ -6892,8 +6953,10 @@ def _wait_for_claude_prompt_ready(
     hard_deadline = started + (
         max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S) if extend_for_slow_boot else timeout_s
     )
+    next_repaint = started + _CLAUDE_REPAINT_AFTER_S
     polls = 0
     empty_polls = 0
+    repaint_requests = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
     # capture taken after the deadline. A post-timeout re-capture can show
     # a different (often healthier-looking) frame than any decision the
@@ -7005,6 +7068,13 @@ def _wait_for_claude_prompt_ready(
             )
         waited_on_sign_in = waiting_on_sign_in
         now = time.monotonic()
+        if now >= next_repaint:
+            # Output from another process can hide a live composer until
+            # Claude Code repaints.
+            if _request_claude_repaint(socket_path, tmux_target):
+                repaint_requests += 1
+                delivery_diagnostics.record_readiness(prompt_repaint_requests=repaint_requests)
+            next_repaint = time.monotonic() + _CLAUDE_REPAINT_INTERVAL_S
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.alive is False:
@@ -7040,8 +7110,8 @@ def _wait_for_claude_prompt_ready(
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
-        f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        f"{empty_polls} empty captures, {repaint_requests} repaint requests). "
+        "The message was not delivered." + _format_terminal_failure_tail(last_nonempty)
     )
 
 
