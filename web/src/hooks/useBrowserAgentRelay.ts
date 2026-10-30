@@ -12,14 +12,16 @@ import { useEffect } from "react";
 import { buildBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
-import { supportsBrowser } from "@/lib/nativeBridge";
+import {
+  navigationHostOptions,
+  supportsBrowser,
+  type BrowserHostOptions,
+} from "@/lib/nativeBridge";
+import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
-import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
-import { getSessionSlim } from "@/lib/sessionsApi";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import type { Host } from "@/hooks/useHosts";
-import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -29,10 +31,9 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: {
+    opts?: BrowserHostOptions & {
       force?: boolean;
       agent?: boolean;
-      sourceHostId?: string;
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
@@ -123,7 +124,7 @@ async function dispatch(
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
-          ...(sourceHostId ? { sourceHostId } : {}),
+          ...navigationHostOptions(sourceHostId),
           ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
@@ -246,34 +247,10 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      let sourceHostId: string | null = null;
-      if (evt.action === "navigate") {
-        try {
-          // Parent hints cannot establish which ancestor has the nearest own host binding.
-          const visited = new Set<string>();
-          let id: string | null = sourceConversationId;
-          while (id !== null && !visited.has(id)) {
-            visited.add(id);
-            const hopId: string = id;
-            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
-            const source: Session = await queryClient.fetchQuery({
-              queryKey: ["session", hopId],
-              queryFn: () => getSessionSlim(hopId),
-              staleTime: Infinity,
-              retry: false,
-            });
-            setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels));
-            setSessionParent(source.id, source.parentSessionId);
-            if (source.hostId) {
-              sourceHostId = source.hostId;
-              break;
-            }
-            id = source.parentSessionId;
-          }
-        } catch {
-          // Unknown provenance stays denied for localhost; public browsing still works.
-        }
-      }
+      const sourceHostId =
+        evt.action === "navigate"
+          ? await fetchSessionHostId(sourceConversationId, { queryClient })
+          : null;
       const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
       const sourceIsArcaHost =
         evt.action === "navigate" && sourceHostId !== null

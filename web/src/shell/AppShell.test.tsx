@@ -1,3 +1,6 @@
+vi.mock("@/lib/fetchSessionHostId", () => ({
+  fetchSessionHostId: vi.fn().mockResolvedValue("local-host"),
+}));
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
@@ -3082,7 +3085,7 @@ describe("Right workspace card visibility", () => {
         browserViewId("conv_from", saved.selectedBrowserId!),
         "https://example.com/page",
         undefined,
-        { agent: true },
+        { agent: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
       );
       expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
       expect(readSessionWorkspaceState("conv_to").openBrowsers ?? []).toEqual([]);

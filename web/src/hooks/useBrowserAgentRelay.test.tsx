@@ -1,10 +1,12 @@
 import { renderHook } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
+import type * as NativeBridge from "@/lib/nativeBridge";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // supportsBrowser gates the whole relay; force it true so the hook registers.
-vi.mock("@/lib/nativeBridge", () => ({
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
   isElectronShell: () => true,
   supportsBrowser: () => true,
 }));
@@ -298,6 +300,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       actionEvent("navigate", {
         url: "http://localhost:5173",
         sourceHostId: "forged",
+        sessionHostProtocol: 1,
         isArca: true,
       }),
       { source: "conv_background_A" },
@@ -310,6 +313,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
         force: true,
         agent: true,
         sourceHostId: "arca-host",
+        sessionHostProtocol: 1,
         rememberedArcaHostId: "arca-host",
       },
     );
@@ -351,6 +355,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
         force: true,
         agent: true,
         sourceHostId: "actual-arca-host-b",
+        sessionHostProtocol: 1,
         rememberedArcaHostId: "remembered-host-a",
         sourceIsArcaHost: true,
       },
@@ -374,7 +379,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       "conv_background_A",
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "other-host" },
+      { force: true, agent: true, sourceHostId: "other-host", sessionHostProtocol: 1 },
     );
   });
 
@@ -399,7 +404,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       "conv_background_A",
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "other-host" },
+      { force: true, agent: true, sourceHostId: "other-host", sessionHostProtocol: 1 },
     );
   });
 
@@ -419,7 +424,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       CONV,
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "other-host" },
+      { force: true, agent: true, sourceHostId: "other-host", sessionHostProtocol: 1 },
     );
   });
 
@@ -454,7 +459,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       CONV,
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "arca-host" },
+      { force: true, agent: true, sourceHostId: "arca-host", sessionHostProtocol: 1 },
     );
   });
 
@@ -551,7 +556,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       "conv_background_A",
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "arca-host" },
+      { force: true, agent: true, sourceHostId: "arca-host", sessionHostProtocol: 1 },
     );
     expect(authenticatedFetch.mock.calls[1][0]).toContain(
       "/v1/sessions/conv_background_A/browser/action_result/",
@@ -604,7 +609,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       "conv_background_A",
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "arca-host" },
+      { force: true, agent: true, sourceHostId: "arca-host", sessionHostProtocol: 1 },
     );
   });
 

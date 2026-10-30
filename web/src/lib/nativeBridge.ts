@@ -27,6 +27,17 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
+export const SESSION_HOST_PROTOCOL = 1;
+
+export interface BrowserHostOptions {
+  sourceHostId?: string | null;
+  sessionHostProtocol?: number;
+}
+
+export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
+  return hostId ? { sourceHostId: hostId, sessionHostProtocol: SESSION_HOST_PROTOCOL } : {};
+}
+
 export interface BrowserRecentSessionInput {
   type: "keydown" | "keyup";
   key: "Tab" | "Control" | "Escape";
@@ -231,10 +242,9 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: {
+    opts?: BrowserHostOptions & {
       force?: boolean;
       agent?: boolean;
-      sourceHostId?: string;
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },

@@ -1,10 +1,15 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type * as NativeBridge from "@/lib/nativeBridge";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { BrowserPane } from "./BrowserPane";
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
 // unsupported-shell (returns null) path is covered by reading the early return.
-vi.mock("@/lib/nativeBridge", () => ({
+vi.mock("@/lib/fetchSessionHostId", () => ({ fetchSessionHostId: vi.fn() }));
+
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
   isElectronShell: () => true,
   supportsBrowser: () => true,
   // DialogContent sizes itself for the iOS keyboard and asks for the shell.
@@ -57,6 +62,7 @@ function installBridge(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  vi.mocked(fetchSessionHostId).mockResolvedValue(null);
   // jsdom has no ResizeObserver; the measuring-container effect (viewActive path)
   // constructs one. Stub it so mounting the container doesn't throw.
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
@@ -323,7 +329,8 @@ describe("BrowserPane design-mode toggle", () => {
 });
 
 describe("BrowserPane toolbar navigation + URL bar", () => {
-  it("opens a manually typed localhost preview through the user navigation path", async () => {
+  it("sends the owning session host and protocol for a manually typed localhost preview", async () => {
+    vi.mocked(fetchSessionHostId).mockResolvedValue("local-host");
     const bridge = installBridge();
     render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
     const bar = screen.getByRole("textbox", { name: "Address bar" });
@@ -335,9 +342,10 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
         "browser-tab:conv_preview:two",
         "http://localhost:5273/preview",
         undefined,
-        { force: true },
+        { force: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
       ),
     );
+    expect(fetchSessionHostId).toHaveBeenCalledWith("conv_preview");
     expect(bar).toHaveValue("http://localhost:5273/preview");
   });
 
