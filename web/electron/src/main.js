@@ -61,7 +61,7 @@ const {
   parseManifestAuth,
   sanitizeServerName,
 } = require("./url");
-const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
+const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
 const {
   parseServerLabels,
   serverLabel,
@@ -5265,7 +5265,7 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
     title: "Omnigent",
     message: `Open this Omnigent link?`,
     detail:
-      `This link will connect Omnigent to ${host} and open a conversation.\n\n` +
+      `This link will connect Omnigent to ${host}.\n\n` +
       `Only open links from a server you trust — once connected, it can show ` +
       `notifications and (when you allow it) manage this machine as a runner.`,
     buttons: ["Cancel", "Open"],
@@ -5345,7 +5345,7 @@ function drainPendingDeepLinks() {
  */
 async function handleDeepLink(raw) {
   const parsed = parseOmnigentDeepLink(raw);
-  if (!parsed) return;
+  if (!parsed || !(await acceptCliDeepLink(raw))) return;
 
   // The origin is fixed by the link itself — no network request needed for the
   // decision. expandDatabricksWorkspaceUrl only appends a mount path under this

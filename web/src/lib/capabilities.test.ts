@@ -241,6 +241,18 @@ describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   });
 });
 
+describe("resolveServerInfo session_fork_workspaces", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ session_fork_workspaces: advertised });
+    expect(parsed.session_fork_workspaces).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo session_event_types", () => {
   it.each([
     [undefined, []],

@@ -15,7 +15,7 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog, ForkSessionForm } from "./ForkSessionDialog";
 import { beginClone, cloneKey, pendingClones } from "./cloneRequests";
-import { forkSession, launchRunner } from "@/lib/sessionsApi";
+import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
 import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
@@ -38,7 +38,11 @@ vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
 });
-vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  fetchSessionRepositoryBranches: vi.fn(),
+  forkSession: vi.fn(),
+  launchRunner: vi.fn(),
+}));
 vi.mock("sonner", () => ({
   toast: Object.assign(
     vi.fn(() => "cloning"),
@@ -80,6 +84,7 @@ vi.mock("./WorkspacePicker", async (importActual) => ({
 }));
 
 const forkSessionMock = vi.mocked(forkSession);
+const fetchSessionRepositoryBranchesMock = vi.mocked(fetchSessionRepositoryBranches);
 const launchRunnerMock = vi.mocked(launchRunner);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useSessionAgentMock = vi.mocked(useSessionAgent);
@@ -187,7 +192,9 @@ function renderDialog(
           {props.info === undefined ? (
             shown()
           ) : (
-            <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...props.info }}>
+            <CapabilitiesProvider
+              info={{ ...FALLBACK_SERVER_INFO, session_fork_workspaces: true, ...props.info }}
+            >
               {shown()}
             </CapabilitiesProvider>
           )}
@@ -252,6 +259,7 @@ function openAdvanced(): void {
 }
 
 beforeEach(() => {
+  fetchSessionRepositoryBranchesMock.mockReset().mockResolvedValue({ repositories: [] });
   forkSessionMock.mockReset();
   launchRunnerMock.mockReset();
   navigateMock.mockReset();
@@ -1829,7 +1837,7 @@ describe("ForkSessionDialog", () => {
       openAdvanced();
       expect(screen.queryByTestId("fork-session-branch-input")).not.toBeInTheDocument();
       expect(screen.getByTestId("fork-session-sandbox-repo-input")).toBeInTheDocument();
-      expect(screen.getByTestId("fork-session-sandbox-branch-input")).toBeInTheDocument();
+      expect(screen.getByTestId("fork-session-sandbox-repo-add")).toBeInTheDocument();
     });
 
     it("prefills the repository from a sandbox source and forks onto a new sandbox", async () => {
@@ -1851,11 +1859,10 @@ describe("ForkSessionDialog", () => {
       });
 
       selectSandbox();
-      openAdvanced();
-      expect(screen.getByTestId("fork-session-sandbox-repo-input")).toHaveValue(
-        "https://github.com/org/repo",
-      );
-      expect(screen.getByTestId("fork-session-sandbox-branch-input")).toHaveValue("release-1.2");
+      await act(async () => {});
+      expect(screen.queryByTestId("fork-session-advanced-content")).not.toBeInTheDocument();
+      expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("repo");
+      expect(screen.getByRole("textbox", { name: "Branch for repo" })).toHaveValue("release-1.2");
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
@@ -1865,7 +1872,7 @@ describe("ForkSessionDialog", () => {
         agentId: undefined,
         upToResponseId: undefined,
         config: {},
-        sandbox: { provider: "modal", workspace: "https://github.com/org/repo#release-1.2" },
+        sandbox: { provider: "modal", workspaces: ["https://github.com/org/repo#release-1.2"] },
       });
       // The server provisions the host, so the dialog must NOT also try to
       // bind one — a launchRunner here would 404 on a host that doesn't exist.
@@ -1896,6 +1903,7 @@ describe("ForkSessionDialog", () => {
         info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
       });
 
+      await act(async () => {});
       expect(screen.getByTestId("fork-session-sandbox-only-hint")).toHaveTextContent(
         "This session can only be cloned onto a new Arclet Sandbox.",
       );
@@ -1907,10 +1915,7 @@ describe("ForkSessionDialog", () => {
       expect(screen.getAllByRole("option")).toHaveLength(1);
       expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Arclet Sandbox");
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
-      openAdvanced();
-      expect(screen.getByTestId("fork-session-sandbox-repo-input")).toHaveValue(
-        "https://github.com/databricks-eng/universe",
-      );
+      expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
@@ -1920,7 +1925,7 @@ describe("ForkSessionDialog", () => {
         agentId: undefined,
         upToResponseId: undefined,
         config: {},
-        sandbox: { provider: "arclet", workspace: "https://github.com/databricks-eng/universe" },
+        sandbox: { provider: "arclet", workspaces: ["https://github.com/databricks-eng/universe"] },
       });
       expect(launchRunnerMock).not.toHaveBeenCalled();
       expect(checkHostDirectoryMock).not.toHaveBeenCalled();
@@ -1955,11 +1960,73 @@ describe("ForkSessionDialog", () => {
       },
     );
 
-    it("inherits ALL repositories from a multi-repo sandbox source", async () => {
-      // A source with several repos records them space-joined; the single
-      // URL/branch fields can't represent that, so the fork shows a read-only
-      // list and inherits every repo (workspace omitted) instead of seeding a
-      // broken URL that would grey the submit button.
+    it.each([true, false, undefined])(
+      "inherits ALL repositories with workspace-list capability %s",
+      async (acceptsWorkspaces) => {
+        // Legacy inheritance must remain usable even if branch discovery is available.
+        useSessionMock.mockReturnValue({
+          session: {
+            labels: {
+              [SANDBOX_REPO_LABEL_KEY]:
+                "https://github.com/org/api#main https://github.com/org/web",
+            },
+          },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        fetchSessionRepositoryBranchesMock.mockResolvedValue({
+          repositories: [
+            { url: "https://github.com/org/api", branch: "feature/api", pushed: true },
+            { url: "https://github.com/org/web", branch: "feature/web", pushed: true },
+          ],
+        });
+        forkSessionMock.mockResolvedValue({
+          id: "conv_fork",
+        } as unknown as Awaited<ReturnType<typeof forkSession>>);
+        // A multi-repo source can only inherit all repos onto a multi-repo dest.
+        renderDialog({
+          ...CODING,
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "agent_sandbox",
+            sandbox_providers: ["agent_sandbox"],
+            sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+            session_fork_workspaces: acceptsWorkspaces,
+          },
+        });
+
+        selectSandbox();
+        await act(async () => {});
+        expect(screen.queryByTestId("fork-session-advanced-content")).not.toBeInTheDocument();
+        expect(screen.getAllByTestId("fork-session-sandbox-repo-row")).toHaveLength(2);
+        expect(screen.getByRole("textbox", { name: "Branch for api" })).toHaveValue(
+          acceptsWorkspaces ? "feature/api" : "main",
+        );
+        expect(screen.getByRole("textbox", { name: "Branch for web" })).toHaveValue(
+          acceptsWorkspaces ? "feature/web" : "",
+        );
+
+        // The space-joined label no longer greys the button on a multi-repo dest.
+        const submit = screen.getByTestId("fork-session-submit") as HTMLButtonElement;
+        expect(submit.disabled).toBe(false);
+        fireEvent.click(submit);
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        const call = forkSessionMock.mock.calls[0][1];
+        expect(call?.sandbox?.provider).toBe("agent_sandbox");
+        if (acceptsWorkspaces) {
+          expect(call?.sandbox?.workspaces).toEqual([
+            "https://github.com/org/api#feature/api",
+            "https://github.com/org/web#feature/web",
+          ]);
+        } else {
+          expect(fetchSessionRepositoryBranchesMock).not.toHaveBeenCalled();
+          expect(call?.sandbox).toEqual({ provider: "agent_sandbox" });
+        }
+      },
+    );
+
+    it("blocks multi-repo edits on an older server while allowing restoration or a single repository", async () => {
       useSessionMock.mockReturnValue({
         session: {
           labels: {
@@ -1969,43 +2036,401 @@ describe("ForkSessionDialog", () => {
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      // A multi-repo source can only inherit all repos onto a multi-repo dest.
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
       renderDialog({
         ...CODING,
         info: {
           managed_sandboxes_enabled: true,
           sandbox_provider: "agent_sandbox",
-          sandbox_providers: ["agent_sandbox"],
+          sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+          session_fork_workspaces: undefined,
+        },
+      });
+      selectSandbox();
+      await act(async () => {});
+      const submit = screen.getByTestId("fork-session-submit");
+      const branch = screen.getByRole("textbox", { name: "Branch for api" });
+      fireEvent.change(branch, { target: { value: "feature/api" } });
+      expect(submit).toHaveAttribute("aria-disabled", "true");
+      expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+        "Upgrade the server to change multiple repositories.",
+      );
+      fireEvent.click(submit);
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      fireEvent.change(branch, { target: { value: "main" } });
+      expect(submit).not.toHaveAttribute("aria-disabled");
+      expect(screen.queryByTestId("fork-session-field-error")).not.toBeInTheDocument();
+      fireEvent.change(screen.getByTestId("fork-session-sandbox-repo-input"), {
+        target: { value: "https://github.com/org/tools" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-sandbox-repo-add"));
+      expect(submit).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(screen.getByRole("button", { name: "Remove tools" }));
+      expect(submit).not.toHaveAttribute("aria-disabled");
+      fireEvent.click(screen.getByRole("button", { name: "Remove web" }));
+      expect(submit).not.toHaveAttribute("aria-disabled");
+      fireEvent.click(submit);
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+        provider: "agent_sandbox",
+        workspace: "https://github.com/org/api#main",
+      });
+    });
+
+    it.each([
+      { branch: "feature#draft", pushed: true, original: "#main", expected: "main", note: null },
+      { branch: "b".repeat(256), pushed: true, original: "#main", expected: "main", note: null },
+      {
+        branch: "feature/api",
+        pushed: true,
+        original: "#main",
+        expected: "feature/api",
+        note: null,
+      },
+      {
+        branch: "wip/api",
+        pushed: false,
+        original: "#main",
+        expected: "main",
+        note: "“wip/api” isn’t pushed. Using main.",
+      },
+      {
+        branch: "wip/api",
+        pushed: false,
+        original: "",
+        expected: "",
+        note: "“wip/api” isn’t pushed. Using the default branch.",
+      },
+      { branch: "feature/api", pushed: null, original: "#main", expected: "main", note: null },
+      { branch: null, pushed: null, original: "#main", expected: "main", note: null },
+    ])(
+      "prefills cloneable branches and falls back quietly: $branch / $pushed / $original",
+      async ({ branch, pushed, original, expected, note }) => {
+        useSessionMock.mockReturnValue({
+          session: {
+            labels: { [SANDBOX_REPO_LABEL_KEY]: `https://github.com/org/api${original}` },
+          },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        fetchSessionRepositoryBranchesMock.mockResolvedValue({
+          repositories: [{ url: "https://github.com/org/api", branch, pushed }],
+        });
+        forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+        renderDialog({
+          ...CODING,
+          info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+        });
+        selectSandbox();
+        await act(async () => {});
+        await act(async () => {});
+        const input = screen.getByRole("textbox", { name: "Branch for api" });
+        expect(input).toHaveValue(expected);
+        if (note) {
+          expect(input).toHaveAccessibleDescription(note);
+          expect(screen.getByText(note)).not.toHaveAttribute("role", "alert");
+        } else {
+          expect(screen.queryByText(/isn’t pushed/)).not.toBeInTheDocument();
+        }
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0][1]?.sandbox?.workspaces).toEqual([
+          `https://github.com/org/api${expected ? `#${expected}` : ""}`,
+        ]);
+      },
+    );
+
+    it("preserves edited and removed/re-added repositories when branch discovery is late", async () => {
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [SANDBOX_REPO_LABEL_KEY]:
+              "https://github.com/org/api#main https://github.com/org/web#main https://github.com/org/tools#main",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      let resolveBranches!: (
+        result: Awaited<ReturnType<typeof fetchSessionRepositoryBranches>>,
+      ) => void;
+      fetchSessionRepositoryBranchesMock.mockReturnValue(
+        new Promise((resolve) => {
+          resolveBranches = resolve;
+        }),
+      );
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "agent_sandbox",
+          sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+        },
+      });
+      selectSandbox();
+      expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+      expect(screen.getByText("Checking current branches…")).toBeInTheDocument();
+      fireEvent.change(screen.getByRole("textbox", { name: "Branch for api" }), {
+        target: { value: "my-choice" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Remove web" }));
+      fireEvent.change(screen.getByTestId("fork-session-sandbox-repo-input"), {
+        target: { value: "https://github.com/org/web" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-sandbox-repo-add"));
+      await act(async () =>
+        resolveBranches({
+          repositories: [
+            { url: "https://github.com/org/api", branch: "wip/api", pushed: false },
+            { url: "https://github.com/org/web", branch: "feature/web", pushed: true },
+            { url: "https://github.com/org/tools", branch: "feature/tools", pushed: true },
+          ],
+        }),
+      );
+      expect(screen.getByRole("textbox", { name: "Branch for api" })).toHaveValue("my-choice");
+      expect(screen.getByRole("textbox", { name: "Branch for web" })).toHaveValue("");
+      expect(screen.getByRole("textbox", { name: "Branch for tools" })).toHaveValue(
+        "feature/tools",
+      );
+      expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled();
+      expect(screen.queryByText(/isn’t pushed/)).not.toBeInTheDocument();
+    });
+
+    it.each(["Source offline", "404 Not Found"])(
+      "keeps the original branch on an older server when discovery fails: %s",
+      async (error) => {
+        useSessionMock.mockReturnValue({
+          session: { labels: { [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api#main" } },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        fetchSessionRepositoryBranchesMock.mockRejectedValue(new Error(error));
+        forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+        renderDialog({
+          ...CODING,
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            session_fork_workspaces: undefined,
+          },
+        });
+        selectSandbox();
+        await act(async () => {});
+        expect(screen.getByRole("textbox", { name: "Branch for api" })).toHaveValue("main");
+        expect(
+          screen.queryByText(/isn’t pushed|Source offline|404 Not Found/),
+        ).not.toBeInTheDocument();
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+          provider: "modal",
+          workspace: "https://github.com/org/api#main",
+        });
+      },
+    );
+
+    it("preserves distinct branches when source repositories or branch results have duplicate URLs", async () => {
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [SANDBOX_REPO_LABEL_KEY]:
+              "https://github.com/org/api#main https://github.com/org/api#stable https://github.com/org/web#release",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      fetchSessionRepositoryBranchesMock.mockResolvedValue({
+        repositories: [
+          { url: "https://github.com/org/api", branch: "feature/api", pushed: true },
+          { url: "https://github.com/org/api", branch: "wip/api", pushed: false },
+          { url: "https://github.com/org/web", branch: "feature/web", pushed: true },
+          { url: "https://github.com/org/web", branch: "other/web", pushed: true },
+        ],
+      });
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "agent_sandbox",
+          sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+        },
+      });
+      selectSandbox();
+      await act(async () => {});
+      expect(
+        screen
+          .getAllByRole("textbox", { name: "Branch for api" })
+          .map((input) => (input as HTMLInputElement).value),
+      ).toEqual(["main", "stable"]);
+      expect(screen.getByRole("textbox", { name: "Branch for web" })).toHaveValue("release");
+      expect(screen.queryByText(/isn’t pushed/)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0][1]?.sandbox?.workspaces).toEqual([
+        "https://github.com/org/api#main",
+        "https://github.com/org/api#stable",
+        "https://github.com/org/web#release",
+      ]);
+    });
+
+    it("releases Clone after a slow branch lookup and ignores its late result", async () => {
+      vi.useFakeTimers();
+      try {
+        useSessionMock.mockReturnValue({
+          session: { labels: { [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api#main" } },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        let resolveBranches!: (
+          result: Awaited<ReturnType<typeof fetchSessionRepositoryBranches>>,
+        ) => void;
+        fetchSessionRepositoryBranchesMock.mockReturnValue(
+          new Promise((resolve) => {
+            resolveBranches = resolve;
+          }),
+        );
+        renderDialog({
+          ...CODING,
+          info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+        });
+        selectSandbox();
+        expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(8_000);
+        });
+        expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled();
+        expect(fetchSessionRepositoryBranchesMock.mock.calls[0][1]?.aborted).toBe(true);
+        await act(async () =>
+          resolveBranches({
+            repositories: [
+              { url: "https://github.com/org/api", branch: "feature/late", pushed: true },
+            ],
+          }),
+        );
+        expect(screen.getByRole("textbox", { name: "Branch for api" })).toHaveValue("main");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("edits inherited branches, replaces a repository, and preserves the fork point", async () => {
+      const sourceLabels = {
+        [SANDBOX_REPO_LABEL_KEY]:
+          "https://github.com/org/api#main https://github.com/org/web#stable",
+      };
+      useSessionMock.mockReturnValue({
+        session: { labels: sourceLabels },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+      renderDialog({
+        ...CODING,
+        upToResponseId: "resp_selected",
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "agent_sandbox",
           sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
         },
       });
 
       selectSandbox();
-      openAdvanced();
-      // No editable single-repo field — a read-only list of every source repo.
-      expect(screen.queryByTestId("fork-session-sandbox-repo-input")).toBeNull();
-      const readonly = screen.getByTestId("fork-session-sandbox-repos-readonly");
-      expect(readonly.textContent).toContain("api#main");
-      expect(readonly.textContent).toContain("web");
-
-      // The space-joined label no longer greys the button on a multi-repo dest.
-      const submit = screen.getByTestId("fork-session-submit") as HTMLButtonElement;
-      expect(submit.disabled).toBe(false);
-      fireEvent.click(submit);
+      await act(async () => {});
+      fireEvent.change(screen.getByRole("textbox", { name: "Branch for api" }), {
+        target: { value: "invalid branch" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+        "Enter a valid branch name",
+      );
+      const branchInput = screen.getByRole("textbox", { name: "Branch for api" });
+      expect(branchInput).toHaveFocus();
+      const pendingUrl = screen.getByTestId("fork-session-sandbox-repo-input");
+      fireEvent.change(pendingUrl, { target: { value: "https://github.com/org/tools" } });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(pendingUrl).toHaveFocus();
+      expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+        "Finish or clear the repository URL",
+      );
+      fireEvent.change(pendingUrl, { target: { value: "" } });
+      fireEvent.change(branchInput, { target: { value: "b".repeat(256) } });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(branchInput).toHaveFocus();
+      expect(branchInput).toHaveAccessibleDescription(
+        "Repository URL and branch must be at most 256 characters together.",
+      );
+      expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+        "Repository URL and branch must be at most 256 characters together.",
+      );
+      fireEvent.change(screen.getByRole("textbox", { name: "Branch for api" }), {
+        target: { value: "feature/search" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Remove web" }));
+      fireEvent.change(screen.getByTestId("fork-session-sandbox-repo-input"), {
+        target: { value: "https://github.com/org/mobile.git" },
+      });
+      fireEvent.keyDown(screen.getByTestId("fork-session-sandbox-repo-input"), { key: "Enter" });
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      fireEvent.change(screen.getByRole("textbox", { name: "Branch for mobile" }), {
+        target: { value: "release" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-      const call = forkSessionMock.mock.calls[0][1];
-      expect(call?.sandbox?.provider).toBe("agent_sandbox");
-      // workspace omitted (undefined) → the server re-clones ALL source repos.
-      expect(call?.sandbox?.workspace).toBeUndefined();
+      expect(forkSessionMock.mock.calls[0][1]).toMatchObject({
+        upToResponseId: "resp_selected",
+        sandbox: {
+          provider: "agent_sandbox",
+          workspaces: [
+            "https://github.com/org/api#feature/search",
+            "https://github.com/org/mobile.git#release",
+          ],
+        },
+      });
+      expect(sourceLabels[SANDBOX_REPO_LABEL_KEY]).toBe(
+        "https://github.com/org/api#main https://github.com/org/web#stable",
+      );
+      expect(launchRunnerMock).not.toHaveBeenCalled();
     });
 
-    it("blocks forking a multi-repo source onto a single-repo provider", async () => {
-      // modal is single-repo; a source with several repos can't inherit them
-      // there, so the fork is blocked in the UI (not 422'd after creation).
+    it("adds several repositories to a local-session fork and requires pending URLs to be added", async () => {
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "agent_sandbox",
+          sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+        },
+      });
+      selectSandbox();
+      const input = screen.getByTestId("fork-session-sandbox-repo-input");
+      fireEvent.change(input, { target: { value: "https://github.com/org/api" } });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(input).toHaveFocus();
+      expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+        "Finish or clear the repository URL before cloning.",
+      );
+      fireEvent.click(screen.getByTestId("fork-session-sandbox-repo-add"));
+      fireEvent.change(input, { target: { value: "git@github.com:org/web.git" } });
+      fireEvent.click(screen.getByTestId("fork-session-sandbox-repo-add"));
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0][1]?.sandbox?.workspaces).toEqual([
+        "https://github.com/org/api",
+        "git@github.com:org/web.git",
+      ]);
+    });
+
+    it("lets a multi-repo source remove extras for a single-repo provider", async () => {
+      // Switching to a smaller provider preserves all selections until the user removes them.
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
       useSessionMock.mockReturnValue({
         session: {
           labels: {
@@ -2026,46 +2451,59 @@ describe("ForkSessionDialog", () => {
       });
 
       selectSandbox();
-      openAdvanced();
-      // The read-only list warns the destination can't take them, and submit
-      // is blocked rather than deferring to a server-side 422.
-      expect(screen.getByTestId("fork-session-repos-unsupported")).toBeInTheDocument();
+      await act(async () => {});
+      expect(screen.getAllByTestId("fork-session-sandbox-repo-row")).toHaveLength(2);
+      expect(screen.queryByTestId("fork-session-sandbox-repo-add")).not.toBeInTheDocument();
       const submit = screen.getByTestId("fork-session-submit");
       expect(submit).toHaveAttribute("aria-disabled", "true");
       fireEvent.click(submit);
       expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
-        "This provider clones only one repository",
+        "This provider clones at most 1 repository",
       );
       expect(forkSessionMock).not.toHaveBeenCalled();
-    });
-
-    it("sends an explicit null workspace when the repository is cleared", async () => {
-      // Clearing the prefill is a real choice (an empty sandbox), so it must
-      // reach the server as an explicit null — omitting the key would make the
-      // server fall back to the source's repository.
-      useSessionMock.mockReturnValue({
-        session: { labels: { [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/repo" } },
-        isLoading: false,
-        error: null,
-      } as unknown as ReturnType<typeof useSession>);
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      renderDialog({ ...CODING, info: { managed_sandboxes_enabled: true } });
-
-      selectSandbox();
-      openAdvanced();
-      fireEvent.change(screen.getByTestId("fork-session-sandbox-repo-input"), {
-        target: { value: "" },
-      });
-      fireEvent.click(screen.getByTestId("fork-session-submit"));
-
+      fireEvent.click(screen.getByRole("button", { name: "Remove web" }));
+      expect(submit).not.toHaveAttribute("aria-disabled");
+      fireEvent.click(submit);
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-      expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
-        provider: null,
-        workspace: null,
-      });
+      expect(forkSessionMock.mock.calls[0][1]?.sandbox?.workspaces).toEqual([
+        "https://github.com/org/api#main",
+      ]);
     });
+
+    it.each([true, false, undefined])(
+      "sends an explicit empty selection with workspace-list capability %s",
+      async (acceptsWorkspaces) => {
+        // Omitting the list would silently inherit the removed source repository.
+        useSessionMock.mockReturnValue({
+          session: { labels: { [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/repo" } },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        forkSessionMock.mockResolvedValue({
+          id: "conv_fork",
+        } as unknown as Awaited<ReturnType<typeof forkSession>>);
+        renderDialog({
+          ...CODING,
+          info: { managed_sandboxes_enabled: true, session_fork_workspaces: acceptsWorkspaces },
+        });
+
+        selectSandbox();
+        await act(async () => {});
+        fireEvent.click(screen.getByRole("button", { name: "Remove repo" }));
+        openHostSelect();
+        fireEvent.click(screen.getByTestId("fork-session-host-option-host_1"));
+        selectSandbox();
+        await act(async () => {});
+        expect(screen.queryByTestId("fork-session-sandbox-repo-row")).not.toBeInTheDocument();
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+          provider: null,
+          ...(acceptsWorkspaces ? { workspaces: [] } : { workspace: null }),
+        });
+      },
+    );
 
     it("greys the submit button on a malformed repository URL", () => {
       renderDialog({ ...CODING, info: { managed_sandboxes_enabled: true } });
@@ -2080,7 +2518,6 @@ describe("ForkSessionDialog", () => {
       });
       expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-disabled", "true");
 
-      // Collapsed Advanced must not hide the reason: a blocked click reopens it.
       openAdvanced();
       fireEvent.click(screen.getByTestId("fork-session-submit"));
       expect(screen.getByTestId("fork-session-sandbox-repo-input")).toHaveFocus();

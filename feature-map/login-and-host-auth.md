@@ -99,9 +99,13 @@ be able to write resources without a separate Omnigent account.
 **CLI sign-in:** `omnigent login <server-url>`.
 
 **Host:** `omnigent host <server-url>` (or `--server`), `omnigent host ""` for a
-local server, `--background`, `--no-open`, `--non-interactive`, and the
+local server, `--background`, `--no-open`, `--open-in-desktop` (or
+`OMNIGENT_HOST_OPEN_IN_DESKTOP=1`), `--non-interactive`, and the
 management commands `status`, `stop`, `stop-session`, `reset-id`, `enable`,
-and `disable`.
+and `disable`. With `--open-in-desktop`, a supported desktop app accepts
+the request before navigating or asking for consent. If it cannot accept within
+five seconds, the browser opens instead. URLs with base paths or selectors keep
+their original destination in the browser. `--no-open` suppresses both.
 
 **Web:** a harness that needs sign-in is marked in the harness picker, and a
 session whose host went offline offers reconnect (see [sessions](./sessions.md)).

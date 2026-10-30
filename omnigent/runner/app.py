@@ -103,7 +103,11 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
-from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.launch_failure import (
+    TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
+    FailureDiagnosis,
+    classify_terminal_failure,
+)
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -1948,6 +1952,8 @@ def create_runner_app(
             exit_status=event.exit_status,
             output=event.last_output,
         )
+        if diagnosis is None and event.closed_outside_omnigent:
+            diagnosis = TERMINAL_CLOSED_OUTSIDE_OMNIGENT
         error = _build_required_terminal_error(event, diagnosis)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
@@ -5282,6 +5288,9 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        _authorized_shell = msg_body.get("authorized_native_shell_command")
+        if isinstance(_authorized_shell, str):
+            harness_body["authorized_native_shell_command"] = _authorized_shell
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and
@@ -6524,6 +6533,19 @@ def create_runner_app(
             )
 
         body = await request.json()
+        if isinstance(body, dict):
+            from omnigent.harnesses.codex_native.shell_input import (
+                CODEX_SHELL_AUTHORIZED_HEADER,
+                shell_command_from_input,
+            )
+
+            # Only the authenticated server transport can authorize direct shell
+            # execution; legacy or caller-supplied body fields confer no authority.
+            body.pop("authorized_native_shell_command", None)
+            if request.headers.get(CODEX_SHELL_AUTHORIZED_HEADER) == "1":
+                authorized_command = shell_command_from_input(body.get("content"))
+                if authorized_command is not None:
+                    body["authorized_native_shell_command"] = authorized_command
         body_type = body.get("type") if isinstance(body, dict) else None
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "

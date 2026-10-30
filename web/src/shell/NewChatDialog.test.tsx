@@ -8648,7 +8648,8 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("gates the add-repository button on a valid URL; submit stays enabled", async () => {
+  it("blocks submit until a pending repository URL is added or cleared", async () => {
+    const user = userEvent.setup();
     renderLanding({ managed_sandboxes_enabled: true });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
@@ -8659,22 +8660,62 @@ describe("NewChatLandingScreen", () => {
     // No repo at all is a valid sandbox create (empty workspace).
     expect(submit.disabled).toBe(false);
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
-    const add = screen.getByTestId("new-chat-landing-repo-add") as HTMLButtonElement;
-    // An unusable URL shape can't be added (it would 422 server-side); the
-    // half-typed input is not a selection, so submit stays enabled.
+    // An unfinished URL must be resolved instead of silently omitted.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "org/repo" },
     });
-    expect(add.disabled).toBe(true);
+    expect(screen.getByTestId("new-chat-landing-repo-add")).toBeDisabled();
+    expect(submit.disabled).toBe(true);
+    async function assertPendingUrlReopens(attempt: () => void): Promise<void> {
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull());
+      attempt();
+      const pendingInput = await screen.findByTestId("new-chat-landing-repo-input");
+      expect(pendingInput).toHaveValue("org/repo");
+      await waitFor(() => expect(pendingInput).toHaveFocus());
+      expect(submit).toBeDisabled();
+    }
+    await assertPendingUrlReopens(() =>
+      fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 }),
+    );
+    await assertPendingUrlReopens(() => fireEvent.keyDown(submit.parentElement!, { key: "Enter" }));
+    await assertPendingUrlReopens(() =>
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer")),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "" },
+    });
     expect(submit.disabled).toBe(false);
-    // A valid URL enables Add; adding it keeps submit enabled.
+    // A valid URL enables Add; adding it enables submit.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/repo" },
     });
-    expect(add.disabled).toBe(false);
-    fireEvent.click(add);
+    expect(screen.getByTestId("new-chat-landing-repo-add")).toBeEnabled();
+    expect(submit.disabled).toBe(true);
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
     await screen.findByTestId("new-chat-landing-repo-row");
     expect(submit.disabled).toBe(false);
+    fireEvent.change(screen.getByRole("textbox", { name: "Branch for repo" }), {
+      target: { value: "feature#invalid" },
+    });
+    expect(submit).toBeDisabled();
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Branch for repo" })).toBeNull(),
+    );
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    const branchInput = await screen.findByRole("textbox", { name: "Branch for repo" });
+    await waitFor(() => expect(branchInput).toHaveFocus());
+    fireEvent.change(branchInput, { target: { value: "b".repeat(256) } });
+    expect(submit).toBeDisabled();
+    expect(branchInput).toHaveAccessibleDescription(
+      "Repository URL and branch must be at most 256 characters together.",
+    );
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(branchInput).toHaveFocus();
+    fireEvent.change(branchInput, { target: { value: "feature/valid" } });
+    expect(submit).toBeEnabled();
   });
 });
 
@@ -12253,12 +12294,44 @@ describe("managed sandbox inference models", () => {
   );
 
   it("blocks stale cached choices when a catalog refresh fails", async () => {
+    const user = userEvent.setup();
     preview(catalog, new Error("Gateway unavailable"));
     renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
     expect(screen.getByRole("alert")).toHaveTextContent("Gateway unavailable");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
     expect(screen.queryByTestId("sandbox-catalog-error-integrations-link")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "org/repo" },
+    });
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull());
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 });
+    expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+      "Gateway unavailable",
+    );
+    expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    preview();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start after reconnect" },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+        "Finish or clear the repository URL",
+      ),
+    );
+    fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 });
+    const repositoryInput = await screen.findByTestId("new-chat-landing-repo-input");
+    await waitFor(() => expect(repositoryInput).toHaveFocus());
+    expect(repositoryInput).toHaveValue("org/repo");
+    expect(screen.queryByTestId("new-chat-landing-submit-error-tooltip")).toBeNull();
+    fireEvent.change(repositoryInput, { target: { value: "" } });
+    expect(submit).toBeEnabled();
   });
 
   it("offers Integrations when Unity requires an account connection", () => {

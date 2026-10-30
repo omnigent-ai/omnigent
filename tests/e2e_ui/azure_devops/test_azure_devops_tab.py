@@ -172,6 +172,8 @@ def test_azure_devops_tab_shows_provider_repo_and_pull_request(
     expect(rail.get_by_text("Adds the widget.", exact=True)).to_be_visible()
     page.screenshot(path=tmp_path / "azure-summary.png", animations="disabled")
     rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    if mobile:
+        rail.get_by_role("button", name="Show file list", exact=True).click()
     expect(rail.get_by_role("button", name="src/app", exact=True)).to_be_visible()
     expect(rail.get_by_text("new_line", exact=True)).to_be_visible()
     rail.locator("[data-expand-button]").first.click()

@@ -19,13 +19,17 @@ never exercised.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
-from contextlib import suppress
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.host import Host, isolated_host
 
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
@@ -133,6 +137,53 @@ def _delete_scheduled_tasks_created_by_test(live_server: str) -> Iterator[None]:
             httpx.delete(
                 f"{live_server}/v1/scheduled-tasks/{task_id}", timeout=10.0
             ).raise_for_status()
+
+
+@contextmanager
+def _online_host(
+    root: Path, live_server: str, config: Mapping[str, Any] | None = None
+) -> Iterator[Host]:
+    """Start a real host and wait until the server lists it online."""
+    with isolated_host(root, live_server, config=config) as host:
+        with httpx.Client(base_url=live_server) as client:
+            host.wait_online(client, timeout=90)
+        yield host
+
+
+@pytest.fixture
+def online_host(live_server: str, tmp_path: Path) -> Iterator[Host]:
+    """A connected host: the create dialog pins a new automation to one.
+
+    Function-scoped so it is offline again by the next test, whose seeded
+    unpinned tasks must still find no online host.
+    """
+    with _online_host(tmp_path / "host", live_server) as host:
+        yield host
+
+
+@pytest.fixture
+def claude_ready_host(
+    live_server: str, mock_llm_server_url: str, tmp_path: Path
+) -> Iterator[Host]:
+    """A connected host where Claude Code is signed in, so the agent picker can select it.
+
+    A host whose Claude Code has no credential reports it as needing sign-in,
+    and the picker disables that row. A key provider pointed at the mock LLM is
+    that credential; no turn runs.
+    """
+    providers = {
+        "e2e-claude": {
+            "kind": "key",
+            "default": ["anthropic"],
+            "anthropic": {
+                "base_url": mock_llm_server_url,
+                "api_key": "mock-key",
+                "models": {"default": "claude-sonnet-4-20250514"},
+            },
+        }
+    }
+    with _online_host(tmp_path / "host", live_server, config={"providers": providers}) as host:
+        yield host
 
 
 def _row_by_name(page: Page, name: str):
@@ -299,6 +350,7 @@ def test_scheduled_task_next_run_label_live_ticks_without_navigation(
     expect(next_run).to_have_text("Next run in 5 mins", timeout=30_000)
 
 
+@pytest.mark.usefixtures("claude_ready_host")
 def test_scheduled_task_create_edit_modal_and_time_picker(
     page: Page,
     live_server: str,
@@ -558,6 +610,7 @@ def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
 def test_scheduled_task_create_persists_model_and_effort(
     page: Page,
     live_server: str,
+    online_host: Host,
 ) -> None:
     """Picking a concrete Model + Effort on create persists both via the API.
 
@@ -565,12 +618,14 @@ def test_scheduled_task_create_persists_model_and_effort(
     ``task-model-trigger`` / ``task-effort-trigger`` selects, submits, then reads
     the created row back from ``GET /v1/scheduled-tasks`` and asserts its
     ``model_override`` / ``reasoning_effort`` are the persisted picks (asserting
-    the server-side values is more robust than re-reading the row text). Opus =
-    the ``"opus"`` model alias, High = the ``"high"`` effort — the shared option
-    vocabulary the dialog renders; a pick sends those verbatim.
+    the server-side values is more robust than re-reading the row text). The
+    task pins the host, so Opus is that host's Claude Code option of that name,
+    and High is the ``"high"`` effort; a pick sends the option's id verbatim.
     """
     page.goto(f"{live_server}/tasks")
-    _open_create_dialog(page)
+    # Until the host's options load, the picker shows the static aliases.
+    with page.expect_response(lambda r: r.url.endswith("/harnesses/claude-native/model-options")):
+        _open_create_dialog(page)
 
     page.get_by_test_id("task-name-input").fill("Model effort create")
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
@@ -584,10 +639,17 @@ def test_scheduled_task_create_persists_model_and_effort(
     expect(_row_by_name(page, "Model effort create")).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == "Model effort create")
-    assert created["model_override"] == "opus", created
+    options = httpx.get(
+        f"{live_server}/v1/hosts/{online_host.host_id}/harnesses/claude-native/model-options",
+        timeout=30.0,
+    ).json()["models"]
+    opus = next(o["id"] for o in options if (o.get("displayName") or o["id"]) == "Opus")
+    assert created["host_id"] == online_host.host_id, created
+    assert created["model_override"] == opus, created
     assert created["reasoning_effort"] == "high", created
 
 
+@pytest.mark.usefixtures("online_host")
 def test_scheduled_task_create_default_omits_model_and_effort(
     page: Page,
     live_server: str,
@@ -710,6 +772,7 @@ def test_scheduled_task_edit_switches_the_harness(
 # they exercise only the dialog, REST, and the rendered row.
 
 
+@pytest.mark.usefixtures("online_host")
 def test_scheduled_task_create_persists_permission_mode(
     page: Page,
     live_server: str,
@@ -737,6 +800,7 @@ def test_scheduled_task_create_persists_permission_mode(
     assert created["permission_mode"] == "acceptEdits", created
 
 
+@pytest.mark.usefixtures("online_host")
 def test_scheduled_task_create_default_omits_permission_mode(
     page: Page,
     live_server: str,
@@ -794,11 +858,12 @@ def test_scheduled_task_edit_prefills_permission_mode(
     expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Bypass permissions")
 
 
+@pytest.mark.usefixtures("online_host")
 def test_scheduled_task_create_persists_continuing_one_session(
     page: Page,
     live_server: str,
 ) -> None:
-    """Choosing "Continue one session" on create persists the session mode."""
+    """Choosing "Continue in the same session" on create persists the session mode."""
     page.goto(f"{live_server}/tasks")
     _open_create_dialog(page)
 
@@ -807,7 +872,7 @@ def test_scheduled_task_create_persists_continuing_one_session(
     page.get_by_test_id("task-session-mode-trigger").click()
     page.get_by_test_id("task-session-mode-continue").click()
     expect(page.get_by_test_id("task-session-mode-trigger")).to_contain_text(
-        "Continue one session"
+        "Continue in the same session"
     )
     page.get_by_test_id("create-scheduled-task-submit").click()
 
@@ -817,6 +882,7 @@ def test_scheduled_task_create_persists_continuing_one_session(
     assert (created["session_mode"], created["session_id"]) == ("continue", None), created
 
 
+@pytest.mark.usefixtures("online_host")
 def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page: Page,
     live_server: str,

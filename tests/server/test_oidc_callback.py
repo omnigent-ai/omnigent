@@ -594,6 +594,59 @@ def test_reauth_callback_rejects_missing_auth_time(
     assert resp.cookies.get("ap_session") is None
 
 
+def test_reauth_callback_accepts_entra_token_expiring_on_arrival(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth id_token whose ``exp`` has just passed is accepted within the leeway.
+
+    Microsoft Entra ID caps ``exp`` at ``auth_time + max_age``, so the
+    ``max_age=0`` that forced re-auth sends yields a token already at its
+    expiry on arrival. Zero-leeway validation rejected it as ``Signature
+    has expired``, surfacing as "Could not determine user email from IdP".
+    """
+    client, keys = callback_client
+    now = int(time.time())
+    reauth_at = now - 2
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            "iat": now - 300,
+            "auth_time": now - 1,
+            "exp": now - 1,
+        }
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+def test_reauth_callback_rejects_token_expired_beyond_leeway(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """The leeway is bounded: a genuinely stale id_token is still rejected."""
+    client, keys = callback_client
+    now = int(time.time())
+    reauth_at = now - 2
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            "iat": now - 3600,
+            "auth_time": now - 1,
+            "exp": now - 600,
+        }
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 400, resp.text
+    assert "Could not determine user email" in resp.json()["error"]
+    assert resp.cookies.get("ap_session") is None
+
+
 @pytest.mark.parametrize("callback_client", [{"require_reauth": False}], indirect=True)
 @pytest.mark.parametrize(
     "auth_time_offset", [pytest.param(None, id="missing"), pytest.param(-3600, id="stale")]

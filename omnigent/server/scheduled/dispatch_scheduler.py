@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Collection, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -331,6 +332,10 @@ ReconcileStartup = Callable[
 OwnedHosts = Callable[[Sequence[str]], Awaitable[Collection[str]]]
 # Acts as the task's owner for the calls one startup or recovery makes.
 FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
+# Checked at the start of each poll and before Run now starts a run here.
+DispatchEnabled = Callable[[], bool]
+# Read before each wait between polls.
+PollInterval = Callable[[], float]
 
 
 class FireIdentityRevoked(Exception):
@@ -348,6 +353,10 @@ async def _owns_every_host(keys: Sequence[str]) -> Collection[str]:
     return keys
 
 
+def _always_enabled() -> bool:
+    return True
+
+
 @dataclass(frozen=True)
 class ScheduledTaskDispatchHooks:
     """Execution, recovery, host-ownership, and owner-identity callbacks; see README.md.
@@ -360,6 +369,8 @@ class ScheduledTaskDispatchHooks:
     on_expired: ReconcileStartup | None = None
     owned_hosts: OwnedHosts = _owns_every_host
     fire_identity: FireIdentity | None = None
+    dispatch_enabled: DispatchEnabled = _always_enabled
+    poll_interval: PollInterval | None = None
 
     def __post_init__(self) -> None:
         if (self.on_fire is None) != (self.on_expired is None):
@@ -384,6 +395,8 @@ class PersistentTaskScheduler:
         on_expired: ReconcileStartup,
         *,
         owned_hosts: OwnedHosts = _owns_every_host,
+        dispatch_enabled: DispatchEnabled = _always_enabled,
+        poll_interval: PollInterval | None = None,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -406,6 +419,8 @@ class PersistentTaskScheduler:
         self._on_fire = on_fire
         self._on_expired = on_expired
         self._owned_hosts = owned_hosts
+        self._dispatch_enabled = dispatch_enabled
+        self._poll_interval = poll_interval
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -464,12 +479,40 @@ class PersistentTaskScheduler:
                     "Could not check scheduled tasks for work; will check again on the next poll",
                     extra=debug_event("scheduled_task_operation_failed", operation="poll"),
                 )
-            await asyncio.sleep(self._poll_seconds)
+            await asyncio.sleep(self._next_poll_delay())
+
+    def _next_poll_delay(self) -> float:
+        """Return the live poll interval, or the configured one if it is unusable."""
+        if self._poll_interval is None:
+            return self._poll_seconds
+        try:
+            delay = float(self._poll_interval())
+        except Exception:
+            _logger.exception(
+                "Could not read the poll interval; waiting %s seconds", self._poll_seconds
+            )
+            return self._poll_seconds
+        if not math.isfinite(delay) or delay <= 0:
+            _logger.warning(
+                "Ignoring poll interval %r, which is not a positive number; waiting %s seconds",
+                delay,
+                self._poll_seconds,
+            )
+            return self._poll_seconds
+        return delay
+
+    def _dispatching(self) -> bool:
+        """Whether polls may read and start work; a failing check keeps dispatch on."""
+        try:
+            return bool(self._dispatch_enabled())
+        except Exception:
+            _logger.exception("Could not check whether dispatch is enabled; dispatching anyway")
+            return True
 
     async def poll_once(self) -> None:
         """Serialize due-task polling and start recovery in the background if idle."""
         async with self._poll_lock:
-            if self._stopped:
+            if self._stopped or not self._dispatching():
                 return
             if self._recovery is None or self._recovery.done():
                 self._recovery = asyncio.create_task(
@@ -509,6 +552,7 @@ class PersistentTaskScheduler:
                 not self._stopped
                 and self.is_started
                 and len(self._startups) < self._max_startups
+                and self._dispatching()
                 and host_ownership_key(run.workspace_id, run.host_id)
                 in await self._owned_host_keys(
                     [host_ownership_key(run.workspace_id, run.host_id)], operation="claim"

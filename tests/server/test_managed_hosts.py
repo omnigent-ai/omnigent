@@ -2419,6 +2419,7 @@ async def test_info_reports_managed_sandboxes_capability(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["managed_sandboxes_enabled"] is expected
+    assert body["session_fork_workspaces"] is True
     # The provider name is surfaced only when the option is offered; a
     # staged/absent config leaks nothing (provider stays None), so the
     # daytona/none cases never name a backend.

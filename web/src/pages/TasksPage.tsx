@@ -73,7 +73,7 @@ export function TasksPage() {
   const [prefill, setPrefill] = useState<ScheduledTaskSuggestion["prefill"] | null>(null);
   const [trigger, setTrigger] = useState<TriggerSource | null>(null);
   // A trigger's manager keeps one session and starts its workers from it, so
-  // the templates need "continue one session" and session orchestration.
+  // the templates need "continue in the same session" and session orchestration.
   const info = useServerInfo();
   const triggersSupported =
     info !== "loading" &&

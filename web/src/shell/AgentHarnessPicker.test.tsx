@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { AgentHarnessPicker } from "./NewChatDialog";
@@ -8,6 +8,11 @@ import type { Host } from "@/hooks/useHosts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
+import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
+import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  writeHiddenPickerAgents,
+} from "@/lib/pickerEntryVisibility";
 
 const agent = (
   overrides: Partial<AvailableAgent> &
@@ -55,6 +60,12 @@ const polly = agent({
   display_name: "Polly",
   harness: "claude-sdk",
 });
+const debby = agent({
+  id: "agent-debby",
+  name: "debby",
+  display_name: "Debby",
+  harness: "claude-sdk",
+});
 
 const readyHost: Host = {
   host_id: "host-test",
@@ -77,6 +88,7 @@ function renderPicker(props: {
   effectiveAgentId?: string | null;
   allowCreateCustomAgent?: boolean;
   sandboxSelected?: boolean;
+  host?: Host;
 }) {
   return render(
     <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
@@ -87,7 +99,7 @@ function renderPicker(props: {
           effectiveAgentId={props.effectiveAgentId ?? null}
           agentLabel="Picker"
           hasAgents
-          host={readyHost}
+          host={props.host ?? readyHost}
           onSelectAgent={() => undefined}
           pendingAgent={null}
           pendingAgentId="pending-agent"
@@ -110,7 +122,13 @@ function inlineHarnessIds(ids: string[]): string[] {
   return ids.filter((id) => screen.queryByTestId(`new-chat-landing-agent-${id}`) !== null);
 }
 
-afterEach(cleanup);
+const row = (id: string) => screen.queryByTestId(`new-chat-landing-agent-${id}`);
+
+afterEach(() => {
+  cleanup();
+  window.localStorage.removeItem(HIDDEN_PICKER_AGENTS_STORAGE_KEY);
+  writeHideUnconfiguredHarnesses(false);
+});
 
 describe("AgentHarnessPicker inline harness list", () => {
   it("keeps the preferred harnesses inline when they are seeded", async () => {
@@ -193,4 +211,74 @@ it("omits the rule above an Agents group that will not render", async () => {
   expect(screen.queryByText("Agents")).toBeNull();
   const menu = screen.getByRole("menu");
   expect(menu.querySelectorAll('[role="separator"]')).toHaveLength(0);
+});
+
+describe("AgentHarnessPicker per-entry visibility", () => {
+  it.each([
+    ["harness", codex],
+    // Polly launches fine here, so only this preference can drop it.
+    ["bundle agent", polly],
+  ])("drops a hidden %s row", async (_kind, hiddenEntry) => {
+    writeHiddenPickerAgents(new Set([hiddenEntry.name]));
+    renderPicker({
+      harnessEntries: [claude, codex],
+      agentEntries: [polly, debby],
+      effectiveAgentId: claude.id,
+    });
+    await openPicker();
+
+    expect(row(hiddenEntry.id)).toBeNull();
+    expect(row(claude.id)).toBeInTheDocument();
+    expect(row(debby.id)).toBeInTheDocument();
+  });
+
+  it("keeps the selected entry visible even when hidden", async () => {
+    writeHiddenPickerAgents(new Set([claude.name]));
+    renderPicker({ harnessEntries: [claude, codex], effectiveAgentId: claude.id });
+    await openPicker();
+
+    expect(row(claude.id)).toBeInTheDocument();
+  });
+
+  it("reacts to a change without a remount", async () => {
+    renderPicker({ harnessEntries: [claude, codex], effectiveAgentId: claude.id });
+    await openPicker();
+    expect(row(codex.id)).toBeInTheDocument();
+
+    act(() => writeHiddenPickerAgents(new Set([codex.name])));
+
+    expect(row(codex.id)).toBeNull();
+  });
+
+  const claudeOnlyHost: Host = {
+    ...readyHost,
+    configured_harnesses: { "claude-native": true, "codex-native": false },
+  };
+  const unconfiguredHost: Host = {
+    ...readyHost,
+    configured_harnesses: { "claude-native": false, "codex-native": false },
+  };
+  it.each([
+    ["every offered entry is hidden", [claude.name, codex.name, polly.name], readyHost, true],
+    ["a hidden ready harness is all that was left", [claude.name], claudeOnlyHost, true],
+    ["only a stale name is stored", ["removed-agent"], unconfiguredHost, false],
+    ["readiness already removed the hidden harness", [codex.name], unconfiguredHost, false],
+  ])(
+    "points at Settings only when the hides emptied the picker: %s",
+    async (_case, hiddenNames, host, pointsAtSettings) => {
+      writeHiddenPickerAgents(new Set(hiddenNames));
+      writeHideUnconfiguredHarnesses(true);
+      renderPicker({
+        harnessEntries: [claude, codex],
+        agentEntries: host === readyHost ? [polly] : [],
+        effectiveAgentId: null,
+        host,
+      });
+      await openPicker();
+
+      expect(row(claude.id)).toBeNull();
+      expect(row(codex.id)).toBeNull();
+      expect(screen.queryByTestId("new-chat-landing-all-hidden") !== null).toBe(pointsAtSettings);
+    },
+  );
 });

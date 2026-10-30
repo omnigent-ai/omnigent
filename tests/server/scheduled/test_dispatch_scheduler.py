@@ -6,7 +6,7 @@ import asyncio
 import logging
 import threading
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -2288,3 +2288,128 @@ async def test_recovery_ownership_lookup_is_bounded_and_retried(store, caplog) -
     assert len(_events(caplog, "scheduled_task_operation_failed")) == 1
     with workspace_scope(7):
         assert store.list_runs(task.id)[0][0].status == "failed"
+
+
+# Every read a poll makes to find work; none may run while dispatch is paused.
+_DISPATCH_READS = (
+    "list_uninitialized_tasks",
+    "list_due_tasks",
+    "list_pending_runs",
+    "list_expired_starting_runs",
+    "purge_deleted_tasks",
+)
+
+
+async def test_paused_dispatch_reads_nothing_and_resumes_without_catching_up(
+    store, monkeypatch
+) -> None:
+    task = _task(store)
+    clock = FakeClock(task.next_run_at + 7200)
+    enabled = False
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run)
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        AsyncMock(),
+        dispatch_enabled=lambda: enabled,
+        now=clock.now,
+        poll_seconds=3600,
+    )
+    await scheduler.start()
+    try:
+        with monkeypatch.context() as paused:
+            for name in _DISPATCH_READS:
+                paused.setattr(store, name, Mock(side_effect=AssertionError(name)))
+            await scheduler.poll_once()
+        # Run now records the request but leaves it for a later poll.
+        requested = await scheduler.run_now(task)
+        assert requested.status == "scheduled"
+        assert fired == []
+        assert scheduler._recovery is None
+        assert store.get(task.id).next_run_at == task.next_run_at
+
+        enabled = True
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+
+    # The overdue occurrence runs once, not once per missed hour, plus the request.
+    scheduled = [run for run in fired if not run.trigger_key.startswith("manual:")]
+    assert [run.scheduled_at for run in scheduled] == [task.next_run_at]
+    assert [run.id for run in fired if run.trigger_key.startswith("manual:")] == [requested.id]
+    assert store.get(task.id).next_run_at > clock.now()
+
+
+async def test_failing_dispatch_check_keeps_dispatching(store, caplog) -> None:
+    task = _task(store)
+    clock = FakeClock(task.next_run_at + 60)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(snapshot.id)
+        await lease.finish("running")
+
+    def broken_check() -> bool:
+        raise RuntimeError("flag service unavailable")
+
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), dispatch_enabled=broken_check, now=clock.now
+    )
+    with caplog.at_level(logging.ERROR, logger=_SCHEDULER_LOGGER):
+        await scheduler.poll_once()
+        await _drain(scheduler)
+
+    assert fired == [task.id]
+    assert "Could not check whether dispatch is enabled" in caplog.text
+
+
+async def test_live_poll_interval_overrides_poll_seconds(store, monkeypatch) -> None:
+    polls = 0
+    polled = asyncio.Event()
+
+    async def poll_once() -> None:
+        nonlocal polls
+        polls += 1
+        if polls == 3:
+            polled.set()
+
+    # With poll_seconds alone the loop would wait an hour after its first poll.
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(), poll_interval=lambda: 0.01, poll_seconds=3600
+    )
+    monkeypatch.setattr(scheduler, "poll_once", poll_once)
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(polled.wait(), 10)
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [0.0, -1.0, float("nan"), float("inf"), RuntimeError("flag service unavailable")],
+    ids=["zero", "negative", "nan", "infinite", "raises"],
+)
+def test_unusable_poll_interval_waits_poll_seconds(store, caplog, reading) -> None:
+    readings = [reading, 7.0]
+
+    def poll_interval() -> float:
+        value = readings.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(), poll_interval=poll_interval, poll_seconds=30
+    )
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        assert scheduler._next_poll_delay() == 30
+    assert caplog.records
+    # Only that wait falls back; the next reading applies again.
+    assert scheduler._next_poll_delay() == 7.0

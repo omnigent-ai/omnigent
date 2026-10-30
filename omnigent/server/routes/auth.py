@@ -70,6 +70,10 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# Clock-skew tolerance for id_token ``exp``/``iat``/``nbf``. Microsoft Entra ID
+# caps ``exp`` at ``auth_time + max_age``, so the ``max_age=0`` that forced
+# re-auth sends yields a token at or just past its expiry when it arrives.
+_ID_TOKEN_LEEWAY_SECONDS = 60
 # An upgrade notice, never a key in the login-ticket store.
 _CLI_UPGRADE_TICKET = "upgrade-required"
 _CLI_UPGRADE_MESSAGE = (
@@ -1507,6 +1511,7 @@ def _validate_id_token(
             algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
+            leeway=_ID_TOKEN_LEEWAY_SECONDS,
         )
     except jwt.InvalidTokenError as exc:
         _logger.warning("id_token validation failed: %s", exc)

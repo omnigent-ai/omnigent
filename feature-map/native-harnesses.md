@@ -48,6 +48,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `isaac-credential-detection`: harness setup offers Isaac when host-side
   Databricks detection finds a matching credential, and fails open for older
   hosts or servers that cannot report detection results.
+- `picker-entry-visibility`: the user hides individual harnesses and agents from
+  every agent picker (new chat, automation, project default) in Settings →
+  Appearance, per device. Independent of the readiness filter above, which only
+  drops rows that cannot launch.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
@@ -162,6 +166,14 @@ Real-provider history compatibility requires a separate live check.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Picker visibility:** open Settings → Appearance → **Show in agent pickers**.
+The row summarizes what is shown ("Showing 15 of 17. Hidden: …"). Press
+**Edit**, filter the checklist and uncheck an entry, or press **Show all** to
+restore them. The entry drops from the New Chat, New automation and
+project-default pickers. This is the user's own per-device choice, unlike "Hide
+unconfigured harnesses" next to it, which only drops rows that cannot launch on
+the selected host.
 
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
@@ -484,6 +496,16 @@ Cross-harness journeys:
   a newer same-value model write and its effort while the applied model stays
   unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
   These cases do not cover live providers or a post-refusal retry.
+- **`picker-entry-visibility`:**
+  `web/src/shell/AgentHarnessPicker.test.tsx` covers the picker rows a hidden
+  entry drops and when the picker points at Settings,
+  `web/src/pages/settings/PickerVisibilitySetting.test.tsx` the Settings
+  summary, checklist, **Show all** and a failed catalog load,
+  `web/src/lib/pickerEntryVisibility.test.ts`
+  the stored set, `web/src/lib/settingsPortability.test.ts` export and import,
+  `web/src/hooks/useAvailableAgents.test.tsx` (`useAgentCatalog`) the Settings
+  list's agents, and `web/src/lib/agentGrouping.test.ts` that Settings and the
+  picker group an entry the same way.
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal
@@ -823,6 +845,33 @@ Cross-harness journeys:
   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
   prompt must remain a separate user turn outside the assistant's folded work,
   including after reload. This browser contract does not launch the Claude CLI.
+- **`chat-render`, `steer`, Codex shell commands from the web composer:**
+  A standalone `!command` runs in the session's shell. Its pending bubble settles
+  and its output appears below it; attachments, multiple content blocks and `!!`
+  text remain model input. On shared servers, direct Codex shell messages require
+  owner access (`LEVEL_OWNER`), including API and automated messages. Codex runs
+  these commands as the host process user, outside its thread sandbox and
+  model-tool approval path. Collaborators with edit access can still send model
+  prompts. Each shell delivery carries trusted owner authorization from the
+  server, bound to the exact command at runner ingress. An older server cannot
+  authorize direct shell execution: the runner reports an undelivered upgrade
+  error and preserves the native session.
+  `tests/e2e_ui/messages/test_native_codex_shell_input.py::test_web_shell_input_runs_in_codex_shell_not_as_prompt`
+  covers both a first message and an existing session, including rendered output.
+  Run it through the repro environment with `--ui-skip-build --video=on` after
+  building the SPA. It requires real Codex and tmux with the mock model provider.
+  `tests/e2e/test_codex_native_shell_followup_e2e.py::test_web_prompt_during_standalone_shell_gets_model_reply`
+  (own environment; real server, runner, Codex and tmux, local mock model) checks
+  that a prompt sent during the command receives an answer after it finishes,
+  and that an unresolved submission with no running command allows the next
+  question through without resubmitting the shell command.
+  `tests/e2e/test_codex_native_shell_followup_e2e.py::test_editor_bang_input_cannot_execute_through_an_older_server`
+  covers editor rejection and ordinary-prompt recovery with current peers or an
+  older server selected by `OMNIGENT_COMPAT_SERVER_PYTHON`.
+  Manually, send `!echo hi`, expand its output and check for `hi`. Then send
+  `!sleep 5` followed immediately by a question; the question must receive an
+  answer. Upload a text file containing `!echo file-content` with an empty
+  composer and verify that it reaches the model without running a shell command.
 - **`codex-plugin-skills`:** use the
   [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
   real CLI catalog regression and recorded browser journey across both

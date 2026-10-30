@@ -1424,6 +1424,15 @@ html[data-electron-mac] .breadcrumb-folder {
   --diffs-font-features: "liga" 0, "calt" 0;
 }
 
+/* Share one opaque comment surface so diff selection cannot tint the cards. */
+.pull-request-comment-surface {
+  background-color: var(--card-solid);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--muted) 20%, transparent),
+    color-mix(in srgb, var(--muted) 20%, transparent)
+  );
+}
+
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
  * hide the native one so both don't show. */
 .transcript-hide-native-scrollbar {

@@ -120,6 +120,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "terminal_launch_failed",
   "runner_disconnected",
   "runner_failed_to_start",
+  "runner_process_crash",
   "runner_unavailable",
   "rate_limit_exceeded",
   "transient_upstream_error",

@@ -9,6 +9,7 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
@@ -223,13 +224,21 @@ function LocationProbe() {
 }
 
 function renderPage(path = "/settings") {
+  // The Appearance section lists the agent catalog (picker visibility), so the
+  // page needs a query client like it has in the real app. Retries off so a
+  // failed fetch surfaces as an empty list instead of hanging the test.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <TooltipProvider>
-      <MemoryRouter initialEntries={[path]}>
-        <SettingsPage />
-        <LocationProbe />
-      </MemoryRouter>
-    </TooltipProvider>,
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[path]}>
+          <SettingsPage />
+          <LocationProbe />
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -1016,6 +1025,7 @@ describe("SettingsPage", () => {
       target: { value: "Fira Code" },
     });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
+    localStorage.setItem("omnigent:hidden-picker-agents", '["polly"]');
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -1083,6 +1093,7 @@ describe("SettingsPage", () => {
       "false",
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
+    expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {

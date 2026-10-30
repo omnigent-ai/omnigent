@@ -1399,6 +1399,86 @@ async def test_required_terminal_exit_after_omnigent_reap_is_expected(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_error", "omnigent_killed", "closed_outside"),
+    [
+        # A live tmux whose only session was killed.
+        ("no current target", False, True),
+        ("no current target", True, False),
+        # The tmux server itself was killed, e.g. by ``killall tmux``.
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", False, True),
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", True, False),
+    ],
+)
+async def test_required_terminal_exit_names_a_session_killed_outside_omnigent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    probe_error: str,
+    omnigent_killed: bool,
+    closed_outside: bool,
+) -> None:
+    """A Claude session tmux reports killed is outside Omnigent unless Omnigent killed it.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :param monkeypatch: Pytest fixture that stubs the tmux subprocess.
+    :param caplog: Captures the exit-observed telemetry row.
+    :param probe_error: The has-session failure tmux gave once the session was gone.
+    :param omnigent_killed: Whether the stop path's ``kill_session`` ended the pane.
+    :param closed_outside: Expected ``closed_outside_omnigent`` on the exit.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.private_dir.mkdir(parents=True)
+    instance.keep_alive_after_exit = True
+    instance._last_session_probe_error = f"tmux command failed (rc=1): {probe_error}"
+    bridge_dir = tmp_path / "bridge"
+    claude_bridge.write_tmux_target(
+        bridge_dir, socket_path=instance.private_dir / "tmux.sock", tmux_target="main"
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    terminal_registry._by_conversation.setdefault("conv_killed", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_killed"
+    )
+    on_activity = callbacks["on_activity"]
+    on_exit = callbacks["on_exit"]
+    assert callable(on_activity) and callable(on_exit)
+    on_activity()
+    if omnigent_killed:
+        claude_bridge.kill_session(bridge_dir)
+    with caplog.at_level(logging.INFO):
+        on_exit()
+        await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].expected_close is False
+    assert exits[0].closed_outside_omnigent is closed_outside
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    assert record.attributes["terminal_closed_outside_omnigent"] == str(closed_outside).lower()
+
+
+@pytest.mark.asyncio
 async def test_required_terminal_exit_while_running_is_failure(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

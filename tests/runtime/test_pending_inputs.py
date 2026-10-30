@@ -1110,3 +1110,33 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
 
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.pending_ids("conv_a") == []
+
+
+def test_queued_slash_prompt_recorded_after_a_plain_follow_up_is_not_lost() -> None:
+    """
+    A "/"-led prompt queued before a plain one can be recorded after it.
+
+    Claude folds the plain prompt in at the next tool call but holds the
+    "/"-led one until the turn ends, so the older entry is not known lost.
+    """
+    pending_inputs.record("conv", [_text_block("/probe-cmd")], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("plain follow-up")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "plain follow-up")
+
+    assert match.matched is not None
+    assert match.skipped == []
+    [uncertain] = match.uncertain
+    assert uncertain.content == [_text_block("/probe-cmd")]
+
+
+def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost() -> None:
+    """A plain older entry jumped over is still reported as lost."""
+    pending_inputs.record("conv", [_text_block("first plain")], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("second plain")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "second plain")
+
+    [skipped] = match.skipped
+    assert skipped.content == [_text_block("first plain")]
+    assert match.uncertain == []
