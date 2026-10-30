@@ -191,7 +191,9 @@ async def test_snapshot_selection_binds_the_effective_owner(
                 harness.catalog.inherit_snapshot, _snapshot(), "bob"
             )
         else:
-            selected = await asyncio.to_thread(harness.catalog.validate_snapshot, _snapshot())
+            selected = await asyncio.to_thread(
+                harness.catalog.validate_snapshot, _snapshot(), user_id="alice"
+            )
     expected_user = "bob" if inherited else "alice"
     assert selected["user_id"] == expected_user
     assert harness.credentials.authorizations[-1]["user"] == expected_user
@@ -249,7 +251,9 @@ async def test_disconnected_caller_never_uses_another_users_credential(
         if operation == "list":
             await asyncio.to_thread(harness.catalog.list_profiles, user_id="alice")
         else:
-            await asyncio.to_thread(harness.catalog.validate_snapshot, _snapshot())
+            await asyncio.to_thread(
+                harness.catalog.validate_snapshot, _snapshot(), user_id="alice"
+            )
     assert error.value.status_code == 409
     assert error.value.detail == "Connect your sandbox provider account before choosing a profile"
     assert harness.credentials.authorizations == []
