@@ -488,7 +488,7 @@ class SessionStatusPoller:
             return
         if self._path is None:
             self._try_resolve()
-            if self._path is None:
+            if self._path is None or self._exhausted:
                 return
         self._read_and_publish()
 
@@ -563,6 +563,8 @@ class SessionStatusPoller:
 
         ``None`` unless the last read was ``waiting`` and carried a reason.
         """
+        if self._exhausted:
+            return None
         status = self._last_status
         if status is None or status.raw_status != "waiting":
             return None
@@ -582,6 +584,8 @@ class SessionStatusPoller:
             return
         self._last_mtime = mtime
         status = read_session_status(self._path)
+        if self._exhausted:
+            return
         if status is None:
             # An unrecognized literal — the file is an undocumented internal
             # detail whose vocabulary can grow. We are now blind to this
