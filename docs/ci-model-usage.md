@@ -1,9 +1,46 @@
 # CI model usage attribution
 
-Polly and Open Code Review attach a stable pipeline name and GitHub run identity
+Model-using CI workflows attach a stable pipeline name and GitHub run identity
 to model requests. The AI Gateway records them in
 `system.ai_gateway.usage.request_tags`, allowing usage to be grouped by workflow
 without assigning a separate service principal to every workflow.
+
+## Workflow coverage
+
+[The maintained inventory](../.github/model-usage.json) classifies all 93 workflow
+definitions: 13 model consumers, five mock test lanes, and 75 workflows without
+model calls. Tests require new workflow files to be classified and check that
+shared actions and reusable workflows keep their caller's pipeline identity.
+
+| Pipeline | Model calls |
+|---|---|
+| `polly-review` | Coordinator, Claude/Codex reviewers, and nested workers |
+| `open-code-review` | OCR action |
+| `auto-assign-reviewer` | Direct chat ranking request |
+| `doc-sync` | Classifier and documentation drafter |
+| `draft-release-notes` | Shared agent action |
+| `feature-blog` | Scout, drafter, and image-generation chat request |
+| `issue-triage` | Native agent or reusable triage classifier |
+| `needs-info-response` | Reusable triage classifier |
+| `publish-changelog` | Shared agent action |
+| `security-triage` | Native agent |
+| `vscode-release-pr` | Direct chat drafting request |
+| `flake-stress-e2e` | Live test clients and policy calls |
+
+`issue-prioritization-v2.yml` requires the calling workflow's pipeline as an input;
+its callers remain distinct. The bounded probe uses `usage-attribution-probe`.
+The mock workflows `e2e`, `e2e-ui`, `integration`, `server-compat`, and
+`flake-stress-ui` also retain separate labels, but their mock calls generate no
+Databricks usage. Dispatch-only workflows attribute inference to the workflow
+they start. Deployed applications and scheduled Databricks jobs are separate
+consumers and are not labeled with the workflow that deployed them.
+
+This is source-level coverage, not evidence that every workflow has run against
+the gateway. Workflows that select an older checkout or install Omnigent from
+PyPI need a revision/release containing the runtime support. Historical flake
+reproductions remain runnable; revisions predating attribution emit a warning
+and their usage remains untagged. The corresponding
+internal-repository rollout has its own inventory and release dependencies.
 
 ## Enable attribution in another CI job
 
@@ -23,8 +60,39 @@ deployments, pass the context to the process that actually makes model calls.
 Other repositories need a version of Omnigent containing this support and must
 opt their jobs in. Raw HTTP clients need the request header explicitly.
 
-Polly and OCR use the AI Gateway Anthropic route instead of the legacy serving
-route. OCR receives the same tags through its `llm_extra_headers` action input,
+File-configured clients also need CI provider configuration: Qwen uses
+`generationConfig.customHeaders`, Goose uses a declarative provider's `headers`,
+Hermes uses provider `extra_headers`, and Kimi uses provider `custom_headers`.
+Their `with_*_ci_request_tags` helpers preserve existing configuration and add
+tags only to gateway entries. CI must call these helpers when preparing the
+vendor files and select those files for both native and headless launches;
+exporting context alone does not configure these standalone clients. Vendor
+schema and local configuration tests do not replace live client validation.
+
+### Runtime scope and failure behavior
+
+The OpenAI SDK merges `default_headers` into its existing headers. Attribution
+adds only `Databricks-Ai-Gateway-Request-Tags` to opted-in Databricks AI Gateway
+clients; it does not replace authentication, content headers, retries, or the
+HTTP transport. Disabled attribution and other destinations receive no new
+headers. A transport test exercises the real SDK and checks the request URL,
+JSON body, authentication, and default headers against an untagged client.
+
+Malformed context, missing pipeline identity, or tags exceeding the 4 KiB CI
+header budget produce a warning and skip attribution instead of blocking model
+calls or child launches. CI setup should call `ci_request_tags(strict=True)` to
+catch configuration errors early. Existing request tags that cannot be safely
+merged are preserved unchanged. CI fields take precedence over same-named tags.
+
+Attribution is explicit process configuration, including outside GitHub Actions.
+Client headers capture it at construction: do not reuse one configured client
+or daemon across unrelated pipeline contexts. Gateway-side policy rejection or
+future SDK changes remain possible; check both workflow health and untagged usage
+when rolling this out.
+
+Native Anthropic clients use the AI Gateway Anthropic route instead of the legacy
+serving route; chat clients use `mlflow/v1` and Responses clients use `codex/v1`.
+OCR receives the same tags through its `llm_extra_headers` action input,
 quoted to preserve JSON commas. Automatic reviews continue using trusted base
 code; OCR's default-branch dispatch requirement remains in effect.
 
@@ -37,8 +105,9 @@ the selected branch. After pushing the candidate branch, run:
 gh workflow run polly-review.yml --ref YOUR_BRANCH -f pr=YOUR_PR -F usage_probe=true
 ```
 
-This job sends two short, non-agent requests using the configured Anthropic and
-OpenAI model variables. It has read-only repository permissions, does not post a
+This job sends three short, non-agent requests over Anthropic Messages, OpenAI
+Responses, and MLflow Chat Completions using the configured model variables.
+It has read-only repository permissions, does not post a
 review, and prints response/request IDs, tags, and token usage without credentials.
 It validates the gateway header and route, including OCR's header encoding; it
 does not replace running the OCR action or testing Polly's child agents.

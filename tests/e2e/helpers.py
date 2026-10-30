@@ -20,6 +20,8 @@ import configparser
 from pathlib import Path
 from typing import Any
 
+from omnigent.databricks_ai_gateway import ci_gateway_base_url, ci_request_tags
+
 # Polling cadence for server-health and response-poll loops. 0.1s
 # was empirically the sweet spot — tighter feedback than the prior
 # 0.5s without measurable CPU cost on the e2e harness.
@@ -34,6 +36,19 @@ POLL_INTERVAL_S: float = 0.1
 HEALTH_TIMEOUT_S: float = 60.0
 
 _DATABRICKSCFG_PATH = Path.home() / ".databrickscfg"
+
+
+def model_base_url(host: str, protocol: str) -> str:
+    """Use the tagged gateway during CI; preserve local legacy routing otherwise."""
+    if ci_request_tags(strict=True):
+        return ci_gateway_base_url(host, protocol)
+    return host.rstrip("/") + "/serving-endpoints"
+
+
+def harness_model_base_url(host: str, harness: str) -> str:
+    """Select chat completions for the Databricks executor and Responses otherwise."""
+    protocol = "mlflow/v1" if harness == "databricks" else "codex/v1"
+    return model_base_url(host, protocol)
 
 
 def lookup_databricks_host(profile: str) -> str | None:

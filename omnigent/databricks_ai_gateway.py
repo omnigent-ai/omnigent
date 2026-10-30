@@ -12,6 +12,7 @@ so each harness names the coding agent and client surfaces the same way.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Mapping
 from typing import Final, TypeVar
@@ -102,6 +103,8 @@ CLIENT_SURFACES_HEADER: Final[str] = "Databricks-Custom-Client-Surfaces"
 REQUEST_TAGS_HEADER: Final[str] = "Databricks-Ai-Gateway-Request-Tags"
 CI_CONTEXT_ENV: Final[str] = "OMNIGENT_CI_CONTEXT"
 _HeaderValue = TypeVar("_HeaderValue")
+_MAX_CI_TAG_HEADER_LENGTH: Final[int] = 4096
+_logger = logging.getLogger(__name__)
 
 _CI_TAG_ENV: Final[dict[str, str]] = {
     "pipeline": "OMNIGENT_CI_PIPELINE",
@@ -116,22 +119,49 @@ _CI_TAG_ENV: Final[dict[str, str]] = {
 }
 
 
-def ci_request_tags(source: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Read opted-in CI attribution, including context inherited by child processes."""
-    env = os.environ if source is None else source
-    if context := env.get(CI_CONTEXT_ENV):
-        tags = json.loads(context)
-        if not isinstance(tags, dict) or not all(
-            isinstance(key, str) and isinstance(value, str) for key, value in tags.items()
-        ):
-            raise ValueError(f"{CI_CONTEXT_ENV} must contain a JSON string-to-string object")
-        return {key: value for key, value in tags.items() if key in _CI_TAG_ENV and value}
-    if not env.get("OMNIGENT_CI_PIPELINE"):
-        return {}
-    tags = {key: env[name] for key, name in _CI_TAG_ENV.items() if env.get(name)}
-    if workflow := tags.get("workflow"):
-        tags["workflow"] = workflow.split("@", 1)[0]
+def _decode_request_tags(value: str) -> dict[str, str]:
+    """Validate a bounded JSON string-to-string tag object."""
+    if len(value) > _MAX_CI_TAG_HEADER_LENGTH:
+        raise ValueError("Request tags exceed the CI header size budget")
+    tags = json.loads(value)
+    if not isinstance(tags, dict) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in tags.items()
+    ):
+        raise ValueError("Request tags must contain a JSON string-to-string object")
     return tags
+
+
+def ci_request_tags(
+    source: Mapping[str, str] | None = None, *, strict: bool = False
+) -> dict[str, str]:
+    """Read opted-in CI tags; invalid optional metadata cannot block model calls.
+
+    CI setup commands use ``strict=True`` to reject invalid attribution early.
+    """
+    env = os.environ if source is None else source
+    try:
+        if context := env.get(CI_CONTEXT_ENV):
+            tags = {
+                key: value
+                for key, value in _decode_request_tags(context).items()
+                if key in _CI_TAG_ENV and value
+            }
+        elif env.get("OMNIGENT_CI_PIPELINE"):
+            tags = {key: env[name] for key, name in _CI_TAG_ENV.items() if env.get(name)}
+        else:
+            return {}
+        if not tags.get("pipeline"):
+            raise ValueError("CI attribution requires a nonempty pipeline")
+        if workflow := tags.get("workflow"):
+            tags["workflow"] = workflow.split("@", 1)[0]
+        if len(json.dumps(tags, separators=(",", ":"))) > _MAX_CI_TAG_HEADER_LENGTH:
+            raise ValueError("Request tags exceed the CI header size budget")
+        return tags
+    except (ValueError, RecursionError) as exc:
+        if strict:
+            raise ValueError("Invalid CI request tags") from exc
+        _logger.warning("Ignoring invalid CI request tags; check OMNIGENT_CI_CONTEXT/PIPELINE")
+        return {}
 
 
 def with_ci_request_tags(headers: Mapping[str, _HeaderValue]) -> dict[str, _HeaderValue | str]:
@@ -141,17 +171,21 @@ def with_ci_request_tags(headers: Mapping[str, _HeaderValue]) -> dict[str, _Head
     if not tags:
         return merged
     existing_tags: dict[str, str] = {}
-    for name in list(merged):
-        if name.lower() != REQUEST_TAGS_HEADER.lower():
-            continue
-        value = merged.pop(name)
-        decoded = json.loads(value) if isinstance(value, str) else None
-        if not isinstance(decoded, dict) or not all(
-            isinstance(key, str) and isinstance(item, str) for key, item in decoded.items()
-        ):
-            raise ValueError(f"{REQUEST_TAGS_HEADER} must contain a JSON string-to-string object")
-        existing_tags.update(decoded)
-    merged[REQUEST_TAGS_HEADER] = json.dumps({**existing_tags, **tags}, separators=(",", ":"))
+    try:
+        for name in list(merged):
+            if name.lower() != REQUEST_TAGS_HEADER.lower():
+                continue
+            value = merged.pop(name)
+            if not isinstance(value, str):
+                raise ValueError("Request tag header must be a string")
+            existing_tags.update(_decode_request_tags(value))
+        encoded = json.dumps({**existing_tags, **tags}, separators=(",", ":"))
+        if len(encoded) > _MAX_CI_TAG_HEADER_LENGTH:
+            raise ValueError("Request tags exceed the CI header size budget")
+    except (ValueError, RecursionError):
+        _logger.warning("Skipping CI tags: existing request tags cannot be safely merged")
+        return dict(headers)
+    merged[REQUEST_TAGS_HEADER] = encoded
     return merged
 
 
@@ -163,7 +197,7 @@ def gateway_request_tag_headers(base_url: str | None) -> dict[str, str]:
 
 
 def ci_gateway_base_url(base_url: str, protocol: str) -> str:
-    """Resolve a CI Databricks URL to the gateway's Anthropic or Codex surface."""
+    """Resolve a CI Databricks URL to a supported gateway protocol surface."""
     parsed = urlparse(base_url)
     if (
         parsed.scheme != "https"
@@ -175,7 +209,7 @@ def ci_gateway_base_url(base_url: str, protocol: str) -> str:
         raise ValueError(
             "CI gateway URL must not contain credentials, query parameters, or fragments"
         )
-    if protocol not in {"anthropic", "codex/v1"}:
+    if protocol not in {"anthropic", "codex/v1", "mlflow/v1"}:
         raise ValueError("Unsupported CI gateway protocol")
     prefix = "" if DATABRICKS_AI_GATEWAY_LABEL in parsed.hostname.split(".") else "/ai-gateway"
     return f"https://{parsed.netloc}{prefix}/{protocol}"
@@ -243,6 +277,7 @@ def with_gateway_attribution_lines(
     lines = [custom_headers] if custom_headers else []
     attribution = gateway_attribution_headers(coding_agent, via_ug=via_ug)
     if REQUEST_TAGS_HEADER in attribution and custom_headers:
+        attribution.pop(REQUEST_TAGS_HEADER)
         lines = []
         tag_headers = {}
         for line in custom_headers.splitlines():

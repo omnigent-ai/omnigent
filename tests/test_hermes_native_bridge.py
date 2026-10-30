@@ -395,6 +395,56 @@ def test_write_policy_hook_config_merges_user_model(tmp_path, monkeypatch) -> No
     assert config["hooks_auto_accept"] is True
 
 
+@pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_ci_provider_headers_survive_hermes_policy_config(
+    tmp_path, monkeypatch, context, legacy
+) -> None:
+    """Native and headless policy setup share the provider-scoped header boundary."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+    from omnigent.harnesses.hermes_native.credentials import with_hermes_ci_request_tags
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if context is not None:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    gateway = {
+        "name": "databricks",
+        "base_url" if legacy else "api": "https://test.cloud.databricks.com/ai-gateway/codex/v1",
+        "key_env": "OPENAI_API_KEY",
+        "transport": "codex_responses",
+        "extra_headers": {"X-Existing": "kept", REQUEST_TAGS_HEADER: '{"team":"ci"}'},
+    }
+    external = {"name": "external", "base_url": "https://example.com/v1"}
+    key = "custom_providers" if legacy else "providers"
+    original = {
+        "model": {"default": "test-model", "provider": "custom:databricks"},
+        key: [gateway, external] if legacy else {"databricks": gateway, "external": external},
+    }
+    user_home = tmp_path / ".hermes"
+    user_home.mkdir()
+    # Explicit CI provider files also serve standalone headless runs without policy hooks.
+    (user_home / "config.yaml").write_text(json.dumps(with_hermes_ci_request_tags(original)))
+    (user_home / ".env").write_text("OPENAI_API_KEY=test-key\n")
+    monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path))
+    home = b.write_policy_hook_config(tmp_path / "bridge", "http://localhost:6767", "ci-test")
+    configured = json.loads((home / "config.yaml").read_text())
+    providers = configured[key]
+    provider = providers[0] if legacy else providers["databricks"]
+    assert (providers[1] if legacy else providers["external"]) == external
+    assert configured["model"] == original["model"]
+    assert provider["transport"] == "codex_responses"
+    assert provider["key_env"] == "OPENAI_API_KEY"
+    assert (home / ".env").read_text() == "OPENAI_API_KEY=test-key\n"
+    headers = provider["extra_headers"]
+    assert headers["X-Existing"] == "kept"
+    expected = {"team": "ci"}
+    if context and context != "invalid":
+        expected.update(json.loads(context))
+    assert json.loads(headers[REQUEST_TAGS_HEADER]) == expected
+    assert gateway["extra_headers"][REQUEST_TAGS_HEADER] == '{"team":"ci"}'
+
+
 def test_read_hermes_home_returns_path_when_exists(tmp_path) -> None:
     (tmp_path / "hermes_home").mkdir()
     assert b.read_hermes_home(tmp_path) == tmp_path / "hermes_home"

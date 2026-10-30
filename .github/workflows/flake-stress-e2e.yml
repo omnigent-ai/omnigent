@@ -61,6 +61,7 @@ permissions:
   contents: read
 
 env:
+  OMNIGENT_CI_PIPELINE: flake-stress-e2e
   # No web SPA build during `uv sync`: this job never serves the bundle
   # and the build hits public npm with no registry mirror (mirrors e2e.yml).
   OMNIGENT_SKIP_WEB_UI: "true"
@@ -284,6 +285,15 @@ jobs:
           OMNIGENT_TEST_MODEL_SPREAD: "1"
           OMNIGENT_TEST_MODEL_POOL_GPT: ${{ vars.OMNIGENT_CI_E2E_MODEL_POOL_GPT }}
         run: |
+          uv run --no-sync python - <<'PY'
+          try:
+              from omnigent.databricks_ai_gateway import ci_request_tags
+          except ImportError:
+              print("::warning::Selected revision predates CI attribution; usage will be untagged.")
+          else:
+              if not ci_request_tags().get("pipeline"):
+                  raise ValueError("CI model requests require a valid pipeline")
+          PY
           mkdir -p artifacts "artifacts/basetemp-${{ matrix.attempt }}"
           # --junitxml emits per-test results eagerly so diagnostics survive a
           # wall-clock overrun (the summarize job parses these). --timeout=180

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tomllib
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from omnigent.harnesses.kimi_native.credentials import (
     KIMI_CODE_HOME_ENV_VAR,
     build_kimi_session_home,
     render_kimi_hooks_toml,
+    with_kimi_ci_request_tags,
 )
 
 
@@ -139,3 +141,68 @@ def test_build_session_home_without_user_home_writes_hooks_only(
 
     parsed = tomllib.loads((session_home / "config.toml").read_text(encoding="utf-8"))
     assert {h["event"] for h in parsed["hooks"]} == {"PreToolUse", "PermissionRequest"}
+
+
+@pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
+def test_ci_headers_survive_kimi_private_home(tmp_path, monkeypatch, context) -> None:
+    """Native config copying preserves CI headers and leaves non-gateway providers alone."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if context is not None:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    user_home = _fake_user_home(tmp_path, monkeypatch)
+    original = """default_model = "test"
+[providers.databricks]
+type = "openai_responses"
+base_url = "https://test.cloud.databricks.com/ai-gateway/codex/v1"
+api_key = "test-key"
+[providers.databricks.custom_headers]
+X-Existing = "kept"
+Databricks-Ai-Gateway-Request-Tags = '{"team":"ci"}'
+[providers.external]
+type = "openai_responses"
+base_url = "https://example.com/v1"
+[models.test]
+provider = "databricks"
+model = "test-model"
+max_context_size = 200000
+"""
+    # CI writes the same supported config consumed by the headless executor.
+    (user_home / "config.toml").write_text(with_kimi_ci_request_tags(original))
+    session_home = tmp_path / "session"
+    env = build_kimi_session_home(session_home, bridge_dir=tmp_path / "bridge")
+    configured = tomllib.loads((Path(env[KIMI_CODE_HOME_ENV_VAR]) / "config.toml").read_text())
+    provider = configured["providers"]["databricks"]
+    assert provider["api_key"] == "test-key"
+    assert provider["base_url"].endswith("/ai-gateway/codex/v1")
+    assert provider["custom_headers"]["X-Existing"] == "kept"
+    expected = {"team": "ci"}
+    if context and context != "invalid":
+        expected.update(json.loads(context))
+    assert json.loads(provider["custom_headers"][REQUEST_TAGS_HEADER]) == expected
+    assert configured["providers"]["external"] == tomllib.loads(original)["providers"]["external"]
+    assert configured["models"] == tomllib.loads(original)["models"]
+    assert len(configured["hooks"]) == 2
+    assert (session_home / "oauth").is_symlink()
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "not valid toml [",
+        """[providers.databricks]
+base_url = "https://test.cloud.databricks.com/ai-gateway/codex/v1"
+[models.external]
+provider = "databricks"
+base_url = "https://example.com/v1"
+""",
+        """[providers.legacy]
+base_url = "https://test.cloud.databricks.com/serving-endpoints"
+""",
+    ],
+)
+def test_kimi_does_not_tag_invalid_legacy_or_mixed_route_config(monkeypatch, config) -> None:
+    monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"repro-agent"}')
+    assert with_kimi_ci_request_tags(config) == config

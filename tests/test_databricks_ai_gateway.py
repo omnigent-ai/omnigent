@@ -58,10 +58,54 @@ def test_ci_context_is_opted_in_and_contains_only_known_fields() -> None:
     assert ci_request_tags(source) == {}
 
 
-@pytest.mark.parametrize("context", ["[]", '{"run_id":123}', '{"pipeline":null}'])
-def test_invalid_ci_context_is_rejected(context: str) -> None:
-    with pytest.raises(ValueError, match="string-to-string"):
-        ci_request_tags({CI_CONTEXT_ENV: context})
+@pytest.mark.parametrize(
+    "context",
+    [
+        "not-json",
+        "[]",
+        '{"run_id":123}',
+        '{"pipeline":null}',
+        '{"run_id":"123"}',
+        json.dumps({"pipeline": "x" * 4096}),
+        json.dumps({"pipeline": "\N{SNOWMAN}" * 700}, ensure_ascii=False),
+        "[" * 2000,
+    ],
+)
+def test_invalid_ci_context_does_not_block_model_or_child_setup(
+    monkeypatch, caplog, context: str
+) -> None:
+    from omnigent.inner.agent_env import clean_agent_env
+
+    monkeypatch.setenv(CI_CONTEXT_ENV, context)
+    assert ci_request_tags() == {}
+    assert gateway_request_tag_headers(_GW) == {}
+    assert clean_agent_env(source={CI_CONTEXT_ENV: context, "PATH": "/bin"}) == {"PATH": "/bin"}
+    assert "Ignoring invalid CI request tags" in caplog.text
+    with pytest.raises(ValueError, match="Invalid CI request tags"):
+        ci_request_tags(strict=True)
+
+
+def test_oversized_pipeline_is_ignored_or_rejected_at_ci_boundary() -> None:
+    source = {"OMNIGENT_CI_PIPELINE": "x" * 4096}
+    assert ci_request_tags(source) == {}
+    with pytest.raises(ValueError, match="Invalid CI request tags"):
+        ci_request_tags(source, strict=True)
+
+
+@pytest.mark.parametrize(
+    "existing", ["not-json", "[]", '{"team":123}', '{"team":"' + "x" * 4040 + '"}']
+)
+def test_unmergeable_existing_tags_are_preserved(monkeypatch, existing) -> None:
+    monkeypatch.setenv("OMNIGENT_CI_PIPELINE", "polly-review")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "example/project")
+    name = REQUEST_TAGS_HEADER.lower()
+    headers = with_gateway_attribution({name: existing, "X-Team": "tools"}, "codex", _GW)
+    assert headers[name] == existing
+    assert REQUEST_TAGS_HEADER not in headers
+    assert headers["X-Team"] == "tools"
+    lines = with_gateway_attribution_lines(f"{name}: {existing}\nX-Team: tools", "claude-code")
+    assert f"{name}: {existing}" in lines.splitlines()
+    assert sum(line.lower().startswith(name + ":") for line in lines.splitlines()) == 1
 
 
 def test_ci_tags_merge_with_existing_headers_and_survive_child_env(monkeypatch) -> None:
@@ -106,7 +150,53 @@ def test_ci_tags_merge_with_existing_headers_and_survive_child_env(monkeypatch) 
     )
 
 
-@pytest.mark.parametrize("protocol", ["anthropic", "codex/v1"])
+@pytest.mark.parametrize("protocol", ["responses", "chat"])
+@pytest.mark.parametrize("gateway,opted_in", [(True, True), (True, False), (False, True)])
+def test_sync_sdk_clients_send_only_opted_in_gateway_tags(
+    monkeypatch, protocol, gateway, opted_in
+) -> None:
+    import httpx
+
+    from omnigent.inner.databricks_executor import _get_openai_client as chat_client
+    from omnigent.inner.open_responses_sdk import _get_openai_client as responses_client
+
+    base_url = (
+        "https://dbc-1.cloud.databricks.com/ai-gateway/"
+        + ("mlflow/v1" if protocol == "chat" else "codex/v1")
+        if gateway
+        else "https://api.openai.com/v1"
+    )
+    monkeypatch.setenv("OPENAI_BASE_URL", base_url)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    if opted_in:
+        monkeypatch.setenv("OMNIGENT_CI_PIPELINE", "integration")
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer test-key"
+        assert request.headers["Content-Type"] == "application/json"
+        assert request.headers["User-Agent"].startswith("OpenAI/")
+        assert request.url.path.endswith(
+            "/chat/completions" if protocol == "chat" else "/responses"
+        )
+        assert json.loads(request.content)["model"] == "test-model"
+        assert (REQUEST_TAGS_HEADER in request.headers) == (gateway and opted_in)
+        if gateway and opted_in:
+            assert json.loads(request.headers[REQUEST_TAGS_HEADER])["pipeline"] == "integration"
+        return httpx.Response(200, json={"id": "reply", "output": [], "choices": []})
+
+    with chat_client() if protocol == "chat" else responses_client() as client:
+        with client.with_options(
+            http_client=httpx.Client(transport=httpx.MockTransport(receive))
+        ) as offline:
+            if protocol == "chat":
+                offline.chat.completions.create(
+                    model="test-model", messages=[{"role": "user", "content": "Hello"}]
+                )
+            else:
+                offline.responses.create(model="test-model", input="Hello")
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "codex/v1", "mlflow/v1"])
 @pytest.mark.parametrize(
     "suffix", ["", "/serving-endpoints", "/serving-endpoints/anthropic", "/ai-gateway/anthropic"]
 )
