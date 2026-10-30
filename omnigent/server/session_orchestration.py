@@ -102,7 +102,17 @@ def require_orchestration_source(
         )
     requester = tool_requester(request, source)
     if requester is not None and requester.delegation_policy == "no_edit_sharing":
-        if any(permissions.has_other_write_grants(session.id, user_id) for session in chain):
+        try:
+            has_other_writers = any(
+                permissions.has_other_write_grants(session.id, user_id) for session in chain
+            )
+        except NotImplementedError as exc:
+            raise OmnigentError(
+                "Delegation is unavailable: this permission store cannot verify edit sharing. "
+                "Implement PermissionStore.has_other_write_grants in the store adapter.",
+                code=ErrorCode.FORBIDDEN,
+            ) from exc
+        if has_other_writers:
             raise OmnigentError(
                 "This harness can delegate only while the sending session and its source chain "
                 "have no edit sharing. Read-only sharing is allowed.",

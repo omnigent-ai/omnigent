@@ -52,6 +52,9 @@ separate compatibility gap. Do not infer support from another harness's passing 
   The fallback requires the `ix_session_permissions_write_access` schema
   prerequisite: each session lookup reads at most two write grants through the
   permission-level index, independently of its read-only audience size.
+  Existing permission-store adapters still start without implementing
+  `has_other_write_grants`; the fallback refuses delegation with an actionable
+  error until that check is implemented. Requester-aware delegation is unaffected.
 - `scheduled`: scheduled runs, their forks and children use the new sends and
   independent creates like any private session their owner owns, so an
   automation can message the owner's other sessions or start workers. The

@@ -109,14 +109,15 @@ class PermissionStore(ABC):
         """
         ...
 
-    @abstractmethod
     def has_other_write_grants(self, conversation_id: str, owner_id: str) -> bool:
         """Check for any edit-or-higher grant belonging to someone other than the owner.
 
-        Includes public grants. The indexed lookup examines at most two write
-        grants, independently of the number of read-only grants on the session.
+        Includes public grants. Optional for existing store adapters; delegation
+        requiring this check is refused until the adapter implements it.
+
+        :raises NotImplementedError: When the adapter cannot verify write sharing.
         """
-        ...
+        raise NotImplementedError("This permission store cannot verify write sharing")
 
     @abstractmethod
     def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
