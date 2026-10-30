@@ -222,8 +222,6 @@ def test_android_chat_keeps_content_out_of_status_bar(
     """
     base_url, session_id = seeded_session
     status_bar_height = 48
-    # Status bar + server-switcher footprint (8px + 25px) + the 32px fade ramp.
-    fade_end = status_bar_height + 33 + 32
 
     page.emulate_media(color_scheme=color_scheme)
     page.set_viewport_size(viewport)
@@ -251,7 +249,20 @@ def test_android_chat_keeps_content_out_of_status_bar(
     )
 
     _assert_status_bar_blends(page, status_bar_height)
+    # Light glass blends with the canvas, so also check it reaches the screen top.
+    glass_top = page.locator("header.session-header-glass").evaluate(
+        "header => header.getBoundingClientRect().top"
+        " + parseFloat(getComputedStyle(header, '::before').top)"
+    )
+    assert glass_top <= 0, f"the header glass starts {glass_top}px below the screen top"
 
+    # Status bar + server-switcher footprint + the 32px fade ramp.
+    switcher_footprint = page.evaluate(
+        "() => ['margin', 'height'].reduce((total, part) => total + parseFloat("
+        "getComputedStyle(document.documentElement)"
+        ".getPropertyValue(`--omnigent-android-switcher-${part}`)), 0)"
+    )
+    fade_end = status_bar_height + int(switcher_footprint) + 32
     content = page.locator(".chat-conversation-content")
     page.evaluate(_PREPEND_MARKER, [content.element_handle(), 40])
     assert _marker_rows(page, 0, fade_end) == [], "at-rest transcript starts inside the top fade"
