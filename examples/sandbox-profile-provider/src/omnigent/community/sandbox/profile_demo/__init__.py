@@ -160,6 +160,7 @@ def contribution() -> SandboxProviderContribution:
                 name="controller_demo",
                 launcher_class="omnigent.community.sandbox.profile_demo.controller:ControllerSandboxLauncher",
                 config_model=ControllerConfig,
+                manages_profiles=True,
             ),
             "profile_demo": SandboxProviderMetadata(
                 name="profile_demo",
@@ -167,6 +168,7 @@ def contribution() -> SandboxProviderContribution:
                     "omnigent.community.sandbox.profile_demo:FileCatalogSandboxLauncher"
                 ),
                 config_model=CatalogConfig,
+                manages_profiles=True,
             ),
         },
     )

@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -54,6 +54,7 @@ def _sandbox_deployment(*, manages_profiles: bool = False) -> ManagedSandboxDepl
             server_url="https://test.example",
             token_ttl_s=100,
             launcher_factory=lambda: launcher,
+            manages_profiles=manages_profiles,
         )
     )
 
@@ -384,6 +385,8 @@ async def test_profile_schedules_are_rejected_before_persistence(
 
     _make_user(db_uri)
     deployment = _sandbox_deployment(manages_profiles=managed)
+    factory = Mock(side_effect=AssertionError("Schedule validation must not construct providers"))
+    deployment.default.launcher_factory = factory
     auth_app.state.sandbox_config = deployment
     auth_app.state.sandbox_profiles = (
         None
@@ -406,6 +409,7 @@ async def test_profile_schedules_are_rejected_before_persistence(
         del body["host_id"], body["workspace"]
         response = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
     assert response.status_code == (400 if managed else 200), response.text
+    factory.assert_not_called()
     if managed:
         assert "cannot select a profile yet" in response.text
         tasks = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()[

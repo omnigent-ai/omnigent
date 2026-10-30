@@ -5,6 +5,7 @@ from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import inspect
 
@@ -12,6 +13,8 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import parse_sandbox_config
+from omnigent.server.sandbox_profile_launch import prepare_profile
+from omnigent.server.schemas import SessionCreateRequest
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -60,6 +63,18 @@ async def test_disabled_profiles_do_not_read_catalog_or_wrap_admission(
         info = await client.get("/v1/info")
         assert info.status_code == 200
         assert info.json()["features"]["sandbox_profiles"] is False
+        factory = Mock(
+            side_effect=AssertionError("Profile preflight must not construct providers")
+        )
+        monkeypatch.setattr(app.state.sandbox_config.default, "launcher_factory", factory)
+        assert (
+            await prepare_profile(
+                Request({"type": "http", "app": app}),
+                SessionCreateRequest(agent_id=uuid4().hex, host_type="managed"),
+            )
+            is None
+        )
+        factory.assert_not_called()
         listing = await client.get("/v1/sandbox-profiles")
         assert listing.status_code == 200
         assert listing.json()["profiles"] == []

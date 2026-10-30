@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,7 @@ def admission_app(runtime_init: None, db_uri: str, tmp_path: Path, request):
                 server_url="https://test.example.com",
                 token_ttl_s=100,
                 launcher_factory=lambda: launcher,
+                manages_profiles=True,
             )
         ),
     )
@@ -148,11 +150,18 @@ def test_runner_admission_skips_deployments_without_profiles(admission_app, monk
 
     app, _hosts, conversations, _host_id, _profile = admission_app
     catalog = app.state.sandbox_profiles
-    monkeypatch.setattr(catalog, "managed_providers", list)
+    factory = Mock(side_effect=AssertionError("Capability checks must not construct providers"))
+    catalog._deployment = replace(
+        catalog._deployment,
+        configs=(
+            replace(catalog._deployment.default, manages_profiles=False, launcher_factory=factory),
+        ),
+    )
     touch = Mock(side_effect=AssertionError("Ordinary deployment must not change reconnects"))
     monkeypatch.setattr(conversations, "touch_profile_runner_liveness", touch)
     assert catalog.admit_runner_connection("unbound-ordinary-runner")
     touch.assert_not_called()
+    factory.assert_not_called()
 
 
 @pytest.mark.parametrize("binding", ["existing", "unbound", "transfer"])

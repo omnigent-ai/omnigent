@@ -187,7 +187,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
-from functools import cached_property, partial
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import click
@@ -722,6 +722,8 @@ class ManagedSandboxConfig:
         Supplies choices without selecting a default or provisioning a host.
         Raise :class:`NoReachableModels` when no model can serve the harness;
         the picker then blocks launch instead of offering Default.
+    :param manages_profiles: Static opt-in copied from plugin metadata. Embedding
+        deployments set it explicitly for launchers that require profile selection.
     """
 
     server_url: str
@@ -737,11 +739,7 @@ class ManagedSandboxConfig:
     )
     # Request-scoped reference; teardown must not depend on launch authorization.
     profile_selection: dict[str, Any] | None = None
-
-    @cached_property
-    def manages_profiles(self) -> bool:
-        """Static deployment capability; user authorization is always checked fresh."""
-        return bool(getattr(self.launcher_factory(), "manages_profiles", False))
+    manages_profiles: bool = False
 
 
 class NoReachableModels(Exception):
@@ -1681,6 +1679,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     validate_inference_credentials({}, model_discovery)
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
+    manages_profiles = False
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -1948,6 +1947,10 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         _parse_registry_config(provider, section)
         launcher_factory = _registry_launcher_factory(provider, section)
         token_ttl_s = _registry_token_ttl_s(provider)
+        from omnigent.onboarding.sandboxes import registry as sandbox_registry
+
+        metadata = sandbox_registry.get_provider_metadata(provider)
+        manages_profiles = metadata is not None and metadata.manages_profiles
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -1964,6 +1967,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         host_config=host_config,
         model_discovery=model_discovery,
         git_clone=git_clone,
+        manages_profiles=manages_profiles,
     )
 
 
@@ -3883,7 +3887,7 @@ async def launch_managed_host(
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
-    launcher = await asyncio.to_thread(build_owner_launcher, entry, config, owner)
+    launcher = build_owner_launcher(entry, config, owner)
     await _select_launch_profile(launcher, entry, owner)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
@@ -3966,7 +3970,7 @@ async def relaunch_managed_host(
         longer matches the configured launcher; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
-    launcher = await asyncio.to_thread(_launcher_for_teardown, host, config)
+    launcher = _launcher_for_teardown(host, config)
     if launcher is None:
         raise HTTPException(
             status_code=400,
@@ -4474,7 +4478,7 @@ async def resume_managed_host(
             return
         # Provider-matched launcher (None if config dropped / provider changed).
         # Non-resumable providers (e.g. Modal) fall through to a fresh relaunch.
-        launcher = await asyncio.to_thread(_launcher_for_teardown, host, config)
+        launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
             return
         # Agent-sandbox recreates its Pod and may lose HOME. Other resumable
@@ -4584,7 +4588,7 @@ async def terminate_managed_host(
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
         return
-    launcher = await asyncio.to_thread(_launcher_for_teardown, tombstone, config)
+    launcher = _launcher_for_teardown(tombstone, config)
     sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:
         if sandbox_id is not None:

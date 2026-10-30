@@ -58,8 +58,23 @@ This sketch omits the existing provisioning and cleanup methods. See the
 [complete HTTP adapter](../../examples/sandbox-profile-provider/src/omnigent/community/sandbox/profile_demo/controller.py)
 for configuration, credentials, request limits and lifecycle wiring.
 
-`manages_profiles` is a static deployment capability cached per provider config;
-restart server replicas after changing it. User authorization is never cached:
+Declare the same capability in the plugin's `SandboxProviderMetadata`:
+
+```python
+from omnigent.onboarding.sandboxes.registry import SandboxProviderMetadata
+
+SandboxProviderMetadata(
+    name="customer",
+    launcher_class="omnigent.community.sandbox.customer:CustomerLauncher",
+    manages_profiles=True,
+)
+```
+
+This default-false metadata lets Omnigent check support without importing or
+constructing a launcher. Embedding deployments that construct
+`ManagedSandboxConfig` directly also set `manages_profiles=True`. The launcher
+capability and metadata must agree; a mismatch rejects profile launches.
+Restart server replicas after changing the declaration. User authorization is never cached:
 resolution, admission and binding can each recheck it as a launch progresses.
 Implement bounded controller timeouts and make authorization calls idempotent.
 

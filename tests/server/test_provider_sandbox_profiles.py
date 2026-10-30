@@ -149,6 +149,7 @@ def catalog(db_uri: str, profiles: _Profiles) -> SandboxProfileCatalog:
             token_ttl_s=100,
             provider="company",
             launcher_factory=lambda: _Provider(profiles),
+            manages_profiles=True,
         )
     )
     return SandboxProfileCatalog(SqlAlchemyConversationStore(db_uri), deployment, hosts)
@@ -237,7 +238,12 @@ def test_unnamed_legacy_provider_keeps_default_launches(catalog: SandboxProfileC
     deployment = catalog._deployment
     assert deployment is not None
     catalog._deployment = ManagedSandboxDeployment.single(
-        replace(deployment.default, provider=None, launcher_factory=FakeSandboxLauncher)
+        replace(
+            deployment.default,
+            provider=None,
+            launcher_factory=FakeSandboxLauncher,
+            manages_profiles=False,
+        )
     )
     assert catalog.managed_providers() == []
     catalog.require_selection(None)
@@ -600,7 +606,7 @@ def test_ordinary_runner_binding_skips_profile_history_limits(catalog, monkeypat
     factory = Mock(side_effect=FakeSandboxLauncher)
     catalog._deployment = replace(
         deployment,
-        configs=(replace(deployment.default, launcher_factory=factory),),
+        configs=(replace(deployment.default, launcher_factory=factory, manages_profiles=False),),
     )
     store = catalog._store.conversations
     conversation = store.create_conversation()
@@ -615,7 +621,7 @@ def test_ordinary_runner_binding_skips_profile_history_limits(catalog, monkeypat
             user_id=_ALICE,
         )
     discovery.assert_not_called()
-    factory.assert_called_once()
+    factory.assert_not_called()
 
 
 @pytest.mark.parametrize("managed_host", [False, True])
@@ -645,6 +651,9 @@ def test_runner_binding_checks_only_its_host_after_unrelated_factory_failure(
     store = catalog._store.conversations
     store.create_conversation(host_id=host_id, workspace="/workspace", runner_id="runner")
     target = store.create_conversation()
+    # Reconnecting uses the saved binding even if a provider cannot construct.
+    assert catalog.admit_runner_connection("runner")
+    catalog._deployment.default.launcher_factory.assert_not_called()
 
     def bind():
         return catalog.reassign_runner(
@@ -675,6 +684,7 @@ def test_unrelated_provider_outage_does_not_block_default_launches(catalog, prof
                 deployment.default,
                 provider="ordinary",
                 launcher_factory=FakeSandboxLauncher,
+                manages_profiles=False,
             ),
             replace(
                 deployment.default,

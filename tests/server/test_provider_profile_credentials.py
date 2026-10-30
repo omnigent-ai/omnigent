@@ -122,6 +122,7 @@ def harness(db_uri: str) -> _Harness:
                 token_ttl_s=100,
                 provider="company",
                 launcher_factory=lambda: _CredentialProvider(credentials),
+                manages_profiles=True,
             ),
         ),
         owner_credentials={

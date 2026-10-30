@@ -114,7 +114,7 @@ class SandboxProfileCatalog:
                 continue
             if not entry.managed_launch_supported:
                 continue
-            if not provider_call(lambda entry=entry: entry.manages_profiles):
+            if not entry.manages_profiles:
                 continue
             if not entry.provider or not entry.provider.strip():
                 raise HTTPException(
@@ -301,7 +301,7 @@ class SandboxProfileCatalog:
                 if not self.managed_providers():
                     return False
             except HTTPException:
-                # Unknown capabilities still require the host-specific checks below.
+                # Invalid profile configuration still requires host-specific checks below.
                 pass
         host_ids = conversation_store.get_runner_host_ids(runner_id)
         if len(host_ids) > 1:

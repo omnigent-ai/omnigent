@@ -273,6 +273,7 @@ async def env(
             token_ttl_s=3600,
             provider=launcher.provider,
             launcher_factory=lambda: launcher(recording, hosts),
+            manages_profiles=True,
         )
     )
     app = create_app(

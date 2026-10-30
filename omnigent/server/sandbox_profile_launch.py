@@ -9,7 +9,6 @@ from typing import Any
 from fastapi import Request
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.provider_sandbox_profiles import provider_call
 from omnigent.stores import ConversationStore
 
 _logger = logging.getLogger(__name__)
@@ -42,11 +41,7 @@ async def prepare_profile(
                 if body.sandbox_provider
                 else deployment.default
             )
-            if (
-                entry is not None
-                and entry.managed_launch_supported
-                and await asyncio.to_thread(provider_call, lambda: entry.manages_profiles)
-            ):
+            if entry is not None and entry.managed_launch_supported and entry.manages_profiles:
                 raise OmnigentError(
                     "This provider requires sandbox profiles; enable the sandbox_profiles feature",
                     code=ErrorCode.INVALID_INPUT,

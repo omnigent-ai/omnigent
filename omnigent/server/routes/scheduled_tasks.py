@@ -379,11 +379,7 @@ def create_scheduled_tasks_router(
                     "managed sandboxes are not configured on this server",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            from omnigent.server.provider_sandbox_profiles import provider_call
-
-            if await asyncio.to_thread(
-                provider_call, lambda: sandbox_config.default.manages_profiles
-            ):
+            if sandbox_config.default.manages_profiles:
                 raise OmnigentError(
                     "Scheduled fresh sandboxes cannot select a profile yet; "
                     "use a connected host or a default provider without profiles",

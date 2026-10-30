@@ -962,7 +962,7 @@ class SandboxHostLauncher(SandboxLifecycle):
     """
 
     manages_profiles: ClassVar[bool] = False
-    """Whether the provider owns profile discovery, permissions, and configuration."""
+    """Own profile discovery, permissions, and configuration; mirror in registry metadata."""
 
     supports_sandbox_profile_lookup: ClassVar[bool] = False
     """Whether sandbox-scoped discovery returns the durable assigned revision."""
