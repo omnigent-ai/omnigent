@@ -17,6 +17,7 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
     ClaudeTranscriptItem,
+    record_hook_event,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 from tests.harnesses.claude_native.forwarder._support import (
@@ -769,6 +770,47 @@ async def test_relay_permission_mode_provenance_survives_delivery_failures(
     assert dedupe.posted_permission_mode == expected[-1][0]
 
 
+@pytest.mark.asyncio
+async def test_relay_permission_mode_ignores_an_observation_older_than_the_applied_one() -> None:
+    """
+    An older observation cannot revert a newer one that was already applied.
+
+    A hook record can be read after a newer pane capture has applied its mode.
+    Ordering by observation time keeps that stale mode from posting as a switch
+    back, while a genuinely later observation still counts as a switch.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept every POST and record its data."""
+        posts.append(json.loads(request.content.decode("utf-8"))["data"])
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _relay(mode: str, observed_at: float) -> None:
+            """Run one permission-mode relay pass observed at ``observed_at``."""
+            await forwarder._relay_permission_mode(
+                client,
+                session_id="conv_abc",
+                mode=mode,
+                dedupe=dedupe,
+                observed_at=observed_at,
+            )
+
+        await _relay("auto", 200.0)
+        # A hook record written before the applied switch is read late.
+        await _relay("default", 100.0)
+        assert posts == [{"permission_mode": "auto", "initial_observation": True}]
+        assert dedupe.observed_permission_mode == "auto"
+        assert dedupe.observed_permission_mode_at == 200.0
+
+        await _relay("default", 300.0)
+        assert posts[-1] == {"permission_mode": "default", "initial_observation": False}
+
+
 def _slash_command_item(*, name: str, arguments: str) -> ClaudeTranscriptItem:
     """
     Build a ``slash_command`` transcript item as the bridge emits it.
@@ -1042,3 +1084,299 @@ async def test_forward_pane_signals_throttles_capture(tmp_path: Path) -> None:
 
     assert reads == 1
     assert dedupe.pane_next_read > 0.0
+
+
+def _pin_parent_session(bridge_dir: Path) -> None:
+    """
+    Pin the parent session id the way the bridge does on SessionStart.
+
+    The forwarder treats a session id the bridge never pinned as a background
+    subagent process, so the parent's hook records need a pinned identity first.
+
+    :param bridge_dir: Bridge directory, e.g. ``tmp_path / "bridge"``.
+    :returns: None.
+    """
+    record_hook_event(
+        bridge_dir, {"hook_event_name": "SessionStart", "session_id": "parent-session"}
+    )
+
+
+def _parent_hook_payload(event_name: str, permission_mode: str) -> dict[str, str]:
+    """
+    Build a main-thread hook payload for the pinned parent session.
+
+    :param event_name: Claude hook event name, e.g. ``"PostToolUse"``.
+    :param permission_mode: Permission mode the hook fired under, e.g. ``"plan"``.
+    :returns: Hook stdin payload carrying the parent's session id.
+    """
+    return {
+        "hook_event_name": event_name,
+        "session_id": "parent-session",
+        "permission_mode": permission_mode,
+    }
+
+
+async def _poll_hook_then_pane(
+    client: httpx.AsyncClient,
+    bridge_dir: Path,
+    dedupe: forwarder._ForwardDedupeState,
+) -> None:
+    """
+    Run one forwarder poll's hook relay and footer relay, in loop order.
+
+    :param client: Client whose transport stands in for the Sessions API.
+    :param bridge_dir: Bridge directory holding ``hooks.jsonl``.
+    :param dedupe: Per-session dedupe state shared across polls.
+    :returns: None.
+    """
+    await forwarder._forward_hook_permission_mode(
+        client, session_id="conv_abc", bridge_dir=bridge_dir, dedupe=dedupe
+    )
+    await forwarder._forward_pane_signals(
+        client, session_id="conv_abc", bridge_dir=bridge_dir, dedupe=dedupe
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_permission_mode_relays_while_the_pane_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Hook records relay switches while every footer read comes back empty.
+
+    A record written before the first poll is not a live switch. Records that
+    land between polls relay only the newest, since a footer poll would not see
+    the modes in between either, and an unchanged mode is not re-posted.
+    """
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    monkeypatch.setattr(forwarder, "read_pane_signals", lambda _bridge_dir: PaneSignals())
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    _pin_parent_session(bridge_dir)
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept every POST and record its data."""
+        posts.append(json.loads(request.content.decode("utf-8"))["data"])
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        record_hook_event(bridge_dir, _parent_hook_payload("PostToolUse", "plan"))
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+        assert posts == []
+
+        record_hook_event(bridge_dir, _parent_hook_payload("UserPromptSubmit", "auto"))
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+        assert posts == [{"permission_mode": "auto", "initial_observation": True}]
+
+        record_hook_event(bridge_dir, _parent_hook_payload("PostToolUse", "acceptEdits"))
+        record_hook_event(bridge_dir, _parent_hook_payload("Stop", "plan"))
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+        assert posts[-1] == {"permission_mode": "plan", "initial_observation": False}
+
+        record_hook_event(bridge_dir, _parent_hook_payload("Stop", "plan"))
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+        assert len(posts) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "refusal", "paused"),
+    [
+        pytest.param("plan", 503, False, id="transient-failure"),
+        pytest.param("dontAsk", 400, True, id="rejected-until-the-pause"),
+    ],
+)
+async def test_hook_permission_mode_retries_a_refused_post_while_the_pane_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    refusal: int,
+    paused: bool,
+) -> None:
+    """
+    A hook-reported switch whose post is refused is posted by a later poll with no new record.
+
+    With the footer unreadable, no fresh observation arrives to carry the retry,
+    so the hook relay offers its last observation again. A mode the server
+    rejects stays quiet until the rejection pause passes. Once posted, polls are quiet.
+    """
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    monkeypatch.setattr(forwarder, "read_pane_signals", lambda _bridge_dir: PaneSignals())
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    _pin_parent_session(bridge_dir)
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+    refusals = [refusal]
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Refuse the first post of the switched-to mode; accept everything else."""
+        data = json.loads(request.content.decode("utf-8"))["data"]
+        posts.append(data)
+        if data["permission_mode"] == mode and refusals:
+            return httpx.Response(refusals.pop(), json={})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+        record_hook_event(bridge_dir, _parent_hook_payload("UserPromptSubmit", "auto"))
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+        record_hook_event(bridge_dir, _parent_hook_payload("PostToolUse", mode))
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+        assert dedupe.posted_permission_mode == "auto"
+
+        if paused:
+            await _poll_hook_then_pane(client, bridge_dir, dedupe)
+            assert len(posts) == 2
+            dedupe.rejected_permission_mode_retry_at = 0.0
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+        await _poll_hook_then_pane(client, bridge_dir, dedupe)
+
+    assert posts == [
+        {"permission_mode": "auto", "initial_observation": True},
+        {"permission_mode": mode, "initial_observation": False},
+        {"permission_mode": mode, "initial_observation": False},
+    ]
+    assert dedupe.posted_permission_mode == mode
+
+
+@pytest.mark.asyncio
+async def test_hook_permission_mode_does_not_revert_a_newer_pane_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A hook record written before a footer read cannot revert the mode it shows.
+
+    The footer is captured after the record was written, so the capture is the
+    newer observation and the late record is dropped rather than posted as a
+    switch back.
+    """
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    monkeypatch.setattr(
+        forwarder, "read_pane_signals", lambda _bridge_dir: PaneSignals(permission_mode="auto")
+    )
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    _pin_parent_session(bridge_dir)
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept every POST and record its data."""
+        posts.append(json.loads(request.content.decode("utf-8"))["data"])
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_hook_permission_mode(
+            client, session_id="conv_abc", bridge_dir=bridge_dir, dedupe=dedupe
+        )
+        record_hook_event(bridge_dir, _parent_hook_payload("PostToolUse", "default"))
+        await forwarder._forward_pane_signals(
+            client, session_id="conv_abc", bridge_dir=bridge_dir, dedupe=dedupe
+        )
+        await forwarder._forward_hook_permission_mode(
+            client, session_id="conv_abc", bridge_dir=bridge_dir, dedupe=dedupe
+        )
+
+    assert posts == [{"permission_mode": "auto", "initial_observation": True}]
+    assert dedupe.observed_permission_mode == "auto"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "timed"),
+    [
+        pytest.param(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "parent-session",
+                "permission_mode": "plan",
+                "agent_id": "a48",
+            },
+            True,
+            id="in-process-subagent",
+        ),
+        pytest.param(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "background-session",
+                "permission_mode": "plan",
+            },
+            True,
+            id="background-process",
+        ),
+        pytest.param(
+            {"hook_event_name": "Stop", "session_id": "parent-session"},
+            True,
+            id="no-mode",
+        ),
+        pytest.param(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "parent-session",
+                "permission_mode": "sideways",
+            },
+            True,
+            id="unknown-mode",
+        ),
+        pytest.param(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "parent-session",
+                "permission_mode": "plan",
+            },
+            False,
+            id="untimed",
+        ),
+    ],
+)
+async def test_hook_permission_mode_skips_records_it_cannot_attribute(
+    tmp_path: Path,
+    payload: dict[str, str],
+    timed: bool,
+) -> None:
+    """
+    A record that is not the parent's main thread, or cannot be ordered, posts nothing.
+
+    An in-process subagent shares the parent's session id and sets agent_id. A
+    background subagent process writes under a session id the bridge never
+    pinned. A payload can also omit the mode or name one the footer never shows,
+    and a record without a timestamp has no place in the observation order. The
+    record arrives after the first poll, so the skip is not start-of-run seeding.
+    """
+    bridge_dir = tmp_path / "bridge"
+    _pin_parent_session(bridge_dir)
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept every POST and record its data."""
+        posts.append(json.loads(request.content.decode("utf-8"))["data"])
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_hook_permission_mode(
+            client, session_id="conv_abc", bridge_dir=bridge_dir, dedupe=dedupe
+        )
+        envelope: dict[str, Any] = {"payload": payload}
+        if timed:
+            envelope["recorded_at"] = time.time()
+        with (bridge_dir / "hooks.jsonl").open("a", encoding="utf-8") as hooks:
+            hooks.write(json.dumps(envelope) + "\n")
+        await forwarder._forward_hook_permission_mode(
+            client, session_id="conv_abc", bridge_dir=bridge_dir, dedupe=dedupe
+        )
+
+    assert posts == []
+    assert dedupe.observed_permission_mode is None
