@@ -954,6 +954,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("queues a follow-up while the side chat runs and sends it when the turn ends", async () => {
+    writeAlwaysSteer(false);
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     expect(screen.queryByTestId("side-chat-send")).toBeNull();
@@ -983,6 +984,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("drains a queued follow-up after its side-chat tab unmounts", async () => {
+    writeAlwaysSteer(false);
     const view = renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Send after I switch tabs" } });
@@ -1002,6 +1004,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("edits, steers, and steers all queued follow-ups like the main composer", () => {
+    writeAlwaysSteer(false);
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     for (const text of ["first", "second", "third"]) {
@@ -1028,6 +1031,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("restores a queued follow-up's quote when it is edited", () => {
+    writeAlwaysSteer(false);
     useChatStore.setState({
       sideChatComposers: {
         [childId]: {
@@ -1056,6 +1060,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("queues /compact for a running Codex side chat with Always steer off", () => {
+    writeAlwaysSteer(false);
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "/compact" } });
