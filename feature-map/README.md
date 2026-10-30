@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Automations introduction](./automations-introduction.md) covers the first-visit
+  walkthrough, capability-dependent content, and browser-local dismissal.
+
 - [Pull request conversations](./pull-request-conversations.md) covers inline
   GitHub threads and replies through Workspace, composer, mobile and Canvas.
 

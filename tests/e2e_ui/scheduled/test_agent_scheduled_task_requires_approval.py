@@ -159,6 +159,9 @@ def _drive_gated_turn(
 
 def _open_task_row(page: Page, base_url: str, name: str):
     page.goto(f"{base_url}/tasks")
+    page.get_by_role("dialog", name="Introducing Automations").get_by_role(
+        "button", name="Maybe later"
+    ).click()
     row = page.locator(_TASK_ROW).filter(has_text=name)
     expect(row).to_be_visible(timeout=30_000)
     _hold(page)
