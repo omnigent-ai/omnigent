@@ -2871,7 +2871,11 @@ class HostProcess:
             source: str, session_id: str
         ) -> tuple[HostImportedLocalSession | None, str | None]:
             from omnigent.session_import.local import load_local_session
-            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+            from omnigent.session_import.models import (
+                ImportSource,
+                SessionImportNotFoundError,
+                import_item_payload,
+            )
 
             try:
                 local = load_local_session(cast(ImportSource, source), session_id)
@@ -2888,16 +2892,10 @@ class HostProcess:
                 HostImportedLocalSession(
                     external_session_id=local.external_session_id,
                     workspace=local.workspace,
-                    items=[
-                        {
-                            "type": item.type,
-                            "response_id": item.response_id,
-                            "data": item.data.model_dump(mode="json", exclude_none=True),
-                        }
-                        for item in local.items
-                    ],
+                    items=[import_item_payload(item) for item in local.items],
                     title=local.title,
                     source=local.source,
+                    archived=local.archived,
                 ),
                 None,
             )
@@ -3710,6 +3708,11 @@ class HostProcess:
                 error_code="invalid_workspace",
                 error=f"workspace path expansion failed: {exc}",
             )
+        params = frame.params or {}
+        # An absolute file target: root the reader at its parent and read the file by name.
+        if frame.op == "list_or_read" and not params.get("path") and os.path.isfile(expanded):
+            params = {**params, "path": os.path.basename(expanded)}
+            expanded = os.path.dirname(expanded)
         if not os.path.isdir(expanded):
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3731,7 +3734,6 @@ class HostProcess:
                     self._fs_readers.popitem(last=False)
             self._fs_readers.move_to_end(expanded)
             reader = cached[1]
-        params = frame.params or {}
         from omnigent.runner import pr_resource
 
         try:
@@ -3804,12 +3806,15 @@ class HostProcess:
             )
 
         try:
+            warnings: list[str] = []
+            skills = self._skill_discovery.discover(frame, root, warnings=warnings)
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                skills=self._skill_discovery.discover(frame, root),
+                skills=skills,
                 session_id=frame.session_id,
                 agent_id=frame.agent_id,
+                warnings=warnings,
             )
         except Exception as exc:
             _logger.exception(

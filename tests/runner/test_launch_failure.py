@@ -13,6 +13,7 @@ from omnigent.runner.launch_failure import (
     diagnose_client_update_required,
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
+    diagnose_codex_provider_auth_failure,
     diagnose_model_unavailable,
 )
 
@@ -31,6 +32,15 @@ _CLIENT_UPDATE_OUTPUT = (
     "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
     'desktop app, then try again."}'
 )
+
+# Codex's turn error when a custom model provider's token command fails its refresh.
+_PROVIDER_AUTH_OUTPUT = (
+    "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+    "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
+    "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools access "
+    "token. Run `isaac` to log in and try again."
+)
+_CODEX_LOGIN_HINT = "\n\nIf this looks like an auth issue, running `codex login` may help."
 
 
 def test_classifies_root_permission_failure() -> None:
@@ -315,6 +325,126 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "If this looks like an auth issue, running `codex login` may help."
     )
     assert classify_native_turn_error("codex_reauth_required", message) == "codex_reauth_required"
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("codex_turn_error", _PROVIDER_AUTH_OUTPUT),
+        ("codex_reauth_required", _PROVIDER_AUTH_OUTPUT + _CODEX_LOGIN_HINT),
+    ],
+)
+def test_classifies_codex_provider_auth_failure(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "codex_provider_auth_failed"
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "workspace_missing"])
+def test_provider_auth_text_does_not_override_other_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _PROVIDER_AUTH_OUTPUT) == code
+
+
+@pytest.mark.parametrize(
+    "message", [_PROVIDER_AUTH_OUTPUT, _PROVIDER_AUTH_OUTPUT + _CODEX_LOGIN_HINT]
+)
+def test_codex_provider_auth_diagnosis_names_the_command_to_sign_in(message: str) -> None:
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis == FailureDiagnosis(
+        title="Codex couldn't get a model provider token",
+        cause=(
+            "The model provider's token command `isaac` failed on the host: Error: Could not "
+            "get an AI DevTools access token. Run `isaac` to log in and try again."
+        ),
+        remediation="Run `isaac` on the host to sign in again, then send your message again.",
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "OSError: [Errno 28] No space left on device: '/tmp/token-helper-example'",
+        "OSError: [Errno 122] Disk quota exceeded: '/tmp/token-helper-example'",
+    ],
+)
+@pytest.mark.parametrize("hint", ["", _CODEX_LOGIN_HINT])
+def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, hint: str) -> None:
+    message = (
+        "provider auth command `isaac` exited with status exit status: 1: "
+        "Traceback (most recent call last):\n"
+        '  File "/opt/token-helper/bootstrap.py", line 10, in create_venv\n'
+        f"    tempfile.mkdtemp()\n{failure}{hint}"
+    )
+
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis == FailureDiagnosis(
+        title="Host storage is full",
+        cause=f"The model provider's token command `isaac` failed on the host: {failure}",
+        remediation=(
+            "Free space or inodes on the affected host filesystem, or raise its disk quota, "
+            "then send your message again."
+        ),
+        category=ErrorCategory.HOST,
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "cause", "remediation"),
+    [
+        (
+            "provider auth command `sh` exited with status exit status: 1: Error: not logged in\n",
+            "The model provider's token command failed on the host: Error: not logged in",
+            "Sign in to the model provider again on the host, then send your message again.",
+        ),
+        (
+            "provider auth command `/opt/bin/isaac` failed to start: "
+            "No such file or directory (os error 2)",
+            "The model provider's token command `/opt/bin/isaac` couldn't be started on the "
+            "host: No such file or directory (os error 2)",
+            "Check that `/opt/bin/isaac` is installed and on PATH on the host, then send your "
+            "message again.",
+        ),
+        (
+            "provider auth command `isaac` timed out after 5000ms",
+            "The model provider's token command `isaac` timed out on the host.",
+            "Run `isaac` on the host to sign in again, then send your message again.",
+        ),
+        (
+            "provider auth command `isaac` produced an empty token",
+            "The model provider's token command `isaac` returned no usable token.",
+            "Run `isaac` on the host to sign in again, then send your message again.",
+        ),
+    ],
+)
+def test_codex_provider_auth_diagnosis_covers_each_codex_outcome(
+    message: str, cause: str, remediation: str
+) -> None:
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis is not None
+    assert (diagnosis.cause, diagnosis.remediation) == (cause, remediation)
+
+
+def test_codex_provider_auth_diagnosis_fits_its_labels() -> None:
+    message = (
+        f"provider auth command `{'isaac' * 40}` exited with status exit status: 1: "
+        f"Error: {'token refresh failed ' * 30}"
+    )
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis is not None
+    for field in (diagnosis.title, diagnosis.cause, diagnosis.remediation):
+        assert field is not None
+        assert len(field) <= 256
+    assert diagnosis.cause.endswith("…")
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["", "401 Unauthorized: your login has expired.", "auth command `isaac` exited"],
+)
+def test_codex_provider_auth_diagnosis_ignores_unrelated_errors(message: str) -> None:
+    assert diagnose_codex_provider_auth_failure(message) is None
 
 
 @pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
@@ -678,6 +808,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
         ("codex_compaction_model_failed", "previous model"),
+        ("codex_provider_auth_failed", "model provider's sign-in command"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

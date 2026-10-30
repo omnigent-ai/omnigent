@@ -49,7 +49,9 @@ function finish(kind, token) {
         }
       }
       const temp = `${config.cachePath}.${process.pid}.tmp`;
-      fs.writeFileSync(temp, JSON.stringify({ token, cachedAt, expiresAt }), { mode: 0o600 });
+      fs.writeFileSync(temp, JSON.stringify({ token, cachedAt, expiresAt, cwd: process.cwd() }), {
+        mode: 0o600,
+      });
       fs.renameSync(temp, config.cachePath);
     }
     if (!refreshing) {
@@ -89,7 +91,12 @@ try {
   if (!refreshing && config.refreshIntervalMs > 0) {
     try {
       const cached = JSON.parse(fs.readFileSync(config.cachePath, "utf8"));
-      if (cached.expiresAt > Date.now() && typeof cached.token === "string" && cached.token.trim()) {
+      if (
+        cached.cwd === process.cwd() &&
+        cached.expiresAt > Date.now() &&
+        typeof cached.token === "string" &&
+        cached.token.trim()
+      ) {
         return finish("ok", cached.token);
       }
     } catch (_) {

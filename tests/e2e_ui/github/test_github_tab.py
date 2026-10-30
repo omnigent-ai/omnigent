@@ -195,11 +195,11 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
     expect(rail.get_by_role("listitem", name="Team platform: Pending")).to_be_visible()
 
-    # A host without tracking controls puts the provider beside the repo.
-    icon = rail.get_by_role("heading", name="GitHub", exact=True).bounding_box()
-    repository = rail.get_by_text("acme/app ·", exact=False).bounding_box()
-    assert icon is not None and repository is not None
-    assert abs(icon["y"] - repository["y"]) < 10
+    # The provider belongs to the request, so its glyph sits beside the title.
+    icon = rail.get_by_title("GitHub", exact=True).bounding_box()
+    title = rail.get_by_text("Add the GitHub tab").bounding_box()
+    assert icon is not None and title is not None
+    assert abs(icon["y"] - title["y"]) < 10
 
     # CI checks on their own line as labeled pills; a zero bucket shows nothing.
     expect(rail.get_by_text("Checks")).to_be_visible()
@@ -267,18 +267,21 @@ def test_pr_diff_retry_keeps_associations(
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
         page.get_by_test_id("composer-pr-link").click()
+    panel.get_by_role(
+        "button", name=f"example.com/acme/app #{_PR_NUMBER} — Add the GitHub tab", exact=True
+    ).click()
     panel.get_by_role("tablist", name="Pull request", exact=True).get_by_role(
         "tab", name="Changes", exact=True
     ).click()
     expect(panel.get_by_role("alert")).to_have_text("GitHub could not load the PR diff.")
-    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    expect(panel.get_by_role("button", name="All pull requests (2)")).to_be_visible()
     expect(panel.get_by_text("No changes vs base.")).to_have_count(0)
     page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-error.png"))
     failed = False
     panel.get_by_role("button", name="Refresh", exact=True).click()
     expect(panel.get_by_role("alert")).to_have_count(0)
     expect(panel.locator("diffs-container")).to_have_count(1)
-    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    expect(panel.get_by_role("button", name="All pull requests (2)")).to_be_visible()
     page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-recovered.png"))
 
 
@@ -418,6 +421,12 @@ def test_composer_pr_link_opens_github_tab(
             expect(panel.get_by_role("tab", name="Pull Requests")).to_have_attribute(
                 "aria-selected", "true"
             )
+        if pr_count > 1:
+            panel.get_by_role(
+                "button",
+                name=f"example.com/acme/app #{_PR_NUMBER} — Add the GitHub tab",
+                exact=True,
+            ).click()
         expect(panel.get_by_text("Add the GitHub tab", exact=True)).to_be_visible(timeout=30_000)
         expect(panel.get_by_label("Pull request status: Open")).to_be_visible()
         expect(
@@ -426,9 +435,7 @@ def test_composer_pr_link_opens_github_tab(
             )
         ).to_be_visible()
         if pr_count > 1:
-            expect(panel.get_by_role("combobox", name="Session pull request")).to_have_text(
-                f"example.com/acme/app #{_PR_NUMBER}"
-            )
+            expect(panel.get_by_role("button", name="All pull requests (2)")).to_be_visible()
     finally:
         page.screenshot(path=tmp_path / "composer-pr-link-after-click.png", animations="disabled")
 
