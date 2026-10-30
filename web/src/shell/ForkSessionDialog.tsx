@@ -95,9 +95,11 @@ import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferen
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import {
   MAX_SANDBOX_REPOS,
+  SANDBOX_WORKSPACE_LENGTH_MESSAGE,
   composeSandboxWorkspaces,
   isValidSandboxBranch,
   isValidSandboxRepoUrl,
+  isValidSandboxWorkspaceLength,
   splitSandboxWorkspace,
 } from "@/lib/sandboxRepositories";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
@@ -1162,7 +1164,8 @@ function SupportedForkSessionForm({
             return !editedSandboxReposRef.current.has(repo.url) &&
               live?.pushed &&
               live.branch &&
-              isValidSandboxBranch(live.branch)
+              isValidSandboxBranch(live.branch) &&
+              isValidSandboxWorkspaceLength(repo.url, live.branch)
               ? { ...repo, branch: live.branch }
               : repo;
           }),
@@ -1277,6 +1280,9 @@ function SupportedForkSessionForm({
           message: "Enter a repository URL like https://github.com/org/repo.",
         };
       }
+      if (sandboxRepos.some((repo) => !isValidSandboxWorkspaceLength(repo.url, repo.branch))) {
+        return { field: "sandboxRepo", message: SANDBOX_WORKSPACE_LENGTH_MESSAGE };
+      }
       if (unsupportedMultiRepoEdit) return { field: "sandboxRepo", message: multiRepoUpgradeHint };
       return sandboxRepos.every((repo) => isValidSandboxBranch(repo.branch))
         ? null
@@ -1311,10 +1317,15 @@ function SupportedForkSessionForm({
     showErrors && submitBlocker?.field === field ? submitBlocker.message : null;
   useEffect(() => {
     if (focusField === null) return;
-    const input = document.getElementById(FORK_FIELD_IDS[focusField]);
-    (input ?? document.getElementById("fork-session-repositories"))?.focus();
+    const section = document.getElementById("fork-session-repositories");
+    const invalid =
+      focusField === "sandboxRepo" && pendingRepoUrl.trim() === ""
+        ? section?.querySelector<HTMLElement>('[aria-invalid="true"]')
+        : null;
+    const input = invalid ?? document.getElementById(FORK_FIELD_IDS[focusField]);
+    (input ?? section)?.focus();
     setFocusField(null);
-  }, [focusField]);
+  }, [focusField, pendingRepoUrl]);
 
   // Conflict hint: other *connected* sessions already working in the picked
   // directory on this host (same wiring as NewChatDialog).

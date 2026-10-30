@@ -3268,9 +3268,12 @@ async def test_repository_branches_use_stored_launch_targets(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_available", [False, True])
+@pytest.mark.parametrize(
+    "source_state",
+    ["offline-host", "live-host", "old-runner", "old-host", "timeout", "unbound-runner"],
+)
 async def test_repository_branches_fall_back_without_waking_source(
-    app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, host_available: bool
+    app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, source_state: str
 ) -> None:
     from omnigent.server.managed_hosts import managed_repo_labels
     from omnigent.server.routes import _host_filesystem
@@ -3285,14 +3288,35 @@ async def test_repository_branches_fall_back_without_waking_source(
     monkeypatch.setattr(app.state.test_host_registry, "get", lambda _host_id: object())
     wake = Mock(side_effect=AssertionError("Branch suggestions must not wake the source"))
     monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
-    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+    runner = _FakeRunnerRouter(
+        _FakeRunnerClient(payload={"detail": "Not Found"}, status_code=404)
+        if source_state == "old-runner"
+        else _OfflineRunnerClient()  # type: ignore[arg-type]
+    )
+    if source_state == "unbound-runner":
+        monkeypatch.setattr(
+            runner,
+            "client_for_session_resources",
+            Mock(
+                side_effect=OmnigentError(
+                    "Session is not bound to a runner", code=ErrorCode.CONFLICT
+                )
+            ),
+        )
+    set_runner_router(runner)  # type: ignore[arg-type]
+    host_reads = []
 
     async def read(**kwargs):
+        host_reads.append(kwargs)
         assert kwargs["op"] == "repository_branches"
         assert kwargs["workspace"] == conversation.workspace
         assert kwargs["params"] == {"repositories": [{"url": url, "path": ""}]}
-        if not host_available:
+        if source_state == "offline-host":
             raise _host_filesystem.HostFsUnavailableError("offline")
+        if source_state == "old-host":
+            raise _host_filesystem.HostFsError(400, "invalid_request", "unknown fs op")
+        if source_state == "timeout":
+            raise TimeoutError("Repository branch lookup deadline expired")
         return {"repositories": [{"url": url, "branch": "feature", "pushed": False}]}
 
     monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
@@ -3302,11 +3326,12 @@ async def test_repository_branches_fall_back_without_waking_source(
         "repositories": [
             {
                 "url": url,
-                "branch": "feature" if host_available else None,
-                "pushed": False if host_available else None,
+                "branch": "feature" if source_state == "live-host" else None,
+                "pushed": False if source_state == "live-host" else None,
             }
         ]
     }
+    assert len(host_reads) == (0 if source_state in {"old-runner", "unbound-runner"} else 1)
     wake.assert_not_called()
 
 

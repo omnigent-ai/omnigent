@@ -106,6 +106,14 @@ describe("SandboxRepositoryPicker", () => {
       screen.getByText("Enter a valid branch name, or leave blank for the default branch."),
     ).toBeVisible();
     expect(onChange).not.toHaveBeenCalled();
+    const longBranch = "b".repeat(256);
+    fireEvent.change(screen.getByTestId("sandbox-repo-branch-search"), {
+      target: { value: longBranch },
+    });
+    expect(screen.queryByRole("option", { name: `Use “${longBranch}”` })).toBeNull();
+    expect(
+      screen.getByText("Repository URL and branch must be at most 256 characters together."),
+    ).toBeVisible();
     fireEvent.change(screen.getByTestId("sandbox-repo-branch-search"), {
       target: { value: "release/next" },
     });
@@ -228,6 +236,18 @@ describe("SandboxRepositoryPicker", () => {
     expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "https://git.example.com/org/my+repo" } });
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
+    expect(input).toHaveAccessibleDescription(
+      "Enter an HTTPS or SSH URL ending in a repository name.",
+    );
+    fireEvent.change(input, {
+      target: { value: `https://git.example.com/org/${"r".repeat(256)}` },
+    });
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
+    expect(input).toHaveAccessibleDescription(
+      "Repository URL and branch must be at most 256 characters together.",
+    );
     fireEvent.change(input, { target: { value: "https://git.example.com/org/repo" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onPendingUrlChange).toHaveBeenLastCalledWith("");
@@ -236,6 +256,11 @@ describe("SandboxRepositoryPicker", () => {
     expect(branchInput).toHaveAttribute("aria-invalid", "true");
     expect(branchInput).toHaveAccessibleDescription(
       "Enter a valid branch name, or leave blank for the default branch.",
+    );
+    fireEvent.change(branchInput, { target: { value: "b".repeat(256) } });
+    expect(branchInput).toHaveAttribute("aria-invalid", "true");
+    expect(branchInput).toHaveAccessibleDescription(
+      "Repository URL and branch must be at most 256 characters together.",
     );
     fireEvent.change(branchInput, {
       target: { value: "release" },

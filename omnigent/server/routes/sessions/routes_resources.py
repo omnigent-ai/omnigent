@@ -3558,6 +3558,7 @@ def register_resources_routes(
         except OmnigentError as exc:
             if exc.code not in {
                 ErrorCode.RUNNER_UNAVAILABLE,
+                ErrorCode.CONFLICT,
                 ErrorCode.NOT_FOUND,
                 ErrorCode.SESSION_AGENT_MISSING,
             }:

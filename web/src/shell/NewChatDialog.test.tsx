@@ -8706,6 +8706,14 @@ describe("NewChatLandingScreen", () => {
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
     const branchInput = await screen.findByRole("textbox", { name: "Branch for repo" });
     await waitFor(() => expect(branchInput).toHaveFocus());
+    fireEvent.change(branchInput, { target: { value: "b".repeat(256) } });
+    expect(submit).toBeDisabled();
+    expect(branchInput).toHaveAccessibleDescription(
+      "Repository URL and branch must be at most 256 characters together.",
+    );
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(branchInput).toHaveFocus();
     fireEvent.change(branchInput, { target: { value: "feature/valid" } });
     expect(submit).toBeEnabled();
   });

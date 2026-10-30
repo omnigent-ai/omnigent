@@ -2068,6 +2068,7 @@ describe("ForkSessionDialog", () => {
 
     it.each([
       { branch: "feature#draft", pushed: true, original: "#main", expected: "main", note: null },
+      { branch: "b".repeat(256), pushed: true, original: "#main", expected: "main", note: null },
       {
         branch: "feature/api",
         pushed: true,
@@ -2333,6 +2334,26 @@ describe("ForkSessionDialog", () => {
       expect(forkSessionMock).not.toHaveBeenCalled();
       expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
         "Enter a valid branch name",
+      );
+      const branchInput = screen.getByRole("textbox", { name: "Branch for api" });
+      expect(branchInput).toHaveFocus();
+      const pendingUrl = screen.getByTestId("fork-session-sandbox-repo-input");
+      fireEvent.change(pendingUrl, { target: { value: "https://github.com/org/tools" } });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(pendingUrl).toHaveFocus();
+      expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+        "Finish or clear the repository URL",
+      );
+      fireEvent.change(pendingUrl, { target: { value: "" } });
+      fireEvent.change(branchInput, { target: { value: "b".repeat(256) } });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(branchInput).toHaveFocus();
+      expect(branchInput).toHaveAccessibleDescription(
+        "Repository URL and branch must be at most 256 characters together.",
+      );
+      expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+        "Repository URL and branch must be at most 256 characters together.",
       );
       fireEvent.change(screen.getByRole("textbox", { name: "Branch for api" }), {
         target: { value: "feature/search" },

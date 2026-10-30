@@ -14,9 +14,11 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import {
+  SANDBOX_WORKSPACE_LENGTH_MESSAGE,
   deriveRepoName,
   isValidSandboxBranch,
   isValidSandboxRepoUrl,
+  isValidSandboxWorkspaceLength,
 } from "@/lib/sandboxRepositories";
 
 const INVALID_BRANCH_MESSAGE = "Enter a valid branch name, or leave blank for the default branch.";
@@ -98,6 +100,7 @@ function SandboxRepoCombobox({
 
 function SandboxRepoBranchSelect({
   repo,
+  url,
   value,
   onChange,
   enabled,
@@ -106,6 +109,7 @@ function SandboxRepoBranchSelect({
   invalid,
 }: {
   repo: GithubRepo;
+  url: string;
   value: string;
   onChange: (branch: string) => void;
   enabled: boolean;
@@ -127,9 +131,11 @@ function SandboxRepoBranchSelect({
   if (value !== "" && !options.includes(value)) options.unshift(value);
   const customBranch = search.trim();
   const invalidSearch = !isValidSandboxBranch(search);
+  const searchTooLong = !isValidSandboxWorkspaceLength(url, search);
   const showCustomBranch =
     customBranch !== "" &&
     !invalidSearch &&
+    !searchTooLong &&
     customBranch !== repo.default_branch &&
     !options.includes(customBranch);
   const chooseBranch = (branch: string): void => {
@@ -172,6 +178,9 @@ function SandboxRepoBranchSelect({
           {invalidSearch && (
             <p className="px-3 py-2 text-xs text-destructive">{INVALID_BRANCH_MESSAGE}</p>
           )}
+          {searchTooLong && (
+            <p className="px-3 py-2 text-xs text-destructive">{SANDBOX_WORKSPACE_LENGTH_MESSAGE}</p>
+          )}
           {isError && (
             <p className="px-3 py-2 text-xs text-muted-foreground">
               Couldn't load branches. Enter a branch name to use it.
@@ -192,6 +201,14 @@ function SandboxRepoBranchSelect({
                   key={branch}
                   value={branch}
                   data-checked={branch === value}
+                  disabled={
+                    !isValidSandboxBranch(branch) || !isValidSandboxWorkspaceLength(url, branch)
+                  }
+                  title={
+                    !isValidSandboxWorkspaceLength(url, branch)
+                      ? SANDBOX_WORKSPACE_LENGTH_MESSAGE
+                      : undefined
+                  }
                   onSelect={() => chooseBranch(branch)}
                 >
                   {branch === repo.default_branch ? `${branch} (pinned)` : branch}
@@ -257,10 +274,23 @@ export function SandboxRepositoryPicker({
     (repo) => !selectedUrls.has(repoIdentity(repoCloneUrl(repo))),
   );
   const duplicateUrl = inputUrl.trim() !== "" && selectedUrls.has(repoIdentity(inputUrl));
-  const invalidUrl = inputUrl.trim() !== "" && !isValidSandboxRepoUrl(inputUrl);
-  const canAdd = isValidSandboxRepoUrl(inputUrl) && !duplicateUrl && selections.length < maxRepos;
+  const urlError = (() => {
+    if (inputUrl.trim() === "") return null;
+    if (duplicateUrl) return "This repository is already selected. Clear this URL to continue.";
+    if (!isValidSandboxWorkspaceLength(inputUrl, "")) return SANDBOX_WORKSPACE_LENGTH_MESSAGE;
+    if (!isValidSandboxRepoUrl(inputUrl))
+      return "Enter an HTTPS or SSH URL ending in a repository name.";
+    return null;
+  })();
+  const canAdd = inputUrl.trim() !== "" && urlError === null && selections.length < maxRepos;
   const addRepo = (url: string): void => {
-    if (selections.length >= maxRepos || selectedUrls.has(repoIdentity(url))) return;
+    if (
+      selections.length >= maxRepos ||
+      selectedUrls.has(repoIdentity(url)) ||
+      !isValidSandboxRepoUrl(url) ||
+      !isValidSandboxWorkspaceLength(url, "")
+    )
+      return;
     onChange([...selections, { url: url.trim(), branch: "" }]);
   };
   const addInput = (): void => {
@@ -292,7 +322,13 @@ export function SandboxRepositoryPicker({
         );
         const name = repo?.full_name ?? deriveRepoName(selection.url) ?? selection.url;
         const invalidBranch = !isValidSandboxBranch(selection.branch);
-        const note = invalidBranch ? INVALID_BRANCH_MESSAGE : branchNotes?.[selection.url];
+        const workspaceTooLong = !isValidSandboxWorkspaceLength(selection.url, selection.branch);
+        const invalid = invalidBranch || workspaceTooLong;
+        const note = (() => {
+          if (invalidBranch) return INVALID_BRANCH_MESSAGE;
+          if (workspaceTooLong) return SANDBOX_WORKSPACE_LENGTH_MESSAGE;
+          return branchNotes?.[selection.url];
+        })();
         const descriptionId = note ? `${testIdPrefix}-branch-note-${index}` : undefined;
         return (
           <div
@@ -311,12 +347,13 @@ export function SandboxRepositoryPicker({
                 {repo ? (
                   <SandboxRepoBranchSelect
                     repo={repo}
+                    url={selection.url}
                     value={selection.branch}
                     onChange={(branch) => setBranch(index, branch)}
                     enabled={githubEnabled}
                     testIdPrefix={testIdPrefix}
                     descriptionId={descriptionId}
-                    invalid={invalidBranch}
+                    invalid={invalid}
                   />
                 ) : (
                   <input
@@ -326,7 +363,7 @@ export function SandboxRepositoryPicker({
                     placeholder="Default branch"
                     aria-label={`Branch for ${name}`}
                     aria-describedby={descriptionId}
-                    aria-invalid={invalidBranch || undefined}
+                    aria-invalid={invalid || undefined}
                     className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
                   />
                 )}
@@ -344,7 +381,7 @@ export function SandboxRepositoryPicker({
             {note && (
               <p
                 id={descriptionId}
-                className={`mt-1 text-xs break-words ${invalidBranch ? "text-destructive" : "text-muted-foreground"}`}
+                className={`mt-1 text-xs break-words ${invalid ? "text-destructive" : "text-muted-foreground"}`}
               >
                 {note}
               </p>
@@ -393,10 +430,8 @@ export function SandboxRepositoryPicker({
               }}
               placeholder="https://github.com/org/repo"
               aria-label="Repository URL"
-              aria-invalid={invalidUrl || duplicateUrl}
-              aria-describedby={
-                invalidUrl || duplicateUrl ? `${testIdPrefix}-input-error` : undefined
-              }
+              aria-invalid={urlError !== null}
+              aria-describedby={urlError ? `${testIdPrefix}-input-error` : undefined}
               className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
               data-testid={`${testIdPrefix}-input`}
             />
@@ -411,11 +446,9 @@ export function SandboxRepositoryPicker({
               Add
             </button>
           </div>
-          {(invalidUrl || duplicateUrl) && (
+          {urlError && (
             <p id={`${testIdPrefix}-input-error`} className="text-xs text-destructive">
-              {duplicateUrl
-                ? "This repository is already selected. Clear this URL to continue."
-                : "Enter an HTTPS or SSH repository URL."}
+              {urlError}
             </p>
           )}
         </>

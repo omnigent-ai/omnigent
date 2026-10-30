@@ -17,11 +17,25 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  * request as well.
  *
  * @param url Value the user typed in the repository input.
- * @returns true when ``url.trim()`` matches one of the two forms.
+ * @returns true when ``url.trim()`` has an accepted form and repository directory name.
  */
 export function isValidSandboxRepoUrl(url: string): boolean {
   const t = url.trim();
-  return /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
+  const validForm =
+    /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
+  const name = validForm ? deriveRepoName(t) : null;
+  return name !== null && name !== "." && name !== ".." && /^[A-Za-z0-9._-]+$/.test(name);
+}
+
+// Each composed repository is stored in a label capped by server LABEL_VALUE_MAX_LEN.
+export const MAX_SANDBOX_WORKSPACE_LENGTH = 256;
+export const SANDBOX_WORKSPACE_LENGTH_MESSAGE = `Repository URL and branch must be at most ${MAX_SANDBOX_WORKSPACE_LENGTH} characters together.`;
+
+/** Count Unicode code points to match the server's limit after input trimming. */
+export function isValidSandboxWorkspaceLength(url: string, branch: string): boolean {
+  return (
+    Array.from(composeSandboxWorkspace(url, branch) ?? "").length <= MAX_SANDBOX_WORKSPACE_LENGTH
+  );
 }
 
 /** Validate the trimmed branch sent to the server; blank selects the repository default. */

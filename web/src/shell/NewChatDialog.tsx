@@ -118,10 +118,12 @@ import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   MAX_SANDBOX_REPOS,
+  SANDBOX_WORKSPACE_LENGTH_MESSAGE,
   composeSandboxWorkspaces,
   deriveRepoName,
   isValidSandboxBranch,
   isValidSandboxRepoUrl,
+  isValidSandboxWorkspaceLength,
 } from "@/lib/sandboxRepositories";
 
 export {
@@ -4725,9 +4727,13 @@ export function NewChatLandingScreen() {
   const sandboxBranchesValid = sandboxRepoSelections.every((repo) =>
     isValidSandboxBranch(repo.branch),
   );
+  const sandboxWorkspaceLengthsValid = sandboxRepoSelections.every((repo) =>
+    isValidSandboxWorkspaceLength(repo.url, repo.branch),
+  );
   const sandboxRepoValid =
     sandboxRepoSelections.every((repo) => isValidSandboxRepoUrl(repo.url)) &&
     sandboxBranchesValid &&
+    sandboxWorkspaceLengthsValid &&
     !sandboxRepoOverCap &&
     !sandboxRepoPending;
 
@@ -5056,19 +5062,21 @@ export function NewChatLandingScreen() {
                 } — remove the extras`
               : sandboxSelected && sandboxRepoPending
                 ? "Finish or clear the repository URL before starting"
-                : sandboxSelected && !sandboxBranchesValid
-                  ? "Please enter a valid repository branch"
-                  : sandboxSelected && !sandboxRepoValid
-                    ? "Please enter a valid repository URL"
-                    : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                      ? "Selected host is unavailable. Reconnect it or choose another host."
-                      : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                        ? "Please choose a host and working directory"
-                        : configuredAgentUnavailable && selectedAgent == null
-                          ? "This project's configured agent is unavailable — pick an agent to continue"
-                          : message.trim().length === 0 && files.length === 0
-                            ? "Enter a message to get started"
-                            : null;
+                : sandboxSelected && !sandboxWorkspaceLengthsValid
+                  ? SANDBOX_WORKSPACE_LENGTH_MESSAGE
+                  : sandboxSelected && !sandboxBranchesValid
+                    ? "Please enter a valid repository branch"
+                    : sandboxSelected && !sandboxRepoValid
+                      ? "Please enter a valid repository URL"
+                      : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                        ? "Selected host is unavailable. Reconnect it or choose another host."
+                        : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                          ? "Please choose a host and working directory"
+                          : configuredAgentUnavailable && selectedAgent == null
+                            ? "This project's configured agent is unavailable — pick an agent to continue"
+                            : message.trim().length === 0 && files.length === 0
+                              ? "Enter a message to get started"
+                              : null;
   useLayoutEffect(() => {
     if (submitDisabledReason !== null) return;
     setSubmitTooltipState("closed");

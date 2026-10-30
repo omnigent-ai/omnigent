@@ -125,7 +125,9 @@ def _sandbox_source(chat: ChatSessionContract) -> list[dict[str, Any]]:
     def create_fork(request: Request) -> dict[str, Any]:
         body = request.post_data_json
         requests.append(body)
-        fork.update_session(labels={"omnigent.sandbox.repo": " ".join(body["workspaces"])})
+        fork.update_session(
+            labels={"omnigent.sandbox.repo": " ".join(body.get("workspaces") or [])}
+        )
         return {"id": _FORK_ID}
 
     contract.json(f"/v1/sessions/{chat.session_id}/fork", create_fork, method="POST")
