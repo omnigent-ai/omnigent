@@ -233,7 +233,9 @@ configuration error, rejected before session or schedule persistence.
 Older servers allowed editors to write `sandbox_profile:*`. A complete old label
 set is indistinguishable from a server-accepted reference, including when it names
 the correct owner. Provider reauthorization alone does not prove that owner chose
-the profile. Stop all older writers first and keep profiles disabled during this check.
+the profile. Every replica and other label writer must run a build that rejects
+the reserved prefix before this check begins; stop older writers and keep profiles
+disabled throughout the audit. Do not audit midway through a rolling upgrade.
 
 In the conversation database, inspect every workspace's `conversation_labels` in
 primary-key order `(workspace_id, conversation_id, key)`. Read at most 200 rows per

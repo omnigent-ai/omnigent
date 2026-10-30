@@ -614,6 +614,51 @@ def test_ordinary_runner_binding_skips_profile_history_limits(catalog, monkeypat
     factory.assert_called_once()
 
 
+@pytest.mark.parametrize("managed_host", [False, True])
+def test_runner_binding_checks_only_its_host_after_unrelated_factory_failure(
+    catalog, managed_host
+):
+    from unittest.mock import Mock
+
+    deployment = catalog._deployment
+    catalog._deployment = replace(
+        deployment,
+        configs=(replace(deployment.default, launcher_factory=Mock(side_effect=RuntimeError)),),
+    )
+    host_id = uuid.uuid4().hex
+    if managed_host:
+        catalog._host_store.register_managed_host(
+            host_id=host_id,
+            name="managed-host",
+            user_id=_ALICE,
+            token="test-token",
+            token_expires_at=2_000_000_000,
+            provider=deployment.default.provider,
+            sandbox_id="sandbox",
+        )
+    else:
+        catalog._host_store.upsert_on_connect(host_id, "ordinary-host", _ALICE)
+    store = catalog._store.conversations
+    store.create_conversation(host_id=host_id, workspace="/workspace", runner_id="runner")
+    target = store.create_conversation()
+
+    def bind():
+        return catalog.reassign_runner(
+            target,
+            "runner",
+            conversation_store=store,
+            host_store=catalog._host_store,
+            user_id=_ALICE,
+        )
+
+    if managed_host:
+        with pytest.raises(HTTPException) as unavailable:
+            bind()
+        assert unavailable.value.status_code == 503
+    else:
+        assert bind() is False
+
+
 def test_unrelated_provider_outage_does_not_block_default_launches(catalog, profiles):
     deployment = catalog._deployment
     assert deployment is not None

@@ -287,8 +287,13 @@ class SandboxProfileCatalog:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
             return True
         profile = self.get_session_snapshot(conversation.id)
-        if profile is None and not self.managed_providers():
-            return False
+        if profile is None:
+            try:
+                if not self.managed_providers():
+                    return False
+            except HTTPException:
+                # Unknown capabilities still require the host-specific checks below.
+                pass
         host_ids = conversation_store.get_runner_host_ids(runner_id)
         if len(host_ids) > 1:
             raise OmnigentError(

@@ -15,15 +15,18 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import FastAPI
 
 from omnigent.connections.databricks import DatabricksConnectionStore
 from omnigent.db.utils import now_epoch
 from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
+from omnigent.onboarding.sandboxes.profiles import ProviderSandboxProfile
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.connections_registry import blocking_owner_resolver, connection_providers
 from omnigent.server.databricks_app import DatabricksConfig, DatabricksTokenSet
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import build_owner_launcher, parse_sandbox_config
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -116,9 +119,25 @@ def _app(db_uri: str, tmp_path: Path, **kwargs: Any) -> FastAPI:
     )
 
 
+@pytest.mark.parametrize("profiles_enabled", [False, True])
 async def test_create_app_binds_owner_launchers_to_databricks_connect(
-    runtime_init: None, db_uri: str, tmp_path: Path
+    runtime_init: None, db_uri: str, tmp_path: Path, monkeypatch, profiles_enabled
 ) -> None:
+    profile = ProviderSandboxProfile(id="build", name="Build", revision="r1")
+    seen = []
+
+    def list_profiles(self, context):
+        seen.append((context.user_id, self._resolve_owner()))
+        return [profile]
+
+    def select_profile(self, context, selected):
+        assert selected == profile
+        seen.append((context.user_id, self._resolve_owner()))
+
+    if profiles_enabled:
+        monkeypatch.setattr(DatabricksSandboxLauncher, "manages_profiles", True)
+        monkeypatch.setattr(DatabricksSandboxLauncher, "list_profiles", list_profiles)
+        monkeypatch.setattr(DatabricksSandboxLauncher, "select_profile", select_profile)
     store = DatabricksConnectionStore(db_uri, _MemoryCipher())
     _connect(store, "alice@example.com", "alice-token", ttl_s=3600)
     app = _app(
@@ -128,6 +147,9 @@ async def test_create_app_binds_owner_launchers_to_databricks_connect(
             client_id="cid", client_secret="secret", redirect_uri=f"{_WS}/cb", scopes="all-apis"
         ),
         databricks_store=store,
+        feature_flags=resolve_feature_flags(
+            {"OMNIGENT_FEATURES": "sandbox_profiles" if profiles_enabled else "-sandbox_profiles"}
+        ),
     )
     deployment = app.state.sandbox_config
 
@@ -136,6 +158,16 @@ async def test_create_app_binds_owner_launchers_to_databricks_connect(
     assert isinstance(launcher, DatabricksSandboxLauncher)
     token, host = await asyncio.to_thread(launcher._resolve_owner)
     assert (token, host) == ("alice-token", _WS)
+    if profiles_enabled:
+        saved = await asyncio.to_thread(
+            app.state.sandbox_profiles.resolve, "build", user_id="alice@example.com"
+        )
+        assert saved["id"] == profile.id
+        assert saved["user_id"] == "alice@example.com"
+        assert len(seen) == 2
+        assert all(row == ("alice@example.com", ("alice-token", _WS)) for row in seen)
+    else:
+        assert app.state.sandbox_profiles is None
 
 
 async def test_create_app_without_databricks_connect_binds_nothing(
