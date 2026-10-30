@@ -504,6 +504,8 @@ export interface Session {
   }[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** Whether the connected runner supports settings on this native side chat. */
+  sideChatSettingsSupported?: boolean;
   /** A saved sandbox inference policy owns the model catalog. */
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
@@ -580,6 +582,13 @@ export interface SkillSummary {
   description: string;
   /** Frontmatter ``name`` label, e.g. ``"Triage Issues"``; absent from older servers. */
   display_name?: string | null;
+}
+
+/** A host's discovered catalog plus the sources it could not read. */
+export interface SkillsCatalog {
+  skills: SkillSummary[];
+  /** User-facing notes, e.g. a failed `codex plugin list`; empty when complete. */
+  warnings: string[];
 }
 
 export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";

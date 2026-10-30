@@ -28,6 +28,8 @@ record omissions rather than treating unselected checks as passed.
 | `images` | P1 | A supported image reaches the model and its reply uses the image; unsupported inputs are rejected without losing the draft. |
 | `fork` | P1 | A supported fork uses copied history on its first turn and remains separate from its parent. |
 | `mcp` | P1 | A configured, supported Omnigent MCP connection can call a harmless tool and show its result. |
+| `user-resources` | P1 | Supported user skills, extensions, prompts and packages remain available after launch/resume; relative paths, disabled resources and owner context controls retain their meaning. |
+| `interactive-input` | P1 | Supported questions and editor dialogs preserve literal/empty answers, settle cancellation, and allow a later turn to complete. |
 
 ## How to get to it (user POV)
 
@@ -69,6 +71,39 @@ consumers of shared code. A capability declaration selects relevant checks; it
 does not prove behavior. Missing credentials or an unobservable transport are
 blocked/missing evidence, not reasons to mark a supported feature N/A.
 
+### Compare harnesses by user journey
+
+Keep a dated comparison with the project's evidence, using one column per
+harness and separate SDK/native rows when their behavior differs. Start with
+Claude, Codex and Pi using the existing declared matrix:
+
+```sh
+uv run --no-sync python -m tests.harness_bench --no-live --markdown \
+  --harness claude-sdk --harness claude-native \
+  --harness codex --harness codex-native --harness pi --harness pi-native
+```
+
+Omit the harness filters to include every official bench profile. Read the
+[capability registry](../omnigent/harness_plugins.py) and owning recipes for
+axes the bench does not measure, such as model families, resources, native
+child discovery and startup settings. Do not duplicate the registry as a
+second maintained capability matrix here.
+
+Each comparison cell needs two independent statements:
+
+| Dimension | What to record |
+| --- | --- |
+| Product behavior | Implemented, limited, known gap, or not established; name the surface and provider/version limits. |
+| Verification | Declaration/source review, mapped test, or observed pass/failure at a specific revision and transport. An unrun test is available coverage, not a pass. |
+
+Unknown declarations are not unsupported features. In particular, a generic
+elicitation flag does not describe every policy bridge or extension dialog;
+Omnigent subagent tools and vendor-child discovery are different journeys.
+Compare like-for-like observations before calling one harness more reliable.
+Keep OSS, live-gateway and Managed evidence separate. For a short CUJ table,
+include core turns, model/effort choice, history recovery, user resources,
+interactive input, native child visibility and remaining acceptance gaps.
+
 ### Existing coverage and gaps
 
 Bench dimensions below are reusable checks, not complete coverage of a row.
@@ -92,6 +127,8 @@ no harness-specific tests exist. No passing per-harness results are implied.
 | `images` | — | No shared probe. Attachment UI alone does not establish delivery to a real harness/model. |
 | `fork` | `fork_replay` | Copied-history use through server/runner; fork dialog, alternate targets and parent isolation need the Sessions recipe. |
 | `mcp` | `omnigent_mcp` | Read-only relay tool for supported natives; Settings inventory alone is not a tool-execution check. |
+| `user-resources` | — | Use the Pi resource recipes below and the native skill/plugin recipes. No shared cross-harness resource-loading probe; file linking alone does not prove runtime discovery or marketplace compatibility. |
+| `interactive-input` | — | `tests/e2e/test_pi_extension_ui_round_trip.py` drives SDK/native Pi through the approval API. The [native dialog recipe](./native-harnesses.md#driving-it-with-the-repro-environment) separately covers browser answers. No shared cross-harness dialog probe. |
 
 Start the tool/history/effort continuity work by extending compatible scenarios,
 not by copying their server/runner setup:
@@ -106,6 +143,43 @@ in the existing drivers/[primitives](../tests/_helpers/README.md). Keep input
 matrices at the lowest reliable layer; retain browser/process cases for distinct
 boundaries. Do not move or replace working regression coverage just to fit the
 checklist.
+
+### Pi SDK large tool requests
+
+For the transport portion of `tool-history`, run
+`pytest tests/inner/test_pi_executor.py -k TestToolServer --reruns 0 -q`
+with Node installed. The
+generated bridge sends a request larger than 64 KiB, then another tool call in
+the same Node process. The oversized case checks the exact size-limit error,
+no rejected tool execution, redacted diagnostics, and a successful next call.
+Real TCP cases cover a sender still writing and bounded cleanup of truncated
+or stalled input. Rejection tests reduce the production 16 MiB request limit.
+
+These checks use the production generated extension and loopback server with
+a test tool executor and Pi registration stub. They do not launch Pi, exercise
+the server/runner or browser entry points, or establish later-turn model recall.
+Native Pi uses a separate tool path. To verify the SDK CLI/API journey, use a
+Pi custom agent with a harmless tool accepting a large string; send a request
+over 64 KiB but below 16 MiB, then one above the limit, and confirm another small
+tool call succeeds after each. The limit includes the serialized request
+envelope, not only its arguments.
+
+### Pi SDK compaction and restart (own environment)
+
+For `compaction`, `reload-resume` and `fork`, run
+`tests/e2e/test_pi_compact_restart_resume.py::test_pi_compacted_session_resumes_compacted_after_restart`.
+It drives the real Pi CLI through a server/runner with a scripted provider and
+a 32k context limit. After repeated compactions, restart both processes and
+continue the session, then fork it and continue the copy. Both outgoing requests
+must retain the summary and recent context, omit summarized turns and fit the
+window; the fork must leave its parent unchanged.
+
+This is an API/process check, not browser reload or live-provider acceptance.
+Existing sessions without a saved compaction checkpoint are not repaired by
+this recipe. After compaction, a failed streamed retry is aborted and drained
+to settlement before exporting context and evicting Pi; retry text is suppressed.
+If settlement or context export fails, the fallback retains only the summary
+and loses recent kept context. Component tests cover these failure paths separately.
 
 ### Pi SDK bundled resources (own environment)
 
@@ -129,6 +203,24 @@ Run the scoped `launch-reply` checks (own environments; real Pi, scripted provid
 uv run --no-sync pytest tests/e2e/omnigent/test_pi_bundle_extensions_cwd_e2e.py tests/e2e/omnigent/test_pi_bundle_project_resources_e2e.py tests/e2e/omnigent/test_pi_managed_extensions_e2e.py --reruns 0 -q
 ```
 
+
+### Pi user resources (own environments)
+
+For `user-resources`, `launch-reply` and `reload-resume`, configure Pi skills/extensions in the
+user agent root, with relative local-package paths and disabled-resource patterns.
+`tests/e2e/omnigent/test_pi_managed_extensions_e2e.py` drives SDK CLI startup with
+default and relative custom roots; inspect provider requests for loaded skills,
+package markers, excluded extensions, and unchanged SDK tool restrictions.
+`tests/e2e/omnigent/test_pi_context_files_e2e.py` checks that context/prompt controls
+and `skills: none` still apply. Native startup/resume is covered by
+`tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` through server/host/runner.
+A host custom root uses the existing explicit
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH=PI_CODING_AGENT_DIR` setting.
+
+These scenarios use real Pi with scripted providers or prompt-observer extensions;
+they do not establish marketplace compatibility, browser rendering, live MCP OAuth,
+OS sandbox or Managed deployment acceptance. Linked resources are shared writable
+files; global instruction files, model credentials and session state stay separate.
 
 ### Deterministic checks versus live canaries
 
