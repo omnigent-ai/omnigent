@@ -63,9 +63,10 @@ class UcodeWorkspaceState:
         :data:`omnigent.harnesses.claude_native.main._UCODE_CLAUDE_CUSTOM_TIER`) to the
         newer Sonnet generation, offered as an opt-in alongside the default
         ``"sonnet"`` tier, for workspaces that serve both side by side.
-    :param fable_enabled: Whether the user opted into ucode's premium Fable
-        family. Live refreshes preserve this policy instead of exposing Fable
-        merely because the workspace advertises it.
+    :param fable_enabled: Whether ucode exposes the premium Fable family: an
+        older ucode's explicit ``fable_enabled`` flag, otherwise whether model
+        discovery recorded a ``fable`` model. Live refreshes preserve this
+        policy instead of exposing Fable merely because the workspace advertises it.
     :param codex_models: Ordered list of Codex model ids available on this
         workspace, e.g. ``["databricks-gpt-5-5"]``.
     :param base_urls: Mapping of tool name to base URL,

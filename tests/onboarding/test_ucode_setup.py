@@ -319,10 +319,14 @@ def test_configure_ucode_for_workspace_keeps_global_scope_over_managed_settings(
     assert _configure_and_record() == [_GLOBAL_SCOPE_ARGV]
 
 
+@pytest.mark.parametrize("saved_user_scope", [False, True])
 def test_configure_ucode_for_workspace_managed_settings_failure_asks_for_administrator(
     tmp_path: Path,
+    saved_user_scope: bool,
 ) -> None:
     """A failed run over existing managed settings is not told to retry with ``--user``."""
+    if saved_user_scope:
+        (tmp_path / "state.json").write_text(json.dumps({"config_scope": "user"}))
     managed_path = tmp_path / "ClaudeCode" / "managed-settings.json"
     managed_path.parent.mkdir(parents=True)
     managed_path.write_text("{}")

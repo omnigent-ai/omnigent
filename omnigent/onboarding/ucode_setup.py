@@ -70,6 +70,9 @@ def build_ucode_configure_command(
 ) -> list[str]:
     """Build the ``ucode configure`` command Omnigent runs.
 
+    Fable needs no flag: ucode records it in ``claude_models`` when the
+    workspace serves it.
+
     :param ucode_command: Command prefix that invokes ucode, e.g.
         ``("/usr/bin/ucode",)`` or ``("uvx", "--from",
         "git+https://github.com/databricks/ucode@<sha>", "ucode")``.
@@ -178,10 +181,10 @@ def run_ucode_configure(
         f"`ucode configure` exited with code {result.returncode}; "
         "see the command output above for details."
     )
-    if not user_scope and _machine_managed_settings_exist(agents):
+    if _machine_managed_settings_exist(agents):
         message += (
-            " If it could not update the existing machine-wide managed settings, "
-            "ask an administrator to run setup; ucode does not allow --user while they exist."
+            " Machine-wide managed settings exist, so ucode does not allow --user; "
+            "if it could not update them, ask an administrator to run setup."
         )
     elif not user_scope:
         message += (
