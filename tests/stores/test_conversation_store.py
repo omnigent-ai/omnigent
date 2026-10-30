@@ -8449,6 +8449,47 @@ def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
     assert len(conversation_store.list_items(conv.id).data) == 1
 
 
+def test_append_probes_stable_ids_in_bounded_batches(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The idempotency probe binds at most one batch of stable ids per statement.
+
+    An import can carry more stable ids than one statement may bind, and a
+    re-post spanning several batches must still dedupe every persisted id.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "_APPEND_STABLE_ID_PROBE_BATCH", 2)
+    conv = conversation_store.create_conversation()
+
+    def item(n: int) -> NewConversationItem:
+        return NewConversationItem(
+            type="message",
+            response_id="resp_x",
+            data=MessageData(role="user", content=[{"type": "input_text", "text": f"m{n}"}]),
+            stable_id=f"{n:02x}" * 16,
+        )
+
+    conversation_store.append(conv.id, [item(n) for n in range(5)])
+    probe_params: list[int] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if "FROM conversation_items" in statement and " IN (" in statement:
+            probe_params.append(len(parameters))
+
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", capture)
+    try:
+        appended = conversation_store.append(conv.id, [item(n) for n in range(7)])
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", capture)
+
+    assert [i.deduplicated for i in appended] == [True] * 5 + [False] * 2
+    # Each probe binds the workspace and conversation ids plus at most two stable ids.
+    assert sorted(probe_params) == [3, 4, 4, 4]
+    assert len(conversation_store.list_items(conv.id).data) == 7
+
+
 # ── Connection-checkout budget ─────────────────────────
 
 

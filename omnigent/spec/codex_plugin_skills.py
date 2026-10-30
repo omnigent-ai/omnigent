@@ -45,46 +45,77 @@ def _skill_roots(root: Path, paths: object) -> list[Path]:
     return sorted(roots)
 
 
-def _inventory_plugins(codex_home: Path, cwd: Path | None) -> list[object] | None:
-    """Return the installed entries of ``codex plugin list --json``, or ``None`` if unreadable."""
-    from omnigent.inner.codex_executor import _find_codex_cli
+def _inventory_failure(exc: Exception) -> tuple[str, str]:
+    """Summarize a failed ``codex plugin list`` for the menu and keep its output for the log.
 
-    if (codex_path := _find_codex_cli()) is None:
-        _log.debug("Codex plugin inventory unavailable: codex CLI not found")
-        return None
-    try:
-        result = subprocess.run(
-            [codex_path, "plugin", "list", "--json"],
-            cwd=cwd or codex_home,
-            env={**os.environ, "CODEX_HOME": str(codex_home)},
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
+    Catalog warnings reach session editors, so the summary names only the
+    command and how it failed; stderr and exception text can carry host paths
+    and stay in the host log.
+    """
+    if isinstance(exc, subprocess.CalledProcessError):
+        return f"`codex plugin list` exited {exc.returncode}", " ".join(
+            str(exc.stderr or "").split()
         )
-        inventory = json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        _log.info("Codex plugin inventory unavailable: %s", exc)
-        return None
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"`codex plugin list` timed out after {exc.timeout:g}s", ""
+    if isinstance(exc, ValueError):
+        return "`codex plugin list` returned unreadable output", str(exc)
+    return "`codex plugin list` could not be run", str(exc)
+
+
+def _report_plugin_skills(message: str, detail: str, warnings: list[str] | None) -> None:
+    """Tell the host log and the caller's menu why plugin skills are missing."""
+    if detail:
+        _log.warning("%s: %s", message, detail)
+    else:
+        _log.warning("%s", message)
+    if warnings is not None:
+        warnings.append(f"{message}; see the host log for details." if detail else f"{message}.")
+
+
+def _without_inventory(summary: str, detail: str, warnings: list[str] | None) -> list[SkillSpec]:
+    """Omit plugin skills, telling the host log and the caller's menu why."""
+    _report_plugin_skills(f"Codex plugin skills unavailable: {summary}", detail, warnings)
+    return []
+
+
+def _inventory_plugins(codex_path: str, codex_home: Path, cwd: Path | None) -> list[object]:
+    """Return the installed entries of ``codex plugin list --json``.
+
+    :raises OSError, subprocess.SubprocessError, ValueError: The inventory is unreadable.
+    """
+    result = subprocess.run(
+        [codex_path, "plugin", "list", "--json"],
+        cwd=cwd or codex_home,
+        env={**os.environ, "CODEX_HOME": str(codex_home)},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    inventory = json.loads(result.stdout)
     plugins = inventory.get("installed") if isinstance(inventory, dict) else None
-    return plugins if isinstance(plugins, list) else []
+    if not isinstance(plugins, list):
+        raise ValueError("inventory has no list of installed plugins")
+    return plugins
 
 
 def _loaded_plugin_skills(
-    codex_home: Path, skills_filter: str | list[str], cwd: Path | None
+    codex_path: str,
+    codex_home: Path,
+    skills_filter: str | list[str],
+    cwd: Path | None,
+    errors: list[str],
 ) -> list[SkillSpec]:
-    """Use Codex's effective configuration and version selection when inventory fails."""
-    from omnigent.inner.codex_executor import _find_codex_cli
+    """Use Codex's effective configuration and version selection when inventory fails.
 
-    if (codex_path := _find_codex_cli()) is None:
-        return []
+    Failures Codex reports while loading skills are appended to ``errors``.
+
+    :raises OSError, RuntimeError, TimeoutError, ValueError: Codex could not list its skills.
+    """
     from omnigent.harnesses.codex_native.skill_discovery import loaded_codex_skills
 
-    try:
-        skills = loaded_codex_skills(codex_path, codex_home, cwd or codex_home)
-    except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
-        _log.info("Codex loaded skills unavailable: %s", exc)
-        return []
+    skills = loaded_codex_skills(codex_path, codex_home, cwd or codex_home, errors=errors)
     cache = (codex_home / "plugins" / "cache").resolve()
     filter_names = set(skills_filter) if isinstance(skills_filter, list) else None
     out: list[SkillSpec] = []
@@ -110,17 +141,53 @@ def _loaded_plugin_skills(
 
 
 def discover_codex_plugin_skills(
-    codex_home: Path, skills_filter: str | list[str], *, cwd: Path | None = None
+    codex_home: Path,
+    skills_filter: str | list[str],
+    *,
+    cwd: Path | None = None,
+    warnings: list[str] | None = None,
 ) -> list[SkillSpec]:
-    """Ask Codex which plugin versions are installed, then parse their skills."""
+    """Ask Codex which plugin versions are installed, then parse their skills.
+
+    When the inventory cannot be read, Codex's loaded-skill catalog supplies
+    the plugin skills. When that fails too, plugin skills are omitted and, if
+    ``warnings`` is given, a user-facing explanation is appended to it so the
+    caller can show the catalog as incomplete rather than empty.
+    """
+    from omnigent.inner.codex_executor import _find_codex_cli
+
     if skills_filter == "none" or skills_filter == []:
         return []
     cache = codex_home / "plugins" / "cache"
     if not cache.is_dir():
         return []
-    plugins = _inventory_plugins(codex_home, cwd)
-    if plugins is None:
-        return _loaded_plugin_skills(codex_home, skills_filter, cwd)
+    if (codex_path := _find_codex_cli()) is None:
+        return _without_inventory("`codex` was not found on the host", "", warnings)
+    try:
+        plugins = _inventory_plugins(codex_path, codex_home, cwd)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        summary, detail = _inventory_failure(exc)
+        _log.info("Codex plugin inventory unavailable: %s", detail or summary)
+        catalog_errors: list[str] = []
+        try:
+            loaded = _loaded_plugin_skills(
+                codex_path, codex_home, skills_filter, cwd, catalog_errors
+            )
+        except (OSError, RuntimeError, TimeoutError, ValueError) as catalog_exc:
+            catalog_detail = str(catalog_exc) or type(catalog_exc).__name__
+            return _without_inventory(
+                f"{summary} and `codex app-server` could not list skills",
+                f"{detail}; {catalog_detail}" if detail else catalog_detail,
+                warnings,
+            )
+        if catalog_errors:
+            _report_plugin_skills(
+                f"Codex plugin skills may be incomplete: {summary} and "
+                "`codex app-server` reported errors loading skills",
+                "; ".join([detail, *catalog_errors] if detail else catalog_errors),
+                warnings,
+            )
+        return loaded
     filter_names = set(skills_filter) if isinstance(skills_filter, list) else None
     out: list[SkillSpec] = []
     for plugin in plugins:

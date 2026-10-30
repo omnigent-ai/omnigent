@@ -5162,11 +5162,12 @@ async def _execute_session_query_tool(
 
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
+        include_archived = args.get("include_archived") is True
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+            _session_list_filters(agent_name, include_archived),
         )
         if isinstance(window, str):
             return window
@@ -5175,6 +5176,7 @@ async def _execute_session_query_tool(
             conversation_id,
             server_client,
             agent_name,
+            include_archived=include_archived,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -6098,11 +6100,31 @@ def _project_agent_list(
     }
 
 
+def _session_list_filters(agent_name: object, include_archived: bool) -> _JsonObject:
+    """
+    The ``sys_session_list`` filters a continuation cursor is bound to.
+
+    ``include_archived`` is recorded only when set, so cursors issued before
+    the flag existed still match a call that omits it.
+
+    :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
+    :param include_archived: Whether archived sessions are listed.
+    :returns: The filter mapping, e.g. ``{"agent_name": None}``.
+    """
+    filters: _JsonObject = {
+        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None
+    }
+    if include_archived:
+        filters["include_archived"] = True
+    return filters
+
+
 async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
     *,
+    include_archived: bool = False,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6123,6 +6145,7 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
+    :param include_archived: Also list archived sessions in the global view.
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -6136,6 +6159,7 @@ async def _session_list_via_rest(
         else await _collect_global_sessions(
             server_client,
             agent_name,
+            include_archived=include_archived,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
         )
@@ -6146,7 +6170,7 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        filters=_session_list_filters(agent_name, include_archived),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -6398,6 +6422,7 @@ async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
     *,
+    include_archived: bool = False,
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
@@ -6416,6 +6441,8 @@ async def _collect_global_sessions(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
+    :param include_archived: Also return archived sessions, each marked
+        ``archived``.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
@@ -6423,6 +6450,8 @@ async def _collect_global_sessions(
     params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
+    if include_archived:
+        params["include_archived"] = "true"
     if after is not None:
         params["after"] = after
     try:
@@ -6456,6 +6485,8 @@ async def _collect_global_sessions(
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),
+                # Only an archive-inclusive listing can return archived rows.
+                **({"archived": r.get("archived") is True} if include_archived else {}),
             }
             for r in rows
         ],

@@ -41,6 +41,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import NativeCodingAgent
+from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -366,6 +367,22 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
         _SUBAGENT_STATUS_TYPE,
     }
 )
+
+
+# A host that confirmed the spawn has a runner process that may still be
+# booting (slow imports on a busy machine), so it earns a longer connect wait.
+_ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR = 2.0
+
+
+def _relaunch_connect_timeout_s(*, acknowledged: bool) -> float:
+    """Seconds a relaunch waits for its runner to connect.
+
+    :param acknowledged: Whether the host confirmed it spawned the runner.
+    :returns: The base relaunch budget (30 s), doubled for a confirmed spawn.
+    """
+    if acknowledged:
+        return _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S * _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR
+    return _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
 
 
 def _is_batchable_external_item(event: SessionEventInput) -> bool:
@@ -1139,6 +1156,20 @@ def register_events_routes(
             from omnigent.server.session_orchestration import orchestration_message
 
             body = orchestration_message(source.id, body.data.get("message"))
+        native_shell_authorized = False
+        if (
+            body.type == "message"
+            and shell_command_from_input(body.data.get("content")) is not None
+            and await asyncio.to_thread(
+                _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            == "codex-native"
+        ):
+            # Direct native shell bypasses tool policies, like the environment shell route.
+            await _require_access_and_level(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+            native_shell_authorized = True
         if body.type == "message" and _is_native_terminal_session(conv):
             _logger.info(
                 "Native input received before runner initialization",
@@ -1450,7 +1481,7 @@ def register_events_routes(
                 # Log and treat as DENY so the session doesn't hang on
                 # "working" forever. The full cause is logged for admins;
                 # the denial reason returned to (and streamed at) the client
-                # stays generic so the raw exception text isn't exposed.
+                # names only the exception class, never its message.
                 _logger.warning(
                     "Input policy evaluation failed for %s: %s",
                     session_id,
@@ -1459,7 +1490,10 @@ def register_events_routes(
                 )
                 _input_verdict = {
                     "verdict": "deny",
-                    "reason": "Denied by policy (policy evaluation error).",
+                    "reason": (
+                        "Denied by policy (policy evaluation error: "
+                        f"{type(_policy_exc).__name__})."
+                    ),
                 }
             if _input_verdict is not None:
                 # DENY or ASK — don't forward to runner. Publish a
@@ -2991,9 +3025,12 @@ def register_events_routes(
                 and relaunched_runner_id is not None
                 and not relaunched_launch_refused
             ):
+                relaunch_connect_timeout_s = _relaunch_connect_timeout_s(
+                    acknowledged=relaunched_launch_acknowledged
+                )
                 _logger.info(
                     "Waiting up to %.0fs for host %s to spawn a runner for session %s",
-                    _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    relaunch_connect_timeout_s,
                     conv.host_id,
                     session_id,
                 )
@@ -3003,7 +3040,7 @@ def register_events_routes(
                     runner_router,
                     _tunnel_registry,
                     runner_id=relaunched_runner_id,
-                    timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    timeout_s=relaunch_connect_timeout_s,
                     runner_exit_reports=runner_exit_reports,
                     host_conn=_host_conn,
                     host_registry=_host_reg,
@@ -3214,7 +3251,7 @@ def register_events_routes(
                     event_name = "runner_never_connected"
                     launch_detail = (
                         "it never connected to the server within "
-                        f"{_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S:.0f}s — the "
+                        f"{_relaunch_connect_timeout_s(acknowledged=True):.0f}s — the "
                         "runner process may be hung or unable to reach the "
                         "server. Check the runner log on the host."
                     )
@@ -3428,6 +3465,7 @@ def register_events_routes(
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
             created_by=created_by,
+            native_shell_authorized=native_shell_authorized,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
             agent_revision=mcp_selection_revision(_agent.bundle_location, conv.labels)
