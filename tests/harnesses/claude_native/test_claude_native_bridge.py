@@ -10109,6 +10109,11 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
         # 46-char title on a browser terminal only 50 columns wide.
         "── " + "t" * 75 + " ─",
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+        # A title too long for the row leaves no leading run: Claude Code
+        # truncates it and draws the padded label from the first column, then
+        # one or two glyphs. The first comes off a 42-column pane after /rename.
+        " Investigate the flaky billing webhook … ─",
+        " " + "t" * 38 + " ──",
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -10133,11 +10138,72 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "│   │   │",  # deeper nesting, same shape
         "│   ├── src",  # a ``tree`` row
         "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+        # Only a label padded from the first column may stand in for the run.
+        "  " + "t" * 38 + "… ─",  # indented like a transcript or draft row
+        "t" * 39 + "… ─",  # no padding space before the text
+        " " + "t" * 37 + " ───",  # more glyphs than Claude Code pads a label with
+        " a │ b row filling label … ─",  # a vertical glyph inside the label
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
     """Ordinary rows must not pass as a rule now that labels are allowed."""
     assert _is_box_rule(line) is False
+
+
+@pytest.mark.parametrize(
+    ("line", "start"),
+    [
+        ("─" * 40, 0),
+        ("  " + "─" * 40, 2),  # a rule typed into a draft, under the glyph
+        ("─" * 30 + " my session ─", 0),
+        (" Investigate the flaky billing webhook … ─", 0),  # padding, not indent
+    ],
+)
+def test_box_rule_start_reports_the_rule_column(line: str, start: int) -> None:
+    """A row-filling label's padding space belongs to the rule, so it starts at column 0."""
+    assert claude_native_bridge._box_rule_start(line) == start
+
+
+def test_claude_prompt_rendered_sees_prompt_under_row_filling_title() -> None:
+    """
+    A title too long for the row does not hide the input box.
+
+    Claude Code then drops the glyph run left of the title, truncates the
+    title with ``…`` and starts the rule with the label's padding space.
+    Reading that row as text left no opening rule, so every message waited
+    out the readiness budget and the timeout reaped the live pane. Pane
+    shape is taken from Claude Code 2.1.312 at 42 columns after ``/rename``.
+    """
+    pane = "\n".join(
+        [
+            "  ⎿ Session renamed to: Investigate the",
+            "    flaky billing webhook retry backoff in",
+            "    the staging cluster",
+            "                      ◐ medium · /effort",
+            " Investigate the flaky billing webhook … ─",  # opening rule
+            "❯ ",
+            "─" * 42,  # closing rule
+            "  Opus 5.5 │ medium │ 0/1M $0.00",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_composer_box_reads_draft_under_row_filling_title() -> None:
+    """The rows between a row-filling title and the closing rule are the whole box."""
+    pane = "\n".join(
+        [
+            " Investigate the flaky billing webhook … ─",
+            "❯ fix the bug",
+            "  in foo.py",
+            "─" * 42,
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert claude_native_bridge._composer_box(pane) == claude_native_bridge._ComposerBox(
+        ["❯ fix the bug", "  in foo.py"], framed=True
+    )
 
 
 def test_claude_prompt_rendered_sees_prompt_over_pasted_tree_output() -> None:
