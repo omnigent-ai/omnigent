@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 PROFILE_LABEL_PREFIX = "sandbox_profile:"
 PROFILE_HOST_SESSION_LIMIT = 200
 _FIELDS = ("provider", "id", "revision", "user_id", "name")
+PROFILE_LABEL_KEYS = tuple(
+    PROFILE_LABEL_PREFIX + field for field in (*_FIELDS, "description:0", "description:1")
+)
 
 
 def reject_profile_labels(labels: Mapping[str, str]) -> None:

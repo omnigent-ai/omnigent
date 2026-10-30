@@ -94,6 +94,54 @@ def test_reference_survives_restart_without_schema_changes(store):
         assert profiles.get_session_snapshot(session.id) is None
 
 
+def test_profile_binding_queries_stay_bounded_with_many_unrelated_labels(store):
+    from uuid import uuid4
+
+    from sqlalchemy import event
+
+    labels = {f"customer:{index}": "value" for index in range(1000)}
+    conversation = store.create_conversation(labels=labels)
+    host_id = uuid4().hex
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if "conversation_labels" in statement and statement.lstrip().upper().startswith(
+            ("SELECT", "DELETE")
+        ):
+            queries.append((statement, parameters))
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture)
+    try:
+        before = store.get_profile_host_binding(conversation.id)
+        previous = store.bind_profiled_host(
+            conversation.id, host_id, "/workspace", PROFILE, runner_id="attempt"
+        )
+        assert previous == before
+        assert store.get_profile_host_binding(conversation.id).profile_snapshot is not None
+        with pytest.raises(ValueError, match="cannot be changed"):
+            store.accept_sandbox_profile(conversation.id, {**PROFILE, "revision": "v2"})
+        assert store.rollback_profiled_host(
+            previous, expected_host_id=host_id, expected_runner_id="attempt"
+        )
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture)
+
+    assert queries
+    with store._conv_engine.connect() as connection:
+        for statement, parameters in queries:
+            if statement.lstrip().upper().startswith("SELECT"):
+                assert len(connection.exec_driver_sql(statement, parameters).all()) <= 7
+            if store._conv_engine.dialect.name == "sqlite":
+                plan = str(
+                    connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+                )
+                assert "key=?" in plan and "SCAN" not in plan
+    current = store.get_conversation(conversation.id)
+    assert current.host_id is None and current.runner_id is None
+    expected = labels if store._conv_engine is store._engine else labels | profile_labels(PROFILE)
+    assert current.labels == expected
+
+
 @pytest.mark.parametrize("operation", ["create", "set", "delete", "fork_extra"])
 def test_generic_label_writers_cannot_forge_or_clear_a_profile(store, operation):
     session = store.create_conversation()

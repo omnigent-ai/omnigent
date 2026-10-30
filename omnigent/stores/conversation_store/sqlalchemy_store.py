@@ -121,6 +121,7 @@ from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
 from omnigent.stores.sandbox_profile_store import (
+    PROFILE_LABEL_KEYS,
     PROFILE_LABEL_PREFIX,
     encode_snapshot,
     has_profile_reference,
@@ -607,9 +608,11 @@ def _dialect_upsert_labels(
 def _fetch_labels(
     session: Session,
     conversation_id: str,
+    *,
+    keys: tuple[str, ...] | None = None,
 ) -> dict[str, str]:
     """
-    Load all guardrails labels for a conversation.
+    Load guardrails labels for a conversation, optionally restricted to exact keys.
 
     Returns an empty dict when no labels have been written
     yet — a conversation that was created before its spec
@@ -622,16 +625,13 @@ def _fetch_labels(
         Empty dict when no rows match.
     """
     with query_name_scope("omnigent.conversation_store.select_conversation_labels"):
-        rows = (
-            session.execute(
-                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id == conversation_id,
-                )
-            )
-            .tuples()
-            .all()
+        statement = select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id == conversation_id,
         )
+        if keys is not None:
+            statement = statement.where(SqlConversationLabel.key.in_(keys))
+        rows = session.execute(statement).tuples().all()
     return dict(rows)
 
 
@@ -4315,7 +4315,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return meta
             if not clear_profile and meta.host_id is not None:
                 with self._profile_label_session(session, read_only=True) as labels:
-                    profiled = has_profile_reference(_fetch_labels(labels, conversation_id))
+                    profiled = has_profile_reference(
+                        _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
+                    )
                 host = session.get(SqlHost, (current_workspace_id(), meta.host_id))
                 if profiled and host is not None and host.deleted_at is None:
                     return meta
@@ -4416,7 +4418,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if row is None:
             raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
-        saved = profile_from_labels(_fetch_labels(session, conversation_id))
+        saved = profile_from_labels(
+            _fetch_labels(session, conversation_id, keys=PROFILE_LABEL_KEYS)
+        )
         if saved is not None:
             if not same_profile_identity(saved, snapshot):
                 raise ValueError("A session's sandbox profile cannot be changed")
@@ -4510,7 +4514,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def get_profile_host_binding(self, conversation_id: str) -> ProfileHostBinding:
         with self._conv_session("read_session_profile") as labels:
-            snapshot = profile_from_labels(_fetch_labels(labels, conversation_id))
+            snapshot = profile_from_labels(
+                _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
+            )
         with self._session("read_profile_host_binding") as session:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is None:
@@ -4543,7 +4549,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ):
                 raise ValueError("The session binding changed; retry the request")
             with self._profile_label_session(session) as labels:
-                saved = profile_from_labels(_fetch_labels(labels, conversation_id))
+                saved = profile_from_labels(
+                    _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
+                )
                 previous = self._profile_host_binding(meta, saved)
                 if expected_binding is not None and previous != expected_binding:
                     raise ValueError("The session binding changed; retry the request")
@@ -4591,9 +4599,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         delete(SqlConversationLabel).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),
                             SqlConversationLabel.conversation_id == previous.session_id,
-                            SqlConversationLabel.key.startswith(
-                                PROFILE_LABEL_PREFIX, autoescape=True
-                            ),
+                            SqlConversationLabel.key.in_(PROFILE_LABEL_KEYS),
                         )
                     )
             return True
@@ -4742,7 +4748,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if meta.host_id is not None and meta.host_id != host_id:
                 with self._profile_label_session(session, read_only=True) as labels:
-                    profiled = has_profile_reference(_fetch_labels(labels, conversation_id))
+                    profiled = has_profile_reference(
+                        _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
+                    )
                 if profiled and not self._can_bind_profile_host(session, meta.host_id, host_id):
                     raise ValueError("A profiled session cannot be moved to a different host")
             binding_changed = meta.host_id != host_id or (
