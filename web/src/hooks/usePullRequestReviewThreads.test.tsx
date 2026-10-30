@@ -199,8 +199,10 @@ it("keeps late pagination results with the original PR and isolates revisions an
       },
     },
   );
+  expect(result.current.isFetching).toBe(false);
   act(() => result.current.loadMore());
   await waitFor(() => expect(respond).toBeDefined());
+  await waitFor(() => expect(result.current.isFetching).toBe(true));
   rerender({ url: "other", account: "bob", revision: "new", page: undefined });
   await act(async () =>
     respond(
@@ -218,6 +220,7 @@ it("keeps late pagination results with the original PR and isolates revisions an
   rerender({ url: "pr", account: "alice", revision: "base:head", page: first });
   await waitFor(() => expect(result.current.page?.data).toHaveLength(2));
   expect(result.current.page?.has_more).toBe(false);
+  expect(result.current.isFetching).toBe(false);
 });
 
 it("fetches on opening Diff, polls only while active, and removes deleted comments after confirmation", async () => {

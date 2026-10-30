@@ -723,13 +723,18 @@ def test_reply_to_inline_review_conversation(
         "pr": {**_INFO["pr"], "head_sha": "head", "base_sha": "base"},
     }
     thread_reads = []
+    pending_reads: list[Route] = []
+    hold_threads = True
 
     def read_info(route: Route) -> None:
         route.fulfill(json=info)
 
     def read_threads(route: Route) -> None:
         thread_reads.append(route.request.url)
-        route.fulfill(json=threads)
+        if hold_threads:
+            pending_reads.append(route)
+        else:
+            route.fulfill(json=threads)
 
     posts = []
 
@@ -800,6 +805,20 @@ def test_reply_to_inline_review_conversation(
     ).click()
     tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
     tabs.get_by_role("tab", name="Changes", exact=False).click()
+    loading = panel.get_by_role("status").filter(has_text="Loading review threads")
+    expect(loading).to_be_visible()
+    layout_toggle = panel.get_by_role("button", name=re.compile(r"Switch to (split|unified) view"))
+    loading_box, toggle_box = loading.bounding_box(), layout_toggle.bounding_box()
+    assert loading_box and toggle_box
+    assert loading_box["y"] + loading_box["height"] / 2 == pytest.approx(
+        toggle_box["y"] + toggle_box["height"] / 2, abs=1
+    )
+    expect(loading.locator("svg")).to_have_class(re.compile("animate-spin"))
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-loading.png"))
+    hold_threads = False
+    pending_reads.pop().fulfill(json=threads)
+    expect(loading).to_have_count(0)
+    expect(panel.get_by_text(re.compile(r"^\d+\+? review conversations?$"))).to_have_count(0)
     conversation = panel.locator('[data-review-thread="thread-1"]')
     expect(conversation).to_be_visible()
     assert conversation.evaluate("element => !!element.closest('diffs-container')")
@@ -875,8 +894,15 @@ def test_reply_to_inline_review_conversation(
     conversation.get_by_role("button", name="Reply", exact=True).click()
     expect(conversation.locator("li")).to_have_count(2)
     expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
+    hold_threads = True
     panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(loading).to_be_visible()
     expect(conversation.locator("li")).to_have_count(2)
+    hold_threads = False
+    for pending in pending_reads:
+        pending.fulfill(json=threads)
+    pending_reads.clear()
+    expect(loading).to_have_count(0)
     expect(conversation.get_by_text("This handles empty input.", exact=True)).to_be_visible()
     assert posts == [{"pr_url": pr_url, "body": "**This handles empty input.**"}]
     assert thread_reads

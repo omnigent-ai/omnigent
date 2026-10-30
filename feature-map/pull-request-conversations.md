@@ -20,6 +20,8 @@ request's Changes subtab. Top-level comments remain in Comments.
   unresolved navigation and original context for unplaceable conversations.
 - `thread-refresh`: Threads fetch separately and poll while Changes is open;
   other subtabs, the PR list and the collapsed rail stop requesting them.
+  A compact **Loading review threads** spinner beside the layout toggle indicates
+  an in-flight read. Conversation navigation shares the diff toolbar.
 
 ## How to get to it (user POV)
 

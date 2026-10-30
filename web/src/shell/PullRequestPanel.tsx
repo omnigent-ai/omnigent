@@ -2583,56 +2583,37 @@ function PullRequestPanelDetails({
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
             of all files' diffs. */}
         <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
-          {data.capabilities.review_threads && (
-            <div className="flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1 text-ui">
-              <span className="text-muted-foreground">
-                {reviews.page
-                  ? `${threads.length}${reviews.page.has_more ? "+" : ""} review conversation${threads.length === 1 && !reviews.page.has_more ? "" : "s"}`
-                  : info.isFetching
-                    ? "Loading conversations…"
-                    : "Review conversations unavailable. Refresh to retry."}
-              </span>
-              {unresolved.length > 0 && (
-                <>
-                  <IconButton
-                    label="Previous unresolved conversation"
-                    onClick={() => navigateThread(-1)}
+          {data.capabilities.review_threads &&
+            (reviews.page?.has_more ||
+              reviews.historyStale ||
+              reviews.page?.warning ||
+              reviews.error) && (
+              <div className="flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1 text-ui">
+                {reviews.page?.has_more && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={reviews.loadingMore}
+                    onClick={reviews.loadMore}
                   >
-                    <ChevronUpIcon className="size-4" />
-                  </IconButton>
-                  <IconButton
-                    label="Next unresolved conversation"
-                    onClick={() => navigateThread(1)}
-                  >
-                    <ChevronDownIcon className="size-4" />
-                  </IconButton>
-                </>
-              )}
-              {reviews.page?.has_more && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={reviews.loadingMore}
-                  onClick={reviews.loadMore}
-                >
-                  {reviews.loadingMore ? "Loading…" : "Load more conversations"}
-                </Button>
-              )}
-              {reviews.historyStale && (
-                <span className="text-muted-foreground">
-                  Older pages may have changed.{" "}
-                  <button type="button" className="underline" onClick={reviews.refreshHistory}>
-                    Reload conversations
-                  </button>
-                </span>
-              )}
-              {(reviews.page?.warning || reviews.error) && (
-                <span role="status" className="text-destructive">
-                  {reviews.error ?? reviews.page?.warning}
-                </span>
-              )}
-            </div>
-          )}
+                    {reviews.loadingMore ? "Loading…" : "Load more conversations"}
+                  </Button>
+                )}
+                {reviews.historyStale && (
+                  <span className="text-muted-foreground">
+                    Older pages may have changed.{" "}
+                    <button type="button" className="underline" onClick={reviews.refreshHistory}>
+                      Reload conversations
+                    </button>
+                  </span>
+                )}
+                {(reviews.page?.warning || reviews.error) && (
+                  <span role="status" className="text-destructive">
+                    {reviews.error ?? reviews.page?.warning}
+                  </span>
+                )}
+              </div>
+            )}
           {(changes.data?.has_more || changes.data?.warning) && (
             <p
               role="status"
@@ -2641,42 +2622,79 @@ function PullRequestPanelDetails({
               {changes.data.warning || "The changed-file list is incomplete."}
             </p>
           )}
-          {files.length > 0 && (
+          {(files.length > 0 || unresolved.length > 0 || reviews.isFetching) && (
             <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
-              <IconButton
-                label={sidebarCollapsed ? "Show file list" : "Hide file list"}
-                onClick={() => setSidebarCollapsed((v) => !v)}
-                className="size-5 text-muted-foreground"
-              >
-                {sidebarCollapsed ? (
-                  <PanelLeftOpenIcon className="size-3.5" />
-                ) : (
-                  <PanelLeftCloseIcon className="size-3.5" />
-                )}
-              </IconButton>
               <div className="flex items-center gap-0.5">
-                <IconButton
-                  label={diffStyle === "split" ? "Switch to unified view" : "Switch to split view"}
-                  onClick={toggleDiffStyle}
-                  className="size-5 text-muted-foreground"
-                >
-                  {diffStyle === "split" ? (
-                    <Rows2Icon className="size-3.5" />
-                  ) : (
-                    <Columns2Icon className="size-3.5" />
-                  )}
-                </IconButton>
-                <IconButton
-                  label={allCollapsed ? "Expand all diffs" : "Collapse all diffs"}
-                  onClick={toggleAll}
-                  className="size-5 text-muted-foreground"
-                >
-                  {allCollapsed ? (
-                    <ChevronsUpDownIcon className="size-3.5" />
-                  ) : (
-                    <ChevronsDownUpIcon className="size-3.5" />
-                  )}
-                </IconButton>
+                {files.length > 0 && (
+                  <IconButton
+                    label={sidebarCollapsed ? "Show file list" : "Hide file list"}
+                    onClick={() => setSidebarCollapsed((v) => !v)}
+                    className="size-5 text-muted-foreground"
+                  >
+                    {sidebarCollapsed ? (
+                      <PanelLeftOpenIcon className="size-3.5" />
+                    ) : (
+                      <PanelLeftCloseIcon className="size-3.5" />
+                    )}
+                  </IconButton>
+                )}
+                {unresolved.length > 0 && (
+                  <>
+                    <IconButton
+                      label="Previous unresolved conversation"
+                      onClick={() => navigateThread(-1)}
+                      className="size-5 text-muted-foreground"
+                    >
+                      <ChevronUpIcon className="size-3.5" />
+                    </IconButton>
+                    <IconButton
+                      label="Next unresolved conversation"
+                      onClick={() => navigateThread(1)}
+                      className="size-5 text-muted-foreground"
+                    >
+                      <ChevronDownIcon className="size-3.5" />
+                    </IconButton>
+                  </>
+                )}
+              </div>
+              <div className="flex items-center gap-0.5">
+                {reviews.isFetching && (
+                  <span
+                    role="status"
+                    className="mr-1 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground"
+                  >
+                    Loading review threads
+                    <Loader2Icon className="size-3 animate-spin" aria-hidden="true" />
+                  </span>
+                )}
+                {files.length > 0 && (
+                  <>
+                    <IconButton
+                      label={
+                        diffStyle === "split" ? "Switch to unified view" : "Switch to split view"
+                      }
+                      onClick={toggleDiffStyle}
+                      className="size-5 text-muted-foreground"
+                    >
+                      {diffStyle === "split" ? (
+                        <Rows2Icon className="size-3.5" />
+                      ) : (
+                        <Columns2Icon className="size-3.5" />
+                      )}
+                    </IconButton>
+                    <IconButton
+                      label={allCollapsed ? "Expand all diffs" : "Collapse all diffs"}
+                      onClick={toggleAll}
+                      className="size-5 text-muted-foreground"
+                    >
+                      {allCollapsed ? (
+                        <ChevronsUpDownIcon className="size-3.5" />
+                      ) : (
+                        <ChevronsDownUpIcon className="size-3.5" />
+                      )}
+                    </IconButton>
+                  </>
+                )}
               </div>
             </div>
           )}

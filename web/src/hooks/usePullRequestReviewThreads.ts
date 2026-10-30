@@ -160,6 +160,7 @@ export function usePullRequestReviewThreads(
   });
   return {
     page,
+    isFetching: query.isFetching || moreThreads.isPending || moreComments.isPending,
     historyStale: page?.history_stale,
     refreshHistory: () => void queryClient.resetQueries({ queryKey: key, exact: true }),
     loadMore: () => {
