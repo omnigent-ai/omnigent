@@ -66,15 +66,21 @@ function mount(value: SandboxProfileSelection | null = null) {
   const onChange = vi.fn();
   function Picker() {
     const [selection, setSelection] = useState(value);
+    const { launchError } = useSandboxProfileCatalog("company", selection);
     return (
-      <SandboxProfilePicker
-        provider="company"
-        value={selection}
-        onChange={(p) => {
-          onChange(p);
-          setSelection(p);
-        }}
-      />
+      <>
+        <SandboxProfilePicker
+          provider="company"
+          value={selection}
+          onChange={(p) => {
+            onChange(p);
+            setSelection(p);
+          }}
+        />
+        <button type="button" disabled={launchError !== null}>
+          Start
+        </button>
+      </>
     );
   }
   render(
@@ -110,6 +116,20 @@ it("keeps an out-of-page selection when search has no matches", async () => {
   expect(await screen.findByText("No matching profiles.")).toBeVisible();
   expect(screen.queryByText("(changed)")).toBeNull();
   expect(onChange).not.toHaveBeenCalled();
+});
+it("allows launching after selecting a new revision from search with an older lookup cached", async () => {
+  const { onChange } = mount(rows[0]);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
+  const revised = { ...rows[0], revision: "v2" };
+  available = [revised];
+  const input = await open(rows[0].name);
+  fireEvent.change(input, { target: { value: rows[0].name } });
+  const result = await screen.findByRole("option", { name: /^Build profile 0/ });
+  expect(onChange).not.toHaveBeenCalled();
+  fireEvent.click(result);
+  expect(onChange).toHaveBeenCalledWith(revised);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
+  expect(screen.queryByText("(changed)")).toBeNull();
 });
 it.each(["renamed", "revised", "revoked"])(
   "revalidates the selected profile when %s",

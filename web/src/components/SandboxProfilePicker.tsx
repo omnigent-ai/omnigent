@@ -31,7 +31,13 @@ export function useSandboxProfileCatalog(
     enabled && provider !== null && (query.data?.managed_providers ?? []).includes(provider);
   const selection = required && value?.provider === provider ? value : null;
   const selectedQuery = useQuery({
-    queryKey: [...SANDBOX_PROFILES_QUERY_KEY, provider, "selected", selection?.id],
+    queryKey: [
+      ...SANDBOX_PROFILES_QUERY_KEY,
+      provider,
+      "selected",
+      selection?.id,
+      selection?.revision,
+    ],
     queryFn: ({ signal }) =>
       fetchSandboxProfiles(provider ?? undefined, { profileId: selection?.id, signal }),
     enabled: selection !== null,
