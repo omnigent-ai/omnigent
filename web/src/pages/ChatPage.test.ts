@@ -1398,7 +1398,6 @@ describe("collectBubbleMarkdown", () => {
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
 describe("buildSlashCommandMap", () => {
-  // Session- and harness-specific commands that need an explicit flag.
   const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];
 
   it("returns the built-ins unchanged when no skills are loaded", () => {

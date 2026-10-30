@@ -3322,8 +3322,11 @@ describe("Composer permission-mode shortcut", () => {
         expect(textarea()).toHaveValue("");
         expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
         fireEvent.click(screen.getByTestId(`composer-permission-option-${option}`));
-        const setter = props.showCodexApprovalMode ? setApproval : setMode;
+        const [setter, otherSetter] = props.showCodexApprovalMode
+          ? [setApproval, setMode]
+          : [setMode, setApproval];
         await waitFor(() => expect(setter).toHaveBeenCalledWith(option));
+        expect(otherSetter).not.toHaveBeenCalled();
         expect(onSend).not.toHaveBeenCalled();
       },
     );
@@ -3365,6 +3368,13 @@ describe("Composer permission-mode shortcut", () => {
       expect(setMode).toHaveBeenCalledTimes(1);
       finish();
       await waitFor(() => expect(screen.getByTestId("composer-permission-chip")).toBeEnabled());
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+      expect(textarea()).toHaveValue("");
+      expect(onSend).not.toHaveBeenCalled();
     });
 
     it("is not listed, and stays plain text, for sessions without a permission control", () => {
