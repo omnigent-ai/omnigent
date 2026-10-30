@@ -29,6 +29,21 @@ export interface PullRequestStatusPresentation {
   priority: number;
 }
 
+/** A stored summary supersedes richer details only when it reports a newer lifecycle change. */
+export function hasNewerPullRequestLifecycle(
+  stored: PullRequestStatusSummary & { state_checked_at?: number | null },
+  live: PullRequestStatusSummary,
+  liveUpdatedAt: number,
+): boolean {
+  if (!((stored.state_checked_at ?? 0) * 1000 > liveUpdatedAt)) return false;
+  const state = stored.state?.toUpperCase();
+  if (!state || !["OPEN", "MERGED", "CLOSED"].includes(state)) return false;
+  return (
+    state !== live.state?.toUpperCase() ||
+    (state === "OPEN" && stored.is_draft !== undefined && stored.is_draft !== live.is_draft)
+  );
+}
+
 const PRESENTATION: Record<PullRequestStatus, PullRequestStatusPresentation> = {
   conflict: {
     label: "Merge conflicts",

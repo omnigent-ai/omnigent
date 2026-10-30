@@ -17,6 +17,7 @@ import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import {
   getPullRequestStatus,
+  hasNewerPullRequestLifecycle,
   sortPullRequestsByStatus,
   type PullRequestStatus,
   type PullRequestStatusSummary,
@@ -124,7 +125,7 @@ function enrichPullRequest(
   source: PullRequestStatusSource | undefined,
 ): ComposerPullRequest {
   if (!source) return association;
-  if (association.state_checked_at && source.updatedAt < association.state_checked_at * 1000) {
+  if (hasNewerPullRequestLifecycle(association, source.pr, source.updatedAt)) {
     return association;
   }
   const { pr } = source;

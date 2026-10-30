@@ -1,9 +1,53 @@
 import { describe, expect, it } from "vitest";
 import {
   getPullRequestStatus,
+  hasNewerPullRequestLifecycle,
   sortPullRequestsByStatus,
   type PullRequestStatusSummary,
 } from "./pullRequestStatus";
+
+describe("hasNewerPullRequestLifecycle", () => {
+  it.each([
+    { stored: { state: "open" }, live: { state: "OPEN", is_draft: false }, expected: false },
+    { stored: { state: "OPEN" }, live: { state: "OPEN", is_draft: true }, expected: false },
+    { stored: { state: "UNKNOWN" }, live: { state: "OPEN" }, expected: false },
+    { stored: { state: null }, live: { state: "OPEN" }, expected: false },
+    { stored: { state: "MERGED" }, live: { state: "OPEN" }, expected: true },
+    {
+      stored: { state: "MERGED", is_draft: true },
+      live: { state: "merged", is_draft: false },
+      expected: false,
+    },
+    { stored: { state: "OPEN" }, live: { state: "CLOSED" }, expected: true },
+    {
+      stored: { state: "OPEN", is_draft: true },
+      live: { state: "OPEN", is_draft: false },
+      expected: true,
+    },
+    {
+      stored: { state: "OPEN", is_draft: false },
+      live: { state: "OPEN", is_draft: true },
+      expected: true,
+    },
+  ])("compares only known lifecycle fields: %j", ({ stored, live, expected }) => {
+    expect(hasNewerPullRequestLifecycle({ ...stored, state_checked_at: 3 }, live, 2000)).toBe(
+      expected,
+    );
+  });
+
+  it.each([undefined, 1, 2])(
+    "ignores a lifecycle change without a newer timestamp: %s",
+    (state_checked_at) => {
+      expect(
+        hasNewerPullRequestLifecycle(
+          { state: "MERGED", state_checked_at },
+          { state: "OPEN" },
+          2000,
+        ),
+      ).toBe(false);
+    },
+  );
+});
 
 describe("getPullRequestStatus", () => {
   it.each(["MERGED", "CLOSED"])(

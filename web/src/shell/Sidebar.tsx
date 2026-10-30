@@ -282,6 +282,7 @@ import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import {
   getPullRequestStatus,
+  hasNewerPullRequestLifecycle,
   pullRequestStatusPresentation,
   type PullRequestStatusSummary,
 } from "@/lib/pullRequestStatus";
@@ -4587,8 +4588,7 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
     !!pr &&
     !!stored &&
     stored.url === pr.url &&
-    !!stored.state &&
-    (stored.state_checked_at ?? 0) * 1000 > (githubInfo.dataUpdatedAt ?? 0);
+    hasNewerPullRequestLifecycle(stored, pr, githubInfo.dataUpdatedAt ?? 0);
   const fromStored = storedIsNewer || (!pr && !association && !!stored?.state);
   let statusSource: PullRequestStatusSummary | null = fromStored ? stored : pr;
   if (pr && !fromStored && (githubInfo.isError || githubInfo.isEnabled === false)) {

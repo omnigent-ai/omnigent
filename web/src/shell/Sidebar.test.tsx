@@ -4006,16 +4006,31 @@ describe("Sidebar view options", () => {
       icon: "circle-check",
     },
   ])(
-    "shows the shared live PR status in the session tooltip: $label",
+    "keeps live PR status when a newer stored summary has the same lifecycle: $label",
     async ({ label, icon, ...status }) => {
+      const url = "https://github.com/omnigent-ai/omnigent/pull/419";
+      const checkedAt = Date.now() / 1000 - 600;
       usePullRequestInfoMock.mockReturnValue({
+        dataUpdatedAt: (checkedAt - 60) * 1000,
         data: {
           object: "session.github.info",
           available: true,
-          pr: { number: 419, state: "OPEN", is_draft: false, ...status },
+          pr: { url, number: 419, state: "OPEN", is_draft: false, ...status },
         },
       });
-      mockConversations([conv("conv_gh", "Codex", { workspace: "/Users/me/omnigent" })]);
+      mockConversations([
+        conv("conv_gh", "Codex", {
+          workspace: "/Users/me/omnigent",
+          pull_request: {
+            url,
+            provider: "github",
+            repository: "omnigent-ai/omnigent",
+            number: 419,
+            state: "open",
+            state_checked_at: checkedAt,
+          },
+        }),
+      ]);
       renderGroupingSidebar();
 
       fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
@@ -4023,6 +4038,7 @@ describe("Sidebar view options", () => {
       });
       const row = await screen.findByTestId("session-tooltip-pr");
       expect(row).toHaveTextContent(`PR#419 · ${label}`);
+      expect(row).not.toHaveTextContent("as of");
       expect(row.querySelector(`.lucide-${icon}`)).toBeInTheDocument();
     },
   );
@@ -4049,11 +4065,37 @@ describe("Sidebar view options", () => {
   );
 
   it.each([
-    { storedNumber: 419, expected: "Merged" },
-    { storedNumber: 420, expected: "Ready to merge" },
+    {
+      storedNumber: 419,
+      storedState: "MERGED",
+      storedDraft: false,
+      liveState: "OPEN",
+      expected: "Merged",
+    },
+    {
+      storedNumber: 420,
+      storedState: "MERGED",
+      storedDraft: false,
+      liveState: "OPEN",
+      expected: "Ready to merge",
+    },
+    {
+      storedNumber: 419,
+      storedState: "OPEN",
+      storedDraft: true,
+      liveState: "OPEN",
+      expected: "Draft",
+    },
+    {
+      storedNumber: 419,
+      storedState: "OPEN",
+      storedDraft: false,
+      liveState: "CLOSED",
+      expected: "Open",
+    },
   ])(
     "uses a newer stored lifecycle only for the same PR: $storedNumber",
-    async ({ storedNumber, expected }) => {
+    async ({ storedNumber, storedState, storedDraft, liveState, expected }) => {
       const now = Date.now();
       usePullRequestInfoMock.mockReturnValue({
         dataUpdatedAt: now - 10_000,
@@ -4063,7 +4105,7 @@ describe("Sidebar view options", () => {
           pr: {
             url: "https://github.com/omnigent-ai/omnigent/pull/419",
             number: 419,
-            state: "OPEN",
+            state: liveState,
             is_draft: false,
             merge_state_status: "CLEAN",
           },
@@ -4077,7 +4119,8 @@ describe("Sidebar view options", () => {
             provider: "github",
             repository: "omnigent-ai/omnigent",
             number: storedNumber,
-            state: "MERGED",
+            state: storedState,
+            is_draft: storedDraft,
             state_checked_at: now / 1000,
           },
         }),

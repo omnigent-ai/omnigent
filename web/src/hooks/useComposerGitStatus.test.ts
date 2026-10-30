@@ -401,6 +401,47 @@ describe("useComposerGitStatus", () => {
     },
   );
 
+  it.each([
+    { live: { merge_state_status: "DIRTY" }, storedDraft: undefined, expected: "conflict" },
+    { live: { checks: { failing: 1, pending: 0 } }, storedDraft: undefined, expected: "failed" },
+    { live: { merge_state_status: "CLEAN" }, storedDraft: undefined, expected: "ready" },
+    {
+      live: { is_draft: true, merge_state_status: "CLEAN" },
+      storedDraft: undefined,
+      expected: "draft",
+    },
+    {
+      live: { is_draft: false, merge_state_status: "CLEAN" },
+      storedDraft: true,
+      expected: "draft",
+    },
+    { live: { is_draft: true, merge_state_status: "CLEAN" }, storedDraft: false, expected: "open" },
+  ])(
+    "retains rich status unless a newer summary changes draft lifecycle: $expected",
+    ({ live, storedDraft, expected }) => {
+      setWorktrees(undefined);
+      setGithub({ tracking_available: true });
+      useSessionPullRequestsMock.mockReturnValue({
+        data: {
+          synced: true,
+          prs: [
+            {
+              url: "updated",
+              number: 1,
+              state: "open",
+              is_draft: storedDraft,
+              state_checked_at: 3,
+            },
+          ],
+        },
+      });
+      usePullRequestInfosMock.mockReturnValue([
+        { dataUpdatedAt: 2000, data: { pr: { url: "updated", state: "OPEN", ...live } } },
+      ]);
+      expect(run().result.current.prStatus).toBe(expected);
+    },
+  );
+
   it("preserves the legacy single PR's full status without another lookup", () => {
     setWorktrees(undefined);
     setGithub({
