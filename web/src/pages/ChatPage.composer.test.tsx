@@ -3954,12 +3954,13 @@ describe("Composer MCP status command", () => {
   });
 
   it.each([
-    { loadsUserSettings: undefined, userRowShown: true },
+    { loadsUserSettings: undefined, agentDetailsLoading: false, userRowShown: true },
     // `skills: none` runs claude-sdk with no setting sources: only managed servers load.
-    { loadsUserSettings: false, userRowShown: false },
+    { loadsUserSettings: false, agentDetailsLoading: false, userRowShown: false },
+    { loadsUserSettings: undefined, agentDetailsLoading: true, userRowShown: false },
   ])(
     "lists the host's Claude servers in a claude-sdk session: %j",
-    ({ loadsUserSettings, userRowShown }) => {
+    ({ loadsUserSettings, agentDetailsLoading, userRowShown }) => {
       composerSessionSnapshot.hostId = "host_sdk";
       setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
       const hostRows = [
@@ -3994,6 +3995,7 @@ describe("Composer MCP status command", () => {
                   loads_user_settings: loadsUserSettings,
                 },
               ],
+              agentDetailsLoading,
             })}
           />
         </MemoryRouter>,

@@ -557,7 +557,9 @@ export function ChatPage() {
   // agent object for the active session. Drives the picker's
   // name/description; the same react-query cache also feeds the header
   // info icon (AgentInfoButton) its tools & policies.
-  const { data: boundAgentBySession } = useSessionAgent(sessionConvId ?? null);
+  const { data: boundAgentBySession, isLoading: boundAgentLoading } = useSessionAgent(
+    sessionConvId ?? null,
+  );
   const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
 
@@ -1215,6 +1217,7 @@ export function ChatPage() {
       onShowReconnectHelp={onShowReconnectHelp}
       sendReconnectsArca={sendReconnectsArca}
       agents={visibleAgents}
+      agentDetailsLoading={boundAgentLoading}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
@@ -1370,6 +1373,8 @@ interface MainAgentSurfaceProps {
   /** Sending reconnects the offline Arca host, so the composer stays enabled. */
   sendReconnectsArca: boolean;
   agents: Agent[] | undefined;
+  /** The bound agent's full object is still loading, so `agents` may hold only its name. */
+  agentDetailsLoading: boolean;
   selectedAgentId: string | null;
   /** Whether older messages exist that haven't been loaded yet. */
   hasMoreHistory: boolean;
@@ -1546,6 +1551,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   onShowReconnectHelp,
   sendReconnectsArca,
   agents,
+  agentDetailsLoading,
   selectedAgentId,
   hasMoreHistory,
   loadingMoreHistory,
@@ -1865,6 +1871,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             onSendSlashCommand={handleSendSlashCommand}
             onStop={onStop}
             agents={agents}
+            agentDetailsLoading={agentDetailsLoading}
             selectedAgentId={selectedAgentId}
             permissionLevel={permissionLevel}
             readOnlyReason={readOnlyReason}
@@ -1980,6 +1987,8 @@ interface ComposerProps {
   onSendSlashCommand?: (name: string, args: string) => void;
   onStop: () => void;
   agents: Agent[] | undefined;
+  /** The bound agent's full object is still loading, so `agents` may hold only its name. */
+  agentDetailsLoading?: boolean;
   selectedAgentId: string | null;
   permissionLevel: number | null;
   /**
@@ -2319,6 +2328,7 @@ function ComposerImpl(
     onNewSession,
     onStop,
     agents,
+    agentDetailsLoading = false,
     selectedAgentId,
     permissionLevel,
     readOnlyReason,
@@ -2542,9 +2552,11 @@ function ComposerImpl(
       : nativeMcpHarness;
   const hostMcpHarness = hostMcpKey !== undefined && isBrandHarness(hostMcpKey) ? hostMcpKey : null;
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
-  // A claude-sdk session run without setting sources (`skills: none`) loads only managed servers.
+  // A claude-sdk session run without setting sources (`skills: none`) loads only managed
+  // servers; until its agent loads, list only those.
   const hostUserServersLoaded =
-    sessionHarness !== "claude-sdk" || selectedAgent?.loads_user_settings !== false;
+    sessionHarness !== "claude-sdk" ||
+    (!agentDetailsLoading && selectedAgent?.loads_user_settings !== false);
   const isSessionHostServer = useCallback(
     (server: HostMcpServer) =>
       server.harness === hostMcpHarness && (server.managed === true || hostUserServersLoaded),

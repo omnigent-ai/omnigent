@@ -935,6 +935,7 @@ async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) 
         logger.warning("Reading MCP status before reconnect failed", exc_info=True)
         return names
     retry: set[str] = set()
+    failed: list[str] = []
     servers = response.get("mcpServers")
     for server in servers if isinstance(servers, list) else []:
         name = server.get("name") if isinstance(server, Mapping) else None
@@ -943,8 +944,10 @@ async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) 
         status = server.get("status")
         if status == "pending":
             retry.add(name)
-        if status not in ("failed", "needs-auth"):
-            continue
+        elif status in ("failed", "needs-auth"):
+            failed.append(name)
+
+    async def reconnect(name: str) -> None:
         try:
             await asyncio.wait_for(
                 client.reconnect_mcp_server(name), timeout=_MCP_RECONNECT_TIMEOUT_SECONDS
@@ -955,6 +958,9 @@ async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) 
         except Exception:
             logger.warning("Reconnecting MCP server %r failed", name, exc_info=True)
             retry.add(name)
+
+    # Run together, so several hung servers delay the turn by one timeout at most.
+    await asyncio.gather(*(reconnect(name) for name in failed))
     return retry
 
 

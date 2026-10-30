@@ -3732,6 +3732,7 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
         "wiki": "needs-auth",
         "docs": "pending",
         "slow": "failed",
+        "stuck": "failed",
         "linear": "connected",
         "jira": "failed",
         "codex-docs": "failed",
@@ -3739,6 +3740,8 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
     status_unavailable = False
     fail_once = {"notes"}
     reconnects: list[str] = []
+    hanging: set[str] = set()
+    hung_together: list[set[str]] = []
 
     class _StubClient:
         def __init__(self, options) -> None:
@@ -3759,8 +3762,13 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
 
         async def reconnect_mcp_server(self, server_name: str) -> None:
             reconnects.append(server_name)
-            if server_name == "slow":
-                await asyncio.sleep(5)
+            if server_name in ("slow", "stuck"):
+                hanging.add(server_name)
+                hung_together.append(set(hanging))
+                try:
+                    await asyncio.sleep(5)
+                finally:
+                    hanging.discard(server_name)
             if server_name in fail_once:
                 fail_once.discard(server_name)
                 raise RuntimeError("still unauthorized")
@@ -3780,7 +3788,9 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
         )
 
     pending = "sign_in_required"
-    report(notes=pending, wiki=pending, docs=pending, slow=pending, jira="connected")
+    report(
+        notes=pending, wiki=pending, docs=pending, slow=pending, stuck=pending, jira="connected"
+    )
     client = await start_turn()
     assert await start_turn() is client
     assert reconnects == []
@@ -3790,6 +3800,7 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
         wiki="connected",
         docs="connected",
         slow="connected",
+        stuck="connected",
         linear="connected",
         jira="connected",
     )
@@ -3800,15 +3811,17 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
     # A failed reconnect neither fails the turn nor stops the remaining servers.
     status_unavailable = False
     assert await start_turn() is client
-    assert reconnects == ["notes", "wiki", "slow"]
+    assert reconnects == ["notes", "wiki", "slow", "stuck"]
+    # Hung reconnects overlap, so together they delay the turn by one timeout.
+    assert {"slow", "stuck"} in hung_together
 
-    # The failed and still-pending servers are checked again; the timed-out one is not.
+    # The failed and still-pending servers are checked again; the timed-out ones are not.
     live["docs"] = "failed"
     assert await start_turn() is client
-    assert reconnects == ["notes", "wiki", "slow", "notes", "docs"]
+    assert reconnects == ["notes", "wiki", "slow", "stuck", "notes", "docs"]
 
     assert await start_turn() is client
-    assert reconnects == ["notes", "wiki", "slow", "notes", "docs"]
+    assert reconnects == ["notes", "wiki", "slow", "stuck", "notes", "docs"]
 
 
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
