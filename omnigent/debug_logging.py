@@ -830,11 +830,18 @@ class _TokenSource:
         except ValueError:
             _diag("token_decode", "token mint returned a non-JSON body")
             return None
+        if not isinstance(body, dict):
+            _diag("token_decode", "token mint returned a non-object JSON body")
+            return None
         token = body.get("access_token")
         if not token:
             _diag("token_missing", "token mint response had no access_token")
             return None
-        expires_in = float(body.get("expires_in", 3600))
+        try:
+            expires_in = float(body.get("expires_in", 3600))
+        except (TypeError, ValueError):
+            _diag("token_expiry", "token mint response had an invalid expires_in")
+            return None
         return token, time.time() + expires_in
 
 
@@ -1123,7 +1130,8 @@ class ZerobusLogHandler(DebugLogHandler):
     def _hold_after_mint_failure(self, rows: list[DebugLogRow]) -> None:
         if self._drain_deadline is not None:
             # Shutting down: there is no later attempt to wait for.
-            _diag("no_token", "no auth token (mint failing); dropping %d row(s)", len(rows))
+            # Own key, so a recent "holding" diag cannot throttle this one away.
+            _diag("held_dropped", "no auth token at shutdown; dropping %d held row(s)", len(rows))
             return
         self._hold(rows)
         self._mint_backoff_s = min(

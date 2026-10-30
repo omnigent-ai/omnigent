@@ -250,9 +250,16 @@ def test_insert_auth_rejection_refreshes_credentials_and_retries_same_batch(
 
 
 def _command_secret_sink(
-    monkeypatch: pytest.MonkeyPatch, outcomes: list[int]
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[int],
+    token_bodies: list[object] | None = None,
 ) -> tuple[dl.ZerobusLogHandler, list[str], list[int]]:
-    """A worker-less sink whose secret command exits with *outcomes* in turn."""
+    """A worker-less sink whose secret command exits with *outcomes* in turn.
+
+    Token mints answer with *token_bodies* in turn, the last one repeating.
+    """
+    bodies = token_bodies or [{"access_token": "token", "expires_in": 3600}]
+    mints: list[object] = []
     monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
     monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
     monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
@@ -270,7 +277,9 @@ def _command_secret_sink(
     class Client:
         def post(self, url: str, **kwargs: object) -> httpx.Response:
             if url.endswith("/oidc/v1/token"):
-                return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+                body = bodies[min(len(mints), len(bodies) - 1)]
+                mints.append(body)
+                return httpx.Response(200, json=body)
             inserted.append(kwargs["content"])  # type: ignore[arg-type]
             return httpx.Response(200)
 
@@ -315,20 +324,56 @@ def test_mint_failure_backoff_grows_and_held_rows_stay_bounded(
     monkeypatch.setattr(dl, "_HELD_MAX_RECORDS", 3)
     sink, inserted, command_calls = _command_secret_sink(monkeypatch, [1])
 
-    for index in range(5):
+    backoffs: list[float] = []
+    for index in range(6):
         sink._mint_retry_at = 0.0
         sink._post([{"message": f"row-{index}"}])
+        backoffs.append(sink._mint_backoff_s)
 
     assert inserted == []
-    assert len(command_calls) == 5
-    assert [row["message"] for row in sink._held_rows] == ["row-2", "row-3", "row-4"]
-    # Five failures double the backoff from its floor, capped at the ceiling.
-    assert sink._mint_backoff_s == min(dl._MINT_RETRY_INITIAL_S * 2**4, dl._MINT_RETRY_MAX_S)
+    assert len(command_calls) == 6
+    assert [row["message"] for row in sink._held_rows] == ["row-3", "row-4", "row-5"]
+    # Failures double the backoff from its floor until the ceiling caps it.
+    assert backoffs == [5.0, 10.0, 20.0, 40.0, 80.0, dl._MINT_RETRY_MAX_S]
+    assert dl._MINT_RETRY_MAX_S == 120.0
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"access_token": "token", "expires_in": "invalid"},
+        {"access_token": "token", "expires_in": None},
+        ["not", "an", "object"],
+    ],
+)
+def test_malformed_mint_response_preserves_held_rows(
+    monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    valid = {"access_token": "token", "expires_in": 3600}
+    sink, inserted, command_calls = _command_secret_sink(
+        monkeypatch, [1, 0], token_bodies=[malformed, valid]
+    )
+    held: list[dl.DebugLogRow] = [{"message": "startup"}]
+    sink._post(held)
+    assert command_calls == [1]
+
+    # The helper recovers but the token response is unusable: keep holding.
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == []
+    assert [row["message"] for row in sink._held_rows] == ["startup"]
+
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == [json.dumps(held)]
+    assert not sink._has_held_rows()
 
 
 def test_held_rows_are_dropped_not_retried_during_shutdown_drain(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
     sink, inserted, command_calls = _command_secret_sink(monkeypatch, [1])
     sink._post([{"message": "startup"}])
     sink._drain_deadline = time.monotonic() + 5.0
@@ -339,6 +384,10 @@ def test_held_rows_are_dropped_not_retried_during_shutdown_drain(
     assert command_calls == [1]
     assert inserted == []
     assert not sink._has_held_rows()
+    # The earlier "holding" diag must not throttle away the drop notice.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("holding 1 row(s)" in message for message in messages)
+    assert any("dropping 1 held row(s)" in message for message in messages)
 
 
 def test_uploader_delivers_held_rows_on_idle_tick(monkeypatch: pytest.MonkeyPatch) -> None:
