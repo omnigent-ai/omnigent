@@ -837,6 +837,42 @@ def _terminal_view(name: str, terminal_id: str = "terminal_goose_main") -> Sessi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_attempts"),
+    [
+        ("thread 019e already has an active writer", 2),
+        ("thread-store internal error: failed to read thread", 1),
+    ],
+    ids=["active_writer_retried", "other_refusal_raised"],
+)
+async def test_launch_codex_retries_once_when_another_writer_holds_the_thread(
+    monkeypatch: pytest.MonkeyPatch, message: str, expected_attempts: int
+) -> None:
+    """A resume refused by a racing app-server is retried once; other refusals raise."""
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.runner.native import orchestration
+
+    attempts: list[str] = []
+    created = _terminal_view("codex", terminal_id="terminal_codex_main")
+
+    async def _fake_create(session_id: str, *_args: object, **_kwargs: object) -> object:
+        attempts.append(session_id)
+        if len(attempts) == 1:
+            raise CodexAppServerResponseError({"code": -32600, "message": message})
+        return created
+
+    monkeypatch.setattr(orchestration, "_auto_create_codex_terminal", _fake_create)
+    ctx = _ensure_ctx(_FakeEnsureRegistry())
+
+    if expected_attempts == 2:
+        assert await orchestration._launch_codex(ctx) is created
+    else:
+        with pytest.raises(CodexAppServerResponseError):
+            await orchestration._launch_codex(ctx)
+    assert attempts == ["conv_e"] * expected_attempts
+
+
+@pytest.mark.asyncio
 async def test_ensure_native_terminal_returns_existing_without_creating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2474,6 +2510,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     resolver_entered = asyncio.Event()
     release_resolver = asyncio.Event()
     resolver_calls = 0
+    resource_registry = SessionResourceRegistry(terminal_registry=None)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         nonlocal resolver_calls
@@ -2487,7 +2524,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
-        resource_registry=SessionResourceRegistry(terminal_registry=None),
+        resource_registry=resource_registry,
     )
     session_id = "initv2_8e32600337d08f59ad381caf96a90659"
     agent_id = "agentv2_880b5afda28ad55ff74cbeb9b5fc67fb"
@@ -2505,7 +2542,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
                 "created_at": 1234,
                 "updated_at": 1234,
                 "workspace": None,
-                "labels": {},
+                "labels": {"omnigent.client_surface": "desktop"},
             },
         },
     }
@@ -2523,6 +2560,9 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     assert first_response.json()["session_init_protocol_version"] == 2
     assert resolver_calls == 1
     assert len(pm.get_client_calls) == 1
+    assert resource_registry.client_surface_env(session_id) == {
+        "OMNIGENT_CLIENT_SURFACE": "desktop"
+    }
     # The envelope supplies session metadata, so the only snapshot-style
     # callback is the history read; restart recovery adds one read of the
     # durable child-session list, which is empty here.

@@ -617,6 +617,11 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+# MySQL stores these documents as BLOB (at most 65,535 bytes), so writes that
+# compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
+_MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
@@ -645,12 +650,12 @@ class SqlConversationMetadata(OmnigentBase):
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     task_summary: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
-    session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    session_state: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
+    session_usage: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
     # JSON-encoded provider binding and model catalog captured at session creation.
     inference_snapshot: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.
-    terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    terminal_launch_args: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
     # Required when host_id is set; enforced by check constraint below.
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)

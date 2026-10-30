@@ -636,7 +636,7 @@ def test_terminate_wraps_unexpected_errors(fake_boxlite: _FakeBoxliteState) -> N
 
 def test_managed_only_capability_surface(fake_boxlite: _FakeBoxliteState) -> None:
     """
-    Managed-only: no CLI bootstrap, no port-forward, and the CLI-bootstrap
+    Managed-only: no CLI bootstrap, no port-forward, no park, and those
     primitives keep the base class's raising defaults.
     """
     launcher = BoxliteSandboxLauncher()
@@ -648,6 +648,8 @@ def test_managed_only_capability_surface(fake_boxlite: _FakeBoxliteState) -> Non
         launcher.stream_exec("bl-1", "echo hi")
     with pytest.raises(SandboxCapabilityError):
         launcher.forward_local_port("bl-1", 8022)
+    with pytest.raises(SandboxCapabilityError, match="stop a sandbox without deleting it"):
+        launcher.stop("bl-1")
 
 
 # ── timeout / cancellation ──────────────────────────────────

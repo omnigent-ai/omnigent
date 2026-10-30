@@ -866,6 +866,8 @@ async function fetchDirEntriesTolerant(
 export interface WorkspaceFileExistence {
   /** True when the parent listing confirms `path` names an existing file. */
   exists: boolean;
+  /** True when the parent listing shows `path` names a directory instead. */
+  isDirectory: boolean;
   /**
    * True only when a parent listing actually completed successfully for the
    * current inputs and fully answered the question, so `exists: false` means
@@ -880,7 +882,8 @@ export interface WorkspaceFileExistence {
 }
 
 /**
- * Check whether `path` names an existing *file* the session can open.
+ * Check whether `path` names an existing *file* the session can open, or a
+ * directory (reported separately so a folder never reads as missing).
  *
  * Backed by a bounded listing of the path's PARENT directory, shared across
  * sibling files via the React Query cache. A directory beyond the scan limit
@@ -931,14 +934,18 @@ export function useWorkspaceFileExists(
   });
   // No candidate = the check was SKIPPED (not path-shaped and untrusted),
   // not run-and-found-nothing — it must never read as "verified absent".
-  if (!candidate) return { exists: false, settled: false };
+  if (!candidate) return { exists: false, isDirectory: false, settled: false };
   const listing = query.data ?? null;
-  const exists = !!listing?.files.some((e) => e.type === "file" && e.path === candidate);
+  const entry = listing?.files.find((e) => e.path === candidate);
   // Only a listing that genuinely completed proves absence: errors and
   // unavailable-runner responses (data === null) leave the answer open. A
   // hit settles even a truncated page, but a miss on a truncated page
   // doesn't — the file may simply live past the page limit.
-  return { exists, settled: query.isSuccess && listing !== null && (exists || !listing.truncated) };
+  return {
+    exists: entry?.type === "file",
+    isDirectory: entry?.type === "directory",
+    settled: query.isSuccess && listing !== null && (!!entry || !listing.truncated),
+  };
 }
 
 // ── Default environment (working folder root) ─────────────────────────────────

@@ -184,20 +184,20 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
 async def _wait_for_runner_connect_waiter(
     app: FastAPI,
     runner_id: str,
-    *,
-    timeout_s: float = 1.0,
 ) -> None:
     """Wait until the app registry has a connect waiter for a runner.
+
+    The wait is a scaled ``budget`` hang guard: a loaded ``-n 4`` CI worker
+    can take over a second to route the POST to its connect grace wait.
 
     :param app: FastAPI app whose ``state.tunnel_registry`` is under
         test.
     :param runner_id: Runner id expected to have one waiter, e.g.
         ``"runner_token_abc123"``.
-    :param timeout_s: Maximum seconds to wait, e.g. ``1.0``.
     :returns: None.
-    :raises AssertionError: If no waiter appears before the timeout.
+    :raises AssertionError: If no waiter appears before the budget expires.
     """
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + budget(5.0)
     while time.monotonic() < deadline:
         if app.state.tunnel_registry.connect_waiter_count(runner_id) > 0:
             return
@@ -542,7 +542,7 @@ async def test_inline_launch_stamps_terminal_view_label_for_custom_native_harnes
 
     assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
     body = resp.json()
-    expected_labels = {"env": "test", "omnigent.ui": "terminal"}
+    expected_labels = {"env": "test", "omnigent.ui": "terminal", "omnigent.client_surface": "cli"}
     assert body["labels"] == expected_labels
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.get_conversation(body["id"])
@@ -2136,7 +2136,7 @@ async def test_message_relaunch_resolves_runner_client_that_misses_after_connect
         launch = await _serve_one_launch(comm, launch_status="launched")
         runner_id = token_bound_runner_id(launch.binding_token)
         relaunched.append(runner_id)
-        await _wait_for_runner_connect_waiter(app, runner_id, timeout_s=budget(5.0))
+        await _wait_for_runner_connect_waiter(app, runner_id)
         app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
         response = await asyncio.wait_for(post, budget(10.0))
     finally:
@@ -2149,6 +2149,69 @@ async def test_message_relaunch_resolves_runner_client_that_misses_after_connect
     assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
     [event] = _runner_client_wait_events(caplog)
     assert (event.attributes["outcome"], event.attributes["attempts"]) == ("resolved", 3)
+
+
+async def test_message_relaunch_waits_longer_for_a_runner_the_host_spawned(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner the host confirmed spawning may connect after the base budget.
+
+    A busy machine can take a few seconds past the 30 s budget to boot the
+    runner; the message must reach it instead of failing as unavailable.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    base_timeout_s = 1.0
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", base_timeout_s)
+    # The fake host never answers status probes; keep them from outlasting the budget.
+    monkeypatch.setattr(sessions_module, "_HOST_RUNNER_STATUS_TIMEOUT_S", 0.05)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    forwarded: list[str] = []
+
+    def _runner_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(request.url.path)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_request), base_url="http://runner"
+    )
+    relaunched: list[str] = []
+
+    async def _get_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient | None:
+        if not relaunched or app.state.tunnel_registry.get(relaunched[0]) is None:
+            return None
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    set_runner_client(None)
+    post = asyncio.create_task(_post_hello(client, session_id))
+    try:
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        runner_id = token_bound_runner_id(launch.binding_token)
+        relaunched.append(runner_id)
+        await _wait_for_runner_connect_waiter(app, runner_id)
+        # Connect after the base budget but well inside the doubled one.
+        await asyncio.sleep(base_timeout_s * 1.4)
+        assert not post.done(), "the send gave up at the base connect budget"
+        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        response = await asyncio.wait_for(post, budget(10.0))
+    finally:
+        post.cancel()
+        await asyncio.gather(post, return_exceptions=True)
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
 
 
 async def test_native_message_relaunch_runner_never_connects_keeps_runner_failed_to_start(
@@ -2714,7 +2777,7 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
         release_spawn.set()
         response = await asyncio.wait_for(create, budget(5.0))
         assert response.status_code == 201, response.text
-        await _wait_for_runner_connect_waiter(app, runner_id, timeout_s=budget(5.0))
+        await _wait_for_runner_connect_waiter(app, runner_id)
         app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
         response = await asyncio.wait_for(post, budget(5.0))
         assert response.status_code < 300, response.text

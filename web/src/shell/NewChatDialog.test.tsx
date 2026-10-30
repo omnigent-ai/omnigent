@@ -1259,6 +1259,7 @@ function setupLandingMocks() {
           useAvailableAgentsMock().data?.find(
             (agent: AvailableAgent) => agent.id === target?.agentId,
           )?.skills ?? [],
+        skillsWarnings: [],
         skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
         refetch: vi.fn(),
       }) as ReturnType<typeof useSkills>,
@@ -1380,7 +1381,10 @@ function renderLanding(
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
     smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
-    features: { harness_install: infoOverrides.harness_install_enabled === true },
+    features: {
+      harness_install: infoOverrides.harness_install_enabled === true,
+      codex_plan_at_launch: true,
+    },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -1495,13 +1499,15 @@ describe("model picker hotkey", () => {
 
   it("cycles the full Pi catalog after searching the model menu", () => {
     mockAgents([testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" })]);
+    // Long enough for the menu to offer search.
     mockModelQueries(() => ({
       ...SUCCESS_QUERY_STATE,
-      data: [
-        { id: "model-a", model: "model-a", displayName: "Model A", isDefault: true },
-        { id: "model-b", model: "model-b", displayName: "Model B" },
-        { id: "model-c", model: "model-c", displayName: "Model C" },
-      ],
+      data: [..."abcdefghij"].map((letter) => ({
+        id: `model-${letter}`,
+        model: `model-${letter}`,
+        displayName: `Model ${letter.toUpperCase()}`,
+        isDefault: letter === "a",
+      })),
     }));
     renderLanding();
     fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
@@ -6507,6 +6513,29 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  const sshDesktop = { kind: "electron", connectSshHost: vi.fn() };
+  it.each([
+    ["the browser", undefined, null, false],
+    ["a desktop app without SSH connect", { kind: "electron" }, null, false],
+    ["a window that offers Run on Arca", sshDesktop, { databricksInternalFeatures: true }, false],
+    ["a desktop app with SSH connect", sshDesktop, null, true],
+  ])("offers SSH connect in %s only when it can", async (_name, desktop, features, shown) => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
+    vi.mocked(getDesktopFeatures).mockResolvedValue(features);
+    try {
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+      // Let the shell's feature answer land before judging.
+      await act(async () => {});
+
+      expect(screen.queryByTestId("ssh-connect-form") !== null).toBe(shown);
+    } finally {
+      vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    }
+  });
+
   it("offers connect-host even when no hosts are online (no dead end)", () => {
     mockHosts([]);
     renderLanding();
@@ -6888,6 +6917,43 @@ describe("NewChatLandingScreen", () => {
     // The label is what the runner reads to launch with the bypass flag.
     expect(labels["omnigent.codex_native.bypass_sandbox"]).toBe("1");
     // The native wrapper labels still ride alongside it.
+    expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
+  });
+
+  it.each([true, false])("requires server support for Codex Plan (%s)", async (supported) => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const togglePlan = () => {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+      const plan = screen.getByTestId("composer-plan-action");
+      expect(plan).not.toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(plan);
+    };
+    togglePlan();
+    cleanup();
+    renderLanding({ features: supported ? { codex_plan_at_launch: true } : {} });
+    if (supported) {
+      expect(screen.getByTestId("new-chat-landing-plan-mode")).toHaveTextContent("Plan mode");
+      togglePlan();
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      togglePlan();
+      selectAgent("a1");
+      selectAgent("a2");
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      togglePlan();
+    } else {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+      expect(screen.getByTestId("composer-plan-action")).toHaveAttribute("aria-disabled", "true");
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      closeMenu();
+    }
+    const { body } = await submitAndReadBody();
+    const labels = body.labels as Record<string, string>;
+    expect(labels["omnigent.codex_native.collaboration_mode"]).toBe(supported ? "plan" : undefined);
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
@@ -8647,6 +8713,7 @@ describe("NewChatLandingScreen skills menu", () => {
       ({ target, enabled = true, starting = false }) =>
         ({
           skills: [],
+          skillsWarnings: [],
           skillsStatus: "ready",
           refetch: vi.fn(),
           ...state,
@@ -8869,6 +8936,23 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByText("No matching skills")).toBeInTheDocument();
     typeMessage("/");
     expect(screen.getByText("No skills available")).toBeInTheDocument();
+  });
+
+  it("explains an incomplete catalog with Retry while listing the skills it read", () => {
+    const retry = vi.fn();
+    const warning = "Codex plugin skills unavailable: `codex plugin list` exited 1";
+    mockSkills({
+      skills: [{ name: "host-review", description: "Host-only skill" }],
+      skillsWarnings: [warning],
+      refetch: retry,
+    });
+    renderLanding();
+    typeMessage("/");
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-host-review")).toBeInTheDocument();
+    expect(screen.queryByText("No skills available")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledOnce();
   });
 
   it("dismisses a loading-only menu with Escape", () => {
@@ -10121,7 +10205,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 
   // Switch the target to the connected host, then create + submit a pending
   // custom agent from the dialog so it becomes the selected agent.
-  async function createAndSelectPendingAgentOnHost(): Promise<void> {
+  async function createAndSelectPendingAgentOnHost(harnessLabel: string): Promise<void> {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
         "Sandbox",
@@ -10142,15 +10226,29 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.change(screen.getByTestId("create-agent-model"), {
       target: { value: "claude-sonnet-4-20250514" },
     });
+    fireEvent.click(screen.getByTestId("create-agent-harness"));
+    fireEvent.click(screen.getByRole("option", { name: harnessLabel }));
     fireEvent.click(screen.getByTestId("create-agent-submit"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent"),
-    );
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
   }
 
-  it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
+  it("disables Plan for pending custom Codex agents and drops them on a sandbox switch", async () => {
+    const agentLabels = await import("@/lib/agentLabels");
+    const catalog = vi.spyOn(agentLabels, "useBrainHarnessLabels").mockReturnValue({
+      ...agentLabels.BRAIN_HARNESS_LABELS,
+      "codex-native": "Codex CLI",
+    });
+    onTestFinished(() => catalog.mockRestore());
     renderLanding({ managed_sandboxes_enabled: true });
-    await createAndSelectPendingAgentOnHost();
+    await createAndSelectPendingAgentOnHost("Codex CLI");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+    const plan = screen.getByTestId("composer-plan-action");
+    expect(plan).toHaveAttribute("aria-disabled", "true");
+    expect(plan).toHaveAttribute(
+      "title",
+      "Turn Plan mode on after this custom agent's session starts",
+    );
+    closeMenu();
     // Switch back to the sandbox: the pending pick can't run there, so the
     // selection falls back to a real agent and the pending row disappears.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
@@ -10480,18 +10578,79 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(selectedPickerModel()).toBeTruthy();
   });
 
-  it("disables effort choices while Smart Routing owns effort", () => {
+  // A managed sandbox has no pre-launch catalog, so Codex's Model section lists
+  // no models there; unchecking Smart Routing must still turn it off, as the
+  // Default row does for Claude Code.
+  it("lets a Codex sandbox session switch back from Smart Routing to the default model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sandbox_unrouted" }),
+    } as unknown as Response);
+    renderLanding({
+      smart_routing_enabled: true,
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "lakebox",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "Sandbox",
+      ),
+    );
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Smart Routing");
+    const smartRouting = () => screen.getByRole("menuitemcheckbox", { name: "Smart Routing" });
+    expect(smartRouting()).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("new-chat-landing-agent-select").getAttribute("aria-label")).toBe(
+      "Codex, Model Smart Routing, Effort —",
+    );
+    // The checkbox is the only way out: no model or Default row is offered.
+    const models = screen.getByTestId("new-chat-landing-agent-models");
+    expect(within(models).getByText("Models unavailable")).toBeVisible();
+    expect(within(models).queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+
+    fireEvent.click(smartRouting());
+
+    expect(smartRouting()).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("new-chat-landing-agent-select").getAttribute("aria-label")).toBe(
+      "Codex, Model Default",
+    );
+    closePrimaryPicker();
+
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({ agent_id: "a2", host_type: "managed" });
+    expect(body.cost_control_mode_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("disables effort choices while Smart Routing owns effort and hands them back once it is unchecked", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentModels("a1");
     pickPrimaryOption("effort", "High");
     expect(selectedPickerEffort()).toHaveTextContent("High");
     pickPrimaryOption("model", "Smart Routing");
-    for (const option of within(screen.getByTestId("new-chat-landing-agent-efforts")).getAllByRole(
-      "menuitemcheckbox",
-    )) {
+    const effortChoices = () =>
+      within(screen.getByTestId("new-chat-landing-agent-efforts")).getAllByRole("menuitemcheckbox");
+    for (const option of effortChoices()) {
       expect(option).toHaveAttribute("data-disabled");
       expect(option).toHaveAttribute("aria-checked", "false");
     }
+
+    // Unchecking lands on the harness default with the effort row usable again.
+    pickPrimaryOption("model", "Smart Routing");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(selectedPickerModel().textContent).toContain("Default");
+    expect(selectedPickerEffort()).toHaveTextContent("Default");
+    for (const option of effortChoices()) {
+      expect(option).not.toHaveAttribute("data-disabled");
+    }
+    expect(
+      JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["claude-native"],
+    ).toMatchObject({ routing: "off", model: "", effort: "" });
   });
 
   it("sends cost_control_mode_override 'on' and no model/effort override when routing is picked", async () => {
