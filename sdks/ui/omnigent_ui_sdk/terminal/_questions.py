@@ -11,7 +11,6 @@ single-select answer uses that text only while the row is highlighted.
 from __future__ import annotations
 
 import asyncio
-import textwrap
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -67,7 +66,7 @@ class QuestionPicker:
 
     @property
     def prefill(self) -> str:
-        """Input-line text to start the current question with: an editor's prefill."""
+        """Answer-line text to start the current question with: an editor's prefill."""
         question = self.current
         return (question.text_default or "") if not question.options else ""
 
@@ -132,7 +131,8 @@ class QuestionPicker:
         question = self.current
         if not question.options:
             if question.text_default is not None:
-                value = text  # editor: the exact text is the answer
+                # Editor: the exact text is the answer, or its fixed default.
+                value = text if question.allow_custom else question.text_default
             else:
                 value = text.strip()
                 if not value or not question.allow_custom:
@@ -165,7 +165,7 @@ class QuestionPicker:
         if question.header:
             title += f" · {_one_line(question.header)}"
         lines.append(("class:prompt-marker", title))
-        for text_line in textwrap.wrap(question.question, max(width - 4, 20)) or [""]:
+        for text_line in _wrap(question.question, max(width - 4, 2)):
             lines.append(("", f"   {text_line}"))
         lines.extend(self._option_lines(width))
         lines.append(("class:model-name", f" {self._hint()}"))
@@ -202,12 +202,38 @@ class QuestionPicker:
     def _hint(self) -> str:
         question = self.current
         if not question.options:
+            if not question.allow_custom:
+                return "⏎ send the answer below · esc dismiss"
             if question.text_default is not None:
                 return "edit the answer below · ⏎ send · esc dismiss"
             return "type the answer below · ⏎ send · esc dismiss"
         if question.multi_select:
             return "↑↓ move · space check · ⏎ send checked (or the highlighted one) · esc dismiss"
         return "↑↓ move · ⏎ choose · esc dismiss"
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Wrap *text* into lines of at most *width* terminal cells, dropping nothing.
+
+    Breaks at spaces, and inside a run wider than a line (e.g. CJK text).
+    """
+    lines: list[str] = []
+    line = ""
+    for word in text.split():
+        candidate = f"{line} {word}" if line else word
+        if get_cwidth(candidate) <= width:
+            line = candidate
+            continue
+        if line:
+            lines.append(line)
+        line = ""
+        for char in word:
+            if line and get_cwidth(line + char) > width:
+                lines.append(line)
+                line = ""
+            line += char
+    lines.append(line)
+    return lines
 
 
 def _one_line(text: str) -> str:

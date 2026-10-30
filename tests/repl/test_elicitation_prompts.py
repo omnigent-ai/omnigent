@@ -164,6 +164,12 @@ def test_question_prompts_follow_web_form_rules() -> None:
                 {"id": "0", "question": "Pick", "options": ["a"], "isOther": False},
                 {"question": "Name?", "options": []},
                 {"id": "1", "question": "Notes?", "options": [], "textInput": {"default": "x"}},
+                {
+                    "question": "Fixed?",
+                    "options": [],
+                    "isOther": False,
+                    "textInput": {"default": "y"},
+                },
             ]
         }
     )
@@ -172,6 +178,7 @@ def test_question_prompts_follow_web_form_rules() -> None:
         ("0", (("a", ""),), False, None),
         ("Name?", (), True, None),
         ("1", (), True, "x"),
+        ("Fixed?", (), False, "y"),
     ]
 
 
@@ -323,10 +330,15 @@ async def test_prompt_kinds_take_the_terminal_one_at_a_time() -> None:
 async def test_a_pre_approved_request_does_not_wait_for_an_open_question() -> None:
     # "Approve always" answers it without input, so it skips the prompt queue.
     adapter, host, _, client, approval_hook = _adapter()
-    _gate_approvals_on_the_user(adapter, approval_hook)
     event = _approval_event()
     adapter._approval_state.remember_always(event.policy_name, event.phase)
-    approval_hook.side_effect = lambda ctx: _pre_approved_hook(adapter, ctx)
+
+    async def _approve_from_the_cache(ctx: Any) -> bool:
+        # run_repl's hook approves a cached "always" without prompting.
+        assert adapter._approval_state.is_pre_approved(ctx.policy_name, ctx.phase)
+        return True
+
+    approval_hook.side_effect = _approve_from_the_cache
     question = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
     await _until(lambda: host.selector_open, "the question never opened")
     approval = asyncio.create_task(adapter._handle_elicitation("conv_abc", event))
@@ -334,14 +346,9 @@ async def test_a_pre_approved_request_does_not_wait_for_an_open_question() -> No
 
     assert host.selector_open, "the selector closed"
     assert _posted(client) == [("conv_abc", "elicit_approve", {"action": "accept"})]
+    approval_hook.assert_awaited_once()
     host.answer({"Env?": "dev"})
     await question
-
-
-async def _pre_approved_hook(adapter: Any, ctx: Any) -> bool:
-    """run_repl's y/a/n hook for a cached "always": approve without prompting."""
-    assert adapter._approval_state.is_pre_approved(ctx.policy_name, ctx.phase)
-    return True
 
 
 async def test_prompt_settled_before_its_turn_is_never_shown() -> None:

@@ -3739,22 +3739,25 @@ class TerminalHost:
         self._answer_buffer.reset(document=Document(prefill, len(prefill)))
 
     def _question_takes_text(self) -> bool:
-        """Whether the open question accepts a typed answer."""
+        """Whether the open question accepts a typed answer (not a fixed default)."""
         picker = self._question_picker
-        return picker is not None and (picker.current.allow_custom or not picker.current.options)
+        return picker is not None and picker.current.allow_custom
 
     def _answer_line_shown(self) -> bool:
         """Whether the answer line shows: only while its text is part of the answer.
 
         A single-select answer uses it only on "Type something", so moving
         onto an option hides it (typing again moves back) rather than leaving
-        text on screen that Enter would drop.
+        text on screen that Enter would drop. A question without options
+        always shows it, a fixed default included.
         """
         picker = self._question_picker
-        if picker is None or not self._question_takes_text():
+        if picker is None:
             return False
         question = picker.current
-        return not question.options or question.multi_select or picker.on_custom_row()
+        if not question.options:
+            return True
+        return question.allow_custom and (question.multi_select or picker.on_custom_row())
 
     def _answer_line_count(self) -> int:
         rows = _prompt_input_visual_line_count(

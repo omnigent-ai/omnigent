@@ -1814,6 +1814,10 @@ async def test_question_picker_answers_follow_the_web_form() -> None:
     assert free_multi.answer("eu-west") is True
     assert await free_multi.future == {"Env?": ["eu-west"]}
 
+    fixed = QuestionPicker([_env_question(options=(), allow_custom=False, text_default="fixed")])
+    assert fixed.answer("fixed CHANGED") is True, "a fixed default answers as it is"
+    assert await fixed.future == {"Env?": "fixed"}
+
     editor = QuestionPicker([_env_question(options=(), text_default="draft")])
     assert editor.answer("") is True, "an editor answer may be empty"
     assert await editor.future == {"Env?": ""}
@@ -1846,6 +1850,15 @@ async def test_question_picker_scrolls_long_lists_and_truncates_wide_lines() -> 
     assert "▸ 12. opt11" in shown and "1. opt0" not in shown
     wide = QuestionPicker([_env_question(options=(("界" * 80, ""),))])
     assert all(get_cwidth(text.rstrip("\n")) <= 40 for _, text in wide.render(40))
+    # Question text wraps by terminal cells and keeps every character.
+    cjk = "你好世界" * 20
+    half = "你好世界" * 10  # 40 characters, but 80 cells
+    for question_text in (cjk, f"Deploy {cjk} now?", f"{half} {half}"):
+        asked = QuestionPicker([_env_question(question=question_text)])
+        rendered = asked.render(80)
+        assert all(get_cwidth(text.rstrip("\n")) <= 80 for _, text in rendered)
+        wrapped = [text.strip() for style, text in rendered if style == ""]
+        assert "".join(wrapped).replace(" ", "") == question_text.replace(" ", "")
     # Agent text with newlines stays one row per option, so the height holds.
     multiline = QuestionPicker(
         [_env_question(header="Env\nironment", options=(("dev\nbox", "a\nb"), ("prod", "")))]
@@ -1928,13 +1941,28 @@ async def test_answer_pastes_and_clears_leave_the_chat_pastes_alone() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_question_that_only_takes_its_options_rejects_typing() -> None:
+@pytest.mark.parametrize(
+    ("question", "shown", "expected"),
+    [
+        (_env_question(allow_custom=False), "", {"Env?": "dev"}),
+        # A fixed default (``isOther: false``) is shown but can't be edited.
+        (
+            _env_question(options=(), allow_custom=False, text_default="fixed"),
+            "fixed",
+            {"Env?": "fixed"},
+        ),
+    ],
+    ids=["options-only", "fixed-default"],
+)
+async def test_a_question_that_takes_no_typed_answer_rejects_typing(
+    question: Any, shown: str, expected: Any
+) -> None:
     host = TerminalHost(model_name="test")
-    asking = await _open(host, _env_question(allow_custom=False))
-    await _press(host, "No")
-    assert host._answer_buffer.text == "" and host._prompt.default_buffer.text == ""
+    asking = await _open(host, question)
+    await _press(host, "CHANGED")
+    assert host._answer_buffer.text == shown and host._prompt.default_buffer.text == ""
     await _press(host, "\r")
-    assert await asking == {"Env?": "dev"}
+    assert await asking == expected
 
 
 @pytest.mark.asyncio
