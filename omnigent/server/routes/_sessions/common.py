@@ -530,6 +530,14 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
 
 
+# While a harness prompt is parked, the bound runner is re-told it is waiting
+# this often, so its idle watchdog keeps the turn open. The cap stops the
+# re-telling once the prompt has been pending this long from its first park,
+# letting an old runner idle out so the nightly host restart can upgrade it.
+_HARNESS_ELICITATION_RUNNER_HOLD_INTERVAL_S = 600.0
+_HARNESS_ELICITATION_RUNNER_HOLD_CAP_S = 6 * 60 * 60.0
+
+
 # How long an archive defers tearing down the session's runner, giving an Undo's
 # unarchive time to land first. When the teardown fires it re-reads the persisted
 # archived flag and skips if the session was unarchived, so any Undo whose

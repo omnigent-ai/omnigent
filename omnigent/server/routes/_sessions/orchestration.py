@@ -129,6 +129,7 @@ from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
+    _harness_elicitation_first_parked_at,
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
@@ -544,6 +545,7 @@ async def _publish_and_wait_for_harness_elicitation(
     # MCP verdict when a real web verdict settles the wait, so the
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
+    runner_hold_task: asyncio.Task[None] | None = None
     try:
         tombstone = _consume_pre_resolved_harness_elicitation(
             session_id, elicitation_id, request_fingerprint
@@ -559,6 +561,12 @@ async def _publish_and_wait_for_harness_elicitation(
         event_payload = event.model_dump()
         session_stream.publish(session_id, event_payload)
         published_request = True
+        first_parked_at = _harness_elicitation_first_parked_at.setdefault(
+            elicitation_id, time.monotonic()
+        )
+        runner_hold_task = asyncio.create_task(
+            _hold_runner_while_parked(session_id, first_parked_at)
+        )
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_request_to_ancestors,
@@ -616,6 +624,8 @@ async def _publish_and_wait_for_harness_elicitation(
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
+        if runner_hold_task is not None:
+            runner_hold_task.cancel()
         # Pop only our own entries — a hook retry may have re-parked
         # this id with a new future while this wait was unwinding.
         if _harness_elicitation_registry.get(elicitation_id) is future:
@@ -645,6 +655,42 @@ async def _publish_and_wait_for_harness_elicitation(
                     elicitation_id,
                     settled_action,
                 )
+
+
+async def _hold_runner_while_parked(session_id: str, first_parked_at: float) -> None:
+    """
+    Tell the bound runner its session is waiting on a parked prompt.
+
+    Runners that predate the runner-side hold exit after an idle window once
+    their pane reads quiet, which ends a turn still parked on a prompt. Re-sends
+    a ``waiting`` status every ``_HARNESS_ELICITATION_RUNNER_HOLD_INTERVAL_S``
+    until the prompt has been pending ``_HARNESS_ELICITATION_RUNNER_HOLD_CAP_S``
+    since its first park, then stops so the host can restart and upgrade. The
+    caller cancels this task when the wait ends. A failed forward is only logged.
+
+    :param session_id: Session whose runner is bound, e.g. ``"conv_abc123"``.
+    :param first_parked_at: ``time.monotonic()`` when this elicitation id was
+        first parked, e.g. ``1234.5``.
+    :returns: None.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    deadline = first_parked_at + _facade._HARNESS_ELICITATION_RUNNER_HOLD_CAP_S
+    while (remaining_s := deadline - time.monotonic()) > 0:
+        try:
+            await _forward_session_change_to_runner(
+                session_id,
+                get_server_runner_router(),
+                {"type": "external_session_status", "data": {"status": "waiting"}},
+            )
+        except Exception:  # noqa: BLE001 - the hold is advisory; the prompt wait must not see it
+            _logger.warning(
+                "Runner waiting-hold forward failed for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        await asyncio.sleep(min(_facade._HARNESS_ELICITATION_RUNNER_HOLD_INTERVAL_S, remaining_s))
 
 
 def _schedule_deferred_elicitation_clear(
