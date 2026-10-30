@@ -1415,7 +1415,7 @@ class TerminalHost:
                 ),
             )
             # Inline question selector, in the same slot as the menu, with its
-            # answer line when the question takes typed text.
+            # answer line while the typed text is what Enter sends.
             _question_selector = ConditionalContainer(
                 HSplit(
                     [
@@ -1425,7 +1425,7 @@ class TerminalHost:
                             dont_extend_height=True,
                         ),
                         ConditionalContainer(
-                            self._answer_window, filter=Condition(self._question_takes_text)
+                            self._answer_window, filter=Condition(self._answer_line_shown)
                         ),
                     ]
                 ),
@@ -3734,9 +3734,22 @@ class TerminalHost:
         self._answer_buffer.reset(document=Document(prefill, len(prefill)))
 
     def _question_takes_text(self) -> bool:
-        """Whether the open question accepts a typed answer, so its answer line shows."""
+        """Whether the open question accepts a typed answer."""
         picker = self._question_picker
         return picker is not None and (picker.current.allow_custom or not picker.current.options)
+
+    def _answer_line_shown(self) -> bool:
+        """Whether the answer line shows: only while its text is part of the answer.
+
+        A single-select answer uses it only on "Type something", so moving
+        onto an option hides it (typing again moves back) rather than leaving
+        text on screen that Enter would drop.
+        """
+        picker = self._question_picker
+        if picker is None or not self._question_takes_text():
+            return False
+        question = picker.current
+        return not question.options or question.multi_select or picker.on_custom_row()
 
     def _answer_line_count(self) -> int:
         rows = _prompt_input_visual_line_count(

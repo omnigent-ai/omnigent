@@ -18,6 +18,7 @@ from omnigent_client import StreamHooks
 
 from omnigent.repl._repl import (
     _ApprovalState,
+    _ApprovalVerdict,
     _FieldInputState,
     _question_prompts,
     _SessionsChatReplAdapter,
@@ -287,6 +288,60 @@ async def test_concurrent_prompts_are_asked_one_at_a_time() -> None:
     await second
 
     assert [args[1] for args in _posted(client)] == ["elicit_q", "elicit_second"]
+
+
+async def test_prompt_kinds_take_the_terminal_one_at_a_time() -> None:
+    # A question, a y/a/n approval and a schema form queued together open in
+    # turn, each only once the previous one is answered.
+    adapter, host, fis, client, approval_hook = _adapter()
+    _gate_approvals_on_the_user(adapter, approval_hook)
+    approvals = adapter._approval_state
+    form = _form_event("elicit_form", {"properties": {"name": {"type": "string"}}})
+    question = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+    await _until(lambda: host.selector_open, "the question never opened")
+    approval = asyncio.create_task(adapter._handle_elicitation("conv_abc", _approval_event()))
+    schema_form = asyncio.create_task(adapter._handle_elicitation("conv_abc", form))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert not approvals.pending and not fis.pending, "a prompt opened over the selector"
+
+    host.answer({"Env?": "dev"})
+    await _until(lambda: approvals.pending, "the approval never opened")
+    assert not host.selector_open and not fis.pending
+    approvals.resolve_verdict(_ApprovalVerdict.APPROVE_ONCE)
+    await approval
+    await _until(lambda: approvals.pending, "the form's approval never opened")
+    approvals.resolve_verdict(_ApprovalVerdict.APPROVE_ONCE)
+    await _until(lambda: fis.pending, "the form's field never opened")
+    fis.resolve("Ada")
+    await question
+    await schema_form
+
+    assert [args[1] for args in _posted(client)] == ["elicit_q", "elicit_approve", "elicit_form"]
+
+
+async def test_a_pre_approved_request_does_not_wait_for_an_open_question() -> None:
+    # "Approve always" answers it without input, so it skips the prompt queue.
+    adapter, host, _, client, approval_hook = _adapter()
+    _gate_approvals_on_the_user(adapter, approval_hook)
+    event = _approval_event()
+    adapter._approval_state.remember_always(event.policy_name, event.phase)
+    approval_hook.side_effect = lambda ctx: _pre_approved_hook(adapter, ctx)
+    question = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+    await _until(lambda: host.selector_open, "the question never opened")
+    approval = asyncio.create_task(adapter._handle_elicitation("conv_abc", event))
+    await _until(lambda: approval.done(), "the pre-approved request waited for the question")
+
+    assert host.selector_open, "the selector closed"
+    assert _posted(client) == [("conv_abc", "elicit_approve", {"action": "accept"})]
+    host.answer({"Env?": "dev"})
+    await question
+
+
+async def _pre_approved_hook(adapter: Any, ctx: Any) -> bool:
+    """run_repl's y/a/n hook for a cached "always": approve without prompting."""
+    assert adapter._approval_state.is_pre_approved(ctx.policy_name, ctx.phase)
+    return True
 
 
 async def test_prompt_settled_before_its_turn_is_never_shown() -> None:

@@ -4,7 +4,8 @@ Agents ask questions with options (Claude's ``AskUserQuestion``, Pi dialogs,
 Codex and Cursor questions). The host shows one question at a time below the
 toolbar: arrows move the highlight, Space toggles an option in multi-select,
 Enter answers, Esc dismisses. When typed answers are allowed, a
-"Type something" row takes the text in the selector's answer line.
+"Type something" row takes the text in the selector's answer line; a
+single-select answer uses that text only while the row is highlighted.
 """
 
 from __future__ import annotations

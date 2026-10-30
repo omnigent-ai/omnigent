@@ -2891,20 +2891,41 @@ class _SessionsChatReplAdapter:
     async def _answer_prompt(self, session_id: str, ticket: _PromptTicket) -> None:
         """Prompt for *ticket* when its turn comes and POST the verdict."""
         try:
-            async with self._prompt_lock:
-                if ticket.settled:
-                    return  # its verdict is no longer wanted from here
-                self._open_ticket = ticket
-                try:
-                    resolve_payload = await self._collect_verdict(ticket)
-                finally:
-                    self._open_ticket = None
+            if self._pre_approved(ticket):
+                # Answered without input, so it needn't wait for the prompt.
+                resolve_payload = await self._collect_verdict(ticket)
+            else:
+                async with self._prompt_lock:
+                    if ticket.settled:
+                        return  # its verdict is no longer wanted from here
+                    self._open_ticket = ticket
+                    try:
+                        resolve_payload = await self._collect_verdict(ticket)
+                    finally:
+                        self._open_ticket = None
             if resolve_payload is not None:
                 await self._post_elicitation_verdict(session_id, ticket, resolve_payload)
         finally:
             # Finished with this request, so a later one may reuse its id.
             if self._prompt_tickets.get(ticket.elicitation_id) is ticket:
                 del self._prompt_tickets[ticket.elicitation_id]
+
+    def _pre_approved(self, ticket: _PromptTicket) -> bool:
+        """Whether *ticket* is a y/a/n approval the user already said "always" to.
+
+        Its hook approves it without prompting, unless accepting it would
+        still ask for schema fields.
+        """
+        event = ticket.event
+        if self._approval_state is None or getattr(event, "ask_user_question", None) is not None:
+            return False
+        policy_name = getattr(event, "policy_name", "")
+        if not self._approval_state.is_pre_approved(policy_name, getattr(event, "phase", "")):
+            return False
+        schema = getattr(event, "requested_schema", None) or {}
+        return not schema.get("properties") or (
+            _build_elicitation_content_from_schema(schema) is not None
+        )
 
     async def _collect_verdict(self, ticket: _PromptTicket) -> dict[str, object] | None:
         """Prompt for *ticket*'s request and build its resolve payload (``None``: post nothing)."""

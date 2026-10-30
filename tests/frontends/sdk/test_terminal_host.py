@@ -1981,6 +1981,29 @@ async def test_editor_question_leaves_the_arrows_to_its_text(tmp_path: Any) -> N
 
 
 @pytest.mark.asyncio
+async def test_the_answer_line_shows_only_while_its_text_is_the_answer() -> None:
+    # Single-select: the typed text belongs to "Type something", so moving onto
+    # an option hides it and Enter sends the option shown, not hidden text.
+    host = TerminalHost(model_name="test")
+    single = await _open(host, _env_question())
+    assert not host._answer_line_shown()
+    await _press(host, "teal")
+    assert host._question_picker is not None and host._question_picker.on_custom_row()
+    assert host._answer_line_shown()
+    await _press(host, "\x1b[A")  # Up onto "prod"
+    assert not host._answer_line_shown()
+    await _press(host, "\r")
+    assert await single == {"Env?": "prod"}
+
+    # Multi-select sends the typed text with the checked options, so it stays.
+    multi = await _open(host, _env_question(multi_select=True))
+    await _press(host, "eu-1\x1b[A ")  # type, Up onto "prod", Space checks it
+    assert host._answer_line_shown()
+    await _press(host, "\r")
+    assert await multi == {"Env?": ["prod", "eu-1"]}
+
+
+@pytest.mark.asyncio
 async def test_question_with_options_ignores_a_prefill() -> None:
     # A prefill would read as typing and move the highlight to "Type
     # something"; only option-less (editor) questions start prefilled.
