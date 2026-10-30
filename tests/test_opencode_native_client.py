@@ -646,3 +646,25 @@ async def test_request_json_http_error_raises() -> None:
     with pytest.raises(OpenCodeClientError):
         await client.list_messages("ses_1")
     await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "item"),
+    [
+        ("list_pending_permissions", "/api/session/ses_1/permission", {"id": "per_1"}),
+        ("list_pending_forms", "/api/session/ses_1/form", {"id": "frm_1"}),
+    ],
+)
+async def test_list_pending_requests_unwraps_data(
+    method: str, path: str, item: dict[str, object]
+) -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"data": [item, "not-an-object"]})
+
+    client = _client(handler)
+    assert await getattr(client, method)("ses_1") == [item]
+    assert seen == [path]
+    await client.aclose()

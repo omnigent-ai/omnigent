@@ -16,6 +16,8 @@ from itertools import chain
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar, cast, get_args
 
+import httpx
+
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.harnesses.claude_native.bridge import (
     RESUME_COPY_MARKER_SUFFIX,
@@ -215,7 +217,7 @@ async def _list_opencode_root_sessions(limit: int) -> list[tuple[str, float]]:
     async with _opencode_import_client() as client:
         try:
             sessions = await client.list_root_sessions(limit=limit)
-        except OpenCodeClientError as exc:
+        except (OpenCodeClientError, httpx.HTTPError) as exc:
             raise SessionImportNotFoundError(f"OpenCode session list failed: {exc}") from exc
     recent: list[tuple[str, float]] = []
     for session in sessions:
@@ -1858,7 +1860,7 @@ async def _fetch_opencode_session(
             if session is None:
                 raise SessionImportNotFoundError(f"OpenCode session {session_id!r} was not found")
             messages = await client.list_messages(session_id)
-        except OpenCodeClientError as exc:
+        except (OpenCodeClientError, httpx.HTTPError) as exc:
             raise SessionImportNotFoundError(
                 f"OpenCode session {session_id!r} could not be read: {exc}"
             ) from exc

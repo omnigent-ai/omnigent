@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
@@ -19,7 +20,7 @@ from omnigent.harnesses.kiro_native.session_forwarder import (
     parse_kiro_jsonl_line,
 )
 from omnigent.harnesses.opencode_native.app_server import OpenCodeCliNotFoundError
-from omnigent.harnesses.opencode_native.client import OpenCodeSession
+from omnigent.harnesses.opencode_native.client import OpenCodeClientError, OpenCodeSession
 from omnigent.harnesses.pi_native.resume import pi_session_records_from_session_items
 from omnigent.session_import import local as local_import
 from omnigent.session_import.local import (
@@ -246,6 +247,29 @@ def test_list_recent_opencode_sessions_uses_server_listing(
 
     assert list_recent_local_session_ids("opencode", limit=2) == ("ses_new", "ses_old")
     assert fake.list_limits == [2]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OpenCodeClientError("list failed: 500", status_code=500),
+        httpx.ReadTimeout("slow import server"),
+    ],
+    ids=["status", "transport"],
+)
+def test_list_recent_opencode_sessions_reports_server_failures_as_not_found(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """A failing import server must not abort the caller's cross-harness listing."""
+
+    class _FailingClient(_FakeImportClient):
+        async def list_root_sessions(self, *, limit: int = 100) -> list[OpenCodeSession]:
+            raise error
+
+    _use_import_client(monkeypatch, _FailingClient())
+
+    with pytest.raises(SessionImportNotFoundError, match="OpenCode session list failed"):
+        list_recent_local_session_ids("opencode", limit=2)
 
 
 def test_list_recent_opencode_sessions_without_store_skips_server(

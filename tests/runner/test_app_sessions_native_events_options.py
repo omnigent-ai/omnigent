@@ -1428,7 +1428,7 @@ async def test_events_clear_on_opencode_native_relaunches_fresh(
     tmp_path: Path,
 ) -> None:
     """``/clear`` relaunches OpenCode without resuming, forking, or seeding."""
-    import omnigent.runner.app as runner_app
+    from omnigent.runner import native_controls
     from tests.runner.helpers import make_test_terminal_instance
 
     conv_id = "4f1c2b7e9d0a4c55b1e7a3c9d2f60a18"
@@ -1447,7 +1447,7 @@ async def test_events_clear_on_opencode_native_relaunches_fresh(
     async def _fake_auto_create(*args: Any, **kwargs: Any) -> None:
         calls.append(kwargs)
 
-    monkeypatch.setattr(runner_app, "_auto_create_opencode_terminal", _fake_auto_create)
+    monkeypatch.setattr(native_controls, "_auto_create_opencode_terminal", _fake_auto_create)
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("opencode", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("opencode", "main")] = instance

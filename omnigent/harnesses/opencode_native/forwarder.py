@@ -461,6 +461,11 @@ def _child_session_id(response: httpx.Response | None) -> str | None:
     return child if isinstance(child, str) and child else None
 
 
+def _synthetic_event(event_type: str, data: Mapping[str, Any]) -> OpenCodeEvent:
+    """Wrap a REST payload as the event that would have carried it live."""
+    return OpenCodeEvent(id=None, type=event_type, data=dict(data), location=None)
+
+
 def _history_message_settled(message: Mapping[str, Any]) -> bool:
     """Return whether a v2 ``Session.Message.Info`` can no longer change."""
     kind = message.get("type")
@@ -548,7 +553,8 @@ class OpenCodeNativeForwarder:
         Run the SSE consume loop with reconnect/backoff and gap-fill.
 
         The first connection pre-marks persisted history; every reconnect
-        replays history persisted after the last settled message.
+        replays history persisted after the last settled message. Either runs
+        once the stream is open, so nothing emitted meanwhile is lost.
 
         :param max_reconnects: Reconnect cap (``None`` = unbounded); used by
             tests to bound the loop.
@@ -557,12 +563,9 @@ class OpenCodeNativeForwarder:
         backoff = 0.5
         try:
             while True:
-                if attempt == 0:
-                    await self.seed_dedupe_from_history()
-                else:
-                    await self.catch_up_from_history()
+                prime = self._seed_once if attempt == 0 else self._catch_up_once
                 try:
-                    await self._consume_once()
+                    await self._consume_once(prime=prime)
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # reconnect on any transient SSE failure.
@@ -589,9 +592,27 @@ class OpenCodeNativeForwarder:
         self._permission_tasks.clear()
         self._form_tasks.clear()
 
-    async def _consume_once(self) -> None:
-        """Consume the event stream once, dispatching each event."""
+    async def _seed_once(self) -> None:
+        """Prime the first connection: pre-mark history, then answer pending requests."""
+        await self.seed_dedupe_from_history()
+        await self.replay_pending_requests()
+
+    async def _catch_up_once(self) -> None:
+        """Prime a reconnect: replay missed history, then answer pending requests."""
+        await self.catch_up_from_history()
+        await self.replay_pending_requests()
+
+    async def _consume_once(self, *, prime: Callable[[], Awaitable[None]] | None = None) -> None:
+        """
+        Consume the event stream once, dispatching each event.
+
+        :param prime: Run when the first frame (``server.connected``) arrives,
+            before any event is dispatched; later frames wait in the stream.
+        """
         async for event in self._opencode.stream_events():
+            if prime is not None:
+                await prime()
+                prime = None
             try:
                 await self.handle_event(event)
             except asyncio.CancelledError:
@@ -1813,10 +1834,13 @@ class OpenCodeNativeForwarder:
             return
         turn = self._turns[self._opencode_session_id]
         settled_prefix = True
+        # Ids listed since the last ``idle``: an ``idle`` ends the active turn only
+        # when that turn's own messages precede it, never a stale earlier one.
+        since_idle: set[str] = set()
         for message in messages:
             if not isinstance(message, Mapping):
                 continue
-            await self._replay_history_message(turn, message)
+            await self._replay_history_message(turn, message, since_idle=since_idle)
             message_id = _str_field(message, "id")
             if settled_prefix and message_id is not None and _history_message_settled(message):
                 self._last_seen_message_id = message_id
@@ -1830,13 +1854,19 @@ class OpenCodeNativeForwarder:
             )
 
     async def _replay_history_message(
-        self, turn: _SessionTurn, message: Mapping[str, Any]
+        self, turn: _SessionTurn, message: Mapping[str, Any], *, since_idle: set[str]
     ) -> None:
         """Post one history message's unseen user text, assistant text, and tools."""
         message_id = _str_field(message, "id")
         if message_id is None:
             return
         kind = message.get("type")
+        if kind == "idle":
+            if turn.running_response_id in since_idle or turn.assistant_message_id in since_idle:
+                await self._replay_idle(turn, message.get("outcome"))
+            since_idle.clear()
+            return
+        since_idle.add(message_id)
         if kind == "user":
             await self._post_user_payload(turn, message_id, message)
             return
@@ -1852,6 +1882,7 @@ class OpenCodeNativeForwarder:
                 text = item.get("text")
                 key = self._key("text-final", message_id, str(text_ordinal))
                 if isinstance(text, str) and text and self.state.mark(key):
+                    await self._open_replayed_turn(turn, message_id)
                     await self._post_assistant_text(
                         turn,
                         text,
@@ -1878,6 +1909,7 @@ class OpenCodeNativeForwarder:
         raw_input = state.get("input")
         arguments = dict(raw_input) if isinstance(raw_input, Mapping) else {}
         if self.state.mark(self._key("tool-call", call_id)):
+            await self._open_replayed_turn(turn, message_id)
             await self._post_tool_call(turn, call_id, name, arguments, message_id=message_id)
         if status == "completed" and self.state.mark(self._key("tool-out", call_id)):
             output = opencode_tool_content_text(state.get("content"))
@@ -1885,6 +1917,54 @@ class OpenCodeNativeForwarder:
         elif status == "error" and self.state.mark(self._key("tool-out", call_id)):
             output = opencode_tool_content_text(state.get("content"), error=state.get("error"))
             await self._post_tool_output(turn, call_id, output, message_id=message_id)
+
+    async def _open_replayed_turn(self, turn: _SessionTurn, message_id: str) -> None:
+        """Open, or give an id to, the turn a missed item belongs to before posting it."""
+        if turn.turn_active and turn.running_response_id is not None:
+            return
+        if turn.assistant_message_id is None:
+            turn.assistant_message_id = message_id
+        await self._begin_turn_if_needed(turn)
+
+    async def _replay_idle(self, turn: _SessionTurn, outcome: object) -> None:
+        """End a turn whose ``idle`` history message was persisted during an outage."""
+        if not turn.turn_active:
+            return
+        if outcome == "failed":
+            await self._post_session_usage()
+            await self._end_turn(
+                turn,
+                status=_STATUS_FAILED,
+                extra={"output": "OpenCode session ended with an error."},
+            )
+            return
+        await self._finish_turn(turn)
+
+    async def replay_pending_requests(self) -> None:
+        """
+        Answer permission requests and forms raised while the stream was down.
+
+        Neither event is persisted in message history, and OpenCode blocks on
+        each until it is answered. Dedupe keys make a request already handled
+        live a no-op. Best effort per session.
+        """
+        for session_id, turn in list(self._turns.items()):
+            if turn.conversation_id is None:
+                continue
+            try:
+                permissions = await self._opencode.list_pending_permissions(session_id)
+                forms = await self._opencode.list_pending_forms(session_id)
+            except Exception:
+                _logger.debug(
+                    "OpenCode forwarder could not list pending requests for %s",
+                    session_id,
+                    exc_info=True,
+                )
+                continue
+            for request in permissions:
+                await self._on_permission_asked(_synthetic_event("permission.asked", request))
+            for form in forms:
+                await self._on_form_created(_synthetic_event("form.created", {"form": form}))
 
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:

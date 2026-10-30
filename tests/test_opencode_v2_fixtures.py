@@ -2,14 +2,18 @@
 
 The fixtures are committed, not generated in CI: they were captured from a
 real ``opencode serve`` 2.0.18 and must be recaptured when the OpenCode wire
-protocol this harness targets changes. This module fails loudly if they are
+protocol this harness targets changes. ``openapi.json`` is trimmed to the routes
+the client calls and the schemas those routes reference. This module fails loudly if they are
 missing or malformed, so the harness tests never run against nothing.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 
+from omnigent.harnesses.opencode_native import client as opencode_client
 from tests.opencode_v2_fixtures import (
     EVENTS_PATH,
     MESSAGES_PATH,
@@ -46,6 +50,20 @@ def test_openapi_fixture_parses_and_has_expected_paths() -> None:
     payload = json.loads(OPENAPI_PATH.read_text(encoding="utf-8"))
     assert "/api/session/{sessionID}/prompt" in payload["paths"]
     assert "/api/session/{sessionID}/permission/{requestID}/reply" in payload["paths"]
+
+
+def test_every_client_route_exists_in_the_captured_spec() -> None:
+    """The fixture keeps only the routes the client calls; each must be a real 2.0.18 route."""
+    payload = json.loads(OPENAPI_PATH.read_text(encoding="utf-8"))
+
+    def _shape(route: str) -> str:
+        return re.sub(r"\{[^}]+\}", "{}", route)
+
+    client_source = inspect.getsource(opencode_client)
+    client_routes = {_shape(route) for route in re.findall(r'"(/api/[^"]*)"', client_source)}
+    spec_routes = {_shape(route) for route in payload["paths"]}
+    assert client_routes, "no /api routes found in the client source"
+    assert client_routes <= spec_routes, sorted(client_routes - spec_routes)
 
 
 def test_events_fixture_has_required_types() -> None:

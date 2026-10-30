@@ -11,9 +11,10 @@ into the session, and web turns are injected over loopback HTTP.
 
 ## Supported version
 
-OpenCode **2.0.x** (`>=2.0.0,<3.0.0`), published on npm as `@opencode/cli`.
-OpenCode 1.x (`opencode-ai`) is no longer supported. A host running it reports
-the harness as *outdated* until it is upgraded.
+OpenCode **2.0.18 or a later 2.0.x patch** (`>=2.0.18,<2.1.0`), published on npm
+as `@opencode/cli`. Newer minors are refused until they are validated. OpenCode
+1.x (`opencode-ai`) is no longer supported. A host running an unsupported version
+reports the harness as *outdated* until it is upgraded.
 `OMNIGENT_OPENCODE_SKIP_VERSION_CHECK=1` bypasses the gate at your own risk.
 
 ## Install and sign in

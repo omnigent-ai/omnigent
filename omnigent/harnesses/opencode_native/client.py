@@ -404,6 +404,28 @@ class OpenCodeClient:
             if isinstance(item, Mapping) and isinstance(item.get("id"), str) and item.get("id")
         ]
 
+    async def list_pending_permissions(self, session_id: str) -> list[_JsonObject]:
+        """
+        List a session's unanswered permission requests (``GET .../permission``).
+
+        :param session_id: OpenCode session id.
+        :returns: ``Permission.Request`` objects, the ``permission.asked`` payload shape.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        data = await self._request_json("GET", f"/api/session/{session_id}/permission")
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    async def list_pending_forms(self, session_id: str) -> list[_JsonObject]:
+        """
+        List a session's unanswered forms (``GET .../form``).
+
+        :param session_id: OpenCode session id.
+        :returns: ``Form.Info`` objects, the ``form.created`` ``form`` shape.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        data = await self._request_json("GET", f"/api/session/{session_id}/form")
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
     async def get_context(self, session_id: str) -> list[_JsonObject]:
         """
         Fetch the messages the model sees next turn (``GET .../context``).

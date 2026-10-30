@@ -7,6 +7,7 @@ content produced before the drop is never re-posted.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -40,6 +41,8 @@ class _FakeOpenCodeClient:
         self.after_ids: list[str | None] = []
         self._event_batches: list[list[OpenCodeEvent]] = []
         self._batch_index = 0
+        self.permission_replies: list[tuple[str, str, str]] = []
+        self.pending_permissions: dict[str, list[dict[str, Any]]] = {}
 
     async def list_messages(
         self, session_id: str, *, after_id: str | None = None
@@ -58,10 +61,21 @@ class _FakeOpenCodeClient:
     async def reply_permission(
         self, session_id: str, request_id: str, decision: str, message: str | None = None
     ) -> bool:
+        self.permission_replies.append((session_id, request_id, decision))
         return True
 
+    async def list_pending_permissions(self, session_id: str) -> list[dict[str, Any]]:
+        return self.pending_permissions.get(session_id, [])
+
+    async def list_pending_forms(self, session_id: str) -> list[dict[str, Any]]:
+        return []
+
     async def stream_events(self) -> AsyncIterator[OpenCodeEvent]:
-        """Yield one batch of events per call (simulates separate SSE connections)."""
+        """Yield one batch of events per call (simulates separate SSE connections).
+
+        Each connection opens with ``server.connected``, as a real server's does.
+        """
+        yield OpenCodeEvent(id=None, type="server.connected", data={}, location=None)
         if self._batch_index < len(self._event_batches):
             batch = self._event_batches[self._batch_index]
             self._batch_index += 1
@@ -210,7 +224,9 @@ async def test_catch_up_called_on_reconnect_not_initial_connect() -> None:
     fwd.seed_dedupe_from_history = _counting_seed  # type: ignore[method-assign]
     fwd.catch_up_from_history = _counting_catch_up  # type: ignore[method-assign]
 
-    async def _failing_consume() -> None:
+    async def _failing_consume(*, prime: Any = None) -> None:
+        # Each connection primes on its first frame, then drops.
+        await prime()
         raise httpx.ReadError("dropped", request=httpx.Request("GET", "http://x/api/event"))
 
     fwd._consume_once = _failing_consume  # type: ignore[method-assign]
@@ -395,3 +411,81 @@ async def test_catch_up_skips_streaming_tool() -> None:
     await _run(fwd, max_reconnects=1)
     items = [b["data"] for _u, b in server.posts if b["type"] == "external_conversation_item"]
     assert [i["item_type"] for i in items] == ["function_call"]
+
+
+def _status_edges(server: _RecordingServerClient) -> list[tuple[str, str | None]]:
+    return [
+        (body["data"]["status"], body["data"].get("response_id"))
+        for _u, body in server.posts
+        if body["type"] == "external_session_status"
+    ]
+
+
+async def test_turn_that_ends_during_an_outage_is_closed_by_catch_up() -> None:
+    """The ``idle`` history message ends the turn, so the next turn opens its own edge."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    first_turn = _live_text_turn("msg_1", "first")
+    opencode.message_snapshots = [
+        [],
+        [
+            {"id": "msg_u1", "type": "user", "text": "hi", "time": {"created": 1}},
+            _assistant("msg_1", _text("first")),
+            {"id": "msg_i1", "type": "idle", "outcome": "succeeded", "time": {"created": 3}},
+        ],
+    ]
+    # The stream drops after the step started, before the turn's terminal events.
+    opencode._event_batches = [first_turn[:2], _live_text_turn("msg_2", "second")]
+
+    await _run(fwd, max_reconnects=1)
+
+    assert _status_edges(server) == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+        ("running", "msg_2"),
+        ("idle", "msg_2"),
+    ]
+    assert _assistant_texts(server) == ["first", "second"]
+
+
+async def test_stale_idle_does_not_end_a_newer_turn() -> None:
+    """An ``idle`` listed before the active turn's own messages belongs to an older turn."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    opencode.message_snapshots = [
+        [],
+        [
+            _assistant("msg_old", _text("old"), completed=False),
+            {"id": "msg_i0", "type": "idle", "outcome": "succeeded", "time": {"created": 2}},
+            _assistant("msg_2", _text("still going"), completed=False),
+        ],
+    ]
+    live = _live_text_turn("msg_2", "still going")
+    opencode._event_batches = [live[:2], []]
+
+    await _run(fwd, max_reconnects=1)
+
+    assert _status_edges(server) == [("running", "msg_2")]
+
+
+async def test_permission_asked_during_an_outage_is_answered_once() -> None:
+    """``permission.asked`` is not in history; the pending listing still gets a reply."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    opencode.pending_permissions[_SESSION] = [
+        {
+            "action": "shell",
+            "id": "per_1",
+            "resources": ["ls"],
+            "sessionID": _SESSION,
+            "source": {"id": "call_1", "messageID": "msg_1", "type": "tool"},
+        }
+    ]
+
+    # Each connection's priming lists it again; it is answered once.
+    for _connection in range(2):
+        await fwd.replay_pending_requests()
+        await asyncio.gather(*fwd._permission_tasks.values())
+
+    # No evaluator is wired, so the reply fails closed.
+    assert opencode.permission_replies == [(_SESSION, "per_1", "reject")]

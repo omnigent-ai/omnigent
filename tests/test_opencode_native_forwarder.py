@@ -51,6 +51,15 @@ class _FakeOpenCodeClient:
         self.form_replies: list[tuple[str, str, dict[str, Any]]] = []
         self.form_cancels: list[tuple[str, str]] = []
         self.stream: list[OpenCodeEvent] = []
+        # session id -> requests still awaiting an answer (REST listings).
+        self.pending_permissions: dict[str, list[dict[str, Any]]] = {}
+        self.pending_forms: dict[str, list[dict[str, Any]]] = {}
+
+    async def list_pending_permissions(self, session_id: str) -> list[dict[str, Any]]:
+        return self.pending_permissions.get(session_id, [])
+
+    async def list_pending_forms(self, session_id: str) -> list[dict[str, Any]]:
+        return self.pending_forms.get(session_id, [])
 
     async def list_messages(
         self, session_id: str, *, after_id: str | None = None
@@ -73,6 +82,8 @@ class _FakeOpenCodeClient:
         return True
 
     async def stream_events(self) -> AsyncIterator[OpenCodeEvent]:
+        # A real server's first frame on every connection is server.connected.
+        yield OpenCodeEvent(id=None, type="server.connected", data={}, location=None)
         for event in self.stream:
             yield event
 
@@ -214,10 +225,14 @@ async def test_consume_once_dispatches_stream_events() -> None:
     async def _record(event: OpenCodeEvent) -> None:
         seen.append(event.type)
 
+    async def _prime() -> None:
+        seen.append("primed")
+
     fwd.handle_event = _record  # type: ignore[method-assign]
     opencode.stream = [_event("session.status", status={"type": "busy"})]
-    await fwd._consume_once()
-    assert seen == ["session.status"]
+    await fwd._consume_once(prime=_prime)
+    # Priming runs once the stream is open, before any frame is dispatched.
+    assert seen == ["primed", "server.connected", "session.status"]
 
 
 async def test_run_reconnects_until_cap() -> None:
@@ -226,7 +241,7 @@ async def test_run_reconnects_until_cap() -> None:
     fwd = _forwarder(server, opencode)
     calls = {"n": 0}
 
-    async def failing_consume() -> None:
+    async def failing_consume(*, prime: Any = None) -> None:
         calls["n"] += 1
         raise httpx.ReadError("dropped", request=httpx.Request("GET", "http://x/api/event"))
 

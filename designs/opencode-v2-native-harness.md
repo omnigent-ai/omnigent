@@ -1,7 +1,6 @@
 # OpenCode v2 support for `opencode-native`
 
 **Status:** implemented · **Date:** 2026-09-25 · **Harness:** `opencode-native` ·
-**Plan:** [`opencode-v2-native-harness-plan.md`](opencode-v2-native-harness-plan.md) ·
 **User guide:** [`docs/opencode-native.md`](../docs/opencode-native.md)
 
 ## Goal
@@ -61,8 +60,9 @@ the docs at `https://opencode.ai/v2/docs/build/{sdk,client,plugins}`, and npm.
 
 ### 1. Process, auth, version, install
 
-- `client.py`: `OPENCODE_MIN_VERSION = "2.0.0"`,
-  `OPENCODE_MAX_VERSION_EXCLUSIVE = "3.0.0"`. `parse_opencode_version` accepts
+- `client.py`: `OPENCODE_MIN_VERSION = "2.0.18"`,
+  `OPENCODE_MAX_VERSION_EXCLUSIVE = "2.1.0"` (the validated release through its
+  patch line; widen after validating a newer minor). `parse_opencode_version` accepts
   `opencode v2.0.18`. `OMNIGENT_OPENCODE_SKIP_VERSION_CHECK` stays.
 - Install spec (`onboarding/harness_install.py`, `deploy/docker/
   install-harness-cli.sh`): `@opencode/cli@~2.0.18`, binary `opencode`, login

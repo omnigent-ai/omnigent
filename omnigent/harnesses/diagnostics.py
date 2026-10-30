@@ -13,7 +13,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from omnigent.debug_logging import debug_event
 from omnigent.process_logging import redact_log_text
 
 DIAGNOSTIC_TAIL_BYTES = 64 * 1024
@@ -96,6 +95,10 @@ def report_stderr_capture_start_failure(
     error_type: str,
 ) -> None:
     """Best-effort, payload-free warning without logging I/O on the pipe reader."""
+
+    # Imported lazily: debug_logging pulls in httpx, and the import-light hook
+    # entrypoints reach this module only for its text helpers.
+    from omnigent.debug_logging import debug_event
 
     def emit() -> None:
         with contextlib.suppress(Exception):
@@ -213,6 +216,8 @@ class HarnessStderrExporter:
     def _emit(
         self, records: deque[bytes], omitted_lines: int, omitted_bytes: int, offset: int
     ) -> None:
+        from omnigent.debug_logging import debug_event
+
         session_id = None
         with contextlib.suppress(Exception):
             session_id = self._session_id()
