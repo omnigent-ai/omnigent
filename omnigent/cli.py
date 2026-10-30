@@ -4024,7 +4024,11 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     """
     import httpx as _httpx
 
-    from omnigent.chat import _remote_headers
+    from omnigent.chat import (
+        _forget_refused_credential,
+        _remember_accepted_credential,
+        _remote_headers,
+    )
     from omnigent.cli_auth import (
         is_workspace_hosted_url,
         load_databricks_org_id,
@@ -4032,6 +4036,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         pinned_databricks_org_id,
         store_databricks_auth,
     )
+    from omnigent.inner.databricks_executor import _forget_remembered_profile, _remember_profile
 
     org_id = load_databricks_org_id(server)
     headers = _remote_headers(server_url=server, host_id=None)
@@ -4045,7 +4050,10 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         org_id = _verified_databricks_org_id(probe, org_id)
         if org_id and is_workspace_hosted_url(server):
             _persist_databricks_org_id(server, org_id)
+        _remember_accepted_credential(server, headers.get("Authorization"))
         return
+    # Neither later clients nor the recovery below may reuse what was refused.
+    _forget_refused_credential(server)
     workspace_host = _databricks_workspace_login_target(server, probe)
     credential_rejected = False
     if workspace_host is None and probe.status_code in (401, 403):
@@ -4061,6 +4069,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         credential_rejected = workspace_host is not None and "Authorization" in headers
     if workspace_host is None:
         return
+    _forget_remembered_profile(workspace_host)
     auth_info = _databricks_workspace_auth_info(workspace_host)
     if auth_info is not None:
         if org_id is None:
@@ -4071,6 +4080,8 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         if refreshed_probe.status_code == 200:
             org_id = _verified_databricks_org_id(refreshed_probe, org_id)
             store_databricks_auth(server, workspace_host, org_id=org_id)
+            if auth_info.profile_name:
+                _remember_profile(workspace_host, auth_info.profile_name)
             return
     # User-facing: show the display form (the workspace /omnigent URL, with
     # ?o= when known), not the internal API mount; it round-trips through
@@ -13521,6 +13532,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         )
 
     from omnigent.cli_auth import is_workspace_hosted_url
+    from omnigent.inner.databricks_executor import _forget_remembered_profile, _remember_profile
 
     auth_info = _databricks_workspace_auth_info(workspace_host)
     if org_id is None and auth_info is not None:
@@ -13576,6 +13588,8 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"The cached Databricks credentials were rejected by {display} "
             f"(HTTP {verify.status_code}) — refreshing the workspace login."
         )
+        # Mint after the login in the default profile order, not the refused one first.
+        _forget_remembered_profile(workspace_host)
         auth_info = _login_and_mint_workspace_auth_info(workspace_host, org_id)
         token = auth_info.token
         if org_id is None:
@@ -13591,6 +13605,8 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"(HTTP {verify.status_code}). Check that your user has access to this app."
         )
     org_id = _verified_databricks_org_id(verify, org_id)
+    if auth_info is not None and auth_info.profile_name:
+        _remember_profile(workspace_host, auth_info.profile_name)
     user_id: str | None = None
     with contextlib.suppress(ValueError):
         raw_user = verify.json().get("user_id")

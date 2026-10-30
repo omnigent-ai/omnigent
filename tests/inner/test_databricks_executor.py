@@ -1810,7 +1810,7 @@ def test_resolve_auth_for_host_prefers_matching_profile(
 def test_resolve_auth_for_host_uses_profile_cli_when_sdk_is_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SDK profile auth can still hit ambiguous host lookup for CLI profiles."""
+    """CLI profiles mint by profile before the SDK, whose host lookup is ambiguous here."""
     from omnigent.inner import databricks_executor
 
     cfg_path = tmp_path / "databrickscfg"
@@ -1857,7 +1857,6 @@ def test_resolve_auth_for_host_uses_profile_cli_when_sdk_is_ambiguous(
     assert auth.current_token() == "fresh-token"
     assert host == "https://example.databricks.com"
     assert attempts == [
-        ("sdk", {"profile": "expired"}),
         (
             "cli",
             [
@@ -1870,7 +1869,7 @@ def test_resolve_auth_for_host_uses_profile_cli_when_sdk_is_ambiguous(
                 "json",
             ],
         ),
-        ("sdk", {"profile": "fresh"}),
+        ("sdk", {"profile": "expired"}),
         (
             "cli",
             [
@@ -1884,6 +1883,163 @@ def test_resolve_auth_for_host_uses_profile_cli_when_sdk_is_ambiguous(
             ],
         ),
     ]
+
+
+def _fake_profile_sources(
+    monkeypatch: pytest.MonkeyPatch, *, stale: set[str], sdk_tokens: dict[str, str]
+) -> list[tuple[str, str]]:
+    """Fake the SDK and the Databricks CLI per profile and record each attempt.
+
+    :param stale: Profiles whose CLI login has expired.
+    :param sdk_tokens: Profiles the SDK authenticates, mapped to their token.
+    :returns: The ``(source, profile)`` attempts, in order.
+    """
+    from omnigent.inner import databricks_executor
+
+    attempts: list[tuple[str, str]] = []
+
+    def _sdk(**kwargs: str) -> _StubSdkConfig:
+        attempts.append(("sdk", kwargs["profile"]))
+        if kwargs["profile"] not in sdk_tokens:
+            raise ValueError("default auth: cannot configure default credentials")
+        return _StubSdkConfig(
+            host="https://example.databricks.com", token=sdk_tokens[kwargs["profile"]]
+        )
+
+    def _cli(args: list[str], **kwargs: object) -> SimpleNamespace:
+        profile = args[args.index("--profile") + 1]
+        attempts.append(("cli", profile))
+        if profile in stale:
+            return SimpleNamespace(returncode=1, stdout="", stderr="refresh token is invalid")
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"access_token": f"{profile}-token"}), stderr=""
+        )
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _sdk)
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(databricks_executor.subprocess, "run", _cli)
+    return attempts
+
+
+def test_resolve_auth_for_host_mints_cli_profiles_without_the_sdk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A working ``databricks-cli`` profile never loads the SDK (~0.7 s to import)."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[ws]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setitem(sys.modules, "databricks.sdk.config", None)
+    attempts = _fake_profile_sources(monkeypatch, stale=set(), sdk_tokens={})
+
+    auth, host = databricks_executor._resolve_databricks_auth(
+        host="https://example.databricks.com"
+    )
+
+    assert auth.current_token() == "ws-token"
+    assert host == "https://example.databricks.com"
+    assert attempts == [("cli", "ws")]
+
+
+def test_resolve_auth_for_host_tries_the_remembered_profile_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the server accepted a profile, later walks skip the stale login listed first."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[stale]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+        "[live]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    attempts = _fake_profile_sources(monkeypatch, stale={"stale"}, sdk_tokens={})
+
+    first, _ = databricks_executor._resolve_databricks_auth(host="https://example.databricks.com")
+    assert first.current_token() == "live-token"
+    assert attempts == [("cli", "stale"), ("sdk", "stale"), ("cli", "live")]
+    assert databricks_executor._remembered_profiles() == {}, "minting alone remembers nothing"
+
+    databricks_executor._remember_profile("https://example.databricks.com", "live")
+    attempts.clear()
+    later, _ = databricks_executor._resolve_databricks_auth(host="https://example.databricks.com")
+
+    assert later.current_token() == "live-token"
+    assert attempts == [("cli", "live")]
+
+    databricks_executor._forget_remembered_profile("https://example.databricks.com")
+    attempts.clear()
+    databricks_executor._resolve_databricks_auth(host="https://example.databricks.com")
+    assert attempts[0] == ("cli", "stale")
+
+
+def test_remembered_profile_keeps_the_identity_preference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A service principal is never remembered, and the env profile stays first."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[user]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+        "[sp]\nhost = https://example.databricks.com\n"
+        "client_id = svc-id\nclient_secret = svc-secret\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    attempts = _fake_profile_sources(
+        monkeypatch, stale={"user", "sp"}, sdk_tokens={"sp": "sp-token"}
+    )
+
+    databricks_executor._remember_profile("https://example.databricks.com", "sp")
+    assert databricks_executor._remembered_profiles() == {}
+
+    auth, _ = databricks_executor._resolve_databricks_auth(host="https://example.databricks.com")
+    assert auth.current_token() == "sp-token"
+    assert attempts[0] == ("cli", "user"), "the user's login must be retried first"
+
+    assert databricks_executor._prefer_remembered_profile(
+        ["env", "user", "other"], "other", set()
+    ) == ["other", "env", "user"]
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "env")
+    assert databricks_executor._prefer_remembered_profile(
+        ["env", "user", "other"], "other", set()
+    ) == ["env", "other", "user"]
+
+
+def test_remembered_profiles_survive_a_corrupt_or_unwritable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bad memory file falls back to the default order and never fails the resolution."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[stale]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+        "[live]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    (tmp_path / databricks_executor._REMEMBERED_PROFILES_FILE).write_text("{not json")
+    attempts = _fake_profile_sources(monkeypatch, stale={"stale"}, sdk_tokens={})
+
+    auth, _ = databricks_executor._resolve_databricks_auth(host="https://example.databricks.com")
+    assert auth.current_token() == "live-token"
+    assert attempts[0] == ("cli", "stale")
+
+    def _read_only(path: Path, payload: object) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("omnigent.install_ledger.atomic_write_json", _read_only)
+    databricks_executor._remember_profile("https://example.databricks.com", "live")
+    assert databricks_executor._remembered_profiles() == {}
 
 
 def test_profile_cli_auth_config_caches_until_token_nears_expiry(
