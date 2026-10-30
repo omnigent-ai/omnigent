@@ -126,3 +126,35 @@ def has_matching_hook_refusal(
         if normalize_prompt(prompt) == submitted_text:
             return True
     return False
+
+
+def has_matching_prompt_hook(
+    boundary: SubmitBoundary,
+    transcript_path: Path,
+    submitted_text: str,
+    *,
+    normalize_prompt: Callable[[str], str],
+) -> bool:
+    """A fresh matching hook suspends retries; it cannot establish delivery."""
+    for entry in read_fresh_submit_records(boundary):
+        payload = entry.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("hook_event_name") != "UserPromptSubmit"
+            or payload.get("session_id") != boundary.native_session_id
+            or payload.get("agent_id") not in (None, "")
+            or payload.get("isSidechain") is True
+        ):
+            continue
+        prompt = payload.get("prompt")
+        path = payload.get("transcript_path")
+        if not isinstance(prompt, str) or not isinstance(path, str) or not path:
+            continue
+        try:
+            if Path(path).resolve() != transcript_path:
+                continue
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if normalize_prompt(prompt) == submitted_text:
+            return True
+    return False

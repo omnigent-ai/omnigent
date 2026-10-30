@@ -48,7 +48,7 @@ def _blocked_prompt_entry(reason: str, prompt: str, *, native_session_id: str) -
         ("ambiguous-legacy", False),
         ("replaced-file", False),
         ("rewritten-prefix", False),
-        ("owner-rotation", False),
+        ("owner-rotation", True),
     ],
 )
 def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
@@ -158,7 +158,10 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
         bridge.inject_user_message(tmp_path, content=content)
 
     assert enters == (1 if stops else 5)
-    if stops:
+    if scenario == "owner-rotation":
+        assert "session changed" in str(caught.value)
+        assert not isinstance(caught.value, bridge.ClaudeMessageNotAccepted)
+    elif stops:
         assert type(caught.value).__name__ == "ClaudeSubmitBlockedUnconfirmed"
         assert "could not be confirmed" in str(caught.value)
     else:
@@ -172,7 +175,11 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
     assert records[0].attributes["outcome"] == "error"
     assert records[0].attributes["delivery_outcome"] == "unknown"
     assert records[0].attributes["verification"] == (
-        "hook_block_unowned" if stops else "draft_still_present"
+        "submit_owner_changed"
+        if scenario == "owner-rotation"
+        else "hook_block_unowned"
+        if stops
+        else "draft_still_present"
     )
     assert content not in records[0].getMessage()
 

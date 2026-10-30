@@ -81,6 +81,8 @@ from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    has_matching_prompt_hook,
+    read_fresh_submit_records,
 )
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
@@ -367,6 +369,9 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # at 20s was recorded as a 10s failure). The slow-accept log below now
 # records real recovery times, so tune this from that distribution.
 _SUBMIT_VERIFY_TIMEOUT_S = 20.0
+# A matching submit hook may still be evaluating policy. Wait without sending
+# more Enter keys, with one deadline measured from the original submit.
+_SUBMIT_HOOK_PROCESSING_TIMEOUT_S = 120.0
 # How long the draft may verifiably sit unaccepted before a warning is
 # logged that the TUI is slow (delivery keeps retrying). Also the point
 # past which a recovery is logged with its elapsed time — the signal
@@ -4525,6 +4530,12 @@ def _paste_and_submit(
         if transcript_path is not None and native_session_id is not None
         else None
     )
+    hook_boundary = (
+        capture_submit_boundary(bridge_dir / _HOOKS_FILE, submit_boundary.native_session_id)
+        if submit_boundary is not None
+        else None
+    )
+    submit_session_id = read_active_session_id(bridge_dir)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
@@ -4532,12 +4543,8 @@ def _paste_and_submit(
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
         return
-    # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
+    # A visible draft can mean a swallowed Enter or a pending submit hook.
+    # Verification retries only until a matching hook starts processing.
     delivery_diagnostics.set_stage("verifying_submit")
     try:
         accepted = _verify_submit_accepted(
@@ -4548,6 +4555,8 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             submit_boundary=submit_boundary,
             submitted_text=text,
+            hook_boundary=hook_boundary,
+            submit_session_id=submit_session_id,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -4572,9 +4581,14 @@ def _verify_submit_accepted(
     bridge_dir: Path | None = None,
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
+    hook_boundary: SubmitBoundary | None = None,
+    submit_session_id: str | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
+
+    A fresh matching prompt hook suspends retries within one fixed processing
+    budget. The hook itself never proves acceptance.
 
     A transiently unresponsive TUI (a CPU-starved host, a long paste
     burst) can take tens of seconds to process the submit while the
@@ -4593,12 +4607,14 @@ def _verify_submit_accepted(
     :param bridge_dir: Bridge whose pending questions protect submit retries.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
+    :param hook_boundary: Hook append boundary captured before Enter.
+    :param submit_session_id: Active web conversation before Enter, when known.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
         ownership of the web input remains unconfirmed.
-    :raises RuntimeError: Pane capture remains unavailable after submitting;
-        delivery cannot be confirmed safely.
+    :raises RuntimeError: Processing expires, the session changes, or capture
+        remains unavailable; delivery cannot be confirmed safely.
     """
     start = time.monotonic()
     last_enter = start
@@ -4607,11 +4623,53 @@ def _verify_submit_accepted(
     retries = 0
     polls = 0
     pane = ""
-    while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
+    deadline = start + _SUBMIT_VERIFY_TIMEOUT_S
+    processing = False
+    rotation_pending = False
+    while time.monotonic() < deadline:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
+        _check_injection_cancelled()
         polls += 1
         delivery_diagnostics.record_submit_composer(pane=pane, box_reader=_composer_box)
+        if (
+            bridge_dir is not None
+            and submit_boundary is not None
+            and (
+                rotation_pending
+                or not _submit_identity_is_current(bridge_dir, submit_boundary, submit_session_id)
+            )
+        ):
+            expected_rotation = (
+                bool(pane.strip())
+                and not _draft_in_input_box(pane, needle)
+                and submitted_text is not None
+                and hook_boundary is not None
+                and _expected_submit_rotation(
+                    bridge_dir, hook_boundary, submitted_text, submit_session_id
+                )
+                and not has_matching_hook_refusal(
+                    submit_boundary,
+                    submitted_text,
+                    normalize_prompt=_unwrap_pasted_content_markers,
+                )
+            )
+            if not expected_rotation:
+                delivery_diagnostics.record_details(verification="submit_owner_changed")
+                # Rotation updates the web binding before recording SessionStart.
+                # Wait for its proof within this budget, without sending keys.
+                if (
+                    submitted_text is not None
+                    and submitted_text.startswith("/")
+                    and _first_slash_command_name(submitted_text) in {"clear", "fork", "branch"}
+                ):
+                    rotation_pending = True
+                    continue
+                raise RuntimeError(
+                    "Claude's session changed while verifying the submitted message. Delivery "
+                    "could not be confirmed; inspect the terminal before retrying."
+                )
         if (
             bridge_dir is not None
             and submit_boundary is not None
@@ -4632,6 +4690,22 @@ def _verify_submit_accepted(
                 "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
                 "could not be confirmed; inspect the terminal before retrying."
             )
+        if (
+            not processing
+            and bridge_dir is not None
+            and submit_boundary is not None
+            and hook_boundary is not None
+            and submitted_text is not None
+            and _submit_identity_is_current(bridge_dir, submit_boundary, submit_session_id)
+            and has_matching_prompt_hook(
+                hook_boundary,
+                submit_boundary.path,
+                submitted_text,
+                normalize_prompt=_unwrap_pasted_content_markers,
+            )
+        ):
+            processing = True
+            deadline = start + max(_SUBMIT_VERIFY_TIMEOUT_S, _SUBMIT_HOOK_PROCESSING_TIMEOUT_S)
         # An empty capture can be a repaint or failed tmux read. It proves
         # neither that the draft cleared nor that another Enter is safe.
         if not pane.strip():
@@ -4653,6 +4727,8 @@ def _verify_submit_accepted(
                     time.monotonic() - start,
                 )
             return True
+        if processing:
+            continue
         now = time.monotonic()
         if not warned and now - start >= _SUBMIT_SLOW_ACCEPT_WARN_S:
             warned = True
@@ -4679,6 +4755,18 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
+    if rotation_pending:
+        raise RuntimeError(
+            "Claude's session changed while verifying the submitted message. Delivery "
+            "could not be confirmed; inspect the terminal before retrying."
+        )
+    if processing:
+        delivery_diagnostics.record_details(verification="hook_processing_unconfirmed")
+        raise RuntimeError(
+            "A matching prompt hook started, but Claude Code message delivery could not be "
+            f"confirmed within {deadline - start:g}s. "
+            "Inspect the terminal before retrying; the message may already have been delivered."
+        )
     if not pane.strip():
         raise RuntimeError(
             f"Claude Code {what} delivery could not be confirmed within "
@@ -4692,7 +4780,20 @@ def _fresh_matching_hook_block(
     bridge_dir: Path, boundary: SubmitBoundary, submitted_text: str
 ) -> bool:
     """A matching refusal prevents retries; it never establishes input ownership."""
+    if not _submit_identity_is_current(bridge_dir, boundary):
+        return False
+    return has_matching_hook_refusal(
+        boundary, submitted_text, normalize_prompt=_unwrap_pasted_content_markers
+    )
+
+
+def _submit_identity_is_current(
+    bridge_dir: Path, boundary: SubmitBoundary, session_id: str | None = None
+) -> bool:
+    """Keep prompt observations within the native session captured before Enter."""
     if read_claude_session_id(bridge_dir) != boundary.native_session_id:
+        return False
+    if session_id is not None and read_active_session_id(bridge_dir) != session_id:
         return False
     path = read_transcript_path(bridge_dir)
     try:
@@ -4700,9 +4801,65 @@ def _fresh_matching_hook_block(
             return False
     except (OSError, ValueError, RuntimeError):
         return False
-    return has_matching_hook_refusal(
-        boundary, submitted_text, normalize_prompt=_unwrap_pasted_content_markers
-    )
+    return True
+
+
+def _expected_submit_rotation(
+    bridge_dir: Path,
+    hook_boundary: SubmitBoundary,
+    submitted_text: str,
+    session_id: str | None,
+) -> bool:
+    """Match an intentional rotation to a fresh hook and the resulting bridge identity."""
+    command = _first_slash_command_name(submitted_text)
+    if not submitted_text.startswith("/") or command not in {"clear", "fork", "branch"}:
+        return False
+    native_session_id = read_claude_session_id(bridge_dir)
+    transcript_path = read_transcript_path(bridge_dir)
+    active_session_id = read_active_session_id(bridge_dir)
+    if (
+        not native_session_id
+        or native_session_id == hook_boundary.native_session_id
+        or transcript_path is None
+    ):
+        return False
+    for entry in read_fresh_submit_records(hook_boundary):
+        payload = entry.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("hook_event_name") != "SessionStart"
+            or payload.get("session_id") != native_session_id
+            or payload.get("agent_id") not in (None, "")
+            or payload.get("isSidechain") is True
+        ):
+            continue
+        if command == "clear":
+            if payload.get("source") != "clear":
+                continue
+            rotated_to = payload.get("omnigent_clear_rotated_to")
+        else:
+            if (
+                payload.get("source") != "resume"
+                or payload.get("omnigent_fork_detected") is not True
+                or payload.get("omnigent_previous_claude_session_id")
+                != hook_boundary.native_session_id
+                or payload.get("omnigent_claude_session_was_seen") is not False
+            ):
+                continue
+            rotated_to = payload.get("omnigent_fork_rotated_to")
+        path = payload.get("transcript_path")
+        if not isinstance(path, str) or not path:
+            continue
+        try:
+            if Path(path).resolve() != transcript_path.resolve():
+                continue
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if session_id is not None and active_session_id != session_id:
+            if not active_session_id or rotated_to != active_session_id:
+                continue
+        return True
+    return False
 
 
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
