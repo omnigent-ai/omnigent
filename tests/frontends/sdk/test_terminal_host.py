@@ -2004,6 +2004,20 @@ async def test_the_answer_line_shows_only_while_its_text_is_the_answer() -> None
 
 
 @pytest.mark.asyncio
+async def test_alt_hash_neither_edits_nor_accepts_an_answer() -> None:
+    # Insert-comment would prefix the answer with "#" and accept it.
+    host = TerminalHost(model_name="test")
+    asking = await _open(host, _env_question())
+    picker = host._question_picker
+    assert picker is not None
+    await _press(host, "teal\x1b#")
+    assert not picker.future.done(), "Alt+# accepted the answer"
+    assert host._answer_buffer.text == "teal"
+    await _press(host, "\r")
+    assert await asking == {"Env?": "teal"}
+
+
+@pytest.mark.asyncio
 async def test_question_with_options_ignores_a_prefill() -> None:
     # A prefill would read as typing and move the highlight to "Type
     # something"; only option-less (editor) questions start prefilled.

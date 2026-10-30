@@ -6,7 +6,7 @@ The driver (``_question_selector_driver.py``) asks seven questions through
 them the way a person would: arrows and Enter for a single choice, Space to
 check multi-select options, typing for a custom answer, editing a prefilled
 answer, and Esc to dismiss. Answers must never be submitted as chat or saved
-to the input history, whatever key accepts them, and undo in the chat line
+to the input history: Alt+# does nothing to them, and undo in the chat line
 never brings one back.
 """
 
@@ -97,12 +97,13 @@ def test_selector_answers_with_real_keystrokes(
     child.send(_ESC)
     wait("ANSWER 5 null")
 
-    # Alt+# accepts the line (as a comment): it answers, never sends chat.
+    # Alt+# (accept as a comment) neither edits nor sends the answer.
     wait("Comment me")
     child.send("synthetic-answer")
     wait("▸ 2. Type something")
     child.send(_ALT_HASH)
-    wait('ANSWER 6 {"Comment?": "#synthetic-answer"}')
+    child.send("\r")
+    wait('ANSWER 6 {"Comment?": "synthetic-answer"}')
 
     # Undo in the chat line can't bring back a dismissed answer.
     wait("Discard me")

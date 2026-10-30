@@ -1186,6 +1186,11 @@ class TerminalHost:
             lambda: self._question_picker is not None and self._question_picker.row_count() > 0
         )
 
+        # Alt+# (insert-comment) would prefix the answer with "#" and accept it.
+        @self._kb.add("escape", "#", filter=_picker_open)
+        def _picker_no_comment(event: KeyPressEvent) -> None:
+            pass
+
         @self._kb.add("up", filter=_picker_rows)
         def _picker_prev(event: KeyPressEvent) -> None:
             self._move_question_highlight(-1)
@@ -3724,7 +3729,7 @@ class TerminalHost:
         self._invalidate_prompt()
 
     def _accept_answer(self, buffer: Buffer) -> bool:
-        """Answer-line accept handler (e.g. Alt+#): it answers, never sends chat."""
+        """Answer-line accept handler: accepting it answers, never sends chat."""
         self._answer_question()
         return True  # the selector manages the line's text
 
