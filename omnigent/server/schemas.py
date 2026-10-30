@@ -64,6 +64,19 @@ class PaginatedList(BaseModel):
     has_more: bool = False
 
 
+class AgentList(PaginatedList):
+    """
+    The built-in agent list, plus the packaged names this deployment hides.
+
+    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
+        trimmed from ``data``. The web picker also discovers agents from a
+        user's recent sessions, so it needs these names to keep a hidden
+        built-in with prior sessions from resurfacing as a custom agent.
+    """
+
+    suppressed_agent_names: list[str] = Field(default_factory=list)
+
+
 # ── Agents ──────────────────────────────────────────────────────
 
 
@@ -1146,6 +1159,8 @@ class CreateResponseRequest(BaseModel):
     pending_id: str | None = None
     delivery_attempt_id: str | None = None
     input_enqueued_at_ms: int | None = None
+    # Runner-validated authorization for one delivery, separate from user content/history.
+    authorized_native_shell_command: str | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
@@ -2059,7 +2074,7 @@ class SandboxStatus(BaseModel):
 
 
 class NativeUsageBaseline(BaseModel):
-    """Own-session cumulative tokens for resuming a native usage reporter.
+    """Own-session cumulative usage for resuming a native usage reporter.
 
     Excludes spawned sessions. Input includes cache reads, matching the native
     usage event contract rather than the display's separate token buckets.
@@ -2068,6 +2083,7 @@ class NativeUsageBaseline(BaseModel):
     cumulative_input_tokens: int = Field(default=0, ge=0)
     cumulative_output_tokens: int = Field(default=0, ge=0)
     cumulative_cache_read_input_tokens: int = Field(default=0, ge=0)
+    cumulative_cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class ModelUsage(BaseModel):
@@ -2403,6 +2419,8 @@ class SessionResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    # Derived from the parent runner's live handshake, never persisted on the child.
+    side_chat_settings_supported: bool = False
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False
@@ -2805,11 +2823,18 @@ class SessionForkRequest(BaseModel):
     :param workspace: Git repository URL (optionally ``#<branch>``) the
         server clones into the fork's sandbox as its working directory,
         e.g. ``"https://github.com/org/repo#release-1.2"``. **Omitting**
-        the field inherits the repository the source session recorded, so
-        cloning a sandbox session lands the fork in the same checkout; an
+        both workspace fields inherits all repositories the source session
+        recorded, so cloning a sandbox session preserves its checkouts; an
         explicit value overrides it and an explicit ``null`` gives the
         fork an empty sandbox. Only valid with ``host_type: "managed"`` —
         an external fork's directory is chosen when it binds a host.
+    :param workspaces: Repository URLs (each optionally ``#<branch>``) to
+        clone into the fork's sandbox, replacing the source's repositories.
+        Send only when ``GET /v1/info`` reports ``session_fork_workspaces``.
+        Several repositories require a provider with ``multi_repo`` support.
+        Mutually exclusive with ``workspace``; explicitly sending ``[]`` or
+        ``null`` gives the fork an empty sandbox. Only valid with
+        ``host_type: "managed"``.
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -2823,6 +2848,7 @@ class SessionForkRequest(BaseModel):
     sandbox_provider: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    workspaces: list[str] | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
     # side-chat tab). It may share its parent's runner.
@@ -2836,8 +2862,8 @@ class SessionForkRequest(BaseModel):
         Enforce the per-``host_type`` contract for a fork.
 
         Mirrors :meth:`_SessionCreateRequestBase._check_managed_host_fields`:
-        a managed fork's ``workspace``, when given, must be a git repository
-        URL (optionally ``#<branch>``) the server clones into the sandbox —
+        a managed fork's workspace(s), when given, must be git repository
+        URLs (optionally ``#<branch>``) the server clones into the sandbox —
         a filesystem path points at nothing in a sandbox that doesn't exist
         yet. Both ``sandbox_provider`` and ``workspace`` are meaningless on
         an external fork, which picks its host and directory afterwards.
@@ -2847,8 +2873,8 @@ class SessionForkRequest(BaseModel):
         :returns: The validated instance.
         :raises ValueError: On a managed workspace that isn't a valid
             repository URL, a malformed managed ``host_id``, or
-            ``host_id`` / ``sandbox_provider`` / ``workspace`` without
-            ``host_type: "managed"``.
+            conflicting or oversized workspace selections, or ``host_id`` /
+            ``sandbox_provider`` / workspace(s) without ``host_type: "managed"``.
         """
         # Lazy import: schemas is imported by nearly every module, so
         # pulling the (FastAPI/click-importing) managed-hosts module in
@@ -2860,13 +2886,26 @@ class SessionForkRequest(BaseModel):
                 raise ValueError(
                     "host_type 'managed' takes a host_id of 32 lowercase hex characters"
                 )
-            if self.workspace is not None:
+            if {"workspace", "workspaces"} <= self.model_fields_set:
+                raise ValueError(
+                    "set either 'workspace' (one repository) or 'workspaces' "
+                    "(several) for host_type 'managed', not both"
+                )
+            if self.workspaces is not None and len(self.workspaces) > _MAX_MANAGED_WORKSPACES:
+                raise ValueError(
+                    f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
+                    f"repositories in 'workspaces' (got {len(self.workspaces)})"
+                )
+            workspaces = self.workspaces or (
+                [self.workspace] if self.workspace is not None else []
+            )
+            for workspace in workspaces:
                 try:
-                    parse_repo_workspace(self.workspace)
+                    parse_repo_workspace(workspace)
                 except ValueError as exc:
                     raise ValueError(
                         "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') as workspace: {exc}"
+                        f"(optionally '#<branch>') for each workspace: {exc}"
                     ) from exc
             return self
         if self.host_id is not None:
@@ -2882,6 +2921,11 @@ class SessionForkRequest(BaseModel):
         if self.workspace is not None:
             raise ValueError(
                 "workspace only applies to host_type 'managed' — an external "
+                "fork picks its directory when it binds a host"
+            )
+        if "workspaces" in self.model_fields_set:
+            raise ValueError(
+                "workspaces only applies to host_type 'managed' — an external "
                 "fork picks its directory when it binds a host"
             )
         return self
@@ -2912,6 +2956,91 @@ class ReadStatePutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionPullRequestSummary(BaseModel):
+    """
+    The first pull request linked to a session, for list surfaces.
+
+    Stored on the server from what the session's host last reported, so it
+    is available while the host is offline.
+
+    :param url: The PR's URL.
+    :param provider: Git provider id, e.g. ``"github"``.
+    :param provider_display: The provider's labels (``display_name``,
+        ``request_name``, ``number_prefix``), or ``None`` for an unknown provider.
+    :param repository: Base repository, e.g. ``"owner/repo"``.
+    :param number: The PR number.
+    :param title: The last title the host looked up, or ``None``.
+    :param state: ``"OPEN"``, ``"MERGED"`` or ``"CLOSED"`` as last fetched, or
+        ``None`` before the host fetched the PR.
+    :param is_draft: Whether the PR was a draft when last fetched.
+    :param state_checked_at: Epoch seconds of the request that last fetched the
+        PR's state, or ``None`` before one did. Open PRs older than five minutes
+        are refreshed when their host is online; clients show older ones as stale.
+    """
+
+    url: str
+    provider: str
+    provider_display: dict[str, str] | None = None
+    repository: str
+    number: int
+    title: str | None = None
+    state: str | None = None
+    is_draft: bool = False
+    state_checked_at: float | None = None
+
+
+class SessionPullRequest(SessionPullRequestSummary):
+    """
+    A pull request linked to a session, as ``GET /v1/sessions/{id}/pull-requests`` lists it.
+
+    :param host: Forge host, e.g. ``"github.com"``.
+    :param relationship: How the PR joined the session: ``"created"``,
+        ``"worked_on"``, ``"attached"``, or ``"inferred"`` from the branch.
+    :param first_seen_at: Epoch seconds the session first saw the PR.
+    :param last_seen_at: Epoch seconds of the PR's latest activity in the session.
+    """
+
+    host: str
+    relationship: Literal["created", "worked_on", "attached", "inferred"]
+    first_seen_at: float
+    last_seen_at: float
+
+
+class SessionRepositoryBranch(BaseModel):
+    """Current branch and remote availability for one managed repository.
+
+    ``pushed`` is true when the branch exists at the original clone URL,
+    false when confirmed absent, and null when availability is unknown.
+    It does not indicate whether local commits or working-tree changes are pushed.
+    """
+
+    url: str
+    branch: str | None = None
+    pushed: bool | None = None
+
+
+class SessionRepositoryBranchList(BaseModel):
+    """Managed repositories in their original launch order."""
+
+    repositories: list[SessionRepositoryBranch]
+
+
+class SessionPullRequestList(BaseModel):
+    """
+    A page of a session's linked pull requests in display order, keyed by URL.
+
+    :param synced: Whether the server has imported the session's PRs from its
+        host. Until then an empty list means "not known yet", not "none".
+    """
+
+    object: Literal["list"] = "list"
+    data: list[SessionPullRequest] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+    synced: bool = False
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -2924,6 +3053,7 @@ class SessionListItem(BaseModel):
     :param agent_name: Human-readable name of the bound agent,
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
+    :param harness: Canonical effective harness, including per-session overrides.
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
@@ -3012,11 +3142,17 @@ class SessionListItem(BaseModel):
         matched in its body. Present whenever the query hit an item body
         (even if the title also matched); ``None`` on non-search reads and
         when only the title matched.
+    :param pull_request: The session's first linked pull request, or
+        ``None`` when it has none.
+    :param pull_requests_synced: Whether the server has imported the session's
+        PRs from its host, so a missing ``pull_request`` means "none" rather than
+        "not known yet". ``None`` on servers without PR storage.
     """
 
     id: str
     agent_id: str
     agent_name: str | None = None
+    harness: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
@@ -3044,6 +3180,8 @@ class SessionListItem(BaseModel):
     # unfiled. Lets the sidebar group sessions by project without a follow-up
     # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
     project_id: str | None = None
+    pull_request: SessionPullRequestSummary | None = None
+    pull_requests_synced: bool | None = None
 
 
 class SessionList(BaseModel):

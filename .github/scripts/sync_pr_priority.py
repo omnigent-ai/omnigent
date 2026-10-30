@@ -7,6 +7,9 @@ creates a closing link, so it is ignored. When a PR closes several issues with
 different priorities the highest one wins, and stale priority labels left by an
 earlier run are dropped. Pure stdlib so it runs without an install and the
 label logic is unit-tested directly.
+
+Set ``PR_NUMBER`` to sync one PR, or ``ISSUE_NUMBER`` to re-sync every open PR
+that closes that issue after its priority changes.
 """
 
 from __future__ import annotations
@@ -34,6 +37,18 @@ query($owner: String!, $name: String!, $number: Int!) {
           number
           labels(first: 50) { nodes { name } }
         }
+      }
+    }
+  }
+}
+"""
+
+_CLOSING_PULLS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      closedByPullRequestsReferences(first: 50, includeClosedPrs: false) {
+        nodes { number }
       }
     }
   }
@@ -81,10 +96,10 @@ class GitHubAPI:
             raw = response.read()
             return json.loads(raw.decode()) if raw else None
 
-    def closing_issue_labels(self, pull_number: int) -> list[list[str]]:
+    def _repository_query(self, query: str, number: int) -> dict[str, Any]:
         payload = {
-            "query": _CLOSING_ISSUES_QUERY,
-            "variables": {"owner": self.owner, "name": self.name, "number": pull_number},
+            "query": query,
+            "variables": {"owner": self.owner, "name": self.name, "number": number},
         }
         result = self._request("https://api.github.com/graphql", payload, "POST")
         if result and result.get("errors"):
@@ -92,13 +107,22 @@ class GitHubAPI:
         # GitHub may return null for data or any intermediate node (e.g. an
         # unknown PR number), so treat each missing level as empty.
         data = (result or {}).get("data") or {}
-        repository = data.get("repository") or {}
+        return data.get("repository") or {}
+
+    def closing_issue_labels(self, pull_number: int) -> list[list[str]]:
+        repository = self._repository_query(_CLOSING_ISSUES_QUERY, pull_number)
         pull_request = repository.get("pullRequest") or {}
         nodes = (pull_request.get("closingIssuesReferences") or {}).get("nodes") or []
         return [
             [label["name"] for label in (node.get("labels") or {}).get("nodes") or []]
             for node in nodes
         ]
+
+    def open_pulls_closing(self, issue_number: int) -> list[int]:
+        repository = self._repository_query(_CLOSING_PULLS_QUERY, issue_number)
+        issue = repository.get("issue") or {}
+        nodes = (issue.get("closedByPullRequestsReferences") or {}).get("nodes") or []
+        return [node["number"] for node in nodes]
 
     def pull_labels(self, pull_number: int) -> list[str]:
         result = self._request(
@@ -141,29 +165,55 @@ def sync_pull(api: GitHubAPI, pull_number: int) -> None:
         print(f"#{pull_number} priority already in sync ({desired or 'none'}).")
 
 
-def run(repo: str, pull_number: int, api: GitHubAPI) -> None:
+def sync_issue(api: GitHubAPI, issue_number: int) -> None:
+    """
+    Re-sync every open PR that closes ``issue_number``.
+    """
+    try:
+        pull_numbers = api.open_pulls_closing(issue_number)
+    except (OSError, RuntimeError) as error:
+        # A failed lookup only skips this re-sync; it must not fail the caller.
+        print(
+            f"::warning::Failed to resolve PRs closing issue #{issue_number}; "
+            f"skipping sync. {error}"
+        )
+        return
+    if not pull_numbers:
+        print(f"No open PRs close #{issue_number}.")
+    for pull_number in pull_numbers:
+        sync_pull(api, pull_number)
+
+
+def run(repo: str, api: GitHubAPI, pull_number: int | None, issue_number: int | None) -> None:
     if repo != CANONICAL_REPO:
         print(f"Skipping {repo}; priority sync only runs for {CANONICAL_REPO}.")
         return
-    sync_pull(api, pull_number)
+    if issue_number is not None:
+        sync_issue(api, issue_number)
+    elif pull_number is not None:
+        sync_pull(api, pull_number)
 
 
 def main() -> int:
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     token = os.environ.get("GITHUB_TOKEN")
-    pull_number = os.environ.get("PR_NUMBER")
     if not token:
         print("GITHUB_TOKEN is required", file=sys.stderr)
         return 1
-    if not pull_number:
-        print("PR_NUMBER is required", file=sys.stderr)
+    numbers: dict[str, int] = {}
+    for name in ("PR_NUMBER", "ISSUE_NUMBER"):
+        value = os.environ.get(name)
+        if not value:
+            continue
+        try:
+            numbers[name] = int(value)
+        except ValueError:
+            print(f"{name} must be an integer, got {value!r}", file=sys.stderr)
+            return 1
+    if len(numbers) != 1:
+        print("Exactly one of PR_NUMBER or ISSUE_NUMBER is required", file=sys.stderr)
         return 1
-    try:
-        pull_number_int = int(pull_number)
-    except ValueError:
-        print(f"PR_NUMBER must be an integer, got {pull_number!r}", file=sys.stderr)
-        return 1
-    run(repo, pull_number_int, GitHubAPI(token, repo))
+    run(repo, GitHubAPI(token, repo), numbers.get("PR_NUMBER"), numbers.get("ISSUE_NUMBER"))
     return 0
 
 
