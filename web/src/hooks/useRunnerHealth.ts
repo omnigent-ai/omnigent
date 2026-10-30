@@ -44,6 +44,13 @@ const POLL_INTERVAL_MS = 10_000;
 // Exponential-backoff ceiling on consecutive /health failures.
 const POLL_MAX_INTERVAL_MS = 60_000;
 
+const refreshListeners = new Set<() => void>();
+
+/** Poll `/health` now instead of at the next tick, e.g. right after a host wakes. */
+export function refreshRunnerHealth(): void {
+  for (const listener of refreshListeners) listener();
+}
+
 interface BatchHealthResponse {
   sessions?: Record<
     string,
@@ -74,8 +81,16 @@ export function useRunnerHealth(
   const [statusMap, setStatusMap] = useState<Map<string, SessionLiveness>>(new Map());
   const [hostStatusRevision, setHostStatusRevision] = useState(0);
 
-  // Desktop reconnects should update the badge without waiting for the next poll.
-  useEffect(() => onHostStatusChanged(() => setHostStatusRevision((revision) => revision + 1)), []);
+  // Desktop reconnects and sandbox wakes update the badge without waiting for the next poll.
+  useEffect(() => {
+    const bump = () => setHostStatusRevision((revision) => revision + 1);
+    const unsubscribeNative = onHostStatusChanged(bump);
+    refreshListeners.add(bump);
+    return () => {
+      unsubscribeNative();
+      refreshListeners.delete(bump);
+    };
+  }, []);
 
   useEffect(() => {
     if (!sessions || sessions.length === 0) {

@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
+import { refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -15,9 +16,10 @@ import {
 import type { ArcaConnectResult, HostActionResult, HostIdentity } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
 import type { PostEventResponse } from "@/lib/sessionsApi";
-import { useSessionReconnect } from "./useSessionReconnect";
+import { SANDBOX_WAKE_ONLINE_GRACE_MS, useSessionReconnect } from "./useSessionReconnect";
 
 vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn() }));
+vi.mock("@/hooks/useRunnerHealth", () => ({ refreshRunnerHealth: vi.fn() }));
 vi.mock("@/lib/nativeBridge", () => ({
   connectArcaHost: vi.fn(),
   controlHost: vi.fn(),
@@ -459,21 +461,18 @@ describe("useSessionReconnect", () => {
   });
 
   it.each([
-    {
-      response: { queued: false, recovered: true, recovery: "runner_relaunched" },
-      message: "Sandbox is back online.",
-    },
-    {
-      response: { queued: false, recovered: false, recovery: "already_connected" },
-      message: "Sandbox is already online.",
-    },
-  ] satisfies { response: PostEventResponse; message: string }[])(
-    "has the server wake an asleep sandbox for an editor in a browser: $message",
-    async ({ response, message }) => {
+    { queued: false, recovered: true, recovery: "runner_relaunched" },
+    { queued: false, recovered: false, recovery: "already_connected" },
+  ] satisfies PostEventResponse[])(
+    "wakes an asleep sandbox for an editor in a browser with no toast: $recovery",
+    async (response) => {
       vi.mocked(isElectronShell).mockReturnValue(false);
       const pending = deferred<PostEventResponse>();
       vi.mocked(retrySession).mockReturnValue(pending.promise);
-      const { result } = renderHook(() => useSessionReconnect(asleepSandbox));
+      const { result, rerender } = renderHook(useSessionReconnect, {
+        initialProps: { ...asleepSandbox, hostOnline: false as boolean | null },
+      });
+      expect(result.current.sandboxStarting).toBe(false);
 
       let reconnect!: Promise<void>;
       await act(async () => {
@@ -481,7 +480,7 @@ describe("useSessionReconnect", () => {
         await result.current.reconnect();
       });
       expect(retrySession).toHaveBeenCalledExactlyOnceWith("session");
-      expect(toast.loading).toHaveBeenCalledWith("Reconnecting sandbox…");
+      expect(result.current.sandboxStarting).toBe(true);
       expect(result.current.dialogOpen).toBe(false);
       expect(getHostIdentity).not.toHaveBeenCalled();
       expect(connectArcaHost).not.toHaveBeenCalled();
@@ -490,30 +489,61 @@ describe("useSessionReconnect", () => {
         pending.resolve(response);
         await reconnect;
       });
-      expect(toast.success).toHaveBeenCalledExactlyOnceWith(message);
-      expect(toast.dismiss).toHaveBeenCalledWith("progress");
+      // Liveness hasn't caught up yet: still starting, with a re-poll requested.
+      expect(result.current.sandboxStarting).toBe(true);
+      expect(refreshRunnerHealth).toHaveBeenCalledOnce();
+
+      rerender({ ...asleepSandbox, hostOnline: true });
+      expect(result.current.sandboxStarting).toBe(false);
+      expect(toast.loading).not.toHaveBeenCalled();
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(toast.error).not.toHaveBeenCalled();
       expect(result.current.dialogOpen).toBe(false);
     },
   );
 
+  it("stops showing a woken sandbox as starting if liveness never reports it online", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
+      const { result } = renderHook(() =>
+        useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+      );
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      expect(result.current.sandboxStarting).toBe(true);
+      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_ONLINE_GRACE_MS - 1));
+      expect(result.current.sandboxStarting).toBe(true);
+      act(() => vi.advanceTimersByTime(1));
+      expect(result.current.sandboxStarting).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows why a sandbox wake failed and lets the next action retry it", async () => {
     vi.mocked(retrySession).mockRejectedValueOnce(new Error("managed host wake timed out"));
     vi.mocked(retrySession).mockResolvedValueOnce({ queued: false, recovered: true });
-    const { result } = renderHook(() => useSessionReconnect(asleepSandbox));
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+    );
     await act(async () => {
       await result.current.reconnect();
     });
     expect(toast.error).toHaveBeenCalledExactlyOnceWith(
       "Couldn't reconnect the sandbox: managed host wake timed out",
     );
-    expect(toast.dismiss).toHaveBeenCalledWith("progress");
+    expect(result.current.sandboxStarting).toBe(false);
+    expect(refreshRunnerHealth).not.toHaveBeenCalled();
     expect(result.current.dialogOpen).toBe(false);
 
     await act(async () => {
       await result.current.reconnect();
     });
     expect(retrySession).toHaveBeenCalledTimes(2);
-    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Sandbox is back online.");
+    expect(result.current.sandboxStarting).toBe(true);
+    expect(toast.loading).not.toHaveBeenCalled();
   });
 
   it("ignores a sandbox wake's result after navigating to another session", async () => {
@@ -524,14 +554,16 @@ describe("useSessionReconnect", () => {
     await act(async () => {
       reconnect = result.current.reconnect();
     });
+    expect(result.current.sandboxStarting).toBe(true);
     rerender({ ...asleepSandbox, sessionId: "other-session", hostId: "other-host" });
-    expect(toast.dismiss).toHaveBeenCalledWith("progress");
+    expect(result.current.sandboxStarting).toBe(false);
 
     await act(async () => {
       pending.resolve({ queued: false, recovered: true });
       await reconnect;
     });
-    expect(toast.success).not.toHaveBeenCalled();
+    expect(result.current.sandboxStarting).toBe(false);
+    expect(refreshRunnerHealth).not.toHaveBeenCalled();
     expect(toast.error).not.toHaveBeenCalled();
   });
 

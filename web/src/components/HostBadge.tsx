@@ -17,6 +17,7 @@ import {
   ComposerConfigTooltipRows,
   ComposerHostTrigger,
   ComposerMenuTooltip,
+  HostStatusDot,
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -97,11 +98,14 @@ function launchStatusWord(launch: SandboxStatus): string {
 export function HostBadge({
   sessionId,
   onReconnect,
+  starting = false,
   appearance = "status",
   readOnly = false,
 }: {
   sessionId: string;
   onReconnect?: () => void;
+  /** The session's sandbox is being woken; the composer dot spins until it is online. */
+  starting?: boolean;
   appearance?: "status" | "composer";
   readOnly?: boolean;
 }) {
@@ -161,20 +165,31 @@ export function HostBadge({
   if (appearance === "composer") {
     // A launching sandbox has no host record yet: show the launch, not a missing host.
     const launchStatus = launch && !host ? launchStatusWord(launch) : null;
-    const reconnectable = !launchStatus && badge?.status === "offline" && !!onReconnect;
-    let label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
+    // A wake, or a launch or resume the server reports by stage, spins the status
+    // dot until the host itself is online.
+    const launchInProgress = launch !== null && launch.stage !== "failed";
+    const hostStarting = (starting || launchInProgress) && badge?.status !== "online";
+    const startingWord = launch && launchInProgress ? launchStatusWord(launch) : "Starting";
+    const dotStatus = hostStarting ? "starting" : (badge?.status ?? "unknown");
+    const reconnectable =
+      !launchStatus && !hostStarting && badge?.status === "offline" && !!onReconnect;
+    let label = badge
+      ? `Host ${badge.label}, ${hostStarting ? startingWord : STATUS_WORD[badge.status]}`
+      : "No host bound";
     // A dormant resumable host wakes on the next message; it isn't disconnected.
     const asleep = badge?.status === "offline" && !!session?.hostResumable;
+    const connectionWord = hostStarting
+      ? startingWord
+      : asleep
+        ? "Asleep — wakes on next message"
+        : CONNECTION_WORD[badge?.status ?? "unknown"];
     let tooltipRows = badge
       ? [
           { label: "Host", value: badge.label },
           // An Arclet's host takes the Arclet's own name, e.g. "omnigent-arclet-1234",
           // which the provider label hides. Other providers' managed-<hex> names don't help.
           ...(host?.sandbox_provider === "arclet" ? [{ label: "Name", value: host.name }] : []),
-          {
-            label: "Status",
-            value: asleep ? "Asleep — wakes on next message" : CONNECTION_WORD[badge.status],
-          },
+          { label: "Status", value: connectionWord },
         ]
       : [{ label: "Host", value: "None" }];
     const launchHost = launch?.provider ? sandboxOptionLabel(launch.provider) : "Sandbox";
@@ -197,7 +212,7 @@ export function HostBadge({
             <DropdownMenuTrigger asChild>
               <ComposerHostTrigger
                 label={label}
-                status={launchStatus ? undefined : (badge?.status ?? "unknown")}
+                status={launchStatus && !hostStarting ? undefined : dotStatus}
                 cloud={!!launchStatus || !!host?.sandbox_provider}
                 data-testid="composer-host-select"
               />
@@ -214,13 +229,8 @@ export function HostBadge({
               {launchStatus || host?.sandbox_provider ? "Cloud" : "My machines"}
             </div>
             <DropdownMenuItem disabled className="gap-2" data-selected="true">
-              {!launchStatus && (
-                <span
-                  className={cn(
-                    "size-2 shrink-0 rounded-full",
-                    STATUS_DOT_CLASS[badge?.status ?? "unknown"],
-                  )}
-                />
+              {(!launchStatus || hostStarting) && (
+                <HostStatusDot status={dotStatus} testId="composer-host-menu-status" />
               )}
               <span>{launchStatus ? launchHost : (badge?.label ?? "No host bound")}</span>
             </DropdownMenuItem>

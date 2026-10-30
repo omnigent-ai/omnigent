@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
+import { refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -12,21 +13,28 @@ import {
 } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
 
+/** How long a woken sandbox may wait for liveness to report its host online. */
+export const SANDBOX_WAKE_ONLINE_GRACE_MS = 20_000;
+
 /**
  * Reconnect this desktop's host directly; use the dialog for fallback and retry.
- * A resumable sandbox host is woken by the server instead.
+ * A resumable sandbox host is woken by the server instead, with its progress
+ * shown by the composer's host status dot rather than a toast.
  */
 export function useSessionReconnect({
   sessionId,
   hostId,
   hostName,
   hostResumable = false,
+  hostOnline,
   isOwner,
 }: {
   sessionId: string | null;
   hostId: string | null;
   hostName?: string | null;
   hostResumable?: boolean;
+  /** The session's host liveness; a woken sandbox counts as starting until it is `true`. */
+  hostOnline?: boolean | null;
   isOwner: boolean;
 }) {
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -34,6 +42,7 @@ export function useSessionReconnect({
   const [error, setError] = useState<string | null>(null);
   const [canReconnectThisMachine, setCanReconnectThisMachine] = useState(false);
   const [canReconnectArca, setCanReconnectArca] = useState(false);
+  const [sandboxWake, setSandboxWake] = useState<"waking" | "awaiting_online" | null>(null);
   const inFlight = useRef<{ progressToast?: string | number } | null>(null);
   const isSessionArcaHost = useCallback(
     () =>
@@ -51,6 +60,7 @@ export function useSessionReconnect({
     setCanReconnectThisMachine(false);
     setCanReconnectArca(false);
     setReconnecting(false);
+    setSandboxWake(null);
     return () => {
       if (inFlight.current?.progressToast !== undefined) {
         toast.dismiss(inFlight.current.progressToast);
@@ -112,29 +122,39 @@ export function useSessionReconnect({
     }
   }, [hostId, runsArcaConnect]);
 
+  // Liveness polls lag the wake, so stay "starting" until the host reads online.
+  useEffect(() => {
+    if (sandboxWake !== "awaiting_online") return;
+    if (hostOnline === true) {
+      setSandboxWake(null);
+      return;
+    }
+    const timer = setTimeout(() => setSandboxWake(null), SANDBOX_WAKE_ONLINE_GRACE_MS);
+    return () => clearTimeout(timer);
+  }, [sandboxWake, hostOnline]);
+
   // The server resumes the sandbox and starts the agent, as it does for a
   // message, so this works in the browser and for anyone who can send one.
   const wakeSandbox = useCallback(async () => {
     if (inFlight.current || !sessionId) return;
-    const operation: { progressToast?: string | number } = {};
+    const operation = {};
     inFlight.current = operation;
+    setSandboxWake("waking");
     try {
-      operation.progressToast = toast.loading("Reconnecting sandbox…");
-      const result = await retrySession(sessionId);
+      await retrySession(sessionId);
       if (inFlight.current !== operation) return;
-      toast.success(result.recovered ? "Sandbox is back online." : "Sandbox is already online.");
+      setSandboxWake("awaiting_online");
+      refreshRunnerHealth();
     } catch (err) {
       if (inFlight.current !== operation) return;
+      setSandboxWake(null);
       toast.error(
         err instanceof Error && err.message
           ? `Couldn't reconnect the sandbox: ${err.message}`
           : "Couldn't reconnect the sandbox. Try again.",
       );
     } finally {
-      if (inFlight.current === operation) {
-        if (operation.progressToast !== undefined) toast.dismiss(operation.progressToast);
-        inFlight.current = null;
-      }
+      if (inFlight.current === operation) inFlight.current = null;
     }
   }, [sessionId]);
 
@@ -199,6 +219,8 @@ export function useSessionReconnect({
     reconnect,
     /** Whether `reconnect` runs the desktop's Arca connect for this session's host. */
     reconnectsArca: runsArcaConnect(),
+    /** A sandbox wake is running or its host has not yet been seen online. */
+    sandboxStarting: sandboxWake !== null,
     dialogOpen,
     setDialogOpen,
     localReconnect: canReconnectThisMachine

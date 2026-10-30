@@ -8,7 +8,7 @@
 
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type RunnerHealthInput, useRunnerHealth } from "./useRunnerHealth";
+import { type RunnerHealthInput, refreshRunnerHealth, useRunnerHealth } from "./useRunnerHealth";
 
 import * as nativeBridge from "@/lib/nativeBridge";
 
@@ -143,6 +143,26 @@ describe("useRunnerHealth", () => {
     expect(result.current.get("conv_a")?.host_online).toBe(true);
     unmount();
     expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("re-polls immediately when the app asks for a refresh, and stops after unmount", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockHealth({ conv_a: { runner_online: false, host_online: false } }),
+    );
+    const sessions = [input("conv_a")];
+    const { result, unmount } = renderHook(() => useRunnerHealth(sessions));
+    await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(false));
+
+    fetchMock.mockResolvedValueOnce(
+      mockHealth({ conv_a: { runner_online: true, host_online: true } }),
+    );
+    act(() => refreshRunnerHealth());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(true));
+
+    unmount();
+    refreshRunnerHealth();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("ignores a stale poll that finishes after a desktop-triggered refresh", async () => {
