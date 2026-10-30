@@ -136,7 +136,7 @@ export function ComposerPrLink({
             const rowStatus = getPullRequestStatus(pr);
             const rowPresentation = pullRequestStatusPresentation(rowStatus);
             const copy = gitProviderCopy(pr.provider, undefined, pr.provider_display);
-            const identity = `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
+            const identity = `${pr.repository} ${copy.prNumberPrefix}${pr.number}`.trim();
             return (
               <li
                 key={pr.url}

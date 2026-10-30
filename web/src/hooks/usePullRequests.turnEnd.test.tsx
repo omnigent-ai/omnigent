@@ -1,8 +1,5 @@
-// The GitHub info query refetches on the focused session's turn end
-// (active → idle), so a PR the agent opened during the turn appears in the
-// status-line indicator without opening the tab. This is the harness-agnostic
-// replacement for the old per-tool git/gh signal — mirrors the trailing-edge
-// invalidate proven in useWorkspaceChangedFiles.test.tsx.
+// Turn-end refresh discovers PRs without opening the panel; composer polling
+// then tracks their status until all linked PRs are terminal.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
@@ -89,7 +86,7 @@ describe("usePullRequestInfo turn-end invalidate", () => {
       );
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(batch ? 2 : 1));
 
-      // Turn ends: the trailing invalidate fires one more github-info fetch.
+      // Turn end refetches every github-info query for the session.
       stubChatStore("conv_live", "idle");
       rerender(
         <QueryClientProvider client={qc}>
@@ -131,7 +128,7 @@ describe("usePullRequestInfo turn-end invalidate", () => {
   });
 
   it.each(["selected", "linked"])(
-    "discovers a %s PR at turn end and polls only while a PR is known",
+    "discovers a %s PR at turn end and polls until linked PRs are terminal",
     async (source) => {
       vi.useFakeTimers();
       stubChatStore("conv_live", "running");
@@ -160,7 +157,15 @@ describe("usePullRequestInfo turn-end invalidate", () => {
       await act(() => vi.advanceTimersByTimeAsync(30_000));
       expect(fetchMock).toHaveBeenCalledTimes(3);
 
-      fetchMock.mockResolvedValue(pullRequestInfoResponse({ pr: null, prs: [] }));
+      fetchMock.mockResolvedValue(
+        pullRequestInfoResponse({
+          pr: null,
+          prs: [
+            { ...pr, state: "MERGED" },
+            { ...pr, url: `${pr.url}2`, state: "CLOSED" },
+          ],
+        }),
+      );
       await act(() => vi.advanceTimersByTimeAsync(30_000));
       expect(fetchMock).toHaveBeenCalledTimes(4);
       await act(() => vi.advanceTimersByTimeAsync(90_000));

@@ -429,6 +429,7 @@ export async function fetchPullRequestInfo(
  *  git/gh checks — and the waiting-for-a-PR / CI-running states, which cost a
  *  `gh` API call but only while the panel is actually focused. */
 const PULL_REQUEST_POLL_MS = 5_000;
+const PULL_REQUEST_LIST_POLL_MS = 30_000;
 
 /**
  * The panel's poll interval for the current GitHub info, or `false` to stop.
@@ -454,7 +455,7 @@ export function computePullRequestPollInterval(
   listRow = false,
 ): number | false {
   // List rows refresh less often and rest once closed; explicit Refresh still refetches them.
-  if (listRow) return info?.pr && info.pr.state !== "OPEN" ? false : 30_000;
+  if (listRow) return info?.pr && info.pr.state !== "OPEN" ? false : PULL_REQUEST_LIST_POLL_MS;
   // No usable info yet — an initial error, or a transient fetch failure with no
   // cached data. Keep trying; runner-offline is gated off by `enabled`.
   if (!info) return PULL_REQUEST_POLL_MS;
@@ -473,12 +474,23 @@ export function computePullRequestPollInterval(
   return pr.checks.pending > 0 || pr.checks.total === 0 ? PULL_REQUEST_POLL_MS : false;
 }
 
+/** Poll linked PRs until all known states are terminal; unknown states keep refreshing. */
+export function computeLinkedPullRequestPollInterval(
+  info: Pick<PullRequestInfo, "pr" | "prs"> | undefined,
+): number | false {
+  const selected = info?.pr;
+  const associations = info?.prs?.filter((pr) => pr.url !== selected?.url) ?? [];
+  const summaries = selected ? [...associations, selected] : associations;
+  return summaries.some((pr) => !["MERGED", "CLOSED"].includes(pr.state?.toUpperCase() ?? ""))
+    ? PULL_REQUEST_LIST_POLL_MS
+    : false;
+}
+
 function usePullRequestQueryContext(rawConversationId: string | undefined) {
   // A `temp:*` id (navigate-first new-chat window) has no server session.
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
-  // Gate on the health poll rather than the session snapshot: the sidebar
-  // tooltip reuses this hook, and must not load every hovered session.
+  // Use the health poll so hovering sidebar rows does not load their session snapshots.
   const retry = useRunnerOfflineRetry(serveable !== false);
   return { conversationId, enabled: !!conversationId && serveable !== false, retry };
 }
@@ -497,10 +509,8 @@ function pullRequestInfoQueryOptions(
     refetchInterval: options?.poll
       ? (query) => {
           const info = query.state.data;
-          if (options.poll === "linked" && !info?.pr && !info?.prs?.length) return false;
-          if (options.poll === "list" || options.poll === "linked") {
-            return computePullRequestPollInterval(info, true);
-          }
+          if (options.poll === "linked") return computeLinkedPullRequestPollInterval(info);
+          if (options.poll === "list") return computePullRequestPollInterval(info, true);
           return info?.tracking_available ? 10_000 : computePullRequestPollInterval(info);
         }
       : false,
@@ -514,7 +524,7 @@ function pullRequestInfoQueryOptions(
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
  *
- * Refetch is driven two ways, both harness-agnostic:
+ * Refetch follows the session lifecycle and the caller's polling mode:
  *   - Turn end: a trailing invalidate on the focused session's active→idle
  *     transition, so a PR the agent opened during the turn shows up (in the
  *     status-line indicator and the panel) without a manual refresh. This is
@@ -524,18 +534,15 @@ function pullRequestInfoQueryOptions(
  *     states poll and which rest. It catches changes a turn boundary can't
  *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
  *     tabs pause (`refetchIntervalInBackground: false`).
- *   - Composer: `{ poll: "linked" }` uses the list cadence once a PR is known,
- *     leaving discovery without a PR to turn-end refreshes.
- *
- * Disabled when the runner is known offline. Retries the runner-offline case
- * with capped backoff so a cold-booting runner resolves before any error UI.
+ *   - Composer: `{ poll: "linked" }` uses the list cadence for open or unknown
+ *     PR states. Empty and terminal lists rest until a turn end or explicit refresh.
  */
 export function usePullRequestInfo(
   rawConversationId: string | undefined,
   options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
   const context = usePullRequestQueryContext(rawConversationId);
-  // A turn end refreshes the default query and every linked PR's cached info.
+  // Prefix invalidation also refreshes usePullRequestInfos queries for this session.
   useTrailingInvalidate(
     context.conversationId,
     useSessionActive(context.conversationId),

@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useLayoutEffect, useRef } from "react";
 
 import {
   type PullRequest,
@@ -234,7 +234,9 @@ export function useComposerGitStatus({
   const worktreeRefetch = worktrees.refetch;
   const githubRefetch = github.refetch;
   const detailQueriesRef = useRef(details);
-  detailQueriesRef.current = details;
+  useLayoutEffect(() => {
+    detailQueriesRef.current = details;
+  }, [details]);
   const refresh = useCallback(() => {
     void worktreeRefetch();
     void githubRefetch();
