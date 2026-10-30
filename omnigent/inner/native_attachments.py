@@ -812,7 +812,15 @@ async def resolve_session_item_file_references(
     :returns: The same items with resolvable attachment blocks rewritten
         to carry ``image_url`` / ``file_data`` data URIs.
     """
+    messages: list[dict[str, Any]] = []
     for item in items:
+        if item.get("type") == "compaction":
+            snapshot = item.get("compacted_messages")
+            if isinstance(snapshot, list):
+                messages.extend(message for message in snapshot if isinstance(message, dict))
+        else:
+            messages.append(item)
+    for item in messages:
         content = item.get("content")
         if item.get("type") != "message" or not isinstance(content, list):
             continue
