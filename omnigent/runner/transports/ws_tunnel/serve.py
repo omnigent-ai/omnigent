@@ -630,8 +630,9 @@ async def serve_tunnel(
                 http_status = _websocket_http_status(exc)
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     http_auth_rejection_streak += 1
-                    if http_auth_rejection_streak == 1:
+                    if http_auth_rejection_streak == 1 or http_auth_rejection_started is None:
                         http_auth_rejection_started = time.monotonic()
+                    rejection_started = http_auth_rejection_started
                     no_credential_to_send = (
                         auth_token is None
                         and auth_token_factory is not None
@@ -640,11 +641,7 @@ async def serve_tunnel(
                             or getattr(auth_token_factory, "declined_without_proxy_bearer", False)
                         )
                     )
-                    waited_s = (
-                        time.monotonic() - http_auth_rejection_started
-                        if http_auth_rejection_started is not None
-                        else 0.0
-                    )
+                    waited_s = time.monotonic() - rejection_started
                     window_elapsed = (
                         http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                         and waited_s >= _NO_CREDENTIAL_FATAL_WINDOW_S
@@ -662,7 +659,7 @@ async def serve_tunnel(
                         # Let the host and server preserve this launch while the
                         # credential recovers, without renewing its deadline.
                         mark_sign_in_pending(
-                            runner_id, http_auth_rejection_started + _NO_CREDENTIAL_FATAL_WINDOW_S
+                            runner_id, rejection_started + _NO_CREDENTIAL_FATAL_WINDOW_S
                         )
                     elif not ever_connected and window_elapsed:
                         # A rejected token can be stale for a while (e.g. a grant that
