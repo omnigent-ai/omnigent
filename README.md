@@ -326,11 +326,12 @@ The command is parsed as argv, without a shell. Omnigent requires a successful
 Codex `environment/info` probe before forwarding the turn. The default readiness
 timeout is 600 seconds; change it with
 `--exec-server-ready-timeout`. A failed command rejects the turn instead of
-falling back to laptop execution. Closing the command after the turn also lets
-an external idle reaper stop the remote compute while the local Omnigent
-session and Codex thread remain alive. Give concurrently active managed
-sessions distinct local URLs or ports; their remote ports may be the same when
-they connect to different hosts.
+falling back to laptop execution. The command must keep the tunnel and remote
+exec server in the foreground and terminate both when it receives a signal.
+Closing it after the turn then lets an external idle reaper stop the remote
+compute while the local Omnigent session and Codex thread remain alive. Give
+concurrently active managed sessions distinct local URLs or ports; their remote
+ports may be the same when they connect to different hosts.
 
 `--exec-cwd` is a path on the exec-server host; it does not need to exist on the
 laptop. Codex receives the environments in `[remote, local]` order on terminal
