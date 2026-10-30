@@ -78,6 +78,7 @@ from omnigent.native.failure_telemetry import (
     provider_error_context_from_text,
 )
 from omnigent.native.input_diagnostics import (
+    TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
     input_attributes,
     log_input_event,
     with_input_attributes,
@@ -3619,7 +3620,7 @@ async def _claim_native_input_resend(
     Take a failed turn's queued message back to send it once more.
 
     Only a turn whose terminal died before any of the message was typed
-    qualifies (see :data:`pending_inputs.TERMINAL_EXITED_BEFORE_DELIVERY_CODE`),
+    qualifies (see :data:`TERMINAL_EXITED_BEFORE_DELIVERY_CODE`),
     and only once per input. A Stop, an already failed session or a sub-agent
     turn keeps today's failure.
 
@@ -3629,7 +3630,7 @@ async def _claim_native_input_resend(
     if (
         not isinstance(raw_stable_id, str)
         or not _failed_event_undelivered(event)
-        or _native_input_reason_code(event) != pending_inputs.TERMINAL_EXITED_BEFORE_DELIVERY_CODE
+        or _native_input_reason_code(event) != TERMINAL_EXITED_BEFORE_DELIVERY_CODE
     ):
         return None
     resend_key = f"{session_id}:{raw_stable_id}"
@@ -3720,7 +3721,7 @@ async def _resend_native_input(
             session_id,
             response_id,
             drained.stable_id,
-            reason_code=pending_inputs.TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+            reason_code=TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
         )
         error_item = _error_item_from_sse(dict(failed_event), response_id=response_id)
         if error_item is not None:
@@ -9407,7 +9408,7 @@ async def _relay_runner_stream_once(
                             event.get("status") == "failed"
                             and isinstance(raw_status_error, dict)
                             and raw_status_error.get("code")
-                            == pending_inputs.TERMINAL_EXITED_BEFORE_DELIVERY_CODE
+                            == TERMINAL_EXITED_BEFORE_DELIVERY_CODE
                         ):
                             # The failed turn's own status edge; the re-send replaces it.
                             _resending_native_sessions.discard(session_id)

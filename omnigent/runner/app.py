@@ -71,7 +71,10 @@ from omnigent.harness_plugins import (
 )
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes
-from omnigent.native.input_diagnostics import input_attributes
+from omnigent.native.input_diagnostics import (
+    TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+    input_attributes,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
@@ -202,7 +205,6 @@ from omnigent.runner.subagent_work import (
     wrapper_label_from_labels,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
-from omnigent.runtime.pending_inputs import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,

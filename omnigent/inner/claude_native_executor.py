@@ -54,7 +54,7 @@ from omnigent.inner.native_attachments import (
     framework_notices,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
-from omnigent.runtime.pending_inputs import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
+from omnigent.native.input_diagnostics import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
 
 _logger = logging.getLogger(__name__)
 

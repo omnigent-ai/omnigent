@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
+from omnigent.native.input_diagnostics import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
@@ -8655,7 +8656,7 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
         session_stream, "publish", lambda _session_id, event: published.append(event)
     )
     error = {
-        "code": pending_inputs.TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+        "code": TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
         "message": "The Claude Code terminal is no longer running.",
         "undelivered": True,
     }

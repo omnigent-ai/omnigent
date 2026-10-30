@@ -453,8 +453,8 @@ async def test_pane_death_before_the_message_is_typed_fails_only_the_turn() -> N
     """
     import asyncio
 
+    from omnigent.native.input_diagnostics import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.runtime.pending_inputs import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
 
     _session_event_queues_ref.pop(_CONV_ID, None)
     publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
