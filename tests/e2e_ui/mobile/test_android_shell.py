@@ -26,6 +26,7 @@ the injected OS inset reach the layout's shared vars.
 from __future__ import annotations
 
 import io
+from typing import Literal
 
 import httpx
 import pytest
@@ -174,25 +175,58 @@ def _marker_rows(page: Page, top: int, bottom: int) -> list[int]:
     )
 
 
-def test_android_unfolded_chat_keeps_content_out_of_status_bar(
+def _assert_status_bar_blends(page: Page, status_bar_height: int) -> None:
+    """Assert the status-bar band continues the color of the header row below it."""
+    header_box = page.locator("header.chat-header").first.bounding_box()
+    assert header_box is not None
+    # The header glass gradient is strongest at its leading edge.
+    column = int(header_box["x"]) + 8
+
+    def strip_color(row: int) -> tuple[int, ...]:
+        strip = Image.open(
+            io.BytesIO(page.screenshot(clip={"x": column, "y": row, "width": 12, "height": 2}))
+        ).convert("RGB")
+        pixels = [strip.getpixel((x, y)) for x in range(strip.width) for y in range(strip.height)]
+        return tuple(sum(channel) // len(pixels) for channel in zip(*pixels, strict=True))
+
+    band, below = strip_color(status_bar_height // 2), strip_color(status_bar_height + 4)
+    assert max(abs(a - b) for a, b in zip(band, below, strict=True)) <= 4, (
+        f"the status bar reads as a separate band: {band} above {below}"
+    )
+
+
+_COLOR_SCHEMES = pytest.mark.parametrize("color_scheme", ["light", "dark"])
+_SHELL_VIEWPORTS = pytest.mark.parametrize(
+    "viewport", [_MOBILE_VIEWPORT, _UNFOLDED_VIEWPORT], ids=["phone", "unfolded"]
+)
+
+
+@_COLOR_SCHEMES
+@_SHELL_VIEWPORTS
+def test_android_chat_keeps_content_out_of_status_bar(
     page: Page,
     seeded_session: tuple[str, str],
+    viewport: ViewportSize,
+    color_scheme: Literal["light", "dark"],
 ) -> None:
-    """An unfolded Android chat paints no content in the status bar or top fade.
+    """An Android chat paints no content in the status bar or top fade.
 
-    The Pixel Fold inner display crosses the 48rem breakpoint. At rest the first
-    transcript content must start below the fade; scrolled, nothing may show in
-    the status-bar band.
+    The Pixel Fold inner display crosses the 48rem breakpoint. At rest the status
+    bar must blend into the header glass and the first transcript content must
+    start below the fade; scrolled, nothing may show in the status-bar band.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    :param viewport: Phone or unfolded-foldable viewport.
+    :param color_scheme: Light or dark system theme.
     """
     base_url, session_id = seeded_session
     status_bar_height = 48
     # Status bar + server-switcher footprint (8px + 25px) + the 32px fade ramp.
     fade_end = status_bar_height + 33 + 32
 
-    page.set_viewport_size(_UNFOLDED_VIEWPORT)
+    page.emulate_media(color_scheme=color_scheme)
+    page.set_viewport_size(viewport)
     page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
     httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
@@ -216,6 +250,8 @@ def test_android_unfolded_chat_keeps_content_out_of_status_bar(
         status_bar_height,
     )
 
+    _assert_status_bar_blends(page, status_bar_height)
+
     content = page.locator(".chat-conversation-content")
     page.evaluate(_PREPEND_MARKER, [content.element_handle(), 40])
     assert _marker_rows(page, 0, fade_end) == [], "at-rest transcript starts inside the top fade"
@@ -237,13 +273,13 @@ def test_android_unfolded_chat_keeps_content_out_of_status_bar(
     assert marker_rows == [], f"scrolled transcript paints in the status bar at rows {marker_rows}"
 
 
-@pytest.mark.parametrize(
-    "viewport", [_MOBILE_VIEWPORT, _UNFOLDED_VIEWPORT], ids=["phone", "unfolded"]
-)
+@_COLOR_SCHEMES
+@_SHELL_VIEWPORTS
 def test_android_scrolled_settings_page_keeps_status_bar_blank(
     page: Page,
     live_server: str,
     viewport: ViewportSize,
+    color_scheme: Literal["light", "dark"],
 ) -> None:
     """Scrolled Settings content never paints in the status bar; the title stays intact.
 
@@ -253,8 +289,10 @@ def test_android_scrolled_settings_page_keeps_status_bar_blank(
     :param page: Playwright page fixture (fresh context per test).
     :param live_server: Base URL of the shared test server.
     :param viewport: Phone or unfolded-foldable viewport.
+    :param color_scheme: Light or dark system theme.
     """
     status_bar_height = 40
+    page.emulate_media(color_scheme=color_scheme)
     page.set_viewport_size(viewport)
     page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
     page.goto(f"{live_server}/settings/appearance")
@@ -267,6 +305,8 @@ def test_android_scrolled_settings_page_keeps_status_bar_blank(
         ".setProperty('--omnigent-android-safe-area-top', `${height}px`)",
         status_bar_height,
     )
+
+    _assert_status_bar_blends(page, status_bar_height)
 
     settings_page = page.locator(".settings-page-scroll")
     page.evaluate(_PREPEND_MARKER, [settings_page.locator(":scope > div").element_handle(), 3000])
