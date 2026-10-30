@@ -33,6 +33,7 @@ export function PullRequestCommentForm({
   inline = false,
   newThread = false,
   disabled = false,
+  local = false,
 }: {
   draft: PullRequestCommentDraft;
   setBody: (body: string) => void;
@@ -41,6 +42,7 @@ export function PullRequestCommentForm({
   inline?: boolean;
   newThread?: boolean;
   disabled?: boolean;
+  local?: boolean;
 }) {
   const [tab, setTab] = useState("write");
   const formRef = useRef<HTMLFormElement>(null);
@@ -139,7 +141,15 @@ export function PullRequestCommentForm({
               className="shrink-0"
               disabled={disabled || draft.pending || !draft.body.trim() || tooLong}
             >
-              {draft.pending ? "Posting…" : inline && !newThread ? "Reply" : "Post comment"}
+              {draft.pending
+                ? local
+                  ? "Saving…"
+                  : "Posting…"
+                : local
+                  ? "Save local comment"
+                  : inline && !newThread
+                    ? "Reply"
+                    : "Post comment"}
             </Button>
             {compactReply && (
               <Button
@@ -160,7 +170,11 @@ export function PullRequestCommentForm({
               className="min-w-0 truncate text-ui text-muted-foreground"
               title={account ?? undefined}
             >
-              {account ? `Comment as ${account}` : "Comment using the host’s GitHub account"}
+              {local
+                ? "Saved in this session. Only sent to the agent when you send your chat message."
+                : account
+                  ? `Comment as ${account}`
+                  : "Comment using the host’s GitHub account"}
             </p>
           </div>
         </>

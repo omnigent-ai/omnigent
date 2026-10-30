@@ -250,3 +250,32 @@ async def test_legacy_file_workflow_preserves_pr_rows(
     assert edited.json()["anchor_metadata"] == anchor
     assert edited.json()["body"] == "Updated feedback"
     assert edited.json()["status"] == "draft"
+
+
+async def test_local_pr_comment_round_trip(client: httpx.AsyncClient, session_id: str) -> None:
+    """Local PR comments use session CRUD and retain coordinates in agent handoff."""
+    anchor = {
+        "pr_url": "https://github.com/acme/app/pull/1",
+        "side": "LEFT",
+        "line": 9,
+        "start_line": 7,
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
+    }
+    response = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_comment_payload(anchor_metadata=anchor, start_index=0, end_index=0),
+    )
+    assert response.status_code == 200
+    comment = response.json()
+    assert comment["anchor_metadata"] == anchor
+    listed = await client.get(f"/v1/sessions/{session_id}/comments")
+    assert listed.json()[0]["anchor_metadata"] == anchor
+    formatted = await client.post(
+        f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [comment["id"]]}
+    )
+    assert formatted.status_code == 200
+    message = formatted.json()["formatted_message"]
+    assert "LEFT lines 7–9" in message
+    assert anchor["head_sha"] in message
+    assert comment["id"] in message

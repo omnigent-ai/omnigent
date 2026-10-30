@@ -1,3 +1,4 @@
+import { useComposerInsertion, consumeComposerInsertion } from "@/lib/composerInsertions";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -3068,6 +3069,18 @@ function ComposerImpl(
       mentions: taggedMentionsRef.current,
     });
   }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
+
+  const composerInsertion = useComposerInsertion(conversationId);
+  useEffect(() => {
+    if (!conversationId || settledConversationId !== conversationId || !composerInsertion) return;
+    if (!fullText.includes(composerInsertion)) {
+      dirtyRef.current = true;
+      editText(null, (text) => [text, composerInsertion].filter(Boolean).join("\n\n"));
+      focusText(null);
+    }
+    consumeComposerInsertion(conversationId);
+    tailTextareaRef.current?.focus();
+  }, [conversationId, settledConversationId, composerInsertion, fullText, editText, focusText]);
 
   const terminalPending = useChatStore((s) => s.terminalPending);
   const hostOnline = useSessionHostOnline(composerSessionId ?? undefined);

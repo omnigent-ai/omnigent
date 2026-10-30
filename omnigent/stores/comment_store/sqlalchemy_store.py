@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import asdict
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -90,6 +91,7 @@ class SqlAlchemyCommentStore(CommentStore):
         end_index: int,
         anchor_content: str | None = None,
         created_by: str | None = None,
+        anchor_metadata: PullRequestCommentAnchor | None = None,
     ) -> Comment:
         """Create and persist a new comment. See base class for contract."""
         # One clock read for both timestamps so a never-edited comment's
@@ -112,6 +114,7 @@ class SqlAlchemyCommentStore(CommentStore):
                 updated_at=created_us,
                 anchor_content=anchor_content,
                 created_by=created_by,
+                anchor_metadata=json.dumps(asdict(anchor_metadata)) if anchor_metadata else None,
             )
             session.add(row)
             return _to_entity(row)
