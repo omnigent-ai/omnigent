@@ -79,7 +79,11 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
-from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.native._native_supersession import (
+    clear_replacement_create_body,
+    post_clear_supersession,
+    unfiled_clear_replacement_body,
+)
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -2729,13 +2733,10 @@ async def _create_thread_replacement_session(
     if CODEX_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
-    create_resp = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
-    )
+    create_body = clear_replacement_create_body(old, agent_id=agent_id, labels=labels)
+    create_resp = await client.post("/v1/sessions", json=create_body)
+    if (unfiled_body := unfiled_clear_replacement_body(create_body, create_resp)) is not None:
+        create_resp = await client.post("/v1/sessions", json=unfiled_body)
     create_resp.raise_for_status()
     created = create_resp.json()
     new_session_id = created.get("id")

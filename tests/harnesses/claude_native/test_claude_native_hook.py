@@ -259,7 +259,8 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
 
     Claude renders hook stdout immediately, before the background
     forwarder can poll the hook log. This test fails if the banner
-    regresses to the launch conversation URL after ``/clear``.
+    regresses to the launch conversation URL after ``/clear``, or if the
+    replacement loses the old session's title or project.
     """
     requests: list[tuple[str, str, dict[str, object] | None]] = []
 
@@ -318,6 +319,8 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
                     "agent_id": "ag_claude",
                     "runner_id": "runner_one",
                     "labels": {"omnigent.claude_native.bridge_id": "bridge_shared"},
+                    "title": "Fix login flow",
+                    "project_id": "proj_alpha",
                 },
                 request=httpx.Request("GET", url),
             )
@@ -398,6 +401,10 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
             {
                 "agent_id": "ag_claude",
                 "labels": {"omnigent.claude_native.bridge_id": "bridge_shared"},
+                "title": "Fix login flow",
+                "project_id": "proj_alpha",
+                "workspace": None,
+                "git": None,
             },
         ),
         ("PATCH", "http://127.0.0.1:8787/v1/sessions/conv_new", {"runner_id": "runner_one"}),
