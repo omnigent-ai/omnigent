@@ -55,6 +55,7 @@ from omnigent.harnesses.claude_native.bridge import (
     is_auth_slash_command,
     kill_session,
     pane_closed_by_omnigent,
+    pane_killed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
@@ -6207,13 +6208,14 @@ def test_failed_expected_close_kill_leaves_no_marker(
         kill_session(bridge_dir, expected_close=True)
 
     assert not pane_closed_by_omnigent(private_dir)
+    assert not pane_killed_by_omnigent(private_dir)
 
 
 def test_kill_session_without_expected_close_leaves_no_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The stop affordance keeps its existing exit handling; it marks nothing."""
+    """The stop affordance marks Omnigent's kill but not an expected close."""
     private_dir = tmp_path / "omnigent-terminal-pane"
     private_dir.mkdir()
     bridge_dir = tmp_path / "bridge"
@@ -6230,6 +6232,7 @@ def test_kill_session_without_expected_close_leaves_no_marker(
     kill_session(bridge_dir)
 
     assert not pane_closed_by_omnigent(private_dir)
+    assert pane_killed_by_omnigent(private_dir)
 
 
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
@@ -11718,6 +11721,8 @@ class _EditableComposer:
         monkeypatch.setattr(claude_native_bridge, "_run_tmux", self._run_tmux)
         monkeypatch.setattr(claude_native_bridge, "_capture_pane", self._capture_pane)
         monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+        # No Claude Code process runs behind this box for a repaint signal to reach.
+        monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 0)
 
     def _run_tmux(self, socket_path: str, *args: str) -> None:
         del socket_path
@@ -12121,6 +12126,80 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
             "/effort high" if slash else "hello from the web"
         ]
     assert sum(args[-1] == "C-l" for args in operations) == (scenario != "scrollback")
+
+
+# Another process's output printed from the input row's cursor onward: it
+# wrapped across the closing rule, so no key can delete it. In the second, a
+# redraw of the input row already erased an idle-compaction notice's marker.
+_PRINTED_OVER_BOX_PANES = {
+    "launcher-warning": """\
+──────────────────────────────
+❯ Background token refresh failed: certificate expired. Troubleshooting step
+s: 1. Renew the certificate, then send your message again.
+  ? for shortcuts
+""",
+    "idle-compact-tail": """\
+──────────────────────────────
+❯
+ens (example-model) -> sent /compact. Use /rewind if you need to return to a spec
+ific earlier point.
+  ? for shortcuts
+""",
+}
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("draft", ["", _STALE_MULTILINE_DRAFT], ids=["empty", "hidden-draft"])
+@pytest.mark.parametrize("printed", list(_PRINTED_OVER_BOX_PANES))
+@pytest.mark.parametrize("repaint_shows_box", [True, False], ids=["repainted", "still-covered"])
+def test_output_printed_over_the_input_box_is_repainted_before_refusing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    draft: str,
+    printed: str,
+    repaint_shows_box: bool,
+) -> None:
+    """Output another process printed over the box is repainted, not refused as a draft."""
+    composer = _EditableComposer(draft, cursor=len(draft))
+    composer.install(monkeypatch)
+    covered = True
+    repaints: list[str] = []
+
+    def repaint(socket_path: str, tmux_target: str) -> int:
+        nonlocal covered
+        repaints.append(tmux_target)
+        covered = not repaint_shows_box
+        return 1
+
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", repaint)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *args: (
+            _PRINTED_OVER_BOX_PANES[printed] if covered else composer._capture_pane(*args)
+        ),
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    def inject() -> None:
+        if slash:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+        else:
+            inject_user_message(bridge_dir, content="hello from the web")
+
+    if repaint_shows_box:
+        inject()
+        assert [text.strip() for text in composer.submitted] == [
+            "/effort high" if slash else "hello from the web"
+        ]
+    else:
+        with pytest.raises(
+            claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
+        ):
+            inject()
+        assert composer.submitted == []
+    assert len(repaints) == 1
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])

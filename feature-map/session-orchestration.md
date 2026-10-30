@@ -48,6 +48,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with
   `sys_session_create` and `placement="same_host"` or `placement="managed"`.
+  Pass `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`
+  to choose an authorized profile/revision from the
+  [provider catalog](../docs/extending/provider_profiles.md).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list

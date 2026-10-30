@@ -975,6 +975,22 @@ class SysSessionCreateTool(Tool):
                                 "top-level session (agent_id only)."
                             ),
                         },
+                        "sandbox_provider": {
+                            "type": "string",
+                            "description": "Optional provider for placement='managed'.",
+                        },
+                        "sandbox_profile_id": {
+                            "type": "string",
+                            "description": (
+                                "Authorized profile ID for placement='managed', required by "
+                                "providers that manage profiles. Use a selection supplied by "
+                                "the user or discovered through GET /v1/sandbox-profiles."
+                            ),
+                        },
+                        "sandbox_profile_revision": {
+                            "type": "string",
+                            "description": "Expected catalog revision of sandbox_profile_id.",
+                        },
                         "agent_id": {
                             "type": "string",
                             "description": (

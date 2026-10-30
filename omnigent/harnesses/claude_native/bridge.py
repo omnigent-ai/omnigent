@@ -245,6 +245,9 @@ _TMUX_FILE = "tmux.json"
 # Written into the pane's private dir just before Omnigent kills the pane, so the
 # runner reads the exit as Omnigent's own close rather than the terminal dying.
 _EXPECTED_CLOSE_FILE = "expected_close"
+# Written there before every Omnigent kill (stop, reap), so an exit without it
+# that tmux reports as a killed session came from outside Omnigent.
+_OMNIGENT_KILL_FILE = "omnigent_kill"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -333,6 +336,10 @@ _DIALOG_FOOTER_RE = re.compile(
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
+# A pane whose prompt has not rendered for this long is asked to repaint
+# (see :func:`_request_claude_repaint`), then again at the interval.
+_CLAUDE_REPAINT_AFTER_S = 5.0
+_CLAUDE_REPAINT_INTERVAL_S = 20.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # Ctrl+K and Ctrl+U as CSI-u sequences, so Claude Code reads them as keys
 # rather than as text when they arrive in one burst.
@@ -4838,8 +4845,11 @@ def kill_session(
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    marker = Path(info["socket_path"]).parent / _EXPECTED_CLOSE_FILE
+    private_dir = Path(info["socket_path"]).parent
+    markers = [private_dir / _OMNIGENT_KILL_FILE]
     if expected_close:
+        markers.append(private_dir / _EXPECTED_CLOSE_FILE)
+    for marker in markers:
         with contextlib.suppress(OSError):
             marker.touch()
     try:
@@ -4851,7 +4861,7 @@ def kill_session(
             allow_missing_target=True,
         )
     except RuntimeError:
-        if expected_close:
+        for marker in markers:
             marker.unlink(missing_ok=True)
         raise
 
@@ -4866,6 +4876,18 @@ def pane_closed_by_omnigent(private_dir: Path) -> bool:
         close and the kill did not fail.
     """
     return (private_dir / _EXPECTED_CLOSE_FILE).exists()
+
+
+def pane_killed_by_omnigent(private_dir: Path) -> bool:
+    """
+    Return whether Omnigent itself killed the Claude pane in *private_dir*.
+
+    :param private_dir: The terminal instance's private dir, which holds its
+        tmux socket, e.g. ``/tmp/omnigent-terminal-abc/``.
+    :returns: ``True`` when :func:`kill_session` ran for this pane (a stop or a
+        reap) and the kill did not fail.
+    """
+    return (private_dir / _OMNIGENT_KILL_FILE).exists()
 
 
 @_serialize_bridge_injection
@@ -5900,6 +5922,60 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     return _ClaudePaneState(None)
 
 
+def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
+    """
+    Ask Claude Code to redraw its whole screen.
+
+    Another process writing to the terminal Claude Code renders on (say, a
+    launcher's background thread logging to the stderr they share) overwrites
+    rows Claude Code's differential renderer believes are unchanged, so it
+    never redraws them. Text over the input box's frame hides a live composer
+    from :func:`_composer_row`, and the readiness wait would reap a healthy
+    pane. ``SIGCONT`` runs Claude Code's resume handler, which drops its
+    cached frame and repaints everything, as after ``fg``. A running process
+    without a handler ignores it, so the whole tree under the pane gets it: a
+    launcher may run Claude Code as its child.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: How many processes were signalled; ``0`` when the pane's
+        process could not be found.
+    """
+    import signal
+    import subprocess
+
+    import psutil
+
+    if IS_WINDOWS:
+        return 0
+    _check_injection_cancelled()
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return 0
+    fields = proc.stdout.split() if proc.returncode == 0 else []
+    if not fields or not fields[0].isdigit():
+        return 0
+    try:
+        root = psutil.Process(int(fields[0]))
+        tree = [root, *root.children(recursive=True)]
+    except psutil.Error:
+        return 0
+    signalled = 0
+    for process in tree:
+        with contextlib.suppress(psutil.Error):
+            process.send_signal(signal.SIGCONT)
+            signalled += 1
+    return signalled
+
+
 def claude_pane_ready(bridge_dir: Path) -> bool:
     """
     Report whether the Claude pane is showing a usable input box right now.
@@ -6514,6 +6590,12 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     capture is likewise retried without sending clearing keys, then refused
     if no readable box appears within the budget.
 
+    Before refusing, Claude Code is asked to repaint once
+    (:func:`_request_claude_repaint`) and the rounds start over. Output
+    another process printed over the box, such as a launcher's log line, is
+    not part of the draft, so no key deletes it; after the repaint the
+    capture shows the real input box.
+
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
@@ -6523,12 +6605,19 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
-    for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
+    repainted = False
+    round_no = 0
+    while True:
         pane = _capture_pane(socket_path, tmux_target)
         box = _composer_box(pane)
         # Blank rows after the glyph row hold nothing a paste could join.
         settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            if not repainted and _request_claude_repaint(socket_path, tmux_target):
+                repainted, round_no = True, 0
+                delivery_diagnostics.record_details(composer_repaint_requested=True)
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                continue
             delivery_diagnostics.record_composer_not_cleared(
                 pane=pane,
                 rows=None if box is None else box.rows,
@@ -6543,6 +6632,7 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
             _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
             if settled:
                 return
+        round_no += 1
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
@@ -6846,7 +6936,9 @@ def _wait_for_claude_prompt_ready(
     dropped, so the first web-UI message silently vanishes. This gate
     polls ``capture-pane`` for the input prompt before injection;
     it returns immediately once mounted, so 2nd+ messages are
-    unaffected.
+    unaffected. While the prompt stays missing it periodically asks
+    Claude Code to repaint (:func:`_request_claude_repaint`), which
+    restores an input box another process's output drew over.
 
     Claude-native only — this is called from :func:`inject_user_message`
     and :func:`inject_slash_command`, which exclusively serve the Claude
@@ -6889,7 +6981,8 @@ def _wait_for_claude_prompt_ready(
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
-        count, how many of those polls saw an empty capture, and the tail
+        count, how many of those polls saw an empty capture, how many
+        repaints were requested, and the tail
         of the last non-empty capture the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a startup crash, a torn/empty capture under a mid-turn repaint, or
@@ -6900,8 +6993,10 @@ def _wait_for_claude_prompt_ready(
     hard_deadline = started + (
         max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S) if extend_for_slow_boot else timeout_s
     )
+    next_repaint = started + _CLAUDE_REPAINT_AFTER_S
     polls = 0
     empty_polls = 0
+    repaint_requests = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
     # capture taken after the deadline. A post-timeout re-capture can show
     # a different (often healthier-looking) frame than any decision the
@@ -7013,6 +7108,13 @@ def _wait_for_claude_prompt_ready(
             )
         waited_on_sign_in = waiting_on_sign_in
         now = time.monotonic()
+        if now >= next_repaint:
+            # Output from another process can hide a live composer until
+            # Claude Code repaints.
+            if _request_claude_repaint(socket_path, tmux_target):
+                repaint_requests += 1
+                delivery_diagnostics.record_readiness(prompt_repaint_requests=repaint_requests)
+            next_repaint = time.monotonic() + _CLAUDE_REPAINT_INTERVAL_S
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.alive is False:
@@ -7048,8 +7150,8 @@ def _wait_for_claude_prompt_ready(
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
-        f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        f"{empty_polls} empty captures, {repaint_requests} repaint requests). "
+        "The message was not delivered." + _format_terminal_failure_tail(last_nonempty)
     )
 
 
