@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import re
@@ -11067,6 +11068,8 @@ async def test_skip_gzip_responder_forwards_start_before_bodies() -> None:
         "more_body": True,
     }
     final_body: Message = {"type": "http.response.body", "body": b"", "more_body": False}
+    # Starlette's gzip path rewrites messages in place, so compare against copies.
+    expected = copy.deepcopy([start, first_body, final_body])
     sent: list[Message] = []
     sent_when_start_returned: list[Message] = []
 
@@ -11089,8 +11092,8 @@ async def test_skip_gzip_responder_forwards_start_before_bodies() -> None:
     )
     await responder(scope, receive, record)
 
-    assert sent == [start, first_body, final_body]
-    assert sent_when_start_returned == [start]
+    assert sent == expected
+    assert sent_when_start_returned == expected[:1]
 
 
 @pytest.mark.parametrize(
