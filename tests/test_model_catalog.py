@@ -1434,6 +1434,10 @@ def _isolate_native_probe_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
     for name in (
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OMNIGENT_CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OMNIGENT_ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
@@ -1446,6 +1450,7 @@ def _isolate_native_probe_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
         monkeypatch.delenv(name, raising=False)
     (tmp_path / "claude-config").mkdir()
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
     monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
     monkeypatch.setattr("omnigent.onboarding.ambient.codex_config_detection", lambda: None)
@@ -1541,6 +1546,9 @@ def test_cli_login_rows_replay_native_probe_catalogs(
     _isolate_config(monkeypatch, tmp_path, provider_config)
     _isolate_native_probe_store(monkeypatch, tmp_path)
     subscribed = provider_kind == "subscription"
+    if not subscribed:
+        # A brokered sandbox: the Claude login arrives as a token env credential.
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
     # The seeded Codex shape is the one the SDK spawn env selects.
     spawn_pin = _build_codex_spawn_env(_worker_spec("codex")).get("HARNESS_CODEX_MODEL_PROVIDER")
     assert spawn_pin == ("openai" if subscribed else None)
@@ -1695,18 +1703,33 @@ def test_codex_login_catalog_requires_a_usable_child_launch(
     assert [model["id"] for model in row["models"]] == (_CLI_LOGIN_CODEX_IDS if listed else [])
 
 
+def test_unconfigured_claude_sdk_without_a_token_login_lists_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stored login would resolve as a subscription, so none here means no login."""
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    _seed_cli_login_catalogs(codex_pinned=False)
+
+    row = catalog_for_spec(_worker_spec("claude-sdk"))["self"]
+
+    assert (row["source"], row["models"]) == ("none", [])
+
+
 @pytest.mark.parametrize(
-    ("settings", "env"),
+    ("settings", "managed", "env"),
     [
-        ({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}}, {}),
-        ({"apiKeyHelper": "echo test-token"}, {}),
-        ({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}, {}),
-        ({}, {"CLAUDE_CODE_USE_VERTEX": "1"}),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}}, {}, {}),
+        ({"apiKeyHelper": "echo test-token"}, {}, {}),
+        ({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}, {}, {}),
+        ({}, {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}, {}),
+        ({}, {}, {"CLAUDE_CODE_USE_VERTEX": "1"}),
     ],
-    ids=["user-gateway", "api-key-helper", "user-bedrock", "env-vertex"],
+    ids=["user-gateway", "api-key-helper", "user-bedrock", "managed-bedrock", "env-vertex"],
 )
 def test_claude_transport_overrides_skip_login_catalog(
     settings: dict[str, object],
+    managed: dict[str, object],
     env: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1718,8 +1741,15 @@ def test_claude_transport_overrides_skip_login_catalog(
     assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"]
 
     (tmp_path / "claude-config" / "settings.json").write_text(json.dumps(settings))
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(json.dumps(managed))
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
     for name, value in env.items():
         monkeypatch.setenv(name, value)
+    # Reseed so an override that also changes the launch key is still read.
+    _seed_cli_login_catalogs(codex_pinned=True)
 
     assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
 

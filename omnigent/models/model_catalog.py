@@ -1549,15 +1549,20 @@ def _cli_login_probe_listing(
             if launch_entry is not None:
                 return None
         if cli == "claude":
+            from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+            from omnigent.onboarding.harness_readiness import _claude_token_env_configured
+
+            # Detection turns a stored login into a subscription, so an
+            # unconfigured child can only run on a token env credential.
+            if provider.kind == NONE_KIND and not _claude_token_env_configured():
+                return None
             if _claude_transport_overridden():
                 return None
-            from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
-
             return _probe_catalog_listing(
                 "claude-native", claude_catalog_fingerprint(None), "Claude Code"
             )
         return _codex_login_probe_listing(spec, provider)
-    except Exception:  # noqa: BLE001 — an unresolvable launch keeps the existing row
+    except Exception:  # an unresolvable launch keeps the existing row
         _logger.debug(
             "CLI-login probe catalog lookup failed for harness %r", harness, exc_info=True
         )
@@ -1574,8 +1579,15 @@ def _claude_transport_overridden() -> bool:
     :returns: ``True`` when managed, user, or process settings select a gateway,
         an ``apiKeyHelper``, or a cloud transport.
     """
-    from omnigent.harnesses.claude_native.main import managed_claude_gateway_signal
+    from omnigent.harnesses.claude_native.main import (
+        _managed_settings_paths,
+        managed_claude_gateway_signal,
+    )
+    from omnigent.onboarding.ambient import read_claude_managed_settings
 
+    managed_settings = read_claude_managed_settings(_managed_settings_paths()) or {}
+    managed_env = managed_settings.get("env")
+    managed_env = managed_env if isinstance(managed_env, dict) else {}
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     settings_path = Path(config_dir) if config_dir else Path.home() / ".claude"
     try:
@@ -1588,7 +1600,7 @@ def _claude_transport_overridden() -> bool:
     user_env = user_env if isinstance(user_env, dict) else {}
     if user_settings.get("apiKeyHelper"):
         return True
-    for env in (os.environ, user_env):
+    for env in (managed_env, user_env, os.environ):
         if any(
             str(env.get(name, "")).strip().lower() in ("1", "true", "yes")
             for name in (
