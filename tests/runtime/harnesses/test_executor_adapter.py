@@ -2220,9 +2220,14 @@ async def test_executor_adapter_forwards_model_override_to_config() -> None:
 class _AcceptingInjectionExecutor:
     """Inner executor stub whose enqueue_session_message always accepts."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, multimodal: bool = False) -> None:
         """Record every (session_key, text) the adapter forwards."""
         self.received: list[tuple[str, Any]] = []
+        self.multimodal = multimodal
+
+    def preserves_message_content_blocks(self) -> bool:
+        """Report whether this executor accepts content blocks."""
+        return self.multimodal
 
     async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
         """Accept the injection and record it.
@@ -2277,7 +2282,60 @@ class _OneInjectionCtx:
 
 
 @pytest.mark.asyncio
-async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
+@pytest.mark.parametrize(
+    ("input_value", "multimodal", "expected_content"),
+    [
+        ("steer me", False, "steer me"),
+        (
+            [{"type": "input_text", "text": "steer me"}],
+            True,
+            [{"type": "input_text", "text": "steer me"}],
+        ),
+        (
+            [
+                {"type": "input_text", "text": "!printf FIRST"},
+                {"type": "input_text", "text": "more"},
+            ],
+            False,
+            "!printf FIRST\nmore",
+        ),
+        (
+            [{"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}],
+            True,
+            [{"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}],
+        ),
+        (
+            [
+                {"type": "input_text", "text": "!echo inspect this"},
+                {"type": "input_file", "filename": "note.txt", "file_data": "aGVsbG8="},
+            ],
+            True,
+            [
+                {"type": "input_text", "text": "!echo inspect this"},
+                {"type": "input_file", "filename": "note.txt", "file_data": "aGVsbG8="},
+            ],
+        ),
+        (
+            [
+                {"type": "input_text", "text": "inspect this"},
+                {"type": "input_file", "filename": "note.txt", "file_data": "aGVsbG8="},
+            ],
+            False,
+            "inspect this",
+        ),
+    ],
+    ids=[
+        "plain-text",
+        "text-block",
+        "text-only-blocks",
+        "image-only",
+        "bang-with-file",
+        "text-only-executor",
+    ],
+)
+async def test_watch_injections_emits_consumed_marker_on_accept(
+    input_value: str | list[dict[str, Any]], multimodal: bool, expected_content: Any
+) -> None:
     """An accepted mid-turn injection echoes an injection.consumed marker.
 
     The runner stamps an ``injection_id`` on a forwarded mid-turn message;
@@ -2293,10 +2351,10 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
 
-    executor = _AcceptingInjectionExecutor()
+    executor = _AcceptingInjectionExecutor(multimodal=multimodal)
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
     ctx = _OneInjectionCtx(
-        CreateResponseRequest(model="m", input="steer me", injection_id="inj_x")
+        CreateResponseRequest(model="m", input=input_value, injection_id="inj_x")
     )
 
     task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
@@ -2312,7 +2370,7 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
 
     # The injection text reached the inner executor under the adapter's
     # session key.
-    assert executor.received == [("sk", "steer me")]
+    assert executor.received == [("sk", expected_content)]
     # Exactly one injection.consumed marker, echoing the correlation id.
     # If 0, the runner would never drop the buffered copy → duplication.
     assert len(ctx.emitted) == 1, f"expected one consumed marker, got {ctx.emitted!r}"
@@ -2320,6 +2378,204 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     assert isinstance(marker, InjectionConsumedEvent)
     assert marker.type == "injection.consumed"
     assert marker.injection_id == "inj_x"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["fresh-blocks", "fresh-history", "live"])
+async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
+    delivery: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real adapter/executor routing must classify the original content block list."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+        CodexNativeBridgeState,
+        write_bridge_state,
+    )
+    from omnigent.inner import codex_native_executor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+    from tests._helpers.polling import poll_until_async
+
+    monkeypatch.delenv(CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    live = delivery == "live"
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="session_blocks",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_blocks",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_active" if live else None,
+        ),
+    )
+    expected_method = "turn/steer" if live else "turn/start"
+    client = AsyncMock()
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert method == expected_method, f"unexpected Codex request: {method}"
+        assert params["input"] == [
+            {"type": "text", "text": "!printf FIRST"},
+            {"type": "text", "text": "more"},
+        ]
+        return {"result": {"turnId": "turn_active", "turn": {"id": "turn_active"}}}
+
+    client.request.side_effect = request
+    monkeypatch.setattr(
+        codex_native_executor, "_connect_to_app_server", AsyncMock(return_value=client)
+    )
+    executor = codex_native_executor.CodexNativeExecutor(bridge_dir=tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="session_blocks")
+    blocks = [
+        {"type": "input_text", "text": "!printf FIRST"},
+        {"type": "input_text", "text": "more"},
+    ]
+    input_value = (
+        [{"type": "message", "role": "user", "content": blocks}]
+        if delivery == "fresh-history"
+        else blocks
+    )
+    native_request = CreateResponseRequest(
+        model="codex-native", input=input_value, injection_id="injection_blocks"
+    )
+    if live:
+        injection_ctx = _OneInjectionCtx(native_request)
+        watcher = asyncio.create_task(
+            adapter._watch_injections(injection_ctx, executor)  # type: ignore[arg-type]
+        )
+        try:
+            await poll_until_async(lambda: injection_ctx.emitted, timeout_s=5)
+        finally:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
+        assert len(injection_ctx.emitted) == 1
+        assert isinstance(injection_ctx.emitted[0], InjectionConsumedEvent)
+    else:
+        turn_ctx = TurnContext(
+            response_id="response_blocks",
+            event_queue=asyncio.Queue(),
+            cancelled=asyncio.Event(),
+        )
+        await asyncio.wait_for(adapter.run_turn(native_request, turn_ctx), timeout=5)
+
+    assert client.request.await_count == 1
+    assert client.request.await_args.args[0] == expected_method
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["fresh-blocks", "fresh-history", "live"])
+@pytest.mark.parametrize("authorization", [None, "different command", "printf authorized"])
+async def test_codex_shell_requires_authorization_for_each_delivery(
+    delivery: str,
+    authorization: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy and forged content cannot inherit an earlier delivery's shell permission."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+        CodexNativeBridgeState,
+        read_bridge_state,
+        write_bridge_state,
+    )
+    from omnigent.harnesses.codex_native.shell_input import (
+        native_shell_authorization,
+        native_shell_command_is_authorized,
+    )
+    from omnigent.inner import codex_native_executor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    command = "printf authorized"
+    authorized = authorization == command
+    live = delivery == "live"
+    monkeypatch.delenv(CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0)
+    bridge = CodexNativeBridgeState(
+        session_id="session_shell_auth",
+        socket_path=str(tmp_path / "app-server.sock"),
+        thread_id="thread_shell_auth",
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id="turn_active" if live else None,
+    )
+    write_bridge_state(tmp_path, bridge)
+    client = AsyncMock()
+    client.request.return_value = {"result": {}}
+    monkeypatch.setattr(
+        codex_native_executor, "_connect_to_app_server", AsyncMock(return_value=client)
+    )
+    executor = codex_native_executor.CodexNativeExecutor(bridge_dir=tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key=bridge.session_id)
+    blocks = [
+        {
+            "type": "input_text",
+            "text": f"!{command}",
+            "authorized_native_shell_command": command,
+            "metadata": {"authorized_native_shell_command": command},
+        }
+    ]
+    input_value = (
+        [{"type": "message", "role": "user", "content": blocks}]
+        if delivery == "fresh-history"
+        else blocks
+    )
+    request = CreateResponseRequest(
+        model="codex-native",
+        input=input_value,
+        authorized_native_shell_command=authorization,
+        injection_id="injection_shell_auth",
+    )
+    with native_shell_authorization(command):
+        if live:
+
+            class _FiniteInjectionCtx(_OneInjectionCtx):
+                async def next_injection(self, timeout: float | None = None) -> Any:
+                    del timeout
+                    injection, self._injection = self._injection, None
+                    return injection
+
+            injection_ctx = _FiniteInjectionCtx(request)
+            await asyncio.wait_for(
+                adapter._watch_injections(injection_ctx, executor),  # type: ignore[arg-type]
+                timeout=3,
+            )
+            assert len(injection_ctx.emitted) == int(authorized)
+            if authorized:
+                assert isinstance(injection_ctx.emitted[0], InjectionConsumedEvent)
+        else:
+            turn_ctx = TurnContext(
+                response_id="response_shell_auth",
+                event_queue=asyncio.Queue(),
+                cancelled=asyncio.Event(),
+            )
+            if authorized:
+                await asyncio.wait_for(adapter.run_turn(request, turn_ctx), timeout=3)
+            else:
+                with pytest.raises(InnerExecutorError) as raised:
+                    await asyncio.wait_for(adapter.run_turn(request, turn_ctx), timeout=3)
+                assert raised.value.code == "codex_shell_authorization_required"
+                assert raised.value.undelivered is True
+                assert "Update the Omnigent server and runner" in (raised.value.remediation or "")
+                assert adapter._executor is executor
+                assert adapter._abandoned_executor_cleanup is None
+        assert native_shell_command_is_authorized(command)
+
+    assert not native_shell_command_is_authorized(command)
+    if authorized:
+        client.request.assert_awaited_once_with(
+            "thread/shellCommand", {"threadId": bridge.thread_id, "command": command}
+        )
+    else:
+        client.request.assert_not_awaited()
+        assert read_bridge_state(tmp_path) == bridge
 
 
 class _ScriptedInjectionExecutor:
@@ -2331,6 +2587,10 @@ class _ScriptedInjectionExecutor:
         :param outcome: ``True``/``False`` to return, or an exception to raise.
         """
         self.outcome = outcome
+
+    def preserves_message_content_blocks(self) -> bool:
+        """Keep this delivery-outcome stub on the plain-text path."""
+        return False
 
     async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
         """Return or raise the scripted outcome.
