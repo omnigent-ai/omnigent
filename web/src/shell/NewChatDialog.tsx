@@ -6483,10 +6483,7 @@ export function NewChatLandingScreen({
     // Desktop keeps the centered composition; mobile docks the composer.
     <div
       ref={setLandingSurface}
-      className={cn(
-        "relative flex min-h-0 flex-1 items-stretch justify-center",
-        !relatedSession && "md:items-center md:pb-24",
-      )}
+      className="relative flex min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24"
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 800px cap, so the composer surface reaches
