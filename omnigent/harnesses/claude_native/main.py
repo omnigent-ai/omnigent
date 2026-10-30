@@ -265,6 +265,7 @@ _CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBAC
 # TMUX/TMUX_PANE point at Omnigent's private tmux server, so without the scrub a
 # tool's `tmux kill-session` or `kill-server` ends Claude itself.
 _CLAUDE_CODE_ENV_FILE_ENV = "CLAUDE_ENV_FILE"
+_CLAUDE_USER_ENV_FILE_ENV = "OMNIGENT_CLAUDE_USER_ENV_FILE"
 _CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
@@ -1684,11 +1685,19 @@ def build_native_claude_terminal_env(
     )
     if _ambient_env_is_non_anthropic_gateway(configured_base_url):
         terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
-    # A user-provided env file keeps priority; it replaces the tmux scrub.
-    if _CLAUDE_CODE_ENV_FILE_ENV not in terminal_env and not os.environ.get(
-        _CLAUDE_CODE_ENV_FILE_ENV
-    ):
-        terminal_env[_CLAUDE_CODE_ENV_FILE_ENV] = claude_tool_env_file()
+    # Run custom tool setup after removing the pane's private tmux address.
+    user_env_file = terminal_env.get(
+        _CLAUDE_CODE_ENV_FILE_ENV, os.environ.get(_CLAUDE_CODE_ENV_FILE_ENV, "")
+    )
+    tool_env_file = claude_tool_env_file()
+    if user_env_file != tool_env_file:
+        if (
+            user_env_file
+            or _CLAUDE_USER_ENV_FILE_ENV in terminal_env
+            or os.environ.get(_CLAUDE_USER_ENV_FILE_ENV)
+        ):
+            terminal_env[_CLAUDE_USER_ENV_FILE_ENV] = user_env_file
+    terminal_env[_CLAUDE_CODE_ENV_FILE_ENV] = tool_env_file
     # A raw credential can override the helper or open Claude's API-key menu.
     for name in native_claude_auth_env_unset(claude_config):
         if name in terminal_env:
