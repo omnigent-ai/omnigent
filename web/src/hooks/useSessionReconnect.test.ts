@@ -542,6 +542,31 @@ describe("useSessionReconnect", () => {
     }
   });
 
+  it.each(["the host comes online", "the user opens another session"] as const)(
+    "doesn't report a late timeout once %s",
+    async (ending) => {
+      vi.useFakeTimers();
+      try {
+        vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
+        const { result, rerender } = renderHook(useSessionReconnect, {
+          initialProps: { ...asleepSandbox, hostOnline: false as boolean | null },
+        });
+        await act(async () => {
+          await result.current.reconnect();
+        });
+        expect(result.current.sandboxStarting).toBe(true);
+        if (ending === "the host comes online") rerender({ ...asleepSandbox, hostOnline: true });
+        else rerender({ ...asleepSandbox, sessionId: "other-session", hostOnline: false });
+        expect(result.current.sandboxStarting).toBe(false);
+        act(() => vi.advanceTimersByTime(SANDBOX_WAKE_ONLINE_GRACE_MS * 2));
+        expect(result.current.sandboxStarting).toBe(false);
+        expect(toast.error).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("shows why a sandbox wake failed and lets the next action retry it", async () => {
     vi.mocked(retrySession).mockRejectedValueOnce(new Error("managed host wake timed out"));
     vi.mocked(retrySession).mockResolvedValueOnce({ queued: false, recovered: true });

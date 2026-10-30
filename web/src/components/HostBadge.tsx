@@ -127,11 +127,14 @@ export function HostBadge({
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
   // The open session's sandbox launch, which its chat progress banners also show.
   const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
-  // The launch stage seen when a wake began. A failed or waiting stage left over
-  // from before the wake mustn't stop its spinner; one reported since then does.
-  const wakeStartRef = useRef({ starting: false, launch: "" });
-  if (starting !== wakeStartRef.current.starting) {
-    wakeStartRef.current = { starting, launch: starting ? launchKey(launch) : "" };
+  // A failed or waiting stage left over from before a wake mustn't stop its
+  // spinner; one reported since then does, even if it repeats the old one.
+  const currentLaunch = launchKey(launch);
+  const [wake, setWake] = useState({ starting: false, launch: "", stageChanged: false });
+  if (starting !== wake.starting) {
+    setWake({ starting, launch: currentLaunch, stageChanged: false });
+  } else if (starting && !wake.stageChanged && currentLaunch !== wake.launch) {
+    setWake({ ...wake, stageChanged: true });
   }
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
@@ -181,7 +184,7 @@ export function HostBadge({
     const launchInProgress =
       launch !== null && launch.stage !== "failed" && launch.stage !== "action_required";
     const launchStoppedWake =
-      launch !== null && !launchInProgress && launchKey(launch) !== wakeStartRef.current.launch;
+      launch !== null && !launchInProgress && (wake.stageChanged || currentLaunch !== wake.launch);
     const hostStarting =
       ((starting && !!badge && !launchStoppedWake) || launchInProgress) &&
       badge?.status !== "online";

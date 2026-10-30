@@ -594,8 +594,9 @@ describe("HostBadge", () => {
     );
     expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
 
+    // Online wins while the wake request is still in flight.
     useSessionHostOnlineMock.mockReturnValue(true);
-    rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
+    rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, online");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
     expect(screen.getByTestId("composer-host-menu-status")).toHaveAttribute(
@@ -819,8 +820,9 @@ describe("HostBadge during a sandbox launch", () => {
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Starting agent");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
 
+    // Online wins while the wake request is still in flight.
     useSessionHostOnlineMock.mockReturnValue(true);
-    rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
+    rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, online");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
   });
@@ -848,28 +850,25 @@ describe("HostBadge during a sandbox launch", () => {
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "unknown");
   });
 
-  it("spins a wake past an earlier failed launch until the server reports a new stop", () => {
-    useChatStore.setState({
-      conversationId: "conv_1",
-      sandboxStatus: { stage: "failed", error: "Sandbox launch timed out", provider: "arclet" },
-    });
+  const timedOut = { stage: "failed", error: "Sandbox launch timed out" } as const;
+  const approve = { stage: "action_required", details: "Approve the sandbox in Arclet" } as const;
+
+  it.each([
+    ["a user action", timedOut, [approve]],
+    ["the same failure again", timedOut, [{ stage: "provisioning" }, timedOut]],
+    ["the same user action again", approve, [{ stage: "provisioning" }, approve]],
+  ] as const)("spins a wake past an earlier stop until it stops on %s", (_stop, before, stages) => {
+    useChatStore.setState({ conversationId: "conv_1", sandboxStatus: before });
     useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
     useSessionMock.mockReturnValue({ session: { hostId: "host_a1b2", hostResumable: true } });
     useSessionHostOnlineMock.mockReturnValue(false);
-    const { rerender } = render(
-      <HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />,
-    );
+    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
     const trigger = screen.getByTestId("composer-host-select");
     const dot = screen.getByTestId("composer-host-status");
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Starting");
     expect(dot).toHaveAttribute("data-status", "starting");
 
-    act(() =>
-      useChatStore.setState({
-        sandboxStatus: { stage: "action_required", details: "Approve the sandbox in Arclet" },
-      }),
-    );
-    rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
+    for (const sandboxStatus of stages) act(() => useChatStore.setState({ sandboxStatus }));
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, offline");
     expect(dot).toHaveAttribute("data-status", "offline");
     fireEvent.pointerDown(trigger, { button: 0 });
