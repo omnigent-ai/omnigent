@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
-import socket
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -16,7 +17,9 @@ from playwright.sync_api import Page, expect
 
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
-from tests.e2e_ui.conftest import _register_agent_yaml, configure_mock_llm
+from tests._helpers.live_server import reserve_port
+from tests._helpers.session import bundle_files, post_session_bundle
+from tests.e2e_ui.conftest import configure_mock_llm
 
 _MANAGED_SERVER = "linear"
 _USER_SERVER = "notes"
@@ -29,31 +32,24 @@ _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 
 
-def _host_command(base_url: str, mock_url: str, managed_path: Path) -> list[str]:
-    """Start the daemon with Claude routed to the mock and managed-mcp.json at a writable path."""
-    providers = {
-        "e2e-claude": {
-            "kind": "key",
-            "default": ["anthropic"],
-            "anthropic": {
-                "base_url": mock_url,
-                "api_key": "mock-key",
-                "models": {"default": _MODEL},
-            },
+def _host_config(mock_url: str) -> dict[str, object]:
+    """Route the host's Claude provider to the mock model server."""
+    anthropic = {"base_url": mock_url, "api_key": "mock-key", "models": {"default": _MODEL}}
+    return {
+        "providers": {
+            "e2e-claude": {"kind": "key", "default": ["anthropic"], "anthropic": anthropic}
         }
     }
+
+
+def _host_command(base_url: str, managed_path: Path) -> list[str]:
+    """Start the daemon with the host inventory reading managed-mcp.json at a writable path."""
     # The real managed-mcp.json lives under /etc; only the host inventory reads this copy.
     bootstrap = (
-        "import os, runpy, sys, yaml\n"
+        "import runpy, sys\n"
         "from pathlib import Path\n"
         "import omnigent.host.mcp_inventory as inventory\n"
         f"inventory._managed_mcp_paths = lambda: (Path({str(managed_path)!r}),)\n"
-        "path = os.path.join(os.environ['OMNIGENT_CONFIG_HOME'], 'config.yaml')\n"
-        "with open(path) as fh:\n"
-        "    config = yaml.safe_load(fh) or {}\n"
-        f"config['providers'] = {providers!r}\n"
-        "with open(path, 'w') as fh:\n"
-        "    yaml.safe_dump(config, fh)\n"
         f"sys.argv = ['omnigent.host._daemon_entry', '--server', {base_url!r}]\n"
         "runpy.run_module('omnigent.host._daemon_entry', run_name='__main__')\n"
     )
@@ -70,7 +66,11 @@ def _write_auth_status(home: Path, name: str, status: str) -> None:
     staged.replace(path)
 
 
-def _claude_sdk_agent(base_url: str, mock_url: str, name: str) -> str:
+@contextlib.contextmanager
+def _claude_sdk_session(
+    client: httpx.Client, mock_url: str, name: str, host_id: str, workspace: Path
+) -> Iterator[str]:
+    """Create a claude-sdk session on the host and delete it afterwards."""
     yaml_text = (
         f"name: {name}\n"
         "prompt: You are a terse assistant.\n"
@@ -83,19 +83,20 @@ def _claude_sdk_agent(base_url: str, mock_url: str, name: str) -> str:
         "    api_key: mock-key\n"
         f"    base_url: {mock_url}\n"
     )
-    agent_id = _register_agent_yaml(base_url, yaml_text, arcname=f"{name}.yaml")
-    assert agent_id is not None
-    return agent_id
-
-
-def _create_session(client: httpx.Client, agent_id: str, host_id: str, workspace: Path) -> str:
-    created = client.post(
+    created = post_session_bundle(
+        client.post,
         "/v1/sessions",
-        json={"agent_id": agent_id, "host_id": host_id, "workspace": str(workspace)},
-        timeout=90.0,
+        bundle_files({f"{name}.yaml": yaml_text.encode()}),
+        metadata={"workspace": str(workspace), "host_id": host_id},
+        timeout=120.0,
     )
     created.raise_for_status()
-    return created.json()["id"]
+    session_id = str(created.json()["session_id"])
+    try:
+        yield session_id
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            client.delete(f"/v1/sessions/{session_id}")
 
 
 def _skip_imports_review(page: Page, host_id: str) -> None:
@@ -134,15 +135,14 @@ def test_claude_sdk_mcp_panel_lists_host_managed_server_sign_in_state(
             tmp_path / "host",
             live_server,
             env={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
-            command=_host_command(live_server, mock_llm_server_url, managed),
+            config=_host_config(mock_llm_server_url),
+            command=_host_command(live_server, managed),
+            ready=lambda started: started.wait_online(client, timeout=120),
         ) as host,
+        _claude_sdk_session(
+            client, mock_llm_server_url, f"sdk-mcp-{host.host_id[:8]}", host.host_id, workspace
+        ) as session_id,
     ):
-        host.wait_online(client, timeout=120)
-        agent_id = _claude_sdk_agent(
-            live_server, mock_llm_server_url, f"sdk-mcp-{host.host_id[:8]}"
-        )
-        session_id = _create_session(client, agent_id, host.host_id, workspace)
-
         page = request.getfixturevalue("page")
         _skip_imports_review(page, host.host_id)
         page.goto(f"{live_server}/c/{session_id}")
@@ -165,11 +165,8 @@ class _SignInGate:
 
     def __init__(self) -> None:
         self.signed_in = False
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.port = probe.getsockname()[1]
-        self._server = None
-        self._thread: threading.Thread | None = None
+        self.port = 0
+        self._cleanup = contextlib.ExitStack()
 
     @property
     def url(self) -> str:
@@ -205,21 +202,28 @@ class _SignInGate:
     def __enter__(self) -> _SignInGate:
         import uvicorn
 
-        self._server = uvicorn.Server(
-            uvicorn.Config(self._app(), host="127.0.0.1", port=self.port, log_level="warning")
-        )
-        self._thread = threading.Thread(target=self._server.run, daemon=True)
-        self._thread.start()
-        deadline = time.monotonic() + 15
-        while not self._server.started and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert self._server.started, "gated MCP server did not start"
+        with contextlib.ExitStack() as stack:
+            sock = stack.enter_context(reserve_port())
+            self.port = sock.getsockname()[1]
+            server = uvicorn.Server(uvicorn.Config(self._app(), log_level="warning"))
+            thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+            thread.start()
+            stack.callback(self._stop, server, thread)
+            deadline = time.monotonic() + 15
+            while not server.started and thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert server.started, "gated MCP server did not start"
+            self._cleanup = stack.pop_all()
         return self
 
     def __exit__(self, *exc: object) -> None:
-        assert self._server is not None and self._thread is not None
-        self._server.should_exit = True
-        self._thread.join(timeout=10)
+        self._cleanup.close()
+
+    @staticmethod
+    def _stop(server, thread: threading.Thread) -> None:
+        server.should_exit = True
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "gated MCP server did not stop"
 
 
 def _send(page: Page, text: str) -> None:
@@ -289,13 +293,14 @@ def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
                 tmp_path / "host",
                 live_server,
                 env={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
-                command=_host_command(live_server, mock_llm_server_url, managed),
+                config=_host_config(mock_llm_server_url),
+                command=_host_command(live_server, managed),
+                ready=lambda started: started.wait_online(client, timeout=120),
             ) as host,
+            _claude_sdk_session(
+                client, mock_llm_server_url, f"sdk-reconnect-{uid}", host.host_id, workspace
+            ) as session_id,
         ):
-            host.wait_online(client, timeout=120)
-            agent_id = _claude_sdk_agent(live_server, mock_llm_server_url, f"sdk-reconnect-{uid}")
-            session_id = _create_session(client, agent_id, host.host_id, workspace)
-
             page = request.getfixturevalue("page")
             _skip_imports_review(page, host.host_id)
             page.goto(f"{live_server}/c/{session_id}")

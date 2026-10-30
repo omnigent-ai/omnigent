@@ -81,6 +81,7 @@ interface AgentObjectWire {
   description?: string | null;
   harness?: string | null;
   mcp_servers?: McpServerSummary[];
+  loads_user_settings?: boolean;
   mcp_servers_editable?: boolean;
   mcp_registry_editable?: boolean;
   policies?: PolicySummary[];
@@ -103,6 +104,7 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
     description: json.description,
     harness: json.harness ?? null,
     mcp_servers: json.mcp_servers,
+    loads_user_settings: json.loads_user_settings,
     mcp_servers_editable: json.mcp_servers_editable,
     mcp_registry_editable: json.mcp_registry_editable,
     policies: json.policies,
