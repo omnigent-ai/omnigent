@@ -375,6 +375,83 @@ async def test_create_managed_sandbox_requires_configured_sandboxes(
     assert resp.status_code == 400, resp.text
 
 
+_SANDBOX_ROWS = [{"id": "system.ai.claude-opus-5-5"}, {"id": "system.ai.claude-sonnet-5"}]
+
+
+async def _save_sandbox_task(
+    auth_client: httpx.AsyncClient, operation: str, model: str
+) -> httpx.Response:
+    """Create a sandbox task with *model*, or create one without and PATCH it in."""
+    body = _create_body(execution_target="managed_sandbox")
+    del body["host_id"], body["workspace"]
+    if operation == "create":
+        return await auth_client.post(
+            "/v1/scheduled-tasks", json={**body, "model_override": model}, headers=_headers()
+        )
+    created = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert created.status_code == 200, created.text
+    return await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}",
+        json={"model_override": model},
+        headers=_headers(),
+    )
+
+
+@pytest.mark.parametrize("operation", ["create", "patch"])
+@pytest.mark.parametrize(
+    ("model", "accepted"),
+    [
+        ("system.ai.claude-sonnet-5", True),
+        # Claude Code resolves its family aliases itself.
+        ("opus", True),
+        ("system.ai.claude-haiku-5-5", False),
+    ],
+)
+async def test_sandbox_task_model_must_be_offered_by_the_sandbox_catalog(
+    auth_app, auth_client, db_uri, operation, model, accepted
+):
+    """A sandbox task's model is checked against the catalog a new sandbox session shows."""
+    _make_user(db_uri)
+    deployment = _sandbox_deployment()
+    deployment.default.default_model_options = AsyncMock(return_value=_SANDBOX_ROWS)
+    auth_app.state.sandbox_config = deployment
+
+    response = await _save_sandbox_task(auth_client, operation, model)
+
+    if accepted:
+        assert response.status_code == 200, response.text
+        assert response.json()["model_override"] == model
+    else:
+        assert response.status_code == 400, response.text
+        assert "not offered for this agent in a new sandbox" in response.text
+        assert "system.ai.claude-sonnet-5" in response.text
+    if model != "opus":
+        deployment.default.default_model_options.assert_awaited_with(
+            "claude-native", "alice@example.com"
+        )
+
+
+@pytest.mark.parametrize("operation", ["create", "patch"])
+@pytest.mark.parametrize("catalog", ["empty", "unavailable"])
+async def test_sandbox_task_keeps_a_model_the_catalog_cannot_check(
+    auth_app, auth_client, db_uri, operation, catalog
+):
+    """An empty or failing catalog can't rule a model out, so the task is saved."""
+    _make_user(db_uri)
+    deployment = _sandbox_deployment()
+    deployment.default.default_model_options = (
+        AsyncMock(return_value=[])
+        if catalog == "empty"
+        else AsyncMock(side_effect=RuntimeError("gateway down"))
+    )
+    auth_app.state.sandbox_config = deployment
+
+    response = await _save_sandbox_task(auth_client, operation, "system.ai.claude-haiku-5-5")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model_override"] == "system.ai.claude-haiku-5-5"
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("managed", [False, True])
 @pytest.mark.parametrize("operation", ["create", "patch"])

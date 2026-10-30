@@ -78,6 +78,17 @@ def selected_catalog_model(catalog: dict[str, Any], model: str | None) -> str:
     return selected
 
 
+def catalog_offers_model(catalog: dict[str, Any], model: str) -> bool | None:
+    """Whether a ready catalog offers *model*; ``None`` when the catalog can't tell.
+
+    A catalog that is empty, unavailable or unconfigured proves nothing about a
+    saved choice, so callers that persist one keep it rather than reject it.
+    """
+    if catalog.get("status") != "ready":
+        return None
+    return any(model in (row.get("id"), row.get("model")) for row in catalog.get("models") or [])
+
+
 async def prepare_create_inference(
     request: Request,
     body: Any,
@@ -158,6 +169,93 @@ async def validate_saved_selection(
     return selected_catalog_model(catalog, model)
 
 
+async def resolve_sandbox_model_options(
+    request: Request,
+    *,
+    provider: str,
+    harness: str,
+    user_id: str | None,
+    spec: Any | None,
+) -> dict[str, Any]:
+    """The models a fresh *provider* sandbox would offer *harness* for *user_id*.
+
+    *spec* is the agent's loaded spec, or ``None`` for a bare harness; an agent
+    that brings its own inference auth or profile gets no sandbox default catalog.
+    """
+    auth = spec.executor.auth if spec is not None else None
+    try:
+        snapshot = await inference_service(request).prepare(
+            provider, harness, user_id, agent_auth=auth
+        )
+        if snapshot is not None:
+            return snapshot["catalog"]
+    except (OmnigentError, ValueError) as exc:
+        return {
+            "configured": True,
+            "models": [],
+            "configuration_revision": None,
+            "provider_label": None,
+            "default_model": None,
+            "status": "unavailable",
+            "error": exc.message
+            if isinstance(exc, OmnigentError)
+            else "Invalid inference configuration",
+        }
+    result: dict[str, Any] = {
+        "configured": False,
+        "models": [],
+        "configuration_revision": None,
+        "provider_label": None,
+        "default_model": None,
+        "status": "unconfigured",
+    }
+    deployment = getattr(request.app.state, "sandbox_config", None)
+    target = deployment.for_provider(provider) if deployment is not None else None
+    # An agent's own provider takes precedence over the sandbox's default catalog.
+    if target is None or not target.managed_launch_supported or auth is not None:
+        return result
+    if spec is not None and (spec.executor.config.get("profile") or spec.executor.profile):
+        return result
+    ambient = await inference_service(request).ambient_catalog(provider, harness, user_id)
+    if ambient is not None:
+        return ambient
+    if target.default_model_options is not None:
+        result["provider_label"] = "AI Gateway"
+        try:
+            rows = await asyncio.wait_for(
+                target.default_model_options(harness, user_id),
+                timeout=_DEFAULT_MODEL_OPTIONS_TIMEOUT_S,
+            )
+            if not all(isinstance(row.get("id"), str) and row["id"] for row in rows):
+                raise ValueError("default_model_options rows must carry a model id")
+            # Advisory rows never carry a default marker; Default stays a separate row.
+            models = [{**row, "isDefault": False} for row in rows]
+            result.update(models=models, status="ready" if models else "empty")
+            if not models:
+                result["error"] = "The gateway lists no usable models for this harness."
+        except NoReachableModels as exc:
+            reason = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], str) else ""
+            reason = reason.strip()[:_NO_REACHABLE_MODELS_REASON_MAX_CHARS]
+            _logger.info(
+                "Sandbox provider reports no reachable models for %s/%s: %s",
+                provider,
+                harness,
+                reason or "(no reason)",
+            )
+            result["status"] = "unsupported"
+            if reason:
+                result["error"] = reason
+        except Exception:  # noqa: BLE001 - optional preview must not block a default launch
+            _logger.warning(
+                "AI Gateway model preview failed for %s/%s", provider, harness, exc_info=True
+            )
+            result.update(
+                status="unavailable",
+                error="Could not load AI Gateway models. You can use Default.",
+            )
+    return result
+
+
 def create_sandbox_inference_router(
     *,
     agent_store: Any,
@@ -179,7 +277,6 @@ def create_sandbox_inference_router(
     ) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
         response.headers["Cache-Control"] = "private, no-store"
-        auth = None
         spec = None
         if agent_id is not None:
             # Clients read a missing agent's 404 from ``detail``; keep that shape.
@@ -203,77 +300,8 @@ def create_sandbox_inference_router(
                 )
             ).spec
             harness = actual_harness(spec, harness)
-            auth = spec.executor.auth
-        try:
-            snapshot = await inference_service(request).prepare(
-                provider, harness, user_id, agent_auth=auth
-            )
-            if snapshot is not None:
-                return snapshot["catalog"]
-        except (OmnigentError, ValueError) as exc:
-            return {
-                "configured": True,
-                "models": [],
-                "configuration_revision": None,
-                "provider_label": None,
-                "default_model": None,
-                "status": "unavailable",
-                "error": exc.message
-                if isinstance(exc, OmnigentError)
-                else "Invalid inference configuration",
-            }
-        result: dict[str, Any] = {
-            "configured": False,
-            "models": [],
-            "configuration_revision": None,
-            "provider_label": None,
-            "default_model": None,
-            "status": "unconfigured",
-        }
-        deployment = getattr(request.app.state, "sandbox_config", None)
-        target = deployment.for_provider(provider) if deployment is not None else None
-        # An agent's own provider takes precedence over the sandbox's default catalog.
-        if target is None or not target.managed_launch_supported or auth is not None:
-            return result
-        if spec is not None and (spec.executor.config.get("profile") or spec.executor.profile):
-            return result
-        ambient = await inference_service(request).ambient_catalog(provider, harness, user_id)
-        if ambient is not None:
-            return ambient
-        if target.default_model_options is not None:
-            result["provider_label"] = "AI Gateway"
-            try:
-                rows = await asyncio.wait_for(
-                    target.default_model_options(harness, user_id),
-                    timeout=_DEFAULT_MODEL_OPTIONS_TIMEOUT_S,
-                )
-                if not all(isinstance(row.get("id"), str) and row["id"] for row in rows):
-                    raise ValueError("default_model_options rows must carry a model id")
-                # Advisory rows never carry a default marker; Default stays a separate row.
-                models = [{**row, "isDefault": False} for row in rows]
-                result.update(models=models, status="ready" if models else "empty")
-                if not models:
-                    result["error"] = "The gateway lists no usable models for this harness."
-            except NoReachableModels as exc:
-                reason = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], str) else ""
-                reason = reason.strip()[:_NO_REACHABLE_MODELS_REASON_MAX_CHARS]
-                _logger.info(
-                    "Sandbox provider reports no reachable models for %s/%s: %s",
-                    provider,
-                    harness,
-                    reason or "(no reason)",
-                )
-                result["status"] = "unsupported"
-                if reason:
-                    result["error"] = reason
-            except Exception:  # optional preview must not block a default launch
-                _logger.warning(
-                    "AI Gateway model preview failed for %s/%s", provider, harness, exc_info=True
-                )
-                result.update(
-                    status="unavailable",
-                    error="Could not load AI Gateway models. You can use Default.",
-                )
-        return result
+        return await resolve_sandbox_model_options(
+            request, provider=provider, harness=harness, user_id=user_id, spec=spec
+        )
 
     return router
