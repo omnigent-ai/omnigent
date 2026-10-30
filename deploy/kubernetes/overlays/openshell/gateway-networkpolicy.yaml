@@ -34,3 +34,12 @@ spec:
       to:
         - ipBlock:
             cidr: 0.0.0.0/0
+    # In-cluster gateway — ports match the gateway pod's port, not its
+    # Service port. Adjust the namespace and port to your gateway install.
+    - ports:
+        - protocol: TCP
+          port: 8080
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshell

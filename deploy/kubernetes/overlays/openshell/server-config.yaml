@@ -15,12 +15,15 @@ data:
       # sandbox network namespace).
       server_url: https://omnigent.example.com
       openshell:
+        # Host image that bakes in your sandbox policy; see the network
+        # egress policy section of deploy/openshell/README.md.
+        # image: registry.example.com/omnigent-host-openshell:latest
         # SERVER env var NAMES whose values are injected into sandboxes
         # at provision time — this is how LLM keys reach the sandbox.
         env:
           - ANTHROPIC_API_KEY
           - OPENAI_API_KEY
           - GEMINI_API_KEY
-        # Gateway name resolved by the SDK's from_active_cluster(); omit
-        # to use the active gateway from ~/.config/openshell/active_gateway.
-        # cluster: my-gateway
+        # Gateway directory under ~/.config/openshell/gateways/ that the
+        # deployment patch mounts from the openshell-gateway-config Secret.
+        cluster: openshell

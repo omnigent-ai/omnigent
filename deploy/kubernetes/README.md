@@ -178,14 +178,17 @@ sessions, and includes RBAC for the
 [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
 CRD when the gateway uses a Kubernetes compute driver.
 
-1. **Edit the configmap patch** — set `OMNIGENT_SANDBOX_SERVER_URL` to the
-   public URL sandboxes will dial back to, and optionally set `OPENSHELL_GATEWAY`
-   to a specific gateway name:
+1. **Edit the server config** — in `overlays/openshell/server-config.yaml`, set
+   `sandbox.server_url` to the URL sandboxes dial back to, and
+   `sandbox.openshell.image` to a host image that bakes in your sandbox policy
+   (see [Network egress policy](../openshell/README.md#network-egress-policy)):
 
-   ```bash
-   # deploy/kubernetes/overlays/openshell/configmap-patch.yaml
-   OMNIGENT_SANDBOX_SERVER_URL: "https://omnigent.example.com"
-   OPENSHELL_GATEWAY: "my-gateway"
+   ```yaml
+   sandbox:
+     provider: openshell
+     server_url: https://omnigent.example.com
+     openshell:
+       image: registry.example.com/omnigent-host-openshell:latest
    ```
 
 2. **Edit secrets** — in `overlays/openshell/secret-patch.yaml`, set the
@@ -197,12 +200,24 @@ CRD when the gateway uses a Kubernetes compute driver.
    ANTHROPIC_API_KEY: "sk-ant-..."
    ```
 
-3. **Gateway access** — the server pod needs to reach the OpenShell gateway's
-   gRPC endpoint. If the gateway runs in-cluster, make sure the NetworkPolicy
-   allows it (the included policy allows all egress on 443 — tighten to taste).
-   If the gateway stores its config/TLS material in a Secret, create
-   `openshell-gateway-config` in the `omnigent` namespace and the deployment
-   mounts it at `~/.config/openshell`.
+3. **Gateway config** — create the `openshell-gateway-config` Secret from the
+   gateway's `metadata.json`, plus its mTLS files for an `https` gateway:
+
+   ```bash
+   gw=~/.config/openshell/gateways/<gateway-name>
+   kubectl -n omnigent create secret generic openshell-gateway-config \
+     --from-file=metadata.json=$gw/metadata.json \
+     --from-file=ca.crt=$gw/mtls/ca.crt \
+     --from-file=tls.crt=$gw/mtls/tls.crt \
+     --from-file=tls.key=$gw/mtls/tls.key
+   ```
+
+   The deployment mounts it as the `openshell` gateway that `server-config.yaml`
+   selects. Its `gateway_endpoint` must be reachable from the server pod, e.g.
+   the gateway Service's cluster DNS name rather than a local port-forward. The
+   mount is read-only, so gateways using OIDC sign-in are not supported. The
+   included NetworkPolicy allows TCP 443 to any address and TCP 8080 to the
+   `openshell` namespace; adjust it to your gateway's namespace and pod port.
 
 4. **Install the agent-sandbox CRD** *(optional)* — if the OpenShell gateway
    delegates to the kubernetes-sigs/agent-sandbox controller:
@@ -211,8 +226,9 @@ CRD when the gateway uses a Kubernetes compute driver.
    kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/main/config/crd/bases/sandbox.agent.k8s.io_agentsandboxes.yaml
    ```
 
-   The overlay's RBAC already grants the server's ServiceAccount permission to
-   manage `AgentSandbox` resources.
+   The overlay's ClusterRoleBinding grants the gateway's ServiceAccount
+   permission to manage `AgentSandbox` resources; edit its subject in
+   `sandbox-clusterrolebinding.yaml` to match your gateway install.
 
 5. **Apply:**
 
