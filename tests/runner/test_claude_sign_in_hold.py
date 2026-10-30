@@ -316,7 +316,10 @@ async def test_sign_in_refusal_holds_the_message_and_sends_it_after_sign_in(
         first = await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
         assert first.status_code == 202
         await _until(
-            lambda: sid in app.state.sign_in_holds and server.notices("databricks_sign_in_pending")
+            lambda: (
+                sid in app.state.sign_in_holds
+                and bool(server.notices("databricks_sign_in_pending"))
+            )
         )
 
         published = _published(app, sid)
@@ -331,7 +334,7 @@ async def test_sign_in_refusal_holds_the_message_and_sends_it_after_sign_in(
         (notice,) = server.notices("databricks_sign_in_pending")
         assert notice["level"] == "info"
         assert notice["remediation"] == _HELD_SIGN_IN_STEP
-        assert "will be sent once you sign in" in notice["message"]
+        assert "will be sent once you sign in" in notice["title"]
 
         # A message sent meanwhile queues behind the held one.
         second = await client.post(f"/v1/sessions/{sid}/events", json=_message("second"))
@@ -457,10 +460,10 @@ def test_hold_notice_keeps_the_sign_in_step_without_asking_for_a_resend() -> Non
     assert notice == {
         "source": "harness",
         "code": "databricks_sign_in_pending",
-        "title": "Claude Code can't start until you sign in to Databricks",
+        "title": "Your message will be sent once you sign in to Databricks",
         "message": (
             "Claude Code is waiting for a sign-in in this session's terminal. "
-            "Your message will be sent once you sign in."
+            "You don't need to send your message again."
         ),
         "remediation": _HELD_SIGN_IN_STEP,
         "level": "info",

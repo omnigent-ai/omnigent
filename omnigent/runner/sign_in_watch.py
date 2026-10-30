@@ -173,18 +173,20 @@ def build_sign_in_watch(
         Tell the chat its message waits for a launcher sign-in instead of failing.
 
         :param conv_id: Session whose message is held.
-        :param error: The harness refusal, carrying the sign-in ``title`` and the
-            next step as ``remediation``.
+        :param error: The harness refusal, carrying the sign-in next step as
+            ``remediation``.
         """
         from omnigent.harnesses.diagnostics import SIGN_IN_RESEND_STEP
 
         agent = _agent_name(_session_harness_name(conv_id))
         item: dict[str, Any] = {
             "code": "databricks_sign_in_pending",
-            "title": error.get("title") or f"{agent} is waiting for a Databricks sign-in",
+            # A collapsed card shows only its headline, so the headline says the message
+            # waits; the refusal's own "can't start" title reads as a failure to resend.
+            "title": "Your message will be sent once you sign in to Databricks",
             "message": (
                 f"{agent} is waiting for a sign-in in this session's terminal. "
-                "Your message will be sent once you sign in."
+                "You don't need to send your message again."
             ),
         }
         remediation = error.get("remediation")
