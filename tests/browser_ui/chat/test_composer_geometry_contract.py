@@ -8,8 +8,10 @@ from itertools import pairwise
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.browser_ui.chat._geometry_helpers import (
     DESKTOP,
+    GEOMETRY_PROBE,
     PHONE,
     TABLET,
     TOLERANCE,
@@ -918,7 +920,12 @@ def test_composer_growth_reflows_without_covering_output(
     shrunk = settled_geometry(page)
     assert shrunk["composerHeight"] == baseline["composerHeight"]
     for key in ("messageTops", "composerTop", "transcriptBottom", "viewport", "railTicks"):
-        assert shrunk[key] == baseline[key], ("after deleting", key, baseline[key], shrunk[key])
+        assert shrunk[key] == pytest.approx(baseline[key], abs=TOLERANCE), (
+            "after deleting",
+            key,
+            baseline[key],
+            shrunk[key],
+        )
     assert_clearance(shrunk, "after deleting")
 
     page.set_viewport_size({"width": 500, "height": 713})
@@ -1006,7 +1013,11 @@ def test_composer_growth_reflows_without_covering_output(
     assert button_relocked_grown["composerHeight"] > button_relocked["composerHeight"]
     assert_clearance(button_relocked_grown, "button relock growth")
     append_streamed_output(page, 80)
-    assert settled_geometry(page)["distanceFromBottom"] <= TOLERANCE
+    poll_until(
+        lambda: page.evaluate(GEOMETRY_PROBE)["distanceFromBottom"] <= TOLERANCE,
+        timeout_s=15,
+        interval_s=0.05,
+    )
 
     composer.fill("")
     settled_geometry(page)

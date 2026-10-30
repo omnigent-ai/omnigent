@@ -15,7 +15,7 @@ summary, and the tool row, and asserts on what the user sees in the
 shell terminal panel:
 
   - the panel shows ``$ <command>`` and the parsed ``exit 0`` status, not
-    the raw Parameters JSON (which stays behind the Raw toggle);
+    the raw Input JSON (which stays behind the Raw toggle);
   - the long output line must FIT the panel (``scrollWidth`` no wider
     than ``clientWidth``), i.e. wrap instead of forcing a horizontal
     scrollbar;
@@ -215,11 +215,11 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
 
     # The panel reads like a terminal: the command (its `$` prompt is CSS-only)
     # and the exit status parsed from sys_os_shell's JSON result; the
-    # Parameters JSON stays behind Raw.
+    # Input JSON stays behind Raw.
     terminal = page.get_by_test_id("shell-tool-terminal")
     expect(terminal).to_contain_text("python3 -c")
     expect(terminal.get_by_text("exit 0", exact=True)).to_be_visible()
-    expect(page.get_by_text("Parameters", exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name="Copy input", exact=True)).to_have_count(0)
 
     # Regression guard: the long output line fits the panel width — no
     # horizontal clipping/scrolling needed to read it.

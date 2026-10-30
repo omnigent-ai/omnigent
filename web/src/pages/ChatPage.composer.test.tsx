@@ -181,6 +181,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     pi: "Pi",
     antigravity: "Antigravity",
     copilot: "Copilot",
+    grok: "Grok Build",
   }),
 }));
 vi.mock("@/lib/goalApi", async (importOriginal) => ({
@@ -2463,6 +2464,30 @@ describe("Composer model/effort label", () => {
       />,
     );
     expect(label()).toHaveTextContent("Polly (Pi)");
+  });
+
+  it("shows the harness identity, not the spec pin, for an own-auth ACP session", () => {
+    // Grok Build runs its own model, so the snapshot leaves llmModel null until
+    // the agent reports one. The spec's pinned model must not appear.
+    useChatStore.setState({
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
+      llmModel: null,
+      sessionHarness: "grok",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "pinned" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Grok Build");
+    expect(label()).not.toHaveTextContent("gpt-4o-mini");
   });
 
   it("names the vendor, not the Task subagent_type, on a Claude Code sub-agent", () => {
@@ -5258,8 +5283,6 @@ describe("Composer reply quotes", () => {
       JSON.stringify([{ text: serializeReplyDraft(replyDraft), replyDraft }]),
     );
     render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
-    textarea().setSelectionRange(0, 0);
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
     const edited = "Introduction\n\nAnswer to keep";
@@ -5273,12 +5296,13 @@ describe("Composer reply quotes", () => {
   it("exits history recall on the first manual text edit", () => {
     localStorage.setItem("omnigent:prompt-history:conv_test", JSON.stringify(["Older prompt"]));
     render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
-    textarea().setSelectionRange(0, 0);
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     expect(textarea()).toHaveValue("Older prompt");
     const edited = "My edited prompt";
     fireEvent.change(textarea(), { target: { value: edited } });
+    textarea().setSelectionRange(0, 0);
+    expect(fireEvent.keyDown(textarea(), { key: "ArrowUp" })).toBe(true);
+    expect(textarea()).toHaveValue(edited);
     textarea().setSelectionRange(edited.length, edited.length);
     fireEvent.keyDown(textarea(), { key: "ArrowDown" });
     expect(textarea()).toHaveValue(edited);
@@ -5935,8 +5959,8 @@ describe("Composer file-attachment focus", () => {
 });
 
 // Paste mirrors drop on the in-session composer: files on the clipboard attach
-// instead of inserting as text, while a plain-text paste is left to the
-// browser. Same contract as the landing composer's paste suite.
+// instead of inserting as text, while plain text is inserted as typed input.
+// Same contract as the landing composer's paste suite.
 describe("Composer paste", () => {
   beforeEach(() => {
     setComposerState({ conversationId: "conv_test", skills: [] });
@@ -5966,14 +5990,15 @@ describe("Composer paste", () => {
     for (const file of files) {
       items.push({ kind: "file", type: file.type, getAsFile: () => file });
     }
-    return { clipboardData: { items } };
+    const getData = (type: string) => (type === "text/plain" ? (text ?? "") : "");
+    return { clipboardData: { items, getData } };
   }
 
-  it("leaves a text-only paste to the browser", () => {
+  it("inserts a text-only paste as typed input", () => {
     render(<Composer {...composerProps()} />);
-    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(true);
+    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(false);
     expect(screen.queryByText(/can't be attached/)).toBeNull();
-    expect(textarea().value).toBe("");
+    expect(textarea().value).toBe("hello world");
   });
 
   it("attaches a pasted file instead of inserting it as text", () => {
@@ -6476,17 +6501,38 @@ describe("Composer — editing queued messages", () => {
     expect(props.onSend).toHaveBeenCalledWith(QUEUED_TEXT, [file]);
   });
 
-  it("browsing history over a non-empty draft leaves the queued row alone", async () => {
+  it.each(["half-typed draft", "first line\nsecond line", " \n "])(
+    "ArrowUp preserves the draft %j and leaves the queued row alone",
+    (draft) => {
+      appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+      renderWithTooltips(<Composer {...composerProps()} />);
+
+      const ta = textarea();
+      fireEvent.change(ta, { target: { value: draft } });
+      ta.setSelectionRange(0, 0);
+      expect(fireEvent.keyDown(ta, { key: "ArrowUp" })).toBe(true);
+
+      expect(ta).toHaveValue(draft);
+      expect(getSessionDraft(CONV)?.text).toBe(draft);
+      expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    },
+  );
+
+  it("keeps a recalled queued message as an editable draft", () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
     renderWithTooltips(<Composer {...composerProps()} />);
 
     const ta = textarea();
-    fireEvent.change(ta, { target: { value: "half-typed draft" } });
-    ta.setSelectionRange(0, 0);
     fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue(QUEUED_TEXT);
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
 
-    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
-    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    ta.setSelectionRange(0, 0);
+    expect(fireEvent.keyDown(ta, { key: "ArrowUp" })).toBe(true);
+    ta.setSelectionRange(QUEUED_TEXT.length, QUEUED_TEXT.length);
+    expect(fireEvent.keyDown(ta, { key: "ArrowDown" })).toBe(true);
+
+    expect(ta).toHaveValue(QUEUED_TEXT);
   });
 
   it("leaves another conversation's identically-worded queued row alone", async () => {
