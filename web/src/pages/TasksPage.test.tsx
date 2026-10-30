@@ -516,8 +516,12 @@ describe("trigger templates", () => {
   });
 
   it.each(["jira", "slack", "github"])("opens the %s builder from the templates page", (source) => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
     setTasks([]);
     renderWithSessionModes(TRIGGER_INFO, true);
+    expect(
+      screen.queryByRole("dialog", { name: "Introducing Automations" }),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
       "data-initial-trigger",

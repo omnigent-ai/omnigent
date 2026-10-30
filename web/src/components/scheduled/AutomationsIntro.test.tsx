@@ -63,8 +63,13 @@ describe("Automations first-visit introduction", () => {
   it("advances through the supported features and remembers completion across remounts", () => {
     const view = render(intro());
     expect(screen.getByText("1 of 4 · Run on a schedule")).toBeVisible();
-    for (let index = 0; index < 3; index++)
+    for (const title of ["Watch for new work", "Keep context between runs", "Make it yours"]) {
       fireEvent.click(screen.getByRole("button", { name: "Next" }));
+      expect(screen.getByRole("button", { name: new RegExp(title) })).toHaveAttribute(
+        "aria-current",
+        "step",
+      );
+    }
     expect(screen.getByText("4 of 4 · Make it yours")).toBeVisible();
     expect(localStorage.length).toBe(0);
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
@@ -151,6 +156,14 @@ describe("Automations first-visit introduction", () => {
     view.rerender(intro({ ...fullInfo, features: { session_orchestration: false } }));
     expect(screen.getByText("Keep context between runs")).toBeVisible();
     expect(screen.queryByText("Watch for new work")).not.toBeInTheDocument();
+    view.rerender(intro({ ...fullInfo, scheduled_task_session_modes: false }));
+    expect(screen.queryByText("Keep context between runs")).not.toBeInTheDocument();
+    expect(screen.queryByText("Watch for new work")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Make it yours/ }));
+    expect(
+      screen.getByText(/Choose your agent and a connected computer or available sandbox/),
+    ).toBeVisible();
+    expect(screen.getByText("Computer or sandbox")).toBeVisible();
   });
 
   it("renders inside the managed portal and uses the deployment's branding", () => {
