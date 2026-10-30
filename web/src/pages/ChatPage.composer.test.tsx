@@ -1,3 +1,4 @@
+import { requestComposerInsertion } from "@/lib/composerInsertions";
 import { create } from "zustand";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -5500,6 +5501,22 @@ describe("Composer reply quotes", () => {
       if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
     },
   );
+
+  it("appends a local review without sending, replacing a draft, or duplicating it", () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...props} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("Existing quote"));
+    fireEvent.change(textarea(), { target: { value: "My instructions" } });
+    act(() => requestComposerInsertion("other-session", "Other review"));
+    expect(textarea()).toHaveValue("My instructions");
+    act(() => requestComposerInsertion("conv_test", "Please address [Comment 123]"));
+    expect(textarea()).toHaveValue("My instructions\n\nPlease address [Comment 123]");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Existing quote");
+    expect(props.onSend).not.toHaveBeenCalled();
+    act(() => requestComposerInsertion("conv_test", "Please address [Comment 123]"));
+    expect(textarea()).toHaveValue("My instructions\n\nPlease address [Comment 123]");
+  });
 
   it("keeps mention markers in the structured payload used to restore a failed send", () => {
     const props = composerProps();

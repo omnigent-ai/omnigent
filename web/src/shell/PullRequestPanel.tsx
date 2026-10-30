@@ -1,3 +1,8 @@
+import { markCommentsSeen } from "@/hooks/useSeenComments";
+import { useComments, type Comment } from "@/hooks/useComments";
+import { LocalReviewComment } from "./LocalReviewComment";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
+import { requestComposerInsertion } from "@/lib/composerInsertions";
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
@@ -459,6 +464,7 @@ function splitPath(path: string): { dir: string; name: string } {
 interface ReviewAnnotation {
   threads: ReviewThread[];
   newThread?: boolean;
+  localComments?: Comment[];
 }
 type DiffOptions = React.ComponentProps<typeof FileDiff<ReviewAnnotation>>["options"];
 
@@ -484,6 +490,8 @@ function PullRequestFileSection({
   threads,
   threadContext,
   matchingRevision,
+  localComments,
+  canCommentLocally,
 }: {
   file: PullRequestChangedFile;
   /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
@@ -496,6 +504,8 @@ function PullRequestFileSection({
   threads: ReviewThread[];
   threadContext: ReviewThreadContext;
   matchingRevision: boolean;
+  localComments: Comment[];
+  canCommentLocally: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [seen, setSeen] = useState(false);
@@ -507,6 +517,8 @@ function PullRequestFileSection({
     threadContext.headSha ?? "",
     threadContext.baseSha ?? "",
   );
+  const canStart = threadContext.canCreate || canCommentLocally;
+  const local = composer.draft.destination === "local";
   const revision = `${threadContext.baseSha}:${threadContext.headSha}`;
   const [selection, setSelection] = useState<{
     revision: string;
@@ -528,13 +540,14 @@ function PullRequestFileSection({
   );
   const [selectionError, setSelectionError] = useState<string>();
   const startConversation = (range: SelectedLineRange) => {
-    if (!threadContext.canCreate || !fileDiff || composer.draft.pending) return;
+    if (!canStart || !fileDiff || composer.draft.pending) return;
     const lines = reviewSelection(range, fileDiff);
     if (!lines) {
       setSelectionError("Select lines within one diff hunk, on the same side.");
       return;
     }
     setSelectionError(undefined);
+    if (!threadContext.canCreate) composer.setDestination("local");
     composer.selectLines(lines);
   };
 
@@ -571,9 +584,9 @@ function PullRequestFileSection({
     seen &&
     (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
   const anchor = composer.draft.anchor;
-  const showGutterUtility = !!threadContext.canCreate && (!anchor || composer.stale);
+  const showGutterUtility = !!canStart && (!anchor || composer.stale);
   const showDraftInline = !!anchor && !composer.stale && renderingDiff;
-  const { annotations, unplaced } = useMemo(() => {
+  const { annotations, unplaced, unplacedLocal } = useMemo(() => {
     const { annotations: threadAnnotations, unplaced: unplacedThreads } = reviewThreadAnnotations(
       threads,
       renderingDiff ? fileDiff : undefined,
@@ -582,6 +595,34 @@ function PullRequestFileSection({
     const inlineAnnotations: DiffLineAnnotation<ReviewAnnotation>[] = threadAnnotations.map(
       (annotation) => ({ ...annotation, metadata: { threads: annotation.metadata } }),
     );
+    const unplacedLocalComments: Comment[] = [];
+    for (const comment of localComments) {
+      const saved = comment.review_anchor!;
+      const side = saved.side === "LEFT" ? "deletions" : "additions";
+      if (
+        !renderingDiff ||
+        !fileDiff ||
+        !reviewSelection(
+          { side, start: saved.start_line ?? saved.line, end: saved.line },
+          fileDiff,
+        ) ||
+        saved.head_sha !== threadContext.headSha ||
+        saved.base_sha !== threadContext.baseSha
+      ) {
+        unplacedLocalComments.push(comment);
+        continue;
+      }
+      const existing = inlineAnnotations.find(
+        (item) => item.side === side && item.lineNumber === saved.line,
+      );
+      if (existing) (existing.metadata.localComments ??= []).push(comment);
+      else
+        inlineAnnotations.push({
+          side,
+          lineNumber: saved.line,
+          metadata: { threads: [], localComments: [comment] },
+        });
+    }
     if (showDraftInline) {
       const side = anchor.side === "LEFT" ? "deletions" : "additions";
       const existing = inlineAnnotations.find(
@@ -595,8 +636,22 @@ function PullRequestFileSection({
           metadata: { threads: [], newThread: true },
         });
     }
-    return { annotations: inlineAnnotations, unplaced: unplacedThreads };
-  }, [threads, renderingDiff, fileDiff, matchingRevision, anchor, showDraftInline]);
+    return {
+      annotations: inlineAnnotations,
+      unplaced: unplacedThreads,
+      unplacedLocal: unplacedLocalComments,
+    };
+  }, [
+    threads,
+    renderingDiff,
+    fileDiff,
+    matchingRevision,
+    anchor,
+    showDraftInline,
+    localComments,
+    threadContext.headSha,
+    threadContext.baseSha,
+  ]);
   const newConversation = anchor && (
     <section
       aria-label="New review conversation"
@@ -620,17 +675,38 @@ function PullRequestFileSection({
           The pull request changed. Your draft is saved; select its lines again before posting.
         </p>
       )}
-      {!threadContext.canCreate && (
+      {!canStart && (
         <p role="status" className="px-3 pb-2">
           Your draft is saved. Commenting is currently unavailable.
         </p>
       )}
+      <div className="flex gap-2 px-3 pb-2" role="group" aria-label="Comment destination">
+        <Button
+          size="sm"
+          variant={local ? "default" : "outline"}
+          aria-pressed={local}
+          disabled={!canCommentLocally || composer.draft.pending}
+          onClick={() => composer.setDestination("local")}
+        >
+          Local comment
+        </Button>
+        <Button
+          size="sm"
+          variant={!local ? "default" : "outline"}
+          aria-pressed={!local}
+          disabled={!threadContext.canCreate || composer.draft.pending}
+          onClick={() => composer.setDestination("github")}
+        >
+          GitHub
+        </Button>
+      </div>
       <PullRequestCommentForm
         {...composer}
         account={threadContext.account}
         inline
         newThread
-        disabled={composer.stale || !threadContext.canCreate}
+        local={local}
+        disabled={composer.stale || (local ? !canCommentLocally : !threadContext.canCreate)}
       />
     </section>
   );
@@ -684,6 +760,19 @@ function PullRequestFileSection({
           {!showDraftInline && newConversation && <div className="px-3">{newConversation}</div>}
         </>
       )}
+      {!collapsed &&
+        unplacedLocal.map((comment) => (
+          <div className="px-3" key={comment.id}>
+            <LocalReviewComment
+              comment={comment}
+              canEdit={canCommentLocally}
+              outdated={
+                comment.review_anchor?.head_sha !== threadContext.headSha ||
+                comment.review_anchor?.base_sha !== threadContext.baseSha
+              }
+            />
+          </div>
+        ))}
       {!collapsed && unplaced.length > 0 && (
         <div className="px-3">
           {unplaced.map((thread) => (
@@ -726,7 +815,7 @@ function PullRequestFileSection({
               fileDiff={fileDiff}
               options={{
                 ...options,
-                enableLineSelection: !!threadContext.canCreate,
+                enableLineSelection: !!canStart,
                 enableGutterUtility: showGutterUtility,
                 onLineSelectionStart: previewSelection,
                 onLineSelectionChange: previewSelection,
@@ -774,6 +863,13 @@ function PullRequestFileSection({
               renderAnnotation={(annotation) => (
                 <div className="min-w-0 px-3">
                   {annotation.metadata.newThread && newConversation}
+                  {annotation.metadata.localComments?.map((comment) => (
+                    <LocalReviewComment
+                      key={comment.id}
+                      comment={comment}
+                      canEdit={canCommentLocally}
+                    />
+                  ))}
                   {annotation.metadata.threads.map((thread) => (
                     <PullRequestReviewThread
                       key={thread.id}
@@ -2005,6 +2101,24 @@ function PullRequestPanelDetails({
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
   const canEdit = useCanEdit(conversationId);
+  const sessionComments = useComments(
+    active && activeTab === "changes" ? conversationId : undefined,
+  );
+  const localComments = (sessionComments.data ?? []).filter(
+    (comment) => comment.review_anchor?.pr_url === (prUrl ?? info.data?.pr?.url),
+  );
+  const openLocalComments = localComments.filter((comment) => comment.status === "draft");
+  const mobilePanel = useMobilePanelHeaderTarget();
+  useEffect(() => {
+    if (active && activeTab === "changes") {
+      markCommentsSeen(
+        (sessionComments.data ?? [])
+          .filter((comment) => comment.review_anchor?.pr_url === (prUrl ?? info.data?.pr?.url))
+          .map((comment) => comment.id),
+      );
+    }
+  }, [active, activeTab, sessionComments.data, prUrl, info.data?.pr?.url]);
+
   const mobile = useIsMobileViewport();
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
@@ -2406,8 +2520,8 @@ function PullRequestPanelDetails({
       pr.base_sha === prDiff.data?.base_sha &&
       reviews.page
     ),
-    headSha: pr.head_sha,
-    baseSha: pr.base_sha,
+    headSha: prDiff.data?.head_sha,
+    baseSha: prDiff.data?.base_sha,
     loadComments: reviews.loadComments,
     loadingComments: reviews.loadingComments,
   };
@@ -2598,7 +2712,7 @@ function PullRequestPanelDetails({
 
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
             of all files' diffs. */}
-        <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
+        <TabsContent value="changes" className="relative flex min-h-0 flex-1 flex-col">
           {data.capabilities.review_threads &&
             (reviews.page?.has_more ||
               reviews.historyStale ||
@@ -2762,7 +2876,7 @@ function PullRequestPanelDetails({
             <div
               ref={scrollRef}
               onScroll={onScroll}
-              className="github-diff-stack min-w-0 flex-1 overflow-y-auto"
+              className="github-diff-stack min-w-0 flex-1 overflow-y-auto pb-20"
             >
               {changes.error || prDiff.error || parseError ? (
                 <PanelMessage>
@@ -2805,9 +2919,21 @@ function PullRequestPanelDetails({
                     threads={threadsByFile.get(file.path) ?? []}
                     threadContext={threadContext}
                     matchingRevision={matchingRevision}
+                    localComments={localComments.filter((comment) => comment.path === file.path)}
+                    canCommentLocally={
+                      !!(canEdit && prDiff.data?.head_sha && prDiff.data?.base_sha)
+                    }
                   />
                 ))
               )}
+              {localComments
+                .filter((comment) => !files.some((file) => file.path === comment.path))
+                .map((comment) => (
+                  <div key={comment.id} className="px-3">
+                    <p className="text-xs">{comment.path}</p>
+                    <LocalReviewComment comment={comment} canEdit={canEdit} outdated />
+                  </div>
+                ))}
               {earlierThreads.length > 0 && (
                 <div className="p-3">
                   <p className="text-ui font-medium">Earlier conversations and unavailable diffs</p>
@@ -2825,6 +2951,35 @@ function PullRequestPanelDetails({
               )}
             </div>
           </div>
+          {sessionComments.isError && (
+            <p role="alert" className="p-3 text-ui">
+              Local comments could not be loaded.{" "}
+              <button
+                type="button"
+                className="underline"
+                onClick={() => void sessionComments.refetch()}
+              >
+                Retry
+              </button>
+            </p>
+          )}
+          {canEdit && openLocalComments.length > 0 && (
+            <Button
+              className="absolute bottom-4 right-4 z-20 rounded-full shadow-lg"
+              aria-label={`Add ${openLocalComments.length} local comments to chat`}
+              onClick={() => {
+                requestComposerInsertion(
+                  conversationId,
+                  formatLocalReviewComments(openLocalComments),
+                );
+                mobilePanel?.close();
+                toast.success("Local review added to your chat draft");
+              }}
+            >
+              <MessageSquareIcon className="size-4" aria-hidden />
+              Add to chat · {openLocalComments.length}
+            </Button>
+          )}
         </TabsContent>
       </Tabs>
     </TooltipProvider>

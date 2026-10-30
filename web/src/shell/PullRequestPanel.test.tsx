@@ -1,9 +1,20 @@
+import type { FileDiff } from "@pierre/diffs/react";
+import type { Comment } from "@/hooks/useComments";
+import { useComposerInsertion, consumeComposerInsertion } from "@/lib/composerInsertions";
 // Tests for PullRequestPanel — the stacked "Files changed" view. The GitHub data
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
@@ -179,8 +190,20 @@ vi.mock("@pierre/diffs", () => ({
   parsePatchFiles: vi.fn(() => [{ files: state.parsedFiles }]),
 }));
 vi.mock("@pierre/diffs/react", () => ({
-  FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
-    <div data-testid="diff" data-path={fileDiff.name} />
+  FileDiff: ({
+    fileDiff,
+    renderGutterUtility,
+    lineAnnotations,
+    renderAnnotation,
+  }: React.ComponentProps<typeof FileDiff>) => (
+    <div data-testid="diff" data-path={fileDiff.name}>
+      {renderGutterUtility?.(() => ({ lineNumber: 1, side: "additions" }))}
+      {lineAnnotations?.map((annotation) => (
+        <div key={`${annotation.side}:${annotation.lineNumber}`}>
+          {renderAnnotation?.(annotation)}
+        </div>
+      ))}
+    </div>
   ),
 }));
 // The resolved theme mode drives @pierre/diffs' themeType.
@@ -3097,3 +3120,110 @@ it.each(["capabilities", "selected_pr_url"] as const)(
     expect(screen.getByText("No comments yet.").parentElement).toHaveClass("pb-16");
   },
 );
+
+it("saves a local comment, batches only this PR's open comments, and retains earlier revisions", async () => {
+  const diffs = await vi.importActual<typeof DiffsModule>("@pierre/diffs");
+  state.parsedFiles = diffs.parsePatchFiles(
+    "diff --git a/hello.py b/hello.py\n--- a/hello.py\n+++ b/hello.py\n@@ -1 +1 @@\n-old\n+new\n",
+  )[0]!.files;
+  state.changes!.data!.data = [file("hello.py", "modified")];
+  state.diff = {
+    object: "session.github.pr_diff",
+    patch: "PATCH",
+    head_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+  };
+  const comments: Comment[] = [];
+  const requests: string[] = [];
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    requests.push(`${init?.method ?? "GET"} ${url}`);
+    if (url.endsWith("/comments") && init?.method === "POST") {
+      const comment = {
+        ...JSON.parse(String(init.body)),
+        id: "local-1",
+        conversation_id: "conv_1",
+        status: "draft",
+        created_by: null,
+        created_at: 0,
+        updated_at: 1,
+        anchor_content: null,
+      } as Comment;
+      comments.push(comment);
+      return new Response(JSON.stringify(comment));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "PATCH") {
+      Object.assign(comments[0]!, JSON.parse(String(init.body)));
+      return new Response(JSON.stringify(comments[0]));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "DELETE") {
+      comments.splice(0);
+      return new Response(null, { status: 204 });
+    }
+    return new Response(JSON.stringify(comments));
+  });
+  onTestFinished(() => {
+    fetch.mockRestore();
+    consumeComposerInsertion("conv_1");
+  });
+  const { client } = renderChanges();
+  const insertion = renderHook(() => useComposerInsertion("conv_1"));
+  await userEvent.click(screen.getByRole("button", { name: "Start a new review conversation" }));
+  expect(screen.getByRole("button", { name: "Local comment" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "New review comment" }),
+    "Handle empty input",
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Save local comment" }));
+  await screen.findByRole("region", { name: "Local review comment" });
+  expect(comments[0]?.review_anchor).toMatchObject({
+    side: "RIGHT",
+    line: 1,
+    head_sha: "a".repeat(40),
+  });
+  expect(requests.filter((request) => request.startsWith("POST"))).toEqual([
+    "POST /v1/sessions/conv_1/comments",
+  ]);
+  await userEvent.click(screen.getByRole("button", { name: "Add 1 local comments to chat" }));
+  expect(insertion.result.current).toContain("[Comment local-1] hello.py (new lines 1)");
+  expect(insertion.result.current).toContain("Handle empty input");
+  expect(requests.some((request) => request.includes("/comments/send"))).toBe(false);
+  const other = {
+    ...comments[0]!,
+    id: "other",
+    review_anchor: { ...comments[0]!.review_anchor!, pr_url: "https://example.com/pr/other" },
+  };
+  const addressed = { ...comments[0]!, id: "addressed", status: "addressed" as const };
+  await act(async () => {
+    client.setQueryData(["comments", "conv_1"], [...comments, other, addressed]);
+  });
+  expect(screen.getByRole("button", { name: "Add 1 local comments to chat" })).toBeInTheDocument();
+  state.diff = { ...state.diff!, head_sha: "c".repeat(40) };
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+  expect(screen.getAllByText(/Earlier revision/).length).toBeGreaterThan(0);
+  const card = within(screen.getAllByRole("region", { name: "Local review comment" })[0]!);
+  await userEvent.click(card.getByRole("button", { name: "Edit" }));
+  await userEvent.clear(card.getByRole("textbox", { name: "Edit local comment" }));
+  await userEvent.type(
+    card.getByRole("textbox", { name: "Edit local comment" }),
+    "Validate empty input",
+  );
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(comments[0]?.body).toBe("Validate empty input"));
+  await userEvent.click(card.getByRole("button", { name: "Mark addressed" }));
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Add 1 local comments to chat" }),
+    ).not.toBeInTheDocument(),
+  );
+  await userEvent.click(card.getByRole("button", { name: "Reopen" }));
+  await screen.findByRole("button", { name: "Add 1 local comments to chat" });
+  await userEvent.click(card.getByRole("button", { name: "Delete" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("region", { name: "Local review comment" })).not.toBeInTheDocument(),
+  );
+});

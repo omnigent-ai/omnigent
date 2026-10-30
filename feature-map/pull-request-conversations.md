@@ -1,7 +1,8 @@
 # Pull request conversations
 
 Read, reply to and start GitHub review conversations beside the code in a pull
-request's Changes subtab. Top-level comments remain in Comments.
+request's Changes subtab. Save local session comments alongside them and prepare
+a batch for the agent in chat. Top-level PR comments remain in Comments.
 
 ## Sub-features
 
@@ -20,6 +21,11 @@ request's Changes subtab. Top-level comments remain in Comments.
   The plus hides while the composer is open; its top-right X closes it.
 - `history`: On-demand pages, incomplete/error states, resolved collapse,
   unresolved navigation and original context for unplaceable conversations.
+- `local-review`: Save session-only comments on either diff side, edit/delete or
+  mark them addressed. **Add to chat · N** appends all open local comments for
+  this PR to the session composer, preserving existing text and attachments.
+  The message contains comment IDs, bodies, paths, lines and commit revisions;
+  the user reviews it and sends separately. Mobile dismisses the PR drawer.
 - `thread-refresh`: Threads fetch separately and poll while Changes is open;
   other subtabs, the PR list and the collapsed rail stop requesting them.
   A compact **Loading review threads** spinner beside the layout toggle indicates
@@ -61,6 +67,28 @@ The existing
 covers the separate Comments composer. Component and runner tests carry the
 pagination, old-side placement, revision, permission and failure matrices.
 
+For local review, use any of the four entry points above, select a diff line,
+choose **Local comment**, and save comments on two files. Reload and confirm
+both remain. Click **Add to chat · 2** with an existing chat draft: its text and
+attachments should remain, both comment references should be appended, and no
+message should be sent yet. Click again to check deduplication. Mark a comment
+addressed and confirm the count decreases. Switch PRs and sessions to check
+isolation. After a new commit, verify earlier comments retain their old line
+references instead of moving onto unrelated lines. Repeat in split/unified
+layouts and mobile (the drawer should close on Add to chat).
+
+The same four browser variants also save local comments on both diff sides,
+retain the Local destination through tab switching, cross-check session storage
+through the REST API, and append both comments to an existing chat draft. The
+mobile variant verifies that the drawer closes. Provider write counts stay
+unchanged during local review.
+
+The local-review component flow is covered by
+`web/src/shell/PullRequestPanel.test.tsx`, composer preservation by
+`web/src/pages/ChatPage.composer.test.tsx`, and persistence/formatting by
+`tests/server/routes/test_comments_crud.py::test_local_pr_comment_round_trip`.
+These checks do not replace a recorded drive of the four entry points.
+
 For a live check, use a disposable GitHub PR with current, old-side, resolved
 and outdated threads. Open Changes, compare both layouts to GitHub, focus the
 reply input and type a draft. Cancel, reopen and confirm the text survives.
@@ -78,8 +106,11 @@ outdated thread and confirm the suggestion uses its labeled original context.
 
 - Browser stubs prove UI behavior; runner/host tests prove provider transport.
   They do not constitute a live GitHub write test.
-- Session file comments addressed to the agent and PR top-level comments are
-  separate features. Review replies publish immediately, without a draft review.
+- Local review comments reuse session comment storage, with immutable PR
+  coordinates separate from Files character offsets. They are visible to session
+  collaborators, persist across reloads, and are never posted to GitHub.
+  The batch is scoped to the current PR; Files comments are not included.
+  GitHub review replies still publish immediately, without a draft review.
 - Older history refreshes on demand; a first-page poll does not refresh every page.
 - Hidden-context and outdated conversations use an explicit original snippet;
   they are never attached to an unrelated current line.

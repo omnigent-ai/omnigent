@@ -15,6 +15,7 @@ from pydantic import BaseModel, model_validator
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import Comment
+from omnigent.entities.comment import PullRequestCommentAnchor
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import (
@@ -50,7 +51,15 @@ def _format_message(comments: list[Comment]) -> str:
         lines.append(f"File: {path}")
         for c in sorted(by_path[path], key=lambda c: c.start_index):
             anchor = f'"{c.anchor_content.strip()}" ' if c.anchor_content else ""
-            lines.append(f"• {anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
+            if c.review_anchor:
+                review = c.review_anchor
+                location = f"{review.side} lines {review.start_line or review.line}–{review.line}"
+                lines.append(
+                    f"• [{c.id}] {review.pr_url} ({location}, "
+                    f"base {review.base_sha}, head {review.head_sha}): {c.body}"
+                )
+            else:
+                lines.append(f"• {anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
 
     return "\n".join(lines)
 
@@ -77,6 +86,7 @@ class AddCommentRequest(BaseModel):
     start_index: int
     end_index: int
     anchor_content: str | None = None
+    review_anchor: PullRequestCommentAnchor | None = None
 
     @model_validator(mode="after")
     def _validate_range(self) -> AddCommentRequest:
@@ -231,6 +241,7 @@ def create_comments_router(
             start_index=body.start_index,
             end_index=body.end_index,
             anchor_content=body.anchor_content,
+            review_anchor=body.review_anchor,
             # Map the single-user "local" sentinel to None (matching the
             # sessions/messages write paths) so single-user comments record
             # no author and stay editable/deletable by any editor — both the

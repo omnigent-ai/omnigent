@@ -1,3 +1,4 @@
+import { createComment } from "./useComments";
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
@@ -1170,6 +1171,7 @@ export interface PullRequestCommentDraft {
   pending: boolean;
   error: string | null;
   anchor?: ReviewThreadAnchor;
+  destination?: "github" | "local";
 }
 
 function usePullRequestCommentDraft(key: readonly string[]) {
@@ -1313,15 +1315,42 @@ export function usePullRequestReviewThreadComposer(
       body: string;
       anchor: ReviewThreadAnchor;
       key: string[];
-    }) =>
-      fetchPullRequestEditResource<{ thread: ReviewThread }>(
-        target.conversationId,
-        "review-threads",
-        {
-          body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
-        },
-      ),
+      local: boolean;
+    }): Promise<{ thread: ReviewThread | null }> =>
+      target.local
+        ? createComment(target.conversationId, {
+            path: target.anchor.path,
+            body: target.body,
+            start_index: 0,
+            end_index: 0,
+            review_anchor: {
+              pr_url: target.prUrl,
+              side: target.anchor.side,
+              line: target.anchor.line,
+              start_line: target.anchor.start_line,
+              head_sha: target.anchor.head_sha,
+              base_sha: target.anchor.base_sha,
+            },
+          }).then(() => ({ thread: null }))
+        : fetchPullRequestEditResource<{ thread: ReviewThread }>(
+            target.conversationId,
+            "review-threads",
+            {
+              body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
+            },
+          ),
     onSuccess: async ({ thread }, target) => {
+      if (target.local) {
+        queryClient.setQueryData(target.key, {
+          body: "",
+          pending: false,
+          error: null,
+          destination: "local",
+        });
+        void queryClient.invalidateQueries({ queryKey: ["comments", target.conversationId] });
+        return;
+      }
+      if (!thread) return;
       await queryClient.cancelQueries({
         queryKey: ["github-review-threads", target.conversationId, target.prUrl],
       });
@@ -1345,13 +1374,21 @@ export function usePullRequestReviewThreadComposer(
     onError: (error: Error, target) =>
       queryClient.setQueryData<PullRequestCommentDraft>(
         target.key,
-        (current) => current && { ...current, pending: false, error: commentPostingError(error) },
+        (current) =>
+          current && {
+            ...current,
+            pending: false,
+            error: target.local ? error.message : commentPostingError(error),
+          },
       ),
   });
   return {
     draft,
     stale,
     setBody: (body: string) => updateDraft({ body, error: null }),
+    setDestination: (destination: "github" | "local") => {
+      if (!draft.pending) updateDraft({ destination, error: null });
+    },
     selectLines: (lines: Pick<ReviewThreadAnchor, "side" | "line" | "start_line">) => {
       if (!draft.pending)
         updateDraft({
@@ -1376,7 +1413,14 @@ export function usePullRequestReviewThreadComposer(
         return;
       }
       updateDraft({ pending: true, error: null });
-      mutation.mutate({ conversationId, prUrl, body: current.body, anchor: current.anchor, key });
+      mutation.mutate({
+        conversationId,
+        prUrl,
+        body: current.body,
+        anchor: current.anchor,
+        key,
+        local: current.destination === "local",
+      });
     },
   };
 }
