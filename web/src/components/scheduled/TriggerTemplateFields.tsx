@@ -78,11 +78,8 @@ export function TriggerTemplateFields({
       <div className="flex flex-col gap-1.5">
         <Label>Trigger</Label>
         <p className="text-sm text-muted-foreground">
-          Each run starts a session for each of these {template.itemPlural} created since the
-          previous run that meets every condition by then. To allow for slow search indexing, the
-          window starts 5 minutes early, so one created just before the previous run can still
-          count. Older {template.itemPlural} don&apos;t, even if they change or start matching
-          later.
+          Runs your automation on all new {template.itemPlural} that match these conditions. Older{" "}
+          {template.itemPlural} are skipped, even if they are edited to match later.
         </p>
         <div
           className="flex flex-col gap-2 rounded-lg border border-border p-3"

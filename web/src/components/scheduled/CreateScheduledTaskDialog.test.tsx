@@ -1773,7 +1773,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       "Continue in the same session",
     );
     expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
-      "Each run starts a session for each of these tickets created since the previous run that meets every condition by then. To allow for slow search indexing, the window starts 5 minutes early, so one created just before the previous run can still count. Older tickets don't, even if they change or start matching later.",
+      "Runs your automation on all new tickets that match these conditions. Older tickets are skipped, even if they are edited to match later.",
     );
     // The form says the source is untrusted and that link-back writes there.
     const note = screen.getByTestId("task-trigger-untrusted-note");
