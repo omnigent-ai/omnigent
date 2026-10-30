@@ -975,6 +975,67 @@ def test_summarize_checks_empty() -> None:
     }
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_summarize_checks_ignores_superseded_workflow_runs(reverse: bool) -> None:
+    def check(workflow: str, run: int, name: str, conclusion: str) -> dict:
+        return {
+            "workflowName": workflow,
+            "name": name,
+            "status": "COMPLETED" if conclusion else "IN_PROGRESS",
+            "conclusion": conclusion,
+            "detailsUrl": f"https://github.com/acme/app/actions/runs/{run}/job/1",
+        }
+
+    rollup = [
+        {**check("Docker", 9, "Docker result", "FAILURE"), "startedAt": "2026-10-30T22:01:56Z"},
+        {**check("Docker", 10, "gate", "SUCCESS"), "startedAt": "2026-10-30T22:01:55Z"},
+        check("Docker", 10, "build", ""),
+        {
+            **check("Docker", 11, "other repo", "SUCCESS"),
+            "detailsUrl": "https://github.com/acme/other/actions/runs/11/job/1",
+        },
+        check("CI", 8, "gate", "FAILURE"),
+        check("CI", 8, "unit", "SUCCESS"),
+        check("CI", 8, "optional", "SKIPPED"),
+        check("CI", 8, "deploy", "CANCELLED"),
+        {"context": "legacy", "state": "ERROR"},
+        {
+            "name": "external",
+            "workflowName": "Docker",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://ci.example/check/12",
+        },
+        {
+            "name": "no workflow",
+            "status": "IN_PROGRESS",
+            "detailsUrl": "https://github.com/acme/app/actions/runs/12/job/1",
+        },
+    ]
+    if reverse:
+        rollup.reverse()
+    result = _summarize_checks(rollup)
+    assert {key: value for key, value in result.items() if key != "runs"} == {
+        "passing": 3,
+        "failing": 3,
+        "pending": 2,
+        "cancelled": 1,
+        "skipped": 1,
+        "total": 10,
+    }
+    assert {run["name"] for run in result["runs"]} == {
+        "gate",
+        "build",
+        "other repo",
+        "unit",
+        "optional",
+        "deploy",
+        "legacy",
+        "external",
+        "no workflow",
+    }
+
+
 def test_github_info_includes_body_and_comments(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

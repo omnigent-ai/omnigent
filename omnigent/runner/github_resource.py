@@ -403,6 +403,16 @@ def _classify_check(check: dict[str, Any]) -> str:
     return "passing" if conclusion in ("SUCCESS", "NEUTRAL") else "failing"
 
 
+def _actions_workflow_run(check: dict[str, Any]) -> tuple[str, str, int] | None:
+    """Identify an Actions workflow run from the fields exposed by ``gh``."""
+    workflow = check.get("workflowName")
+    url = check.get("detailsUrl")
+    if not isinstance(workflow, str) or not workflow or not isinstance(url, str):
+        return None
+    match = re.fullmatch(r"(https?://[^/]+/[^/]+/[^/]+)/actions/runs/(\d+)(?:/.*)?", url)
+    return (match[1], workflow, int(match[2])) if match else None
+
+
 def _summarize_checks(rollup: Any) -> dict[str, Any]:
     """Summarize a ``statusCheckRollup`` into bucket counts + per-check details.
 
@@ -412,8 +422,16 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     counts = {"passing": 0, "failing": 0, "pending": 0, "cancelled": 0, "skipped": 0}
     runs: list[dict[str, Any]] = []
     if isinstance(rollup, list):
+        # Superseded workflows can leave failed result jobs before their replacements finish.
+        # ponytail: gh exposes workflow names; fetch suite metadata if names collide.
+        latest_runs: dict[tuple[str, str], int] = {}
+        for check in rollup:
+            if isinstance(check, dict) and (run := _actions_workflow_run(check)):
+                latest_runs[run[:2]] = max(latest_runs.get(run[:2], 0), run[2])
         for check in rollup:
             if not isinstance(check, dict):
+                continue
+            if (run := _actions_workflow_run(check)) and run[2] < latest_runs[run[:2]]:
                 continue
             bucket = _classify_check(check)
             counts[bucket] += 1
