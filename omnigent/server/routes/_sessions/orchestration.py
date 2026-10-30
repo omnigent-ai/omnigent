@@ -55,7 +55,11 @@ from omnigent.harness_availability import (
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
 )
-from omnigent.harnesses.claude_native import PEER_MESSAGE_WAKE_KIND, PEER_MESSAGE_WAKE_TEXT
+from omnigent.harnesses.claude_native import (
+    PEER_MESSAGE_WAKE_KIND,
+    PEER_MESSAGE_WAKE_TEXT,
+    PENDING_PROMPT_HOLD_REASON,
+)
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
@@ -6524,7 +6528,7 @@ async def _forward_native_terminal_message(
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
     native_shell_authorized: bool = False,
-) -> None:
+) -> bool:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
 
@@ -6550,7 +6554,8 @@ async def _forward_native_terminal_message(
     :param input_delivery: Queued input identifiers and original enqueue time.
     :param agent_revision: Effective spec revision used to invalidate runner caches.
     :param native_shell_authorized: Owner authorization for this shell delivery.
-    :returns: None.
+    :returns: ``True`` when the runner held the message until a pending
+        terminal prompt is resolved instead of delivering it.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
@@ -6682,6 +6687,11 @@ async def _forward_native_terminal_message(
             input_delivery,
         ),
     )
+    try:
+        reply = resp.json()
+    except ValueError:
+        return False
+    return isinstance(reply, dict) and reply.get("reason") == PENDING_PROMPT_HOLD_REASON
 
 
 async def _persist_session_event(
@@ -8392,10 +8402,11 @@ async def _dispatch_session_event_to_runner_impl(
         # at spawn, so the in-band switch is what makes routing take on an
         # already-running pane.
         forwarded = False
+        held_for_prompt = False
         try:
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
-            await _forward_native_terminal_message(
+            held_for_prompt = await _forward_native_terminal_message(
                 runner_client,
                 session_id,
                 conv,
@@ -8466,7 +8477,9 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(
+            item_id=None, pending_id=pending_id, held_for_prompt=held_for_prompt
+        )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return _SessionEventDispatchResult(item_id=None, pending_id=None)
     item_id = await _forward_event_to_runner(

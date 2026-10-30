@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 
+from omnigent.harnesses.claude_native import PENDING_PROMPT_HOLD_REASON
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
@@ -116,6 +117,7 @@ async def test_question_buffers_messages_and_resumes_fifo(
         second = await client.post(f"/v1/sessions/{sid}/events", json=_message("second"))
         assert first.status_code == second.status_code == 202
         assert first.json()["status"] == second.json()["status"] == "buffered"
+        assert first.json()["reason"] == second.json()["reason"] == PENDING_PROMPT_HOLD_REASON
         assert app.state.claude_prompt_waiters[sid] is waiter
         assert sid not in app.state.active_turns
         assert app.state.has_active_work()
@@ -139,6 +141,27 @@ async def test_question_buffers_messages_and_resumes_fifo(
     first_body, second_body = harness.posted_bodies
     assert first_body["content"][-1]["content"][0]["text"] == "first"
     assert second_body["content"][-1]["content"][0]["text"] == "second"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_open", [True, False])
+async def test_active_turn_reply_reports_pending_prompt_hold(
+    prompt_open: bool, pending_prompt: dict[str, bool]
+) -> None:
+    """A delivery turn waiting on a question still reports follow-ups as held."""
+    app, harness = _build_app()
+    sid = uuid.uuid4().hex
+    pending_prompt["pending"] = prompt_open
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        app.state.active_turns[sid] = None
+        response = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
+        assert response.status_code == 202
+        assert response.json()["status"] == "buffered"
+        expected_reason = PENDING_PROMPT_HOLD_REASON if prompt_open else None
+        assert response.json().get("reason") == expected_reason
+        assert len(app.state.session_message_buffers[sid]) == 1
+        assert harness.posted_bodies == []
 
 
 @pytest.mark.asyncio
@@ -286,7 +309,7 @@ async def test_stop_during_drain_probe_does_not_restart_session(
         calls += 1
         if from_waiter and calls == 1:
             return True
-        if calls == (3 if from_waiter else 1):
+        if calls == (3 if from_waiter else 2):
             probe_started.set()
             assert release_probe.wait(5)
         return False

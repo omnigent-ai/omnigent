@@ -69,6 +69,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.harnesses.claude_native import PENDING_PROMPT_HOLD_REASON
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.input_diagnostics import input_attributes
@@ -6822,13 +6823,26 @@ def create_runner_app(
                                 exc_info=True,
                                 extra={"session_id": conversation_id},
                             )
-                    return JSONResponse(
-                        status_code=202,
-                        content={
-                            "status": "buffered",
-                            "detail": ("Message buffered; active turn will process it."),
-                        },
-                    )
+                    _active_turn_reply = {
+                        "status": "buffered",
+                        "detail": "Message buffered; active turn will process it.",
+                    }
+                    # Probe only after buffering so a turn ending during the await still drains it.
+                    try:
+                        _held_for_prompt = (
+                            await _pending_claude_prompt_bridge_dir(conversation_id) is not None
+                        )
+                    except (OSError, RuntimeError):
+                        _logger.debug(
+                            "post_session_events: pending Claude prompt probe failed conv=%s",
+                            conversation_id,
+                            exc_info=True,
+                            extra={"session_id": conversation_id},
+                        )
+                        _held_for_prompt = False
+                    if _held_for_prompt:
+                        _active_turn_reply["reason"] = PENDING_PROMPT_HOLD_REASON
+                    return JSONResponse(status_code=202, content=_active_turn_reply)
 
                 if _session_harness_name(conversation_id) == "claude-native":
                     pending_bridge_dir = None
@@ -6857,6 +6871,7 @@ def create_runner_app(
                             status_code=202,
                             content={
                                 "status": "buffered",
+                                "reason": PENDING_PROMPT_HOLD_REASON,
                                 "detail": "Message buffered until the pending prompt is resolved.",
                             },
                         )

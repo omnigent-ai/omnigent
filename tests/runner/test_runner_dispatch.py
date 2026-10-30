@@ -8618,6 +8618,8 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
+    assert info["pending_inputs"] == []
+    assert info["pending_input_count"] == 0
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
 
 
@@ -9014,6 +9016,13 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "workspace": "/repo",
                     "git_branch": "feature/x",
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
+                    "pending_inputs": [
+                        {
+                            "pending_id": "pending_1",
+                            "content": [{"type": "input_text", "text": "resume the deploy"}],
+                            "created_by": "alice@example.com",
+                        }
+                    ],
                 },
             )
         if request.method == "GET" and request.url.path == "/v1/runners/runner_1/status":
@@ -9063,6 +9072,9 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     # blocked session is waiting on.
     assert info["pending_elicitation_count"] == 2
     assert info["pending_elicitations"] == [{"id": "el_1"}, {"id": "el_2"}]
+    # A message held behind the prompt is visible even though it is not in history yet.
+    assert info["pending_inputs"] == [{"pending_id": "pending_1", "text": "resume the deploy"}]
+    assert info["pending_input_count"] == 1
     # Metadata-only: the full transcript is never embedded.
     assert "items" not in info
 
@@ -12615,6 +12627,7 @@ def _running_child_server_handler(
     child_busy: bool = False,
     delete_posts: list[int] | None = None,
     events_status: int = 200,
+    events_body: dict[str, Any] | None = None,
 ) -> Any:
     """Build a MockTransport handler for a named-mode in-flight-send test.
 
@@ -12622,9 +12635,9 @@ def _running_child_server_handler(
     per ``child_busy``), records the stamped dispatch id on PATCH and the posted
     message on the child's /events, and 500s any duplicate-create POST so an
     accidental untracked create is caught. ``events_status`` forces the child's
-    /events response code (e.g. 500 to exercise a post failure), and any DELETE
-    of the child is recorded in ``delete_posts`` so a test can assert a still-live
-    turn is never torn down.
+    /events response code (e.g. 500 to exercise a post failure) and
+    ``events_body`` its JSON body, and any DELETE of the child is recorded in
+    ``delete_posts`` so a test can assert a still-live turn is never torn down.
     """
 
     async def _handler(request: httpx.Request) -> httpx.Response:
@@ -12660,7 +12673,10 @@ def _running_child_server_handler(
             return httpx.Response(204)
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             event_posts.append(json.loads(request.content))
-            return httpx.Response(events_status, json={"ok": events_status < 400})
+            return httpx.Response(
+                events_status,
+                json=events_body if events_body is not None else {"ok": events_status < 400},
+            )
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
@@ -12748,6 +12764,55 @@ async def test_named_send_reuses_tracked_in_flight_entry_without_restamp(
     assert len(event_posts) == 1
     assert event_posts[0]["created_by"] == "alice@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "stop and report where the merge stands"
+
+
+@pytest.mark.asyncio
+async def test_named_send_reports_message_held_behind_pending_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send the child's terminal holds behind an open prompt is reported as held."""
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_held", "conv_child_held"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
+
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    entry.status = "running"
+    original_work_id = entry.work_id
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        events_status=202,
+        events_body={"queued": True, "pending_id": "pending_1", "held_for_prompt": True},
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = subagent_work.get_subagent_work(child_id)
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "held"
+    assert "injected" not in payload["message"]
+    assert "not been delivered yet" in payload["message"]
+    assert "pending_inputs" in payload["message"]
+    # The held message still belongs to the tracked turn, whose result arrives later.
+    assert stamped == []
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == "running"
+    assert len(event_posts) == 1
 
 
 @pytest.mark.asyncio

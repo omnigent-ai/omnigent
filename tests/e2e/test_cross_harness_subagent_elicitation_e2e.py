@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,7 @@ import pytest
 import yaml
 
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+from tests._helpers.session import send_user_text
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -287,6 +289,94 @@ def _items(client: httpx.Client, session_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _write_parent_with_claude_child(
+    tmp_path: Path, *, parent_prompt: str, child_prompt: str
+) -> Path:
+    """Write a codex-native parent bundle with a claude-native ``claude_code`` sub-agent."""
+    name = f"cross-harness-parent-{uuid.uuid4().hex[:8]}"
+    parent = {
+        "spec_version": 1,
+        "name": name,
+        "executor": {
+            "type": "omnigent",
+            "auth": {"type": "provider", "name": "test-models"},
+            "config": {"harness": "codex-native", "yolo": True},
+        },
+        "llm": {"model": _PARENT_MODEL},
+        "prompt": parent_prompt,
+        "async": True,
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {"type": "none"},
+        },
+        "tools": {"agents": ["claude_code"]},
+    }
+    child = {
+        "spec_version": 1,
+        "name": "claude_code",
+        "executor": {
+            "type": "omnigent",
+            "auth": {"type": "provider", "name": "test-models"},
+            "config": {"harness": "claude-native", "permission_mode": "default"},
+        },
+        "llm": {"model": _CHILD_MODEL},
+        "prompt": child_prompt,
+        "os_env": parent["os_env"],
+    }
+    bundle = tmp_path / name
+    child_dir = bundle / "agents" / "claude_code"
+    child_dir.mkdir(parents=True)
+    (bundle / "config.yaml").write_text(yaml.safe_dump(parent), encoding="utf-8")
+    (child_dir / "config.yaml").write_text(yaml.safe_dump(child), encoding="utf-8")
+    return bundle
+
+
+def _native_parent_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "text": "",
+        "native_items": [
+            {
+                "type": "function_call",
+                "id": f"fc-{call_id}",
+                "call_id": call_id,
+                "namespace": "mcp__omnigent",
+                "name": name,
+                "arguments": json.dumps(arguments),
+            }
+        ],
+    }
+
+
+def _parent_tool_output(mock_url: str, call_id: str) -> str | None:
+    """Return the tool result Codex sent back to the parent model, if any."""
+    for body in get_mock_requests(mock_url, key=_PARENT_MODEL):
+        for item in body.get("input") or []:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "function_call_output"
+                and item.get("call_id") == call_id
+            ):
+                output = item.get("output")
+                return output if isinstance(output, str) else json.dumps(output)
+    return None
+
+
+def _claude_child(client: httpx.Client, parent_id: str) -> dict[str, Any] | None:
+    response = client.get(f"/v1/sessions/{parent_id}/child_sessions")
+    response.raise_for_status()
+    return next(
+        (
+            row
+            for row in response.json()["data"]
+            if row.get("sub_agent_name") == "claude_code"
+            or row.get("tool") == "claude_code"
+            or str(row.get("title", "")).startswith("claude_code:")
+        ),
+        None,
+    )
+
+
 def _wait_for(
     probe: Callable[[], Any],
     *,
@@ -374,67 +464,26 @@ def test_codex_parent_answers_real_claude_child_elicitation(
 ) -> None:
     """A different parent harness preserves the child's prompt and native answer."""
     client, _workspace, runner_id, mock_url = cross_harness_rig
-    name = f"cross-harness-parent-{uuid.uuid4().hex[:8]}"
-    parent = {
-        "spec_version": 1,
-        "name": name,
-        "executor": {
-            "type": "omnigent",
-            "auth": {"type": "provider", "name": "test-models"},
-            "config": {"harness": "codex-native", "yolo": True},
-        },
-        "llm": {"model": _PARENT_MODEL},
-        "prompt": "Delegate the color question to claude_code using sys_session_send.",
-        "async": True,
-        "os_env": {
-            "type": "caller_process",
-            "cwd": ".",
-            "sandbox": {"type": "none"},
-        },
-        "tools": {"agents": ["claude_code"]},
-    }
-    child = {
-        "spec_version": 1,
-        "name": "claude_code",
-        "executor": {
-            "type": "omnigent",
-            "auth": {"type": "provider", "name": "test-models"},
-            "config": {"harness": "claude-native", "permission_mode": "default"},
-        },
-        "llm": {"model": _CHILD_MODEL},
-        "prompt": "Ask the user the color question using AskUserQuestion.",
-        "os_env": parent["os_env"],
-    }
-    bundle = tmp_path / name
-    child_dir = bundle / "agents" / "claude_code"
-    child_dir.mkdir(parents=True)
-    (bundle / "config.yaml").write_text(yaml.safe_dump(parent), encoding="utf-8")
-    (child_dir / "config.yaml").write_text(yaml.safe_dump(child), encoding="utf-8")
+    bundle = _write_parent_with_claude_child(
+        tmp_path,
+        parent_prompt="Delegate the color question to claude_code using sys_session_send.",
+        child_prompt="Ask the user the color question using AskUserQuestion.",
+    )
     # Native and server title generation must not consume the child's tool call.
     for title_marker in ("<session>", "<user_message>"):
         configure_mock_llm(mock_url, [{"text": "Color question"}], match=title_marker)
     configure_mock_llm(
         mock_url,
         [
-            {
-                "text": "",
-                "native_items": [
-                    {
-                        "type": "function_call",
-                        "id": "fc-dispatch-claude",
-                        "call_id": "dispatch-claude",
-                        "namespace": "mcp__omnigent",
-                        "name": "sys_session_send",
-                        "arguments": json.dumps(
-                            {
-                                "agent": "claude_code",
-                                "title": "color-question",
-                                "args": "Ask the user the color question.",
-                            }
-                        ),
-                    }
-                ],
-            },
+            _native_parent_call(
+                "dispatch-claude",
+                "sys_session_send",
+                {
+                    "agent": "claude_code",
+                    "title": "color-question",
+                    "args": "Ask the user the color question.",
+                },
+            ),
             {"text": "Waiting for the Claude child."},
         ],
         key=_PARENT_MODEL,
@@ -491,22 +540,8 @@ def test_codex_parent_answers_real_claude_child_elicitation(
         response.raise_for_status()
         assert response.json().get("queued") is True, response.text
 
-        def find_child() -> dict[str, Any] | None:
-            response = client.get(f"/v1/sessions/{parent_id}/child_sessions")
-            response.raise_for_status()
-            return next(
-                (
-                    row
-                    for row in response.json()["data"]
-                    if row.get("sub_agent_name") == "claude_code"
-                    or row.get("tool") == "claude_code"
-                    or str(row.get("title", "")).startswith("claude_code:")
-                ),
-                None,
-            )
-
         child_row = _wait_for(
-            find_child,
+            lambda: _claude_child(client, parent_id),
             description="Codex to dispatch the Claude child",
             deadline=cross_harness_deadline,
             client=client,
@@ -598,6 +633,143 @@ def test_codex_parent_answers_real_claude_child_elicitation(
             session_ids=session_ids,
             timeout=30,
         )
+    finally:
+        for sid in reversed(session_ids):
+            with contextlib.suppress(httpx.HTTPError):
+                client.post(f"/v1/sessions/{sid}/events", json={"type": "stop_session"}, timeout=2)
+                client.delete(f"/v1/sessions/{sid}", timeout=2)
+
+
+@pytest.mark.parametrize("ambient_provider_env", ["clean"], indirect=True)
+def test_send_to_child_held_behind_permission_prompt_is_not_reported_as_injected(
+    cross_harness_deadline: float,
+    cross_harness_rig: tuple[httpx.Client, Path, str, str],
+    tmp_path: Path,
+) -> None:
+    """A follow-up held behind the child's Bash approval is reported, and visible, as held."""
+    client, _workspace, runner_id, mock_url = cross_harness_rig
+    run = uuid.uuid4().hex[:4]
+    # Tokens are shorter than the title markers so title requests keep their queue;
+    # among equal-length tokens the mock serves the newest message.
+    dispatch_token, followup_token, info_token = (f"zq{step}-{run}" for step in (1, 2, 3))
+    followup_marker = f"resume-deploy-{uuid.uuid4().hex[:8]}"
+    bundle = _write_parent_with_claude_child(
+        tmp_path,
+        parent_prompt="Delegate the deploy to claude_code using sys_session_send.",
+        child_prompt="Run the deploy command with your Bash tool.",
+    )
+    for title_marker in ("<session>", "<user_message>"):
+        configure_mock_llm(mock_url, [{"text": "Deploy"}] * 6, match=title_marker)
+    for token, call_id, followup in (
+        (dispatch_token, "dispatch-deploy", "Run the deploy step with your Bash tool."),
+        (followup_token, "followup-deploy", f"Permission granted, resume ({followup_marker})."),
+    ):
+        configure_mock_llm(
+            mock_url,
+            [
+                _native_parent_call(
+                    call_id,
+                    "sys_session_send",
+                    {"agent": "claude_code", "title": "deploy", "args": followup},
+                ),
+                {"text": "Done."},
+            ],
+            match=token,
+        )
+    configure_mock_llm(
+        mock_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "deploy-bash",
+                        "name": "Bash",
+                        "arguments": json.dumps(
+                            {
+                                "command": "mkdir -p /tmp/deploy-step && echo deploy-started",
+                                "description": "Start the deploy",
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": _CHILD_DONE},
+        ],
+        key=_CHILD_MODEL,
+    )
+    agent_name = upload_agent(client, bundle)
+    parent_id = create_runner_bound_session(client, agent_name=agent_name, runner_id=runner_id)
+    session_ids = [parent_id]
+    try:
+        send_user_text(client, session_id=parent_id, text=f"Start the deploy ({dispatch_token}).")
+        child_id = _wait_for(
+            lambda: (_claude_child(client, parent_id) or {}).get("id"),
+            description="Codex to dispatch the Claude child",
+            deadline=cross_harness_deadline,
+            client=client,
+            session_ids=session_ids,
+        )
+        session_ids.append(child_id)
+        _wait_for(
+            lambda: any(
+                event["params"].get("tool_name") == "Bash"
+                for event in _snapshot(client, child_id).get("pending_elicitations", [])
+            ),
+            description="the child's real Bash approval prompt",
+            deadline=cross_harness_deadline,
+            client=client,
+            session_ids=session_ids,
+        )
+        configure_mock_llm(
+            mock_url,
+            [
+                _native_parent_call(
+                    "info-deploy", "sys_session_get_info", {"session_id": child_id}
+                ),
+                {"text": "Done."},
+            ],
+            match=info_token,
+        )
+
+        send_user_text(
+            client, session_id=parent_id, text=f"Unblock the deploy ({followup_token})."
+        )
+        steer_output = _wait_for(
+            lambda: _parent_tool_output(mock_url, "followup-deploy"),
+            description="the parent's follow-up sys_session_send result",
+            deadline=cross_harness_deadline,
+            client=client,
+            session_ids=session_ids,
+        )
+        held = _snapshot(client, child_id)
+        assert held["pending_elicitations"], held
+        assert followup_marker in json.dumps(held.get("pending_inputs")), held
+        assert not any(
+            followup_marker in json.dumps(body.get("messages"))
+            for body in get_mock_requests(mock_url, key=_CHILD_MODEL)
+        ), "the follow-up reached Claude before its approval was resolved"
+
+        send_user_text(client, session_id=parent_id, text=f"Check the deploy ({info_token}).")
+        info_output = _wait_for(
+            lambda: _parent_tool_output(mock_url, "info-deploy"),
+            description="the parent's sys_session_get_info result",
+            deadline=cross_harness_deadline,
+            client=client,
+            session_ids=session_ids,
+        )
+
+        observed = {
+            "send claims injection": "injected into the running turn" in steer_output,
+            "send reports the hold": bool(
+                re.search(r"\b(held|buffered|queued)\b", steer_output, re.IGNORECASE)
+            ),
+            "get_info shows the held follow-up": followup_marker in info_output,
+        }
+        assert observed == {
+            "send claims injection": False,
+            "send reports the hold": True,
+            "get_info shows the held follow-up": True,
+        }, (observed, steer_output, info_output)
     finally:
         for sid in reversed(session_ids):
             with contextlib.suppress(httpx.HTTPError):
