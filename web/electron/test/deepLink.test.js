@@ -10,7 +10,11 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("../src/deepLink");
+const {
+  parseOmnigentDeepLink,
+  chooseDeepLinkStrategy,
+  acceptCliDeepLink,
+} = require("../src/deepLink");
 
 describe("parseOmnigentDeepLink", () => {
   it("parses a loopback host with a port as http", () => {
@@ -68,12 +72,23 @@ describe("parseOmnigentDeepLink", () => {
     assert.equal(parseOmnigentDeepLink("omnigent:///c/x"), null);
   });
 
+  it("accepts the server-home root path", () => {
+    // `omnigent start` opens the host UI root, not a conversation.
+    assert.deepEqual(parseOmnigentDeepLink("omnigent://localhost:8000/"), {
+      origin: "http://localhost:8000",
+      path: "/",
+    });
+    assert.deepEqual(parseOmnigentDeepLink("omnigent://localhost:8000"), {
+      origin: "http://localhost:8000",
+      path: "/",
+    });
+  });
+
   it("rejects non-/c/<id> paths", () => {
     assert.equal(parseOmnigentDeepLink("omnigent://localhost:8000/inbox"), null);
     assert.equal(parseOmnigentDeepLink("omnigent://localhost:8000/settings/appearance"), null);
     assert.equal(parseOmnigentDeepLink("omnigent://localhost:8000/c/"), null); // empty id
     assert.equal(parseOmnigentDeepLink("omnigent://localhost:8000/c/a/b"), null); // nested path
-    assert.equal(parseOmnigentDeepLink("omnigent://localhost:8000/"), null);
   });
 
   it("rejects unparseable / non-string input", () => {
@@ -178,5 +193,66 @@ describe("chooseDeepLinkStrategy", () => {
       knownOrigins: [],
     });
     assert.deepEqual(decision, { strategy: "reuse-inplace", windowIndex: 0 });
+  });
+});
+
+describe("CLI navigation acknowledgment", () => {
+  const token = "a".repeat(64);
+  it("preserves ordinary links without contacting a callback", async (t) => {
+    const request = t.mock.method(globalThis, "fetch", () => assert.fail("unexpected callback"));
+    assert.equal(await acceptCliDeepLink("omnigent://localhost:6767/"), true);
+    assert.equal(request.mock.callCount(), 0);
+  });
+
+  for (const acknowledgment of [
+    "",
+    "0:" + token,
+    "65536:" + token,
+    "123:bad",
+    "https://example.com",
+  ]) {
+    it(`rejects malformed callback ${acknowledgment}`, async (t) => {
+      t.mock.method(globalThis, "fetch", () => assert.fail("unexpected callback"));
+      assert.equal(
+        await acceptCliDeepLink(`omnigent://localhost/?desktop_ack=${acknowledgment}`),
+        false,
+      );
+    });
+  }
+
+  it("rejects duplicate callbacks and unsupported routes without a request", async (t) => {
+    t.mock.method(globalThis, "fetch", () => assert.fail("unexpected callback"));
+    assert.equal(
+      await acceptCliDeepLink(
+        `omnigent://localhost/?desktop_ack=123:${token}&desktop_ack=123:${token}`,
+      ),
+      false,
+    );
+    assert.equal(
+      await acceptCliDeepLink(`omnigent://localhost/settings?desktop_ack=123:${token}`),
+      false,
+    );
+  });
+
+  for (const status of [204, 404, 410]) {
+    it(`only accepts a live CLI acknowledgment (HTTP ${status})`, async (t) => {
+      t.mock.method(globalThis, "fetch", async (url, options) => {
+        assert.equal(url, `http://127.0.0.1:1234/desktop-open/${token}`);
+        assert.equal(options.method, "POST");
+        assert.equal(options.redirect, "error");
+        return { status };
+      });
+      assert.equal(
+        await acceptCliDeepLink(`omnigent://localhost/?desktop_ack=1234:${token}`),
+        status === 204,
+      );
+    });
+  }
+
+  it("discards a late request after the CLI listener closes", async (t) => {
+    t.mock.method(globalThis, "fetch", async () => {
+      throw new Error("connection refused");
+    });
+    assert.equal(await acceptCliDeepLink(`omnigent://localhost/?desktop_ack=1234:${token}`), false);
   });
 });

@@ -3517,6 +3517,14 @@ async def _execute_session_create(
     if placement != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
     message = args.get("message")
+    profile_fields = ("sandbox_provider", "sandbox_profile_id", "sandbox_profile_revision")
+    selection = {key: args[key] for key in profile_fields if args.get(key) is not None}
+    if selection and placement != "managed":
+        return json.dumps({"error": "Sandbox profile selection requires placement='managed'"})
+    if any(not isinstance(value, str) or not value.strip() for value in selection.values()):
+        return json.dumps({"error": "Sandbox selection fields must be nonempty strings"})
+    if selection.get("sandbox_profile_revision") and not selection.get("sandbox_profile_id"):
+        return json.dumps({"error": "sandbox_profile_revision requires sandbox_profile_id"})
     if placement != "child" and message is not None:
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
@@ -3559,6 +3567,7 @@ async def _execute_session_create(
         headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
         if placement == "managed":
             body["host_type"] = "managed"
+            body.update(selection)
             initial_items = body.pop("initial_items", None)
             if isinstance(initial_items, list) and initial_items:
                 body["initial_input"] = initial_items[0]
@@ -3580,8 +3589,18 @@ async def _execute_session_create(
 
             info = await server_client.get("/v1/info")
             info.raise_for_status()
+            info_data = info.json()
+            if selection.get("sandbox_profile_id"):
+                features = info_data.get("features") if isinstance(info_data, dict) else None
+                if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:
+                    return json.dumps(
+                        {
+                            "error": "This server does not advertise sandbox profile support; "
+                            "no session was created."
+                        }
+                    )
             host_id = (
-                uuid.uuid4().hex if info.json().get("request_managed_sandbox_host_id") else None
+                uuid.uuid4().hex if info_data.get("request_managed_sandbox_host_id") else None
             )
             if host_id is not None:
                 body["host_id"] = host_id

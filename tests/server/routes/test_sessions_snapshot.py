@@ -1018,7 +1018,7 @@ async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_conn
 
     assert snapshot.status == "failed"
     assert snapshot.last_task_error == {
-        "code": "runner_failed_to_start",
+        "code": "runner_process_crash",
         "message": _RUNNER_EXIT_ERROR,
     }
 

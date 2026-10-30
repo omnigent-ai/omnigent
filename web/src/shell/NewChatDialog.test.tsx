@@ -1,4 +1,11 @@
 import { testAgent } from "@/test/agentFixtures";
+import { fetchSandboxProfiles, SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
+
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
+}));
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -1223,6 +1230,11 @@ function mockModelQueries(
 function setupLandingMocks() {
   fixDialogProps = null;
   authenticatedFetchMock.mockReset();
+  vi.mocked(fetchSandboxProfiles).mockReset().mockResolvedValue({
+    profiles: [],
+    managed_providers: [],
+    next_cursor: null,
+  });
   getCurrentUserIdMock.mockReset();
   getCurrentUserIdMock.mockReturnValue(null);
   resolveIdentityMock.mockReset();
@@ -1390,7 +1402,7 @@ function renderLanding(
     dictation_available: false,
     ...infoOverrides,
   };
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
@@ -1409,6 +1421,7 @@ function renderLanding(
     </QueryClientProvider>,
     { reactStrictMode: strictMode },
   );
+  return { ...view, client };
 }
 
 function tooltipKeys(tooltip: HTMLElement): string[] {
@@ -1627,6 +1640,7 @@ async function submitAndReadBody(
   fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
     target: { value: prompt },
   });
+  expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
   fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
   return readCreateBody();
 }
@@ -8419,6 +8433,7 @@ describe("NewChatLandingScreen", () => {
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
         target: { value: "audit the repo" },
       });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
       fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
       await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
       const [, init] = authenticatedFetchMock.mock.calls[0];
@@ -8561,6 +8576,283 @@ describe("NewChatLandingScreen", () => {
     expect(body.workspaces).toEqual([]);
   });
 
+  it.each([true, false, undefined, "provider-opt-out"])(
+    "uses only selections advertised by the server and provider (%s)",
+    async (enabled) => {
+      const profile = {
+        id: "large",
+        name: "Large workspace",
+        description: "For builds",
+        provider: "agent_sandbox",
+        revision: "revision-1",
+      };
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+        profiles: [profile, { ...profile, id: "other", name: "Other provider", provider: "modal" }],
+        managed_providers: ["agent_sandbox", "modal"],
+        next_cursor: null,
+      });
+      authenticatedFetchMock.mockResolvedValue(
+        new Response(JSON.stringify({ id: "conv_profile" })),
+      );
+      renderLanding({
+        features: { sandbox_profiles: true },
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_providers: ["agent_sandbox"],
+      });
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+      );
+      expect(screen.queryByText("Other provider")).toBeNull();
+      fireEvent.click(screen.getByText("Large workspace"));
+      await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
+      cleanup();
+      vi.mocked(fetchSandboxProfiles).mockClear();
+      if (enabled === "provider-opt-out") {
+        vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+          profiles: [],
+          managed_providers: [],
+          next_cursor: null,
+        });
+      }
+      const { client } = renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_providers: ["agent_sandbox"],
+        features:
+          enabled === undefined
+            ? {}
+            : { sandbox_profiles: enabled === true || enabled === "provider-opt-out" },
+      });
+      if (enabled === true) {
+        expect(
+          await screen.findByRole("button", { name: "Sandbox profile: Large workspace" }),
+        ).toBeVisible();
+      } else {
+        await waitFor(() =>
+          expect(screen.queryByRole("button", { name: /Sandbox profile:/ })).toBeNull(),
+        );
+      }
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "build the project" },
+      });
+      if (enabled === "provider-opt-out") {
+        let rejectRefresh!: (reason: Error) => void;
+        vi.mocked(fetchSandboxProfiles).mockImplementation(
+          () =>
+            new Promise((_resolve, reject) => {
+              rejectRefresh = reject;
+            }),
+        );
+        const refresh = client.refetchQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+        await waitFor(() => expect(fetchSandboxProfiles).toHaveBeenCalledTimes(2));
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        await act(async () => {
+          rejectRefresh(new Error("Catalog unavailable"));
+          await refresh;
+        });
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        expect(screen.queryByRole("button", { name: /Sandbox profile:/ })).toBeNull();
+      }
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const body = JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string);
+      expect(body.host_type).toBe("managed");
+      if (enabled === true) {
+        expect(body).toMatchObject({
+          sandbox_profile_id: "large",
+          sandbox_profile_revision: "revision-1",
+        });
+      } else {
+        expect(body).not.toHaveProperty("sandbox_profile_id");
+        expect(body).not.toHaveProperty("sandbox_profile_revision");
+      }
+      if (enabled === true || enabled === "provider-opt-out")
+        expect(fetchSandboxProfiles).toHaveBeenCalledWith(
+          "agent_sandbox",
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+      else expect(fetchSandboxProfiles).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "launches with an explicit profile revision (attachments=%s)",
+    async (attachments) => {
+      const profile = {
+        id: "large",
+        name: "Large workspace",
+        description: "For builds",
+        provider: "agent_sandbox",
+        revision: "revision-1",
+      };
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+        profiles: [profile, { ...profile, id: "other", name: "Other provider", provider: "modal" }],
+        managed_providers: ["agent_sandbox", "modal"],
+        next_cursor: null,
+      });
+      authenticatedFetchMock.mockResolvedValue(
+        new Response(JSON.stringify({ id: "conv_profile" })),
+      );
+      renderLanding({
+        features: { sandbox_profiles: true },
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_providers: ["agent_sandbox", "modal"],
+        durable_initial_input: attachments,
+      });
+      const picker = await screen.findByRole("button", {
+        name: "Sandbox profile: Choose profile",
+      });
+      expect(fetchSandboxProfiles).toHaveBeenCalledWith(
+        "agent_sandbox",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "build the project" },
+      });
+      expect(screen.getByText("Choose a sandbox profile to continue.")).toBeVisible();
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      fireEvent.click(picker);
+      expect(screen.queryByRole("option", { name: /^Default/ })).toBeNull();
+      expect(screen.queryByText("Other provider")).toBeNull();
+      fireEvent.click(screen.getByText("Large workspace"));
+      await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
+      if (!attachments) {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-modal"));
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+        fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+        expect(authenticatedFetchMock).not.toHaveBeenCalled();
+        expect(
+          await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+        ).toBeVisible();
+        expect(fetchSandboxProfiles).toHaveBeenCalledWith(
+          "modal",
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+        );
+        fireEvent.click(screen.getByText("Large workspace"));
+        await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
+      }
+      const file = new File(["build context"], "context.txt", { type: "text/plain" });
+      if (attachments)
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [file] },
+        });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const request = authenticatedFetchMock.mock.calls[0][1]!;
+      const body = JSON.parse(
+        attachments
+          ? ((request.body as FormData).get("metadata") as string)
+          : (request.body as string),
+      );
+      if (attachments) expect((request.body as FormData).getAll("initial_files")).toEqual([file]);
+      expect(body).toMatchObject({
+        host_type: "managed",
+        sandbox_provider: "agent_sandbox",
+        sandbox_profile_id: "large",
+        sandbox_profile_revision: "revision-1",
+      });
+    },
+  );
+
+  it.each([403, 409])(
+    "refreshes rejected profile choices after HTTP %s without silently reselecting",
+    async (status) => {
+      const profile = {
+        id: "large",
+        name: "Large workspace",
+        description: "",
+        provider: "agent_sandbox",
+        revision: "revision-1",
+      };
+      const catalog = {
+        profiles: [profile],
+        managed_providers: ["agent_sandbox"],
+        next_cursor: null,
+      };
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue(catalog);
+      authenticatedFetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Choose a sandbox profile again." }), { status }),
+      );
+      renderLanding({
+        features: { sandbox_profiles: true },
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+      });
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+      );
+      fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+      await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "build" },
+      });
+      const refreshed = {
+        ...profile,
+        id: status === 403 ? "replacement" : profile.id,
+        revision: "revision-2",
+      };
+      let resolveCatalog!: (value: typeof catalog) => void;
+      const pendingCatalog = new Promise<typeof catalog>((resolve) => {
+        resolveCatalog = resolve;
+      });
+      vi.mocked(fetchSandboxProfiles).mockImplementation(() => pendingCatalog);
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(resolveCatalog).toBeDefined());
+      expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+        "Choose a sandbox profile again.",
+      );
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      resolveCatalog({ ...catalog, profiles: [refreshed] });
+      await screen.findByText(
+        "This profile changed or is unavailable. Choose a profile again before launching.",
+      );
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("build");
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByRole("button", { name: "Sandbox profile: Large workspace" }));
+      fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+      await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
+      authenticatedFetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "conv_profile" })),
+      );
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+      expect(JSON.parse(authenticatedFetchMock.mock.calls[1][1]!.body as string)).toMatchObject({
+        sandbox_provider: "agent_sandbox",
+        sandbox_profile_id: refreshed.id,
+        sandbox_profile_revision: "revision-2",
+      });
+    },
+  );
+
+  it("blocks sandbox launches on a catalog error while allowing host fallback", async () => {
+    vi.mocked(fetchSandboxProfiles).mockRejectedValue(new Error("Unavailable"));
+    renderLanding({
+      features: { sandbox_profiles: true },
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+    });
+    await screen.findByRole("button", { name: "Sandbox profile: Profiles unavailable" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "build" } });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
   it("carries the picked provider in the managed create when several are offered", async () => {
     // A multi-provider server renders one row per provider. Picking the
     // second (non-default) row must ride into the POST as sandbox_provider,
@@ -8579,6 +8871,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "audit the repo" },
     });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
@@ -8648,7 +8941,8 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("gates the add-repository button on a valid URL; submit stays enabled", async () => {
+  it("blocks submit until a pending repository URL is added or cleared", async () => {
+    const user = userEvent.setup();
     renderLanding({ managed_sandboxes_enabled: true });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
@@ -8659,22 +8953,62 @@ describe("NewChatLandingScreen", () => {
     // No repo at all is a valid sandbox create (empty workspace).
     expect(submit.disabled).toBe(false);
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
-    const add = screen.getByTestId("new-chat-landing-repo-add") as HTMLButtonElement;
-    // An unusable URL shape can't be added (it would 422 server-side); the
-    // half-typed input is not a selection, so submit stays enabled.
+    // An unfinished URL must be resolved instead of silently omitted.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "org/repo" },
     });
-    expect(add.disabled).toBe(true);
+    expect(screen.getByTestId("new-chat-landing-repo-add")).toBeDisabled();
+    expect(submit.disabled).toBe(true);
+    async function assertPendingUrlReopens(attempt: () => void): Promise<void> {
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull());
+      attempt();
+      const pendingInput = await screen.findByTestId("new-chat-landing-repo-input");
+      expect(pendingInput).toHaveValue("org/repo");
+      await waitFor(() => expect(pendingInput).toHaveFocus());
+      expect(submit).toBeDisabled();
+    }
+    await assertPendingUrlReopens(() =>
+      fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 }),
+    );
+    await assertPendingUrlReopens(() => fireEvent.keyDown(submit.parentElement!, { key: "Enter" }));
+    await assertPendingUrlReopens(() =>
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer")),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "" },
+    });
     expect(submit.disabled).toBe(false);
-    // A valid URL enables Add; adding it keeps submit enabled.
+    // A valid URL enables Add; adding it enables submit.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/repo" },
     });
-    expect(add.disabled).toBe(false);
-    fireEvent.click(add);
+    expect(screen.getByTestId("new-chat-landing-repo-add")).toBeEnabled();
+    expect(submit.disabled).toBe(true);
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
     await screen.findByTestId("new-chat-landing-repo-row");
     expect(submit.disabled).toBe(false);
+    fireEvent.change(screen.getByRole("textbox", { name: "Branch for repo" }), {
+      target: { value: "feature#invalid" },
+    });
+    expect(submit).toBeDisabled();
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Branch for repo" })).toBeNull(),
+    );
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    const branchInput = await screen.findByRole("textbox", { name: "Branch for repo" });
+    await waitFor(() => expect(branchInput).toHaveFocus());
+    fireEvent.change(branchInput, { target: { value: "b".repeat(256) } });
+    expect(submit).toBeDisabled();
+    expect(branchInput).toHaveAccessibleDescription(
+      "Repository URL and branch must be at most 256 characters together.",
+    );
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(branchInput).toHaveFocus();
+    fireEvent.change(branchInput, { target: { value: "feature/valid" } });
+    expect(submit).toBeEnabled();
   });
 });
 
@@ -12253,12 +12587,44 @@ describe("managed sandbox inference models", () => {
   );
 
   it("blocks stale cached choices when a catalog refresh fails", async () => {
+    const user = userEvent.setup();
     preview(catalog, new Error("Gateway unavailable"));
     renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
     expect(screen.getByRole("alert")).toHaveTextContent("Gateway unavailable");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
     expect(screen.queryByTestId("sandbox-catalog-error-integrations-link")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "org/repo" },
+    });
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull());
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 });
+    expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+      "Gateway unavailable",
+    );
+    expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    preview();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start after reconnect" },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+        "Finish or clear the repository URL",
+      ),
+    );
+    fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 });
+    const repositoryInput = await screen.findByTestId("new-chat-landing-repo-input");
+    await waitFor(() => expect(repositoryInput).toHaveFocus());
+    expect(repositoryInput).toHaveValue("org/repo");
+    expect(screen.queryByTestId("new-chat-landing-submit-error-tooltip")).toBeNull();
+    fireEvent.change(repositoryInput, { target: { value: "" } });
+    expect(submit).toBeEnabled();
   });
 
   it("offers Integrations when Unity requires an account connection", () => {

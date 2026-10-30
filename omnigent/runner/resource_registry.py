@@ -187,6 +187,9 @@ class TerminalExitEvent:
     :param expected_close: ``True`` when Omnigent killed the pane itself to
         fail the turn (a delivery timeout). That turn reports its own error,
         so the exit is not a second failure.
+    :param closed_outside_omnigent: ``True`` when tmux reported the Claude
+        session or its server gone and Omnigent had not killed it, e.g. a
+        ``tmux kill-session`` or ``killall tmux`` run on the host.
     :param terminal_instance_id: Identity of the observed terminal instance.
     :param lifecycle_context: Content-free evidence captured before exit cleanup.
     """
@@ -203,6 +206,7 @@ class TerminalExitEvent:
     exit_status: int | None = None
     session_was_idle: bool = False
     expected_close: bool = False
+    closed_outside_omnigent: bool = False
     terminal_instance_id: str | None = None
     lifecycle_context: dict[str, str] = field(default_factory=dict)
 
@@ -303,6 +307,13 @@ def _pane_closed_by_omnigent(private_dir: Path) -> bool:
     from omnigent.harnesses.claude_native.bridge import pane_closed_by_omnigent
 
     return pane_closed_by_omnigent(private_dir)
+
+
+def _pane_killed_by_omnigent(private_dir: Path) -> bool:
+    """Whether Omnigent itself killed the Claude pane in *private_dir*."""
+    from omnigent.harnesses.claude_native.bridge import pane_killed_by_omnigent
+
+    return pane_killed_by_omnigent(private_dir)
 
 
 def _terminal_exit_diagnostics(
@@ -1879,6 +1890,15 @@ class SessionResourceRegistry:
             and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             and _pane_closed_by_omnigent(instance.private_dir)
         )
+        closed_outside_omnigent = (
+            instance is not None
+            and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
+            and instance.session_killed_by_tmux()
+            and not _pane_killed_by_omnigent(instance.private_dir)
+        )
+        lifecycle_context["terminal_closed_outside_omnigent"] = str(
+            closed_outside_omnigent
+        ).lower()
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1990,6 +2010,7 @@ class SessionResourceRegistry:
                     exit_status=exit_status,
                     session_was_idle=session_was_idle,
                     expected_close=expected_close,
+                    closed_outside_omnigent=closed_outside_omnigent,
                     terminal_instance_id=instance.diagnostic_id if instance is not None else None,
                     lifecycle_context=lifecycle_context,
                 )

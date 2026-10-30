@@ -156,6 +156,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
   dismissed or the missing setup is completed.
+- `sandbox-profiles`: participating providers add a [profile picker](sandbox-profiles.md)
+  to New session; Start waits for an authorized, current selection.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
   line indents it as a list item; the newline gesture continues the list
   (numbers increment) and ends it after an empty item.

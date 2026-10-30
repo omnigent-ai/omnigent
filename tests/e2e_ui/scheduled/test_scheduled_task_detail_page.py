@@ -97,7 +97,7 @@ def test_scheduled_task_detail_page_run_now_records_run_row(
     expect(page.get_by_test_id("task-detail-schedule")).to_contain_text(
         "Every day at 9:00 AM", timeout=15_000
     )
-    expect(page.get_by_test_id("task-detail-host")).to_contain_text("Resolve at fire time")
+    expect(page.get_by_test_id("task-detail-host")).to_contain_text("Most recently active host")
     expect(page.get_by_test_id("task-detail-runs-empty")).to_be_visible()
 
     # Run now returns 202; the page polls its run history until the run lands.

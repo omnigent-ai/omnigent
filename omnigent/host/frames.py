@@ -1093,7 +1093,8 @@ class HostFsRequestFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
-        ``"diff"``, ``"search"``.
+        ``"diff"``, ``"search"``, or PR resources including ``"github_info"``,
+        ``"github_review_threads"`` and ``"github_review_thread_comments"``.
     :param workspace: Absolute path to the session's workspace on the
         host, e.g. ``"/Users/alice/project"``.
     :param session_id: Session id, forwarded to the change registry.
@@ -1120,7 +1121,7 @@ class HostFsWriteFrame:
     (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
     reviewer edits (``op="github_reviewers_update"``), title and description edits
     (``op="github_details_update"``), comments (``op="github_comment_create"``),
-    description attachment uploads
+    review replies (``op="github_review_thread_reply"``), description attachment uploads
     (``op="github_attachment_upload"``, the file base64-encoded in
     ``content_base64``), merges (``op="github_merge"``),
     and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
@@ -1133,8 +1134,8 @@ class HostFsWriteFrame:
     :param op: Write op name — ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
-        ``"github_attachment_upload"``, ``"github_merge"``, or
-        ``"github_disable_auto_merge"``.
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
