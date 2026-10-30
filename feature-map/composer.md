@@ -90,6 +90,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `permissions-command`: in Claude Code, Codex, and Devin native sessions,
+  `/permissions` opens the composer's permission menu instead of reaching the
+  vendor terminal. Other sessions don't list it and send it as text. States:
+  non-owner or change in flight (error, no menu), arguments rejected.
 - `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
   Codex, and Devin native sessions steps through every mode in the chip's menu,
   including Full Access and Dangerous, wrapping while the chip is clickable. States:
@@ -533,6 +537,13 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/lib/permissionModeCycle.test.ts`.
   `web/src/shell/NewChatDialog.test.tsx` checks that Shift+Tab on the landing
   page leaves the launch mode unchanged and does not prevent focus traversal.
+- **`permissions-command`:** with real CLIs (nightly),
+  `tests/e2e_ui/chat/test_claude_native_permission_switch_from_dont_ask.py::test_permissions_command_opens_composer_picker`
+  and
+  `tests/e2e_ui/chat/test_codex_native_permissions_command.py::test_permissions_command_opens_codex_approval_picker`.
+  `tests/browser_ui/chat/test_slash_menu.py::test_permissions_command_opens_the_permission_picker`
+  checks that the menu closes after a pick. Gating, Devin, the owner check,
+  arguments, and plain-text fallback are in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`plan-mode`:** with a real Codex CLI and a mock model, creation in Plan mode
   and subsequent composer toggles preserve the preset and agent instructions in
   `tests/e2e_ui/chat/test_codex_plan_mode_instructions.py::test_codex_plan_mode_creation_and_toggles_preserve_instructions`.

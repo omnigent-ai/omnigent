@@ -3269,6 +3269,115 @@ describe("Composer permission-mode shortcut", () => {
     expect(pressShiftTab(textarea())).toBe(true);
     expect(setMode).not.toHaveBeenCalled();
   });
+
+  describe("/permissions", () => {
+    const harnesses = [
+      {
+        name: "claude-native",
+        harness: "claude-native",
+        props: { showClaudePermissionMode: true },
+        option: "acceptEdits",
+      },
+      {
+        name: "devin-native",
+        harness: "devin-native",
+        props: { showClaudePermissionMode: true, modelPickerKind: "devin" as const },
+        option: "accept-edits",
+      },
+      {
+        name: "codex-native",
+        harness: "codex-native",
+        props: { showCodexApprovalMode: true },
+        option: "full-access",
+      },
+    ];
+
+    function renderPermissionSession(harness: string, props: Parameters<typeof composerProps>[0]) {
+      useChatStore.setState({
+        conversationId: `permissions-${harness}`,
+        sessionHarness: harness,
+        claudePermissionMode: harness === "devin-native" ? "normal" : "default",
+        codexApprovalMode: "ask-for-approval",
+      });
+      const onSend = vi.fn();
+      renderWithTooltips(<Composer {...composerProps({ onSend, ...props })} />);
+      return onSend;
+    }
+
+    it.each(harnesses)(
+      "opens the $name permission control on submit without sending",
+      async ({ harness, props, option }) => {
+        const setMode = spyClaudeSetter();
+        const setApproval = vi
+          .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+          .mockResolvedValue(undefined);
+        const onSend = renderPermissionSession(harness, props);
+        fireEvent.change(textarea(), { target: { value: "/permissions" } });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+
+        expect(onSend).not.toHaveBeenCalled();
+        expect(textarea()).toHaveValue("");
+        expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+        fireEvent.click(screen.getByTestId(`composer-permission-option-${option}`));
+        const setter = props.showCodexApprovalMode ? setApproval : setMode;
+        await waitFor(() => expect(setter).toHaveBeenCalledWith(option));
+        expect(onSend).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(harnesses)(
+      "lists /permissions for $name and opens the control from the menu",
+      async ({ harness, props }) => {
+        const onSend = renderPermissionSession(harness, props);
+        fireEvent.change(textarea(), { target: { value: "/perm" } });
+        expect(screen.getByTestId("slash-menu-item-permissions")).toHaveTextContent(
+          "/permissionsChange the permission mode for this session",
+        );
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+
+        expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+        expect(textarea()).toHaveValue("");
+        expect(onSend).not.toHaveBeenCalled();
+      },
+    );
+
+    it("is not listed, and stays plain text, for sessions without a permission control", () => {
+      const onSend = renderPermissionSession("claude-sdk", {});
+      fireEvent.change(textarea(), { target: { value: "/" } });
+      expect(screen.getByTestId("slash-menu-item-help")).toBeInTheDocument();
+      expect(screen.queryByTestId("slash-menu-item-permissions")).toBeNull();
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(onSend).toHaveBeenCalledWith("/permissions", undefined);
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+    });
+
+    it("explains why a non-owner can't open the control and sends nothing", () => {
+      const onSend = renderPermissionSession("claude-native", {
+        showClaudePermissionMode: true,
+        permissionLevel: 3,
+      });
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(
+        screen.getByText("Only the session owner can change the permission mode"),
+      ).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects arguments without opening the control or sending", () => {
+      const onSend = renderPermissionSession("claude-native", { showClaudePermissionMode: true });
+      fireEvent.change(textarea(), { target: { value: "/permissions allow Bash" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(screen.getByText("/permissions does not accept arguments")).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("Composer background tasks", () => {

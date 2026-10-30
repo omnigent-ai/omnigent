@@ -2099,6 +2099,8 @@ interface ComposerProps {
  * :param showModel: Whether to include ``/model`` (in-process sessions
  *     and claude-native, which both honor ``conv.model_override``; see
  *     the call site).
+ * :param showPermissions: Whether to include ``/permissions``, which opens
+ *     the composer's permission control, so only sessions showing one.
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
@@ -2112,6 +2114,7 @@ export function buildSlashCommandMap(
   supportsModelReset = false,
   showMcp = false,
   showClear = false,
+  showPermissions = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2120,6 +2123,7 @@ export function buildSlashCommandMap(
     if (name === "/compact" && !showCompact) continue;
     if (name === "/mcp" && !showMcp) continue;
     if (name === "/clear" && !showClear) continue;
+    if (name === "/permissions" && !showPermissions) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2423,6 +2427,9 @@ function ComposerImpl(
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
+  // Bumped by "/permissions" to open the permission control instead of sending
+  // the command, which would open the vendor's own selector in its terminal.
+  const [permissionPickerOpenNonce, setPermissionPickerOpenNonce] = useState(0);
   // Single send-telemetry point (see submit()). Emitting here rather than via
   // the Button's componentId covers Enter-key sends too — a textarea Enter never
   // submits the form, so it would otherwise bypass the Button entirely.
@@ -2876,6 +2883,7 @@ function ComposerImpl(
         supportsModelReset,
         composerSessionId !== null,
         showClear,
+        showClaudePermissionMode || showCodexApprovalMode,
       ),
     [
       skills,
@@ -2888,6 +2896,8 @@ function ComposerImpl(
       supportsModelReset,
       composerSessionId,
       showClear,
+      showClaudePermissionMode,
+      showCodexApprovalMode,
     ],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
@@ -3263,6 +3273,26 @@ function ComposerImpl(
       case "/mcp":
         if (arg) setCommandError("Usage: /mcp");
         return true;
+      case "/permissions": {
+        if (!showClaudePermissionMode && !showCodexApprovalMode) return false;
+        if (arg) {
+          setCommandError("/permissions does not accept arguments");
+          return true;
+        }
+        if (!permissionControlInteractive || configBusy) {
+          setCommandError(
+            !isOwnerLevel(permissionLevel)
+              ? "Only the session owner can change the permission mode"
+              : "The permission mode can't be changed right now",
+          );
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        setPermissionPickerOpenNonce((n) => n + 1);
+        return true;
+      }
       case "/help": {
         const lines = Object.entries(slashCommands).map(([name, desc]) => `${name} — ${desc}`);
         setCommandError(lines.join("\n"));
@@ -4221,6 +4251,7 @@ function ComposerImpl(
                       : "Only the session owner can change the permission mode"
                   }
                   onSelect={(mode) => void changePermission(mode)}
+                  openNonce={permissionPickerOpenNonce}
                 />
               )}
             </>
