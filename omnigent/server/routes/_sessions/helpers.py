@@ -80,6 +80,7 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
+from omnigent.harnesses.claude_native.program_status import ERROR_HOOK_GRACE_S
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
@@ -4925,6 +4926,50 @@ def _failure_log_detail(error: ErrorDetail | None) -> str:
     return f"{message[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
 
 
+# Causeless ``failed`` edges a runner relayed, held for their cause, by session
+# id. The timer keeps the context it was scheduled in, so it publishes in that
+# workspace.
+_held_bare_failures: WorkspaceScopedCache[str, tuple[asyncio.TimerHandle, Callable[[], None]]] = (
+    WorkspaceScopedCache()
+)
+
+
+def hold_bare_failure(session_id: str, publish: Callable[[], None]) -> None:
+    """
+    Hold a relayed ``failed`` edge that carries no cause until one arrives.
+
+    A runner that predates hook-owned Claude failures reports the error state
+    as a causeless ``failed`` edge, and the ``StopFailure`` hook posts the
+    cause about a second later. A ``failed`` edge with an error replaces the
+    held one (see :func:`_publish_status`). Any other edge, the grace running
+    out, or the runner's stream ending publishes it unchanged. A repeat keeps
+    the first hold, so a re-sent edge neither publishes nor extends the wait.
+
+    :param session_id: Session/conversation identifier.
+    :param publish: Publishes the held edge exactly as it arrived.
+    """
+    if session_id in _held_bare_failures:
+        return
+    # Same wait a current runner gives the hook before failing the turn itself.
+    handle = asyncio.get_running_loop().call_later(
+        ERROR_HOOK_GRACE_S, flush_held_bare_failure, session_id
+    )
+    _held_bare_failures[session_id] = (handle, publish)
+
+
+def flush_held_bare_failure(session_id: str) -> None:
+    """
+    Publish the causeless ``failed`` edge held for *session_id*, if any.
+
+    :param session_id: Session/conversation identifier.
+    """
+    held = _held_bare_failures.pop(session_id, None)
+    if held is not None:
+        handle, publish = held
+        handle.cancel()
+        publish()
+
+
 def _publish_status(
     session_id: str,
     status: str,
@@ -4981,6 +5026,14 @@ def _publish_status(
         confirmed finished (e.g. claude-native's ``Stop`` hook), which clears a
         sticky ``failed`` like a ``running`` edge would.
     """
+    # The cause for a held causeless ``failed`` edge replaces it, so the turn
+    # fails once, with its reason. Any other edge publishes the held one first.
+    held_bare_failure = _held_bare_failures.pop(session_id, None)
+    if held_bare_failure is not None:
+        handle, publish_held = held_bare_failure
+        handle.cancel()
+        if status != "failed" or error is None:
+            publish_held()
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
     # follow-on quiescence signal. This matters for claude-native: the
