@@ -511,7 +511,20 @@ function PullRequestFileSection({
     revision: string;
     range: SelectedLineRange | null;
   }>();
+  // Preview the drag without moving the code by adding the comment action row.
+  const [selectionPreview, setSelectionPreview] = useState<typeof selection>();
   const selectedLines = selection?.revision === revision ? selection.range : null;
+  const previewSelection = useCallback(
+    (range: SelectedLineRange | null) => setSelectionPreview({ revision, range }),
+    [revision],
+  );
+  const commitSelection = useCallback(
+    (range: SelectedLineRange | null) => {
+      setSelection({ revision, range });
+      setSelectionPreview(undefined);
+    },
+    [revision],
+  );
   const [selectionError, setSelectionError] = useState<string>();
   const startConversation = (range: SelectedLineRange) => {
     if (!threadContext.canCreate || !fileDiff || composer.draft.pending) return;
@@ -556,29 +569,32 @@ function PullRequestFileSection({
     !pureRename &&
     seen &&
     (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
-  const { annotations: threadAnnotations, unplaced } = reviewThreadAnnotations(
-    threads,
-    renderingDiff ? fileDiff : undefined,
-    matchingRevision,
-  );
-  const annotations: DiffLineAnnotation<ReviewAnnotation>[] = threadAnnotations.map(
-    (annotation) => ({ ...annotation, metadata: { threads: annotation.metadata } }),
-  );
   const anchor = composer.draft.anchor;
   const showDraftInline = !!anchor && !composer.stale && renderingDiff;
-  if (showDraftInline) {
-    const side = anchor.side === "LEFT" ? "deletions" : "additions";
-    const existing = annotations.find(
-      (item) => item.side === side && item.lineNumber === anchor.line,
+  const { annotations, unplaced } = useMemo(() => {
+    const { annotations: threadAnnotations, unplaced: unplacedThreads } = reviewThreadAnnotations(
+      threads,
+      renderingDiff ? fileDiff : undefined,
+      matchingRevision,
     );
-    if (existing) existing.metadata.newThread = true;
-    else
-      annotations.push({
-        side,
-        lineNumber: anchor.line,
-        metadata: { threads: [], newThread: true },
-      });
-  }
+    const inlineAnnotations: DiffLineAnnotation<ReviewAnnotation>[] = threadAnnotations.map(
+      (annotation) => ({ ...annotation, metadata: { threads: annotation.metadata } }),
+    );
+    if (showDraftInline) {
+      const side = anchor.side === "LEFT" ? "deletions" : "additions";
+      const existing = inlineAnnotations.find(
+        (item) => item.side === side && item.lineNumber === anchor.line,
+      );
+      if (existing) existing.metadata.newThread = true;
+      else
+        inlineAnnotations.push({
+          side,
+          lineNumber: anchor.line,
+          metadata: { threads: [], newThread: true },
+        });
+    }
+    return { annotations: inlineAnnotations, unplaced: unplacedThreads };
+  }, [threads, renderingDiff, fileDiff, matchingRevision, anchor, showDraftInline]);
   const newConversation = anchor && (
     <section
       aria-label="New review conversation"
@@ -711,7 +727,7 @@ function PullRequestFileSection({
           </button>
         </div>
       ) : fileDiff ? (
-        <div className="overflow-x-auto">
+        <div className="overflow-x-auto" onPointerCancel={() => setSelectionPreview(undefined)}>
           <div
             style={{
               minWidth: annotations.length && options?.diffStyle === "split" ? 720 : undefined,
@@ -723,9 +739,13 @@ function PullRequestFileSection({
                 ...options,
                 enableLineSelection: !!threadContext.canCreate,
                 enableGutterUtility: !!threadContext.canCreate,
-                onLineSelected: (range) => setSelection({ revision, range }),
+                onLineSelectionStart: previewSelection,
+                onLineSelectionChange: previewSelection,
+                onLineSelectionEnd: commitSelection,
               }}
-              selectedLines={selectedLines}
+              selectedLines={
+                selectionPreview?.revision === revision ? selectionPreview.range : selectedLines
+              }
               disableWorkerPool
               renderGutterUtility={
                 threadContext.canCreate
@@ -2116,6 +2136,13 @@ function PullRequestPanelDetails({
       theme: PULL_REQUEST_DIFF_THEME,
       themeType,
       diffStyle,
+      unsafeCSS: `
+        [data-selected-line] { background-color: var(--sidebar-active); }
+        [data-column-number][data-selected-line], [data-gutter-buffer][data-selected-line] {
+          color: var(--sidebar-active-foreground);
+          box-shadow: inset -3px 0 var(--sidebar-active-foreground);
+        }
+      `,
       // The section renders its own header; the diff body has none.
       disableFileHeader: true,
       // Expand unchanged context 10 lines at a time (default is 100). The

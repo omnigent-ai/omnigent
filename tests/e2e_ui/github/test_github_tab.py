@@ -643,6 +643,11 @@ def test_reply_to_inline_review_conversation(
 ) -> None:
     """Reply and start line/range conversations through each shared-panel surface."""
     base_url, session_id = seeded_session
+    page.emulate_media(color_scheme="dark" if entry in {"composer-mobile", "canvas"} else "light")
+    if entry in {"composer-desktop", "canvas"}:
+        page.add_init_script(
+            'localStorage.setItem("omnigent:ui-theme-palette", JSON.stringify("github"))'
+        )
     _stub_github(page, pr_count=2)
     pr_url = _INFO["pr"]["url"]
     thread = {
@@ -821,6 +826,48 @@ def test_reply_to_inline_review_conversation(
     expect(panel.get_by_text(re.compile(r"^\d+\+? review conversations?$"))).to_have_count(0)
     conversation = panel.locator('[data-review-thread="thread-1"]')
     expect(conversation).to_be_visible()
+    file = panel.locator('[data-github-file="src/app/main.py"]')
+    diff = file.locator("diffs-container").first
+    gutter = diff.locator(":scope > [data-diff] > [data-code] > [data-gutter]")
+    rows = diff.locator(":scope > [data-diff] > [data-code] > [data-content]")
+    first_line = gutter.locator('[data-column-number="1"]')
+    last_line = gutter.locator('[data-column-number="3"]')
+    original_line = last_line.element_handle()
+    assert original_line
+    first_box, last_box = first_line.bounding_box(), last_line.bounding_box()
+    middle_box = gutter.locator('[data-column-number="2"]').bounding_box()
+    assert first_box and last_box and middle_box
+    page.mouse.move(last_box["x"] + 8, last_box["y"] + last_box["height"] / 2)
+    page.mouse.down()
+    expect(last_line).to_have_attribute("data-selected-line", "single")
+    page.mouse.move(first_box["x"] + 8, first_box["y"] + first_box["height"] / 2, steps=5)
+    expect(rows.locator(":scope > [data-line][data-selected-line]")).to_have_count(3)
+    expect(gutter.locator(":scope > [data-column-number][data-selected-line]")).to_have_count(3)
+    assert original_line.evaluate("element => element.isConnected")
+    page.mouse.move(middle_box["x"] + 8, middle_box["y"] + middle_box["height"] / 2)
+    expect(rows.locator(":scope > [data-line][data-selected-line]")).to_have_count(2)
+    page.mouse.move(first_box["x"] + 8, first_box["y"] + first_box["height"] / 2)
+    expect(rows.locator(":scope > [data-line][data-selected-line]")).to_have_count(3)
+    expect(file.get_by_role("button", name="Comment on selected lines")).to_have_count(0)
+    colors = page.evaluate("""() => {
+        const probe = document.createElement('span');
+        document.body.append(probe);
+        const colors = ['sidebar-active', 'sidebar-active-foreground']
+            .map(token => {
+                probe.style.backgroundColor = `var(--${token})`;
+                return getComputedStyle(probe).backgroundColor;
+            });
+        probe.remove();
+        return colors;
+    }""")
+    for selected in rows.locator(":scope > [data-line][data-selected-line]").all():
+        expect(selected).to_have_css("background-color", colors[0])
+    expect(first_line).to_have_css("background-color", colors[0])
+    expect(first_line).to_have_css("color", colors[1])
+    expect(first_line).to_have_css("box-shadow", f"{colors[1]} -3px 0px 0px 0px inset")
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-drag-selection.png"))
+    page.mouse.up()
+    expect(file.get_by_role("button", name="Comment on selected lines")).to_be_visible()
     assert conversation.evaluate("element => !!element.closest('diffs-container')")
     assert (
         conversation.evaluate("element => element.closest('[slot]').getAttribute('slot')")
@@ -914,7 +961,6 @@ def test_reply_to_inline_review_conversation(
     conversation.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-posted.png"))
 
-    file = panel.locator('[data-github-file="src/app/main.py"]')
     line = file.locator("diffs-container").first.locator(
         ":scope > [data-diff] > [data-code] > [data-gutter] "
         '> [data-column-number="2"][data-line-type="change-addition"]'

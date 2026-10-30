@@ -16,6 +16,7 @@ request's Changes subtab. Top-level comments remain in Comments.
   immediate posting remain available in the expanded composer.
 - `new-conversation`: Gutter plus and line-selection actions for a single line or
   same-side range; independent conversations on lines with existing threads.
+  Selection follows the drag, with the sidebar's theme tint and an accent gutter.
 - `history`: On-demand pages, incomplete/error states, resolved collapse,
   unresolved navigation and original context for unplaceable conversations.
 - `thread-refresh`: Threads fetch separately and poll while Changes is open;
