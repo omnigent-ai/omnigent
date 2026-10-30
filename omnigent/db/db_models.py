@@ -1314,6 +1314,9 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param ssh_target: SSH destination the owner reaches the host by from their
+        own machine, e.g. ``"arclet_dev.ssh"``, from the last ``host.hello``.
+        ``NULL`` when never reported.
     """
 
     __tablename__ = "hosts"
@@ -1346,6 +1349,7 @@ class SqlHost(OmnigentBase):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    ssh_target: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
