@@ -6383,3 +6383,73 @@ async def test_turn_options_expose_ask_user_question_only_with_its_hook(
     matchers = [m.matcher for m in (options.hooks or {}).get("PreToolUse", [])]
     assert ("AskUserQuestion" in options.tools) is bridge_wired
     assert ("AskUserQuestion" in matchers) is bridge_wired
+
+
+@pytest.mark.parametrize("with_os_env", [True, False])
+def test_the_wrapped_cli_can_read_the_bundles_skills(tmp_path: Path, with_os_env: bool) -> None:
+    # The runner extracts the bundle under the temp directory, which the bwrap
+    # wrap replaces with a private tmpfs: the CLI must be granted the bundle's
+    # skills and plugin manifest or it loads none of the bundled skills.
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    bundle = tmp_path / "bundle"
+    (bundle / "skills" / "pdf").mkdir(parents=True)
+    (bundle / "skills" / "pdf" / "SKILL.md").write_text("---\nname: pdf\ndescription: d\n---\n")
+    full = Mock(return_value=PreparedClaudeCli(cli_path="/tmp/w", enable_native_tools=True))
+    tight = Mock(return_value="/tmp/w")
+    with (
+        patch(
+            "omnigent.inner.claude_sdk_executor._find_system_claude",
+            return_value="/usr/bin/claude",
+        ),
+        patch("omnigent.inner.claude_sdk_executor.prepare_claude_cli_path", full),
+        patch("omnigent.inner.claude_sdk_executor.prepare_tight_cli_process_path", tight),
+    ):
+        ClaudeSDKExecutor(
+            os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)) if with_os_env else None,
+            bundle_dir=bundle,
+            agent_name="agent",
+        )
+    called = full if with_os_env else tight
+    assert called.call_args.kwargs["extra_read_roots"] == [
+        bundle / "skills",
+        bundle / ".claude-plugin",
+    ]
+
+
+def test_prepare_claude_cli_path_grants_the_extra_read_roots(tmp_path: Path) -> None:
+    from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict[str, SandboxPolicy] = {}
+
+    def capture(_path: str, sandbox: SandboxPolicy) -> str:
+        captured["sandbox"] = sandbox
+        return "/tmp/launcher"
+
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(tmp_path),
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=True),
+    )
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[tmp_path],
+        write_roots=[tmp_path],
+        write_files=[],
+        allow_network=True,
+    )
+    with (
+        patch("omnigent.inner.claude_sdk_executor.resolve_sandbox", return_value=policy),
+        patch("omnigent.inner.claude_sdk_executor._claude_internal_write_roots", return_value=[]),
+        patch("omnigent.inner.claude_sdk_executor._claude_internal_write_files", return_value=[]),
+        patch("omnigent.inner.claude_sdk_executor.get_backend"),
+        patch("omnigent.inner.claude_sdk_executor.create_exec_launcher", side_effect=capture),
+    ):
+        prepare_claude_cli_path(
+            "/usr/bin/claude", spec, extra_read_roots=[tmp_path / "bundle" / "skills"]
+        )
+    assert (tmp_path / "bundle" / "skills").resolve() in captured["sandbox"].read_roots

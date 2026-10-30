@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,8 +21,35 @@ from omnigent.spec.skill_sources import (
     select_claude_portable_skills,
     skill_source_context_from_env,
 )
+from omnigent.spec.types import SkillSpec
 
 _log = logging.getLogger(__name__)
+
+
+def bundle_resource_roots(bundle_dir: Path | None) -> list[Path]:
+    """The parts of a bundle a sandboxed Claude CLI reads: its skills and plugin manifest.
+
+    Runners extract bundles under the temp directory, which ``linux_bwrap``
+    replaces with a private tmpfs, so these are granted read-only explicitly.
+    """
+    if bundle_dir is None:
+        return []
+    return [
+        path for path in (bundle_dir / "skills", bundle_dir / ".claude-plugin") if path.is_dir()
+    ]
+
+
+def skill_resource_roots(skills: Iterable[SkillSpec]) -> list[Path]:
+    """Each skill's directory, for a sandbox that must reach its ``scripts/`` and references.
+
+    A bundle skill lives in the runner's extraction directory, under the temp
+    directory a ``linux_bwrap`` sandbox hides behind its private ``/tmp``.
+    """
+    roots: list[Path] = []
+    for skill in skills:
+        if skill.skill_dir is not None and skill.skill_dir not in roots:
+            roots.append(skill.skill_dir)
+    return roots
 
 
 def ensure_bundle_plugin_manifest(
