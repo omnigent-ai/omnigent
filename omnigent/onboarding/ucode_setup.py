@@ -30,12 +30,8 @@ _logger = logging.getLogger(__name__)
 _SANDBOX_CONFIGURE_TIMEOUT_S = 120
 
 _UCODE_AGENT_NAMES: tuple[str, ...] = ("claude", "codex", "pi")
-# Pin ucode to a fixed commit so setup is reproducible, rather than tracking
-# ucode's ``main`` HEAD (a mutable ref that can move under us between runs and
-# break setup unexpectedly). A full SHA is immutable, so uvx caches the built
-# wheel by ref and reuses it across runs — no ``--refresh-package`` needed to
-# defeat a mutable branch's stale cache. This is ucode v0.2.1, the first
-# release whose ``configure --user`` writes settings without sudo.
+# Pin an immutable SHA (ucode v0.2.1, sudo-free ``configure --user``) so setup is
+# reproducible and uvx reuses its cached build instead of tracking ``main``.
 _UCODE_GIT_REF = "5f72236eea3ab01db2cc4ff5fd4f15ede7626c33"
 _UCODE_UVX_SOURCE = f"git+https://github.com/databricks/ucode@{_UCODE_GIT_REF}"
 
@@ -182,7 +178,12 @@ def run_ucode_configure(
         f"`ucode configure` exited with code {result.returncode}; "
         "see the command output above for details."
     )
-    if not user_scope:
+    if not user_scope and _machine_managed_settings_exist(agents):
+        message += (
+            " If it could not update the existing machine-wide managed settings, "
+            "ask an administrator to run setup; ucode does not allow --user while they exist."
+        )
+    elif not user_scope:
         message += (
             " If it could not update machine-wide managed settings (that needs "
             "administrator rights), configure your user only, then rerun setup:\n"
