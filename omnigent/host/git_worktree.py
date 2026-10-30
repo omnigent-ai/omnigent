@@ -12,7 +12,10 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +40,12 @@ _ROLLBACK_RESERVE_FRACTION: float = 0.25
 _CREATE_DEADLINE: ContextVar[tuple[float, float] | None] = ContextVar(
     "_CREATE_DEADLINE", default=None
 )
+
+# ``(main work tree, branch)`` pairs a create in this process is working on. A
+# rollback's checks and its ref delete are separate git commands, so a second
+# create of the same branch must not run in between.
+_BRANCHES_IN_USE: set[tuple[str, str]] = set()
+_BRANCHES_IN_USE_LOCK = threading.Lock()
 
 # Max directory-collision suffixes (``-2`` .. ``-N``) before giving up.
 _MAX_DIR_COLLISION_SUFFIX: int = 50
@@ -581,7 +590,8 @@ def create_worktree(
         not a git repo, the base ref can't be resolved, or
         ``git worktree add`` fails (e.g. the branch already exists in
         create mode, is missing or still checked out in
-        existing-branch mode).
+        existing-branch mode), or another create of the same branch is
+        still running in this process.
     """
     budget_s = WORKTREE_CREATE_BUDGET_S if timeout_s is None else timeout_s
     deadline = time.monotonic() + budget_s
@@ -623,6 +633,55 @@ def _create_worktree(
     # (``…/feature-worktrees/<branch>``); resolving to the main repo keeps
     # all worktrees as siblings (``…/myrepo-worktrees/<branch>``).
     repo_root = _main_work_tree(repo_path)
+    with _claim_branch(repo_root, branch_name):
+        return _create_worktree_in_repo(
+            repo_path=repo_path,
+            repo_root=repo_root,
+            branch_name=branch_name,
+            base_branch=base_branch,
+            existing_branch=existing_branch,
+            deadline=deadline,
+            budget_s=budget_s,
+        )
+
+
+@contextmanager
+def _claim_branch(repo_root: str, branch_name: str) -> Iterator[None]:
+    """Hold ``branch_name`` for one create, failing at once if another create holds it.
+
+    :param repo_root: Main work tree, e.g. ``"/Users/alice/myrepo"``.
+    :param branch_name: Branch the create checks out, e.g. ``"feature/login"``.
+    :raises WorktreeError: If a create of the same branch is still running.
+    """
+    key = (repo_root, branch_name)
+    with _BRANCHES_IN_USE_LOCK:
+        if key in _BRANCHES_IN_USE:
+            raise WorktreeError(
+                f"a worktree for branch {branch_name!r} is already being created; "
+                "retry once it finishes"
+            )
+        _BRANCHES_IN_USE.add(key)
+    try:
+        yield
+    finally:
+        with _BRANCHES_IN_USE_LOCK:
+            _BRANCHES_IN_USE.discard(key)
+
+
+def _create_worktree_in_repo(
+    *,
+    repo_path: str,
+    repo_root: str,
+    branch_name: str,
+    base_branch: str | None,
+    existing_branch: bool,
+    deadline: float,
+    budget_s: float,
+) -> CreatedWorktree:
+    """Do :func:`_create_worktree`'s git work while holding ``branch_name``.
+
+    :param repo_root: Main work tree of ``repo_path``, e.g. ``"/Users/alice/myrepo"``.
+    """
     prefix = _run_git(["rev-parse", "--show-prefix"], cwd=repo_path)
     if prefix.returncode != 0:
         raise _git_error("could not resolve selected repository directory", prefix)

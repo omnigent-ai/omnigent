@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -981,6 +982,49 @@ def test_failed_add_rollback_keeps_peer_worktree_of_same_branch(
     linked = [wt.branch for wt in list_worktrees(repo_path=str(git_repo)) if not wt.is_main]
     assert linked == ["feature/x"]
     assert _branch_exists(git_repo, "feature/x")
+
+
+def test_failed_add_rollback_turns_away_same_branch_peer(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer create of the branch cannot check it out between the rollback's scan and delete."""
+    real_run = git_worktree_module._run_git
+    failed = False
+    peer_errors: list[str] = []
+
+    def peer_after_scan(
+        args: list[str], *, cwd: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal failed
+        if args[:2] == ["worktree", "add"] and not failed:
+            failed = True
+            return subprocess.CompletedProcess(args, 128, "", "fatal: disk full")
+        if args[:2] == ["update-ref", "-d"] and not peer_errors:
+
+            def recreate() -> None:
+                try:
+                    create_worktree(
+                        repo_path=str(git_repo), branch_name="feature/x", existing_branch=True
+                    )
+                    peer_errors.append("")
+                except WorktreeError as exc:
+                    peer_errors.append(exc.message)
+
+            peer = threading.Thread(target=recreate)
+            peer.start()
+            peer.join()
+        return real_run(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", peer_after_scan)
+    with pytest.raises(WorktreeError, match="disk full"):
+        create_worktree(repo_path=str(git_repo), branch_name="feature/x")
+    assert peer_errors == [
+        "a worktree for branch 'feature/x' is already being created; retry once it finishes"
+    ]
+    assert not _branch_exists(git_repo, "feature/x")
+    assert _worktree_count(git_repo) == 1
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/x")
+    assert _current_branch(Path(created.worktree_path)) == "feature/x"
 
 
 @pytest.mark.parametrize("advanced", ["before_rollback", "during_rollback"])
