@@ -34,7 +34,14 @@
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  queryOptions,
+  skipToken,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -187,6 +194,8 @@ export interface PullRequestCapabilities {
   label_editing?: boolean;
   /** The PR can be merged from the panel; absent from older hosts. */
   merging?: boolean;
+  /** Top-level comments can be posted; absent from older hosts. */
+  comment_posting?: boolean;
   /** Reviews can be requested and pending requests withdrawn; absent from older hosts. */
   reviewer_editing?: boolean;
   /** The PR's title and description can be edited; absent from older hosts. */
@@ -215,6 +224,12 @@ export interface PullRequestAssociation {
   /** Git provider id; absent from hosts that predate providers (GitHub). */
   provider?: string;
   provider_display?: GitProviderDisplay;
+  /** "OPEN" | "MERGED" | "CLOSED" as the host last fetched it; null until it does. */
+  state?: string | null;
+  /** Whether the PR was a draft at that fetch. */
+  is_draft?: boolean;
+  /** Epoch seconds of that fetch, or null. */
+  state_checked_at?: number | null;
 }
 
 function prQuery(prUrl?: string): string {
@@ -332,9 +347,18 @@ export interface PullRequestFileDiffResponse {
   after: string | null;
 }
 
+class PullRequestApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 /** Surface the server's error message (e.g. a git failure) rather than a bare
  *  status code, mirroring the workspace hooks. */
-async function errorFromResponse(res: Response): Promise<Error> {
+export async function errorFromResponse(res: Response): Promise<Error> {
   let message = `${res.status} ${res.statusText}`;
   try {
     const body = (await res.json()) as { error?: { message?: string }; detail?: unknown };
@@ -343,7 +367,7 @@ async function errorFromResponse(res: Response): Promise<Error> {
   } catch {
     // Non-JSON body (gateway/front-door error) — keep the status line.
   }
-  return new Error(message);
+  return new PullRequestApiError(message, res.status);
 }
 
 /** Classify a 404 body from the GitHub resource endpoint.
@@ -405,6 +429,7 @@ export async function fetchPullRequestInfo(
  *  git/gh checks — and the waiting-for-a-PR / CI-running states, which cost a
  *  `gh` API call but only while the panel is actually focused. */
 const PULL_REQUEST_POLL_MS = 5_000;
+const PULL_REQUEST_LIST_POLL_MS = 30_000;
 
 /**
  * The panel's poll interval for the current GitHub info, or `false` to stop.
@@ -425,7 +450,12 @@ const PULL_REQUEST_POLL_MS = 5_000;
  * polling while the panel is open+focused — we can't tell "no CI" from "checks
  * haven't registered yet", and freshness wins for the cost of a focused poll.
  */
-export function computePullRequestPollInterval(info: PullRequestInfo | undefined): number | false {
+export function computePullRequestPollInterval(
+  info: PullRequestInfo | undefined,
+  listRow = false,
+): number | false {
+  // List rows refresh less often and rest once closed; explicit Refresh still refetches them.
+  if (listRow) return info?.pr && info.pr.state !== "OPEN" ? false : PULL_REQUEST_LIST_POLL_MS;
   // No usable info yet — an initial error, or a transient fetch failure with no
   // cached data. Keep trying; runner-offline is gated off by `enabled`.
   if (!info) return PULL_REQUEST_POLL_MS;
@@ -444,13 +474,57 @@ export function computePullRequestPollInterval(info: PullRequestInfo | undefined
   return pr.checks.pending > 0 || pr.checks.total === 0 ? PULL_REQUEST_POLL_MS : false;
 }
 
+/** Poll linked PRs until all known states are terminal; unknown states keep refreshing. */
+export function computeLinkedPullRequestPollInterval(
+  info: Pick<PullRequestInfo, "pr" | "prs"> | undefined,
+): number | false {
+  const selected = info?.pr;
+  const associations = info?.prs?.filter((pr) => pr.url !== selected?.url) ?? [];
+  const summaries = selected ? [...associations, selected] : associations;
+  return summaries.some((pr) => !["MERGED", "CLOSED"].includes(pr.state?.toUpperCase() ?? ""))
+    ? PULL_REQUEST_LIST_POLL_MS
+    : false;
+}
+
+function usePullRequestQueryContext(rawConversationId: string | undefined) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session.
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  const serveable = useWorkspaceServeable(conversationId);
+  // Use the health poll so hovering sidebar rows does not load their session snapshots.
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return { conversationId, enabled: !!conversationId && serveable !== false, retry };
+}
+
+function pullRequestInfoQueryOptions(
+  { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
+  options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
+) {
+  return queryOptions({
+    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
+    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
+    enabled,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    staleTime: 30_000,
+    refetchInterval: options?.poll
+      ? (query) => {
+          const info = query.state.data;
+          if (options.poll === "linked") return computeLinkedPullRequestPollInterval(info);
+          if (options.poll === "list") return computePullRequestPollInterval(info, true);
+          return info?.tracking_available ? 10_000 : computePullRequestPollInterval(info);
+        }
+      : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
 /**
  * Fetch GitHub context (repo, branch, base ref, PR + CI summary) for a session.
  *
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
  *
- * Refetch is driven two ways, both harness-agnostic:
+ * Refetch follows the session lifecycle and the caller's polling mode:
  *   - Turn end: a trailing invalidate on the focused session's active→idle
  *     transition, so a PR the agent opened during the turn shows up (in the
  *     status-line indicator and the panel) without a manual refresh. This is
@@ -460,38 +534,28 @@ export function computePullRequestPollInterval(info: PullRequestInfo | undefined
  *     states poll and which rest. It catches changes a turn boundary can't
  *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
  *     tabs pause (`refetchIntervalInBackground: false`).
- *
- * Disabled when the runner is known offline. Retries the runner-offline case
- * with capped backoff so a cold-booting runner resolves before any error UI.
+ *   - Composer: `{ poll: "linked" }` uses the list cadence for open or unknown
+ *     PR states. Empty and terminal lists rest until a turn end or explicit refresh.
  */
 export function usePullRequestInfo(
   rawConversationId: string | undefined,
-  options?: { poll?: boolean; prUrl?: string },
+  options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
-  // A `temp:*` id (navigate-first new-chat window) has no server session.
-  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
-  const serveable = useWorkspaceServeable(conversationId);
-  // Gate on the health poll rather than the session snapshot: the sidebar
-  // tooltip reuses this hook, and must not load every hovered session.
-  const retry = useRunnerOfflineRetry(serveable !== false);
-  // Turn-end backstop: refetch when the focused session goes active→idle, so a
-  // just-opened PR appears without opening the tab. Keys off the turn lifecycle,
-  // so it works for every harness (no per-harness tool detection).
-  useTrailingInvalidate(conversationId, useSessionActive(conversationId), "github-info");
-  return useQuery({
-    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
-    enabled: !!conversationId && serveable !== false,
-    retry,
-    retryDelay: runnerOfflineRetryDelay,
-    staleTime: 30_000,
-    refetchInterval: options?.poll
-      ? (query) =>
-          query.state.data?.tracking_available
-            ? 10_000
-            : computePullRequestPollInterval(query.state.data)
-      : false,
-    refetchIntervalInBackground: false,
+  const context = usePullRequestQueryContext(rawConversationId);
+  // Prefix invalidation also refreshes usePullRequestInfos queries for this session.
+  useTrailingInvalidate(
+    context.conversationId,
+    useSessionActive(context.conversationId),
+    "github-info",
+  );
+  return useQuery(pullRequestInfoQueryOptions(context, options));
+}
+
+/** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
+export function usePullRequestInfos(rawConversationId: string | undefined, prUrls: string[]) {
+  const context = usePullRequestQueryContext(rawConversationId);
+  return useQueries({
+    queries: prUrls.map((prUrl) => pullRequestInfoQueryOptions(context, { poll: "list", prUrl })),
   });
 }
 
@@ -660,21 +724,30 @@ export function usePullRequestDiff(
   });
 }
 
+/** Link or unlink a PR through the runner or host; returns the refreshed info. */
+export async function updateSessionPr(
+  conversationId: string,
+  body: { url: string; action: "attach" | "remove" },
+): Promise<PullRequestInfo> {
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/prs`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!response.ok) throw await errorFromResponse(response);
+  return normalizePullRequestInfo((await response.json()) as PullRequestInfo);
+}
+
 export function useUpdateSessionPr(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (body: { url: string; action: "attach" | "remove" }) => {
-      const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/prs`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
-      );
-      if (!response.ok) throw await errorFromResponse(response);
-      return normalizePullRequestInfo((await response.json()) as PullRequestInfo);
-    },
+    // Per session, so a link still running after a session switch updates only its own.
+    mutationKey: ["update-session-pr", conversationId],
+    mutationFn: (body: { url: string; action: "attach" | "remove" }) =>
+      updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
       queryClient.setQueryData(["github-info", conversationId], info);
@@ -707,6 +780,7 @@ async function fetchPullRequestEditResource<T>(
   resource:
     | "labels"
     | "reviewers"
+    | "comments"
     | "details"
     | "attachments"
     | "merge-options"
@@ -1052,4 +1126,101 @@ export function uploadPullRequestAttachment(
   return fetchPullRequestEditResource<PullRequestAttachment>(conversationId, "attachments", {
     form,
   });
+}
+
+export const MAX_PULL_REQUEST_COMMENT_CHARACTERS = 65536;
+
+/** Match Python's Unicode code-point length, including astral characters. */
+export function pullRequestCommentTooLong(body: string): boolean {
+  return [...body].length > MAX_PULL_REQUEST_COMMENT_CHARACTERS;
+}
+
+function commentPostingError(error: Error): string {
+  const uncertain =
+    !(error instanceof RunnerOfflineError) &&
+    (!(error instanceof PullRequestApiError) || error.status >= 500);
+  return uncertain && !/check github before retrying/i.test(error.message)
+    ? `${error.message} Check GitHub before retrying if the comment may have been sent.`
+    : error.message;
+}
+
+interface PullRequestCommentDraft {
+  body: string;
+  pending: boolean;
+  error: string | null;
+}
+
+function commentDraftKey(conversationId: string, prUrl: string) {
+  return ["github-comment-draft", conversationId, prUrl] as const;
+}
+
+function mergePostedComments(comments: PullRequestComment[], posted: PullRequestComment[]) {
+  const urls = new Set(comments.map((comment) => comment.url));
+  return [...comments, ...posted.filter((comment) => !urls.has(comment.url))].sort((left, right) =>
+    (left.created_at ?? "").localeCompare(right.created_at ?? ""),
+  );
+}
+
+/** A PR-scoped draft survives tab/session switches and settles even after unmount. */
+export function usePullRequestCommentComposer(conversationId: string, prUrl: string) {
+  const queryClient = useQueryClient();
+  const key = commentDraftKey(conversationId, prUrl);
+  const initialDraft: PullRequestCommentDraft = { body: "", pending: false, error: null };
+  const { data: draft = initialDraft } = useQuery<PullRequestCommentDraft>({
+    queryKey: key,
+    queryFn: skipToken,
+    initialData: initialDraft,
+    enabled: false,
+    gcTime: 24 * 60 * 60 * 1000,
+  });
+  const updateDraft = (update: Partial<PullRequestCommentDraft>) =>
+    queryClient.setQueryData<PullRequestCommentDraft>(key, (current) =>
+      current ? { ...current, ...update } : current,
+    );
+  const mutation = useMutation({
+    mutationKey: ["github-comment-create", conversationId, prUrl],
+    retry: false,
+    mutationFn: (body: string) =>
+      fetchPullRequestEditResource<{ comment: PullRequestComment }>(conversationId, "comments", {
+        body: { pr_url: prUrl, body },
+      }),
+    onSuccess: async ({ comment }) => {
+      await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
+      updateDraft({ body: "", pending: false, error: null });
+      queryClient.setQueriesData<PullRequestInfo>(
+        { queryKey: ["github-info", conversationId] },
+        (info) =>
+          info?.pr && info.selected_pr_url === prUrl
+            ? {
+                ...info,
+                pr: {
+                  ...info.pr,
+                  comments: mergePostedComments(info.pr.comments ?? [], [comment]),
+                },
+              }
+            : info,
+      );
+    },
+    onError: (error: Error) =>
+      updateDraft({
+        pending: false,
+        error: commentPostingError(error),
+      }),
+  });
+  return {
+    draft,
+    setBody: (body: string) => updateDraft({ body, error: null }),
+    post: () => {
+      const current = queryClient.getQueryData<PullRequestCommentDraft>(key);
+      if (
+        !current ||
+        current.pending ||
+        !current.body.trim() ||
+        pullRequestCommentTooLong(current.body)
+      )
+        return;
+      updateDraft({ pending: true, error: null });
+      mutation.mutate(current.body);
+    },
+  };
 }

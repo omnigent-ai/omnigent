@@ -50,7 +50,7 @@ def _wait(check, message: str, timeout: float = 90):
 def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
     tmp_path: Path, databricks: bool, page, built_spa
 ) -> None:
-    """Read a file, reload/recall, then stop and resume the owned terminal.
+    """Read a file, reload/recall, then automatically recover the owned terminal.
 
     Earlier message/tool IDs stay unchanged and only the new turn is appended.
     """
@@ -373,9 +373,21 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 check=True,
                 capture_output=True,
             )
-            resume = terminal_view.get_by_role("button", name="Resume session", exact=True)
-            expect(resume).to_be_enabled(timeout=30_000)
-            resume.click()
+            expect(
+                terminal_view.get_by_role("button", name="Resume session", exact=True)
+            ).to_be_enabled(timeout=30_000)
+            page.get_by_test_id("view-mode-chat").click()
+            with page.expect_response(
+                lambda response: (
+                    response.url.endswith(f"/v1/sessions/{session_id}/events")
+                    and response.request.method == "POST"
+                    and response.request.post_data_json.get("type") == "retry_session"
+                ),
+                timeout=60_000,
+            ) as recovery:
+                page.get_by_test_id("view-mode-terminal").click()
+            assert recovery.value.ok
+            assert recovery.value.json()["recovered"] is True
             expect(terminal).to_have_attribute("data-state", "connected", timeout=60_000)
             page.get_by_test_id("view-mode-chat").click()
             composer.fill("Without tools, recall the file again. Prefix with GATEWAY_RECALL_OK.")

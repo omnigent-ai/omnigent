@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import NamedTuple
 
@@ -56,6 +57,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.inner import _proc
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -798,26 +800,45 @@ def _parse_harness_cli_version(text: str) -> str | None:
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 
-# Probe caches damping the ambient readiness storm: every readiness refresh
-# on every host daemon execs vendor CLIs (``--version`` / ``auth status``)
-# whose answers change only when the binary is swapped or a login flips —
-# with a few dozen idle hosts that compounds into a constant machine-wide
-# subprocess churn. ``--version`` output is a pure function of the binary
-# bytes, so successful parses are cached against the binary's
-# ``(path, mtime_ns, size)`` signature; login state can flip without the
-# binary changing, so only positive verdicts are cached and they expire
-# after a short TTL — a cached "not logged in" would blind the setup
-# wizard's confirmation right after a successful login.
-_VERSION_PROBE_CACHE: dict[tuple[str, int, int], str] = {}
+# Cache successful probes to limit subprocess churn during readiness checks.
+# Launchers can delegate to an updated executable without changing themselves.
+_VERSION_PROBE_CACHE: dict[tuple[str, int, int], tuple[str, float]] = {}
 _LOGIN_PROBE_CACHE: dict[tuple[str, str], float] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
+# ponytail: a 60s TTL bounds staleness without tracking launcher dependencies.
+_VERSION_PROBE_CACHE_TTL_S = 60.0
 _LOGIN_PROBE_CACHE_TTL_S = 120.0
 _PROBE_CACHE_MAX_ENTRIES = 64
 
 
-def invalidate_harness_login_probe_cache() -> None:
-    """Force the next harness login check to call the vendor CLI."""
+def _cli_probe_cwd() -> str | None:
+    """Return a stable cwd for a harness CLI probe, or ``None`` to inherit it.
+
+    A long-lived daemon can outlive the directory it was started from (a temp
+    checkout or a removed git worktree). A probe subprocess inherits that
+    deleted cwd, where ``claude`` exits non-zero, so a present CLI reads as
+    unavailable. Return ``None`` while the cwd is intact; once it is gone, fall
+    back to the home directory, else the filesystem root.
+    """
+    try:
+        os.getcwd()
+        return None
+    except OSError:
+        pass
+    try:
+        # Path.home() raises RuntimeError, not OSError, when HOME is unset.
+        home = Path.home()
+        if home.is_dir():
+            return str(home)
+    except (OSError, RuntimeError):
+        pass
+    return os.path.abspath(os.sep)
+
+
+def invalidate_harness_probe_caches() -> None:
+    """Force fresh CLI version and login probes after refresh or installation."""
     with _PROBE_CACHE_LOCK:
+        _VERSION_PROBE_CACHE.clear()
         _LOGIN_PROBE_CACHE.clear()
 
 
@@ -1000,20 +1021,25 @@ def _harness_cli_version_string(
 ) -> str | None:
     """Return the parsed, normalized version string from *binary* ``--version``.
 
-    Successful parses are cached against the binary's ``(path, mtime_ns,
-    size)`` signature — the output cannot change until the binary does.
-    Failed probes (missing/hung binary, unparseable output) are never
-    cached, so a flaky state keeps re-probing like before.
+    Successful parses are cached briefly against ``(path, mtime_ns, size)``.
+    Expiration catches updates behind an unchanged launcher. Failed probes
+    (missing/hung binary, unparseable output) are never cached.
 
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
+    probe_cwd = _cli_probe_cwd()
+    if probe_cwd is not None and not os.path.isabs(binary):
+        # The daemon's starting cwd is gone, so the probe would run under a
+        # fallback dir; a relative discovered path re-resolves there to a
+        # different executable, so report unverifiable instead of probing it.
+        return None
     sig = _binary_signature(binary)
     if sig is not None:
         with _PROBE_CACHE_LOCK:
             cached = _VERSION_PROBE_CACHE.get(sig)
-        if cached is not None:
-            return cached
+        if cached is not None and time.monotonic() < cached[1]:
+            return cached[0]
     try:
         completed = subprocess.run(
             [binary, "--version"],
@@ -1022,6 +1048,7 @@ def _harness_cli_version_string(
             text=True,
             timeout=timeout,
             check=False,
+            cwd=probe_cwd,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1035,7 +1062,7 @@ def _harness_cli_version_string(
         with _PROBE_CACHE_LOCK:
             if len(_VERSION_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
                 _VERSION_PROBE_CACHE.clear()
-            _VERSION_PROBE_CACHE[sig] = version
+            _VERSION_PROBE_CACHE[sig] = (version, time.monotonic() + _VERSION_PROBE_CACHE_TTL_S)
     return version
 
 
@@ -1083,6 +1110,117 @@ def harness_install_display(key: str) -> str:
     return " ".join(harness_install_command(key))
 
 
+# Lines of installer stderr kept for diagnosis. The output is teed straight to
+# this process as it arrives, so this buffer only has to be long enough to hold
+# npm's error block — not the whole install log, which must not grow the host
+# daemon's memory.
+_INSTALLER_STDERR_TAIL_LINES = 80
+
+# Grace for the tee thread to drain after the installer exits. Bounded so a
+# pipe that never reaches EOF cannot hang the install call.
+_INSTALLER_TEE_DRAIN_TIMEOUT_S = 5.0
+
+# npm's own machine-readable cause line: ``npm error code EACCES`` on npm 10+,
+# ``npm ERR! code EACCES`` on 9 and earlier. Matching the code rather than the
+# prose keeps this stable across npm majors.
+_NPM_ERROR_CODE_RE = re.compile(r"npm (?:error|ERR!)\s+code\s+([A-Z0-9_]+)")
+
+# npm cause code -> what the user can do about it. Deliberately small: these are
+# the failures a person can actually act on.
+_NPM_FAILURE_REASONS: dict[str, str] = {
+    "EACCES": "permission denied writing the global install directory",
+    "EPERM": "permission denied writing the global install directory",
+    "ECONNREFUSED": "could not reach the npm registry",
+    "ECONNRESET": "could not reach the npm registry",
+    "ENOTFOUND": "could not reach the npm registry",
+    "ETIMEDOUT": "could not reach the npm registry",
+    "EAI_AGAIN": "could not reach the npm registry (DNS lookup failed)",
+    "ENETUNREACH": "could not reach the npm registry (network unreachable)",
+    "E401": "the npm registry rejected the credentials",
+    "E403": "the npm registry refused access to the package",
+    "ENEEDAUTH": "the npm registry requires authentication",
+    "ENOSPC": "no space left on the device",
+}
+
+
+def _installer_failure_reason(returncode: int, stderr_tail: str) -> str:
+    """Name an install failure's cause, falling back to the exit code.
+
+    :param returncode: The installer's exit status.
+    :param stderr_tail: The tail of the installer's stderr, possibly empty.
+    :returns: A cause naming what the user can fix when the output identifies
+        one, else ``"installer exited with code <n>"``. The bare exit code is
+        the fallback rather than an error, because a vendor installer's output
+        is not npm-shaped and still has to produce *some* reason.
+    """
+    for code in _NPM_ERROR_CODE_RE.findall(stderr_tail):
+        explanation = _NPM_FAILURE_REASONS.get(code)
+        if explanation is not None:
+            return f"{explanation} (npm {code})"
+    return f"installer exited with code {returncode}"
+
+
+def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
+    """Run an installer, teeing its stderr so it is both shown and readable.
+
+    The installer's output has to keep streaming to this process — that is what
+    makes a failure visible in the setup terminal and the host log — but the
+    reason string also needs to read it. So stderr is piped and each line is
+    written straight through as it arrives, while a bounded tail is retained
+    for :func:`_installer_failure_reason`. stdout is left inheriting, untouched.
+
+    The tee thread owns the pipe and closes it at EOF. A child the installer
+    leaves running can hold the pipe open after the installer exits, so the
+    drain wait is bounded rather than closing the pipe here, which would block
+    until that child exits.
+
+    :param cmd: The installer argv, e.g. ``["npm", "install", "-g", pkg]``.
+    :param timeout: Seconds to wait before killing the installer.
+    :returns: ``(returncode, stderr_tail)``.
+    :raises subprocess.TimeoutExpired: If *timeout* elapses first; the
+        installer and its child processes are killed before this propagates.
+    :raises OSError: If the installer cannot be executed at all.
+    """
+    tail: deque[str] = deque(maxlen=_INSTALLER_STDERR_TAIL_LINES)
+    tail_lock = threading.Lock()
+    # Not _proc.spawn_kwargs(): a new session would cut the setup wizard's
+    # installers off from the terminal (prompts, /dev/tty, Ctrl-C).
+    proc = subprocess.Popen(
+        cmd,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        bufsize=1,
+    )
+    stream = proc.stderr
+    assert stream is not None  # stderr=PIPE above
+
+    def _tee() -> None:
+        with stream:
+            for line in stream:
+                with tail_lock:
+                    tail.append(line)
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+    # A reader thread, so a wedged installer still hits the timeout below
+    # instead of blocking forever on a read that never reaches EOF.
+    pump = threading.Thread(target=_tee, name="harness-install-stderr", daemon=True)
+    pump.start()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Killing only the installer would leave npm lifecycle scripts or the
+        # inner shell of ``curl | bash`` running and writing to the pipe.
+        _proc.kill_tree(proc)
+        proc.wait()
+        raise
+    finally:
+        pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
+    with tail_lock:
+        return returncode, "".join(tail)
+
+
 class HarnessInstallResult(NamedTuple):
     """Outcome of :func:`try_install_harness_cli`.
 
@@ -1101,17 +1239,22 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     """Install the harness CLI, returning whether it landed and why not.
 
     Same behavior and side effects as :func:`install_harness_cli` (the
-    installer's output streams to this process, uncaptured, so failures stay
-    visible in the setup terminal / host log), but returns a human-readable
-    reason so a UI-driven install can surface "npm is not available on the
-    host" instead of a silent boolean failure.
+    installer's output still streams to this process, so failures stay visible
+    in the setup terminal / host log), but returns a human-readable reason so a
+    UI-driven install can surface "npm is not available on the host" instead of
+    a silent boolean failure.
+
+    A failing installer's stderr is teed rather than merely passed through, so
+    the reason can name what the user has to fix — a permission problem and an
+    unreachable registry are both exit code 1 and were previously reported
+    identically.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
         resolves via :func:`resolve_cli_binary` (including the no-op where it
         was already present), otherwise ``(False, reason)`` naming the failure
-        (manual-only spec, missing installer, timeout, OS error, non-zero exit,
-        or a post-install binary-not-found).
+        (manual-only spec, missing installer, timeout, OS error, a diagnosed or
+        bare non-zero exit, or a post-install binary-not-found).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
@@ -1122,11 +1265,12 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     if shutil.which(cmd[0]) is None:
         return HarnessInstallResult(False, f"{cmd[0]!r} is not available on the host")
     try:
-        result = subprocess.run(cmd, check=False, timeout=300)
+        returncode, stderr_tail = _run_installer(cmd, timeout=300)
     except subprocess.TimeoutExpired:
         return HarnessInstallResult(False, "install timed out after 300s")
     except OSError as exc:
         return HarnessInstallResult(False, f"install command failed to run: {exc}")
+    invalidate_harness_probe_caches()
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
@@ -1149,8 +1293,8 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         if resolved_dir not in path_entries:
             os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
         return HarnessInstallResult(True, None)
-    if result.returncode != 0:
-        return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
+    if returncode != 0:
+        return HarnessInstallResult(False, _installer_failure_reason(returncode, stderr_tail))
     return HarnessInstallResult(
         False, f"installer completed but {spec.binary!r} could not be found"
     )
@@ -1207,6 +1351,12 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
     if binary is None:
         return False
+    probe_cwd = _cli_probe_cwd()
+    if probe_cwd is not None and not os.path.isabs(binary):
+        # The daemon's starting cwd is gone, so the probe would run under a
+        # fallback dir; a relative discovered path re-resolves there to a
+        # different executable, so report not-logged-in instead of probing it.
+        return False
     # Positive verdicts are TTL-cached (see the cache block above): logins
     # are sticky, and the readiness loop re-probing a logged-in CLI every
     # refresh is the ambient storm. Negatives always re-probe so a login
@@ -1215,16 +1365,16 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     with _PROBE_CACHE_LOCK:
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
         result = subprocess.run(
-            [argv_binary, *spec.status_args],
+            [binary, *spec.status_args],
             check=False,
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            cwd=probe_cwd,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False

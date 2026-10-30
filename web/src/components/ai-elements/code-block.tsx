@@ -59,10 +59,21 @@ const addKeysToTokens = (lines: ThemedToken[][]): KeyedLine[] =>
     })),
   }));
 
+/** A scheme that token colors are pinned to instead of following the app's `.dark` class. */
+export type CodeColorScheme = "light" | "dark";
+
+const DARK_TOKEN_CLASSES = "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]";
+
 // Token rendering component
-const TokenSpan = ({ token }: { token: ThemedToken }) => (
+const TokenSpan = ({
+  token,
+  colorScheme,
+}: {
+  token: ThemedToken;
+  colorScheme: CodeColorScheme | undefined;
+}) => (
   <span
-    className="dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]"
+    className={colorScheme === undefined ? DARK_TOKEN_CLASSES : undefined}
     style={
       {
         backgroundColor: token.bgColor,
@@ -71,6 +82,10 @@ const TokenSpan = ({ token }: { token: ThemedToken }) => (
         fontWeight: isBold(token.fontStyle) ? "bold" : undefined,
         textDecoration: isUnderline(token.fontStyle) ? "underline" : undefined,
         ...token.htmlStyle,
+        ...(colorScheme === "dark" && {
+          color: token.htmlStyle?.["--shiki-dark"],
+          backgroundColor: token.htmlStyle?.["--shiki-dark-bg"],
+        }),
       } as CSSProperties
     }
   >
@@ -96,14 +111,19 @@ const LINE_NUMBER_CLASSES = cn(
 const LineSpan = ({
   keyedLine,
   showLineNumbers,
+  colorScheme,
 }: {
   keyedLine: KeyedLine;
   showLineNumbers: boolean;
+  colorScheme: CodeColorScheme | undefined;
 }) => (
   <span className={showLineNumbers ? LINE_NUMBER_CLASSES : "block"}>
-    {keyedLine.tokens.length === 0
+    {/* Plain text gives a blank line one empty token, which would render zero-height. */}
+    {keyedLine.tokens.every(({ token }) => token.content === "")
       ? "\n"
-      : keyedLine.tokens.map(({ token, key }) => <TokenSpan key={key} token={token} />)}
+      : keyedLine.tokens.map(({ token, key }) => (
+          <TokenSpan key={key} token={token} colorScheme={colorScheme} />
+        ))}
   </span>
 );
 
@@ -261,10 +281,12 @@ const CodeBlockBody = memo(
     tokenized,
     showLineNumbers,
     className,
+    colorScheme,
   }: {
     tokenized: TokenizedCode;
     showLineNumbers: boolean;
     className?: string;
+    colorScheme?: CodeColorScheme;
   }) => {
     const preStyle = useMemo(
       () => ({
@@ -279,7 +301,8 @@ const CodeBlockBody = memo(
     return (
       <pre
         className={cn(
-          "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)] m-0 p-4 text-ui",
+          colorScheme === undefined && DARK_TOKEN_CLASSES,
+          "m-0 p-4 text-ui",
           className,
         )}
         style={preStyle}
@@ -291,7 +314,12 @@ const CodeBlockBody = memo(
           )}
         >
           {keyedLines.map((keyedLine) => (
-            <LineSpan key={keyedLine.key} keyedLine={keyedLine} showLineNumbers={showLineNumbers} />
+            <LineSpan
+              key={keyedLine.key}
+              keyedLine={keyedLine}
+              showLineNumbers={showLineNumbers}
+              colorScheme={colorScheme}
+            />
           ))}
         </code>
       </pre>
@@ -300,7 +328,8 @@ const CodeBlockBody = memo(
   (prevProps, nextProps) =>
     prevProps.tokenized === nextProps.tokenized &&
     prevProps.showLineNumbers === nextProps.showLineNumbers &&
-    prevProps.className === nextProps.className,
+    prevProps.className === nextProps.className &&
+    prevProps.colorScheme === nextProps.colorScheme,
 );
 
 CodeBlockBody.displayName = "CodeBlockBody";
@@ -375,6 +404,7 @@ export const CodeBlockContent = ({
   wrap = false,
   className,
   leading,
+  colorScheme,
 }: {
   code: string;
   language: CodeLanguage;
@@ -385,6 +415,8 @@ export const CodeBlockContent = ({
   className?: string;
   /** Rendered before the code in the same box, e.g. a floated toolbar the first line wraps around. */
   leading?: ReactNode;
+  /** Pin token colors to one scheme; by default they follow the app's. */
+  colorScheme?: CodeColorScheme;
 }) => {
   // Memoized raw tokens for immediate display
   // Raw ANSI escapes would flash on screen until the highlighter loads.
@@ -435,6 +467,7 @@ export const CodeBlockContent = ({
         className={cn(wrap && "whitespace-pre-wrap wrap-anywhere", className)}
         showLineNumbers={showLineNumbers}
         tokenized={tokenized}
+        colorScheme={colorScheme}
       />
     </div>
   );

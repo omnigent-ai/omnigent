@@ -16,7 +16,7 @@ function carriesFiles(transfer: DataTransfer | null | undefined): boolean {
  */
 export function useFileDropTarget(
   target: HTMLElement | null,
-  onFiles: (files: File[]) => void,
+  onFiles: (files: File[], event: DragEvent) => void,
 ): boolean {
   const [isDragActive, setIsDragActive] = useState(false);
   // A rebind between dragenter and drop would lose the depth count.
@@ -54,7 +54,7 @@ export function useFileDropTarget(
       depth = 0;
       setIsDragActive(false);
       const files = Array.from(e.dataTransfer?.files ?? []);
-      if (files.length > 0) onFilesRef.current(files);
+      if (files.length > 0) onFilesRef.current(files, e);
     };
 
     // Cancelled drag: Esc, or a drop outside the target.

@@ -67,6 +67,7 @@ from omnigent.runner.resource_registry import (
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.runner.slow_io import run_provider_cli, run_slow_io
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -98,6 +99,14 @@ class ResourceRoutes:
     ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]]
     require_os_env: Callable[[str], Coroutine[Any, Any, AgentSpec | None]]
     resolve_conversation_id: Callable[[str], Coroutine[Any, Any, str | None]]
+
+
+def _server_tracking_fields(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the server's vouching for a POST body's PR (see ``pr_resource.server_tracking``)."""
+    return {
+        "server_tracked": body.get("server_tracked"),
+        "default_pr_url": body.get("default_pr_url"),
+    }
 
 
 def register_resource_routes(
@@ -1159,7 +1168,7 @@ def register_resource_routes(
                     # files. Consult one rooted where the search actually runs.
                     registry = _search_registry_for_root(env_root)
             if registry is not None:
-                indexed = await _asyncio.to_thread(
+                indexed = await run_slow_io(
                     index_search,
                     registry,
                     fs._resolve(path),
@@ -1194,21 +1203,16 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,  # noqa: ARG001
     ) -> JSONResponse:
-        import asyncio as _asyncio
-
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
         try:
-            # ``list_changed_files`` shells out to ``git status`` synchronously,
-            # which on a large repo (cold untracked cache) can take seconds.
-            # Offload to a thread so it never blocks the event loop — a blocked
-            # loop can't answer the server's runner-stream relay probe and the
-            # session's first turn 503s with runner_unavailable.
+            # git status can take seconds; keep it off the loop (relay probes)
+            # and off the default pool (native message delivery).
             raw_changes = (
-                await _asyncio.to_thread(
+                await run_slow_io(
                     session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
@@ -1278,17 +1282,13 @@ def register_resource_routes(
                 },
             )
 
-        import asyncio as _asyncio
-
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         try:
             # Offloaded like list_filesystem_changes: get_changed_file shells out
             # to git (status + show) synchronously, so keep it off the loop.
             record = (
-                await _asyncio.to_thread(
-                    session_registry.get_changed_file, session_id, relative_path
-                )
+                await run_slow_io(session_registry.get_changed_file, session_id, relative_path)
                 if session_registry is not None
                 else None
             )
@@ -1313,7 +1313,7 @@ def register_resource_routes(
         is_deleted = record.get("status") == "deleted"
 
         before: str | None = (
-            await _asyncio.to_thread(session_registry.get_baseline, relative_path)
+            await run_slow_io(session_registry.get_baseline, relative_path)
             if session_registry is not None
             else None
         )
@@ -1351,28 +1351,73 @@ def register_resource_routes(
             )
         return root
 
-    async def _github_call(session_id: str, operation: str, **kwargs: Any) -> JSONResponse:
+    async def _github_call(
+        session_id: str,
+        operation: str,
+        *,
+        server_tracked: object = False,
+        default_pr_url: object = None,
+        **kwargs: Any,
+    ) -> JSONResponse:
         from omnigent.runner import pr_resource
 
         root = await _github_workspace_root(session_id)
         function = getattr(pr_resource, operation)
+
+        def call() -> dict[str, Any]:
+            with pr_resource.server_tracking(server_tracked, default_pr_url):
+                return function(root, session_id=session_id, **kwargs)
+
         try:
-            result = await asyncio.to_thread(function, root, session_id=session_id, **kwargs)
+            result = await run_provider_cli(call)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(status_code=200, content=result)
 
     @app.get("/v1/sessions/{session_id}/resources/github")
-    async def read_github_info(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "pr_info", pr_url=pr_url)
+    async def read_github_info(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_info",
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
-    async def read_github_changes(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "pr_changed_files", pr_url=pr_url)
+    async def read_github_changes(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_changed_files",
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
-    async def read_github_pr_diff(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "pr_diff", pr_url=pr_url)
+    async def read_github_pr_diff(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_diff",
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
@@ -1383,6 +1428,8 @@ def register_resource_routes(
         previous_path: str | None = None,
         head_sha: str | None = None,
         base_sha: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
     ) -> JSONResponse:
         if relative_path.startswith("/") or any(
             seg in ("", "..") for seg in relative_path.split("/")
@@ -1397,6 +1444,8 @@ def register_resource_routes(
             previous_path=previous_path,
             head_sha=head_sha,
             base_sha=base_sha,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/prs")
@@ -1405,7 +1454,11 @@ def register_resource_routes(
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
         return await _github_call(
-            session_id, "update_session_pr", url=body["url"], action=body.get("action", "attach")
+            session_id,
+            "update_session_pr",
+            url=body["url"],
+            action=body.get("action", "attach"),
+            **_server_tracking_fields(body),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/preferences")
@@ -1417,11 +1470,16 @@ def register_resource_routes(
             account=body.get("account"),
             remote=body.get("remote"),
             pr_url=body.get("pr_url"),
+            **_server_tracking_fields(body),
         )
 
     @app.get("/v1/sessions/{session_id}/resources/github/labels")
-    async def read_github_labels(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "pr_labels", pr_url=pr_url)
+    async def read_github_labels(
+        session_id: str, pr_url: str | None = None, server_tracked: bool = False
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id, "pr_labels", pr_url=pr_url, server_tracked=server_tracked
+        )
 
     @app.post("/v1/sessions/{session_id}/resources/github/labels")
     async def update_github_labels_route(session_id: str, request: Request) -> JSONResponse:
@@ -1432,15 +1490,18 @@ def register_resource_routes(
             session_id,
             "update_pr_labels",
             pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
             add=body.get("add", []),
             remove=body.get("remove", []),
         )
 
     @app.get("/v1/sessions/{session_id}/resources/github/merge-options")
     async def read_github_merge_options(
-        session_id: str, pr_url: str | None = None
+        session_id: str, pr_url: str | None = None, server_tracked: bool = False
     ) -> JSONResponse:
-        return await _github_call(session_id, "pr_merge_options", pr_url=pr_url)
+        return await _github_call(
+            session_id, "pr_merge_options", pr_url=pr_url, server_tracked=server_tracked
+        )
 
     @app.post("/v1/sessions/{session_id}/resources/github/merge")
     async def merge_github_pr_route(session_id: str, request: Request) -> JSONResponse:
@@ -1451,6 +1512,7 @@ def register_resource_routes(
             session_id,
             "merge_pr",
             pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
             merge_method=body.get("merge_method"),
             expected_head=body.get("expected_head"),
         )
@@ -1460,11 +1522,20 @@ def register_resource_routes(
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
-        return await _github_call(session_id, "disable_pr_auto_merge", pr_url=body["pr_url"])
+        return await _github_call(
+            session_id,
+            "disable_pr_auto_merge",
+            pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
+        )
 
     @app.get("/v1/sessions/{session_id}/resources/github/reviewers")
-    async def read_github_reviewers(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "pr_review_candidates", pr_url=pr_url)
+    async def read_github_reviewers(
+        session_id: str, pr_url: str | None = None, server_tracked: bool = False
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id, "pr_review_candidates", pr_url=pr_url, server_tracked=server_tracked
+        )
 
     @app.post("/v1/sessions/{session_id}/resources/github/reviewers")
     async def update_github_reviewers_route(session_id: str, request: Request) -> JSONResponse:
@@ -1475,8 +1546,22 @@ def register_resource_routes(
             session_id,
             "update_pr_reviewers",
             pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
             add=body.get("add", []),
             remove=body.get("remove", []),
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/comments")
+    async def create_github_comment_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "create_pr_comment",
+            pr_url=body["pr_url"],
+            body=body.get("body"),
+            **_server_tracking_fields(body),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/details")
@@ -1488,13 +1573,18 @@ def register_resource_routes(
             session_id,
             "update_pr_details",
             pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
             title=body.get("title"),
             body=body.get("body"),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/attachments")
     async def upload_github_attachment_route(
-        session_id: str, request: Request, pr_url: str, name: str = ""
+        session_id: str,
+        request: Request,
+        pr_url: str,
+        name: str = "",
+        server_tracked: bool = False,
     ) -> JSONResponse:
         # The server forwards the file's raw bytes, already capped at its size limit.
         return await _github_call(
@@ -1503,6 +1593,7 @@ def register_resource_routes(
             pr_url=pr_url,
             name=name,
             content=await request.body(),
+            server_tracked=server_tracked,
         )
 
     @app.get(
