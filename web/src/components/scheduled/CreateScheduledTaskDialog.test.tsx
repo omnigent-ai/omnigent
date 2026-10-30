@@ -1086,9 +1086,24 @@ describe("CreateScheduledTaskDialog submit", () => {
     const days = within(screen.getByRole("group", { name: "Days of the month" }));
     expect(days.getByRole("button", { name: "15" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.change(screen.getByLabelText("Repeat every"), { target: { value: "3" } });
+    fireEvent.keyDown(screen.getByLabelText("Month"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "July" }));
+    fireEvent.click(days.getByRole("button", { name: "20" }));
+    for (const label of ["Month", "Repeat unit"]) {
+      fireEvent.keyDown(screen.getByLabelText(label), { key: "Enter" });
+      fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Repeat every")).toHaveValue(3);
+      expect(screen.getByLabelText("Month")).toHaveTextContent("July");
+      expect(days.getByRole("button", { name: "20" })).toHaveAttribute("aria-pressed", "true");
+    }
+
     fireEvent.keyDown(screen.getByLabelText("Repeat every"), { key: "Escape" });
     fireEvent.click(screen.getByTestId("custom-schedule-trigger"));
     expect(screen.getByLabelText("Repeat every")).toHaveValue(2);
+    expect(screen.getByLabelText("Month")).toHaveTextContent("June");
+    expect(screen.getByRole("button", { name: "20" })).toHaveAttribute("aria-pressed", "false");
+
     fireEvent.keyDown(screen.getByLabelText("Repeat every"), { key: "Escape" });
     fireEvent.click(screen.getByTestId("custom-schedule-trigger"));
     fireEvent.keyDown(screen.getByLabelText("Month"), { key: "Enter" });
@@ -1933,45 +1948,71 @@ describe("scheduler capabilities", () => {
     },
   );
 
-  it.each([
-    [false, "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0", "custom"],
-    [undefined, "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0", "custom"],
-    [false, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3", "count"],
-    [undefined, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3", "count"],
-  ] as const)("protects saved rules when automations_v2 is %s: %s", async (enabled, rule, kind) => {
-    render(
-      <CapabilitiesProvider
-        info={{
-          ...SERVER_INFO_OFFLINE_FALLBACK,
-          features: enabled === undefined ? {} : { automations_v2: enabled },
-        }}
-      >
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          editingTask={scheduledTask({ rrule: rule })}
-        />
-      </CapabilitiesProvider>,
-    );
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "This server does not support custom schedules or occurrence limits",
-    );
-    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
-    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    expect(updateMutateAsync).not.toHaveBeenCalled();
-    if (kind === "custom") {
-      expect(screen.getByTestId("custom-schedule-trigger")).toBeDisabled();
-      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Every day" }));
-    } else {
-      expect(screen.getByLabelText("Occurrences")).toHaveValue(3);
-      expect(screen.getByLabelText("Occurrences")).toBeDisabled();
-      fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Never" }));
-    }
-    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=9;BYMINUTE=0");
-  });
+  it.each(
+    ([false, undefined, "loading"] as const).flatMap((enabled) =>
+      [
+        { rule: "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0", replacements: ["custom"] },
+        { rule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3", replacements: ["count"] },
+        {
+          rule: "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0;COUNT=3",
+          replacements: ["custom", "count"],
+        },
+        {
+          rule: "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0;COUNT=3",
+          replacements: ["count", "custom"],
+        },
+      ].map((scenario) => ({ enabled, ...scenario })),
+    ),
+  )(
+    "protects saved rules with $enabled capability: $rule, replacing $replacements",
+    async ({ enabled, rule, replacements }) => {
+      const info: React.ComponentProps<typeof CapabilitiesProvider>["info"] =
+        enabled === "loading"
+          ? "loading"
+          : {
+              ...SERVER_INFO_OFFLINE_FALLBACK,
+              features: enabled === undefined ? {} : { automations_v2: enabled },
+            };
+      render(
+        <CapabilitiesProvider info={info}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({ rrule: rule })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "This server does not support custom schedules or occurrence limits",
+      );
+      fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      expect(updateMutateAsync).not.toHaveBeenCalled();
+      for (const [index, kind] of replacements.entries()) {
+        if (kind === "custom") {
+          expect(screen.getByTestId("custom-schedule-trigger")).toBeDisabled();
+          fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
+          fireEvent.click(screen.getByRole("option", { name: "Every day" }));
+        } else {
+          expect(screen.getByLabelText("Occurrences")).toHaveValue(3);
+          expect(screen.getByLabelText("Occurrences")).toBeDisabled();
+          fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
+          fireEvent.click(screen.getByRole("option", { name: "Never" }));
+        }
+        if (index < replacements.length - 1) {
+          expect(screen.getByRole("alert")).toHaveTextContent(
+            "This server does not support custom schedules or occurrence limits",
+          );
+          expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+          fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+          expect(updateMutateAsync).not.toHaveBeenCalled();
+        }
+      }
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=9;BYMINUTE=0");
+    },
+  );
 });

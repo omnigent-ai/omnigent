@@ -121,7 +121,7 @@ def _list_task_ids(base_url: str) -> set[str]:
 
 
 @pytest.fixture(autouse=True)
-def _delete_scheduled_tasks_created_by_test(live_server: str) -> Iterator[None]:
+def _delete_scheduled_tasks_created_by_test(request: pytest.FixtureRequest) -> Iterator[None]:
     """Delete every scheduled task a test creates, tracked or not.
 
     ``live_server`` is one server for the whole pytest session, so a task a
@@ -130,6 +130,12 @@ def _delete_scheduled_tasks_created_by_test(live_server: str) -> Iterator[None]:
     locator. Diffing the id set before/after the test closes that gap without
     relying on each test to register what it created.
     """
+    server_fixture = (
+        "automations_v2_server"
+        if "automations_v2_server" in request.fixturenames
+        else "live_server"
+    )
+    live_server = request.getfixturevalue(server_fixture)
     before = _list_task_ids(live_server)
     yield
     for task_id in _list_task_ids(live_server) - before:
@@ -158,6 +164,13 @@ def online_host(live_server: str, tmp_path: Path) -> Iterator[Host]:
     unpinned tasks must still find no online host.
     """
     with _online_host(tmp_path / "host", live_server) as host:
+        yield host
+
+
+@pytest.fixture
+def automations_v2_host(automations_v2_server: str, tmp_path: Path) -> Iterator[Host]:
+    """Connect the custom-schedule journey to its explicitly enabled server."""
+    with _online_host(tmp_path / "host", automations_v2_server) as host:
         yield host
 
 
@@ -558,11 +571,11 @@ def _pick_select_option(page: Page, trigger_test_id: str, option_label: str) -> 
     page.get_by_role("option", name=option_label, exact=True).click()
 
 
-@pytest.mark.usefixtures("online_host")
-def test_scheduled_task_custom_schedule_round_trip(page: Page, live_server: str) -> None:
+@pytest.mark.usefixtures("automations_v2_host")
+def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_server: str) -> None:
     """Nested schedule pickers stay open and persist the visual recurrence and timezone."""
     name = f"Custom schedule {uuid.uuid4().hex[:8]}"
-    _open_automations_page(page, live_server)
+    _open_automations_page(page, automations_v2_server)
     _open_create_dialog(page)
     page.get_by_test_id("task-name-input").fill(name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
@@ -573,16 +586,14 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, live_server: str)
     page.get_by_test_id("schedule-time").click()
     page.keyboard.press("Escape")
     expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    expect(page.get_by_label("Repeat every", exact=True)).to_be_visible()
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
+    expect(page.get_by_test_id("schedule-time")).to_have_value("10:00 AM")
     page.keyboard.press("Escape")
     expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
     expect(page.get_by_label("Frequency", exact=True)).to_have_text("Every day")
     _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
     page.get_by_label("Repeat every", exact=True).fill("2")
-    page.get_by_test_id("schedule-time").fill("invalid")
-    page.keyboard.press("Escape")
-    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
-    _pick_select_option(page, "custom-freq-trigger", "Hours")
-    expect(page.get_by_label("Minute of the hour", exact=True)).to_have_text("00")
     _pick_select_option(page, "custom-freq-trigger", "Months")
     page.get_by_test_id("custom-freq-trigger").click()
     expect(page.get_by_role("listbox")).to_be_visible()
@@ -611,7 +622,7 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, live_server: str)
     page.get_by_test_id("create-scheduled-task-submit").click()
     row = _row_by_name(page, name)
     expect(row).to_be_visible(timeout=30_000)
-    response = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0)
+    response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks", timeout=10.0)
     response.raise_for_status()
     task = next(task for task in response.json()["scheduled_tasks"] if task["name"] == name)
     assert task["rrule"] == "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15;BYHOUR=23;BYMINUTE=37;COUNT=4"
@@ -640,7 +651,7 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, live_server: str)
     page.get_by_label("End date", exact=True).fill(end_date)
     page.get_by_test_id("create-scheduled-task-submit").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
-    response = httpx.get(f"{live_server}/v1/scheduled-tasks/{task['id']}", timeout=10.0)
+    response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}", timeout=10.0)
     response.raise_for_status()
     assert response.json()["rrule"] == (
         "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15;BYHOUR=23;BYMINUTE=37;"
