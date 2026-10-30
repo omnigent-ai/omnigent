@@ -403,14 +403,107 @@ def _classify_check(check: dict[str, Any]) -> str:
     return "passing" if conclusion in ("SUCCESS", "NEUTRAL") else "failing"
 
 
-def _actions_workflow_run(check: dict[str, Any]) -> tuple[str, str, int] | None:
+def _actions_workflow_run(check: dict[str, Any]) -> tuple[str, int] | None:
     """Identify an Actions workflow run from the fields exposed by ``gh``."""
-    workflow = check.get("workflowName")
     url = check.get("detailsUrl")
-    if not isinstance(workflow, str) or not workflow or not isinstance(url, str):
+    if not isinstance(url, str):
         return None
     match = re.fullmatch(r"(https?://[^/]+/[^/]+/[^/]+)/actions/runs/(\d+)(?:/.*)?", url)
-    return (match[1], workflow, int(match[2])) if match else None
+    return (match[1], int(match[2])) if match else None
+
+
+def _filter_superseded_actions_runs(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
+    """Remove cancelled superseded runs only when Actions confirms their identity."""
+    checks = data.get(_PR_CHECKS_FIELD)
+    head_sha = data.get("headRefOid")
+    url = data.get("url")
+    if (
+        not isinstance(checks, list)
+        or not isinstance(head_sha, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha)
+        or not isinstance(url, str)
+    ):
+        return
+    try:
+        reference = PullRequestRef.from_url(url)
+    except ValueError:
+        return
+    repository_url = f"https://{reference.host}/{reference.repository}"
+    actions_checks = [
+        (check, run)
+        for check in checks
+        if isinstance(check, dict)
+        and (run := _actions_workflow_run(check))
+        and run[0] == repository_url
+    ]
+    if len({run for _, run in actions_checks}) < 2 or not any(
+        _classify_check(check) == "failing" for check, _ in actions_checks
+    ):
+        return
+    try:
+        host = _host_args(cwd, reference)
+    except ValueError:
+        return
+    rc, out, _ = _gh(
+        [
+            "api",
+            *host,
+            "--paginate",
+            "--slurp",
+            f"repos/{reference.repository}/actions/runs?head_sha={head_sha}&per_page=100",
+        ],
+        cwd=cwd,
+        token=token,
+    )
+    if rc != 0:
+        return
+    try:
+        pages = json.loads(out)
+    except ValueError:
+        return
+    if not isinstance(pages, list):
+        return
+    latest_runs: dict[tuple[int, str, str], int] = {}
+    workflow_runs: list[tuple[int, tuple[int, str, str], int, bool]] = []
+    for page in pages:
+        rows = page.get("workflow_runs") if isinstance(page, dict) else None
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("head_sha") != head_sha:
+                continue
+            run_id, workflow_id, number = (
+                row.get(key) for key in ("id", "workflow_id", "run_number")
+            )
+            event, branch = row.get("event"), row.get("head_branch")
+            if (
+                not isinstance(run_id, int)
+                or isinstance(run_id, bool)
+                or run_id <= 0
+                or not isinstance(workflow_id, int)
+                or isinstance(workflow_id, bool)
+                or workflow_id <= 0
+                or not isinstance(number, int)
+                or isinstance(number, bool)
+                or number <= 0
+                or not isinstance(event, str)
+                or not event
+                or not isinstance(branch, str)
+                or not branch
+            ):
+                continue
+            identity = (workflow_id, event, branch)
+            latest_runs[identity] = max(latest_runs.get(identity, 0), number)
+            workflow_runs.append((run_id, identity, number, row.get("conclusion") == "cancelled"))
+    # Cancelled workflows can leave failed result jobs while their replacements run.
+    superseded = {
+        (repository_url, run_id)
+        for run_id, identity, number, cancelled in workflow_runs
+        if cancelled and number < latest_runs[identity]
+    }
+    data[_PR_CHECKS_FIELD] = [
+        check
+        for check in checks
+        if not isinstance(check, dict) or _actions_workflow_run(check) not in superseded
+    ]
 
 
 def _summarize_checks(rollup: Any) -> dict[str, Any]:
@@ -422,16 +515,8 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     counts = {"passing": 0, "failing": 0, "pending": 0, "cancelled": 0, "skipped": 0}
     runs: list[dict[str, Any]] = []
     if isinstance(rollup, list):
-        # Superseded workflows can leave failed result jobs before their replacements finish.
-        # ponytail: gh exposes workflow names; fetch suite metadata if names collide.
-        latest_runs: dict[tuple[str, str], int] = {}
-        for check in rollup:
-            if isinstance(check, dict) and (run := _actions_workflow_run(check)):
-                latest_runs[run[:2]] = max(latest_runs.get(run[:2], 0), run[2])
         for check in rollup:
             if not isinstance(check, dict):
-                continue
-            if (run := _actions_workflow_run(check)) and run[2] < latest_runs[run[:2]]:
                 continue
             bucket = _classify_check(check)
             counts[bucket] += 1
@@ -735,6 +820,7 @@ def _gh_pr_view(
         return None
     if not isinstance(data, dict):
         return None
+    _filter_superseded_actions_runs(data, cwd=cwd, token=token)
     comments = data.get("comments")
     if isinstance(comments, list) and len(comments) >= _MAX_COMMENTS:
         _refresh_latest_comments(data, cwd=cwd, token=token)
@@ -911,7 +997,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
     # Resolve the PR first. A hit tells us the repo (from the PR URL) and that
     # we're authenticated, so we skip the separate `gh repo view` and the account
     # enumeration entirely — the common case makes the fewest network calls.
-    data = _pr_view_json(root, _PR_VIEW_FIELDS, token=token)
+    data = _pr_view_json(root, _PR_VIEW_FIELDS + ",headRefOid", token=token)
     if data is not None:
         author = data.get("author")
         body = data.get("body")

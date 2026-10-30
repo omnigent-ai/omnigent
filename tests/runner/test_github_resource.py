@@ -975,46 +975,95 @@ def test_summarize_checks_empty() -> None:
     }
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-def test_summarize_checks_ignores_superseded_workflow_runs(reverse: bool) -> None:
-    def check(workflow: str, run: int, name: str, conclusion: str) -> dict:
-        return {
-            "workflowName": workflow,
-            "name": name,
-            "status": "COMPLETED" if conclusion else "IN_PROGRESS",
-            "conclusion": conclusion,
-            "detailsUrl": f"https://github.com/acme/app/actions/runs/{run}/job/1",
-        }
+def _actions_check(run_id: int, name: str, conclusion: str = "FAILURE") -> dict:
+    return {
+        "workflowName": "CI",
+        "name": name,
+        "status": "COMPLETED" if conclusion else "IN_PROGRESS",
+        "conclusion": conclusion,
+        "detailsUrl": f"https://github.com/acme/app/actions/runs/{run_id}/job/1",
+    }
 
+
+def _actions_run(run_id: int, **fields: object) -> dict:
+    return {
+        "id": run_id,
+        "workflow_id": 1,
+        "run_number": run_id,
+        "event": "pull_request",
+        "head_branch": "feature",
+        "head_sha": "a" * 40,
+        "conclusion": "success",
+        **fields,
+    }
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_github_checks_ignore_confirmed_superseded_cancelled_runs(
+    monkeypatch: pytest.MonkeyPatch, reverse: bool
+) -> None:
     rollup = [
-        {**check("Docker", 9, "Docker result", "FAILURE"), "startedAt": "2026-10-30T22:01:56Z"},
-        {**check("Docker", 10, "gate", "SUCCESS"), "startedAt": "2026-10-30T22:01:55Z"},
-        check("Docker", 10, "build", ""),
+        {**_actions_check(9, "Docker result"), "startedAt": "2026-10-30T22:01:56Z"},
+        {**_actions_check(10, "gate", "SUCCESS"), "startedAt": "2026-10-30T22:01:55Z"},
+        _actions_check(10, "build", ""),
         {
-            **check("Docker", 11, "other repo", "SUCCESS"),
+            **_actions_check(11, "other repo", "SUCCESS"),
             "detailsUrl": "https://github.com/acme/other/actions/runs/11/job/1",
         },
-        check("CI", 8, "gate", "FAILURE"),
-        check("CI", 8, "unit", "SUCCESS"),
-        check("CI", 8, "optional", "SKIPPED"),
-        check("CI", 8, "deploy", "CANCELLED"),
+        _actions_check(8, "gate"),
+        _actions_check(8, "unit", "SUCCESS"),
+        _actions_check(8, "optional", "SKIPPED"),
+        _actions_check(8, "deploy", "CANCELLED"),
         {"context": "legacy", "state": "ERROR"},
         {
-            "name": "external",
-            "workflowName": "Docker",
-            "status": "COMPLETED",
-            "conclusion": "FAILURE",
+            **_actions_check(12, "external"),
             "detailsUrl": "https://ci.example/check/12",
         },
+        {**_actions_check(12, "unknown run", ""), "workflowName": None},
+    ]
+    metadata = [
         {
-            "name": "no workflow",
-            "status": "IN_PROGRESS",
-            "detailsUrl": "https://github.com/acme/app/actions/runs/12/job/1",
+            "workflow_runs": [
+                _actions_run(9, conclusion="cancelled"),
+                _actions_run(8, workflow_id=2, conclusion="cancelled"),
+            ]
+        },
+        {
+            "workflow_runs": [
+                _actions_run(10, conclusion=None),
+                _actions_run(11, conclusion="cancelled", run_number=1),
+            ]
         },
     ]
     if reverse:
         rollup.reverse()
-    result = _summarize_checks(rollup)
+        metadata.reverse()
+        for page in metadata:
+            page["workflow_runs"].reverse()
+    calls: list[tuple[Sequence[str], str | None]] = []
+
+    def gh(argv, *, cwd, token=None):
+        calls.append((argv, token))
+        if argv[:2] == ["pr", "view"]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "url": "https://github.com/acme/app/pull/42",
+                        "headRefOid": "a" * 40,
+                        "statusCheckRollup": rollup,
+                    }
+                ),
+                "",
+            )
+        return 0, json.dumps(metadata), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    data = github_resource._gh_pr_view(
+        [], "url,headRefOid,statusCheckRollup", cwd="/workspace", token="selected-token"
+    )
+    assert data is not None
+    result = github_resource._checks_fields(data)["checks"]
     assert {key: value for key, value in result.items() if key != "runs"} == {
         "passing": 3,
         "failing": 3,
@@ -1023,17 +1072,156 @@ def test_summarize_checks_ignores_superseded_workflow_runs(reverse: bool) -> Non
         "skipped": 1,
         "total": 10,
     }
-    assert {run["name"] for run in result["runs"]} == {
-        "gate",
-        "build",
-        "other repo",
-        "unit",
-        "optional",
-        "deploy",
-        "legacy",
-        "external",
-        "no workflow",
+    expected = [
+        ("gate", "passing", "https://github.com/acme/app/actions/runs/10/job/1"),
+        ("build", "pending", "https://github.com/acme/app/actions/runs/10/job/1"),
+        ("other repo", "passing", "https://github.com/acme/other/actions/runs/11/job/1"),
+        ("gate", "failing", "https://github.com/acme/app/actions/runs/8/job/1"),
+        ("unit", "passing", "https://github.com/acme/app/actions/runs/8/job/1"),
+        ("optional", "skipped", "https://github.com/acme/app/actions/runs/8/job/1"),
+        ("deploy", "cancelled", "https://github.com/acme/app/actions/runs/8/job/1"),
+        ("legacy", "failing", None),
+        ("external", "failing", "https://ci.example/check/12"),
+        ("unknown run", "pending", "https://github.com/acme/app/actions/runs/12/job/1"),
+    ]
+    if reverse:
+        expected.reverse()
+    assert result["runs"] == [
+        {"name": name, "bucket": bucket, "url": url} for name, bucket, url in expected
+    ]
+    assert len(calls) == 2
+    assert calls[1] == (
+        [
+            "api",
+            "--hostname",
+            "github.com",
+            "--paginate",
+            "--slurp",
+            f"repos/acme/app/actions/runs?head_sha={'a' * 40}&per_page=100",
+        ],
+        "selected-token",
+    )
+
+
+@pytest.mark.parametrize(
+    ("older", "newer"),
+    [
+        ({"workflow_id": 1}, {"workflow_id": 2}),
+        ({"event": "push"}, {"event": "pull_request"}),
+        ({"head_branch": "other"}, {"head_branch": "feature"}),
+        ({"conclusion": "failure"}, {}),
+        ({"run_number": 2}, {"run_number": 1}),
+        ({"head_sha": "b" * 40}, {}),
+        ({}, {"head_sha": "b" * 40}),
+        ({"workflow_id": None}, {}),
+        ({}, {"run_number": "200"}),
+    ],
+)
+def test_github_checks_preserve_failures_without_confirmed_replacement(
+    monkeypatch: pytest.MonkeyPatch, older: dict, newer: dict
+) -> None:
+    checks = [_actions_check(100, "build"), _actions_check(200, "build", "SUCCESS")]
+    metadata = [
+        _actions_run(100, **({"conclusion": "cancelled"} | older)),
+        _actions_run(200, **newer),
+    ]
+
+    def gh(argv, **kwargs):
+        if argv[:2] == ["pr", "view"]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "url": "https://github.com/acme/app/pull/42",
+                        "headRefOid": "a" * 40,
+                        "statusCheckRollup": checks,
+                    }
+                ),
+                "",
+            )
+        return 0, json.dumps([{"workflow_runs": metadata}]), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    data = github_resource._gh_pr_view([], "url,headRefOid,statusCheckRollup", cwd="/workspace")
+    assert data is not None
+    assert data["statusCheckRollup"] == checks
+    assert github_resource._checks_fields(data)["checks"]["failing"] == 1
+
+
+@pytest.mark.parametrize(
+    ("returncode", "response"),
+    [
+        (1, "forbidden"),
+        (None, "timed out"),
+        (0, "invalid json"),
+        (0, "{}"),
+        (0, '[{"workflow_runs": null}]'),
+        (0, '[{"workflow_runs": [null, {}, {"id": 100}]}]'),
+    ],
+)
+def test_github_checks_preserve_failures_when_actions_metadata_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, returncode: int | None, response: str
+) -> None:
+    checks = [_actions_check(100, "result"), _actions_check(200, "gate", "SUCCESS")]
+
+    def gh(argv, **kwargs):
+        if argv[:2] == ["pr", "view"]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "url": "https://github.com/acme/app/pull/42",
+                        "headRefOid": "a" * 40,
+                        "statusCheckRollup": checks,
+                    }
+                ),
+                "",
+            )
+        return returncode, response, ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    data = github_resource._gh_pr_view([], "url,headRefOid,statusCheckRollup", cwd="/workspace")
+    assert data is not None
+    assert data["statusCheckRollup"] == checks
+    assert github_resource._checks_fields(data)["checks"]["failing"] == 1
+
+
+@pytest.mark.parametrize(
+    "variant", ["clean", "single_run", "external", "no_head", "enterprise_auth"]
+)
+def test_github_checks_skip_unnecessary_actions_metadata_requests(
+    monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    checks = [_actions_check(100, "result"), _actions_check(200, "gate", "SUCCESS")]
+    data = {
+        "url": "https://github.com/acme/app/pull/42",
+        "headRefOid": "a" * 40,
+        "statusCheckRollup": checks,
     }
+    if variant == "clean":
+        checks[0]["conclusion"] = "SUCCESS"
+    elif variant == "single_run":
+        checks[0]["detailsUrl"] = checks[1]["detailsUrl"]
+    elif variant == "external":
+        checks[0]["detailsUrl"] = "https://ci.example/result"
+    elif variant == "no_head":
+        data.pop("headRefOid")
+    elif variant == "enterprise_auth":
+        data["url"] = "https://ghe.example.com/acme/app/pull/42"
+        for check in checks:
+            check["detailsUrl"] = str(check["detailsUrl"]).replace("github.com", "ghe.example.com")
+        monkeypatch.setattr(github_resource, "_list_accounts", lambda _cwd: (False, []))
+    calls = []
+
+    def gh(argv, **kwargs):
+        calls.append(argv)
+        assert argv[:2] == ["pr", "view"]
+        return 0, json.dumps(data), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    result = github_resource._gh_pr_view([], "url,headRefOid,statusCheckRollup", cwd="/workspace")
+    assert result == data
+    assert len(calls) == 1
 
 
 def test_github_info_includes_body_and_comments(
@@ -1332,8 +1520,8 @@ def test_github_info_resolves_pr_when_checks_field_is_forbidden(
     assert info["pr"]["checks_supported"] is False
     # The refused call is retried once without the field; no commit fallback runs.
     assert [c[-1] for c in calls if c[:2] == ("pr", "view")] == [
-        github_resource._PR_VIEW_FIELDS,
-        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
+        github_resource._PR_VIEW_FIELDS + ",headRefOid",
+        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", "") + ",headRefOid",
     ]
     assert not any(c[0] == "api" for c in calls)
 
@@ -1412,8 +1600,8 @@ def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
     assert info["pr"]["number"] == 42
     assert info["pr"]["checks_supported"] is False
     assert [c[-1] for c in calls if c[:3] == ("pr", "view", "42")] == [
-        github_resource._PR_VIEW_FIELDS,
-        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
+        github_resource._PR_VIEW_FIELDS + ",headRefOid",
+        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", "") + ",headRefOid",
     ]
 
 
