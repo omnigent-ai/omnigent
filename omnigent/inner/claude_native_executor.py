@@ -35,6 +35,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_launch_model,
     read_model_env,
     read_model_picker_values,
+    terminal_failure_tail,
 )
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
@@ -54,6 +55,7 @@ from omnigent.inner.native_attachments import (
     framework_notices,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.runner.launch_failure import classify_terminal_failure
 
 _logger = logging.getLogger(__name__)
 
@@ -332,7 +334,24 @@ class ClaudeNativeExecutor(Executor):
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            # A launcher that printed a known fatal error before exiting gets
+            # the same diagnosis the runner gives a required-terminal exit.
+            exit_status = exc.exit_status
+            diagnosis = classify_terminal_failure(
+                command="claude",
+                exit_status=int(exit_status) if exit_status and exit_status.isdigit() else None,
+                output=terminal_failure_tail(str(exc)),
+            )
+            if diagnosis is None:
+                yield ExecutorError(message=message, undelivered=True)
+                return
+            yield ExecutorError(
+                message=f"{diagnosis.cause} {message}",
+                code="required_terminal_exited",
+                title=diagnosis.title,
+                remediation=diagnosis.remediation,
+                undelivered=True,
+            )
             return
         except ClaudePromptTimeout as exc:
             _logger.exception(
