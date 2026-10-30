@@ -18,6 +18,7 @@ from omnigent.harnesses.claude_native.bridge import (
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudeComposerNotCleared,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
@@ -29,6 +30,7 @@ from omnigent.harnesses.claude_native.bridge import (
     has_pending_user_prompt,
     inject_slash_command,
     inject_user_message,
+    input_box_reads_clear,
     is_auth_slash_command,
     kill_session,
     read_active_session_id,
@@ -69,11 +71,14 @@ _AUTH_COMMAND_GUIDANCE_MANAGED_SANDBOX = (
     "nothing from the web chat. " + MANAGED_SANDBOX_SIGN_IN_REMEDY
 )
 
-# How long a turn waits for the person to answer a Claude question or permission
-# prompt that held its message before anything was typed. Inside the server's
-# 600 s pending-input lifetime, so a message still held at the end is reported.
-_ANSWER_HOLD_S = 8 * 60.0
-_ANSWER_POLL_S = 1.0
+# How long a turn holds a message refused before anything was typed: until the
+# person answers a Claude question or permission prompt, or until Claude Code's
+# input box reads clear. Inside the server's 600 s pending-input lifetime, so a
+# message still held at the end is reported.
+_MESSAGE_HOLD_S = 8 * 60.0
+_MESSAGE_HOLD_POLL_S = 1.0
+# How often a message held for the input box asks Claude Code to repaint it.
+_INPUT_BOX_REPAINT_INTERVAL_S = 10.0
 
 # Below this much free space Claude Code fails to append its transcript
 # ("Transcript write failed (ENOSPC)"), so a message would run unseen by the web.
@@ -115,6 +120,8 @@ class ClaudeNativeExecutor(Executor):
         # adapter caching one executor per conversation; per-turn
         # construction would regress the lock to per-turn scope.
         self._inject_lock = asyncio.Lock()
+        # Set while ``run_turn`` holds a refused message (see ``_hold_message``).
+        self._holding_message = False
         # The model the pane is currently on, so a routing turn only types
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
@@ -140,6 +147,9 @@ class ClaudeNativeExecutor(Executor):
         """
         del session_key
         if not _session_is_active(self._bridge_dir, self._request_session_id):
+            return False
+        if self._holding_message:
+            # Refused, it follows as the next turn, behind the held message.
             return False
         text = _content_to_text(content, self._bridge_dir)
         if not text:
@@ -190,6 +200,65 @@ class ClaudeNativeExecutor(Executor):
                 self._applied_model = wanted_model
             await self._inject_prompt(text, notices)
 
+    async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
+        """
+        Wait until what refused the message before it was typed is gone.
+
+        Messages sent meanwhile are refused back to the runner, which delivers
+        them as later turns, so none overtakes the held one.
+
+        :param refusal: The :class:`ClaudeUserPromptPending` or
+            :class:`ClaudeComposerNotCleared` the delivery raised.
+        :param deadline: Event-loop time the hold ends at, shared by every
+            refusal in the turn.
+        :returns: ``True`` once the message can be delivered again, ``False``
+            when the hold ran out.
+        """
+        self._holding_message = True
+        try:
+            if isinstance(refusal, ClaudeComposerNotCleared):
+                return await self._wait_for_clear_input_box(deadline)
+            return await self._wait_for_answer(deadline)
+        finally:
+            self._holding_message = False
+
+    async def _wait_for_clear_input_box(self, deadline: float) -> bool:
+        """
+        Hold a turn whose message an input box that could not be verified clear refused.
+
+        Nothing was pasted, so the message can go once the box reads clear.
+        Output another process printed over the box, such as a launcher's log
+        line, keeps it unreadable until Claude Code repaints, so the hold asks
+        for a repaint every :data:`_INPUT_BOX_REPAINT_INTERVAL_S`. The person
+        can also clear the box from the embedded terminal. Nothing is typed
+        while the message is held.
+
+        :param deadline: Event-loop time the hold ends at, shared by every
+            refusal in the turn.
+        :returns: ``True`` once the box reads clear, ``False`` when the hold
+            ran out.
+        """
+        loop = asyncio.get_running_loop()
+        _logger.info(
+            "claude-native: holding the message until Claude Code's input box reads clear",
+            extra={"session_id": self._request_session_id},
+        )
+        next_repaint = loop.time()
+        while loop.time() < deadline:
+            await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
+            repaint = loop.time() >= next_repaint
+            if repaint:
+                next_repaint = loop.time() + _INPUT_BOX_REPAINT_INTERVAL_S
+            try:
+                clear = await asyncio.to_thread(
+                    input_box_reads_clear, self._bridge_dir, repaint=repaint
+                )
+            except (OSError, RuntimeError):
+                continue
+            if clear:
+                return True
+        return False
+
     async def _wait_for_answer(self, deadline: float) -> bool:
         """
         Hold a turn whose message a pending question or permission prompt refused.
@@ -208,7 +277,7 @@ class ClaudeNativeExecutor(Executor):
             extra={"session_id": self._request_session_id},
         )
         while loop.time() < deadline:
-            await asyncio.sleep(_ANSWER_POLL_S)
+            await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
             try:
                 pending = await asyncio.to_thread(has_pending_user_prompt, self._bridge_dir)
             except (OSError, RuntimeError):
@@ -260,7 +329,9 @@ class ClaudeNativeExecutor(Executor):
             or :class:`ExecutorError` on bridge failure. A question or
             permission prompt that refuses the message before anything is
             typed holds the turn until it is answered (see
-            :meth:`_wait_for_answer`), then the message is delivered.
+            :meth:`_wait_for_answer`), then the message is delivered. So does
+            an input box that could not be verified clear, until it reads
+            clear (see :meth:`_wait_for_clear_input_box`).
         """
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
@@ -325,18 +396,18 @@ class ClaudeNativeExecutor(Executor):
         wanted_model_arg = self._model_command_arg(wanted_model)
         try:
             with telemetry.span("claude_native.inject"):
-                answer_deadline: float | None = None
+                hold_deadline: float | None = None
                 while True:
                     try:
                         await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
                         break
-                    except ClaudeUserPromptPending as exc:
-                        # Refused before anything was typed: wait for the answer and retry.
-                        if not exc.nothing_typed:
+                    except (ClaudeUserPromptPending, ClaudeComposerNotCleared) as exc:
+                        # Refused before the message was typed: hold it and retry.
+                        if isinstance(exc, ClaudeUserPromptPending) and not exc.nothing_typed:
                             raise
-                        if answer_deadline is None:
-                            answer_deadline = asyncio.get_running_loop().time() + _ANSWER_HOLD_S
-                        if not await self._wait_for_answer(answer_deadline):
+                        if hold_deadline is None:
+                            hold_deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
+                        if not await self._hold_message(exc, hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
         except ClaudeTerminalExited as exc:

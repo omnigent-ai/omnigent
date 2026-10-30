@@ -6119,6 +6119,35 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
     return pending
 
 
+def input_box_reads_clear(bridge_dir: Path, *, repaint: bool = False) -> bool:
+    """
+    Report whether Claude Code's input box reads clear, without sending input.
+
+    A delivery refused with :class:`ClaudeComposerNotCleared` can go once this
+    holds (:func:`_composer_reads_clear`). Output another process printed over
+    the box keeps it unreadable until Claude Code repaints, so *repaint* asks
+    for one (:func:`_request_claude_repaint`) when it does not read clear; a
+    later call sees the result.
+
+    :param bridge_dir: The session's native bridge directory.
+    :param repaint: Whether to ask Claude Code to repaint a box that does not
+        read clear.
+    :returns: ``True`` when the box reads clear; ``False`` when it does not or
+        the pane is not advertised.
+    """
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    if _composer_reads_clear(_composer_box(_capture_pane(socket_path, target))):
+        return True
+    if repaint:
+        _request_claude_repaint(socket_path, target, bridge_dir)
+    return False
+
+
 def auto_mode_billing_notice_visible(pane: str) -> bool:
     """Recognize the exact informational notice below the live pane's last rule."""
     return _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_NOTICE)
@@ -6588,6 +6617,20 @@ def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None
     return rows
 
 
+def _composer_reads_clear(box: _ComposerBox | None) -> bool:
+    """
+    Return whether one burst of clearing keys is known to empty *box*.
+
+    True when the capture showed the box whole (both rules on screen) with
+    nothing after its glyph row but blank rows: the burst empties the glyph
+    row, and no hidden line is left for a paste to join.
+
+    :param box: The box :func:`_composer_box` read, or ``None``.
+    :returns: ``True`` when the box reads clear.
+    """
+    return box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
+
+
 def _clear_composer(socket_path: str, tmux_target: str) -> None:
     """
     Delete the whole draft in Claude Code's input box.
@@ -6632,7 +6675,7 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
         pane = _capture_pane(socket_path, tmux_target)
         box = _composer_box(pane)
         # Blank rows after the glyph row hold nothing a paste could join.
-        settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
+        settled = _composer_reads_clear(box)
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
             if not repainted and _request_claude_repaint(socket_path, tmux_target):
                 repainted, round_no = True, 0

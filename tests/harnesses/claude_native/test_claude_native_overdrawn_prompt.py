@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import shlex
 import shutil
 import subprocess
@@ -193,6 +194,30 @@ def _wait_until(condition: Callable[[], bool], what: str) -> None:
         time.sleep(0.02)
 
 
+def _pane_tty(socket_path: str) -> str:
+    return subprocess.run(
+        ["tmux", "-S", socket_path, "display-message", "-p", "-t", "main", "#{pane_tty}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    ).stdout.strip()
+
+
+def _draw_over_the_input_box(socket_path: str) -> None:
+    """Write over the input box's frame, leaving the glyph the TUI last drew."""
+    with open(_pane_tty(socket_path), "w") as terminal:
+        terminal.write(
+            "\x1b[2;1Hbackground refresh failed: certificate expired\r\n"
+            "\x1b[3;3Hsee the troubleshooting steps\r\n"
+            "1. renew the certificate, then send your message again\r\n"
+        )
+    _wait_until(
+        lambda: not bridge._claude_prompt_rendered(bridge._capture_pane(socket_path, "main")),
+        "foreign output did not reach the pane",
+    )
+
+
 @pytest.fixture
 def overdrawn_terminal(tmp_path: Path) -> Iterator[tuple[str, Path]]:
     script = tmp_path / "tui.py"
@@ -228,27 +253,7 @@ def overdrawn_terminal(tmp_path: Path) -> Iterator[tuple[str, Path]]:
                 lambda: bridge._claude_prompt_rendered(bridge._capture_pane(socket_path, "main")),
                 "test TUI never drew its input box",
             )
-            pane_tty = subprocess.run(
-                [*tmux, "display-message", "-p", "-t", "main", "#{pane_tty}"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            ).stdout.strip()
-            # Another process sharing the terminal writes over the input box's
-            # frame, leaving the glyph the TUI last drew.
-            with open(pane_tty, "w") as terminal:
-                terminal.write(
-                    "\x1b[2;1Hbackground refresh failed: certificate expired\r\n"
-                    "\x1b[3;3Hsee the troubleshooting steps\r\n"
-                    "1. renew the certificate, then send your message again\r\n"
-                )
-            _wait_until(
-                lambda: (
-                    not bridge._claude_prompt_rendered(bridge._capture_pane(socket_path, "main"))
-                ),
-                "foreign output did not reach the pane",
-            )
+            _draw_over_the_input_box(socket_path)
             yield socket_path, marker
         finally:
             with contextlib.suppress(subprocess.SubprocessError):
@@ -269,16 +274,18 @@ def test_real_overdrawn_composer_is_repainted_before_the_wait_gives_up(
     assert marker.read_text().splitlines() == ["drawn", "drawn"]
 
 
-@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
-@pytest.mark.timeout(30)
-def test_repaint_reaches_a_claude_outside_the_pane_tree(
+@pytest.fixture
+def relayed_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> Iterator[tuple[str, Path, Path]]:
     """
-    The repaint reaches a Claude Code that a launcher runs outside the pane's tree.
+    A pane whose TUI runs outside the pane's process tree, as a relaying launcher runs it.
 
     isaac's fast launch leaves only a relay in the pane while Claude Code runs on a
     pre-started worker's terminal; its session registry still names the process.
+
+    :yields: The tmux socket path, the TUI's draw log, and a bridge directory whose
+        Claude session the registry names.
     """
     script = tmp_path / "tui.py"
     script.write_text(_REPAINTING_TUI)
@@ -299,14 +306,7 @@ def test_repaint_reaches_a_claude_outside_the_pane_tree(
                 capture_output=True,
                 timeout=5,
             )
-            pane_tty = subprocess.run(
-                [*tmux, "display-message", "-p", "-t", "main", "#{pane_tty}"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            ).stdout.strip()
-            with open(pane_tty, "wb") as terminal:
+            with open(_pane_tty(socket_path), "wb") as terminal:
                 tui = subprocess.Popen(
                     [sys.executable, str(script), str(marker)],
                     stdin=subprocess.DEVNULL,
@@ -317,17 +317,77 @@ def test_repaint_reaches_a_claude_outside_the_pane_tree(
                 '{"sessionId": "sid-1", "kind": "interactive"}'
             )
             _wait_until(lambda: marker.exists(), "test TUI never drew")
-
-            # The pane's own tree is only the idle relay stand-in.
-            assert bridge._request_claude_repaint(socket_path, "main") == 1
-            assert bridge._request_claude_repaint(socket_path, "main", bridge_dir) == 2
-            _wait_until(
-                lambda: marker.read_text().splitlines() == ["drawn", "drawn"],
-                "the registry-named process was not repainted",
-            )
+            yield socket_path, marker, bridge_dir
         finally:
             if tui is not None:
                 tui.kill()
                 tui.wait(timeout=5)
             with contextlib.suppress(subprocess.SubprocessError):
                 subprocess.run([*tmux, "kill-server"], capture_output=True, timeout=5)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.timeout(30)
+def test_repaint_reaches_a_claude_outside_the_pane_tree(
+    relayed_terminal: tuple[str, Path, Path],
+) -> None:
+    """The repaint reaches a Claude Code that a launcher runs outside the pane's tree."""
+    socket_path, marker, bridge_dir = relayed_terminal
+
+    # The pane's own tree is only the idle relay stand-in.
+    assert bridge._request_claude_repaint(socket_path, "main") == 1
+    assert bridge._request_claude_repaint(socket_path, "main", bridge_dir) == 2
+    _wait_until(
+        lambda: marker.read_text().splitlines() == ["drawn", "drawn"],
+        "the registry-named process was not repainted",
+    )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.timeout(30)
+def test_a_held_message_repaints_a_claude_outside_the_pane_tree(
+    relayed_terminal: tuple[str, Path, Path],
+) -> None:
+    """A held message's poll asks a relayed Claude Code to repaint the box it cannot read."""
+    socket_path, marker, bridge_dir = relayed_terminal
+    (bridge_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": socket_path, "tmux_target": "main"})
+    )
+    _draw_over_the_input_box(socket_path)
+
+    assert not bridge.input_box_reads_clear(bridge_dir)
+    assert marker.read_text().splitlines() == ["drawn"], "Only an asked-for repaint is sent."
+    assert not bridge.input_box_reads_clear(bridge_dir, repaint=True)
+    _wait_until(
+        lambda: bridge.input_box_reads_clear(bridge_dir),
+        "the held message's repaint did not reach the relayed Claude Code",
+    )
+    assert marker.read_text().splitlines() == ["drawn", "drawn"]
+
+
+def test_a_held_message_reads_the_input_box_without_typing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hold's poll only captures the pane, and repaints only a box that needs it."""
+    (tmp_path / "tmux.json").write_text('{"socket_path": "/tmp/sock", "tmux_target": "main"}')
+    panes = iter([_OVERDRAWN_PANE, _OVERDRAWN_PANE, _READY_PANE])
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: next(panes))
+    repaints: list[Path | None] = []
+
+    def repaint(socket_path: str, tmux_target: str, bridge_dir: Path | None = None) -> int:
+        del socket_path, tmux_target
+        repaints.append(bridge_dir)
+        return 1
+
+    def typed(*args: str) -> None:
+        pytest.fail(f"the hold typed into the pane: {args}")
+
+    monkeypatch.setattr(bridge, "_request_claude_repaint", repaint)
+    monkeypatch.setattr(bridge, "_run_tmux", typed)
+
+    assert not bridge.input_box_reads_clear(tmp_path)
+    assert repaints == []
+    assert not bridge.input_box_reads_clear(tmp_path, repaint=True)
+    assert repaints == [tmp_path]
+    assert bridge.input_box_reads_clear(tmp_path, repaint=True)
+    assert repaints == [tmp_path], "A box that reads clear needs no repaint."
