@@ -66,11 +66,16 @@ class _NoSignalServer(uvicorn.Server):
 # Databricks-hosted Claude model ids that default to
 # ``thinking.display="omitted"`` — Opus 4.7+ (e.g.
 # ``databricks-claude-opus-4-8``) and Fable, which shares Opus's
-# adaptive-only thinking surface. Sonnet/Haiku stream visible thinking
-# without a display field, so the shim leaves them untouched.
+# adaptive-only thinking surface. Both the legacy serving-endpoint
+# spelling (``databricks-claude-opus-*``) and the Unity Catalog spelling
+# (``system.ai.claude-opus-*``) name the same Databricks-hosted tiers.
+# Sonnet/Haiku stream visible thinking without a display field, so the
+# shim leaves them untouched.
 DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES: tuple[str, ...] = (
     "databricks-claude-opus-",
     "databricks-claude-fable-",
+    "system.ai.claude-opus-",
+    "system.ai.claude-fable-",
 )
 
 # Hop-by-hop headers (RFC 9110 §7.6.1) must not be forwarded by an

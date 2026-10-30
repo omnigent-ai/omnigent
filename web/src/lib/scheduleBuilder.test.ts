@@ -11,6 +11,8 @@ import {
   DEFAULT_SCHEDULE_MODEL,
   parseRRuleToScheduleModel,
   type ScheduleModel,
+  validateSchedule,
+  parseUntil,
 } from "./scheduleBuilder";
 
 /** A schedule model with overrides on top of the default. */
@@ -29,6 +31,15 @@ describe("buildRRule — Hourly minute-of-hour", () => {
 });
 
 describe("parseRRuleToScheduleModel", () => {
+  it("preserves ended rules and normalizes equivalent day sets when parsing", () => {
+    const parsed = parseRRuleToScheduleModel(
+      "FREQ=WEEKLY;BYDAY=FR,MO,MO;BYHOUR=9;BYMINUTE=0;UNTIL=20200101T235959Z",
+    );
+    expect(parsed).not.toBeNull();
+    expect(buildRRule(parsed!)).toBe(
+      "FREQ=WEEKLY;BYDAY=MO,FR;BYHOUR=9;BYMINUTE=0;UNTIL=20200101T235959Z",
+    );
+  });
   it("round-trips daily rules into the visible schedule controls", () => {
     expect(parseRRuleToScheduleModel("FREQ=DAILY;BYHOUR=14;BYMINUTE=30")).toMatchObject({
       preset: "daily",
@@ -65,8 +76,49 @@ describe("parseRRuleToScheduleModel", () => {
     });
   });
 
-  it("rejects interval rules the visible form cannot represent", () => {
-    expect(parseRRuleToScheduleModel("FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0")).toBeNull();
+  it.each([
+    { customFreq: "hourly", interval: 3, minute: 7 },
+    { customFreq: "daily", interval: 2 },
+    { customFreq: "weekly", interval: 3, weekdays: ["MO", "FR"] },
+    { customFreq: "monthly", interval: 1, monthDays: [1, 15, 31] },
+    { customFreq: "yearly", interval: 2, month: 6, monthDays: [1, 15] },
+  ] as Partial<ScheduleModel>[])(
+    "round-trips custom recurrence %j with each ending",
+    (overrides) => {
+      for (const end of [
+        undefined,
+        { type: "count", count: 5 },
+        { type: "until", until: "20271231T155959Z" },
+      ] as ScheduleModel["end"][]) {
+        const rule = buildRRule(model({ preset: "custom", ...overrides, end }));
+        const parsed = parseRRuleToScheduleModel(rule);
+        expect(parsed).toMatchObject({
+          preset: "custom",
+          customFreq: overrides.customFreq,
+          interval: overrides.interval,
+        });
+        expect(buildRRule(parsed!)).toBe(rule);
+      }
+    },
+  );
+
+  it.each([
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=30",
+    "FREQ=WEEKLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;INTERVAL=367",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYHOUR=10",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3;UNTIL=20271231T155959Z",
+    "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=32;BYHOUR=9;BYMINUTE=0",
+  ])("does not silently discard unsupported fields: %s", (rule) => {
+    expect(parseRRuleToScheduleModel(rule)).toBeNull();
+  });
+
+  it("validates bounds and rejects impossible cutoff dates", () => {
+    expect(validateSchedule(model({ preset: "custom", interval: 367 }))).not.toBeNull();
+    expect(validateSchedule(model({ end: { type: "count", count: 1 } }))).not.toBeNull();
+    expect(parseUntil("20270230T235959Z")).toBeNull();
+    expect(parseUntil("20270228T235959Z")?.toISOString()).toBe("2027-02-28T23:59:59.000Z");
   });
 
   it("round-trips non-quarter-hour daily minutes", () => {
@@ -85,6 +137,52 @@ describe("parseRRuleToScheduleModel", () => {
   });
 });
 
+describe("visual schedule validation", () => {
+  it.each([
+    { customFreq: "weekly", interval: 209, weekdays: ["MO"] },
+    { customFreq: "yearly", month: 2, monthDays: [30, 31] },
+    { customFreq: "yearly", month: 4, monthDays: [31] },
+    { customFreq: "monthly", monthDays: Array.from({ length: 25 }, (_, index) => index + 1) },
+    { customFreq: "yearly", interval: 9 },
+    { customFreq: "monthly", interval: 97 },
+    { customFreq: "yearly", interval: 5, month: 2, monthDays: [29] },
+  ] as Partial<ScheduleModel>[])("rejects backend-incompatible recurrence %j", (overrides) => {
+    expect(validateSchedule(model({ preset: "custom", ...overrides }))).not.toBeNull();
+  });
+
+  it.each([
+    { customFreq: "weekly", interval: 209, weekdays: ["FR"] },
+    { customFreq: "yearly", month: 2, monthDays: [29, 30] },
+    { customFreq: "yearly", interval: 4, month: 2, monthDays: [29] },
+    { customFreq: "yearly", interval: 8, hour: 0, month: 1, monthDays: [1] },
+    { customFreq: "monthly", interval: 96, hour: 0, monthDays: [1] },
+    { customFreq: "monthly", interval: 95, monthDays: [31] },
+    { customFreq: "yearly", interval: 366, monthDays: [1, 15] },
+    { customFreq: "monthly", interval: 366, monthDays: [1, 15] },
+    { customFreq: "hourly", interval: 366 },
+  ] as Partial<ScheduleModel>[])("retains supported recurrence %j", (overrides) => {
+    expect(validateSchedule(model({ preset: "custom", ...overrides }))).toBeNull();
+  });
+
+  it("distinguishes invalid day numbers from an empty selection", () => {
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "monthly", monthDays: [32] })),
+    ).toBe("Days of the month must be whole numbers from 1 to 31.");
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "monthly", monthDays: [] })),
+    ).toBe("Pick at least one day of the month.");
+  });
+
+  it("requires a future cutoff for submission without preventing parsing ended tasks", () => {
+    const schedule = model({ end: { type: "until", until: "20300610T235959Z" } });
+    expect(validateSchedule(schedule, { now: new Date("2030-06-11T00:00:00Z") })).toBe(
+      "Choose an end date in the future.",
+    );
+    expect(validateSchedule(schedule, { now: new Date("2030-06-10T23:59:59Z") })).not.toBeNull();
+    expect(validateSchedule(schedule, { now: new Date("2030-06-10T23:59:58Z") })).toBeNull();
+  });
+});
+
 describe("parseTimeOfDayInput", () => {
   it("accepts common 12-hour and 24-hour time input", async () => {
     const { parseTimeOfDayInput } = await import("./scheduleBuilder");
@@ -98,20 +196,5 @@ describe("parseTimeOfDayInput", () => {
     expect(parseTimeOfDayInput("25:00")).toBeNull();
     expect(parseTimeOfDayInput("5:99 PM")).toBeNull();
     expect(parseTimeOfDayInput("not a time")).toBeNull();
-  });
-});
-
-describe("parseMinuteOfHourInput", () => {
-  it("accepts any minute in an hour", async () => {
-    const { parseMinuteOfHourInput } = await import("./scheduleBuilder");
-    expect(parseMinuteOfHourInput(":00")).toBe(0);
-    expect(parseMinuteOfHourInput("7")).toBe(7);
-    expect(parseMinuteOfHourInput(":59")).toBe(59);
-  });
-
-  it("rejects invalid minute input", async () => {
-    const { parseMinuteOfHourInput } = await import("./scheduleBuilder");
-    expect(parseMinuteOfHourInput(":60")).toBeNull();
-    expect(parseMinuteOfHourInput("abc")).toBeNull();
   });
 });

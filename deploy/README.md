@@ -296,6 +296,10 @@ and a signed ID token with `auth_time` at or after the reauthentication request.
 Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
 missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
 but still requires ticket-specific browser sign-in and approval.
+For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare
+Access), set `OMNIGENT_OIDC_REQUIRE_REAUTH=0`. The server still sends
+`prompt=login` and requires PKCE, ticket-specific sign-in, and approval, but it
+no longer verifies that the IdP asked for credentials again.
 Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
@@ -673,6 +677,30 @@ unauthenticated `GET /.well-known/omnigent.json` manifest, not in `/v1/info`.
 Desktop builds that read it always show the host next to it, and an MDM-provided
 name (`omnigentServerName`) takes precedence. When unset, the desktop shows the
 host; it does not fall back to `app_name`.
+
+## Curating the New Chat picker
+
+Limit and order what New Chat offers, and choose where a fresh chat starts, with
+two optional keys in the same server config as `branding:` (`omnigent server -c
+config.yaml`, or `/data/config.yaml` in the Docker stack). A plain `omnigent
+server` without `-c` does not read them. Takes effect on the next server start.
+
+```yaml
+restrict_to_agent_names: [polly, claude-native-ui]  # New Chat offers only these, in this order
+default_agent_name: polly                            # where a user with no history starts
+```
+
+With `restrict_to_agent_names` set, New Chat shows one flat list: no Harnesses
+heading, no "Other..." submenus, no "Create custom agent" and no Smart Routing.
+A user's own earlier pick wins over `default_agent_name` while it is still
+offered. The server logs a warning at startup for a name it can't offer.
+
+This is display only, not access control: the API, the CLI, the automation and
+project-default pickers, and existing sessions still reach every agent. To
+remove packaged agents everywhere, use `OMNIGENT_SEEDED_AGENTS` ([Trimming the
+packaged built-in agents](docker/README.md#trimming-the-packaged-built-in-agents));
+an agent it removes stays hidden even when `restrict_to_agent_names` lists it.
+Both keys are served on the unauthenticated `GET /v1/info`.
 
 ## Adding a new deploy target
 

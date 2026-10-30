@@ -32,6 +32,10 @@ The second test replays the OMNI-2529 deadlock over the same live stack: a
 managed runner whose re-mint gets 403 from the (simulated) Apps edge after its
 owner JWT fully expires must re-resolve a local credential instead of raising
 ``httpx.RequestError`` on every callback forever.
+
+The third test covers a runner whose first real mint precedes its session
+binding: the server's 401 must neither fail callbacks closed nor latch a
+decline that outlives the binding.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -193,12 +198,19 @@ def _login_owner(base_url: str) -> str:
 def _seed_owned_session_with_managed_runner(base_url: str, db_uri: str) -> str:
     """Create Alice's session and bind the managed runner id to it.
 
-    Alice logs in through the real accounts endpoint. Session creation and
-    owner grants use HTTP; the saved host and runner binding model a managed
-    launch without provisioning an external sandbox.
-
     :param base_url: Live server base URL.
     :param db_uri: SQLite URI of the server's database.
+    :returns: The created session id.
+    """
+    session_id = _create_owned_session(base_url)
+    _bind_managed_runner(db_uri, session_id)
+    return session_id
+
+
+def _create_owned_session(base_url: str) -> str:
+    """Create Alice's session over HTTP after a real accounts login.
+
+    :param base_url: Live server base URL.
     :returns: The created session id.
     """
     owner_cookie = _login_owner(base_url)
@@ -214,8 +226,18 @@ def _seed_owned_session_with_managed_runner(base_url: str, db_uri: str) -> str:
             files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
         )
     assert create.status_code in (200, 201), (create.status_code, create.text)
-    session_id = create.json()["session_id"]
+    return create.json()["session_id"]
 
+
+def _bind_managed_runner(db_uri: str, session_id: str) -> None:
+    """Bind the managed runner id to a session, as a managed launch does.
+
+    The saved host and runner binding model a managed launch without
+    provisioning an external sandbox.
+
+    :param db_uri: SQLite URI of the server's database.
+    :param session_id: Session to bind the runner to.
+    """
     runner_id = token_bound_runner_id(_BINDING_TOKEN)
     from omnigent.stores.host_store import HostStore
 
@@ -224,7 +246,32 @@ def _seed_owned_session_with_managed_runner(base_url: str, db_uri: str) -> str:
     conversations = SqlAlchemyConversationStore(db_uri)
     conversations.set_host_id(session_id, host_id, workspace="/tmp/e2e-workspace")
     conversations.replace_runner_id(session_id, runner_id)
-    return session_id
+
+
+def _enter_managed_sandbox_posture(monkeypatch: pytest.MonkeyPatch, base_url: str) -> None:
+    """Leave this process only the binding token and server URL, like a fresh sandbox.
+
+    Forcing the omnigent-login and Databricks credential sources to miss routes
+    ``_make_auth_token_factory`` to the managed-mint tier.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param base_url: Live server base URL.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_databricks_creds(*args: object, **kwargs: object) -> tuple[object, str]:
+        """Stand in for _resolve_databricks_auth in a credential-less sandbox."""
+        raise DatabricksAuthError("managed sandbox has no Databricks config")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", base_url)
+    monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, _BINDING_TOKEN)
+    monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.delenv(RUNNER_DELEGATED_AUTH_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _no_databricks_creds,
+    )
 
 
 def _start_apps_edge_proxy(
@@ -360,22 +407,8 @@ def test_managed_runner_callback_authenticates_end_to_end(
 
     # 3. Put this process in a managed-sandbox posture: the runner holds ONLY
     #    its binding token and the server URL — no omnigent-login token, no
-    #    Databricks config. Forcing both credential sources to miss is what a
-    #    fresh sandbox actually is, and it routes _make_auth_token_factory to
-    #    the managed-mint tier under test.
-    from omnigent.inner.databricks_executor import DatabricksAuthError
-
-    def _no_databricks_creds(*args: object, **kwargs: object) -> tuple[object, str]:
-        """Stand in for _resolve_databricks_auth in a credential-less sandbox."""
-        raise DatabricksAuthError("managed sandbox has no Databricks config")
-
-    monkeypatch.setenv("RUNNER_SERVER_URL", base_url)
-    monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, _BINDING_TOKEN)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
-    monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth",
-        _no_databricks_creds,
-    )
+    #    Databricks config.
+    _enter_managed_sandbox_posture(monkeypatch, base_url)
 
     contents_path = f"/v1/sessions/{session_id}/agent/contents"
 
@@ -479,3 +512,53 @@ def test_managed_runner_survives_mint_403_after_token_expiry(
         assert mint_factory.proxy_auth_failed is True
     finally:
         shutdown_proxy()
+
+
+def test_managed_runner_recovers_when_session_binds_after_mint_401(
+    accounts_server: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mint 401 before the session is bound must not outlive the binding.
+
+    The construction probe cannot connect, so the factory installs with no
+    proxy bearer and its first real mint gets 401. That callback must return
+    the server's 401 instead of raising, and must authenticate once bound.
+
+    :param accounts_server: ``(base_url, db_uri)`` from the live-server fixture.
+    :param monkeypatch: Puts this process into the managed-sandbox posture and
+        fails only the construction probe's connection.
+    :returns: None.
+    """
+    base_url, db_uri = accounts_server
+    session_id = _create_owned_session(base_url)
+    _enter_managed_sandbox_posture(monkeypatch, base_url)
+
+    from omnigent.runner import _entry
+
+    real_mint = _entry._mint_managed_owner_token
+    mint_attempts: list[int] = []
+
+    def _boot_race_then_real_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        """Fail the construction probe's connection, then mint for real."""
+        mint_attempts.append(1)
+        if len(mint_attempts) == 1:
+            raise httpx.ConnectError("server not listening yet")
+        return real_mint(*args, **kwargs)
+
+    monkeypatch.setattr(_entry, "_mint_managed_owner_token", _boot_race_then_real_mint)
+
+    factory = _make_auth_token_factory()
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    auth = _RunnerDatabricksAuth(factory)
+    contents_path = f"/v1/sessions/{session_id}/agent/contents"
+
+    unbound = asyncio.run(_get_agent_contents(base_url, contents_path, auth))
+    assert unbound.status_code == 401, (unbound.status_code, unbound.text)
+    assert factory.declined_without_proxy_bearer is True
+
+    _bind_managed_runner(db_uri, session_id)
+    bound = asyncio.run(_get_agent_contents(base_url, contents_path, auth))
+    assert bound.status_code == 200, (bound.status_code, bound.text)
+    assert bound.content[:2] == b"\x1f\x8b", "expected a gzip agent bundle body"
+    assert factory.declined is False
+    assert factory.declined_without_proxy_bearer is False
