@@ -157,6 +157,9 @@ the header menu), and each place is a separate entry point.
   Working, Draft, and Done. Working stays visible with muted “No sessions” text
   when empty. Starting or running sessions enter Working immediately; idle must
   last 10 seconds before they leave it. Errors and approvals bypass that delay.
+  Background work of a native Claude or Codex session keeps it in Working, and
+  a prompt its turn waits on in the terminal puts it in Needs attention; see the
+  `working-status` rules in [Native harnesses](./native-harnesses.md).
   This only affects grouping, and existing hover/rename holds still apply.
   Harness groups sessions under alphabetically ordered harness names (such as
   Claude Code, Codex, and Pi), including custom agents using the same harness.
