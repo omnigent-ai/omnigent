@@ -19,6 +19,8 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
+const pullRequestFault = vi.hoisted(() => ({ error: null as Error | null }));
+
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useConversations: vi.fn(),
@@ -66,7 +68,10 @@ vi.mock("./Sidebar", () => ({
   isMobileViewport: vi.fn(() => false),
 }));
 vi.mock("./PullRequestPanel", () => ({
-  PullRequestPanel: () => <div data-testid="github-panel">Pull request details</div>,
+  PullRequestPanel: () => {
+    if (pullRequestFault.error) throw pullRequestFault.error;
+    return <div data-testid="github-panel">Pull request details</div>;
+  },
 }));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
@@ -100,9 +105,19 @@ import { useConversations } from "@/hooks/useConversations";
 
 const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
 
-afterEach(cleanup);
+function suppressPullRequestFault(event: ErrorEvent) {
+  if (event.error === pullRequestFault.error) event.preventDefault();
+}
+
+afterEach(() => {
+  cleanup();
+  window.removeEventListener("error", suppressPullRequestFault);
+  vi.restoreAllMocks();
+});
 
 beforeEach(() => {
+  pullRequestFault.error = null;
+  window.addEventListener("error", suppressPullRequestFault);
   // The rail persists per-session state (selected tab, width) in
   // localStorage; clear it so one test's writes can't leak into another.
   localStorage.clear();
@@ -149,6 +164,7 @@ function ChatLinkProbe() {
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   return (
     <>
+      <input aria-label="Chat draft" defaultValue="" />
       <button type="button" onClick={() => registerNavigationGuard?.(() => {})}>
         Hold navigation
       </button>
@@ -293,6 +309,80 @@ describe("opening Pull Requests from the composer", () => {
     fireEvent.click(screen.getByRole("link", { name: "Another session" }));
 
     expect(screen.getByTestId("github-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+});
+
+describe("Pull Requests render failures", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "files" });
+    pullRequestFault.error = new Error("Pull request panel render failed");
+  });
+
+  it("keeps desktop chat, sidebar, and workspace tabs usable and allows retry", () => {
+    renderShell();
+    const draft = screen.getByRole("textbox", { name: "Chat draft" });
+    fireEvent.change(draft, { target: { value: "Unsent message" } });
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+    const workspace = screen.getByRole("complementary", { name: "Workspace" });
+    expect(within(workspace).getByRole("alert")).toHaveTextContent(
+      "Unable to display pull requests.",
+    );
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Chat draft" })).toBe(draft);
+    expect(draft).toHaveValue("Unsent message");
+    expect(screen.getByRole("button", { name: "Open folder" })).toBeInTheDocument();
+
+    fireEvent.mouseDown(within(workspace).getByRole("tab", { name: /^Files$/ }));
+    expect(within(workspace).getByRole("tab", { name: /^Files$/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(workspace).getByTestId("files-panel")).toBeInTheDocument();
+    expect(within(workspace).queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.mouseDown(within(workspace).getByRole("tab", { name: "Pull Requests" }));
+    expect(within(workspace).getByRole("alert")).toBeInTheDocument();
+    pullRequestFault.error = null;
+    fireEvent.click(within(workspace).getByRole("button", { name: "Try again" }));
+    expect(within(workspace).getByTestId("github-panel")).toBeInTheDocument();
+    expect(within(workspace).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("recovers the desktop panel when navigating to another session", () => {
+    writeSessionWorkspaceState("conv_other", { open: true, rightRailTab: "github" });
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+
+    pullRequestFault.error = null;
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+
+    expect(screen.getByTestId("github-panel")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open PR" })).toBeInTheDocument();
+  });
+
+  it("keeps the mobile drawer Close button usable after a panel failure", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+    const drawer = screen.getByTestId("github-panel-drawer");
+    expect(within(drawer).getByRole("alert")).toHaveTextContent("Unable to display pull requests.");
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open PR" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").open).toBe(false);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).queryByRole("alert")).not.toBeInTheDocument();
+
+    pullRequestFault.error = null;
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+    expect(within(drawer).getByTestId("github-panel")).toBeInTheDocument();
   });
 });
 

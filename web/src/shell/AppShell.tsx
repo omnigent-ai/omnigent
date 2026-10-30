@@ -1,4 +1,5 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
@@ -2864,7 +2865,9 @@ function AppShellImpl() {
                   onClose={() => setGithubPanelOpen(false)}
                   testId="github-panel-drawer"
                 >
-                  <PullRequestPanel conversationId={conversationId} />
+                  <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+                    <PullRequestPanel conversationId={conversationId} />
+                  </RenderErrorBoundary>
                 </MobilePanelDrawer>
               )}
               <div ref={setMobileFileTarget} className="md:hidden" />

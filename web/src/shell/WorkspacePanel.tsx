@@ -32,6 +32,7 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   ALT_KEY,
   ARIA_MOD_KEY,
@@ -1861,7 +1862,9 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : scopeView === "github" ? (
-            <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+            <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+              <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+            </RenderErrorBoundary>
           ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
               <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
