@@ -3712,6 +3712,76 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
     assert options.stderr is None
 
 
+@pytest.mark.asyncio
+async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    status_file = tmp_path / "mcp-auth-status.json"
+    monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
+
+    def report(**statuses: str) -> None:
+        entries = [{"harness": "claude", "name": n, "status": s} for n, s in statuses.items()]
+        entries.append({"harness": "codex", "name": "codex-docs", "status": "connected"})
+        status_file.write_text(json.dumps({"servers": entries}))
+
+    live = {
+        "notes": "failed",
+        "wiki": "needs-auth",
+        "linear": "connected",
+        "jira": "failed",
+        "codex-docs": "failed",
+    }
+    reconnects: list[str] = []
+
+    class _StubClient:
+        def __init__(self, options) -> None:
+            self.options = options
+            self._query = None
+            self._transport = None
+
+        async def connect(self) -> None:
+            pass
+
+        async def disconnect(self) -> None:
+            pass
+
+        async def get_mcp_status(self) -> dict[str, object]:
+            return {"mcpServers": [{"name": n, "status": s} for n, s in live.items()]}
+
+        async def reconnect_mcp_server(self, server_name: str) -> None:
+            reconnects.append(server_name)
+            if server_name == "notes":
+                raise RuntimeError("still unauthorized")
+
+    class _StubSDK:
+        ClaudeSDKClient = _StubClient
+
+    executor = ClaudeSDKExecutor()
+
+    async def start_turn() -> object:
+        return await executor._get_or_create_client(
+            _StubSDK,  # type: ignore[arg-type]
+            session_key="test-session",
+            options=SimpleNamespace(),
+            model=None,
+        )
+
+    report(notes="sign_in_required", wiki="sign_in_required", jira="connected")
+    client = await start_turn()
+    assert await start_turn() is client
+    assert reconnects == []
+
+    report(notes="connected", wiki="connected", linear="connected", jira="connected")
+    # A failed reconnect neither fails the turn nor stops the remaining servers.
+    assert await start_turn() is client
+    assert reconnects == ["notes", "wiki"]
+
+    assert await start_turn() is client
+    assert reconnects == ["notes", "wiki"]
+
+
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd

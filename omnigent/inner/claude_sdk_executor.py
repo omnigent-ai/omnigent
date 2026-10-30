@@ -36,9 +36,9 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
@@ -319,6 +319,8 @@ class _ClaudeClient(Protocol):
     ) -> None: ...
     async def set_model(self, model: str | None) -> None: ...
     async def interrupt(self) -> None: ...
+    async def get_mcp_status(self) -> Mapping[str, object]: ...
+    async def reconnect_mcp_server(self, server_name: str) -> None: ...
 
     # receive_response yields heterogeneous SDK message objects — kept
     # as ``Any`` so the caller can ``isinstance``-narrow onto the SDK's
@@ -419,6 +421,8 @@ class _ClaudeSDK(Protocol):
 
 _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
+_MCP_STATUS_TIMEOUT_SECONDS = 10.0
+_MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -901,6 +905,24 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    # Host-reported account state of each Claude MCP server when last checked.
+    mcp_auth: dict[str, str] = field(default_factory=dict)
+
+
+def _claude_mcp_auth_statuses() -> dict[str, str]:
+    """The host sign-in manager's account state for each Claude MCP server, by name."""
+    try:
+        from omnigent.host.mcp_inventory import read_auth_status_overlay
+
+        overlay = read_auth_status_overlay(pathlib.Path.home())
+    except Exception:
+        logger.warning("Reading MCP auth status failed", exc_info=True)
+        return {}
+    return {
+        name: fields["auth_status"]
+        for (harness, name), fields in overlay.items()
+        if harness == "claude"
+    }
 
 
 @dataclass(frozen=True)
@@ -1987,6 +2009,7 @@ class ClaudeSDKExecutor(Executor):
     ) -> _ClaudeClient:
         state = self._clients.get(session_key)
         if state is None:
+            mcp_auth = _claude_mcp_auth_statuses()
             await self._route_options_through_gateway_shim(options)
             # Tee CLI stderr so the connect timeout error carries the
             # tail; ``_on_stderr`` alone only logs at DEBUG.
@@ -2079,6 +2102,7 @@ class ClaudeSDKExecutor(Executor):
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
+                mcp_auth=mcp_auth,
             )
             self._clients[session_key] = state
             return client
@@ -2086,7 +2110,44 @@ class ClaudeSDKExecutor(Executor):
         if state.model != model:
             await state.client.set_model(model)
             state.model = model
+        await self._reconnect_signed_in_mcp_servers(state)
         return state.client
+
+    async def _reconnect_signed_in_mcp_servers(self, state: _ClaudeClientState) -> None:
+        """Reconnect servers the host reports signed in since this client last checked.
+
+        The CLI connects MCP servers only at startup, so one that failed while its
+        sign-in was pending stays failed for the life of the client.
+        """
+        previous, state.mcp_auth = state.mcp_auth, _claude_mcp_auth_statuses()
+        signed_in = {
+            name
+            for name, status in state.mcp_auth.items()
+            if status == "connected" and previous.get(name) != "connected"
+        }
+        if not signed_in:
+            return
+        try:
+            response = await asyncio.wait_for(
+                state.client.get_mcp_status(), timeout=_MCP_STATUS_TIMEOUT_SECONDS
+            )
+        except Exception:
+            logger.warning("Reading MCP status before reconnect failed", exc_info=True)
+            return
+        servers = response.get("mcpServers")
+        for server in servers if isinstance(servers, list) else []:
+            name = server.get("name") if isinstance(server, Mapping) else None
+            if not isinstance(name, str) or name not in signed_in:
+                continue
+            if server.get("status") not in ("failed", "needs-auth"):
+                continue
+            try:
+                await asyncio.wait_for(
+                    state.client.reconnect_mcp_server(name),
+                    timeout=_MCP_RECONNECT_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.warning("Reconnecting MCP server %r failed", name, exc_info=True)
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
