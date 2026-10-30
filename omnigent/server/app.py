@@ -161,6 +161,10 @@ from omnigent.server.seeded_agents import (
     seeded_agent_allowed,
     seeded_agent_allowlist,
 )
+from omnigent.server.server_config import (
+    RESTRICT_TO_AGENT_NAMES_KEY,
+    PickerCuration,
+)
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -208,6 +212,22 @@ class BrandingInfo(BaseModel):
     heading: str | None
     logos: BrandingLogosInfo
     powered_by: bool
+
+
+class PickerInfo(BaseModel):
+    """How a deployment curates what the New Chat picker shows.
+
+    Display only: it narrows the picker, never what exists. Every agent stays
+    seeded, forkable and reachable through the API.
+
+    :param restrict_to_agent_names: Names the picker may offer; empty means
+        the full roster.
+    :param default_agent_name: Name a fresh New Chat starts on, or ``None``.
+        A user's remembered pick wins over it.
+    """
+
+    restrict_to_agent_names: list[str] = []
+    default_agent_name: str | None = None
 
 
 class FilesystemAttachmentsInfo(BaseModel):
@@ -273,6 +293,7 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``project_id``; older servers reject it.
     scheduled_task_projects: bool = False
     branding: BrandingInfo
+    picker: PickerInfo = PickerInfo()
 
 
 def _resolve_extension_state(
@@ -972,6 +993,59 @@ def _ensure_builtin_agent(
     agent_store.create(agent_id, name, bundle_key)
     agent_cache.evict(agent_id)
     _logger.info("Registered built-in %s agent as %s", name, agent_id)
+
+
+def _warn_on_empty_picker_restriction(
+    agent_store: AgentStore,
+    curation: PickerCuration,
+    suppressed_agent_names: frozenset[str] = frozenset(),
+) -> None:
+    """Say so at startup when ``restrict_to_agent_names`` names an agent New Chat cannot offer.
+
+    The restriction is display-only, so a mistyped name, or one
+    ``OMNIGENT_SEEDED_AGENTS`` leaves out, fails quietly: the picker simply has
+    less in it, or nothing at all. Each name is looked up directly, so the
+    check holds however many agents the server has.
+
+    :param agent_store: Store the picker's roster is read from.
+    :param curation: The configured curation; checked only when it restricts.
+    :param suppressed_agent_names: Packaged agents ``OMNIGENT_SEEDED_AGENTS``
+        leaves out; seeded, but never offered.
+    """
+    if not curation.restricted:
+        return
+    names = curation.restrict_to_agent_names
+    try:
+        missing = [name for name in names if agent_store.get_by_name(name) is None]
+    except Exception:  # noqa: BLE001 — a store hiccup must not stop startup
+        _logger.warning("could not check %s against the agent roster", RESTRICT_TO_AGENT_NAMES_KEY)
+        return
+    suppressed = [name for name in names if name in suppressed_agent_names and name not in missing]
+    if suppressed:
+        # The env var wins: it decides what the server offers at all.
+        _logger.warning(
+            "server config %s names %d agent(s) that %s leaves out, so New Chat will not "
+            "offer them: %s",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            len(suppressed),
+            SEEDED_AGENTS_ENV,
+            ", ".join(suppressed),
+        )
+    if len(missing) + len(suppressed) == len(names):
+        _logger.warning(
+            "server config %s matches no agent this server offers (%s); only a user's own "
+            "agent with one of these names will show in New Chat",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            ", ".join(names),
+        )
+        return
+    if missing:
+        _logger.warning(
+            "server config %s has %d name(s) matching no server agent: %s",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            len(missing),
+            ", ".join(missing),
+        )
 
 
 def _ensure_default_agents(
@@ -1692,12 +1766,14 @@ def create_app(
 
     from omnigent.server.server_config import (
         load_branding_snapshot,
+        load_picker_curation,
         load_server_config,
         session_title_instructions,
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
     branding_snapshot = load_branding_snapshot(resolved_server_config)
+    picker_curation = load_picker_curation(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     if harness_install is None:
@@ -1930,6 +2006,10 @@ def create_app(
             app_inst.state.suppressed_agent_names = _ensure_default_agents(
                 agent_store, artifact_store, agent_cache
             )
+        # The roster exists either way, so the check does not depend on seeding here.
+        _warn_on_empty_picker_restriction(
+            agent_store, picker_curation, app_inst.state.suppressed_agent_names
+        )
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
@@ -2225,6 +2305,7 @@ def create_app(
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
+    app.state.picker_curation = picker_curation
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
     app.state.automations = True if automations is None else automations
@@ -2278,6 +2359,42 @@ def create_app(
         if _owner_credentials:
             sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
             app.state.sandbox_config = sandbox_config
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    sandbox_profiles = (
+        SandboxProfileCatalog(conversation_store, sandbox_config, host_store)
+        if host_store is not None and resolved_feature_flags.enabled(Feature.SANDBOX_PROFILES)
+        else None
+    )
+    app.state.sandbox_profiles = sandbox_profiles
+    if host_store is not None and sandbox_profiles is not None:
+
+        def admit_profiled_launch(
+            host_id: str,
+            session_id: str,
+            owner: str | None,
+            generation: str | None,
+            allow_unbound: bool = False,
+            transfer_from_host_id: str | None = None,
+        ) -> None:
+            _admit_host_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+            )
+            host = host_store.get_host(host_id)
+            sandbox_profiles.require_session_host(
+                session_id,
+                host_id,
+                bind=not allow_unbound and transfer_from_host_id is None,
+                sandbox_provider=host.sandbox_provider if host is not None else None,
+                user_id=host.user_id if host is not None else None,
+            )
+
+        host_registry.launch_authorizer = admit_profiled_launch
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -3521,6 +3638,7 @@ def create_app(
                 "automations_enabled": scheduled_task_store is not None
                 and deployment_gate_enabled(app.state.automations, "automations"),
                 "branding": branding_snapshot.config(),
+                "picker": picker_curation.config(),
             }
         )
 
@@ -3728,6 +3846,13 @@ def create_app(
         tags=["extensions"],
     )
     from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+    from omnigent.server.routes.sandbox_profiles import create_sandbox_profiles_router
+
+    app.include_router(
+        create_sandbox_profiles_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["sandbox profiles"],
+    )
 
     app.include_router(
         create_sandbox_inference_router(
@@ -4747,6 +4872,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            admit_managed_runner=(
+                sandbox_profiles.admit_runner_connection if sandbox_profiles is not None else None
+            ),
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),

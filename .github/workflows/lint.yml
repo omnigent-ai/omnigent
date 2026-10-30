@@ -93,6 +93,15 @@ jobs:
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
 
+      - name: Test Merge Ready expiry sweep
+        run: node --test .github/scripts/merge-ready/sweep.test.js
+
+      - name: Check Merge Ready shell syntax
+        run: |
+          for script in .github/scripts/merge-ready/*.sh; do
+            bash -n "$script"
+          done
+
       - name: Install TypeScript dependencies
         # Pin the npm registry to the npmjs default; limit installs to packages
         # checked here so Electron's large native devDependencies are not fetched.

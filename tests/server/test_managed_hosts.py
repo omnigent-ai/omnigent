@@ -120,6 +120,22 @@ def _injected_config(
     )
 
 
+async def test_direct_launch_without_catalog_rejects_missing_selection_before_prepare(
+    db_uri: str,
+) -> None:
+    class ProfileLauncher(FakeSandboxLauncher):
+        manages_profiles: ClassVar[bool] = True
+
+        def prepare(self) -> None:
+            pytest.fail("Unselected provider must not prepare")
+
+    with pytest.raises(HTTPException) as caught:
+        await launch_managed_host(
+            config=_injected_config(ProfileLauncher()), owner=_OWNER, host_store=HostStore(db_uri)
+        )
+    assert caught.value.status_code == 422
+
+
 class _ClassifyingFakeSandboxLauncher(FakeSandboxLauncher):
     """
     A fake that declares ``classifies_runner_by_agent`` and records the
@@ -2743,6 +2759,12 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
     fake = _LegacySignatureLauncher(on_host_start=_register, can_resume=True)
     config = _injected_config(fake)
 
+    def construct() -> _LegacySignatureLauncher:
+        assert threading.current_thread() is threading.main_thread()
+        return fake
+
+    config.default.launcher_factory = construct
+
     result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
     host_store.set_offline(result.host_id)
     await resume_managed_host(result.host_id, host_store, config)
@@ -2776,6 +2798,12 @@ async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
     fake = _AcmeLauncher(on_host_start=_register)
     config = _injected_config(fake)
 
+    def construct() -> _AcmeLauncher:
+        assert threading.current_thread() is threading.main_thread()
+        return fake
+
+    config.default.launcher_factory = construct
+
     result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
 
     host = host_store.get_host(result.host_id)
@@ -2783,10 +2811,14 @@ async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
     assert host.sandbox_provider == "acme-cloud"
     assert host.sandbox_id == "sb-fake-1"
 
+    await relaunch_managed_host(host=host, host_store=host_store, config=config)
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+
     # Teardown resolves the launcher through the same config factory
     # (provider matches the row) — the custom launcher's terminate runs.
     await terminate_managed_host(host, host_store, config)
-    assert fake.terminated == ["sb-fake-1"]
+    assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
     assert host_store.get_host(result.host_id) is None
 
 
@@ -5872,13 +5904,25 @@ def contributed_acme_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_plugin_state_for_tests()
 
 
+@pytest.mark.parametrize("manages_profiles", [False, True])
 def test_parse_contributed_provider_builds_registry_backed_factory(
     contributed_acme_provider: None,
+    monkeypatch: pytest.MonkeyPatch,
+    manages_profiles: bool,
 ) -> None:
     """
     A provider contributed through the entry point group is configurable and
     serves managed sessions, without being named in this module.
     """
+    from omnigent.onboarding.sandboxes import registry
+
+    metadata = registry.get_provider_metadata("acme")
+    assert metadata is not None
+    monkeypatch.setitem(
+        registry.plugin_state().providers,
+        "acme",
+        replace(metadata, manages_profiles=manages_profiles),
+    )
     cfg = parse_sandbox_config(
         {
             "provider": "acme",
@@ -5893,6 +5937,9 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     # told the sandbox option works rather than offered one that 400s.
     assert cfg.managed_launch_supported is True
     assert cfg.token_ttl_s == 1234
+    with monkeypatch.context() as no_import:
+        no_import.delitem(sys.modules, f"{COMMUNITY_MODULE_PREFIX}acme")
+        assert cfg.manages_profiles is manages_profiles
 
     launcher = cfg.launcher_factory()
     assert isinstance(launcher, _AcmeLauncher)

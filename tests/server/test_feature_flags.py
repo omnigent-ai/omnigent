@@ -25,6 +25,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         {Feature.CLAUDE_OSC_STATUS, Feature.CODEX_PLAN_AT_LAUNCH, Feature.SESSION_ORCHESTRATION}
     )
     assert flags.frontend_dict() == {
+        "sandbox_profiles": False,
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
