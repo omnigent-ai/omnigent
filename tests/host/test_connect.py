@@ -8070,32 +8070,46 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("stale", [False, True], ids=["fresh", "stale"])
 async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
-    monkeypatch: pytest.MonkeyPatch,
+    stale: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A store-backed CLI-login listing serves the stored catalog's own rows.
+    """A store-backed CLI-login listing serves the CLI-login catalog's own rows.
 
-    Those rows keep the probe's display names and aliases; the listing's wire
-    ids stay routable, and the native launch config is never re-resolved.
+    Those rows keep the probe's display names, aliases and default; the listing's
+    wire ids stay routable. A stale catalog still serves at once and refreshes in
+    the background on the CLI-login launch, never a re-resolved native config.
     """
     from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.models import model_catalog_store
     from omnigent.models.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path)
+    rows = [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5", "isDefault": True}
+    ]
+    fingerprint = claude_native.claude_catalog_fingerprint(None)
+    model_catalog_store.write_catalog("claude-native", fingerprint, rows)
+    if stale:
+        old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+        os.utime(model_catalog_store.catalog_path("claude-native", fingerprint), (old, old))
+    probed_configs: list[object] = []
+
+    async def _probe(claude_config: object) -> list[dict[str, object]]:
+        probed_configs.append(claude_config)
+        return rows
 
     def _fake_listing(spec: object, harness: str) -> ModelListing:
         assert harness == "claude-sdk"
         return ModelListing(
             source="cli",
-            verified=True,
+            verified=not stale,
             models=(ModelEntry(id="claude-sonnet-5", family="claude"),),
             note="test catalog",
         )
 
-    def _stored_rows(claude_config: object) -> list[dict[str, object]] | None:
-        assert claude_config is None
-        return [{"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"}]
-
+    monkeypatch.setattr(claude_native, "claude_model_catalog", _probe)
     monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
-    monkeypatch.setattr(claude_native, "stored_claude_catalog_rows", _stored_rows)
     monkeypatch.setattr(
         "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
     )
@@ -8113,9 +8127,14 @@ async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
     assert result == HostModelOptionsResultFrame(
         request_id="req_sdk_store",
         status="ok",
-        models=[{"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"}],
+        models=rows,
         routable_models=["claude-sonnet-5"],
     )
+    refresh = model_catalog_store._inflight.get(("claude-native", fingerprint))
+    if refresh is not None:
+        await refresh
+    assert probed_configs == ([None] if stale else [])
+    assert not model_catalog_store.catalog_is_stale("claude-native", fingerprint)
     _cleanup_host(host)
 
 

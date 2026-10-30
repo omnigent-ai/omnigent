@@ -4112,12 +4112,12 @@ class HostProcess:
                     error="failed to resolve Claude SDK model options",
                 )
             if listing.source == "cli":
-                # A CLI-login listing replays the stored probe catalog's wire ids;
-                # serve that catalog's rows so the picker keeps its display names,
-                # aliases (resolved inside the harness) and default.
-                from omnigent.harnesses.claude_native.main import stored_claude_catalog_rows
+                # A CLI-login listing replays the CLI-login catalog's wire ids; serve
+                # its rows (display names, aliases, default) from the same launch, which
+                # also refreshes a stale catalog in the background.
+                from omnigent.harnesses.claude_native.main import claude_launch_catalog
 
-                rows = await asyncio.to_thread(stored_claude_catalog_rows, None)
+                rows = await claude_launch_catalog(None)
                 if rows:
                     return HostModelOptionsResultFrame(
                         request_id=frame.request_id,
