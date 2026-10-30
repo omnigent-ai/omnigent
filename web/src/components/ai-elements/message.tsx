@@ -9,7 +9,7 @@ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
+import type { ComponentProps, HTMLAttributes, ReactElement } from "react";
 import {
   cloneElement,
   createContext,
@@ -34,7 +34,13 @@ import {
 
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "./MermaidError";
-import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } from "./MermaidBlock";
+import {
+  extractCodeText,
+  FullscreenIcon,
+  isMermaidPre,
+  MermaidBlock,
+  MERMAID_NO_FULLSCREEN,
+} from "./MermaidBlock";
 
 import {
   CHAT_LINK_SAFETY,
@@ -340,26 +346,6 @@ function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownP
   }
 
   return { code: { copy: false, download: true }, mermaid: MERMAID_NO_FULLSCREEN };
-}
-
-function extractCodeText(children: ReactNode): string {
-  if (typeof children === "string" || typeof children === "number") {
-    return String(children);
-  }
-
-  if (Array.isArray(children)) {
-    return children.map(extractCodeText).join("");
-  }
-
-  if (isValidElement(children)) {
-    const props = children.props as { children?: ReactNode; code?: unknown };
-    if (typeof props.code === "string") {
-      return props.code;
-    }
-    return extractCodeText(props.children);
-  }
-
-  return "";
 }
 
 // Streamdown ships its own 16px icon set (filled, even-odd fill rule) rather
