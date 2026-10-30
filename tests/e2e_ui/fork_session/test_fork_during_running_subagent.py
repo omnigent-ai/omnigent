@@ -47,10 +47,9 @@ _WAKE_REPLY = "I collected the worker's result from my inbox; see the tool resul
 # How long the fork is watched for the finished worker's result after the
 # original has already shown it; delivery to both would happen at the same time.
 _FORK_WATCH_S = 20.0
-# Transcript card titles (web/src/lib/toolTitle.ts); sys_session_send has no
-# friendly title and renders its raw name.
+# Transcript card titles (web/src/lib/toolTitle.ts).
 _TOOL_CARD_TITLE = {
-    "sys_session_send": r"^sys_session_send\(",
+    "sys_session_send": r"^Start child session:",
     "sys_read_inbox": r"^Read inbox",
     "sys_session_list": r"^List child sessions",
     "sys_cancel_task": r"^Cancel task",
@@ -384,7 +383,7 @@ def _run_journey(
         expect(dialog).to_be_visible(timeout=15_000)
         _pace(1.5)
         _record_on_screen(
-            page, obs, "dialog_subagent_warning", r"sub-agents? (is|are) still running"
+            page, obs, "dialog_subagent_warning", r"^\d+ sub-agents? (is|are) still running\."
         )
         obs["dialog_text"] = dialog.inner_text()
         _screenshot(page, evidence_dir, "02-fork-dialog.png")
