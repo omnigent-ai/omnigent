@@ -1775,9 +1775,14 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
       "Runs your automation on all new tickets that match these conditions. Older tickets are skipped, even if they are edited to match later.",
     );
-    // The form says the source is untrusted and that link-back writes there.
-    const note = screen.getByTestId("task-trigger-untrusted-note");
-    expect(note).toHaveTextContent("Anyone who can write in what you watch can try to steer");
+    expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
+      "Each run handles up to 10 new tickets, oldest first. The rest are picked up on the next run.",
+    );
+    // The form warns the source is untrusted and says link-back writes there.
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can create a ticket in this project can add instructions that the agent may follow. The agent runs with your tools and your permissions. Make sure you trust them.",
+    );
+    const note = screen.getByTestId("task-trigger-attribution-note");
     expect(note).toHaveTextContent("Link-back posts to Jira with your account.");
     expect(note).toHaveTextContent(
       'Anything posted with your account ends with "Sent with Omnigent".',
@@ -1887,6 +1892,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   it("leaves the link-back step out when then only starts the session", async () => {
     renderTrigger("slack");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Message posted");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can post in this channel can add instructions",
+    );
     type("task-trigger-scope", "#eng-support");
     fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
     type("task-trigger-condition-0-value", "error");
@@ -1903,7 +1911,10 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   it("hands the rendered prompt to the plain Prompt field on Edit as prompt", () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
+    const warning = screen.getByTestId("task-trigger-untrusted-note");
+    expect(warning).toHaveTextContent("Anyone who can open an issue in this repository can add");
     pick("task-trigger-event", "task-trigger-event-pr");
+    expect(warning).toHaveTextContent("Anyone who can open a pull request in this repository can");
     type("task-trigger-scope", "acme/app");
     type("task-trigger-instructions", "Fix it.");
     fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
