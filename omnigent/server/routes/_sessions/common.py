@@ -56,7 +56,10 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
-from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
+)
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -225,7 +228,7 @@ _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nicknam
 _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 
 
-_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 
 
 # Current approval/sandbox mode of a live codex-native session. ``terminal_launch_args``
