@@ -1739,13 +1739,15 @@ function resolvedCliPath() {
 }
 
 /**
- * What to tell the user when hostCliCommand(serverUrl) found no launcher.
+ * What to tell the user when hostCliCommand(serverUrl, connectHostCommand)
+ * found no launcher.
  *
  * @param {string} serverUrl
+ * @param {unknown} [connectHostCommand] The server page's connect-a-host command.
  * @returns {string}
  */
-function missingHostCliError(serverUrl) {
-  return databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)
+function missingHostCliError(serverUrl, connectHostCommand) {
+  return usesIsaacHost(serverUrl, connectHostCommand)
     ? "The isaac CLI was not found. Install it before connecting this machine."
     : "The omnigent CLI was not found. Install it or set its path.";
 }
@@ -1783,25 +1785,58 @@ function rememberOnboardingRunner(serverUrl, runner) {
 const ONBOARDING_RUNNER_TTL_MS = 10 * 60 * 1000;
 
 /**
- * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
- * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
- * Databricks-managed HTTPS server); every other window keeps the configured /
- * auto-detected public Omnigent CLI. Returns null when the selected launcher
- * is unavailable.
+ * Whether the server page's connect-a-host command is `isaac omni`. The page can
+ * only pick a launcher this app knows; its text is never run as given.
+ *
+ * @param {unknown} connectHostCommand
+ * @returns {boolean}
+ */
+function isIsaacHostHint(connectHostCommand) {
+  return (
+    typeof connectHostCommand === "string" &&
+    connectHostCommand.trim().split(/\s+/).join(" ") === "isaac omni"
+  );
+}
+
+/**
+ * Whether desktop host enrollment on `serverUrl` goes through `isaac omni`: only
+ * on a Databricks-managed HTTPS server, and only when the MDM flag is set (the
+ * Arca gate) or the server page's own connect-a-host command is `isaac omni`.
  *
  * @param {string | null | undefined} serverUrl
+ * @param {unknown} [connectHostCommand] The server page's connect-a-host command.
+ * @returns {boolean}
+ */
+function usesIsaacHost(serverUrl, connectHostCommand) {
+  return (
+    isDatabricksManagedServerUrl(serverUrl) &&
+    (isIsaacHostHint(connectHostCommand) || databricksInternalFeaturesEnabled())
+  );
+}
+
+/**
+ * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
+ * windows use `isaac omni` (see {@link usesIsaacHost}); every other window keeps
+ * the configured / auto-detected public Omnigent CLI. When the page named
+ * `isaac omni`, connecting runs the command the page shows, `isaac omni
+ * --server <url>` (plus `--non-interactive`), which leaves a background host
+ * (`backgroundConnect`). Returns null when the selected launcher is unavailable.
+ *
+ * @param {string | null | undefined} serverUrl
+ * @param {unknown} [connectHostCommand] The server page's connect-a-host command.
  * @returns {string | {
  *   executable: string,
  *   prefixArgs: string[],
  *   displayName: string,
+ *   backgroundConnect?: boolean,
  * } | null}
  */
-function hostCliCommand(serverUrl) {
-  const useIsaac = databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
-  if (!useIsaac) return resolvedCliPath();
+function hostCliCommand(serverUrl, connectHostCommand) {
+  if (!usesIsaacHost(serverUrl, connectHostCommand)) return resolvedCliPath();
   const isaacPath = isaac.resolveIsaacPath();
   if (!isaacPath) return null;
-  return { executable: isaacPath, prefixArgs: ["omni"], displayName: "isaac omni" };
+  const command = { executable: isaacPath, prefixArgs: ["omni"], displayName: "isaac omni" };
+  return isIsaacHostHint(connectHostCommand) ? { ...command, backgroundConnect: true } : command;
 }
 
 /**
@@ -4710,13 +4745,13 @@ function registerIpc() {
   // come from local config (no `omnigent host status` subprocess), so this is
   // instant — it lets the new-session picker tag/connect "this machine" without
   // waiting on the slow runner-status check.
-  ipcMain.handle("omnigent:host-get-identity", (event) => {
+  ipcMain.handle("omnigent:host-get-identity", (event, options) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] host-get-identity from untrusted sender dropped");
       return null;
     }
     return {
-      cliInstalled: Boolean(hostCliCommand(senderServerUrl(event))),
+      cliInstalled: Boolean(hostCliCommand(senderServerUrl(event), options?.connectHostCommand)),
       hostId: omnigentCli.localHostId(),
     };
   });
@@ -4830,14 +4865,17 @@ function registerIpc() {
 
   // SPA → start / stop / restart this machine's host daemon for the window's
   // own server (the host selection menu's "connect this machine" action).
-  ipcMain.handle("omnigent:host-control", async (event, action) => {
+  ipcMain.handle("omnigent:host-control", async (event, action, options) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("host-control is only available to a connected server page");
     }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    const cliCommand = hostCliCommand(serverUrl);
-    if (!cliCommand) return { ok: false, error: missingHostCliError(serverUrl) };
+    const connectHostCommand = options?.connectHostCommand;
+    const cliCommand = hostCliCommand(serverUrl, connectHostCommand);
+    if (!cliCommand) {
+      return { ok: false, error: missingHostCliError(serverUrl, connectHostCommand) };
+    }
     let result;
     if (action === "start" || action === "restart") {
       // Enrolling this machine as a runner executes agent code locally, so it

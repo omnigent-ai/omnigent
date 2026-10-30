@@ -162,6 +162,15 @@ export interface OmnigentHostConfig {
    */
   cliServerUrlSuffix?: string;
   /**
+   * Optional connect-a-host command the host shows its users in place of
+   * `omni host --server <url>` (e.g. `"isaac omni"`, a Databricks-internal
+   * wrapper that targets the managed server and signs in on first use). The
+   * desktop app's "This Mac" runs the same command, `<command> --server <url>`,
+   * when it knows the launcher, so the machine connects the way the host's
+   * instructions say. Omitted standalone.
+   */
+  connectHostCommand?: string;
+  /**
    * Optional URL to the host's appearance settings, linked beside the browser
    * embed's automatic theme option. Omitted standalone and hidden in Electron.
    */
@@ -244,6 +253,14 @@ export function isHostRoutingEnabled(): boolean {
  */
 export function getOmnigentUserSearch(): OmnigentHostConfig["searchUsers"] {
   return hostConfig.searchUsers;
+}
+
+/**
+ * The host-provided connect-a-host command, or `undefined` when none is
+ * configured.
+ */
+export function getOmnigentConnectHostCommand(): OmnigentHostConfig["connectHostCommand"] {
+  return hostConfig.connectHostCommand;
 }
 
 /**

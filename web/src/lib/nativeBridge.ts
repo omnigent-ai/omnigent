@@ -20,6 +20,8 @@
 //   * This module never throws: a broken/old shell must not take down
 //     notifications in the browser path.
 
+import { getOmnigentConnectHostCommand } from "./host.ts";
+
 /**
  * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
  * `move` are live drag frames carrying an open fraction; `open` and `close`
@@ -200,9 +202,12 @@ interface ElectronDesktopApi extends NativeShellApi {
   /** This machine's path for a dropped File; "" if none or off the pinned server. */
   getPathForFile?: (file: File) => Promise<string>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
-  getHostIdentity?: () => Promise<HostIdentity | null>;
+  getHostIdentity?: (options?: HostCommandOptions) => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
-  controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
+  controlHost?: (
+    action: HostControlAction,
+    options?: HostCommandOptions,
+  ) => Promise<HostActionResult>;
   /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
   onHostStatusChanged?: (callback: () => void) => () => void;
   /** Desktop feature gates (MDM-managed); absent on older shells. */
@@ -404,6 +409,20 @@ export interface HostIdentity {
   cliInstalled: boolean;
   /** This machine's host id, or null if it has none yet. */
   hostId: string | null;
+}
+
+/** How this page tells the desktop shell to connect this machine. */
+export interface HostCommandOptions {
+  /**
+   * The connect-a-host command this page shows (host config
+   * `connectHostCommand`). The shell runs it when it knows the launcher.
+   */
+  connectHostCommand?: string;
+}
+
+function hostCommandOptions(): HostCommandOptions {
+  const connectHostCommand = getOmnigentConnectHostCommand();
+  return connectHostCommand ? { connectHostCommand } : {};
 }
 
 /** Result of a host control action from the desktop shell. */
@@ -1063,7 +1082,7 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
   const electron = electronApi();
   if (!electron?.getHostIdentity) return null;
   try {
-    return await electron.getHostIdentity();
+    return await electron.getHostIdentity(hostCommandOptions());
   } catch (err) {
     console.warn("[nativeBridge] electron getHostIdentity failed:", err);
     return null;
@@ -1091,7 +1110,7 @@ export async function controlHost(action: HostControlAction): Promise<HostAction
   const electron = electronApi();
   if (!electron?.controlHost) return { ok: false, error: "not running under the desktop shell" };
   try {
-    return await electron.controlHost(action);
+    return await electron.controlHost(action, hostCommandOptions());
   } catch (err) {
     console.warn("[nativeBridge] electron controlHost failed:", err);
     return { ok: false, error: String(err) };
