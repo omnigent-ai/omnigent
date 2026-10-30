@@ -11179,6 +11179,15 @@ def _consumed_pending_ids(published: list[tuple[str, dict[str, Any]]]) -> list[s
     ]
 
 
+def _consumed_inputs(published: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, str]]:
+    """The ``(item_id, cleared_pending_id)`` of each ``session.input.consumed`` event, in order."""
+    return [
+        (event["data"]["item_id"], event["data"]["cleared_pending_id"])
+        for _sid, event in published
+        if event.get("type") == "session.input.consumed"
+    ]
+
+
 @pytest.mark.parametrize(
     ("event_type", "wrapper", "runner_status", "delivered"),
     [
@@ -11284,15 +11293,10 @@ async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
             assert notice["level"] == "info"
             assert notice["title"] == "Message not sent because the session was stopped"
             assert "waiting for Claude," in notice["message"]
-        consumed = [
-            (event["data"]["item_id"], event["data"]["cleared_pending_id"])
-            for _sid, event in published
-            if event.get("type") == "session.input.consumed"
-        ]
         user_item_ids = [
             item["id"] for item in items if item["type"] == "message" and item["role"] == "user"
         ]
-        assert consumed == list(zip(user_item_ids, held, strict=True))
+        assert _consumed_inputs(published) == list(zip(user_item_ids, held, strict=True))
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == (
             sent_during_stop
         )
@@ -11336,7 +11340,13 @@ async def test_failed_stop_still_keeps_the_message_the_runner_discarded(
             ("native_input_discarded_by_stop", "Message discarded by Stop session")
         ]
         assert "could not be stopped" in notices[0]["message"]
-        assert _consumed_pending_ids(published) == [held]
+        user_items = [
+            item for item in items if item["type"] == "message" and item["role"] == "user"
+        ]
+        assert [item["content"] for item in user_items] == [
+            [{"type": "input_text", "text": "held message"}]
+        ]
+        assert _consumed_inputs(published) == [(user_items[0]["id"], held)]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
             still_queued
         ]
@@ -11346,7 +11356,7 @@ async def test_failed_stop_still_keeps_the_message_the_runner_discarded(
 async def test_unsaved_stop_notice_returns_the_discarded_messages_to_the_queue(
     monkeypatch: pytest.MonkeyPatch, failing_step: str
 ) -> None:
-    """A failed lookup or append keeps the discarded messages queued in order, unannounced."""
+    """A failed lookup or append keeps the discarded messages queued in order and quiet."""
     from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
     from omnigent.runtime import pending_inputs
@@ -11379,7 +11389,6 @@ async def test_unsaved_stop_notice_returns_the_discarded_messages_to_the_queue(
             _queue_web_message(session_id, "held message two"),
         ]
         still_queued = _queue_web_message(session_id, "still queued")
-        pending_inputs.mark_interrupted(session_id, held)
         await orchestration._settle_native_inputs_discarded_by_stop(
             _UnavailableStore(),  # type: ignore[arg-type]
             session_id,
@@ -11387,8 +11396,9 @@ async def test_unsaved_stop_notice_returns_the_discarded_messages_to_the_queue(
             held,
         )
         assert pending_inputs.pending_ids(session_id) == [*held, still_queued]
-        restored = [pending_inputs.resolve(session_id, pending_id) for pending_id in held]
-        assert [entry is not None and entry.interrupted for entry in restored] == [True, True]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+            still_queued
+        ]
         assert published == []
     finally:
         pending_inputs.reset_for_tests()

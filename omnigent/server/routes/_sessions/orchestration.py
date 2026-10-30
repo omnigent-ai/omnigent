@@ -3751,13 +3751,10 @@ async def _settle_native_inputs_discarded_by_stop(
     """
     Keep the queued web messages a stopped runner discarded, each with a notice.
 
-    The runner drops messages it was still holding (behind an open native
-    prompt or a running turn) when the session is stopped, even if stopping
-    then fails. No transcript mirror will ever settle them, so a later mirror
-    would otherwise skip them and blame the harness for never recording them.
-    A failed harness lookup or append returns the entries to the queue unsaved
-    without changing the stop's outcome; after a failed stop they may still be
-    reported as never recorded.
+    No transcript mirror will ever settle a message the runner dropped, so a later
+    mirror would otherwise report it as never recorded. The entries are marked
+    interrupted first: if the harness lookup or append fails they return to the
+    queue unsaved and settle quietly, and the stop's outcome is unchanged.
 
     :param conversation_store: Store to append the messages and notices to.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
@@ -3767,6 +3764,7 @@ async def _settle_native_inputs_discarded_by_stop(
     :param stop_landed: ``False`` when the runner reported the stop failed,
         so the notice does not claim the session was stopped.
     """
+    pending_inputs.mark_interrupted(session_id, pending_ids)
     discarded = [
         entry
         for pending_id in pending_ids
