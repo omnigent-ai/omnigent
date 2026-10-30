@@ -501,24 +501,33 @@ def _live_codex_app_server_processes(state_dir: Path) -> dict[int, int] | None:
     :param state_dir: The session's codex-native state dir, e.g.
         ``~/.omnigent/codex-native/<sha256(session)[:32]>``.
     :returns: ``pid -> pgid`` for matching live processes, or ``None`` when
-        the process table could not be listed (non-posix, or ``ps`` failed).
+        the process table could not be listed (non-posix, or ``ps`` failed
+        or exited nonzero).
     """
     if os.name != "posix":
         return None
-    needle = str(state_dir)
+    raw = str(state_dir)
+    # The bridge MCP args reach the command line JSON-encoded (see
+    # ``bridge.codex_mcp_config_overrides``), which escapes non-ASCII as
+    # ``\uXXXX``: match that spelling too so a live owner is never missed.
+    needles = {raw, json.dumps(raw)[1:-1]}
     try:
         # macOS ps passes raw argv bytes through, so decode leniently: one
         # foreign process with non-UTF-8 argv must not crash the caller.
-        listing = subprocess.run(
+        result = subprocess.run(
             ["ps", "-axww", "-o", "pid=,pgid=,command="],
             check=False,
             capture_output=True,
             encoding="utf-8",
             errors="replace",
             timeout=5.0,
-        ).stdout
+        )
     except (OSError, subprocess.TimeoutExpired):
         return None
+    if result.returncode != 0:
+        # An unsuccessful listing is unknown, never "no owner".
+        return None
+    listing = result.stdout or ""
     own_pgid = os.getpgid(0)
     matches: dict[int, int] = {}
     for line in listing.splitlines():
@@ -533,7 +542,7 @@ def _live_codex_app_server_processes(state_dir: Path) -> dict[int, int] | None:
         # "app-server" scopes the match to the codex app-server itself (the
         # session's bridge MCP child also carries the state dir, but it is a
         # member of the app-server's process group and dies with it).
-        if needle not in command or "app-server" not in command:
+        if "app-server" not in command or not any(n in command for n in needles):
             continue
         if pid == os.getpid() or pgid <= 0 or pgid == own_pgid:
             continue

@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _test_app_server,
@@ -139,9 +140,20 @@ async def test_start_expires_orphaned_backfill_lease_before_spawn(
     db_path = _seed_codex_state_db(codex_home, status="running", updated_at=int(time.time()))
     monkeypatch.setattr(app_server, "codex_native_process_alive_for_state_dir", lambda _d: False)
 
+    leases_at_spawn: list[tuple[str, str | None, int]] = []
+    real_spawn = CodexNativeAppServer._spawn_app_server_process
+
+    async def _spy_spawn(self: CodexNativeAppServer, resolved_listen: str) -> None:
+        leases_at_spawn.append(_read_backfill_lease(db_path))
+        await real_spawn(self, resolved_listen)
+
+    monkeypatch.setattr(CodexNativeAppServer, "_spawn_app_server_process", _spy_spawn)
+
     server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
     server.reconcile_process_registry = False
     await server.start()
     await server.close()
 
+    # Recovery must land before the app-server spawns, not merely during start().
+    assert leases_at_spawn == [("running", "w-1", 0)]
     assert _read_backfill_lease(db_path) == ("running", "w-1", 0)

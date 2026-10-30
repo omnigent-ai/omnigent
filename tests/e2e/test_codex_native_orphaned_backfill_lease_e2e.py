@@ -1,40 +1,16 @@
 """E2E regression: codex-native startup must recover an orphaned backfill lease.
 
-The reported journey: a Codex native session whose private ``CODEX_HOME`` holds
-a ``running`` state-db backfill lease left by an interrupted earlier launch
-(the lease owner is dead, and its timestamp is younger than Codex's 900s
-``BACKFILL_LEASE_SECONDS``). Relaunching/resuming the session cannot reclaim
-that lease: Codex's ``codex app-server`` prints ``state db backfill is running
-...; waiting up to 30s`` and exits 1 after ~30s, so the session's terminal
-never comes up. Retrying does not help until the lease expires (~15 minutes).
+Exercise real Codex startup with fresh, expired, and unexpired orphaned
+state-db backfill leases in the session's private ``CODEX_HOME``, without
+inference requests. An unexpired ``running`` lease with no live owner makes
+``codex app-server`` wait ~30s on its backfill gate and exit, inside
+Omnigent's readiness budget; recovery must let the launch become ready.
 
-Why raising the outer budget does not fix it: Omnigent's readiness budget is
-already ``_APP_SERVER_READY_TIMEOUT_SECONDS = 60.0``, but Codex exits on its
-own ~30s backfill gate well inside that window, so
-``CodexNativeAppServer._wait_until_ready()`` observes an early exit and raises
-``Codex app-server exited early: ... state db backfill ...`` regardless.
+The launch path is the product one: ``build_codex_native_server`` plus
+``CodexNativeAppServer.start()``. The backfill gate runs before the app-server
+binds its listener, so no login or model credentials are needed.
 
-This drives the real product launch path end to end: ``build_codex_native_server``
-is the exact factory the runner's ``_auto_create_codex_terminal`` uses, and
-``CodexNativeAppServer.start()`` is the coroutine it awaits. No LLM and no model
-credentials are needed -- the backfill gate blocks before the app-server binds
-its listener, before any model traffic. The orphaned lease is established the
-way the incident RCA established it: launch once to create the state db, then
-mark the backfill row ``running`` with a current timestamp (a dead-owner,
-unexpired lease).
-
-The regression these guard:
-
-* **control (expired lease)** -- a ``running`` lease aged past 900s is reclaimed
-  and the launch reaches ready. Proves the seeding actually drives Codex's gate
-  and distinguishes the bug from a harness failure.
-* **the bug (orphaned unexpired lease)** -- a ``running`` lease at age 0 must
-  still let the session start. While the bug is live the launch instead dies on
-  the backfill gate at ~30s; a recovery fix must let it become ready (or fail
-  fast with distinct, actionable, non-destructive guidance rather than the
-  generic readiness error).
-
-Runs with only the ``codex`` CLI installed (no login, no LLM key)::
+Runs with only the ``codex`` CLI installed::
 
     pytest tests/e2e/test_codex_native_orphaned_backfill_lease_e2e.py -v
 """

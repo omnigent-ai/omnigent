@@ -609,10 +609,33 @@ def test_live_app_server_listing_matches_only_state_dir_app_servers(
         ]
     )
     monkeypatch.setattr(
-        registry.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=listing)
+        registry.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=listing),
     )
 
     assert registry._live_codex_app_server_processes(state_dir) == {111: 222}
+
+
+def test_live_app_server_listing_matches_json_escaped_state_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A live owner whose state dir reaches argv JSON-escaped is still matched."""
+    state_dir = tmp_path / "jos\u00e9" / "codex-native" / "abc123"
+    escaped = json.dumps(str(state_dir))[1:-1]
+    assert escaped != str(state_dir)
+    listing = (
+        "111 222 codex -c mcp_servers.omnigent.args="
+        f'["-m", "bridge", "--bridge-dir", "{escaped}"] app-server --listen ws://127.0.0.1:1'
+    )
+    monkeypatch.setattr(
+        registry.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=listing),
+    )
+
+    assert registry._live_codex_app_server_processes(state_dir) == {111: 222}
+    assert registry.codex_native_process_alive_for_state_dir(state_dir) is True
 
 
 def test_live_app_server_listing_unavailable_reads_unknown(monkeypatch, tmp_path: Path) -> None:
@@ -624,3 +647,13 @@ def test_live_app_server_listing_unavailable_reads_unknown(monkeypatch, tmp_path
     monkeypatch.setattr(registry.subprocess, "run", _raise)
 
     assert registry._live_codex_app_server_processes(tmp_path) is None
+
+    # A nonzero ``ps`` exit with empty stdout is also unknown, not "no owner".
+    monkeypatch.setattr(
+        registry.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    assert registry._live_codex_app_server_processes(tmp_path) is None
+    assert registry.codex_native_process_alive_for_state_dir(tmp_path) is True
