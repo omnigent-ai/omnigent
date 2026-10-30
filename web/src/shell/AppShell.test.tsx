@@ -2203,7 +2203,10 @@ describe("Sidebar across the md breakpoint", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: matches(query),
+      // Live like a real MediaQueryList, so a cached list sees each resize.
+      get matches() {
+        return matches(query);
+      },
       addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
         if (!listeners.has(query)) listeners.set(query, new Set());
         listeners.get(query)?.add(listener);
