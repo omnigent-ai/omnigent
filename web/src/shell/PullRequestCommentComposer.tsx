@@ -64,10 +64,10 @@ export function PullRequestCommentForm({
       tabIndex={compactReply ? -1 : undefined}
       className={
         collapsed
-          ? "min-w-0 border-t bg-muted/30 p-2"
+          ? "pull-request-comment-surface min-w-0 border-t p-2"
           : inline
-            ? "flex max-h-96 min-w-0 flex-col gap-2 border-t bg-background p-3"
-            : "flex max-h-[60%] shrink-0 flex-col gap-2 border-t bg-background p-3"
+            ? "pull-request-comment-surface flex max-h-96 min-w-0 flex-col gap-2 border-t p-3"
+            : "pull-request-comment-surface flex max-h-[60%] shrink-0 flex-col gap-2 border-t p-3"
       }
       onSubmit={(event) => {
         event.preventDefault();
@@ -82,7 +82,7 @@ export function PullRequestCommentForm({
           value={draft.body}
           onChange={(event) => setBody(event.target.value)}
           onFocus={() => setReplyExpanded(true)}
-          className="bg-background dark:bg-background"
+          className="bg-transparent focus-visible:border-input focus-visible:outline-none focus-visible:ring-0 dark:bg-transparent"
         />
       ) : (
         <>
@@ -100,7 +100,7 @@ export function PullRequestCommentForm({
                       ? "Reply to review conversation"
                       : "New PR comment"
                 }
-                className="max-h-40 bg-transparent focus-visible:ring-0 dark:bg-transparent"
+                className="max-h-40 bg-transparent focus-visible:border-input focus-visible:outline-none focus-visible:ring-0 dark:bg-transparent"
                 placeholder={inline && !newThread ? "Write a reply…" : "Leave a comment..."}
                 autoFocus={newThread || compactReply}
                 value={draft.body}

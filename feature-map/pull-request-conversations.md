@@ -17,6 +17,7 @@ request's Changes subtab. Top-level comments remain in Comments.
 - `new-conversation`: Gutter plus and line-selection actions for a single line or
   same-side range; independent conversations on lines with existing threads.
   Selection follows the drag, with the sidebar's theme tint and an accent gutter.
+  The plus hides while the composer is open; its top-right X closes it.
 - `history`: On-demand pages, incomplete/error states, resolved collapse,
   unresolved navigation and original context for unplaceable conversations.
 - `thread-refresh`: Threads fetch separately and poll while Changes is open;
@@ -67,7 +68,7 @@ Preview the reply, switch tabs and back, post, then refresh. Confirm one reply
 under the displayed account on GitHub. Move the commented line in a new commit
 and confirm the discussion remains accessible. Click a line number and its plus
 to start another conversation; drag line numbers or Shift-click to select a range
-and choose **Comment on selected lines**. Confirm the range on GitHub. In browser Network, the existing
+and click its gutter plus. Confirm the range on GitHub. In browser Network, the existing
 thread requests should poll only while Changes is visible.
 For an existing comment with a fenced `suggestion`, compare its red removal and
 green addition rows to GitHub, including a multiline replacement. Expand an

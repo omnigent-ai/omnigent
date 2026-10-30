@@ -74,6 +74,7 @@ import {
   ServerOffIcon,
   TerminalIcon,
   Trash2Icon,
+  XIcon,
 } from "lucide-react";
 import { FileDiff } from "@pierre/diffs/react";
 import {
@@ -511,7 +512,7 @@ function PullRequestFileSection({
     revision: string;
     range: SelectedLineRange | null;
   }>();
-  // Preview the drag without moving the code by adding the comment action row.
+  // Restore the committed range when a pointer gesture is canceled.
   const [selectionPreview, setSelectionPreview] = useState<typeof selection>();
   const selectedLines = selection?.revision === revision ? selection.range : null;
   const previewSelection = useCallback(
@@ -570,6 +571,7 @@ function PullRequestFileSection({
     seen &&
     (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
   const anchor = composer.draft.anchor;
+  const showGutterUtility = !!threadContext.canCreate && (!anchor || composer.stale);
   const showDraftInline = !!anchor && !composer.stale && renderingDiff;
   const { annotations, unplaced } = useMemo(() => {
     const { annotations: threadAnnotations, unplaced: unplacedThreads } = reviewThreadAnnotations(
@@ -598,21 +600,20 @@ function PullRequestFileSection({
   const newConversation = anchor && (
     <section
       aria-label="New review conversation"
-      className="my-2 min-w-0 rounded-md border bg-background text-foreground font-sans text-ui [white-space:normal]"
+      className="pull-request-comment-surface my-2 min-w-0 rounded-md border text-foreground font-sans text-ui [white-space:normal]"
     >
       <div className="flex items-center justify-between gap-2 px-3 py-2">
         <span>
           New conversation · {anchor.side === "LEFT" ? "Old" : "New"}{" "}
           {anchor.start_line ? `lines ${anchor.start_line}–${anchor.line}` : `line ${anchor.line}`}
         </span>
-        <Button
-          variant="ghost"
-          size="sm"
+        <IconButton
+          label="Close comment composer"
           disabled={composer.draft.pending}
           onClick={composer.cancel}
         >
-          Cancel
-        </Button>
+          <XIcon className="size-4" aria-hidden="true" />
+        </IconButton>
       </div>
       {composer.stale && (
         <p role="status" className="px-3 pb-2">
@@ -675,18 +676,6 @@ function PullRequestFileSection({
       </button>
       {!collapsed && (
         <>
-          {selectedLines && threadContext.canCreate && (
-            <div className="flex items-center gap-2 px-3 py-1">
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={composer.draft.pending}
-                onClick={() => startConversation(selectedLines)}
-              >
-                <PlusIcon className="size-3.5" /> Comment on selected lines
-              </Button>
-            </div>
-          )}
           {selectionError && (
             <p role="alert" className="px-3 py-2 text-ui">
               {selectionError}
@@ -738,7 +727,7 @@ function PullRequestFileSection({
               options={{
                 ...options,
                 enableLineSelection: !!threadContext.canCreate,
-                enableGutterUtility: !!threadContext.canCreate,
+                enableGutterUtility: showGutterUtility,
                 onLineSelectionStart: previewSelection,
                 onLineSelectionChange: previewSelection,
                 onLineSelectionEnd: commitSelection,
@@ -748,7 +737,7 @@ function PullRequestFileSection({
               }
               disableWorkerPool
               renderGutterUtility={
-                threadContext.canCreate
+                showGutterUtility
                   ? (getHoveredLine) => (
                       <button
                         type="button"
@@ -963,7 +952,7 @@ function PullRequestCommentCard({
   const ts = comment.created_at ? Date.parse(comment.created_at) : NaN;
   const rel = relativeTime(ts);
   return (
-    <li className="rounded-lg border border-border bg-muted/20 p-3">
+    <li className="pull-request-comment-surface rounded-lg border border-border p-3">
       <div className="mb-1.5 flex items-center gap-2 text-xs">
         <PullRequestAuthorAvatar author={comment.author} hue={authorHue} />
         <span className="min-w-0 truncate font-medium text-foreground">

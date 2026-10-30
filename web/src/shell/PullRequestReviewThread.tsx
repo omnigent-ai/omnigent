@@ -52,7 +52,7 @@ export function PullRequestReviewThread({
       aria-label={`Review conversation: ${thread.path}, ${lineLabel}`}
       data-review-thread={thread.id}
       tabIndex={-1}
-      className="my-2 min-w-0 max-w-full rounded-md border border-border bg-background text-foreground font-sans text-ui [white-space:normal]"
+      className="pull-request-comment-surface my-2 min-w-0 max-w-full rounded-md border border-border text-foreground font-sans text-ui [white-space:normal]"
     >
       <button
         type="button"

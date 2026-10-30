@@ -645,8 +645,10 @@ def test_reply_to_inline_review_conversation(
     base_url, session_id = seeded_session
     page.emulate_media(color_scheme="dark" if entry in {"composer-mobile", "canvas"} else "light")
     if entry in {"composer-desktop", "canvas"}:
+        palette = "gruvbox" if entry == "composer-desktop" else "github"
         page.add_init_script(
-            'localStorage.setItem("omnigent:ui-theme-palette", JSON.stringify("github"))'
+            'localStorage.setItem("omnigent:ui-theme-palette", '
+            f"JSON.stringify({json.dumps(palette)}))"
         )
     _stub_github(page, pr_count=2)
     pr_url = _INFO["pr"]["url"]
@@ -809,6 +811,12 @@ def test_reply_to_inline_review_conversation(
         "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
     ).click()
     tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
+    tabs.get_by_role("tab", name="Comments", exact=False).click()
+    top_comment = panel.get_by_role("region", name="PR comments").get_by_role("listitem").first
+    comment_background = top_comment.evaluate(
+        "element => getComputedStyle(element).backgroundColor"
+    )
+    comment_tint = top_comment.evaluate("element => getComputedStyle(element).backgroundImage")
     tabs.get_by_role("tab", name="Changes", exact=False).click()
     loading = panel.get_by_role("status").filter(has_text="Loading review threads")
     expect(loading).to_be_visible()
@@ -852,7 +860,7 @@ def test_reply_to_inline_review_conversation(
     colors = page.evaluate("""() => {
         const probe = document.createElement('span');
         document.body.append(probe);
-        const colors = ['sidebar-active', 'sidebar-active-foreground']
+        const colors = ['sidebar-active', 'sidebar-active-foreground', 'input']
             .map(token => {
                 probe.style.backgroundColor = `var(--${token})`;
                 return getComputedStyle(probe).backgroundColor;
@@ -867,7 +875,9 @@ def test_reply_to_inline_review_conversation(
     expect(first_line).to_have_css("box-shadow", f"{colors[1]} -3px 0px 0px 0px inset")
     page.screenshot(path=str(tmp_path / f"inline-{entry}-drag-selection.png"))
     page.mouse.up()
-    expect(file.get_by_role("button", name="Comment on selected lines")).to_be_visible()
+    expect(file.get_by_role("button", name="Comment on selected lines")).to_have_count(0)
+    expect(conversation).to_have_css("background-color", comment_background)
+    expect(conversation).to_have_css("background-image", comment_tint)
     assert conversation.evaluate("element => !!element.closest('diffs-container')")
     assert (
         conversation.evaluate("element => element.closest('[slot]').getAttribute('slot')")
@@ -898,6 +908,8 @@ def test_reply_to_inline_review_conversation(
     page.screenshot(path=str(tmp_path / f"inline-{entry}-compact.png"))
     textbox.focus()
     expect(textbox).to_be_focused()
+    expect(textbox).to_have_css("outline-style", "none")
+    expect(textbox).to_have_css("border-color", colors[2])
     textbox.fill("**This handles empty input.**")
     conversation.get_by_role("button", name="Cancel", exact=True).click()
     expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
@@ -980,7 +992,23 @@ def test_reply_to_inline_review_conversation(
     plus.click()
     draft = file.get_by_role("region", name="New review conversation", exact=True)
     expect(draft.get_by_text("New conversation · New line 2", exact=True)).to_be_visible()
+    expect(draft).to_have_css("background-color", comment_background)
+    expect(draft).to_have_css("background-image", comment_tint)
+    line.hover()
+    expect(plus).to_have_count(0)
+    draft.get_by_role("button", name="Close comment composer", exact=True).click()
+    expect(draft).to_have_count(0)
+    line.hover()
+    expect(plus).to_be_visible()
+    plus.click()
+    expect(draft.get_by_text("New conversation · New line 2", exact=True)).to_be_visible()
+    expect(plus).to_have_count(0)
+    comment_input = draft.get_by_role("textbox", name="New review comment")
+    expect(comment_input).to_be_focused()
+    expect(comment_input).to_have_css("outline-style", "none")
+    expect(comment_input).to_have_css("border-color", colors[2])
     draft.get_by_role("textbox", name="New review comment").fill("**Separate conversation.**")
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-composer.png"))
     tabs.get_by_role("tab", name="Summary", exact=True).click()
     tabs.get_by_role("tab", name="Changes", exact=False).click()
     expect(draft.get_by_role("textbox", name="New review comment")).to_have_value(
@@ -1015,8 +1043,9 @@ def test_reply_to_inline_review_conversation(
     assert plus_box["x"] + plus_box["width"] / 2 == pytest.approx(
         line_box["x"] + line_box["width"], abs=2
     )
-    file.get_by_role("button", name="Comment on selected lines", exact=True).click()
+    plus.click()
     expect(draft.get_by_text("New conversation · Old lines 1–2", exact=True)).to_be_visible()
+    expect(plus).to_have_count(0)
     draft.get_by_role("textbox", name="New review comment").fill("Consider these lines together.")
     draft.get_by_role("button", name="Post comment", exact=True).click()
     ranged = file.locator('[data-review-thread="new-thread-2"]')
