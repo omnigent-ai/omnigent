@@ -134,6 +134,25 @@ _REJECTED_ARGUMENT_MARKERS = (
 )
 
 
+# --- gateway launcher's Databricks CLI version check -------------------------
+# A capture can keep only the end of the launcher's error: the quoted version
+# (``... output: 'Databricks CLI v1.2.3'``) or the timed-out probe. Those
+# fragments count only beside the launcher's own "Claude Code exited" box.
+_CLI_VERSION_UNREAD_PHRASE = "could not parse databricks cli version"
+_CLI_VERSION_UNREAD_FRAGMENT = re.compile(
+    r"(?m)\bcli v\d+\.\d+\.\d+'$|'--version'\]' timed out after \d+\s+seconds>"
+)
+_LAUNCHER_EXIT_BOX = "claude code exited with code"
+
+
+def _cli_version_unread(signal: _Signal) -> bool:
+    if _CLI_VERSION_UNREAD_PHRASE in signal.output:
+        return True
+    return _LAUNCHER_EXIT_BOX in signal.output and bool(
+        _CLI_VERSION_UNREAD_FRAGMENT.search(signal.output)
+    )
+
+
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
@@ -147,6 +166,42 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    # The Databricks gateway launcher checks `databricks --version` before it
+    # starts Claude Code; a probe that times out or fails ends the launch with
+    # this error, even when the version it then prints is valid.
+    _TerminalMatcher(
+        "gateway_databricks_cli_version_unread",
+        _cli_version_unread,
+        FailureDiagnosis(
+            title="The Databricks gateway launcher couldn't check the Databricks CLI",
+            cause=(
+                "The launcher exited before starting Claude Code because "
+                "`databricks --version` failed or answered too slowly on the host."
+            ),
+            remediation=(
+                "Run `databricks --version` on the host. If it is slow or fails, reinstall "
+                "or update the Databricks CLI. Then send your message again."
+            ),
+            category=ErrorCategory.UPSTREAM,
+        ),
+    ),
+    # The same launcher upgrades a too-old Databricks CLI itself; when the
+    # installer fails (e.g. an older CLI already holds its target path) it exits.
+    _TerminalMatcher(
+        "gateway_databricks_cli_install_failed",
+        lambda s: "failed to install/upgrade databricks cli automatically" in s.output,
+        FailureDiagnosis(
+            title="The Databricks gateway launcher couldn't install the Databricks CLI",
+            cause=(
+                "The launcher exited before starting Claude Code because it couldn't "
+                "install or upgrade the Databricks CLI on the host."
+            ),
+            remediation=(
+                "Install a current Databricks CLI on the host, removing an older one first "
+                "if the terminal output names it. Then send your message again."
+            ),
         ),
     ),
     _TerminalMatcher(
