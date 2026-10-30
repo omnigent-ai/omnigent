@@ -4085,7 +4085,7 @@ def create_app(
                 attempt = await _launch_runner_on_host(
                     conv, conversation_store, host_registry, host_conn
                 )
-            except Exception:  # noqa: BLE001 — a failed relaunch keeps the plain failure
+            except Exception:  # a failed relaunch keeps the plain failure
                 _logger.warning(
                     "Relaunch after host return failed for session=%s", conv.id, exc_info=True
                 )
