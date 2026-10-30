@@ -390,6 +390,7 @@ describe("filtersFromConversationQueryKey", () => {
         includeArchived: false,
         project: undefined,
         visibility: "mine",
+        sortBy,
       });
     },
   );
@@ -594,6 +595,40 @@ describe("insertNewRowsIntoPages", () => {
       DEFAULT_FILTERS,
     );
     expect(inserted).toHaveLength(0);
+  });
+
+  it.each([
+    ["inserts into a Name list with every page loaded", "zeta", false, ["zeta", "beta", "delta"]],
+    [
+      "inserts a row that sorts inside a partial Name window",
+      "Alpha",
+      true,
+      ["Alpha", "beta", "delta"],
+    ],
+    [
+      "leaves a row that sorts past a partial Name window to the refetch",
+      "zeta",
+      true,
+      ["beta", "delta"],
+    ],
+  ])("%s", (_name, title, hasMore, expected) => {
+    const before = data([conv("beta"), conv("delta")]);
+    before.pages[0].has_more = hasMore;
+    const { data: after } = insertNewRowsIntoPages(before, candidate(title, { title }), {
+      ...DEFAULT_FILTERS,
+      sortBy: "title",
+    });
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(expected);
+  });
+
+  it("still prepends to a partial newest-first window", () => {
+    const before = data([conv("beta"), conv("delta")]);
+    before.pages[0].has_more = true;
+    const { inserted } = insertNewRowsIntoPages(before, candidate("zeta", { title: "zeta" }), {
+      ...DEFAULT_FILTERS,
+      sortBy: "created_at",
+    });
+    expect(inserted.map((c) => c.id)).toEqual(["zeta"]);
   });
 
   it("skips ids the caller excludes (e.g. a session being deleted)", () => {

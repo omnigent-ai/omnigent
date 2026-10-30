@@ -552,6 +552,21 @@ it("keeps a stored Name ordering but lists by Updated until the server can sort 
   expect(listed().every(([url]) => params(url).get("sort_by") === "title")).toBe(true);
 });
 
+it("keeps the lists when Updated is picked while a stored Name ordering lists by Updated", async () => {
+  localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+  groupingUi = true;
+  titleSort = false;
+  view = "all";
+  const { result } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+  fetchMock.mockClear();
+  act(() => result.current.updateView({ ordering: "updated" }));
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("updated");
+  expect(result.current.mine.data).toBeDefined();
+  expect(result.current.shared.data).toBeDefined();
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
 it.each([false, true])(
   "clears destination sort snapshots while folders, pins and Archived reload (archived folder: %s)",
   async (archivedFolder) => {

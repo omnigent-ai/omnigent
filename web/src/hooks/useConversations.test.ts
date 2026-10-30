@@ -281,7 +281,6 @@ describe.each([undefined, "updated_at", "created_at", "title"] as const)(
         const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
         expect(params.get("visibility")).toBe(visibility ?? "all");
         expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
-        // Names list A to Z; timestamps list newest first.
         expect(params.get("order")).toBe(sortBy === "title" ? "asc" : "desc");
         queryClient.clear();
       },
@@ -1032,6 +1031,39 @@ describe("recently-created keep-alive", () => {
     // row doesn't flash out of the sidebar.
     await waitFor(() => expect(result.current.data).toBeDefined());
     expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it.each([
+    ["alpha", ["alpha", "beta", "delta"]],
+    ["zeta", ["beta", "delta"]],
+  ])("keeps %s in a partial Name page only when it sorts inside it", async (title, expected) => {
+    markRecentlyCreated({
+      id: title,
+      object: "conversation",
+      title,
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: null,
+    });
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "list",
+        data: ["beta", "delta"].map((id) => ({ id, object: "conversation", title: id })),
+        first_id: "beta",
+        last_id: "delta",
+        has_more: true,
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("", true, { sortBy: "title" }), {
+      wrapper,
+    });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(expected);
   });
 
   it("drops the keep-alive (no duplicate) once the fetch returns the row", async () => {
@@ -3159,6 +3191,50 @@ describe("useMoveToProject", () => {
         false,
       ]);
       expect(oldFolder!.pages[0].data.map((c) => c.id)).toEqual(["conv_deep"]);
+    },
+  );
+
+  it.each([
+    ["alpha", ["alpha", "beta", "delta"], []],
+    ["zeta", ["beta", "delta"], ["zeta"]],
+  ])(
+    "adds %s to a partial Name folder only when it sorts inside it",
+    async (title, targetIds, oldFolderIds) => {
+      let resolveList: (value: Response) => void = () => {};
+      fetchMock.mockReset();
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            resolveList = resolve;
+          }),
+        )
+        .mockResolvedValueOnce(
+          mockResponse({ id: title, object: "conversation", title, project_id: "p_sprint" }),
+        );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+      const oldKey = ["project-sessions", "Old folder", "title", false];
+      const targetKey = ["project-sessions", "Sprint 42", "title", false];
+      queryClient.setQueryData(
+        oldKey,
+        infinitePage([conversation({ id: title, title, project_id: "p_old" })]),
+      );
+      const target = infinitePage(["beta", "delta"].map((id) => conversation({ id, title: id })));
+      target.pages[0].has_more = true;
+      queryClient.setQueryData(targetKey, target);
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+      result.current.mutate({ id: title, project: "Sprint 42" });
+      // The project lookup starts only after onMutate has applied the overlay.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+      const targetRows = queryClient.getQueryData<ConversationsInfiniteData>(targetKey)!.pages[0];
+      expect(targetRows.data.map((c) => c.id)).toEqual(targetIds);
+      const oldRows = queryClient.getQueryData<ConversationsInfiniteData>(oldKey)!.pages[0];
+      expect(oldRows.data.map((c) => c.id)).toEqual(oldFolderIds);
+      resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
     },
   );
 

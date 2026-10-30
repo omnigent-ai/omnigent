@@ -50,27 +50,39 @@ const SESSION_SORT_BY_ORDERING: Record<SidebarOrdering, SessionSortBy> = {
   name: "title",
 };
 
+/**
+ * The view the sidebar lists by. A server that rejects sort_by=title lists by
+ * Updated; the stored Name choice is kept so it returns once the server supports it.
+ */
+function effectiveSidebarView(
+  stored: SidebarViewPreferences,
+  groupingUi: boolean,
+  titleSort: boolean,
+): SidebarViewPreferences {
+  if (!groupingUi) return DEFAULT_SIDEBAR_VIEW;
+  if (stored.ordering === "name" && !titleSort) {
+    return { ...stored, ordering: DEFAULT_SIDEBAR_VIEW.ordering };
+  }
+  return stored;
+}
+
 function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
   const serverInfo = useServerInfo();
   const [storedView, setView] = useState(readSidebarViewPreferences);
   const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
   const titleSort = sessionTitleSortSupported(serverInfo);
-  const view = useMemo(() => {
-    if (!groupingUi) return DEFAULT_SIDEBAR_VIEW;
-    // A server that rejects sort_by=title lists by Updated; the stored choice
-    // is kept so Name returns once the server supports it.
-    if (storedView.ordering === "name" && !titleSort) {
-      return { ...storedView, ordering: DEFAULT_SIDEBAR_VIEW.ordering };
-    }
-    return storedView;
-  }, [groupingUi, titleSort, storedView]);
+  const view = useMemo(
+    () => effectiveSidebarView(storedView, groupingUi, titleSort),
+    [groupingUi, titleSort, storedView],
+  );
   const sortBy = SESSION_SORT_BY_ORDERING[view.ordering];
   const updateView = useCallback(
     (patch: Partial<SidebarViewPreferences>) => {
       const next = { ...storedView, ...patch };
       writeSidebarViewPreferences(next);
-      if (next.ordering !== storedView.ordering) {
+      const nextOrdering = effectiveSidebarView(next, groupingUi, titleSort).ordering;
+      if (nextOrdering !== view.ordering) {
         // Clear the destination snapshots before observers switch to the selected order.
         for (const queryKey of [["conversations", "", false, null], ["project-sessions"]]) {
           void client.invalidateQueries({ queryKey, refetchType: "none" });
@@ -80,14 +92,14 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
               (key[0] === "conversations"
                 ? (key[5] ?? "updated_at")
                 : parseProjectSessionsQueryKey(key).sortBy) ===
-              SESSION_SORT_BY_ORDERING[next.ordering],
+              SESSION_SORT_BY_ORDERING[nextOrdering],
           });
         }
         void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
       }
       setView(next);
     },
-    [storedView, client],
+    [storedView, view.ordering, groupingUi, titleSort, client],
   );
   const [selectedView, registerView] = useState<SessionFilter | null>(null);
   const viewNeedsShared = selectedView === "all" || selectedView === "shared";

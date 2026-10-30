@@ -32,6 +32,7 @@ import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
+  belongsInLoadedWindow,
   filtersFromConversationQueryKey,
   lastIdAfterFiltering,
   insertNewRowsIntoPages,
@@ -444,7 +445,8 @@ export { clearRecentlyCreated } from "@/lib/sessionListCache";
 /**
  * Prepend recently-created rows the first page doesn't yet include (the index
  * hasn't caught up). Only the unfiltered, unsearched first page — a create sorts
- * newest-first. Once the fetch returns the row itself, the keep-alive is dropped.
+ * newest-first, and a Name list takes only rows within that page's range.
+ * Once the fetch returns the row itself, the keep-alive is dropped.
  * Applied before `applySessionTombstones`, so a create-then-delete stays gone.
  */
 function withRecentlyCreated(
@@ -455,6 +457,7 @@ function withRecentlyCreated(
   includeArchived: boolean,
   queryClient: QueryClient,
   visibility?: "mine" | "shared" | "archived",
+  sortBy?: SessionSortBy,
 ): ConversationsPage {
   // Recently-created sessions are always owned (active, not archived), so skip
   // injection for "shared" and "archived" filters where they would not belong.
@@ -480,6 +483,7 @@ function withRecentlyCreated(
     // isn't reverted by re-injecting stale data.
     const row = findCachedConversationRow(queryClient, id) ?? snapshot;
     if (row.archived && !includeArchived) continue;
+    if (!belongsInLoadedWindow([page], row, sortBy)) continue;
     inject.push(row);
   }
   if (inject.length === 0) return page;
@@ -603,6 +607,7 @@ export async function fetchConversationsPage({
       includeArchived,
       queryClient,
       visibility,
+      sortBy,
     ),
     !includeArchived && visibility !== "archived",
     page,
@@ -2412,7 +2417,8 @@ export function useMoveToProject() {
       if (next !== data) queryClient.setQueryData(key, next);
     }
     // Target folder cache: overlay the row's fields if already present, and
-    // insert a deep row (outside the flat window) into the first page.
+    // insert a deep row (outside the flat window) into the first page when it
+    // sorts within the folder's loaded pages.
     const visibleScopes = new Set(windowScopes);
     if (targetProjectName !== null) {
       for (const [targetKey, targetData] of queryClient.getQueriesData<ConversationsInfiniteData>({
@@ -2434,7 +2440,12 @@ export function useMoveToProject() {
         }
         let next = merged ?? targetData;
         const [first, ...rest] = next.pages;
-        if (!found.has(id) && !windowScopes.has(scope) && first) {
+        const insert =
+          !found.has(id) &&
+          !windowScopes.has(scope) &&
+          first !== undefined &&
+          belongsInLoadedWindow(next.pages, row, sortBy);
+        if (insert) {
           next = {
             ...next,
             pages: [
@@ -2444,7 +2455,7 @@ export function useMoveToProject() {
           };
         }
         if (next !== targetData) queryClient.setQueryData(targetKey, next);
-        if (found.has(id) || first !== undefined) visibleScopes.add(scope);
+        if (found.has(id) || insert) visibleScopes.add(scope);
       }
     }
     for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
