@@ -1,7 +1,6 @@
 import { GitPullRequestIcon, Loader2Icon } from "lucide-react";
-import { useId, useState } from "react";
 import { PullRequestStatusIcon } from "@/components/PullRequestStatusIcon";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { gitProviderCopy } from "@/lib/gitProviders";
@@ -46,8 +45,6 @@ export function ComposerPrLink({
   className?: string;
 }) {
   const isCoarsePointer = useIsCoarsePointer();
-  const [previewOpen, setPreviewOpen] = useState(false);
-  const previewId = useId();
   // Status belongs to a known PR; lookup and setup errors remain in the GitHub tab.
   if (prCount <= 0 || !onOpen) return null;
 
@@ -77,7 +74,8 @@ export function ComposerPrLink({
   const label = prCount > 1 ? `${prCount} PRs` : singleLabel;
   const status = prStatus ?? "unknown";
   const presentation = pullRequestStatusPresentation(status);
-  const showPreview = prs.length > 0 && !isCoarsePointer;
+  const showPreview = prs.length > 0;
+  const showNativeHint = !showPreview || isCoarsePointer;
   const openHint =
     prCount > 1
       ? "View these PRs in the Pull Requests tab"
@@ -91,8 +89,7 @@ export function ComposerPrLink({
       onClick={() => onOpen()}
       aria-label={label}
       aria-description={prStatus ? presentation.label : undefined}
-      aria-describedby={showPreview && previewOpen ? previewId : undefined}
-      title={showPreview ? undefined : openHint}
+      title={showNativeHint ? openHint : undefined}
       className={cn(
         "group flex min-w-0 items-center gap-1 rounded text-sm transition-colors hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
         presentation.className,
@@ -106,65 +103,65 @@ export function ComposerPrLink({
       <span
         data-workspace-collapse-label=""
         className="truncate tabular-nums underline-offset-2 group-hover:underline group-focus-visible:underline"
-        title={showPreview ? undefined : label}
+        title={showNativeHint ? label : undefined}
       >
         {label}
       </span>
     </button>
   );
 
-  // HoverCard prevents touchstart; touch devices need the button's native tap.
   if (!showPreview) return trigger;
 
   return (
-    <HoverCard open={previewOpen} onOpenChange={setPreviewOpen} openDelay={200} closeDelay={150}>
-      <HoverCardTrigger asChild>{trigger}</HoverCardTrigger>
-      <HoverCardContent
-        data-testid="composer-pr-preview"
-        id={previewId}
-        role="tooltip"
-        side="top"
-        align="start"
-        collisionPadding={16}
-        className="w-96 max-w-[calc(100vw-2rem)] p-0"
-      >
-        <div className="border-b border-border/50 px-3 py-2 text-xs font-medium text-muted-foreground">
-          Pull requests
-        </div>
-        <ul aria-label="Pull requests by status" className="max-h-80 overflow-y-auto p-1">
-          {prs.map((pr) => {
-            const rowStatus = getPullRequestStatus(pr);
-            const rowPresentation = pullRequestStatusPresentation(rowStatus);
-            const copy = gitProviderCopy(pr.provider, undefined, pr.provider_display);
-            const identity = `${pr.repository} ${copy.prNumberPrefix}${pr.number}`.trim();
-            return (
-              <li
-                key={pr.url}
-                data-pr-url={pr.url}
-                data-pr-status={rowStatus}
-                className="flex items-start gap-2 rounded-md px-2 py-2"
-              >
-                <PullRequestStatusIcon status={rowStatus} className="mt-0.5 size-4 shrink-0" />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="truncate text-xs text-muted-foreground" title={identity}>
-                      {identity}
-                    </span>
-                    <span className={cn("shrink-0 text-xs", rowPresentation.className)}>
-                      {rowPresentation.label}
-                    </span>
-                  </div>
-                  {pr.title?.trim() && (
-                    <div className="truncate text-ui font-medium" title={pr.title.trim()}>
-                      {pr.title.trim()}
+    <TooltipProvider delayDuration={200}>
+      <Tooltip>
+        <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+        <TooltipContent
+          data-testid="composer-pr-preview"
+          side="top"
+          sideOffset={4}
+          align="start"
+          collisionPadding={16}
+          className="block w-96 max-w-[calc(100vw-2rem)] p-0 shadow-menu ring-1 ring-foreground/10"
+        >
+          <div className="border-b border-border/50 px-3 py-2 text-xs font-medium text-muted-foreground">
+            Pull requests
+          </div>
+          <ul aria-label="Pull requests by status" className="max-h-80 overflow-y-auto p-1">
+            {prs.map((pr) => {
+              const rowStatus = getPullRequestStatus(pr);
+              const rowPresentation = pullRequestStatusPresentation(rowStatus);
+              const copy = gitProviderCopy(pr.provider, undefined, pr.provider_display);
+              const identity = `${pr.repository} ${copy.prNumberPrefix}${pr.number}`.trim();
+              return (
+                <li
+                  key={pr.url}
+                  data-pr-url={pr.url}
+                  data-pr-status={rowStatus}
+                  className="flex items-start gap-2 rounded-md px-2 py-2"
+                >
+                  <PullRequestStatusIcon status={rowStatus} className="mt-0.5 size-4 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="truncate text-xs text-muted-foreground" title={identity}>
+                        {identity}
+                      </span>
+                      <span className={cn("shrink-0 text-xs", rowPresentation.className)}>
+                        {rowPresentation.label}
+                      </span>
                     </div>
-                  )}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      </HoverCardContent>
-    </HoverCard>
+                    {pr.title?.trim() && (
+                      <div className="truncate text-ui font-medium" title={pr.title.trim()}>
+                        {pr.title.trim()}
+                      </div>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }

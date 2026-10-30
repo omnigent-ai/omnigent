@@ -1,11 +1,17 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComposerPrLink } from "./ComposerPrLink";
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 
-afterEach(cleanup);
+vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: vi.fn(() => false) }));
+
+afterEach(() => {
+  cleanup();
+  vi.mocked(useIsCoarsePointer).mockReturnValue(false);
+});
 
 describe("ComposerPrLink", () => {
   it.each(["ready", "loading", "unknown"] as const)(
@@ -114,7 +120,8 @@ describe("ComposerPrLink", () => {
     expect(screen.queryByText("#null")).toBeNull();
   });
 
-  it("shows the combined status and exposes each PR state on keyboard focus", async () => {
+  it.each([false, true])("shows each PR state on keyboard focus (coarse=%s)", async (coarse) => {
+    vi.mocked(useIsCoarsePointer).mockReturnValue(coarse);
     const prs: ComposerPullRequest[] = [
       {
         url: "https://github.com/example/app/pull/42",
@@ -160,6 +167,8 @@ describe("ComposerPrLink", () => {
     expect(screen.getByText("Merged")).toBeVisible();
     expect(screen.getByText("Previously merged work")).toBeVisible();
     expect(preview.querySelector(".lucide-git-merge")).toBeInTheDocument();
+    fireEvent.keyDown(link, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
     fireEvent.click(link);
     expect(onOpen).toHaveBeenCalledTimes(1);
   });

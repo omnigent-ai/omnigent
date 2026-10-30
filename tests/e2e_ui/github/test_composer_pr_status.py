@@ -83,36 +83,43 @@ def test_composer_pr_status_preview(
     indicator = page.get_by_test_id("composer-pr-link")
     expect(indicator).to_have_accessible_name("4 PRs", timeout=30_000)
     expect(indicator).to_have_attribute("data-pr-status", "conflict")
+    preview = page.get_by_test_id("composer-pr-preview")
     if not touch:
         indicator.hover()
-        preview = page.get_by_test_id("composer-pr-preview")
         expect(preview).to_be_visible()
-        rows = preview.get_by_role("listitem")
-        expect(rows).to_have_count(4)
-        assert rows.evaluate_all("rows => rows.map(row => row.dataset.prStatus)") == [
-            "conflict",
-            "ready",
-            "merged",
-            "closed",
-        ]
-        for row, title, label in zip(
-            rows.all(),
-            [pr["title"] for pr in [pull_requests[3], pull_requests[2], *pull_requests[:2]]],
-            ["Merge conflicts", "Ready to merge", "Merged", "Closed"],
-            strict=True,
-        ):
-            expect(row).to_contain_text(title)
-            expect(row.get_by_text(label, exact=True)).to_be_visible()
-            expect(row.locator("svg")).to_have_count(1)
-        box = preview.bounding_box()
-        assert box and box["x"] >= 16 and box["x"] + box["width"] <= viewport_width - 16
-        page.screenshot(path=tmp_path / "composer-pr-preview.png", animations="disabled")
-        page.mouse.move(0, 0)
+        page.mouse.move(0, 0, steps=10)
         expect(preview).to_be_hidden()
-        indicator.focus()
-        expect(preview).to_be_visible()
-        indicator.press("Escape")
-        expect(preview).to_be_hidden()
+
+    composer = page.get_by_placeholder("Send a message…")
+    composer.focus()
+    composer.press("Shift+Tab")
+    expect(indicator).to_be_focused()
+    expect(preview).to_be_visible()
+    preview_id = preview.get_attribute("id")
+    assert preview_id
+    expect(indicator).to_have_attribute("aria-describedby", preview_id)
+    rows = preview.get_by_role("listitem")
+    expect(rows).to_have_count(4)
+    assert rows.evaluate_all("rows => rows.map(row => row.dataset.prStatus)") == [
+        "conflict",
+        "ready",
+        "merged",
+        "closed",
+    ]
+    for row, title, label in zip(
+        rows.all(),
+        [pr["title"] for pr in [pull_requests[3], pull_requests[2], *pull_requests[:2]]],
+        ["Merge conflicts", "Ready to merge", "Merged", "Closed"],
+        strict=True,
+    ):
+        expect(row).to_contain_text(title)
+        expect(row.get_by_text(label, exact=True)).to_be_visible()
+        expect(row.locator("svg")).to_have_count(1)
+    box = preview.bounding_box()
+    assert box and box["x"] >= 16 and box["x"] + box["width"] <= viewport_width - 16
+    page.screenshot(path=tmp_path / "composer-pr-preview.png", animations="disabled")
+    indicator.press("Escape")
+    expect(preview).to_be_hidden()
     if touch:
         page.screenshot(path=tmp_path / "composer-pr-touch.png", animations="disabled")
         indicator.tap()
@@ -129,6 +136,7 @@ def test_composer_pr_status_preview(
     ).to_be_visible()
     page.screenshot(path=tmp_path / "composer-pr-panel.png", animations="disabled")
     if viewport_width >= 768:
+        page.mouse.move(0, 0, steps=10)
         indicator.hover()
         expect(preview).to_be_visible()
         page.screenshot(path=tmp_path / "composer-pr-panel-preview.png", animations="disabled")

@@ -231,7 +231,7 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
         pr_link.hover()
         preview = page.get_by_test_id("composer-pr-preview")
         expect(preview.get_by_text(f"example/repo #{pr_number}", exact=True)).to_be_visible()
-        page.mouse.move(0, 0)
+        page.mouse.move(0, 0, steps=10)
         expect(preview).to_be_hidden()
     # The PR number stays visible and the context ring stays accessible; a
     # crowded bar collapses only the directory and branch text to their icons.
