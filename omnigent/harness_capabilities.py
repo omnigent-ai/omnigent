@@ -49,6 +49,34 @@ class Resume(str, Enum):
     COLD_ONLY = "cold-only"  # rebuild from Omnigent transcript / history replay
 
 
+class PauseSemantics(str, Enum):
+    """What a Pause (interrupt) actually does to the vendor agent.
+
+    Published so a client can tell, *before* pressing Pause, whether the work
+    in flight survives. No harness freezes a turn mid-step today, so nothing
+    declares ``SUSPENDS``; the value exists because the wire contract is
+    public and a future harness may earn it.
+    """
+
+    SUSPENDS = "suspends"  # the turn freezes in place and can continue later
+    ENDS_RUN = "ends-run"  # the turn is stopped and abandoned; the work is lost
+    UNSUPPORTED = "unsupported"  # Pause does not reach the vendor agent at all
+
+
+class PauseResume(str, Enum):
+    """What a turn sent *after* a Pause continues.
+
+    ``SAME_THREAD`` means the vendor keeps the conversation it already had, so
+    the next turn lands in it. ``NEW_TURN`` means the vendor session was
+    dropped and the next turn rebuilds it from the Omnigent transcript — the
+    conversation is preserved, the vendor's own thread is not.
+    """
+
+    SAME_THREAD = "same-thread"
+    NEW_TURN = "new-turn"
+    UNSUPPORTED = "unsupported"
+
+
 class EffortFamily(str, Enum):
     """Which reasoning-effort value set applies (see reasoning_effort.py)."""
 
@@ -103,6 +131,17 @@ class InstructionDelivery(str, Enum):
     UNKNOWN = "unknown"
 
 
+#: ``resume_after_pause`` when undeclared: resident vendors keep their thread
+#: across an interrupt; SDK and CLI harnesses rebuild it from the transcript.
+RESUME_AFTER_PAUSE_BY_MODE: dict[IntegrationMode, PauseResume] = {
+    IntegrationMode.NATIVE_TUI: PauseResume.SAME_THREAD,
+    IntegrationMode.NATIVE_SERVER: PauseResume.SAME_THREAD,
+    IntegrationMode.ACP_SUBPROCESS: PauseResume.SAME_THREAD,
+    IntegrationMode.SDK_IN_PROCESS: PauseResume.NEW_TURN,
+    IntegrationMode.CLI_SUBPROCESS: PauseResume.NEW_TURN,
+}
+
+
 @dataclass(frozen=True)
 class HarnessCapabilities:
     """The declared feature set one harness supports.
@@ -117,6 +156,17 @@ class HarnessCapabilities:
     :param interrupt: Whether a running turn can be cancelled mid-stream. This
         is a *declared* claim; the harness bench's interrupt probe verifies it
         live and flags drift when a harness does not honor it.
+    :param pause: What Pause does to the vendor agent — ``ends-run`` for every
+        harness that honors an interrupt today. When *interrupt* is ``False``
+        this is normalized to ``unsupported`` silently: a declared value is
+        not an error, because the dataclass default cannot tell a declaration
+        from an omission.
+    :param resume_after_pause: What the turn after a Pause continues —
+        ``same-thread`` when the vendor keeps its own conversation across the
+        interrupt, ``new-turn`` when the vendor session is dropped and rebuilt
+        from the Omnigent transcript. Defaults by integration mode
+        (:data:`RESUME_AFTER_PAUSE_BY_MODE`); normalized to ``unsupported``
+        with *pause*.
     :param streaming: Whether the harness forwards token-level deltas (vs a
         single complete blob). Declared claim; verified by the bench's
         streaming probe.
@@ -152,6 +202,9 @@ class HarnessCapabilities:
     subagents: bool
     interrupt: bool
     streaming: bool
+    pause: PauseSemantics = PauseSemantics.ENDS_RUN
+    # ``None`` means "as the integration mode implies"; resolved in ``__post_init__``.
+    resume_after_pause: PauseResume | None = None
     steering: bool | None = None
     live_queue: bool | None = None
     images: bool | None = None
@@ -161,8 +214,29 @@ class HarnessCapabilities:
     shell_tool_prompt: str | None = None
     instruction_delivery: InstructionDelivery = InstructionDelivery.UNKNOWN
 
+    def __post_init__(self) -> None:
+        if self.resume_after_pause is None:
+            object.__setattr__(
+                self, "resume_after_pause", RESUME_AFTER_PAUSE_BY_MODE[self.integration_mode]
+            )
+        # Pause cannot end a run the harness has no way to interrupt.
+        if not self.interrupt:
+            object.__setattr__(self, "pause", PauseSemantics.UNSUPPORTED)
+            object.__setattr__(self, "resume_after_pause", PauseResume.UNSUPPORTED)
+
+    @property
+    def resume_after_pause_value(self) -> PauseResume:
+        """The resolved axis; never ``None`` after construction."""
+        assert self.resume_after_pause is not None
+        return self.resume_after_pause
+
     def as_dict(self) -> dict[str, str | bool | None]:
-        """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
+        """Return a JSON-serializable view for the ``/v1/harnesses`` catalog.
+
+        ``cancel`` is published as a constant ``True``: Omnigent's own turn
+        teardown records a cancellation and its cause whatever the vendor does,
+        so it is framework behaviour, not a per-harness claim.
+        """
         return {
             "integration_mode": self.integration_mode.value,
             "elicitation": self.elicitation.value,
@@ -173,6 +247,9 @@ class HarnessCapabilities:
             "subagents": self.subagents,
             "interrupt": self.interrupt,
             "streaming": self.streaming,
+            "pause": self.pause.value,
+            "resume_after_pause": self.resume_after_pause_value.value,
+            "cancel": True,
             "steering": self.steering,
             "live_queue": self.live_queue,
             "images": self.images,
