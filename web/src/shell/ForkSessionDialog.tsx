@@ -152,6 +152,14 @@ function ForkFieldError({ message }: { message: string | null }) {
   );
 }
 
+function sandboxRepositoryHint(count: number): string {
+  if (count === 0) return "No repositories selected. The fork starts in an empty workspace.";
+  if (count === 1) {
+    return "The agent starts in this repository. Remove it to start with an empty workspace.";
+  }
+  return "Repositories are cloned side by side. The agent starts in the directory containing them.";
+}
+
 /**
  * Compact host label for the Select item — mirrors NewChatDialog's
  * HostOption (which is private to that module).
@@ -1135,7 +1143,19 @@ function SupportedForkSessionForm({
     void fetchSessionRepositoryBranches(sourceSessionId, controller.signal)
       .then(({ repositories }) => {
         if (controller.signal.aborted) return;
-        const currentBranches = new Map(repositories.map((repo) => [repo.url, repo]));
+        const ambiguousUrls = new Set<string>();
+        for (const entries of [originals, repositories]) {
+          const seen = new Set<string>();
+          for (const repo of entries) {
+            if (seen.has(repo.url)) ambiguousUrls.add(repo.url);
+            seen.add(repo.url);
+          }
+        }
+        const currentBranches = new Map(
+          repositories
+            .filter((repo) => !ambiguousUrls.has(repo.url))
+            .map((repo) => [repo.url, repo]),
+        );
         setSandboxRepos((current) =>
           current.map((repo) => {
             const live = currentBranches.get(repo.url);
@@ -1217,6 +1237,21 @@ function SupportedForkSessionForm({
     forkEffectiveProvider !== null &&
     info.sandbox_provider_capabilities?.[forkEffectiveProvider]?.multi_repo === true;
   const maxSandboxRepos = forkProviderMultiRepo ? MAX_SANDBOX_REPOS : 1;
+  const sandboxWorkspaces = composeSandboxWorkspaces(sandboxRepos);
+  const originalSandboxWorkspaces = (sourceSandboxRepo ?? "").split(/\s+/).filter(Boolean);
+  const sandboxWorkspacesSupported = info !== "loading" && info.session_fork_workspaces === true;
+  const originalSandboxReposUnchanged =
+    sandboxWorkspaces.length === originalSandboxWorkspaces.length &&
+    sandboxWorkspaces.every((entry, index) => entry === originalSandboxWorkspaces[index]);
+  const unsupportedMultiRepoEdit =
+    !sandboxWorkspacesSupported && sandboxWorkspaces.length > 1 && !originalSandboxReposUnchanged;
+  const multiRepoUpgradeHint =
+    "Upgrade the server to change multiple repositories. You can keep the original repositories or select at most one.";
+  const sandboxWorkspaceFields = (() => {
+    if (sandboxWorkspacesSupported) return { workspaces: sandboxWorkspaces };
+    if (sandboxWorkspaces.length <= 1) return { workspace: sandboxWorkspaces[0] ?? null };
+    return {};
+  })();
   // The first field stopping submit, with the message shown under it. A coding
   // source needs a live host + valid directory; a sandbox clone needs neither
   // (the server provisions both), only a coherent repository.
@@ -1232,7 +1267,7 @@ function SupportedForkSessionForm({
         return {
           field: "sandboxRepo",
           message: isValidSandboxRepoUrl(pendingRepoUrl)
-            ? "Add this repository or clear the URL before cloning."
+            ? "Finish or clear the repository URL before cloning."
             : "Enter a repository URL like https://github.com/org/repo.",
         };
       }
@@ -1242,6 +1277,7 @@ function SupportedForkSessionForm({
           message: "Enter a repository URL like https://github.com/org/repo.",
         };
       }
+      if (unsupportedMultiRepoEdit) return { field: "sandboxRepo", message: multiRepoUpgradeHint };
       return sandboxRepos.every((repo) => isValidSandboxBranch(repo.branch))
         ? null
         : {
@@ -1434,11 +1470,11 @@ function SupportedForkSessionForm({
         config: runConfig,
         // Sandbox clone: the server provisions the host, so the fork call
         // carries the compute request itself and no launchRunner follows.
-        // An explicit empty list starts a blank sandbox instead of inheriting.
+        // Older servers accept one explicit workspace or unchanged inherited repositories.
         sandbox: sandboxSelected
           ? {
               provider: sandboxProvider,
-              workspaces: composeSandboxWorkspaces(sandboxRepos),
+              ...sandboxWorkspaceFields,
               // The new sandbox host's id; keys the fork and its requests
               // until the host binds (see NewChatDialog's managed create).
               ...(info !== "loading" && info.request_managed_sandbox_host_id
@@ -1884,13 +1920,14 @@ function SupportedForkSessionForm({
               onPendingUrlChange={setPendingRepoUrl}
             />
             <p className="text-xs text-muted-foreground">
-              {sandboxRepos.length === 0
-                ? "No repositories selected. The fork starts in an empty workspace."
-                : sandboxRepos.length === 1
-                  ? "The agent starts in this repository. Remove it to start with an empty workspace."
-                  : "Repositories are cloned side by side. The agent starts in the directory containing them."}
+              {sandboxRepositoryHint(sandboxRepos.length)}
             </p>
-            <ForkFieldError message={fieldError("sandboxRepo")} />
+            <ForkFieldError
+              message={
+                fieldError("sandboxRepo") ??
+                (unsupportedMultiRepoEdit ? multiRepoUpgradeHint : null)
+              }
+            />
           </section>
         )}
 

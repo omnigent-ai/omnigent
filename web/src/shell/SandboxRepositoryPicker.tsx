@@ -29,11 +29,14 @@ function repoCloneUrl(repo: GithubRepo): string {
 }
 
 function repoIdentity(url: string): string {
-  return url
+  const normalized = url
     .trim()
     .replace(/^git@([^:]+):/, "https://$1/")
-    .replace(/\/+$/, "")
-    .replace(/\.git$/, "");
+    .replace(/\/+$/, "");
+  const identity = /^https:\/\/github\.com\//i.test(normalized)
+    ? normalized.toLowerCase()
+    : normalized;
+  return identity.replace(/\.git$/, "");
 }
 
 function SandboxRepoCombobox({
@@ -191,7 +194,7 @@ function SandboxRepoBranchSelect({
                   data-checked={branch === value}
                   onSelect={() => chooseBranch(branch)}
                 >
-                  {branch}
+                  {branch === repo.default_branch ? `${branch} (pinned)` : branch}
                 </CommandItem>
               ))}
               {showCustomBranch && (
@@ -271,6 +274,7 @@ export function SandboxRepositoryPicker({
       selections[index]?.url,
     );
   };
+  const repositoryOccurrences = new Map<string, number>();
   return (
     <div className="flex min-w-0 flex-col gap-2" data-testid={`${testIdPrefix}-picker`}>
       {selections.length > maxRepos && (
@@ -281,6 +285,8 @@ export function SandboxRepositoryPicker({
         </p>
       )}
       {selections.map((selection, index) => {
+        const occurrence = repositoryOccurrences.get(selection.url) ?? 0;
+        repositoryOccurrences.set(selection.url, occurrence + 1);
         const repo = repos.find(
           (item) => repoIdentity(repoCloneUrl(item)) === repoIdentity(selection.url),
         );
@@ -289,7 +295,11 @@ export function SandboxRepositoryPicker({
         const note = invalidBranch ? INVALID_BRANCH_MESSAGE : branchNotes?.[selection.url];
         const descriptionId = note ? `${testIdPrefix}-branch-note-${index}` : undefined;
         return (
-          <div key={selection.url} className="min-w-0" data-testid={`${testIdPrefix}-row`}>
+          <div
+            key={`${selection.url}:${occurrence}`}
+            className="min-w-0"
+            data-testid={`${testIdPrefix}-row`}
+          >
             <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1.5 py-1 sm:flex sm:gap-2 sm:py-0">
               <span
                 className="col-start-1 row-start-1 min-w-0 flex-1 truncate text-sm"
@@ -404,7 +414,7 @@ export function SandboxRepositoryPicker({
           {(invalidUrl || duplicateUrl) && (
             <p id={`${testIdPrefix}-input-error`} className="text-xs text-destructive">
               {duplicateUrl
-                ? "This repository is already selected. Change its branch above."
+                ? "This repository is already selected. Clear this URL to continue."
                 : "Enter an HTTPS or SSH repository URL."}
             </p>
           )}

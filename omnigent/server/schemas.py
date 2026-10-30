@@ -2830,6 +2830,7 @@ class SessionForkRequest(BaseModel):
         an external fork's directory is chosen when it binds a host.
     :param workspaces: Repository URLs (each optionally ``#<branch>``) to
         clone into the fork's sandbox, replacing the source's repositories.
+        Send only when ``GET /v1/info`` reports ``session_fork_workspaces``.
         Several repositories require a provider with ``multi_repo`` support.
         Mutually exclusive with ``workspace``; explicitly sending ``[]`` or
         ``null`` gives the fork an empty sandbox. Only valid with

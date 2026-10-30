@@ -63,6 +63,7 @@ def _sandbox_source(chat: ChatSessionContract) -> list[dict[str, Any]]:
             "single_user": True,
             "needs_setup": False,
             "managed_sandboxes_enabled": True,
+            "session_fork_workspaces": True,
             "sandbox_provider": "agent_sandbox",
             "sandbox_providers": ["agent_sandbox", "modal"],
             "sandbox_provider_capabilities": {
@@ -157,7 +158,7 @@ def test_sandbox_fork_edits_multiple_repositories_and_branches(
     chat_session_contract: ChatSessionContract,
     entry: str,
 ) -> None:
-    """Each fork entry prefills available branches and sends edited selections."""
+    """Fork entries share prefill; desktop/mobile edit and message forks retain cutoff."""
     chat = chat_session_contract
     page.set_viewport_size(
         {"width": 390, "height": 844}
@@ -177,26 +178,38 @@ def test_sandbox_fork_edits_multiple_repositories_and_branches(
     )
     branch_note = dialog.get_by_text("“wip/customer-checkout” isn’t pushed. Using main.")
     expect(branch_note).to_be_visible()
-    dialog.get_by_role("combobox", name="Branch for acme/delivery-api").click()
-    page.get_by_role("option", name="release/stable", exact=True).click()
-    expect(branch_note).to_be_visible()
-    dialog.get_by_role("button", name="Remove acme/customer-web").click()
-    expect(branch_note).to_have_count(0)
-    dialog.get_by_role("combobox", name="GitHub repository").click()
-    page.get_by_placeholder("Search repositories…").fill("shared")
-    page.get_by_role("option", name="acme/shared-contracts").click()
-    dialog.get_by_role("combobox", name="Branch for acme/shared-contracts").click()
-    page.get_by_placeholder("Search or enter a branch…").fill("release/checkout")
-    page.get_by_role("option", name="Use “release/checkout”").click()
-    expect(dialog.get_by_test_id("fork-session-sandbox-repo-row")).to_have_count(2)
+
+    if entry.startswith("sidebar"):
+        assert requests == []
+        assert chat.session_patches == []
+        return
+
+    expected_workspaces = [
+        "https://github.com/acme/delivery-api.git#feature/checkout",
+        "https://github.com/acme/customer-web.git#main",
+    ]
+    if entry != "message":
+        dialog.get_by_role("combobox", name="Branch for acme/delivery-api").click()
+        page.get_by_role("option", name="release/stable", exact=True).click()
+        expect(branch_note).to_be_visible()
+        dialog.get_by_role("button", name="Remove acme/customer-web").click()
+        expect(branch_note).to_have_count(0)
+        dialog.get_by_role("combobox", name="GitHub repository").click()
+        page.get_by_placeholder("Search repositories…").fill("shared")
+        page.get_by_role("option", name="acme/shared-contracts").click()
+        dialog.get_by_role("combobox", name="Branch for acme/shared-contracts").click()
+        page.get_by_placeholder("Search or enter a branch…").fill("release/checkout")
+        page.get_by_role("option", name="Use “release/checkout”").click()
+        expect(dialog.get_by_test_id("fork-session-sandbox-repo-row")).to_have_count(2)
+        expected_workspaces = [
+            "https://github.com/acme/delivery-api.git#release/stable",
+            "https://github.com/acme/shared-contracts.git#release/checkout",
+        ]
 
     dialog.get_by_test_id("fork-session-submit").click()
     expect(page).to_have_url(f"{chat.base_url}/c/{_FORK_ID}")
     assert len(requests) == 1
-    assert requests[0]["workspaces"] == [
-        "https://github.com/acme/delivery-api.git#release/stable",
-        "https://github.com/acme/shared-contracts.git#release/checkout",
-    ]
+    assert requests[0]["workspaces"] == expected_workspaces
     assert requests[0]["sandbox_provider"] == "agent_sandbox"
     assert requests[0].get("up_to_response_id") == (
         "checkout-response" if entry == "message" else None

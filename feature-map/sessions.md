@@ -609,11 +609,13 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/browser_ui/chat/test_fork_sandbox_repositories.py::test_sandbox_fork_edits_multiple_repositories_and_branches`
   runs without a repro instance using `uv run pytest <test>
 --browser-ui-skip-build --video=on --output=<evidence-directory>`.
-  Each entry checks current-branch prefilling and the unpushed-branch fallback,
-  edits an inherited multi-repository selection, removes one repo, searches for
-  another, chooses independent branches, and checks the fork request and
-  navigation. The built SPA uses mocked sandbox and GitHub responses; this proves
-  browser behavior and the submitted payload, not sandbox provisioning.
+  Each entry checks current-branch prefilling and the unpushed-branch fallback.
+  Desktop and phone header variants remove a repo, search for another, choose
+  independent branches, and check the fork request and navigation. The message
+  variant submits the inherited selection and checks the history cutoff; sidebar
+  variants stop after opening and checking the prefill. The built SPA uses mocked
+  sandbox and GitHub responses and advertises support for editable fork workspaces;
+  this proves browser behavior and the submitted payload, not sandbox provisioning.
 - **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
   `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
   runs without a repro instance using `uv run pytest <test>

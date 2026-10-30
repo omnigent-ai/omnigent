@@ -254,6 +254,8 @@ class ServerInfoResponse(BaseModel):
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
+    # A managed fork accepts ``workspaces``; older servers reject the field.
+    session_fork_workspaces: bool = True
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -3501,6 +3503,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,
+                "session_fork_workspaces": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit

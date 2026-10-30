@@ -1276,7 +1276,12 @@ Request body matches `SessionForkRequest`:
 
   workspaces (array of strings | null, optional)
     Repository URLs, each optionally `#<branch>`, replacing the source's
-    selection. Accepts up to 10 repositories. Several repositories require
+    selection. Send only when `GET /v1/info` reports
+    `session_fork_workspaces: true`; older servers reject this field.
+    Without it, use `workspace` for zero/one repository, omit both fields
+    to inherit unchanged repositories, and require a server upgrade for
+    changes to a multi-repository selection.
+    Accepts up to 10 repositories. Several repositories require
     a sandbox provider with `multi_repo` support and are cloned as siblings;
     the session starts in their parent directory. Sending `[]` or null
     starts an empty sandbox. Mutually exclusive with `workspace`, including

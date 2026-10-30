@@ -6079,6 +6079,11 @@
             "title": "Session Event Types",
             "type": "array"
           },
+          "session_fork_workspaces": {
+            "default": true,
+            "title": "Session Fork Workspaces",
+            "type": "boolean"
+          },
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
@@ -6855,7 +6860,7 @@
                 "type": "null"
               }
             ],
-            "description": "Repository URLs (each optionally `#<branch>`) to clone into the fork's sandbox, replacing the source's repositories. Several repositories require a provider with `multi_repo` support. Mutually exclusive with `workspace`; explicitly sending `[]` or `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"`.",
+            "description": "Repository URLs (each optionally `#<branch>`) to clone into the fork's sandbox, replacing the source's repositories. Send only when `GET /v1/info` reports `session_fork_workspaces`. Several repositories require a provider with `multi_repo` support. Mutually exclusive with `workspace`; explicitly sending `[]` or `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"`.",
             "title": "Workspaces"
           }
         },

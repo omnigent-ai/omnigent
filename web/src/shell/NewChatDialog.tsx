@@ -5055,7 +5055,7 @@ export function NewChatLandingScreen() {
                   maxSandboxRepos === 1 ? "repository" : "repositories"
                 } — remove the extras`
               : sandboxSelected && sandboxRepoPending
-                ? "Add the repository or clear its URL before starting"
+                ? "Finish or clear the repository URL before starting"
                 : sandboxSelected && !sandboxBranchesValid
                   ? "Please enter a valid repository branch"
                   : sandboxSelected && !sandboxRepoValid

@@ -4306,13 +4306,8 @@ def register_core_routes(
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
 
-        # Managed host: schedule the fork's own BACKGROUND sandbox provision
-        # and return immediately, exactly like a managed create. The host is
-        # registered to the forking caller, so the sandbox resolves THEIR
-        # credentials, never the source owner's. Omitted workspace fields inherit
-        # ALL of the repositories the source recorded (read off the SOURCE,
-        # since a fork never inherits the labels itself), so cloning a
-        # multi-repo sandbox session lands the fork with every repo.
+        # Provision in the background with the caller's credentials. Use explicit
+        # workspaces, else workspace, else every repository recorded on the source.
         try:
             if body.host_type == "managed":
                 if "workspaces" in fields_set:

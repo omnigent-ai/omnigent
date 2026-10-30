@@ -74,21 +74,21 @@ describe("SandboxRepositoryPicker", () => {
 
   it("matches pasted clone URLs to GitHub repositories and excludes selected repositories", async () => {
     const { onChange } = renderPicker([
-      { url: "git@github.com:org/api", branch: "feature/orders" },
+      { url: "git@GitHub.com:Org/API", branch: "feature/orders" },
     ]);
     await screen.findByRole("combobox", { name: "Branch for org/api" });
     fireEvent.click(screen.getByRole("combobox", { name: "GitHub repository" }));
     expect(screen.queryByRole("option", { name: /org\/api/ })).toBeNull();
     fireEvent.click(screen.getByRole("option", { name: /org\/web/ }));
     expect(onChange).toHaveBeenLastCalledWith([
-      { url: "git@github.com:org/api", branch: "feature/orders" },
+      { url: "git@GitHub.com:Org/API", branch: "feature/orders" },
       { url: "https://github.com/org/web.git", branch: "" },
     ]);
     fireEvent.change(screen.getByRole("textbox", { name: "Repository URL" }), {
-      target: { value: "https://github.com/org/api.git/" },
+      target: { value: "https://GitHub.com/ORG/api.git/" },
     });
     expect(
-      screen.getByText("This repository is already selected. Change its branch above."),
+      screen.getByText("This repository is already selected. Clear this URL to continue."),
     ).toBeVisible();
     expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
   });
@@ -116,6 +116,55 @@ describe("SandboxRepositoryPicker", () => {
     fireEvent.click(screen.getByRole("combobox", { name: "Branch for org/api" }));
     fireEvent.click(screen.getByRole("option", { name: "Default (main)" }));
     expect(onChange).toHaveBeenLastCalledWith([{ url: REPOSITORIES[0].clone_url, branch: "" }]);
+  });
+
+  it("distinguishes an inherited pinned default branch from following the default", async () => {
+    const { onChange } = renderPicker([{ url: REPOSITORIES[0].clone_url!, branch: "main" }]);
+    const branchPicker = await screen.findByRole("combobox", { name: "Branch for org/api" });
+    fireEvent.click(branchPicker);
+    expect(screen.getByRole("option", { name: "Default (main)" })).toHaveAttribute(
+      "data-checked",
+      "false",
+    );
+    const pinned = screen.getByRole("option", { name: "main (pinned)" });
+    expect(pinned).toHaveAttribute("data-checked", "true");
+    fireEvent.click(pinned);
+    expect(onChange).toHaveBeenLastCalledWith([{ url: REPOSITORIES[0].clone_url, branch: "main" }]);
+    fireEvent.click(branchPicker);
+    fireEvent.click(screen.getByRole("option", { name: "Default (main)" }));
+    expect(onChange).toHaveBeenLastCalledWith([{ url: REPOSITORIES[0].clone_url, branch: "" }]);
+  });
+
+  it("edits and removes inherited duplicate repositories independently", async () => {
+    const url = "https://git.example.com/org/api";
+    const { onChange } = renderPicker([
+      { url, branch: "main" },
+      { url, branch: "stable" },
+    ]);
+    const branches = screen.getAllByRole("textbox", { name: "Branch for api" });
+    fireEvent.change(branches[1], { target: { value: "release" } });
+    expect(branches[0]).toHaveValue("main");
+    expect(onChange).toHaveBeenLastCalledWith([
+      { url, branch: "main" },
+      { url, branch: "release" },
+    ]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove api" })[0]);
+    expect(screen.getByRole("textbox", { name: "Branch for api" })).toHaveValue("release");
+    expect(onChange).toHaveBeenLastCalledWith([{ url, branch: "release" }]);
+    await waitFor(() => expect(fetchGithubRepos).toHaveBeenCalledOnce());
+  });
+
+  it("keeps path casing significant for repositories outside GitHub", async () => {
+    const { onChange } = renderPicker([{ url: "https://git.example.com/Org/API", branch: "" }]);
+    fireEvent.change(screen.getByRole("textbox", { name: "Repository URL" }), {
+      target: { value: "https://git.example.com/org/api" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    expect(onChange).toHaveBeenLastCalledWith([
+      { url: "https://git.example.com/Org/API", branch: "" },
+      { url: "https://git.example.com/org/api", branch: "" },
+    ]);
+    await waitFor(() => expect(fetchGithubRepos).toHaveBeenCalledOnce());
   });
 
   it("loads only the opened repository's branches and reuses them when reopened", async () => {
