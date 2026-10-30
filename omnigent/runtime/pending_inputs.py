@@ -98,7 +98,9 @@ text-matched mirror skips it (see :func:`resolve_matching_text`) and the
 persist site records it as undelivered; :data:`_TTL_S` bounds a ghost no
 later message follows: stale entries are evicted lazily on the next
 :func:`record` / :func:`snapshot_for` / :func:`resolve_oldest` for the
-same conversation.
+same conversation. A watched entry (:func:`watch_expiry`) is kept past
+the TTL instead, and the server records it as undelivered once its session
+is idle, so the message is not dropped without a card.
 """
 
 from __future__ import annotations
@@ -122,6 +124,8 @@ from omnigent.native.input_diagnostics import input_attributes, log_input_event
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
+# Public name for watchers that schedule themselves just past the TTL.
+TTL_S: float = _TTL_S
 
 # Hard cap on unheld queued entries per conversation, enforced by
 # :func:`record`: the oldest unheld entries are evicted when a new one would
@@ -317,6 +321,8 @@ class _Entry:
     held: bool = False
     uncertain: bool = False
     interrupted: bool = False
+    # Set by :func:`watch_expiry`: the entry is kept past the TTL and settled by the caller.
+    expiry_watched: bool = False
     input_enqueued_at_ms: int | None = field(default_factory=lambda: int(time.time() * 1000))
     delivery_attempt_id: str | None = field(default_factory=lambda: uuid.uuid4().hex)
     last_delivery_stage: str = "server_queued"
@@ -349,7 +355,11 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
     entries = _pending.get(conversation_id)
     if entries is None:
         return
-    stale = [pid for pid, entry in entries.items() if now - entry.created_at > _TTL_S]
+    stale = [
+        pid
+        for pid, entry in entries.items()
+        if now - entry.created_at > _TTL_S and not entry.expiry_watched
+    ]
     for pid in stale:
         entries.pop(pid, None)
     if not entries:
@@ -691,6 +701,67 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
             entries.pop(oldest_id)
             if not entries:
                 _pending.pop(conversation_id, None)
+        return _drained_input(entry)
+
+
+def watch_expiry(conversation_id: str, pending_id: str) -> bool:
+    """
+    Keep one queued entry past :data:`_TTL_S` until the caller settles it.
+
+    Without this an entry is dropped silently at the TTL, so a message that was
+    never recorded disappears with no error. The caller polls
+    :func:`expire_pending_input` once the entry is stale and the session is
+    idle, and records the message as undelivered. While the session is busy the
+    entry stays matchable, so a mirror that arrives late still drains it.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The id returned by :func:`record`.
+    :returns: ``True`` when the entry is queued and now watched.
+    """
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is None:
+            return False
+        entry.expiry_watched = True
+        return True
+
+
+def is_queued(conversation_id: str, pending_id: str) -> bool:
+    """
+    Report whether an entry is still queued (held or not).
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The id returned by :func:`record`.
+    :returns: ``True`` until the entry is drained, resolved, or expired.
+    """
+    with _lock:
+        return pending_id in _pending.get(conversation_id, {})
+
+
+def expire_pending_input(conversation_id: str, pending_id: str) -> DrainedInput | None:
+    """
+    Remove a watched entry that outlived the TTL and return it for undelivered recording.
+
+    Returns ``None`` (and removes the entry quietly) when the entry was
+    interrupted, may have been settled by a positional drain, or is a slash
+    command Claude runs itself: none of those is a message the agent failed to
+    record. Also ``None`` while the entry is still fresh or held by a persist
+    in progress.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The id returned by :func:`record`.
+    :returns: The expired entry to record as undelivered, or ``None``.
+    """
+    with _lock:
+        entries = _pending.get(conversation_id)
+        entry = entries.get(pending_id) if entries is not None else None
+        if entries is None or entry is None or entry.held or _now() - entry.created_at <= _TTL_S:
+            return None
+        entries.pop(pending_id, None)
+        if not entries:
+            _pending.pop(conversation_id, None)
+        if entry.interrupted or entry.uncertain or _is_slash_led(entry):
+            return None
         return _drained_input(entry)
 
 
@@ -1074,6 +1145,11 @@ def _prefer_live(candidates: list[int], interrupted: list[bool]) -> int | None:
 def _collapse_whitespace(text: str) -> str:
     """Collapse whitespace runs so paste and mirror spacing differences cancel out."""
     return " ".join(text.split())
+
+
+def _is_slash_led(entry: _Entry) -> bool:
+    """Whether the entry is a slash command Claude runs itself, not a recorded message."""
+    return _collapse_whitespace(_content_text(entry.content)).startswith("/")
 
 
 def _attachment_count(content: list[dict[str, Any]]) -> int:
