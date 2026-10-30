@@ -48,6 +48,8 @@ No agent turn or provider credentials are needed.
 
 - Clearing local storage, using a different browser/device, or changing users or
   servers shows the guide again. Completion is not synced to an account.
+- If an embedded host does not identify its backend, dismissal lasts only until
+  the guide unmounts or the host configuration changes; it is not saved or shared with other tabs.
 - If browser storage is blocked, the guide still closes but cannot remember the
   dismissal after remounting.
 - Next and selecting a feature do not mark the introduction as seen.

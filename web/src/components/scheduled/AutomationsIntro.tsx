@@ -18,7 +18,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { withBasePath } from "@/lib/basePath";
 import { useAppName } from "@/lib/branding";
-import { getOmnigentServerIdentity } from "@/lib/host";
+import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
@@ -26,6 +26,8 @@ interface Step {
   id: "schedule" | "watch" | "context" | "configure";
   title: string;
   description: string;
+  caption: string;
+  result?: string;
   icon: LucideIcon;
 }
 
@@ -35,12 +37,20 @@ export function AutomationsIntro({ onClose }: { onClose: () => void }) {
   const viewerId = useViewerId();
   const rebasePath = useRebasePath();
   if (info === "loading" || viewerId === null) return null;
-  const storageKey = `omnigent:automations-intro:v1:${JSON.stringify([
-    getOmnigentServerIdentity() ?? window.location.origin,
-    withBasePath(rebasePath("/")),
-    viewerId,
-  ])}`;
-  return <IntroDialog key={storageKey} storageKey={storageKey} info={info} onClose={onClose} />;
+  const server = getOmnigentServerIdentity();
+  const mountPath = withBasePath(rebasePath("/"));
+  const storageKey =
+    server === null
+      ? null
+      : `omnigent:automations-intro:v1:${JSON.stringify([server, mountPath, viewerId])}`;
+  return (
+    <IntroDialog
+      key={storageKey ?? JSON.stringify([getOmnigentHostGeneration(), mountPath, viewerId])}
+      storageKey={storageKey}
+      info={info}
+      onClose={onClose}
+    />
+  );
 }
 
 function IntroDialog({
@@ -48,12 +58,13 @@ function IntroDialog({
   info,
   onClose,
 }: {
-  storageKey: string;
+  storageKey: string | null;
   info: ServerInfo;
   onClose: () => void;
 }) {
   const appName = useAppName();
   const [open, setOpen] = useState(() => {
+    if (storageKey === null) return true;
     try {
       return localStorage.getItem(storageKey) !== "seen";
     } catch {
@@ -62,6 +73,7 @@ function IntroDialog({
   });
   const [stepIndex, setStepIndex] = useState(0);
   useEffect(() => {
+    if (storageKey === null) return;
     function onStorage(event: StorageEvent) {
       if (event.key === storageKey && event.newValue === "seen") setOpen(false);
     }
@@ -71,6 +83,7 @@ function IntroDialog({
 
   function dismiss() {
     setOpen(false);
+    if (storageKey === null) return;
     try {
       localStorage.setItem(storageKey, "seen");
     } catch {
@@ -84,6 +97,8 @@ function IntroDialog({
       title: "Run on a schedule",
       description:
         "Set a recurring time for your agent to investigate issues, review code, or prepare a report.",
+      caption: "Every weekday · 9:00 AM",
+      result: "Your results, ready to review",
       icon: Clock3Icon,
     },
   ];
@@ -93,6 +108,8 @@ function IntroDialog({
       title: "Watch for new work",
       description:
         "Use Jira, Slack, or GitHub templates to check periodically and start sessions for matching items. Your agent needs access to the service.",
+      caption: "Jira · Slack · GitHub",
+      result: "Start work on matching items",
       icon: SearchIcon,
     });
   }
@@ -102,6 +119,8 @@ function IntroDialog({
       title: "Keep context between runs",
       description:
         "Start fresh each run, or continue one session so your agent can build on its earlier work.",
+      caption: "Continue one session",
+      result: "Build on what you learned",
       icon: Repeat2Icon,
     });
   }
@@ -111,6 +130,7 @@ function IntroDialog({
     description: info.managed_sandboxes_enabled
       ? "Choose your agent and a connected computer or available sandbox. Customize model and permission settings where supported."
       : "Choose your agent and connected computer. Keep the server and computer running, and customize model and permission settings where supported.",
+    caption: "Your agent · Your instructions",
     icon: SlidersHorizontalIcon,
   });
   const activeIndex = Math.min(stepIndex, steps.length - 1);
@@ -206,15 +226,7 @@ function IntroDialog({
               />
             </div>
             <div className="relative md:hidden" aria-hidden="true">
-              <IllustrationCard icon={activeStep.icon}>
-                {activeStep.id === "schedule"
-                  ? "Every weekday · 9:00 AM"
-                  : activeStep.id === "watch"
-                    ? "Jira · Slack · GitHub"
-                    : activeStep.id === "context"
-                      ? "Continue one session"
-                      : "Your agent · Your instructions"}
-              </IllustrationCard>
+              <IllustrationCard icon={activeStep.icon}>{activeStep.caption}</IllustrationCard>
             </div>
             <p
               aria-live="polite"
@@ -279,23 +291,15 @@ function StepIllustration({
   return (
     <>
       <IllustrationCard icon={step.icon}>
-        {step.id === "schedule"
-          ? "Every weekday · 9:00 AM"
-          : step.id === "watch"
-            ? "Jira · Slack · GitHub"
-            : "Earlier work"}
+        {step.id === "context" ? "Earlier work" : step.caption}
       </IllustrationCard>
       <ArrowDownIcon className="my-3 size-5 text-muted-foreground/50" />
       <IllustrationCard icon={SparklesIcon}>
-        {step.id === "context" ? "Continue one session" : appName}
+        {step.id === "context" ? step.caption : appName}
       </IllustrationCard>
       <ArrowDownIcon className="my-3 size-5 text-muted-foreground/50" />
       <IllustrationCard icon={step.id === "watch" ? GitPullRequestIcon : MessageSquareIcon}>
-        {step.id === "watch"
-          ? "Start work on matching items"
-          : step.id === "context"
-            ? "Build on what you learned"
-            : "Your results, ready to review"}
+        {step.result}
       </IllustrationCard>
     </>
   );

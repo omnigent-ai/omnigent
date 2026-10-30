@@ -1,11 +1,16 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AutomationsIntro } from "./AutomationsIntro";
 import { useViewerId } from "@/hooks/useViewerId";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
-import { setEmbedRoot, setOmnigentHostConfig } from "@/lib/host";
+import {
+  getOmnigentHostConfig,
+  setEmbedRoot,
+  setOmnigentHostConfig,
+  type OmnigentHostConfig,
+} from "@/lib/host";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
@@ -18,15 +23,12 @@ const fullInfo: ServerInfo = {
   features: { session_orchestration: true },
 };
 
-function intro(info: ServerInfo | "loading" = fullInfo, basename = "") {
+function intro(info: ServerInfo | "loading" = fullInfo, basename = "", onClose = () => {}) {
   return (
     <MemoryRouter>
       <RoutingProvider value={basenamedRouting(basename)}>
         <CapabilitiesProvider info={info}>
-          <button type="button" data-testid="new-task-button">
-            New automation
-          </button>
-          <AutomationsIntro onClose={() => {}} />
+          <AutomationsIntro onClose={onClose} />
         </CapabilitiesProvider>
       </RoutingProvider>
     </MemoryRouter>
@@ -70,13 +72,14 @@ describe("Automations first-visit introduction", () => {
     view.unmount();
     render(intro());
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Guide" })).not.toBeInTheDocument();
   });
 
-  it.each(["Maybe later", "Close", "Escape"])("remembers dismissal with %s", (action) => {
-    const view = render(intro());
+  it.each(["Maybe later", "Close", "Escape"])("remembers dismissal with %s", async (action) => {
+    const onClose = vi.fn();
+    const view = render(intro(fullInfo, "", onClose));
     if (action === "Escape") fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
     else fireEvent.click(screen.getByRole("button", { name: action }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     view.unmount();
     render(intro());
@@ -98,6 +101,43 @@ describe("Automations first-visit introduction", () => {
     fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
     view.rerender(intro(fullInfo, "/another-mount"));
     expect(screen.getByRole("dialog")).toBeVisible();
+  });
+
+  it("does not reuse or persist dismissal for embedded backends without an identity", () => {
+    const standalone = render(intro());
+    fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+    const originKey = localStorage.key(0)!;
+    standalone.unmount();
+
+    const previousConfig = getOmnigentHostConfig();
+    const embeddedConfig: OmnigentHostConfig = { fetcher: vi.fn() };
+    const write = vi.spyOn(Storage.prototype, "setItem");
+    try {
+      setOmnigentHostConfig(embeddedConfig);
+      const backendA = render(intro());
+      expect(screen.getByRole("dialog")).toBeVisible();
+      fireEvent(window, new StorageEvent("storage", { key: originKey, newValue: "seen" }));
+      expect(screen.getByRole("dialog")).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      backendA.rerender(intro());
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+      embeddedConfig.fetcher = vi.fn();
+      setOmnigentHostConfig(embeddedConfig);
+      backendA.rerender(intro());
+      expect(screen.getByRole("dialog")).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+      expect(write).not.toHaveBeenCalled();
+      backendA.unmount();
+      const remounted = render(intro());
+      expect(screen.getByRole("dialog")).toBeVisible();
+      remounted.unmount();
+    } finally {
+      // The host setter preserves an installed fetcher unless its owner removes it.
+      delete embeddedConfig.fetcher;
+      setOmnigentHostConfig(previousConfig);
+    }
   });
 
   it("only describes capabilities the deployment supports", () => {

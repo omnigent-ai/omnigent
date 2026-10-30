@@ -237,7 +237,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
 
   return (
     <PageScroll contentClassName="px-4 md:px-6">
-      {!isLoading && !isError && (
+      {tasks !== undefined && (
         <AutomationsIntro onClose={() => newTaskButtonRef.current?.focus()} />
       )}
       <div className="mb-6 flex items-start justify-between gap-4">

@@ -262,6 +262,8 @@ def test_automations_introduction_first_visit(
     intro = page.get_by_role("dialog", name="Introducing Automations")
     expect(intro).to_be_visible(timeout=30_000)
     expect(intro.get_by_role("listitem")).to_have_count(4)
+    page.mouse.click(2, 2)
+    expect(intro).to_be_visible()
     for _ in range(3):
         intro.get_by_role("button", name="Next", exact=True).click()
     expect(intro.get_by_text("4 of 4 · Make it yours")).to_be_visible()
