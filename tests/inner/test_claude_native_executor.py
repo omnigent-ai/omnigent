@@ -1851,17 +1851,19 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     pane = "❯ "
+    cursor_offset = 0
     enters = 0
     prompt_pending = False
     killed: list[Path] = []
 
     def run_tmux(socket_path: str, *args: str) -> None:
-        nonlocal pane, enters, prompt_pending
+        nonlocal pane, cursor_offset, enters, prompt_pending
         del socket_path
-        if args[-1] == "Space":
+        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
             pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
+            cursor_offset = 1
+        elif args[-1] == "BSpace":
+            cursor_offset = max(0, cursor_offset - 1)
         elif args[0] == "paste-buffer":
             pane = "❯ review this function"
             prompt_pending = not submitted
@@ -1889,6 +1891,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_a: pane)
+    monkeypatch.setattr(claude_bridge, "_composer_cursor_offset", lambda *_a: cursor_offset)
     monkeypatch.setattr(claude_bridge, "_has_approval_wait", lambda _bridge: prompt_pending)
     monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.0)

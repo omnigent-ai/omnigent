@@ -15,6 +15,7 @@ import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import ClaudeUserPromptPending, write_tmux_target
+from tests.harnesses.claude_native.test_claude_native_bridge import _composer_pane, _fake_tmux
 
 _RULE = "──────────────────────────────"
 _PERMISSION_PROMPT = (
@@ -99,7 +100,19 @@ def test_a_prompt_after_the_paste_is_not_retryable(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The draft is in the box by then; a retry could append to it."""
-    _show(monkeypatch, f"{_RULE}\n❯ hi\n{_RULE}\n  ? for shortcuts\n")
+    draft = ""
+
+    def run_tmux(_socket_path: str, *args: str) -> None:
+        nonlocal draft
+        if args[0] == "paste-buffer":
+            draft = "hi"
+
+    _fake_tmux(monkeypatch, [_composer_pane()], on_send=run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_args, **_kw: f"{_RULE}\n❯ {draft}\n{_RULE}\n  ? for shortcuts\n",
+    )
     checks = iter([False, True])
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _dir: next(checks))
 

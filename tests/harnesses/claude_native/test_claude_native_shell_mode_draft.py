@@ -73,11 +73,14 @@ class _InputBox:
                 self.mode = "prompt"
         elif key == "\x1b[97;5u":
             self.cursor = self.draft.rfind("\n", 0, self.cursor) + 1
-        elif key == "Space":
+        elif key in {"Space", " "}:
             self.draft = self.draft[: self.cursor] + " " + self.draft[self.cursor :]
             self.cursor += 1
+        elif key == "BSpace" and self.cursor:
+            self.draft = self.draft[: self.cursor - 1] + self.draft[self.cursor :]
+            self.cursor -= 1
         elif key == "Enter":
-            self.submitted.append((self.mode, self.draft.strip()))
+            self.submitted.append((self.mode, self.draft.removesuffix("\n")))
             self.draft = ""
             self.cursor = 0
 
@@ -103,6 +106,8 @@ def _patch_tmux(
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
+        if cmd[-1] == "#{cursor_x} #{cursor_y}":
+            return SimpleNamespace(returncode=0, stdout=f"{box.cursor + 2} 1\n", stderr="")
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=box.pane(), stderr="")
         calls.append(cmd)
@@ -162,14 +167,30 @@ def test_an_empty_shell_mode_box_is_still_escaped(
 
 @pytest.mark.parametrize("draft", ["one\ntwo\nthree", "\none\ntwo"])
 @pytest.mark.parametrize("cursor", [0, 6, None], ids=["start", "middle", "end"])
+@pytest.mark.parametrize(
+    "first_capture_empty", [False, True], ids=["visible", "after-blank-capture"]
+)
 def test_a_multiline_shell_draft_is_cleared_before_web_input(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft: str, cursor: int | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft: str,
+    cursor: int | None,
+    first_capture_empty: bool,
 ) -> None:
     """Line edits reclaim shell drafts without executing any leftover command."""
     box = _InputBox("bash", draft, cursor=cursor)
     bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="hello from the web")
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.1)
+    capture = claude_native_bridge._capture_pane
+    captures = 0
 
-    inject_user_message(bridge_dir, content="hello from the web")
+    def capture_after_blank(socket_path: str, tmux_target: str, **kwargs: object) -> str:
+        nonlocal captures
+        captures += 1
+        return "" if first_capture_empty and captures == 1 else capture(socket_path, tmux_target)
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture_after_blank)
+    inject_user_message(bridge_dir, content="hello from the web", timeout_s=0.1)
 
     assert box.submitted == [("prompt", "hello from the web")]
 
