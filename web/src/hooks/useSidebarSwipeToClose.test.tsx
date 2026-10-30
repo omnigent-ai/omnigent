@@ -139,20 +139,51 @@ describe("useSidebarSwipeToClose", () => {
   });
 
   it.each([
-    ["at 0.62 px/ms", 31, 100, true],
-    ["below 0.6 px/ms", 29, 100, false],
-    ["lifted 100 ms after the last move", 31, 190, true],
-    ["lifted 101 ms after the last move", 31, 191, false],
-  ])("treats a short drag as a flick only %s", (_label, lastMovePx, liftAt, close) => {
+    ["at 0.62 px/ms", 31, 200, true],
+    ["below 0.6 px/ms", 29, 200, false],
+    ["lifted 100 ms after the last move", 31, 200, true],
+    ["lifted 101 ms after the last move", 31, 201, false],
+  ])("treats a short drag as a flick only %s", (_label, stepPx, liftAt, close) => {
+    const { getByTestId, onSettle } = setup();
+    const row = getByTestId("row");
+
+    // Two even moves, so the speed over the 100 ms window is stepPx / 50.
+    touch(row, "touchstart", 200, 100, 0);
+    touch(row, "touchmove", 200 - stepPx, 100, 50);
+    touch(row, "touchmove", 200 - 2 * stepPx, 100, 100);
+    touch(row, "touchend", 0, 0, liftAt);
+
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(close);
+  });
+
+  it("does not read one jittery move at the end of a slow drag as a flick", () => {
     const { getByTestId, onSettle } = setup();
     const row = getByTestId("row");
 
     touch(row, "touchstart", 200, 100, 0);
-    touch(row, "touchmove", 180, 100, 40);
-    touch(row, "touchmove", 180 - lastMovePx, 100, 90);
-    touch(row, "touchend", 0, 0, liftAt);
+    touch(row, "touchmove", 186, 100, 60);
+    touch(row, "touchmove", 172, 100, 120);
+    touch(row, "touchmove", 158, 100, 180);
+    // 3 px in 2 ms is 1.5 px/ms on its own, but ~0.3 px/ms over the window.
+    touch(row, "touchmove", 155, 100, 182);
+    touch(row, "touchend", 0, 0, 190);
 
-    expect(onSettle).toHaveBeenCalledExactlyOnceWith(close);
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it("still closes on a flick that ends a slow drag", () => {
+    const { getByTestId, onSettle } = setup();
+    const row = getByTestId("row");
+
+    touch(row, "touchstart", 200, 100, 0);
+    touch(row, "touchmove", 186, 100, 100);
+    touch(row, "touchmove", 180, 100, 200);
+    touch(row, "touchmove", 160, 100, 220);
+    touch(row, "touchmove", 140, 100, 240);
+    touch(row, "touchmove", 120, 100, 260);
+    touch(row, "touchend", 0, 0, 270);
+
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(true);
   });
 
   it.each([

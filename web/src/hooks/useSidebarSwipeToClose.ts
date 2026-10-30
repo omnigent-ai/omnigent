@@ -1,7 +1,7 @@
 // A leftward swipe on the open mobile drawer (or the scrim beside it) slides it
 // shut, reporting the same progress → settle contract as the native open swipe.
 
-import { useEffect, useRef, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
 // Travel (CSS px) before a touch is classified as a horizontal swipe rather
 // than a tap or a vertical scroll of the session list.
@@ -14,6 +14,23 @@ const CLOSE_DISTANCE_FRACTION = 0.33;
 const CLOSE_FLICK_VELOCITY = 0.6;
 // A finger that rested this long before lifting is not flicking.
 const FLICK_MAX_IDLE_MS = 100;
+// Flick speed is the finger's travel over this trailing window, so one jittery
+// or coalesced touchmove can't read as a flick on its own.
+const VELOCITY_WINDOW_MS = 100;
+
+interface TouchSample {
+  x: number;
+  time: number;
+}
+
+/** Leftward speeds are negative. `samples[0]` is the position at the window start. */
+function windowVelocity(samples: TouchSample[]): number {
+  const reference = samples[0];
+  const latest = samples.at(-1);
+  if (!reference || !latest) return 0;
+  const span = Math.min(VELOCITY_WINDOW_MS, latest.time - reference.time);
+  return span > 0 ? (latest.x - reference.x) / span : 0;
+}
 
 /** True when `target` sits inside content that can itself scroll horizontally. */
 function startsInHorizontalScroller(target: EventTarget | null, boundary: Element): boolean {
@@ -58,7 +75,9 @@ export function useSidebarSwipeToClose({
   // Read callbacks through a ref so per-frame re-renders (each progress update
   // sets state) don't re-subscribe the listeners and drop the gesture mid-drag.
   const callbacks = useRef({ onDragProgress, onSettle });
-  callbacks.current = { onDragProgress, onSettle };
+  useLayoutEffect(() => {
+    callbacks.current = { onDragProgress, onSettle };
+  });
 
   useEffect(() => {
     if (!enabled) return;
@@ -70,14 +89,17 @@ export function useSidebarSwipeToClose({
     let startTime = 0;
     let drawerWidth = 1;
     let progress = 1;
-    let lastX = 0;
-    let lastTime = 0;
-    let velocity = 0;
+    let samples: TouchSample[] = [];
 
     const reset = () => {
       tracking = false;
       dragging = false;
-      velocity = 0;
+      samples = [];
+    };
+    const recordSample = (x: number, time: number) => {
+      samples.push({ x, time });
+      // Keep the newest sample at or before the window start as its reference.
+      while (samples.length > 2 && samples[1].time <= time - VELOCITY_WINDOW_MS) samples.shift();
     };
 
     const onTouchStart = (event: TouchEvent) => {
@@ -94,10 +116,9 @@ export function useSidebarSwipeToClose({
       const touch = event.touches[0];
       tracking = true;
       startX = touch.clientX;
-      lastX = startX;
       startY = touch.clientY;
       startTime = event.timeStamp;
-      lastTime = startTime;
+      recordSample(startX, startTime);
       drawerWidth = Math.max(1, drawer.getBoundingClientRect().width);
       progress = 1;
     };
@@ -111,6 +132,7 @@ export function useSidebarSwipeToClose({
       const touch = event.touches[0];
       const dx = touch.clientX - startX;
       const dy = touch.clientY - startY;
+      recordSample(touch.clientX, event.timeStamp);
       if (!dragging) {
         if (Math.abs(dx) < DECIDE_SLOP_PX && Math.abs(dy) < DECIDE_SLOP_PX) return;
         // Vertical scrolls, rightward swipes, and hold-then-drag belong to
@@ -121,10 +143,6 @@ export function useSidebarSwipeToClose({
         }
         dragging = true;
       }
-      const elapsed = event.timeStamp - lastTime;
-      if (elapsed > 0) velocity = (touch.clientX - lastX) / elapsed;
-      lastX = touch.clientX;
-      lastTime = event.timeStamp;
       progress = Math.max(0, Math.min(1, 1 + dx / drawerWidth));
       callbacks.current.onDragProgress(progress);
       if (event.cancelable) event.preventDefault();
@@ -132,10 +150,11 @@ export function useSidebarSwipeToClose({
 
     const settle = (event: TouchEvent | null) => {
       if (dragging) {
+        const lastMoveTime = samples.at(-1)?.time ?? startTime;
         const flicking =
           event !== null &&
-          event.timeStamp - lastTime <= FLICK_MAX_IDLE_MS &&
-          velocity <= -CLOSE_FLICK_VELOCITY;
+          event.timeStamp - lastMoveTime <= FLICK_MAX_IDLE_MS &&
+          windowVelocity(samples) <= -CLOSE_FLICK_VELOCITY;
         const close = flicking || progress <= 1 - CLOSE_DISTANCE_FRACTION;
         // A completed drag must not also activate the row under the finger.
         if (event?.cancelable) event.preventDefault();
