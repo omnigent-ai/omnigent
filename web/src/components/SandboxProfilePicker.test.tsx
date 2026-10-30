@@ -148,7 +148,7 @@ it("distinguishes no access from no search matches", async () => {
   await open("No profiles available");
   expect(screen.getByRole("status")).toHaveTextContent("No sandbox profiles available");
 });
-it.each(["loading", "missing", "disabled", "ordinary"])(
+it.each(["loading", "missing", "disabled", "ordinary", "managed-disabled"])(
   "preserves legacy behavior for %s",
   async (state) => {
     capability.info =
@@ -156,8 +156,11 @@ it.each(["loading", "missing", "disabled", "ordinary"])(
         ? "loading"
         : {
             ...FALLBACK_SERVER_INFO,
-            managed_sandboxes_enabled: true,
-            features: state === "missing" ? {} : { sandbox_profiles: state === "ordinary" },
+            managed_sandboxes_enabled: state !== "managed-disabled",
+            features:
+              state === "missing"
+                ? {}
+                : { sandbox_profiles: state === "ordinary" || state === "managed-disabled" },
           };
     vi.mocked(fetchSandboxProfiles).mockResolvedValue({
       profiles: [],

@@ -133,7 +133,8 @@ def test_controller_requires_safe_url_and_explicit_selection():
 
 
 @pytest.mark.parametrize("profile_result", ["missing", "malformed", "mismatch"])
-def test_provision_cleans_up_invalid_assignment(monkeypatch, profile_result):
+@pytest.mark.parametrize("cleanup", ["success", "failure", "timeout"])
+def test_provision_cleans_up_invalid_assignment(monkeypatch, caplog, profile_result, cleanup):
     monkeypatch.setenv("SANDBOX_CONTROLLER_TOKEN", "test-service-token")
     original = httpx.Client
     profile = {"id": "build", "name": "Build", "revision": "1"}
@@ -152,6 +153,10 @@ def test_provision_cleans_up_invalid_assignment(monkeypatch, profile_result):
                 result["sandbox_profile"] = {**profile, "revision": "2"}
             return httpx.Response(200, json=result)
         assert request.method == "DELETE" and request.url.path == "/sandboxes/sb-123"
+        if cleanup == "failure":
+            return httpx.Response(503)
+        if cleanup == "timeout":
+            raise httpx.ReadTimeout("cleanup timeout")
         allocated.remove("sb-123")
         return httpx.Response(204)
 
@@ -166,4 +171,7 @@ def test_provision_cleans_up_invalid_assignment(monkeypatch, profile_result):
     error = SandboxProfileChanged if profile_result == "mismatch" else SandboxConfigError
     with pytest.raises(error):
         launcher.provision("example")
-    assert allocated == set()
+    assert allocated == (set() if cleanup == "success" else {"sb-123"})
+    if cleanup != "success":
+        assert "Controller cleanup failed for sandbox 'sb-123'" in caplog.text
+        assert "test-service-token" not in caplog.text

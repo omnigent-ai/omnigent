@@ -187,7 +187,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
-from functools import partial
+from functools import cached_property, partial
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import click
@@ -737,6 +737,11 @@ class ManagedSandboxConfig:
     )
     # Request-scoped reference; teardown must not depend on launch authorization.
     profile_selection: dict[str, Any] | None = None
+
+    @cached_property
+    def manages_profiles(self) -> bool:
+        """Static deployment capability; user authorization is always checked fresh."""
+        return bool(getattr(self.launcher_factory(), "manages_profiles", False))
 
 
 class NoReachableModels(Exception):

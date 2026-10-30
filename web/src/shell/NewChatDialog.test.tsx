@@ -1639,7 +1639,7 @@ async function submitAndReadBody(
   fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
     target: { value: prompt },
   });
-  await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+  expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
   fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
   return readCreateBody();
 }
@@ -8432,7 +8432,7 @@ describe("NewChatLandingScreen", () => {
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
         target: { value: "audit the repo" },
       });
-      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
       fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
       await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
       const [, init] = authenticatedFetchMock.mock.calls[0];
@@ -8697,7 +8697,7 @@ describe("NewChatLandingScreen", () => {
       fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
       fireEvent.click(picker);
-      expect(screen.queryByRole("menuitem", { name: /^Default/ })).toBeNull();
+      expect(screen.queryByRole("option", { name: /^Default/ })).toBeNull();
       expect(screen.queryByText("Other provider")).toBeNull();
       fireEvent.click(screen.getByText("Large workspace"));
       await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
@@ -8852,7 +8852,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "audit the repo" },
     });
-    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
@@ -12853,7 +12853,7 @@ describe("managed sandbox gateway preview", () => {
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
   });
 
-  it("waits for the selected harness's catalog without probing a host", async () => {
+  it("waits for the selected harness's catalog without probing a host", () => {
     mockHosts([]);
     localStorage.setItem(LAST_AGENT_KEY, "a2");
     vi.mocked(useSandboxModelOptions).mockReturnValue({
@@ -12879,7 +12879,7 @@ describe("managed sandbox gateway preview", () => {
     openAgentModels("a2");
     expect(screen.getByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeVisible();
     closeMenu();
-    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
   });
 
   it("changes catalogs and efforts when switching Codex, Claude Code, and Polly", async () => {

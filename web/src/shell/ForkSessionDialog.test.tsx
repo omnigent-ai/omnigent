@@ -1826,8 +1826,8 @@ describe("ForkSessionDialog", () => {
         expect(forkSessionMock).not.toHaveBeenCalled();
         expect(picker).toHaveFocus();
         fireEvent.click(picker);
-        expect(screen.queryByRole("menuitem", { name: /^Default/ })).toBeNull();
-        expect(screen.queryByRole("menuitem", { name: "Other workspace" })).toBeNull();
+        expect(screen.queryByRole("option", { name: /^Default/ })).toBeNull();
+        expect(screen.queryByRole("option", { name: "Other workspace" })).toBeNull();
         fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
         await waitFor(() =>
           expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-disabled"),
@@ -1839,7 +1839,7 @@ describe("ForkSessionDialog", () => {
         fireEvent.click(
           await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
         );
-        expect(screen.queryByRole("menuitem", { name: "Large workspace" })).toBeNull();
+        expect(screen.queryByRole("option", { name: "Large workspace" })).toBeNull();
         fireEvent.click(screen.getByRole("option", { name: "Other workspace" }));
         await waitFor(() => expect(submit).not.toHaveAttribute("aria-disabled"));
         fireEvent.click(submit);
@@ -1879,7 +1879,7 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-submit"));
       expect(forkSessionMock).not.toHaveBeenCalled();
       fireEvent.click(picker);
-      expect(screen.queryByRole("menuitem", { name: /^Default/ })).toBeNull();
+      expect(screen.queryByRole("option", { name: /^Default/ })).toBeNull();
       vi.mocked(fetchSandboxProfiles).mockResolvedValue(CATALOG);
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       await screen.findByRole("button", { name: "Sandbox profile: Choose profile" });

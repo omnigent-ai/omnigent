@@ -4561,6 +4561,7 @@ async def _run_managed_launch(
         profile = await saved_profile(
             sandbox_profiles,
             session_id,
+            user_id=owner,
             host_id=relaunch_host.host_id if relaunch_host is not None else None,
         )
         if profile is not None:
@@ -5742,7 +5743,9 @@ async def _run_managed_wake(
             host = await asyncio.to_thread(host_store.get_host, host_id)
             if host is None:
                 raise HTTPException(status_code=404, detail="managed host not found")
-            profile = await saved_profile(sandbox_profiles, session_id, host_id=host_id)
+            profile = await saved_profile(
+                sandbox_profiles, session_id, user_id=host.user_id, host_id=host_id
+            )
             if profile is None:
                 await asyncio.to_thread(
                     sandbox_profiles.require_selection, host.sandbox_provider, user_id=host.user_id

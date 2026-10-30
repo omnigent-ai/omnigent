@@ -105,14 +105,23 @@ def _bind(catalog, session_id, host_id):
     from omnigent.db.db_models import uuid_to_bytes
 
     host_id = uuid_to_bytes(host_id).hex()
-    try:
-        catalog._store.conversations.bind_profiled_host(
-            session_id, host_id, "/workspace", catalog.get_session_snapshot(session_id)
+    profile = catalog.get_session_snapshot(session_id)
+    host = catalog._host_store.get_host(host_id)
+    if host is None:
+        catalog._host_store.register_managed_host(
+            host_id=host_id,
+            name="profile-host",
+            user_id=profile["user_id"],
+            token="test-token",
+            provider=profile["provider"],
+            sandbox_id="test-sandbox",
+            token_expires_at=2_000_000_000,
         )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=409, detail="A profiled session cannot be moved to a different host"
-        ) from exc
+    elif host.sandbox_provider is None:
+        catalog._host_store.bind_sandbox(
+            host_id, provider=profile["provider"], sandbox_id="test-sandbox"
+        )
+    catalog._store.conversations.bind_profiled_host(session_id, host_id, "/workspace", profile)
 
 
 def _require(catalog, session_id, host_id, **kwargs):
@@ -322,14 +331,17 @@ def test_saved_reference_reauthorizes_after_restart_and_revocation(
         profiles.selections.clear()
         profiles.listings.clear()
         profiles.list_error = RuntimeError("Discovery is unavailable; selection is authoritative")
-        assert restarted.validate_snapshot(restarted.get_session_snapshot(session_id)) == snapshot
+        assert (
+            restarted.validate_snapshot(restarted.get_session_snapshot(session_id), user_id=_ALICE)
+            == snapshot
+        )
         assert profiles.selections == [
             (SandboxProfileContext(user_id=_ALICE, workspace_id=41), _BUILD)
         ]
         assert restarted.get_host_snapshot(host_id) == snapshot
         profiles.allowed[(_ALICE, 41)] = []
         with pytest.raises(HTTPException) as denied:
-            restarted.validate_snapshot(snapshot)
+            restarted.validate_snapshot(snapshot, user_id=_ALICE)
         assert denied.value.status_code == 403
         assert restarted.get_session_snapshot(session_id) == snapshot
         assert profiles.listings == []
@@ -389,7 +401,7 @@ def test_snapshot_cannot_cross_workspace_boundaries(
         snapshot = catalog.resolve("build", provider="company", user_id=_ALICE)
     profiles.selections.clear()
     with workspace_scope(42), pytest.raises(HTTPException) as denied:
-        catalog.validate_snapshot(snapshot)
+        catalog.validate_snapshot(snapshot, user_id=_ALICE)
     assert denied.value.status_code == 403
     assert profiles.selections == []
 
@@ -556,13 +568,50 @@ def test_host_binding_cannot_lose_original_host_profile(
     for bind in (False, True):
         with pytest.raises(HTTPException, match="different host"):
             _require(catalog, source_id, other_host_id, bind=bind)
-    with pytest.raises(HTTPException, match="different host"):
+    with pytest.raises(ValueError, match="session binding changed"):
         _bind(catalog, source_id, other_host_id)
     assert catalog.get_host_snapshot(host_id) == profile
     assert catalog.get_host_snapshot(other_host_id) == profile
     profiles.allowed.clear()
     with pytest.raises(HTTPException, match="access denied"):
         _require(catalog, source_id, host_id, bind=False)
+
+
+def test_ordinary_host_transfer_remains_available_with_profiles_enabled(catalog):
+    source_host, target_host = uuid.uuid4().hex, uuid.uuid4().hex
+    for host_id in (source_host, target_host):
+        catalog._host_store.upsert_on_connect(host_id, "ordinary-host", _ALICE)
+    conversation = catalog._store.conversations.create_conversation(
+        host_id=source_host, workspace="/workspace"
+    )
+    catalog.require_session_host(conversation.id, target_host, bind=False, user_id=_ALICE)
+    catalog.require_session_host(conversation.id, target_host, user_id=_ALICE)
+    assert catalog.get_session_snapshot(conversation.id) is None
+
+
+def test_ordinary_runner_binding_skips_profile_history_limits(catalog, monkeypatch):
+    from unittest.mock import Mock
+
+    deployment = catalog._deployment
+    factory = Mock(side_effect=FakeSandboxLauncher)
+    catalog._deployment = replace(
+        deployment,
+        configs=(replace(deployment.default, launcher_factory=factory),),
+    )
+    store = catalog._store.conversations
+    conversation = store.create_conversation()
+    discovery = Mock(side_effect=AssertionError("Ordinary runners need no profile lookup"))
+    monkeypatch.setattr(store, "get_runner_host_ids", discovery)
+    for _ in range(2):
+        assert not catalog.reassign_runner(
+            conversation,
+            "ordinary-runner",
+            conversation_store=store,
+            host_store=catalog._host_store,
+            user_id=_ALICE,
+        )
+    discovery.assert_not_called()
+    factory.assert_called_once()
 
 
 def test_unrelated_provider_outage_does_not_block_default_launches(catalog, profiles):
@@ -622,5 +671,5 @@ def test_session_reference_cannot_use_a_different_execution_identity(catalog, pr
         _accept(catalog, target_id, catalog.inherit_snapshot(snapshot, _BOB))
         with pytest.raises(HTTPException) as mismatch:
             _require(catalog, target_id, host_id, user_id=_ALICE)
-        assert mismatch.value.status_code == 409
+        assert mismatch.value.status_code == 403
         assert catalog._store.get_session_host_id(target_id) is None

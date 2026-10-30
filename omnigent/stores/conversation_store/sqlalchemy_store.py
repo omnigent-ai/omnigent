@@ -123,6 +123,7 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.sandbox_profile_store import (
     PROFILE_LABEL_PREFIX,
     encode_snapshot,
+    has_profile_reference,
     profile_from_labels,
     profile_labels,
     reject_profile_labels,
@@ -132,6 +133,7 @@ from omnigent.stores.sandbox_profile_store import (
 _logger = logging.getLogger(__name__)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
+_RUNNER_BINDING_LIMIT = 200
 
 
 def _decode_session_state(
@@ -2223,8 +2225,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         after: str | None = None,
         limit: int = 32,
     ) -> list[str]:
-        if not 1 <= limit <= 100:
-            raise ValueError("limit must be between 1 and 100")
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
         query = select(SqlConversationMetadata.id).where(
             SqlConversationMetadata.workspace_id == current_workspace_id(),
             SqlConversationMetadata.host_id == host_id,
@@ -4312,10 +4314,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             if expected_host_id is not None and meta.host_id != expected_host_id:
                 return meta
             if not clear_profile and meta.host_id is not None:
-                with self._profile_label_session(session) as labels:
-                    saved = profile_from_labels(_fetch_labels(labels, conversation_id))
+                with self._profile_label_session(session, read_only=True) as labels:
+                    profiled = has_profile_reference(_fetch_labels(labels, conversation_id))
                 host = session.get(SqlHost, (current_workspace_id(), meta.host_id))
-                if saved is not None and host is not None and host.deleted_at is None:
+                if profiled and host is not None and host.deleted_at is None:
                     return meta
             meta.host_id = None
             meta.workspace = None
@@ -4365,32 +4367,44 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def get_runner_host_ids(self, runner_id: str) -> list[str]:
         """Resolve legacy runner-only clients through the existing runner index."""
-        hosts: set[str] = set()
-        after = None
         with self._session("resolve_runner_host") as session:
-            while True:
-                statement = select(
-                    SqlConversationMetadata.id, SqlConversationMetadata.host_id
-                ).where(
+            rows = self._runner_binding_candidates(session, runner_id)
+            if len(rows) > _RUNNER_BINDING_LIMIT:
+                raise ValueError(
+                    "Runner history exceeds the binding lookup limit; launch a new runner"
+                )
+            return sorted({row.host_id for row in rows if row.host_id is not None})[:2]
+
+    @staticmethod
+    def _runner_binding_candidates(session: Session, runner_id: str | None) -> list[Any]:
+        # Apply residual host/source checks in Python after this indexed, bounded read.
+        return list(
+            session.execute(
+                select(
+                    SqlConversationMetadata.id,
+                    SqlConversationMetadata.host_id,
+                    SqlConversationMetadata.workspace,
+                    SqlConversationMetadata.git_branch,
+                )
+                .where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.runner_id == runner_id,
                 )
-                if after is not None:
-                    statement = statement.where(SqlConversationMetadata.id > after)
-                rows = session.execute(
-                    statement.order_by(SqlConversationMetadata.id).limit(200)
-                ).all()
-                hosts.update(host for _, host in rows if host is not None)
-                if len(hosts) > 1 or len(rows) < 200:
-                    return sorted(hosts)[:2]
-                after = rows[-1][0]
+                .order_by(SqlConversationMetadata.id)
+                .limit(_RUNNER_BINDING_LIMIT + 1)
+            )
+        )
 
     @contextmanager
-    def _profile_label_session(self, metadata_session: Session) -> Iterator[Session]:
+    def _profile_label_session(
+        self, metadata_session: Session, *, read_only: bool = False
+    ) -> Iterator[Session]:
         if self._conv_engine is self._engine:
             yield metadata_session
         else:
-            with self._conv_session_immediate("accept_sandbox_profile") as session:
+            session_maker = self._conv_session if read_only else self._conv_session_immediate
+            operation = "check_profile_host_affinity" if read_only else "accept_sandbox_profile"
+            with session_maker(operation) as session:
                 yield session
 
     @staticmethod
@@ -4454,16 +4468,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
             if meta.runner_id != expected_runner_id or meta.host_id not in (None, host_id):
                 raise ValueError("The session binding changed; retry the request")
-            source = session.scalar(
-                select(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.runner_id == (runner_id or expected_runner_id),
-                    SqlConversationMetadata.host_id == host_id,
-                    SqlConversationMetadata.id != conversation_id,
-                )
-                .order_by(SqlConversationMetadata.id)
-                .limit(1)
+            candidates = self._runner_binding_candidates(session, runner_id or expected_runner_id)
+            source = next(
+                (
+                    row
+                    for row in candidates
+                    if row.host_id == host_id and row.id != conversation_id
+                ),
+                None,
             )
             if source is None:
                 raise ValueError(
@@ -4612,18 +4624,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             if meta.runner_id != expected_runner_id or meta.host_id != expected_host_id:
                 return False
             if meta.host_id is not None:
-                source = session.scalar(
-                    select(SqlConversationMetadata.id)
-                    .where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.runner_id == expected_runner_id,
-                        SqlConversationMetadata.host_id == expected_host_id,
-                        SqlConversationMetadata.id != previous.id,
-                    )
-                    .order_by(SqlConversationMetadata.id)
-                    .limit(1)
-                )
-                if source is None:
+                candidates = self._runner_binding_candidates(session, expected_runner_id)
+                if not any(
+                    row.host_id == expected_host_id and row.id != previous.id for row in candidates
+                ):
                     return False
             if previous.runner_id is not None:
                 meta.host_id = previous.host_id
@@ -4737,11 +4741,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             if meta.host_id is not None and meta.host_id != host_id:
-                with self._profile_label_session(session) as labels:
-                    saved = profile_from_labels(_fetch_labels(labels, conversation_id))
-                if saved is not None and not self._can_bind_profile_host(
-                    session, meta.host_id, host_id
-                ):
+                with self._profile_label_session(session, read_only=True) as labels:
+                    profiled = has_profile_reference(_fetch_labels(labels, conversation_id))
+                if profiled and not self._can_bind_profile_host(session, meta.host_id, host_id):
                     raise ValueError("A profiled session cannot be moved to a different host")
             binding_changed = meta.host_id != host_id or (
                 workspace is not None and meta.workspace != workspace

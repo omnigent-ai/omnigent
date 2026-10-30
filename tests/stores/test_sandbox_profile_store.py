@@ -19,6 +19,60 @@ PROFILE = {
 }
 
 
+def test_host_recovery_has_a_fixed_work_bound_and_skips_ordinary_hosts(store, monkeypatch):
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlConversationMetadata
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+    from omnigent.stores.host_store import HostStore
+
+    host_id = uuid4().hex
+    hosts = HostStore(store.storage_location)
+    hosts.upsert_on_connect(host_id, "ordinary", "alice")
+    with store._session_immediate("seed_large_host_history") as session:
+        session.execute(
+            insert(SqlConversationMetadata),
+            [
+                {"id": uuid4().hex, "host_id": host_id, "workspace": "/workspace"}
+                for _ in range(250)
+            ],
+        )
+    catalog = SandboxProfileCatalog(store, None, hosts)
+    lookup = Mock(wraps=store.list_host_conversation_ids)
+    monkeypatch.setattr(store, "list_host_conversation_ids", lookup)
+    assert catalog.get_host_snapshot(host_id) is None
+    lookup.assert_not_called()
+
+    hydrate = Mock(side_effect=AssertionError("Overflow must not hydrate session history"))
+    monkeypatch.setattr(store, "get_conversation", hydrate)
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        with pytest.raises(ValueError, match="lookup limit"):
+            SandboxProfileStore(store).get_host_snapshot(host_id)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert len(queries) == 1
+    statement, parameters = queries[0]
+    with store._engine.connect() as connection:
+        assert len(connection.exec_driver_sql(statement, parameters).all()) == 201
+        if store._engine.dialect.name == "sqlite":
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            assert "ix_conversation_metadata_host_id" in plan
+            assert "SCAN" not in plan and "TEMP B-TREE" not in plan
+    hydrate.assert_not_called()
+
+
 @pytest.fixture(params=["conversation_store", "split_db_conversation_store"])
 def store(request):
     return request.getfixturevalue(request.param)
@@ -95,6 +149,34 @@ def test_oversized_identity_is_rejected_without_partial_labels(store):
         profiles.bind_session(session.id, {**PROFILE, "user_id": "a" * 257})
     assert store.get_conversation(session.id).labels == {}
     assert profile_labels(PROFILE)["sandbox_profile:description:1"] == "x" * 250
+
+
+def test_legacy_partial_labels_do_not_block_ordinary_host_changes(store):
+    from uuid import uuid4
+
+    from omnigent.db.db_models import SqlConversationLabel
+    from omnigent.stores.host_store import HostStore
+
+    hosts = HostStore(store.storage_location)
+    first, second = uuid4().hex, uuid4().hex
+    for host_id in (first, second):
+        hosts.upsert_on_connect(host_id, "ordinary-host", "alice")
+    conversation = store.create_conversation(host_id=first, workspace="/workspace")
+    with store._conv_session_immediate("seed_legacy_partial_profile") as transaction:
+        transaction.add(
+            SqlConversationLabel(
+                conversation_id=conversation.id,
+                key="sandbox_profile:team",
+                value="build",
+                updated_at=0,
+            )
+        )
+    store.set_host_id(conversation.id, second, "/new-workspace")
+    assert store.get_conversation(conversation.id).host_id == second
+    store.clear_host_binding(conversation.id)
+    assert store.get_conversation(conversation.id).host_id is None
+    with pytest.raises(ValueError, match="Incomplete saved sandbox profile"):
+        SandboxProfileStore(store).get_session_snapshot(conversation.id)
 
 
 def test_failed_metadata_commit_never_leaves_a_runner_or_mutable_profile(store, monkeypatch):

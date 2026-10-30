@@ -219,7 +219,7 @@ does not validate any of these real infrastructure steps.
 
 The server feature is disabled by default. Set `OMNIGENT_FEATURES=sandbox_profiles`
 (append to existing overrides) before trying the web demo. Follow the
-[deployment and rollback guide](../../docs/extending/provider_profiles.md#deployment-and-rollback)
+[deployment and rollback guide](../../docs/extending/provider_profiles.md#rollout-rollback-and-verification)
 for production rollout. The file provider is an integration example, not an
 Okta or Google Groups connector.
 

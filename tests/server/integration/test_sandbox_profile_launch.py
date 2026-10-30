@@ -46,6 +46,181 @@ from tests.server.integration._sandbox_profile_support import env as env
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("env", ["controller"], indirect=True)
+async def test_missing_sandbox_uses_bound_reference_with_large_host_history(env, monkeypatch):
+    from sqlalchemy import insert
+
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+    host_id = env.conversations.get_conversation(source_id).host_id
+    with env.conversations._session_immediate("seed_large_host_history") as transaction:
+        transaction.execute(
+            insert(SqlConversationMetadata),
+            [
+                {"id": uuid.uuid4().hex, "host_id": host_id, "workspace": "/workspace"}
+                for _ in range(250)
+            ],
+        )
+    monkeypatch.setattr(
+        env.conversations,
+        "list_host_conversation_ids",
+        Mock(side_effect=AssertionError("Resume must use its known session reference")),
+    )
+    env.recording.gone = True
+    await env.wake(source_id)
+    launch = env.app.state.managed_launches.get(source_id)
+    assert launch is None or launch.error is None
+    assert env.catalog.get_session_snapshot(source_id) == env.profile
+    assert len(env.recording.allocations) == 2
+
+
+@pytest.mark.parametrize("transport", ["json", "multipart"])
+async def test_explicit_managed_child_inherits_profile_and_parent_binding(
+    env, monkeypatch, transport
+):
+    parent_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+    env.app.state.tunnel_registry = env.app.state.profile_test_tunnels
+    register_test_runner(env.app, "parent-runner", harnesses=["codex"], owner=_OWNER)
+    env.conversations.replace_runner_id(parent_id, "parent-runner")
+    monkeypatch.setattr(sessions_routes, "_get_runner_client", AsyncMock(return_value=None))
+    response = await env.create(transport, parent_session_id=parent_id, host_type="managed")
+    assert response.status_code == 201, response.text
+    child = env.conversations.get_conversation(
+        response.json().get("id", response.json().get("session_id"))
+    )
+    parent = env.conversations.get_conversation(parent_id)
+    assert child.parent_conversation_id == parent_id
+    assert child.runner_id == parent.runner_id
+    from omnigent.runner.routing import routing_host_id
+
+    assert routing_host_id(child, env.conversations) == parent.host_id
+    assert env.catalog.get_session_snapshot(child.id) == env.profile
+    assert len(env.recording.allocations) == 1
+
+
+@pytest.mark.parametrize("wake", [False, True])
+async def test_foreign_saved_identity_is_rejected_before_credentials_or_provider(
+    env, monkeypatch, wake
+):
+    from omnigent.db.db_models import SqlConversationLabel, current_workspace_id
+    from omnigent.server import sandbox_profiles
+
+    session_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+    with env.conversations._conv_session_immediate("seed_legacy_foreign_identity") as transaction:
+        row = transaction.get(
+            SqlConversationLabel, (current_workspace_id(), session_id, "sandbox_profile:user_id")
+        )
+        row.value = _OTHER_USER
+    credential_lookup = Mock(side_effect=AssertionError("Must reject before owner credentials"))
+    monkeypatch.setattr(sandbox_profiles, "build_owner_launcher", credential_lookup)
+    env.recording.selections.clear()
+    if wake:
+        await env.wake(session_id)
+    else:
+        env.app.state.managed_launches.begin(session_id)
+        await _run_managed_launch(
+            session_id=session_id,
+            owner=_OWNER,
+            sandbox_config=env.app.state.sandbox_config,
+            repos=[],
+            tracker=env.app.state.managed_launches,
+            conversation_store=env.conversations,
+            host_store=env.hosts,
+            host_registry=None,
+            tunnel_registry=None,
+            sandbox_profiles=env.catalog,
+        )
+    assert "identity mismatch" in env.app.state.managed_launches.get(session_id).error
+    credential_lookup.assert_not_called()
+    assert env.recording.selections == []
+    assert len(env.recording.allocations) == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_malformed_legacy_profile_labels_remain_readable(env, enabled):
+    from omnigent.db.db_models import SqlConversationLabel
+
+    response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+    assert response.status_code == 201, response.text
+    session_id = response.json()["id"]
+    with env.conversations._conv_session_immediate("seed_legacy_profile_label") as transaction:
+        transaction.add(
+            SqlConversationLabel(
+                conversation_id=session_id, key="sandbox_profile:team", value="build", updated_at=0
+            )
+        )
+    if not enabled:
+        env.app.state.sandbox_profiles = None
+    response = await env.client.get(f"/v1/sessions/{session_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["sandbox_profile"] is None
+    assert env.recording.selections == []
+    if enabled:
+        with pytest.raises(HTTPException, match="Incomplete saved sandbox profile"):
+            env.catalog.get_session_snapshot(session_id)
+
+
+@pytest.mark.parametrize("transport", ["json", "multipart"])
+@pytest.mark.parametrize("concurrent_rebind", [False, True])
+async def test_caller_host_create_clears_runner_when_post_bind_profile_check_fails(
+    env, monkeypatch, transport, concurrent_rebind
+):
+    source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+    host_id = env.conversations.get_conversation(source_id).host_id
+    registry = env.app.state.profile_test_hosts
+    env.app.state.host_registry = registry
+    registry.register(
+        host_id=host_id,
+        ws=AsyncMock(),
+        owner=_OWNER,
+        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="profile-host"),
+    )
+
+    async def valid_workspace(**kwargs):
+        return kwargs["workspace"]
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._workspace_validation.validate_workspace", valid_workspace
+    )
+    require_host = env.catalog.require_session_host
+    failed_sessions = []
+
+    def reject_after_bind(session_id, host_id, **kwargs):
+        if env.conversations.get_conversation(session_id).runner_id:
+            failed_sessions.append(session_id)
+            if concurrent_rebind:
+                env.conversations.replace_runner_id(session_id, "replacement-runner")
+            raise HTTPException(status_code=403, detail="Profile access revoked after runner bind")
+        return require_host(session_id, host_id, **kwargs)
+
+    monkeypatch.setattr(env.catalog, "require_session_host", reject_after_bind)
+    response = await env.create(
+        transport,
+        host_type="external",
+        sandbox_provider=None,
+        host_id=host_id,
+        workspace="/workspace",
+    )
+    assert len(failed_sessions) == 1, response.text
+    assert env.conversations.get_conversation(failed_sessions[0]).runner_id == (
+        "replacement-runner" if concurrent_rebind else None
+    )
+    assert len(env.recording.allocations) == 1
+
+
+@pytest.mark.parametrize("transport", ["json", "multipart"])
+async def test_profile_provider_with_flag_off_rejects_before_persistence(env, transport):
+    env.app.state.sandbox_profiles = None
+    before = env.persisted()
+    response = await env.create(transport)
+    assert response.status_code == 400, response.text
+    assert "enable the sandbox_profiles feature" in response.text
+    assert env.persisted() == before
+    assert env.recording.allocations == []
+    assert env.recording.selections == []
+
+
 @pytest.mark.parametrize("transport", ["json", "multipart"])
 @pytest.mark.parametrize("invalid", ["unknown", "stale", "disabled"])
 async def test_rejected_selection_does_not_persist_or_allocate(

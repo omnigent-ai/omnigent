@@ -800,7 +800,12 @@ def register_core_routes(
             try:
                 await asyncio.to_thread(profile_catalog.require_session_host, session_id, host_id)
             except Exception:
-                await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                with contextlib.suppress(ValueError):
+                    await asyncio.to_thread(
+                        conversation_store.clear_runner_id,
+                        session_id,
+                        expected_binding=dataclasses.replace(target.conv, runner_id=runner_id),
+                    )
                 raise
         set_current_runner_id(runner_id)
         add_audit_attrs(runner_id=runner_id)

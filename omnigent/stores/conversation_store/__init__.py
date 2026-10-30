@@ -1792,7 +1792,8 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param expected_host_id: When supplied, clear only if the current host
             still matches this identity; otherwise leave every binding field unchanged.
-        :param clear_profile: Retained for callers; host affinity lives in the existing host field.
+        :param clear_profile: Allow detaching a profiled session from a live host.
+            When false, that binding is left unchanged. Accepted profile labels are retained.
         :returns: The current :class:`Conversation` after the conditional clear.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
@@ -1825,7 +1826,7 @@ class ConversationStore(ABC):
         raise NotImplementedError
 
     def get_runner_host_ids(self, runner_id: str) -> list[str]:
-        """Profile admission: return up to two directly bound hosts to detect ambiguity."""
+        """Return up to two hosts; reject runner histories exceeding the fixed read budget."""
         raise NotImplementedError
 
     def reassign_runner_with_host(

@@ -3706,14 +3706,15 @@ def test_runner_session_status_page_uses_runner_index(
 
 
 @pytest.mark.parametrize("host_count", [0, 1, 3])
+@pytest.mark.parametrize("sessions_per_host", [4, 250])
 def test_runner_host_lookup_is_bounded(
-    conversation_store: SqlAlchemyConversationStore, host_count: int
+    conversation_store: SqlAlchemyConversationStore, host_count: int, sessions_per_host: int
 ) -> None:
     from omnigent.db.db_models import workspace_scope
 
     hosts = [f"{value:032x}" for value in range(1, host_count + 1)]
     for host_id in [None, *hosts]:
-        for _ in range(4):
+        for _ in range(sessions_per_host):
             conv = conversation_store.create_conversation(runner_id="runner-target")
             if host_id is not None:
                 conversation_store.set_host_id(conv.id, host_id, "/workspace")
@@ -3730,11 +3731,21 @@ def test_runner_host_lookup_is_bounded(
 
     event.listen(conversation_store._engine, "before_cursor_execute", capture)
     try:
-        assert conversation_store.get_runner_host_ids("runner-target") == hosts[:2]
+        if sessions_per_host == 250:
+            with pytest.raises(ValueError, match="lookup limit"):
+                conversation_store.get_runner_host_ids("runner-target")
+        else:
+            assert conversation_store.get_runner_host_ids("runner-target") == hosts[:2]
     finally:
         event.remove(conversation_store._engine, "before_cursor_execute", capture)
     assert len(queries) == 1
     assert all("LIMIT" in statement for statement, _ in queries)
+    with conversation_store._engine.connect() as connection:
+        statement, parameters = queries[0]
+        assert len(connection.exec_driver_sql(statement, parameters).all()) == min(
+            201, sessions_per_host * (host_count + 1)
+        )
+    assert "host_id =" not in statement
     if conversation_store._engine.dialect.name == "sqlite":
         with conversation_store._engine.connect() as connection:
             for statement, parameters in queries:
@@ -3871,7 +3882,7 @@ def test_reassign_runner_with_host_copies_trusted_binding(
     statement, parameters = queries[0]
     assert "LIMIT" in statement.upper()
     with store._engine.connect() as connection:
-        assert len(connection.exec_driver_sql(statement, parameters).all()) == 1
+        assert len(connection.exec_driver_sql(statement, parameters).all()) == 3
         if store._engine.dialect.name == "sqlite":
             plan = str(
                 connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
@@ -3879,7 +3890,7 @@ def test_reassign_runner_with_host_copies_trusted_binding(
             assert any(
                 f"ix_conversation_metadata_{field}_id" in plan
                 and f"workspace_id=? AND {field}_id=?" in plan
-                for field in ("host", "runner")
+                for field in ("runner",)
             ), plan
             assert "SCAN" not in plan, plan
             assert "TEMP B-TREE" not in plan, plan
@@ -3913,6 +3924,59 @@ def test_reassign_runner_with_host_rejects_stale_expected_runner(
         "/original/path",
         "original-branch",
     )
+
+
+@pytest.mark.parametrize("operation", ["rotate", "rollback"])
+def test_runner_transfer_bounds_residual_host_filter(conversation_store, db_uri, operation):
+    from sqlalchemy import insert
+
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    store = conversation_store
+    host_id, runner_id = "a" * 32, "runner-with-hostless-history"
+    _register_host(db_uri, host_id)
+    previous = store.create_conversation(conversation_id="f" * 32)
+    store.set_host_id(previous.id, host_id, "/workspace")
+    store.replace_runner_id(previous.id, runner_id)
+    with store._session_immediate("seed_hostless_runner_history") as transaction:
+        transaction.execute(
+            insert(SqlConversationMetadata),
+            [{"id": f"{i:032x}", "runner_id": runner_id} for i in range(1, 251)],
+        )
+    store.create_conversation(
+        conversation_id="e" * 32, runner_id=runner_id, host_id=host_id, workspace="/workspace"
+    )
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT") and "runner_id =" in statement:
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        if operation == "rotate":
+            with pytest.raises(ValueError, match="Bind the replacement session"):
+                store.reassign_runner_with_host(
+                    previous.id, host_id, None, expected_runner_id=runner_id
+                )
+        else:
+            assert not store.rollback_runner_reassignment(
+                previous, expected_runner_id=runner_id, expected_host_id=host_id
+            )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert store.get_conversation(previous.id).runner_id == runner_id
+    assert len(queries) == 1
+    statement, parameters = queries[0]
+    assert "host_id =" not in statement
+    with store._engine.connect() as connection:
+        assert len(connection.exec_driver_sql(statement, parameters).all()) == 201
+        if store._engine.dialect.name == "sqlite":
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            assert "ix_conversation_metadata_runner_id" in plan
+            assert "SCAN" not in plan and "TEMP B-TREE" not in plan
 
 
 def test_reassign_runner_with_host_concurrent_detaches_keep_one_direct_binding(

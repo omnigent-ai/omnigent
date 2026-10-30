@@ -20,6 +20,8 @@ Omnigent stores the provider/profile revision and trusted execution identity.
 - Clone on desktop/mobile: session actions → Clone session → sandbox destination
   → Sandbox profile. A same-provider fork defaults to the source profile and reports
   a newer offered revision. Starting/cloning requires an authorized choice.
+- Message-action branch clones, sidebar clone actions and the error-card fork
+  action use this same profile-enabled fork dialog.
 - Settings has no sandbox editor. `/settings/sandboxes` falls back to General.
 
 ## Driving it with the repro environment
@@ -82,12 +84,21 @@ integration evidence separately; the browser test does not exercise them.
   profile availability. Resource location must survive catalog changes.
 - The example owns image/resource configuration. Core has no configuration schema,
   admin editor, catalog writes, directory connector or identity management.
-- Scheduled fresh sandboxes do not have a profile picker and cannot launch through
-  providers that require selection. Native `/clear` and `/fork` reauthorize and
+- Scheduled fresh sandboxes reject profile-requiring defaults at task create/update.
+  The session-create tool accepts explicit provider/profile/revision fields for managed placement.
+  Native `/clear` and `/fork` reauthorize and
   bind the replacement before detaching the source; the last directly bound
   runner session cannot detach. Host and profile mismatches remain blocked.
+- Missing sandboxes use the bound session's reference for replacement. Legacy host recovery and runner-only
+  adoption reject histories over 200 associations; use controller lookup for host
+  recovery and a new runner for runner adoption. Ordinary hosts skip recovery scans.
+  Native `/clear` retains old sessions on the host, so a long-lived sandbox without
+  controller lookup can reach the host limit through normal use. Ordinary-only
+  deployments skip runner profile discovery; mixed deployments keep its safety bound.
 - Rollout is opt-in. Drain profiled workloads before disabling the flag or rolling
   back to a server without profile authorization; retain surviving session labels and controller sandbox assignments. No schema
   changes or new indexes are involved.
+  Before first opt-in, complete the [legacy-label audit](../docs/extending/provider_profiles.md#rollout-rollback-and-verification)
+  after upgrading every writer. Enable the flag before configuring a provider that requires profiles.
 
 Controller recovery is covered in `tests/server/integration/test_sandbox_profile_controller.py`: last-session deletion, restart, historical revision, revocation and missing-sandbox replacement. The [controller walkthrough](../examples/sandbox-profile-provider/README.md#controller-recovery-demo) is runnable without a cluster.

@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import Request
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.provider_sandbox_profiles import provider_call
 from omnigent.stores import ConversationStore
 
 _logger = logging.getLogger(__name__)
@@ -34,12 +35,29 @@ async def prepare_profile(
             user_id=user_id,
         )
     if catalog is None:
+        deployment = getattr(request.app.state, "sandbox_config", None)
+        if body.host_type == "managed" and deployment is not None:
+            entry = (
+                deployment.for_provider(body.sandbox_provider)
+                if body.sandbox_provider
+                else deployment.default
+            )
+            if (
+                entry is not None
+                and entry.managed_launch_supported
+                and await asyncio.to_thread(provider_call, lambda: entry.manages_profiles)
+            ):
+                raise OmnigentError(
+                    "This provider requires sandbox profiles; enable the sandbox_profiles feature",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         return None
     snapshot = (
         await asyncio.to_thread(catalog.get_session_snapshot, inherited_session_id)
         if inherited_session_id is not None
         and (
-            getattr(body, "side_chat", False)
+            getattr(body, "parent_session_id", None) is not None
+            or getattr(body, "side_chat", False)
             or (body.host_type != "managed" and "host_type" not in body.model_fields_set)
         )
         else None
@@ -76,14 +94,14 @@ async def record_profile(
 
 
 async def saved_profile(
-    catalog: Any, session_id: str, *, host_id: str | None = None
+    catalog: Any, session_id: str, *, user_id: str | None, host_id: str | None = None
 ) -> dict[str, Any] | None:
     """Recheck authorization without replacing the accepted provider reference."""
     if catalog is None:
         return None
     if host_id is not None:
-        await asyncio.to_thread(catalog.require_session_host, session_id, host_id)
+        await asyncio.to_thread(catalog.require_session_host, session_id, host_id, user_id=user_id)
     snapshot = await asyncio.to_thread(catalog.get_session_snapshot, session_id)
     if snapshot is not None:
-        await asyncio.to_thread(catalog.validate_snapshot, snapshot)
+        await asyncio.to_thread(catalog.validate_snapshot, snapshot, user_id=user_id)
     return snapshot

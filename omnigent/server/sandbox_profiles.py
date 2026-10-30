@@ -22,6 +22,7 @@ from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SO
 from omnigent.stores.sandbox_profile_store import (
     SandboxProfileStore,
     encode_snapshot,
+    profile_from_labels,
     same_profile_identity,
 )
 
@@ -114,7 +115,7 @@ class SandboxProfileCatalog:
                 continue
             if not entry.managed_launch_supported:
                 continue
-            if not provider_call(entry.launcher_factory).manages_profiles:
+            if not provider_call(lambda entry=entry: entry.manages_profiles):
                 continue
             if not entry.provider or not entry.provider.strip():
                 raise HTTPException(
@@ -189,17 +190,21 @@ class SandboxProfileCatalog:
                     "workspace_id": context.workspace_id,
                 }
             ).model_dump()
-            return self.validate_snapshot(snapshot)
+            return self.validate_snapshot(snapshot, user_id=context.user_id)
         raise HTTPException(
             status_code=422, detail="Sandbox profiles are unavailable for this provider"
         )
 
     def validate_snapshot(
-        self, snapshot: dict[str, Any], *, sandbox_id: str | None = None
+        self, snapshot: dict[str, Any], *, user_id: str | None, sandbox_id: str | None = None
     ) -> dict[str, Any]:
         """Recheck authorization for a session's accepted provider reference."""
         try:
             saved_reference = ProviderProfileSnapshot.model_validate(snapshot).model_dump()
+            if saved_reference["user_id"] != profile_context(user_id).user_id:
+                raise HTTPException(
+                    status_code=403, detail="Sandbox profile execution identity mismatch"
+                )
             if (
                 saved_reference["workspace_id"]
                 != profile_context(saved_reference["user_id"]).workspace_id
@@ -225,16 +230,21 @@ class SandboxProfileCatalog:
 
     def inherit_snapshot(self, snapshot: dict[str, Any], user_id: str | None) -> dict[str, Any]:
         context = profile_context(user_id)
-        return self.validate_snapshot({**snapshot, "user_id": context.user_id})
+        return self.validate_snapshot({**snapshot, "user_id": context.user_id}, user_id=user_id)
 
     def bind_session(self, session_id: str, snapshot: dict[str, Any]) -> None:
         try:
-            self._store.bind_session(session_id, self.validate_snapshot(snapshot))
+            self._store.bind_session(
+                session_id, self.validate_snapshot(snapshot, user_id=snapshot["user_id"])
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     def get_session_snapshot(self, session_id: str) -> dict[str, Any] | None:
-        return self._store.get_session_snapshot(session_id)
+        try:
+            return self._store.get_session_snapshot(session_id)
+        except ValueError as exc:
+            raise _invalid_reference(exc) from exc
 
     def reassign_runner(
         self,
@@ -249,12 +259,14 @@ class SandboxProfileCatalog:
         if runner_id is not None and runner_id == conversation.runner_id:
             snapshot = self.get_session_snapshot(conversation.id)
             if snapshot is not None:
-                self.validate_snapshot(snapshot)
+                self.validate_snapshot(snapshot, user_id=user_id)
             return False
         current_host_id = conversation.host_id
         if conversation.runner_id and current_host_id:
             current_host = host_store.get_host(current_host_id) if host_store else None
-            protected = self.get_host_snapshot(current_host_id) is not None or (
+            protected = self.get_host_snapshot(
+                current_host_id, reference_session_id=conversation.id
+            ) is not None or (
                 current_host is not None
                 and current_host.sandbox_provider is not None
                 and current_host.sandbox_provider
@@ -275,6 +287,8 @@ class SandboxProfileCatalog:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
             return True
         profile = self.get_session_snapshot(conversation.id)
+        if profile is None and not self.managed_providers():
+            return False
         host_ids = conversation_store.get_runner_host_ids(runner_id)
         if len(host_ids) > 1:
             raise OmnigentError(
@@ -354,14 +368,30 @@ class SandboxProfileCatalog:
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
-    def _saved_host_snapshot(self, host_id: str) -> dict[str, Any] | None:
+    def _saved_host_snapshot(
+        self, host_id: str, reference_session_id: str | None = None
+    ) -> dict[str, Any] | None:
         try:
+            if reference_session_id is not None:
+                conversation = self._store.conversations.get_conversation(reference_session_id)
+                if conversation is not None and conversation.host_id == host_id:
+                    snapshot = profile_from_labels(conversation.labels)
+                    if snapshot is not None:
+                        return snapshot
             return self._store.get_host_snapshot(host_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    def get_host_snapshot(self, host_id: str) -> dict[str, Any] | None:
+    def get_host_snapshot(
+        self, host_id: str, *, reference_session_id: str | None = None
+    ) -> dict[str, Any] | None:
         host = self._host_store.get_host(host_id) if self._host_store else None
+        if (
+            host is None
+            or not host.sandbox_provider
+            or host.sandbox_provider not in self.managed_providers(host.sandbox_provider)
+        ):
+            return None
         if (
             host is not None
             and host.deleted_at is None
@@ -379,9 +409,9 @@ class SandboxProfileCatalog:
                         )
                     except SandboxGoneError:
                         # Surviving sessions retain the exact revision for replacement.
-                        saved = self._saved_host_snapshot(host_id)
+                        saved = self._saved_host_snapshot(host_id, reference_session_id)
                         if saved is not None:
-                            return self.validate_snapshot(saved)
+                            return self.validate_snapshot(saved, user_id=host.user_id)
                         raise HTTPException(
                             status_code=409, detail="Sandbox no longer exists"
                         ) from None
@@ -398,7 +428,9 @@ class SandboxProfileCatalog:
                         }
                     ).model_dump()
                     try:
-                        self.validate_snapshot(snapshot, sandbox_id=host.sandbox_id)
+                        self.validate_snapshot(
+                            snapshot, user_id=host.user_id, sandbox_id=host.sandbox_id
+                        )
                     except SandboxGoneError:
                         raise HTTPException(
                             status_code=409, detail="Sandbox disappeared; retry the request"
@@ -415,7 +447,12 @@ class SandboxProfileCatalog:
                             status_code=409, detail="The sandbox changed; retry the request"
                         )
                     return snapshot
-        return self._saved_host_snapshot(host_id)
+        saved = self._saved_host_snapshot(host_id)
+        if saved is not None and saved["user_id"] != host.user_id:
+            raise HTTPException(
+                status_code=403, detail="Sandbox profile execution identity mismatch"
+            )
+        return saved
 
     def require_session_host(
         self,
@@ -427,17 +464,24 @@ class SandboxProfileCatalog:
         user_id: str | None = None,
     ) -> None:
         """After host ownership checks, inherit or match the host's accepted profile."""
-        host_snapshot = self.get_host_snapshot(host_id)
+        host = self._host_store.get_host(host_id) if self._host_store else None
+        if host is not None:
+            if user_id is not None and host.user_id != user_id:
+                raise HTTPException(status_code=403, detail="Host owner mismatch")
+            user_id = host.user_id
         session_snapshot = self.get_session_snapshot(session_id)
+        if session_snapshot is not None and session_snapshot["user_id"] != user_id:
+            raise HTTPException(
+                status_code=403, detail="Sandbox profile execution identity mismatch"
+            )
+        host_snapshot = self.get_host_snapshot(host_id, reference_session_id=session_id)
         if host_snapshot is not None:
-            self.validate_snapshot(host_snapshot)
-            if user_id is not None and host_snapshot["user_id"] != user_id:
-                raise HTTPException(
-                    status_code=403, detail="Sandbox profile execution identity mismatch"
-                )
+            self.validate_snapshot(host_snapshot, user_id=user_id)
         elif sandbox_provider is not None:
             self.require_selection(sandbox_provider, user_id=user_id)
-        if not self._store.can_bind_host(session_id, host_id):
+        if (
+            session_snapshot is not None or host_snapshot is not None
+        ) and not self._store.can_bind_host(session_id, host_id):
             raise HTTPException(
                 status_code=409, detail="A profiled session cannot be moved to a different host"
             )

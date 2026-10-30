@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from omnigent.stores.conversation_store import ConversationStore
 
 PROFILE_LABEL_PREFIX = "sandbox_profile:"
+PROFILE_HOST_SESSION_LIMIT = 200
 _FIELDS = ("provider", "id", "revision", "user_id", "name")
 
 
@@ -64,12 +65,24 @@ def profile_from_labels(labels: Mapping[str, str]) -> dict[str, Any] | None:
 
 
 def public_profile(labels: Mapping[str, str]) -> dict[str, Any] | None:
-    snapshot = profile_from_labels(labels)
+    try:
+        snapshot = profile_from_labels(labels)
+    except ValueError:
+        # Malformed legacy references must not break session reads.
+        return None
     return (
         {key: value for key, value in snapshot.items() if key not in ("user_id", "workspace_id")}
         if snapshot
         else None
     )
+
+
+def has_profile_reference(labels: Mapping[str, str]) -> bool:
+    """Check reference shape for affinity guards, without authorizing execution."""
+    try:
+        return profile_from_labels(labels) is not None
+    except ValueError:
+        return False
 
 
 def encode_snapshot(value: dict[str, Any]) -> bytes:
@@ -102,16 +115,19 @@ class SandboxProfileStore:
         )
 
     def get_host_snapshot(self, host_id: str) -> dict[str, Any] | None:
-        after = None
+        ids = self.conversations.list_host_conversation_ids(
+            host_id, limit=PROFILE_HOST_SESSION_LIMIT + 1
+        )
+        if len(ids) > PROFILE_HOST_SESSION_LIMIT:
+            raise ValueError(
+                "Host history exceeds the profile lookup limit; "
+                "enable controller assignment lookup"
+            )
         accepted = None
-        while True:
-            ids = self.conversations.list_host_conversation_ids(host_id, after=after, limit=100)
-            for session_id in ids:
-                snapshot = self.get_session_snapshot(session_id)
-                if snapshot is not None:
-                    if accepted is not None and not same_profile_identity(accepted, snapshot):
-                        raise ValueError("Sessions on this host have conflicting sandbox profiles")
-                    accepted = snapshot
-            if len(ids) < 100:
-                return accepted
-            after = ids[-1]
+        for session_id in ids:
+            snapshot = self.get_session_snapshot(session_id)
+            if snapshot is not None:
+                if accepted is not None and not same_profile_identity(accepted, snapshot):
+                    raise ValueError("Sessions on this host have conflicting sandbox profiles")
+                accepted = snapshot
+        return accepted

@@ -19,6 +19,8 @@ Enable `OMNIGENT_FEATURES=sandbox_profiles` on the server, preserving any other
 feature overrides. Both the server flag and the provider's `manages_profiles`
 capability are required. Ordinary providers keep their deployment defaults.
 Older servers and flag-off clients do not display or query profile choices.
+Complete the [rollout checks](#rollout-rollback-and-verification) before first
+opt-in on an existing deployment.
 
 The [example package](../../examples/sandbox-profile-provider/README.md) includes
 both a file-catalog Kubernetes adapter and an HTTP controller adapter. Install
@@ -55,6 +57,11 @@ class CustomerLauncher(SandboxHostLauncher):
 This sketch omits the existing provisioning and cleanup methods. See the
 [complete HTTP adapter](../../examples/sandbox-profile-provider/src/omnigent/community/sandbox/profile_demo/controller.py)
 for configuration, credentials, request limits and lifecycle wiring.
+
+`manages_profiles` is a static deployment capability cached per provider config;
+restart server replicas after changing it. User authorization is never cached:
+resolution, admission and binding can each recheck it as a launch progresses.
+Implement bounded controller timeouts and make authorization calls idempotent.
 
 `SandboxProfileContext` is a frozen dataclass:
 
@@ -180,14 +187,32 @@ and separate search keys keep older responses from replacing newer results.
 | Last session deleted | Its labels are deleted; capable controllers retain the sandbox assignment. |
 | Host deletion | Existing host metadata marks deletion; surviving sessions can bind an authorized replacement. |
 | Failed allocation / runner startup | Roll back the attempted host/runner binding and clean up fresh infrastructure. Retain a preaccepted selection for retry. |
-| Scheduled fresh sandbox | No scheduler profile picker yet; providers requiring selection reject an unprofiled scheduled launch. |
+| Programmatic managed create | `sys_session_create(placement="managed")` accepts `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`, with the same authorization as the composer. |
+| Scheduled fresh sandbox | Creating/updating a task rejects a default provider requiring profiles before saving. Use a connected host or an ordinary default provider. Already-saved unsupported tasks fail closed at launch. |
 
 Omnigent stores the accepted provider/ID/revision, public display snapshot and
 execution identity under reserved `sandbox_profile:*` session labels. Generic
 create, update, delete and fork-label APIs cannot forge or modify them. Public
 session responses hide that namespace and expose a typed `sandbox_profile`
 summary. No private configuration is stored. Host affinity uses the existing
-conversation `host_id`; native runner lookup pages the existing runner index.
+conversation `host_id`. Capable controllers remain authoritative for sandbox
+assignments; a missing sandbox can be replaced from its bound session's reference.
+Ordinary hosts skip
+profile discovery entirely. Legacy host recovery reads at most 201 session IDs
+through the existing host index and rejects histories over 200 before hydrating
+labels. Enable controller assignment lookup for large histories or orphan recovery.
+Runner-only adoption reads at most 201 metadata rows through the existing runner
+index, rejecting more than 200 associations rather than guessing a host. Start a
+new runner when that limit is reached. Rotation and rollback also bound their
+source lookup to 201 rows and leave the binding intact if no source is found.
+Ordinary-only deployments skip runner profile discovery. Mixed deployments retain
+the runner bound even for unprofiled sessions: a truncated history cannot prove
+that no unseen association belongs to a profile-managed host.
+
+Incomplete legacy labels remain readable with `sandbox_profile: null`; they
+do not impose profile affinity on ordinary metadata binding operations and
+cannot authorize execution. Saved identities must match the trusted execution
+owner before any owner credential resolution or provider authorization call.
 
 Single-database deployments commit labels and metadata together. Split-database
 deployments accept immutable labels before binding metadata. If that second
@@ -198,9 +223,36 @@ There is no cross-database atomicity claim or unsafe fallback to default setting
 
 ## Rollout, rollback and verification
 
-Deploy with the flag off, install/configure the provider, then validate authenticated
-identity mapping, historical revisions and cleanup before enabling the flag.
-No schema deployment or schema downgrade is needed.
+Deploy with the flag off and keep providers in ordinary mode while validating
+authenticated identity mapping, historical revisions and cleanup in staging.
+No schema deployment or schema downgrade is needed. Enable the flag before setting
+`manages_profiles = True`; a profile-requiring provider with the flag off is a
+configuration error, rejected before session or schedule persistence.
+
+**Before the first opt-in on an existing deployment, audit the reserved labels.**
+Older servers allowed editors to write `sandbox_profile:*`. A complete old label
+set is indistinguishable from a server-accepted reference, including when it names
+the correct owner. Provider reauthorization alone does not prove that owner chose
+the profile. Stop all older writers first and keep profiles disabled during this check.
+
+In the conversation database, inspect every workspace's `conversation_labels` in
+primary-key order `(workspace_id, conversation_id, key)`. Read at most 200 rows per
+transaction, continue after the last `(conversation_id, key)` for that workspace,
+and check `key.startswith("sandbox_profile:")` in the audit process. Use the
+database's native UUID cursor representation. Do not add a prefix filter that
+forces each page to scan an unbounded portion of the tenant. Back up and review
+any matches, then remove those specific full-primary-key rows in bounded batches
+through an administrator's maintenance procedure; the public label API deliberately
+rejects this namespace. Complete a second audit with **zero matching labels**
+before enabling the feature. Do not run this cleanup against an already-enabled
+deployment: its accepted references are legitimate and must be preserved.
+
+Upgrade every server replica and launch client before opting a provider in. Older
+clients cannot supply a required selection and receive 422; there is no implicit
+default profile. Keep providers used by older clients and fresh-sandbox schedules
+ordinary until those callers support selection. Inventory existing schedules
+before changing the default provider. Ordinary controllers retain their launch
+behavior with either flag setting. The reserved label namespace applies globally.
 
 To roll back, stop new profiled launches and drain their running sandboxes before
 disabling the flag or using an older server. A flag-off server does not enforce

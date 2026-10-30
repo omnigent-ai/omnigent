@@ -125,7 +125,7 @@ def test_provider_owned_profiles(
     )
     expect(page.get_by_role("button", name="Start session", exact=True)).to_be_disabled()
     chooser.click()
-    expect(page.get_by_role("menuitem", name="Default", exact=False)).to_have_count(0)
+    expect(page.get_by_role("option", name="Default", exact=False)).to_have_count(0)
     page.screenshot(
         path=evidence / "provider-03-alice-choices.png", full_page=True, animations="disabled"
     )
@@ -259,7 +259,7 @@ def test_provider_owned_profiles(
     expect(
         page.get_by_role("option", name="Large development sandbox", exact=False)
     ).to_have_count(0)
-    expect(page.get_by_role("menuitem", name="Default", exact=False)).to_have_count(0)
+    expect(page.get_by_role("option", name="Default", exact=False)).to_have_count(0)
     page.screenshot(
         path=evidence / "provider-04-bob-mobile.png", full_page=True, animations="disabled"
     )
@@ -275,7 +275,7 @@ def test_provider_owned_profiles(
     catalog_file.write_text(json.dumps(catalog))
     page.reload()
     page.get_by_role("button", name="Sandbox profile:", exact=False).click()
-    expect(page.get_by_role("menuitem", name="Default", exact=False)).to_have_count(0)
+    expect(page.get_by_role("option", name="Default", exact=False)).to_have_count(0)
     expect(
         page.get_by_role("option", name="Small development sandbox", exact=False)
     ).to_have_count(0)

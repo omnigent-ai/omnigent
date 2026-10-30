@@ -206,8 +206,8 @@ map an area, remove it here in the same change.
 - Mobile layout: `tests/e2e_ui/mobile/` (only composer labels, the composer
   after an unacknowledged send, sidebar rename under the keyboard, and
   terminal touch scroll are mapped)
-- Onboarding and host import review: `tests/e2e_ui/onboarding/` (only the
-  import review modal's link to Harnesses is mapped)
+- Onboarding and host import review: `tests/e2e_ui/onboarding/` (the import
+  review modal's link to Harnesses and provider profile selection/clone flows are mapped)
 - Visual snapshots: `tests/e2e_ui/visual/`
 
 **CLI commands:**

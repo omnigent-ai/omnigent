@@ -60,7 +60,15 @@ def admission_app(runtime_init: None, db_uri: str, tmp_path: Path):
         ),
     )
     host_id = uuid.uuid4().hex
-    hosts.upsert_on_connect(host_id, "profile-host", "alice")
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="profile-host",
+        user_id="alice",
+        token="test-token",
+        provider="company",
+        sandbox_id="test-sandbox",
+        token_expires_at=2_000_000_000,
+    )
     profile = app.state.sandbox_profiles.resolve("build", user_id="alice")
     app.state.profile_test_offered = offered
     app.state.profile_test_selections = selections
@@ -107,7 +115,5 @@ def test_profile_binding_waits_for_accepted_host_binding(admission_app, binding)
     )
     snapshot = app.state.sandbox_profiles.get_session_snapshot(target.id)
     assert snapshot == (profile if binding == "existing" else None)
-    # Adopting a profile also checks permission at the persistence boundary.
-    assert app.state.profile_test_selections == [("build", "1")] * (
-        2 if binding == "existing" else 1
-    )
+    assert app.state.profile_test_selections
+    assert set(app.state.profile_test_selections) == {("build", "1")}

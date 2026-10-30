@@ -21,7 +21,18 @@ def test_native_message_schema(spec):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("placement", ["child", "same_host", "managed"])
-async def test_create_placement(placement, monkeypatch):
+@pytest.mark.parametrize(
+    "profile",
+    [
+        None,
+        {
+            "sandbox_provider": "company",
+            "sandbox_profile_id": "build",
+            "sandbox_profile_revision": "v1",
+        },
+    ],
+)
+async def test_create_placement(placement, monkeypatch, profile):
     from omnigent.runner import subagent_work
 
     register = Mock()
@@ -48,12 +59,17 @@ async def test_create_placement(placement, monkeypatch):
                         "placement": placement,
                         "message": "Start",
                         "title": "Worker task",
+                        **(profile or {}),
                     }
                 ),
                 server_client=client,
                 conversation_id="manager",
             )
         )
+    if profile and placement != "managed":
+        assert "requires placement='managed'" in result["error"]
+        assert requests == []
+        return
     assert "error" not in result, result
     assert len(requests) == (2 if placement == "same_host" else 1)
     body = json.loads(requests[0].content)
@@ -69,7 +85,10 @@ async def test_create_placement(placement, monkeypatch):
         assert result["title"] == "Worker task"
         register.assert_not_called()
     if placement == "managed":
-        assert "sandbox_provider" not in body
+        if profile:
+            assert all(body[key] == value for key, value in profile.items())
+        else:
+            assert "sandbox_provider" not in body
         assert body["host_type"] == "managed"
         assert len(body["host_id"]) == 32
         assert body["initial_input"]["data"]["content"][0]["text"] == "Start"

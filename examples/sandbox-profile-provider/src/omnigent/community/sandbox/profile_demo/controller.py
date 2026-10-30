@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import suppress
 from typing import Any, ClassVar
@@ -18,6 +19,8 @@ from omnigent.onboarding.sandboxes.profiles import (
     SandboxProfileContext,
 )
 from omnigent.onboarding.sandboxes.types import SandboxConfigError
+
+_logger = logging.getLogger(__name__)
 
 
 class ControllerConfig(BaseModel):
@@ -145,14 +148,22 @@ class ControllerSandboxLauncher(SandboxHostLauncher):
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise SandboxConfigError("Controller returned no sandbox id")
         try:
-            profile = ProviderSandboxProfile.model_validate(result["sandbox_profile"])
-        except (KeyError, ValueError):
-            self.terminate(sandbox_id)
-            raise SandboxConfigError("Controller returned an invalid sandbox profile") from None
-        assert self._profile is not None
-        if (profile.id, profile.revision) != (self._profile.id, self._profile.revision):
-            self.terminate(sandbox_id)
-            raise SandboxProfileChanged("Controller allocated a different profile revision")
+            try:
+                profile = ProviderSandboxProfile.model_validate(result["sandbox_profile"])
+            except (KeyError, ValueError):
+                raise SandboxConfigError(
+                    "Controller returned an invalid sandbox profile"
+                ) from None
+            assert self._profile is not None
+            if (profile.id, profile.revision) != (self._profile.id, self._profile.revision):
+                raise SandboxProfileChanged("Controller allocated a different profile revision")
+        except (SandboxConfigError, SandboxProfileChanged):
+            try:
+                self.terminate(sandbox_id)
+            except Exception:  # noqa: BLE001 — retain the allocation validation error
+                # Keep the admission failure; record an escaped ID for manual cleanup.
+                _logger.error("Controller cleanup failed for sandbox %r", sandbox_id[:256])
+            raise
         return sandbox_id
 
     def resume(self, sandbox_id: str) -> None:
