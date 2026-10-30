@@ -12,7 +12,14 @@
 // gets the user's actual level for any conversation they navigate to.
 
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
-import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import type { SessionHostResolveOptions } from "@/lib/identity";
+import {
+  getSessionHost,
+  getSessionParent,
+  sessionRoutingHostId,
+  setSessionHost,
+  setSessionParent,
+} from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import type { Session } from "@/lib/types";
@@ -25,10 +32,42 @@ import type { Session } from "@/lib/types";
  */
 const MAX_ROOT_WALK_HOPS = 8;
 
+// Bound cold host-routing lookups, including malformed acyclic ancestry.
+const MAX_HOST_CHAIN_READS = 16;
+
 interface UseSessionResult {
   session: Session | null;
   isLoading: boolean;
   error: Error | null;
+}
+
+/**
+ * Whether ``targetId`` is on the cached parent chain starting at
+ * ``parentSessionId``. Synchronous and cache-only: the chain is cached by
+ * {@link useRootSessionId}'s walk, and an uncached hop ends the search.
+ */
+export function isCachedAncestor(
+  queryClient: QueryClient,
+  parentSessionId: string | null | undefined,
+  targetId: string,
+): boolean {
+  let id = parentSessionId ?? null;
+  for (let hop = 0; id !== null && hop < MAX_ROOT_WALK_HOPS; hop++) {
+    if (id === targetId) return true;
+    id = queryClient.getQueryData<Session>(["session", id])?.parentSessionId ?? null;
+  }
+  return false;
+}
+
+/** The shared ``["session", id]`` snapshot query, disabled for a null id; see {@link useSession}. */
+export function sessionQueryOptions(sessionId: string | null) {
+  return {
+    queryKey: ["session", sessionId] as const,
+    queryFn: () => getSessionSlim(sessionId as string, { refreshState: true }),
+    enabled: sessionId !== null,
+    staleTime: Infinity,
+    retry: false,
+  };
 }
 
 /**
@@ -55,13 +94,7 @@ export function useSession(conversationId: string | null | undefined): UseSessio
   // caller can leak a `GET /v1/sessions/temp:*` — cheaper than gating every
   // call site.
   const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
-  const { data, isLoading, error } = useQuery({
-    queryKey: serverId ? ["session", serverId] : ["session", null],
-    queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
-    enabled: serverId !== null,
-    staleTime: Infinity,
-    retry: false,
-  });
+  const { data, isLoading, error } = useQuery(sessionQueryOptions(serverId));
   return {
     session: data ?? null,
     isLoading,
@@ -164,8 +197,8 @@ export function useActiveRootSessionId(
  *
  * Registered as identity's session-host resolver at the app entry
  * (``setSessionHostResolver``); the chat store's stream bind goes through the
- * same resolver. Best-effort: a hostless top-level session, an unknown id, or
- * a cycle ends the walk with whatever is known.
+ * same resolver. Best-effort: a hostless top-level session, an unknown id,
+ * a cycle, or an exhausted read budget ends the walk with whatever is known.
  *
  * @param queryClient - The app QueryClient holding the snapshot cache.
  * @param sessionId - Session whose routing host to resolve, e.g. ``"conv_child"``.
@@ -173,24 +206,40 @@ export function useActiveRootSessionId(
 export async function prefetchSessionHostChain(
   queryClient: QueryClient,
   sessionId: string,
+  options: SessionHostResolveOptions = {},
 ): Promise<void> {
   const visited = new Set<string>();
   let id: string | null = sessionId;
-  while (id !== null && !visited.has(id) && getSessionHost(sessionId) === null) {
+  while (
+    id !== null &&
+    visited.size < MAX_HOST_CHAIN_READS &&
+    !visited.has(id) &&
+    getSessionHost(sessionId) === null
+  ) {
     visited.add(id);
     const hopId: string = id;
-    // Each hop's id comes from the previous snapshot, so the chain is serial.
-    // oxlint-disable-next-line no-await-in-loop
-    const session: Session = await queryClient.fetchQuery({
+    const queryOptions = {
       queryKey: ["session", hopId],
       queryFn: () => getSessionSlim(hopId),
-      staleTime: Infinity,
+      staleTime: options.force ? 0 : Infinity,
       retry: false,
-    });
+    };
+    if (
+      options.force &&
+      queryClient.getQueryState(queryOptions.queryKey)?.fetchStatus === "fetching"
+    ) {
+      // An in-flight snapshot may predate provisioning. Let it settle before
+      // starting the fresh read, without cancelling other snapshot consumers.
+      // oxlint-disable-next-line no-await-in-loop
+      await queryClient.fetchQuery(queryOptions).catch(() => undefined);
+    }
+    // Each hop's id comes from the previous snapshot, so the chain is serial.
+    // oxlint-disable-next-line no-await-in-loop
+    const session: Session = await queryClient.fetchQuery(queryOptions);
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
-    setSessionHost(session.id, session.hostId);
-    setSessionParent(session.id, session.parentSessionId);
-    id = session.parentSessionId;
+    setSessionHost(session.id, sessionRoutingHostId(session.hostId, session.labels));
+    setSessionParent(session.id, session.parentSessionId, session.labels);
+    id = getSessionParent(session.id);
   }
 }

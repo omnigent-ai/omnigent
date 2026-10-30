@@ -58,7 +58,7 @@ function writeHistory(key: string, entries: ComposerDraft[]): void {
 
 /**
  * Append `text` to the persisted prompt history for `scope` (localStorage),
- * trimming plain text and skipping empty / consecutive-duplicate entries (matching
+ * trimming trailing whitespace and skipping empty / consecutive-duplicate entries (matching
  * shell ``HISTCONTROL=ignoredups``). Caps at {@link MAX_ENTRIES} with FIFO
  * eviction.
  *
@@ -81,7 +81,7 @@ export function appendPromptHistoryEntry(
 ): ComposerDraft[] | null {
   if (!text.trim()) return null;
   const entry = readComposerDraft({ text, replyDraft })!;
-  if (!entry.replyDraft) entry.text = text.trim();
+  if (!entry.replyDraft) entry.text = text.trimEnd();
   const key = scopedKey(scope);
   const history = readHistory(key);
   // Identical text with different quote provenance must remain separate entries.
@@ -99,16 +99,15 @@ export function appendPromptHistoryEntry(
 
 export interface PromptHistory {
   /**
-   * Append `text` to history and reset the recall cursor. Trims plain text;
+   * Append `text` to history and reset the recall cursor. Trims trailing whitespace;
    * skips empty / whitespace-only and consecutive duplicates.
    */
   appendEntry: (text: string, replyDraft?: StoredReplyDraft) => void;
 
   /**
-   * Walk back to an older entry. On first call, captures `currentText` as
-   * the draft so it can be restored later. Returns the recalled entry,
-   * or null when there's nothing to recall (history empty, or already at
-   * the oldest entry).
+   * Walk back to an older entry, starting only when `currentText` is empty.
+   * Returns null for an unsent draft, empty history, or the oldest entry.
+   * Once recalling, nonempty text is allowed until resetCursor is called.
    */
   recallPrevious: (currentText: string, replyDraft?: StoredReplyDraft) => ComposerDraft | null;
 
@@ -176,9 +175,8 @@ export function usePromptHistory(scope?: string | null): PromptHistory {
       if (history.length === 0) return null;
 
       if (cursorRef.current === null) {
-        // Entering recall mode: stash the in-progress text so ArrowDown can
-        // restore it. Captures the literal value (including whitespace) —
-        // we're not the source of truth for trim semantics here.
+        // Arrow keys in an unsent draft must remain caret navigation.
+        if (currentText !== "") return null;
         draftRef.current = readComposerDraft({ text: currentText, replyDraft })!;
         cursorRef.current = 0;
       } else if (cursorRef.current < history.length - 1) {

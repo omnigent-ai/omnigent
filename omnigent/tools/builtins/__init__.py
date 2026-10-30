@@ -70,6 +70,7 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
@@ -103,6 +104,7 @@ __all__ = [
     "SysTimerCancelTool",
     "SysTimerSetTool",
     "UpdateCommentTool",
+    "WebReadTool",
     "WebSearchTool",
     "any_skill_has_resources",
     "find_skill_by_name",
@@ -250,6 +252,7 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
+    "web_read": lambda config: WebReadTool(config=config),
     "nimble_research": lambda config: NimbleResearchTool(config=config),
     "nimble_extract": lambda config: NimbleExtractTool(config=config),
     "upload_file": _create_upload_file,
@@ -277,10 +280,10 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # name in the runner's tool dispatch — reserved here so user specs
     # cannot shadow it.
     "sys_advise_models": None,
-    # ``browser_*`` embedded-browser tools are framework-owned: always
+    # ``browser_*`` embedded-browser tools are framework-owned:
     # auto-registered by ``ToolManager._register_browser_tools`` (the
-    # single source of truth for registration), so any agent can drive
-    # the desktop app's browser without the spec opting in. Reserved
+    # single source of truth for registration) unless the spec sets
+    # ``tool_groups.browser: false``. Reserved
     # here with ``None`` — exactly like ``list_comments`` /
     # ``update_comment`` — so user specs cannot shadow the names and
     # ``get_builtin_tool`` returns ``None`` for them (they are not
@@ -291,6 +294,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    "ui_open_file": None,
 }
 
 # Hindsight long-term memory (optional ``hindsight`` extra). Registered only

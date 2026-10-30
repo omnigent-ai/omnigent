@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { measureElement, useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   Conversation,
@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isSystemUserContent } from "@/lib/systemMessage";
+import { isTerminalCommandInput } from "@/lib/blocks";
 import {
   type Bubble,
   type BubbleCache,
@@ -24,13 +25,21 @@ import {
 import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
-import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { DbcertBanner } from "@/components/DbcertBanner";
+import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
+import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-import { RunnerStartingIndicator, McpStartupIndicator } from "@/pages/ChatIndicators";
+import {
+  RunnerStartingIndicator,
+  McpStartupIndicator,
+  SandboxActionBanner,
+} from "@/pages/ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import {
   type ConversationScroller,
@@ -42,7 +51,6 @@ import {
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
-  UserMessageNavConnected,
   WorkingIndicator,
   bubbleKey,
   buildPendingBubbles,
@@ -59,6 +67,7 @@ import {
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
+  hostId: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -104,6 +113,7 @@ export function isNativeFindShortcut(
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
+  hostId,
   setConversationEl,
   containerEl,
   scroller,
@@ -168,8 +178,8 @@ function TranscriptImpl({
     const ids = new Set<string>();
     for (const block of blocks) {
       if (
-        block.type === "user_message" &&
-        !isSystemUserContent(block.content) &&
+        ((block.type === "user_message" && !isSystemUserContent(block.content)) ||
+          isTerminalCommandInput(block)) &&
         block.ctx.itemId !== null
       ) {
         ids.add(block.ctx.itemId);
@@ -219,7 +229,14 @@ function TranscriptImpl({
       flushSync(() => setNativeFindConversationId(display.conversationId));
     };
     window.addEventListener("keydown", handleFind);
-    return () => window.removeEventListener("keydown", handleFind);
+    // The desktop Edit > Find… menu opens its find bar without a keydown.
+    const unsubscribeFindOpened = onFindOpened(() => {
+      if (display.conversationId) setNativeFindConversationId(display.conversationId);
+    });
+    return () => {
+      window.removeEventListener("keydown", handleFind);
+      unsubscribeFindOpened();
+    };
   }, [display.conversationId]);
   const disableVirtualization = nativeFindConversationId === display.conversationId;
   const [searchParams] = useSearchParams();
@@ -309,24 +326,34 @@ function TranscriptImpl({
   }, [nav]);
 
   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  const arcaWarning = useArcaShutdownBanner();
+  const showArcaBanner = arcaWarning.showForHost(hostId);
+  const hasPinnedBanner = display.hasTasks || showArcaBanner;
   return (
     <>
       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
       <ChatPlanAccordion className="mt-14 md:mt-12" />
+      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
-        <Conversation className={cn(!display.hasTasks && "chat-scroll-fade", "flex-1")}>
+        <Conversation
+          className={cn(
+            hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            "flex-1",
+          )}
+        >
           <ConversationContent
             scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)] pb-6",
-              display.hasTasks ? "pt-4" : "pt-20",
+              "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
+              hasPinnedBanner ? "pt-4" : "pt-20",
+              showArcaBanner && "chat-content-under-arca-banner",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -409,13 +436,6 @@ function TranscriptImpl({
             />
           </ConversationContent>
           <ConversationScrollButton />
-          <UserMessageNavConnected
-            goPrev={nav.goPrev}
-            goNext={nav.goNext}
-            canPrev={nav.canPrev}
-            canNext={nav.canNext}
-            hidden={userMessageIds.length === 0}
-          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
@@ -426,8 +446,12 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs warning, a sibling of Conversation. */}
-        <StreamBudgetBanner />
+        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+        <FloatingBannerStack>
+          <StreamBudgetBanner />
+          <DbcertBanner conversationId={conversationId} hostId={hostId} />
+          <SandboxActionBanner />
+        </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
         {!isMobileViewport && (
           <TurnRail
@@ -469,7 +493,7 @@ export function activeTurnIdAtBubbleIndex(bubbles: Bubble[], midIndex: number): 
  * mount every bubble's markdown/tool subtree at once.
  *
  * The window is one flex child of the content div, sized to the full measured
- * height (`getTotalSize`) with each row absolutely positioned. Keeping the
+ * height (`getTotalSize`), with mounted rows padded to their offsets. Keeping the
  * wrapper at full height preserves `scrollHeight`, so StickToBottom's
  * at-bottom math, the TranscriptScrollbar, and the LatestTurnSpacer all keep
  * measuring the whole transcript even though most rows are unmounted. Rows are
@@ -541,6 +565,8 @@ function rememberTranscriptView(convId: string, snap: TranscriptViewSnapshot): v
 }
 /** Physical "is this scroll element at (or within a hair of) its bottom". */
 const BOTTOM_EPSILON_PX = 8;
+/** Space between virtualized rows, shared by the virtualizer's offsets and the list's layout. */
+const ROW_GAP_PX = 16;
 const RESTORE_CANCEL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
 function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
@@ -621,8 +647,8 @@ export function VirtualBubbleList({
       // offset is scroll-invariant and only in-flow content above it moves it,
       // while the hold measures purely inside the list. Neither sees the other's
       // change, so their writes add rather than double-count.
-      // Native scroll anchoring can't — the rows it would anchor to are out of
-      // flow — so it is off for this scroller (data-virtualized-transcript).
+      // Native scroll anchoring would also answer the virtualizer's own row
+      // corrections, so it is off for this scroller (data-virtualized-transcript).
       // Only the observer sees the net change per painted frame; a layout
       // effect can catch the indicator mid unmount-and-remount. At the very
       // top the indicator is meant to be seen, so nothing moves there.
@@ -633,8 +659,8 @@ export function VirtualBubbleList({
       if (observed) {
         const previous = listOffsetRef.current;
         listOffsetRef.current = { el: scrollEl, offset, scrollable };
-        // With virtualization off (native find) the rows are in flow and the
-        // browser's own anchoring handles this; writing too would double it.
+        // With virtualization off (native find) the browser's own anchoring is
+        // on and handles this; writing too would double it.
         if (
           !disableVirtualization &&
           previous?.el === scrollEl &&
@@ -652,7 +678,16 @@ export function VirtualBubbleList({
     };
     measure(false);
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure(true));
+    let viewportHeight = scrollEl.clientHeight;
+    const observer = new ResizeObserver(() => {
+      const nextViewportHeight = scrollEl.clientHeight;
+      if (viewportHeight === 0 && nextViewportHeight > 0) {
+        // The browser can restore scrollTop without firing scroll when a hidden view returns.
+        scrollEl.dispatchEvent(new Event("scroll"));
+      }
+      viewportHeight = nextViewportHeight;
+      measure(true);
+    });
     observer.observe(scrollEl); // viewport height changes
     if (wrapper.parentElement) observer.observe(wrapper.parentElement); // content reflow above
     return () => observer.disconnect();
@@ -713,11 +748,20 @@ export function VirtualBubbleList({
       const key = bubbleKey(bubbles[index]!);
       return rowKeyAliasRef.current.get(key) ?? key;
     },
-    // Replaces the content column's `gap-4` between bubbles, which absolute
-    // positioning would otherwise drop.
-    gap: 16,
+    gap: ROW_GAP_PX,
     overscan: 6,
     scrollMargin,
+    // Unrounded, unlike the library default: in-flow rows sit at their exact
+    // heights, so rounded sizes would drift each row off its virtual offset.
+    measureElement: (element, entry, instance) => {
+      const observed = entry?.borderBoxSize?.[0]?.blockSize;
+      if (observed !== undefined) return observed;
+      // On mount the library falls back to a cached size, else the rounded offsetHeight.
+      const key = instance.options.getItemKey(instance.indexFromElement(element));
+      return instance.itemSizeCache.has(key)
+        ? measureElement(element, entry, instance)
+        : element.getBoundingClientRect().height;
+    },
   });
 
   // An assistant bubble is keyed by its first item, so a history page that
@@ -915,9 +959,9 @@ export function VirtualBubbleList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bubbles, scrollEl, range, totalSize, virtualizer]);
 
-  // Older-history prepend compensation. Absolute rows are out of normal flow,
-  // so the browser's native scroll anchoring can't hold the read position
-  // across a prepend. Snapshot every mounted row's offset each render; when a
+  // Older-history prepend compensation. Native scroll anchoring is off for
+  // this scroller, so it can't hold the read position across a prepend.
+  // Snapshot every mounted row's offset each render; when a
   // prepend lands, restore scrollTop so the topmost snapshotted row that still
   // exists keeps its pre-prepend viewport position. A bubble the page renamed
   // is skipped when any other row survives, and otherwise held by its bottom
@@ -1019,9 +1063,22 @@ export function VirtualBubbleList({
     );
   }
 
+  // Rows stay in flow, padded to their virtual offsets: the browser resolves a
+  // drag ending beside or between out-of-flow rows to the start of the list.
+  const virtualItems = virtualizer.getVirtualItems();
+  const firstItem = virtualItems[0];
+  const lastItem = virtualItems.at(-1);
   return (
-    <div ref={wrapperRef} className="relative w-full" style={{ height: `${totalSize}px` }}>
-      {virtualizer.getVirtualItems().map((item) => {
+    <div
+      ref={wrapperRef}
+      className="flex w-full flex-col"
+      style={{
+        rowGap: ROW_GAP_PX,
+        paddingTop: firstItem ? firstItem.start - scrollMargin : 0,
+        paddingBottom: lastItem ? totalSize - (lastItem.end - scrollMargin) : totalSize,
+      }}
+    >
+      {virtualItems.map((item) => {
         const bubble = bubbles[item.index];
         if (!bubble) return null;
         return (
@@ -1030,8 +1087,7 @@ export function VirtualBubbleList({
             data-index={item.index}
             data-bubble-key={rowKey(bubble)}
             ref={virtualizer.measureElement}
-            className="absolute top-0 left-0 w-full"
-            style={{ transform: `translateY(${item.start - scrollMargin}px)` }}
+            className="relative"
           >
             <BubbleView
               bubble={bubble}

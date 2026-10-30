@@ -170,6 +170,25 @@ describe("SetupTerminalStep", () => {
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
+  it("fills the bar from the start when there's no install step", () => {
+    let emit: (line: string) => void = () => {};
+    const props = {
+      onRun: () => new Promise<{ ok: boolean }>(() => {}),
+      onSetupLog: (cb: (line: string) => void) => {
+        emit = cb;
+        return () => {};
+      },
+      onBack: vi.fn(),
+    };
+    const { container, rerender } = render(<SetupTerminalStep {...props} />);
+    const bar = () => container.querySelector<HTMLElement>("[style*='width']")?.style.width;
+    expect(bar()).toBe("10%");
+    act(() => emit("$ omnigent host --server https://team.example.com/"));
+    expect(bar()).toBe("35%");
+    rerender(<SetupTerminalStep {...props} connection={{ phase: "connecting" }} />);
+    expect(bar()).toBe("70%");
+  });
+
   it("fires onBack from Back on the failure screen", async () => {
     const onBack = vi.fn();
     render(<SetupTerminalStep onRun={vi.fn().mockResolvedValue({ ok: false })} onBack={onBack} />);

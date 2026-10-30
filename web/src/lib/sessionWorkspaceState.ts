@@ -7,14 +7,20 @@
 // effect drops keys whose PTY has gone away once the terminal list loads.
 
 import type { RightRailTab } from "@/shell/railTabs";
+import { parseTerminalSplitState, type TerminalSplitState } from "./terminalSplitLayout";
+import type { DefaultWorkspaceTab } from "./workspaceTabPreferences";
 
-const RAIL_TABS: readonly RightRailTab[] = [
+const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
   "files",
   "changes",
   "github",
   "subagents",
+];
+const RAIL_TABS: readonly RightRailTab[] = [
+  ...WORKSPACE_PANEL_TABS,
   "browser",
   "sidechat",
+  "content-search",
 ];
 
 export interface SessionWorkspaceState {
@@ -22,8 +28,10 @@ export interface SessionWorkspaceState {
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected Workspace navigation tab. */
-  rightRailTab?: RightRailTab;
+  /** Selected Workspace page, or null when no pinned or opened page is available. */
+  rightRailTab?: RightRailTab | null;
+  /** Unpinned built-in pages explicitly opened from the Workspace menu. */
+  openPanels?: DefaultWorkspaceTab[];
   /** Ordered list of open file tabs. */
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
@@ -37,11 +45,15 @@ export interface SessionWorkspaceState {
   /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
    *  by design: side chats are ephemeral and vanish when the app is closed. */
   openSideChats?: string[];
+  /** Open sub-agent tabs (`subagentTabId` values) in open order, shown after the side chats. */
+  openSubagentTabs?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
+  /** Split panes of the main terminal view; absent while unsplit. */
+  terminalSplit?: TerminalSplitState;
 }
 
-const STORAGE_KEY = "omnigent:session-workspace-state";
+export const SESSION_WORKSPACE_STATE_KEY = "omnigent:session-workspace-state";
 // Cap stored sessions so the store can't grow without bound. The
 // least-recently-touched entries (front of the array) are pruned first once the
 // cap is exceeded.
@@ -73,13 +85,33 @@ interface StoredEntry {
 
 type Store = StoredEntry[];
 
+/** The non-empty strings in `values`, first occurrence kept. */
+function uniqueIds(values: unknown[]): string[] {
+  return [
+    ...new Set(
+      values.filter((value): value is string => typeof value === "string" && value !== ""),
+    ),
+  ];
+}
+
 function sanitize(entry: unknown): SessionWorkspaceState {
   if (typeof entry !== "object" || entry === null) return {};
   const record = entry as Record<string, unknown>;
   const state: SessionWorkspaceState = {};
   if (typeof record.open === "boolean") state.open = record.open;
   if (isValidWidth(record.widthPx)) state.widthPx = record.widthPx;
-  if (isRailTab(record.rightRailTab)) state.rightRailTab = record.rightRailTab;
+  if (record.rightRailTab === null || isRailTab(record.rightRailTab)) {
+    state.rightRailTab = record.rightRailTab;
+  }
+  if (Array.isArray(record.openPanels)) {
+    state.openPanels = [
+      ...new Set(
+        record.openPanels.filter((value): value is DefaultWorkspaceTab =>
+          WORKSPACE_PANEL_TABS.some((tab) => tab === value),
+        ),
+      ),
+    ];
+  }
   if (Array.isArray(record.openFiles) && record.openFiles.every((p) => typeof p === "string")) {
     state.openFiles = record.openFiles as string[];
   }
@@ -95,37 +127,25 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedTerminalKey === null || typeof record.selectedTerminalKey === "string") {
     state.selectedTerminalKey = record.selectedTerminalKey;
   }
-  if (Array.isArray(record.openBrowsers)) {
-    state.openBrowsers = [
-      ...new Set(
-        record.openBrowsers.filter(
-          (value): value is string => typeof value === "string" && value.length > 0,
-        ),
-      ),
-    ];
-  }
+  if (Array.isArray(record.openBrowsers)) state.openBrowsers = uniqueIds(record.openBrowsers);
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;
   }
-  if (Array.isArray(record.openSideChats)) {
-    state.openSideChats = [
-      ...new Set(
-        record.openSideChats.filter(
-          (value): value is string => typeof value === "string" && value.length > 0,
-        ),
-      ),
-    ];
-  }
+  if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
+  if (Array.isArray(record.openSubagentTabs))
+    state.openSubagentTabs = uniqueIds(record.openSubagentTabs);
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }
+  const terminalSplit = parseTerminalSplitState(record.terminalSplit);
+  if (terminalSplit) state.terminalSplit = terminalSplit;
   return state;
 }
 
 function readStore(): Store {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(SESSION_WORKSPACE_STATE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -142,12 +162,15 @@ function readStore(): Store {
   }
 }
 
-function writeStore(store: Store): void {
-  if (typeof window === "undefined") return;
+/** Persist the store; false when storage refused the write. */
+function writeStore(store: Store): boolean {
+  if (typeof window === "undefined") return false;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    window.localStorage.setItem(SESSION_WORKSPACE_STATE_KEY, JSON.stringify(store));
+    return true;
   } catch {
     // Storage quota/access errors must not break panel interactions.
+    return false;
   }
 }
 
@@ -157,11 +180,11 @@ export function readSessionWorkspaceState(conversationId: string): SessionWorksp
   return entry ? entry.state : {};
 }
 
-/** Merge a partial update into one session's persisted workspace state. */
-export function writeSessionWorkspaceState(
+/** Like {@link writeSessionWorkspaceState}, but returns false when storage refused the write. */
+export function saveSessionWorkspaceState(
   conversationId: string,
   patch: SessionWorkspaceState,
-): void {
+): boolean {
   const store = readStore();
   const existingIdx = store.findIndex((e) => e.id === conversationId);
   const prev = existingIdx >= 0 ? store[existingIdx].state : {};
@@ -183,6 +206,9 @@ export function writeSessionWorkspaceState(
   if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {
     next.openSideChats = next.openSideChats.slice(-MAX_OPEN_FILES);
   }
+  if (next.openSubagentTabs && next.openSubagentTabs.length > MAX_OPEN_FILES) {
+    next.openSubagentTabs = next.openSubagentTabs.slice(-MAX_OPEN_FILES);
+  }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).
   if (existingIdx >= 0) store.splice(existingIdx, 1);
@@ -190,7 +216,15 @@ export function writeSessionWorkspaceState(
   if (store.length > MAX_SESSIONS) {
     store.splice(0, store.length - MAX_SESSIONS);
   }
-  writeStore(store);
+  return writeStore(store);
+}
+
+/** Merge a partial update into one session's persisted workspace state. */
+export function writeSessionWorkspaceState(
+  conversationId: string,
+  patch: SessionWorkspaceState,
+): void {
+  saveSessionWorkspaceState(conversationId, patch);
 }
 
 /** Let existing chats follow a changed default while keeping their open tabs and layout. */
@@ -202,6 +236,17 @@ export function resetSessionWorkspaceTabSelections(): void {
     delete state.selectedTerminalKey;
     delete state.selectedBrowserId;
     delete state.selectedSideChatId;
+  }
+  writeStore(store);
+}
+
+/** Forget newly unpinned pages without disturbing other tabs or their selection. */
+export function unpinSessionWorkspaceTabs(tabs: readonly DefaultWorkspaceTab[]): void {
+  if (tabs.length === 0) return;
+  const store = readStore();
+  for (const { state } of store) {
+    if (tabs.some((tab) => tab === state.rightRailTab)) delete state.rightRailTab;
+    if (state.openPanels) state.openPanels = state.openPanels.filter((tab) => !tabs.includes(tab));
   }
   writeStore(store);
 }

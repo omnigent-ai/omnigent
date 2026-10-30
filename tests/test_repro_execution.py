@@ -307,9 +307,10 @@ def test_unreadable_metadata_does_not_prevent_execution(tmp_path, monkeypatch):
     manifest = next((tmp_path / "execution").glob("*/attempt.json"))
     assert "command-ran" in (manifest.parent / "stdout.txt").read_text()
     record = json.loads(manifest.read_text())
-    assert {"operation": "file_fingerprint", "error_type": "PermissionError"} in record[
-        "collection_errors"
-    ]
+    assert any(
+        e["operation"] == "file_fingerprint" and e["error_type"] == "PermissionError"
+        for e in record["collection_errors"]
+    )
     assert record["ended_at_ns"] >= record["started_at_ns"]
 
 
@@ -333,7 +334,10 @@ def test_finalization_failure_preserves_exit_status(tmp_path, monkeypatch, capsy
         record = json.loads(next((tmp_path / "execution").glob("*/attempt.json")).read_text())
         assert record["exit_code"] == 7
         assert not record["artifacts_complete"]
-        assert {"operation": "inventory", "error_type": "OSError"} in record["collection_errors"]
+        assert any(
+            e["operation"] == "inventory" and e["error_type"] == "OSError"
+            for e in record["collection_errors"]
+        )
 
 
 @pytest.mark.parametrize("broken_journal", [False, True])
@@ -410,7 +414,7 @@ def test_non_session_urls_do_not_trigger_snapshots(tmp_path):
         collector.session(url)
     assert not collector.sessions
     collector.session("http://localhost/c/s/")
-    collector.session("http://localhost/v1/sessions/other/items")
+    collector.session("http://localhost/v1/sessions/other", {"id": "other"})
     assert set(collector.sessions) == {("http://localhost", "s"), ("http://localhost", "other")}
 
 
@@ -801,7 +805,10 @@ def test_group_wait_failure_preserves_command_result(tmp_path, monkeypatch, erro
     )
     record = json.loads(next((tmp_path / "execution").glob("*/attempt.json")).read_text())
     assert record["status"] == "finished"
-    assert {"operation": "group_wait", "error_type": error.__name__} in record["collection_errors"]
+    assert any(
+        e["operation"] == "group_wait" and e["error_type"] == error.__name__
+        for e in record["collection_errors"]
+    )
 
 
 @pytest.mark.parametrize("ending", ["\n", "\r\n"])
@@ -1050,7 +1057,10 @@ def test_worker_http_request_is_observed_during_snapshot(tmp_path, monkeypatch):
         if request.url.path == "/v1/sessions/first":
             entered.set()
             assert release.wait(timeout=5)
-        return httpx.Response(200, json={"id": "second", "data": [], "has_more": False})
+            return httpx.Response(200, json={"id": "first"})
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"id": "second"})
+        return httpx.Response(200, json={"data": [], "has_more": False})
 
     def init(client, *args, **kwargs):
         kwargs["transport"] = httpx.MockTransport(handle)
@@ -1192,3 +1202,401 @@ sys.exit(7)
     assert {"command_redaction", "output_redaction"} <= {
         e["operation"] for e in record["collection_errors"]
     }
+
+
+@pytest.mark.parametrize("sid", ["conv_custom-id", "ac82ef19", "name:child", "with space"])
+def test_session_discovery_requires_matching_identity(tmp_path, sid):
+    from urllib.parse import quote
+
+    collector = Evidence(tmp_path)
+    for route in ("projects", "search", "stats"):
+        collector.session(f"http://localhost/v1/sessions/{route}", {"data": []})
+        collector.session(f"http://localhost/v1/sessions/{route}", {"id": route, "data": []})
+    collector.session("http://localhost/v1/sessions", {"data": [{"id": sid}]})
+    collector.session("http://localhost/v1/sessions/wrong", {"id": sid})
+    collector.session("http://localhost/v1/sessions/missing", {"id": "missing"}, status=404)
+    collector.session("http://localhost/v1/sessions/bad", {"id": ["bad"]})
+    assert not collector.sessions
+    collector.session(f"http://localhost/v1/sessions/{quote(sid)}", {"id": sid})
+    collector.session("http://localhost/v1/sessions", {"id": "second"})
+    assert set(collector.sessions) == {("http://localhost", sid), ("http://localhost", "second")}
+
+
+@pytest.mark.parametrize("observer", ["http", "browser"])
+def test_bundle_created_session_is_captured_before_delete(tmp_path, monkeypatch, observer):
+    from types import SimpleNamespace
+
+    deleted = False
+
+    def handle(request):
+        nonlocal deleted
+        if request.method == "POST":
+            return httpx.Response(
+                201, json={"session_id": "bundled", "agent_id": "ag_test", "agent_name": "test"}
+            )
+        if request.method == "DELETE":
+            deleted = True
+            return httpx.Response(204)
+        if deleted:
+            return httpx.Response(404)
+        body = (
+            {"id": "bundled"}
+            if request.url.path == "/v1/sessions/bundled"
+            else {"data": [{"id": "last-turn"}], "has_more": False}
+        )
+        return httpx.Response(200, json=body)
+
+    original = httpx.Client.__init__
+    monkeypatch.setattr(
+        httpx.Client,
+        "__init__",
+        lambda client, *a, **kw: original(
+            client, *a, **{**kw, "transport": httpx.MockTransport(handle)}
+        ),
+    )
+    collector = Evidence(tmp_path)
+    state = {"sessions": set()}
+    try:
+        if observer == "http":
+            collector.install_http()
+        with httpx.Client() as client:
+            created = client.post("http://localhost/v1/sessions", files={"bundle": b"bundle"})
+            if observer == "browser":
+                collector.response(
+                    SimpleNamespace(
+                        url=str(created.url),
+                        status=created.status_code,
+                        headers=created.headers,
+                        json=created.json,
+                        request=SimpleNamespace(method="POST", post_data=None),
+                    ),
+                    "browser",
+                    state,
+                )
+                assert state["sessions"] == {("http://localhost", "bundled")}
+                collector.install_http()
+            # No navigation or session-info read precedes deletion.
+            client.get("http://localhost/v1/sessions/bundled/items")
+            client.delete("http://localhost/v1/sessions/bundled")
+        snapshots = [e for e in events(tmp_path) if e["kind"] == "session_items"]
+        assert len(snapshots) == 1
+        assert snapshots[0]["session_id"] == "bundled"
+        assert snapshots[0]["reason"] == "before_session_delete"
+        assert snapshots[0]["body"]["data"] == [{"id": "last-turn"}]
+    finally:
+        collector.patch.undo()
+
+
+@pytest.mark.parametrize(
+    "method,path,status,body",
+    [
+        ("GET", "/v1/sessions", 200, {"session_id": "s"}),
+        ("POST", "/v1/sessions/s/items", 200, {"session_id": "s"}),
+        ("POST", "/v1/sessions/s", 200, {"session_id": "s"}),
+        ("POST", "/v1/sessions", 400, {"session_id": "s"}),
+        ("POST", "/v1/sessions", 201, {"session_id": "s", "data": []}),
+        ("POST", "/v1/sessions", 201, {"id": None, "session_id": "s"}),
+        *[("POST", "/v1/sessions", 201, {"session_id": sid}) for sid in (".", "..", "a/b", [])],
+    ],
+)
+def test_creation_alias_does_not_bypass_identity_checks(tmp_path, method, path, status, body):
+    collector = Evidence(tmp_path)
+    collector.session("http://localhost" + path, body, status=status, method=method)
+    assert not collector.sessions
+
+
+@pytest.mark.parametrize("sid", [".", ".."])
+@pytest.mark.parametrize("route", ["/v1/sessions", "/v1/sessions/{sid}", "/c/{sid}"])
+def test_dot_only_session_identity_cannot_trigger_normalized_snapshot(
+    tmp_path, monkeypatch, sid, route
+):
+    reads = []
+
+    def send(client, request, **kwargs):
+        reads.append(str(request.url))
+        return httpx.Response(404, request=request)
+
+    monkeypatch.setattr(httpx.Client, "send", send)
+    collector = Evidence(tmp_path)
+    collector.session("http://localhost" + route.format(sid=sid.replace(".", "%2E")), {"id": sid})
+    collector.snapshot("test")
+    assert not collector.sessions
+    assert not reads
+
+
+@pytest.mark.parametrize("delete_status", [204, 403])
+def test_delete_snapshots_only_target_and_classifies_later_absence(
+    tmp_path, monkeypatch, delete_status
+):
+    deleted = set()
+    reads = []
+
+    def handle(request):
+        sid = request.url.path.split("/")[3]
+        if request.method == "DELETE":
+            if delete_status == 204:
+                deleted.add(sid)
+            return httpx.Response(delete_status)
+        reads.append(request.url.path)
+        if sid in deleted or sid == "missing":
+            return httpx.Response(404)
+        body = {"data": [{"id": "retained-turn"}], "has_more": False}
+        if request.url.path == f"/v1/sessions/{sid}":
+            body = {"id": sid}
+        return httpx.Response(200, json=body)
+
+    original = httpx.Client.__init__
+
+    def init(client, *args, **kwargs):
+        original(client, *args, **{**kwargs, "transport": httpx.MockTransport(handle)})
+
+    monkeypatch.setattr(httpx.Client, "__init__", init)
+    collector = Evidence(tmp_path)
+    collector.install_http()
+    try:
+        for sid in ("first", "second", "missing"):
+            collector.session(f"http://localhost/c/{sid}")
+        with httpx.Client() as client:
+            client.delete("http://localhost/v1/sessions/first")
+        assert reads == [f"/v1/sessions/first{suffix}" for suffix in ("", "/resources", "/items")]
+        collector.snapshot("after_teardown")
+        saved = events(tmp_path)
+        assert any(
+            e["kind"] == "session_items" and e["reason"] == "before_session_delete" for e in saved
+        )
+        errors = [e for e in saved if e["kind"] == "collection_error"]
+        assert {e["session_id"] for e in errors} == {"missing"}
+        assert all(e["phase"] == "after_teardown" and e["detail"] for e in errors)
+        assert bool([e for e in saved if e["kind"] == "session_absent" and e["expected"]]) == (
+            delete_status == 204
+        )
+        if delete_status == 204:
+            assert reads.count("/v1/sessions/first/items") == 1
+    finally:
+        collector.patch.undo()
+
+
+@pytest.mark.parametrize("surface", ["info", "resources", "items", "identity"])
+def test_snapshot_failures_keep_precise_context(tmp_path, monkeypatch, surface):
+    def handle(request):
+        route = request.url.path.rsplit("/", 1)[-1]
+        if route == {"info": "s", "resources": "resources", "items": "items"}.get(surface):
+            return httpx.Response(500)
+        return httpx.Response(
+            200, json={"id": "wrong" if surface == "identity" else "s", "has_more": False}
+        )
+
+    original = httpx.Client.__init__
+    monkeypatch.setattr(
+        httpx.Client,
+        "__init__",
+        lambda client, *a, **kw: original(
+            client, *a, **{**kw, "transport": httpx.MockTransport(handle)}
+        ),
+    )
+    collector = Evidence(tmp_path)
+    collector.session("http://localhost/c/s")
+    collector.snapshot("before_teardown")
+    error = next(e for e in events(tmp_path) if e["kind"] == "collection_error")
+    assert error["session_id"] == "s" and error["phase"] == "before_teardown"
+    assert error["error_type"] == ("ValueError" if surface == "identity" else "HTTPStatusError")
+
+
+def test_diagnostics_are_sanitized_before_bounding(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXAMPLE_TOKEN", "secret-value-12345")
+    journal = Journal(tmp_path)
+
+    def fail():
+        raise RuntimeError(
+            "stop failed secret-value-12345 password=inline-value api_key='two words' "
+            'payload {"refresh_token": "unknown-secret"} '
+            "at http://user:password@localhost/p?token=hidden " + "x" * 4000
+        )
+
+    journal.capture("trace_stop", fail, context_id="context-1", phase="before_browser_close")
+    event = events(tmp_path)[0]
+    assert event["detail"] == "stop failed [redacted] password=[redacted]"
+    assert "secret-value" not in event["detail"] and "user:password" not in event["detail"]
+    assert all(s not in event["detail"] for s in ("inline-value", "two words", "unknown-secret"))
+    assert "token=hidden" not in event["detail"]
+    assert event["context_id"] == "context-1" and event["phase"] == "before_browser_close"
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "password=correct horse battery staple",
+        "client-secret = correct horse battery staple, with more words",
+        'payload {"refresh_token": "correct horse\\" battery staple"}',
+        "api_key='correct horse\nbattery staple'",
+        "password\n= correct horse battery staple",
+    ],
+)
+def test_diagnostic_credentials_do_not_reach_journal_or_aggregation(tmp_path, assignment):
+    from dev.repro_env.execution import collector_errors
+
+    journal = Journal(tmp_path)
+    # The credential was generated at runtime, not supplied in the environment.
+    journal.secrets = ()
+
+    def fail():
+        raise RuntimeError("stop failed " + assignment)
+
+    journal.capture("trace_stop", fail)
+    wrapper = Journal(tmp_path)
+    errors = collector_errors(tmp_path, wrapper)
+    assert len(errors) == 1
+    assert errors[0]["detail"].startswith("stop failed ")
+    saved = journal.path.read_text() + json.dumps(errors) + json.dumps(journal.errors)
+    assert "[redacted]" in saved
+    assert all(part not in saved for part in ("correct", "horse", "battery", "staple"))
+
+
+def test_diagnostics_bound_safe_text_and_omit_oversized_input(tmp_path, monkeypatch):
+    from dev.repro_env.execution import MAX_DIAGNOSTIC_INPUT
+
+    journal = Journal(tmp_path)
+    assert len(journal.failure("trace_stop", RuntimeError("benign " * 600))["detail"]) == 2048
+    original = journal.clean
+
+    def clean(value):
+        if isinstance(value, str):
+            pytest.fail("oversized diagnostic must not be scanned or truncated before redaction")
+        return original(value)
+
+    monkeypatch.setattr(journal, "clean", clean)
+    error = journal.failure("trace_stop", RuntimeError("sensitive " * MAX_DIAGNOSTIC_INPUT))
+    assert error["detail"] == "[diagnostic omitted: oversized error]"
+
+
+def test_hyphenated_diagnostic_does_not_stall_collection(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    script = """
+from pathlib import Path
+from dev.repro_env.execution import Journal
+import sys
+journal = Journal(Path(sys.argv[1]))
+error = journal.failure('trace_stop', RuntimeError('failure ' + 'a-' * 8000 + '!'))
+assert len(error['detail']) == 2048
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=True,
+        capture_output=True,
+        timeout=5,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["collection_error", "collection_incomplete", "truncated", "malformed", "interrupted", "none"],
+)
+def test_subprocess_capture_completeness_is_separate_from_inventory(tmp_path, monkeypatch, kind):
+    from dev.repro_env import execution
+
+    # Isolate metadata from this test's temporary directory; test the real subprocess journal.
+    monkeypatch.setattr(execution, "launch_observations", lambda root: {})
+    (tmp_path / "execution-context.json").write_text("{}")
+    script = """
+import os, sys
+from pathlib import Path
+from dev.repro_env.execution import Journal
+path = Path(os.environ["OMNIGENT_REPRO_ATTEMPT_DIR"])
+journal = Journal(path)
+kind = sys.argv[1]
+if kind == 'malformed':
+    journal.path.write_text('{"partial":')
+elif kind == 'truncated':
+    journal.emit('large', text='x' * 300000)
+elif kind == 'interrupted':
+    journal.emit('collector_start')
+elif kind != 'none':
+    journal.emit(kind, operation='trace_stop', context_id='browser-1', detail='trace unavailable')
+(path / 'useful.png').write_bytes(b'retained')
+sys.exit(7)
+"""
+    source = tmp_path / "collector.py"
+    source.write_text(script)
+    assert run(tmp_path, [sys.executable, str(source), kind]) == 7
+    path = next((tmp_path / "execution").glob("*/attempt.json"))
+    record = json.loads(path.read_text())
+    assert record["artifacts_complete"]
+    assert record["capture_complete"] == (kind == "none")
+    assert bool(record["collection_errors"]) == (kind != "none")
+    assert (path.parent / "useful.png").read_bytes() == b"retained"
+
+
+@pytest.mark.parametrize("status", [200, 403, 404])
+@pytest.mark.parametrize("surface", ["items", "responses"])
+def test_known_session_subresources_keep_test_and_browser_association(tmp_path, status, surface):
+    collector = Evidence(tmp_path)
+    collector.node = "first-test"
+    collector.session("http://localhost/v1/sessions/known", {"id": "known"})
+    collector.node = "second-test"
+    state = {"sessions": set()}
+    collector.session(
+        f"http://localhost/v1/sessions/known/{surface}", {"data": []}, state=state, status=status
+    )
+    collector.session("http://localhost/v1/sessions/projects/items", {"data": []}, state=state)
+    assert collector.sessions == {("http://localhost", "known"): {"first-test", "second-test"}}
+    assert state["sessions"] == {("http://localhost", "known")}
+
+
+@pytest.mark.parametrize("surface", ["items", "responses"])
+def test_subresource_only_traffic_does_not_discover_external_session(tmp_path, surface):
+    collector = Evidence(tmp_path)
+    collector.node = "observer-test"
+    state = {"sessions": set()}
+    collector.session(
+        f"http://localhost/v1/sessions/external/{surface}",
+        {"id": "item-1", "data": []},
+        state=state,
+    )
+    assert not collector.sessions
+    assert not state["sessions"]
+    assert not any(e["kind"] == "product_session" for e in events(tmp_path))
+
+
+def test_failure_details_survive_unserializable_context(tmp_path):
+    journal = Journal(tmp_path)
+    nested = {}
+    nested["cycle"] = nested
+    error = journal.failure("snapshot", ValueError("useful diagnostic"), nested=nested)
+    assert error == {
+        "operation": "snapshot",
+        "error_type": "ValueError",
+        "detail": "useful diagnostic",
+    }
+    error = journal.failure("snapshot", ValueError("diagnostic"), error_type="wrong")
+    assert error["error_type"] == "ValueError"
+
+
+def test_child_journal_error_cap_counts_omitted_records(tmp_path):
+    from dev.repro_env.execution import collector_errors
+
+    wrapper, child = Journal(tmp_path), Journal(tmp_path)
+    for i in range(202):
+        child.emit("collection_error", operation="snapshot", session_id=str(i))
+    child.emit("collection_error", operation="snapshot", session_id="201")
+    errors = collector_errors(tmp_path, wrapper)
+    assert len(errors) == 201
+    assert errors[-1] == {
+        "operation": "collection_errors",
+        "error_type": "OmittedRecords",
+        "omitted_record_count": 3,
+    }
+
+
+def test_unreadable_journal_does_not_claim_collector_interruption(tmp_path):
+    from dev.repro_env.execution import collector_errors
+
+    wrapper, child = Journal(tmp_path), Journal(tmp_path)
+    child.emit("collector_start")
+    with child.path.open("a") as stream:
+        stream.write("not-json\n")
+    child.emit("collector_end", collection_errors=[])
+    assert collector_errors(tmp_path, wrapper) == []
+    assert [e["operation"] for e in wrapper.errors] == ["child_journal_read"]

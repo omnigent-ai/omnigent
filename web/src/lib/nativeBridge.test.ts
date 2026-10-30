@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  applyMacElectronShellAttribute,
+  checkDbcert,
   getServerPicker,
+  hasDbcertPreflightBridge,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
   isNativeShell,
   nativeNotify,
+  refreshDbcert,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
@@ -16,6 +20,7 @@ import {
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsNativeServerPicker,
+  supportsArcaConnect,
   supportsBrowser,
   switchServer,
 } from "./nativeBridge";
@@ -142,6 +147,72 @@ afterEach(() => {
   setAndroid(false);
 });
 
+describe("dbcert preflight bridge", () => {
+  it("forwards local-only renewal options without changing ordinary refresh calls", async () => {
+    const nativeRefresh = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      refreshDbcert: nativeRefresh,
+    };
+    expect(await refreshDbcert({ skipArcaSync: true })).toEqual({ ok: true });
+    expect(nativeRefresh).toHaveBeenLastCalledWith({ skipArcaSync: true });
+    expect(await refreshDbcert()).toEqual({ ok: true });
+    expect(nativeRefresh).toHaveBeenLastCalledWith();
+  });
+
+  it("detects older shells and browsers without the new method", async () => {
+    setElectron(false);
+    expect(hasDbcertPreflightBridge()).toBe(false);
+    expect((await checkDbcert()).ok).toBe(false);
+    setElectron(true);
+    expect(hasDbcertPreflightBridge()).toBe(false);
+    expect((await checkDbcert()).ok).toBe(false);
+  });
+
+  it.each(["checkDbcert", "refreshDbcert", "ensureDbcert"])(
+    "requires both checking and refresh, not just %s",
+    (method) => {
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        kind: "electron",
+        [method]: vi.fn(),
+      };
+      expect(hasDbcertPreflightBridge()).toBe(false);
+    },
+  );
+
+  it("passes through the native result and turns an IPC failure into a retryable error", async () => {
+    const nativeCheck = vi.fn().mockResolvedValue({ ok: true, valid: false });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      checkDbcert: nativeCheck,
+      refreshDbcert: vi.fn(),
+    };
+    expect(hasDbcertPreflightBridge()).toBe(true);
+    expect(await checkDbcert()).toEqual({ ok: true, valid: false });
+    nativeCheck.mockResolvedValueOnce({ ok: true, valid: true });
+    expect(await checkDbcert()).toEqual({ ok: true, valid: true });
+    nativeCheck.mockRejectedValue(new Error("IPC channel closed"));
+    expect(await checkDbcert()).toEqual({
+      ok: false,
+      error: "Couldn't check your laptop's dbcert. Try again.",
+    });
+  });
+});
+
+describe("supportsArcaConnect", () => {
+  it("is true only when the desktop shell offers the Arca connect", () => {
+    setElectron(false);
+    expect(supportsArcaConnect()).toBe(false);
+    // An older desktop shell without the method.
+    setElectron(true);
+    expect(supportsArcaConnect()).toBe(false);
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
+    expect(supportsArcaConnect()).toBe(true);
+  });
+});
+
 describe("isNativeShell / isElectronShell", () => {
   it("are false in a plain browser (no preload bridge)", () => {
     setElectron(false);
@@ -194,6 +265,38 @@ describe("isNativeShell / isElectronShell", () => {
     expect(isNativeShell()).toBe(false);
     delete (window as unknown as Record<string, unknown>).omnigentDesktop;
     delete (window as unknown as Record<string, unknown>).omnigentNative;
+  });
+});
+
+describe("applyMacElectronShellAttribute", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.documentElement.removeAttribute("data-electron-mac");
+  });
+
+  function setUserAgent(ua: string): void {
+    vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue(ua);
+  }
+
+  it("marks <html> in the macOS Electron shell", () => {
+    setElectron(true);
+    setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Electron/40.0.0");
+    applyMacElectronShellAttribute();
+    expect(document.documentElement).toHaveAttribute("data-electron-mac", "true");
+  });
+
+  it("leaves <html> unmarked in Electron on other platforms", () => {
+    setElectron(true);
+    setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Electron/40.0.0");
+    applyMacElectronShellAttribute();
+    expect(document.documentElement).not.toHaveAttribute("data-electron-mac");
+  });
+
+  it("leaves <html> unmarked in a plain macOS browser", () => {
+    setElectron(false);
+    setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0");
+    applyMacElectronShellAttribute();
+    expect(document.documentElement).not.toHaveAttribute("data-electron-mac");
   });
 });
 

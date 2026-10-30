@@ -23,8 +23,7 @@ from omnigent.harnesses.claude_native.bridge import (
     write_tmux_target,
 )
 from omnigent.inner.terminal import TerminalInstance
-from omnigent.runner import app as runner_app_module
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, native_controls
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -130,8 +129,8 @@ async def _open_claude_native_session(
     monkeypatch.setattr("omnigent.runner.native._launch_claude", _stub_launch_claude)
     # No ``raising=False``: a renamed constant must fail the test loudly rather
     # than silently leave the real 30s budget in place.
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 0.2)
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_POLL_S", 0.01)
     monkeypatch.setattr(
         claude_native_bridge,
         "read_model_env",
@@ -204,8 +203,9 @@ async def test_session_change_heals_dead_registered_missing_tmux_socket(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
-        del timeout_s, auto_confirm, confirm_hint
+        del timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         if not auto_create_calls:
             real_inject(inject_bridge_dir, command=command, timeout_s=1.0)
             raise AssertionError(
@@ -305,8 +305,9 @@ async def test_model_change_heals_before_read_model_env(
         timeout_s: float = 1.0,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
-        del command, timeout_s, auto_confirm, confirm_hint
+        del command, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         if not auto_create_calls:
             real_inject(inject_bridge_dir, command="/model claude-opus-4-7", timeout_s=1.0)
 
@@ -375,8 +376,9 @@ async def test_session_change_live_pane_does_not_recreate(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
-        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         captured.append(command)
 
     def _ready(bridge_dir: Path) -> bool:
@@ -455,8 +457,8 @@ async def test_live_pane_with_occupied_composer_does_not_stall(
     )
     auto_create_calls.clear()
     # Budget the shipped value: a regression here shows up as a 30s test.
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 30.0)
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.25)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 30.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_POLL_S", 0.25)
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
 
@@ -562,8 +564,8 @@ async def test_recreated_pane_is_waited_for_before_injection(
     auto_create_calls.clear()
     # A budget with room for several probes: the fixture's 0.2s is smaller than
     # the first ``asyncio.to_thread`` hop, so the poll would exit after one.
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 5.0)
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_POLL_S", 0.01)
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
 
@@ -646,8 +648,8 @@ async def test_failed_recreate_does_not_wait(
     )
     auto_create_calls.clear()
     # Budget the shipped value: a regression shows up as a 30s test.
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 30.0)
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.25)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 30.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_POLL_S", 0.25)
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
 

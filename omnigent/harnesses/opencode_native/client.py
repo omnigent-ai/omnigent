@@ -30,9 +30,10 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
-# Supported OpenCode CLI/API range: the 2.x ``/api/*`` protocol.
-OPENCODE_MIN_VERSION = "2.0.0"
-OPENCODE_MAX_VERSION_EXCLUSIVE = "3.0.0"
+# Supported OpenCode CLI/API range: the 2.0.x ``/api/*`` protocol, from the release
+# the wire fixtures were captured on. Widen only after validating a newer minor.
+OPENCODE_MIN_VERSION = "2.0.18"
+OPENCODE_MAX_VERSION_EXCLUSIVE = "2.1.0"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
@@ -182,9 +183,10 @@ class OpenCodeClient:
         self._base_url = base_url.rstrip("/")
         default_headers: dict[str, str] = dict(headers or {})
         if directory:
-            # The server URI-decodes this header, so non-ASCII paths survive.
+            # Percent-encoded like OpenCode's own SDK; ``serve`` decodes it, and a raw
+            # non-ASCII path is not a valid header value.
             default_headers.setdefault(
-                "x-opencode-directory", urllib.parse.quote(directory, safe="/")
+                "x-opencode-directory", urllib.parse.quote(directory, safe="!~*'()")
             )
         self._directory = directory
         self._owns_client = client is None

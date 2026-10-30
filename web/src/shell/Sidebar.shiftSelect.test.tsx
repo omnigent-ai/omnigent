@@ -1,19 +1,18 @@
+import { conversationPage } from "@/test/sidebarMockHelpers";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for shift-click range selection in the sidebar's multi-session mode.
 // Covers the pure range computation helper and the integrated click behavior.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as IdentityModule from "@/lib/identity";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
-import { computeShiftSelectRange, Sidebar } from "./Sidebar";
+import { computeShiftSelectRange } from "./Sidebar";
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
 
 describe("computeShiftSelectRange", () => {
   const ids = ["a", "b", "c", "d", "e"];
@@ -49,71 +48,54 @@ describe("computeShiftSelectRange", () => {
 
 // ── Integration tests ───────────────────────────────────────────────────────
 
-const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock } = vi.hoisted(() => ({
-  projectsMock: [] as string[],
-  conversationsRef: {
-    current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
-  },
-  projectSessionsMock: { current: {} as Record<string, unknown[]> },
-  bulkArchiveMock: { mutate: vi.fn() },
-}));
+const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock, bulkMoveMock } =
+  vi.hoisted(() => ({
+    projectsMock: [] as string[],
+    conversationsRef: {
+      current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
+    },
+    projectSessionsMock: { current: {} as Record<string, unknown[]> },
+    bulkArchiveMock: { mutate: vi.fn() },
+    bulkMoveMock: { mutate: vi.fn() },
+  }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({
-    mutate: bulkArchiveMock.mutate,
-    isPending: false,
-    isError: false,
-  }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })) }),
-  useProjectSessions: (project: string, enabled: boolean) => {
-    const override = projectSessionsMock.current[project];
-    const rows = !enabled
-      ? []
-      : (override ??
-        conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
-        ));
-    return {
-      data: enabled
-        ? {
-            pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
-            pageParams: [undefined],
-          }
-        : undefined,
-      isLoading: false,
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useBulkArchiveConversations: () => ({
+      mutate: bulkArchiveMock.mutate,
+      isPending: false,
       isError: false,
-      error: null,
-      fetchNextPage: vi.fn(),
-      hasNextPage: false,
-      isFetchingNextPage: false,
-    };
-  },
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+    }),
+    useBulkMoveToProject: () => ({ mutate: bulkMoveMock.mutate, isPending: false, isError: false }),
+    useProjects: () => ({ data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })) }),
+    useProjectSessions: (project: string, enabled: boolean) => {
+      const override = projectSessionsMock.current[project];
+      const rows = !enabled
+        ? []
+        : (override ??
+          conversationsRef.current.filter(
+            (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
+          ));
+      return {
+        data: enabled
+          ? {
+              pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
+              pageParams: [undefined],
+            }
+          : undefined,
+        isLoading: false,
+        isError: false,
+        error: null,
+        fetchNextPage: vi.fn(),
+        hasNextPage: false,
+        isFetchingNextPage: false,
+      };
+    },
+    fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
+  };
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
@@ -145,48 +127,13 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
 
 function mockConversations(convs: Conversation[]) {
   conversationsRef.current = convs;
-  useConvMock.mockImplementation(
-    () =>
-      ({
-        data: {
-          pages: [
-            {
-              data: convs,
-              first_id: convs[0]?.id ?? null,
-              last_id: convs.at(-1)?.id ?? null,
-              has_more: false,
-            },
-          ],
-          pageParams: [undefined],
-        },
-        isLoading: false,
-        isError: false,
-        error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
-        isFetchingNextPage: false,
-      }) as unknown as ReturnType<typeof useConversations>,
-  );
-}
-
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
+  useConvMock.mockImplementation(() => conversationPage(convs));
 }
 
 beforeEach(() => {
   useConvMock.mockReset();
   bulkArchiveMock.mutate.mockReset();
+  bulkMoveMock.mutate.mockReset();
   localStorage.clear();
   projectsMock.length = 0;
   projectSessionsMock.current = {};
@@ -332,6 +279,112 @@ describe("Sidebar shift-click selection", () => {
     const [{ ids, archived }] = bulkArchiveMock.mutate.mock.calls[0];
     expect(archived).toBe(true);
     expect([...ids].sort()).toEqual(["p1", "p2", "p3"]);
+  });
+
+  it("keeps a projects-scope shift range to the rows above Show more", async () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([
+      ...Array.from({ length: 7 }, (_, i) =>
+        conv(`a${i}`, { labels: { omni_project: "Alpha" }, updated_at: 100 - i }),
+      ),
+      conv("b0", { labels: { omni_project: "Beta" }, updated_at: 1 }),
+    ]);
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha", "Beta"]));
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    fireEvent.click(await screen.findByRole("link", { name: "a0" }));
+    fireEvent.click(screen.getByRole("link", { name: "b0" }), { shiftKey: true });
+
+    // a0–a4 and b0; a5 and a6 sit behind Alpha's Show more.
+    await waitFor(() => {
+      expect(screen.getByText("6 selected")).toBeInTheDocument();
+    });
+  });
+
+  it("keeps a selected folder session in bulk actions once it moves behind Show more", async () => {
+    projectsMock.push("Alpha");
+    const filed = (id: string, updatedAt: number) =>
+      conv(id, { labels: { omni_project: "Alpha" }, updated_at: updatedAt });
+    const rows = Array.from({ length: 6 }, (_, i) => filed(`a${i}`, 100 - i));
+    // The global window holds only a0; a4 comes from the folder's own query.
+    mockConversations([rows[0]!, conv("c1")]);
+    projectSessionsMock.current["Alpha"] = rows;
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    fireEvent.click(await screen.findByRole("link", { name: "a4" }));
+    // A newer session lands on top; the next render pushes a4 behind Show more.
+    projectSessionsMock.current["Alpha"] = [filed("a_new", 200), ...rows];
+    fireEvent.click(screen.getByRole("link", { name: "a0" }));
+    await waitFor(() => {
+      expect(screen.getByText("2 selected")).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("link", { name: "a4" })).toBeNull();
+
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+    await waitFor(() => {
+      expect(bulkArchiveMock.mutate).toHaveBeenCalledTimes(1);
+    });
+    expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual(["a0", "a4"]);
+  });
+
+  it("keeps a folder's listed rows when older sessions are bulk-moved into it", async () => {
+    projectsMock.push("Alpha");
+    const alpha = Array.from({ length: 6 }, (_, i) =>
+      conv(`a${i}`, { labels: { omni_project: "Alpha" }, updated_at: 100 - i }),
+    );
+    const older = [conv("old1", { updated_at: 2 }), conv("old2", { updated_at: 1 })];
+    mockConversations([...alpha, ...older]);
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
+    renderSidebar();
+    const alphaRowIds = () =>
+      Array.from(
+        document
+          .querySelector('[data-project-order-name="Alpha"]')!
+          .closest("section")!
+          .querySelectorAll("[data-sidebar-session-id]"),
+        (row) => row.getAttribute("data-sidebar-session-id"),
+      );
+    expect(alphaRowIds()).toEqual(["a0", "a1", "a2", "a3", "a4"]);
+
+    fireEvent.click(screen.getByTestId("toggle-selection-mode"));
+    fireEvent.click(screen.getByRole("link", { name: "old1" }));
+    fireEvent.click(screen.getByRole("link", { name: "old2" }));
+    // The move succeeds; filing keeps updated_at, so both sort below Alpha's six.
+    bulkMoveMock.mutate.mockImplementation(
+      (_variables: unknown, options?: { onSuccess?: () => void }) => options?.onSuccess?.(),
+    );
+    mockConversations([
+      ...alpha,
+      ...older.map((c) => ({ ...c, labels: { omni_project: "Alpha" } })),
+    ]);
+    fireEvent.pointerDown(screen.getByTestId("bulk-move-to-project"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Alpha" }));
+
+    expect(bulkMoveMock.mutate.mock.calls[0]?.[0]).toEqual({
+      ids: ["old1", "old2"],
+      project: "Alpha",
+    });
+    // Leaving selection renders the moved rows: they wait behind Show more.
+    await waitFor(() => {
+      expect(screen.queryByText("2 selected")).toBeNull();
+    });
+    expect(alphaRowIds()).toEqual(["a0", "a1", "a2", "a3", "a4"]);
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(alphaRowIds()).toEqual(["a0", "a1", "a2", "a3", "a4", "a5", "old1", "old2"]);
   });
 
   it("labels Delete with the owned count when the selection is mixed-ownership", async () => {

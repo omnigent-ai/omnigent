@@ -43,6 +43,7 @@ from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
+from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
@@ -83,10 +84,9 @@ _TMP_PARENT_ENV_VAR = HARNESS_TMP_PARENT_ENV_VAR
 # depth.
 _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 
-# Sentinel file the Omnigent instance writes into its subdir on boot. The
-# orphan sweep uses it to tell whether a sibling subdir belongs to
-# a still-running Omnigent (leave alone) or a crashed one (kill its
-# children, remove the dir).
+# Sentinel each instance writes into its subdir on boot; the orphan sweep uses it
+# to tell a still-running sibling from a crashed one (kill children, remove dir).
+# Holds an owner claim; older builds wrote a bare PID.
 _AP_PID_FILE = "AP_PID"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
@@ -203,7 +203,9 @@ def _default_tmp_parent() -> Path:
     the host's real ``/tmp`` is unavailable or unsuitable. Relative
     values are intentionally preserved: Unix socket paths have tight
     length limits, and a short path such as ``.tmp/oa`` is useful
-    for local worktrees whose absolute path is long.
+    for local worktrees whose absolute path is long. Prefer storage
+    cleared at boot: the orphan sweep never reclaims a dir whose
+    owner ran under an earlier boot.
 
     :returns: Configured parent path, or the per-uid default
         ``/tmp/omnigent-<uid>`` on POSIX.
@@ -686,13 +688,7 @@ class HarnessProcessManager:
             # Sweep BEFORE creating our own dir, so a crashed prior instance
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
-        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Write the AP_PID sentinel so other instances' sweeps can
-        # tell our dir is live. Strict ``"x"`` because the dir is
-        # exclusively ours; a pre-existing sentinel would mean the
-        # uuid collided with a still-running instance — fail loud.
-        sentinel = self._instance_dir / _AP_PID_FILE
-        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        self._ensure_instance_dir()
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -721,9 +717,10 @@ class HarnessProcessManager:
         switching support; changes to ACP startup options also require a restart.
 
         Crash detection: if the previously-spawned subprocess has
-        exited (``returncode is not None``), the entry is dropped
-        and a fresh subprocess is spawned with the ``env``
-        provided on the call that triggered the respawn.
+        exited (``returncode is not None``), or its Unix socket has
+        disappeared, the entry is dropped and a fresh subprocess is
+        spawned with the ``env`` provided on the call that triggered
+        the respawn.
         Per-conversation lock ensures concurrent callers during
         the lazy-init window don't race two subprocesses onto the
         same socket — see §Process management: Spawn lock for the
@@ -762,7 +759,7 @@ class HarnessProcessManager:
         # bumped generation and is allowed to respawn.
         async with self._registry_lock:
             start_generation = self._release_generations.get(conversation_id, 0)
-        # Non-None only for a model/harness-switch respawn of an in-flight entry
+        # Non-None only for a deliberate replacement of an in-flight entry
         # (not crash respawns — those are already covered by the orphan watchdog).
         respawn_reason: str | None = None
         # The replaced entry's in-flight response id, captured at the respawn
@@ -785,6 +782,39 @@ class HarnessProcessManager:
                     "while get_client waited"
                 )
             entry = self._entries.get(conversation_id)
+            # "any" control callers may hold an established connection past the
+            # unlink; don't kill the turn they're interrupting. Concrete-harness
+            # (new-turn) callers reconnect via the pathname and own recovery.
+            if (
+                not IS_WINDOWS
+                and entry is not None
+                and harness != "any"
+                and entry.process.returncode is None
+                and entry.endpoint is not None
+                and entry.endpoint.socket_path is not None
+                and entry.endpoint.socket_path.parent == self._instance_dir
+                and not entry.endpoint.socket_path.exists()
+            ):
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                _logger.warning(
+                    "harness %s for conversation %s lost its socket; respawning",
+                    entry.harness,
+                    conversation_id,
+                    extra={
+                        "session_id": conversation_id,
+                        "event_name": "harness_socket_missing",
+                        "attributes": {
+                            "harness": entry.harness,
+                            "pid": entry.process.pid,
+                            "socket_path": str(entry.endpoint.socket_path),
+                            "tracked_response_id": replaced_response_id,
+                        },
+                    },
+                )
+                await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
+                entry = None
+                respawn_reason = "harness_respawn_socket_missing"
             if entry is not None and entry.process.returncode is not None:
                 # Prior subprocess died; drop the stale entry and
                 # respawn below. The dead client is closed on
@@ -809,13 +839,14 @@ class HarnessProcessManager:
                     },
                 )
                 await self._close_entry(entry)
+                # The retired process cannot emit its terminal stream edge.
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
             if entry is not None and harness != "any" and entry.harness != harness:
                 # The harness is fixed at spawn time (it selects which runner
                 # module the subprocess loads), but the socket is keyed by
-                # conversation only — so after an in-place agent switch
-                # (``POST /v1/sessions/{id}/switch-agent``) a later turn
-                # resolves a DIFFERENT harness and must respawn, otherwise the
+                # conversation only, so if the session's agent binding changes,
+                # a later turn resolves a DIFFERENT harness and must respawn, otherwise the
                 # cached subprocess keeps serving the old harness. Mirrors the
                 # model-change respawn below.
                 #
@@ -833,6 +864,7 @@ class HarnessProcessManager:
                 )
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
             if (
@@ -847,6 +879,7 @@ class HarnessProcessManager:
                 )
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
             if entry is not None and not (
@@ -867,6 +900,7 @@ class HarnessProcessManager:
                     )
                     replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                     await self._close_entry(entry)
+                    self._in_flight_response_ids.pop(conversation_id, None)
                     entry = None
                     respawn_reason = "harness_respawn_model_switch"
             if entry is None:
@@ -998,7 +1032,7 @@ class HarnessProcessManager:
                 entry.client.post(cancel_url, json={"type": "interrupt"}),
                 timeout=timeout_s,
             )
-        except (httpx.HTTPError, asyncio.TimeoutError):
+        except (TimeoutError, httpx.HTTPError):
             _logger.exception(
                 "harness cancel forward failed: conversation_id=%s harness_response_id=%s",
                 conversation_id,
@@ -1150,6 +1184,7 @@ class HarnessProcessManager:
                     self._release_generations.get(conversation_id, 0) + 1
                 )
                 entry = self._entries.pop(conversation_id, None)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 # NOTE: ``_spawn_locks[conversation_id]`` intentionally
                 # NOT popped — see this method's docstring for the
                 # per-conv lock-identity invariant rationale.
@@ -1208,6 +1243,13 @@ class HarnessProcessManager:
                 self._spawn_locks[conversation_id] = lock
             return lock
 
+    def _ensure_instance_dir(self) -> None:
+        # Temporary-file cleanup may remove either directory after start().
+        # Recreated state needs the same private modes and live-owner claim.
+        self._tmp_parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
+
     async def _spawn_entry(
         self,
         conversation_id: str,
@@ -1234,6 +1276,7 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
+        self._ensure_instance_dir()
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
@@ -1421,12 +1464,20 @@ class HarnessProcessManager:
 
         :param entry: The bookkeeping record to tear down.
         """
+        cancellation: asyncio.CancelledError | None = None
         try:
             await entry.client.aclose()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
         except Exception:
             # A broken transport must not skip the subprocess kill below.
             _logger.exception("error closing harness client during teardown; continuing")
-        finally:
+
+        async def _force_kill_and_wait() -> None:
+            _proc.kill_tree(entry.process)
+            await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+
+        try:
             if entry.process.returncode is None:
                 try:
                     # Tree-aware backstop: this process parents the sandbox
@@ -1434,14 +1485,27 @@ class HarnessProcessManager:
                     # handle strands both when an executor close() never runs.
                     _proc.terminate_tree(entry.process)
                     await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                except asyncio.CancelledError as exc:
+                    # Cancellation during either wait must not abandon the child.
+                    cancellation = exc
+                    try:
+                        await _force_kill_and_wait()
+                    except asyncio.CancelledError as exc:
+                        cancellation = exc
+                    except Exception:
+                        pass
                 except Exception:
                     # Graceful SIGTERM didn't complete — it timed out, or
                     # send_signal/wait raised (e.g. the process vanished
                     # mid-teardown). Force-kill best-effort; a process that
                     # is already gone is already done.
-                    with contextlib.suppress(Exception):
-                        _proc.kill_tree(entry.process)
-                        await entry.process.wait()
+                    try:
+                        await _force_kill_and_wait()
+                    except asyncio.CancelledError as exc:
+                        cancellation = exc
+                    except Exception:
+                        pass
+        finally:
             with contextlib.suppress(Exception):
                 close_subprocess_transport(entry.process)
             # Best-effort socket cleanup. uvicorn's atexit usually
@@ -1449,6 +1513,8 @@ class HarnessProcessManager:
             # hard-killed runner won't. No-op for TCP endpoints.
             with contextlib.suppress(Exception):
                 entry.endpoint.cleanup()
+        if cancellation is not None:
+            raise cancellation
 
     async def _idle_reaper_loop(self) -> None:
         """
@@ -1585,17 +1651,25 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
                 exc,
             )
             continue
-        try:
-            pid = int(sentinel.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError) as exc:
-            _logger.warning(
-                "could not read AP_PID sentinel at %s: %s; skipping",
-                sentinel,
-                exc,
-            )
-            continue
-        if _pid_alive(pid):
-            continue
+        claim = read_owner_claim(child, filename=_AP_PID_FILE)
+        if claim is not None:
+            # Only a sweeper in the owner's boot and PID namespace can judge it.
+            if not owner_is_gone(claim, process_alive=_pid_alive):
+                continue
+            pid = claim.pid
+        else:
+            # A bare PID from a build that predates owner claims.
+            try:
+                pid = int(sentinel.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError) as exc:
+                _logger.warning(
+                    "could not read AP_PID sentinel at %s: %s; skipping",
+                    sentinel,
+                    exc,
+                )
+                continue
+            if _pid_alive(pid):
+                continue
         _logger.info(
             "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
             child,

@@ -109,6 +109,12 @@ def test_right_click_opens_project_folder_menu(project_page: tuple[Page, str]) -
 
     page.get_by_test_id("rename-project").click()
     expect(page.get_by_test_id("rename-project-confirm")).to_be_visible()
+    name_input = page.get_by_role("dialog").locator("input")
+    expect(name_input).to_be_focused()
+    assert name_input.evaluate("input => [input.selectionStart, input.selectionEnd]") == [
+        0,
+        len(project),
+    ]
 
 
 def test_click_dismissing_menu_does_not_toggle_then_next_click_toggles(

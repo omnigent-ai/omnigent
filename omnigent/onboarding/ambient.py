@@ -47,7 +47,7 @@ DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 # ``subscription`` is a logged-in CLI; ``local`` is a self-hosted endpoint;
 # ``cli-config`` is a custom model provider a harness CLI's own config file
 # defines (today: a ``[model_providers.X]`` table in ``~/.codex/config.toml``
-# that carries its own auth, e.g. the Databricks AI Gateway written by
+# that carries its own auth, e.g. the Databricks Unity Gateway written by
 # ``isaac configure codex``).
 KEY_KIND: DetectedKind = "key"
 SUBSCRIPTION_KIND: DetectedKind = "subscription"
@@ -252,7 +252,7 @@ class CodexConfigProvider:
     :param provider_id: The ``model_provider`` id the config selects, i.e.
         the key under ``[model_providers.<id>]``, e.g. ``"Databricks"``.
     :param display_name: The provider table's ``name`` field, e.g.
-        ``"Databricks AI Gateway"``; falls back to :attr:`provider_id` when
+        ``"Databricks Unity Gateway"``; falls back to :attr:`provider_id` when
         the table names none.
     """
 
@@ -327,7 +327,7 @@ class CodexConfigTransport:
     The runtime-routing counterpart of :class:`CodexConfigProvider` (which
     only carries the id / display name for the setup menu). This reads the
     fields a harness needs to actually talk to the provider — the ones
-    ``isaac configure codex`` writes for the Databricks AI Gateway.
+    ``isaac configure codex`` writes for the Databricks Unity Gateway.
 
     :param base_url: The provider table's ``base_url``, e.g.
         ``"https://<workspace>.ai-gateway.cloud.databricks.com/codex/v1"``.
@@ -336,10 +336,15 @@ class CodexConfigTransport:
         ``command`` + ``args`` (e.g. ``"jq -r .access_token /path/token.json"``).
         ``None`` when the table carries no ``[X.auth]`` token command (e.g. it
         authenticates via a static header or AWS SigV4 instead).
+    :param auth_refresh_interval_ms: Positive token cache lifetime from the auth
+        table; absent or invalid values disable caching.
+    :param auth_timeout_ms: Positive auth timeout, defaulting to twenty seconds.
     """
 
     base_url: str
     auth_command: str | None
+    auth_refresh_interval_ms: int = 0
+    auth_timeout_ms: int = 20_000
 
 
 def codex_config_provider_transport(
@@ -348,7 +353,7 @@ def codex_config_provider_transport(
     """Read the base URL + auth command for one Codex ``[model_providers.X]``.
 
     A harness that pinned a ``cli-config`` provider (e.g. pi-native routing the
-    user's Databricks AI Gateway) needs the *transport* — where to send
+    user's Databricks Unity Gateway) needs the *transport* — where to send
     requests and how to authenticate — not just the id. This parses the named
     ``[model_providers.<provider_id>]`` table out of ``config.toml`` and returns
     its ``base_url`` plus a shell command (rebuilt from ``[X.auth]``
@@ -392,7 +397,16 @@ def codex_config_provider_transport(
             # shlex.join produces a single shell-safe string Pi can run as a
             # "!command" apiKey (it shell-quotes the token file path etc.).
             auth_command = shlex.join(parts)
-    return CodexConfigTransport(base_url=base_url.strip(), auth_command=auth_command)
+    refresh_interval = auth.get("refresh_interval_ms", 0) if isinstance(auth, dict) else 0
+    timeout = auth.get("timeout_ms", 20_000) if isinstance(auth, dict) else 20_000
+    return CodexConfigTransport(
+        base_url=base_url.strip(),
+        auth_command=auth_command,
+        auth_refresh_interval_ms=(
+            refresh_interval if type(refresh_interval) is int and refresh_interval > 0 else 0
+        ),
+        auth_timeout_ms=timeout if type(timeout) is int and timeout > 0 else 20_000,
+    )
 
 
 def codex_config_detection() -> DetectedProvider | None:
@@ -517,25 +531,86 @@ def claude_managed_gateway(
         credentials api.anthropic.com); ``has_credential`` is whether Claude
         Code has a usable credential to apply at launch.
     """
+    payload = read_claude_managed_settings(paths)
+    if payload is None:
+        return None, False
+    raw_env = payload.get("env")
+    env = raw_env if isinstance(raw_env, dict) else {}
+    raw_base_url = env.get("ANTHROPIC_BASE_URL")
+    base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+    has_helper = bool(payload.get("apiKeyHelper"))
+    use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+        "",
+        "0",
+        "false",
+    )
+    return base_url or None, has_helper or use_gateway
+
+
+def read_claude_managed_settings(
+    paths: tuple[Path, ...] | None = None,
+) -> dict[str, object] | None:
+    """Return the managed settings file Claude Code applies, parsed.
+
+    The first readable, object-shaped file decides, matching Claude Code's own
+    precedence.
+
+    :param paths: Settings files to read, highest precedence first; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The parsed settings object, or ``None`` when no file is readable.
+    """
     for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(payload, dict):
-            continue
-        raw_env = payload.get("env")
-        env = raw_env if isinstance(raw_env, dict) else {}
-        raw_base_url = env.get("ANTHROPIC_BASE_URL")
-        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
-        has_helper = bool(payload.get("apiKeyHelper"))
-        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-        )
-        return base_url or None, has_helper or use_gateway
-    return None, False
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
+    """Return Claude Code's user ``settings.json``, parsed.
+
+    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
+    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
+    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
+    relative value is relative to the CLI's working directory.
+
+    :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
+        ``None`` means this process's working directory.
+    :returns: The settings object, or ``None`` when the file is missing,
+        unreadable, or not an object.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured) if configured else Path.home() / ".claude"
+    settings_path = Path(cwd or "") / config_dir / "settings.json"
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def claude_managed_gateway_routes(paths: tuple[Path, ...] | None = None) -> str | None:
+    """Return the non-Anthropic gateway Claude Code's managed settings pin, if any.
+
+    Claude Code applies managed settings over the environment omnigent passes,
+    so when this returns a URL it — not omnigent's provider config — decides
+    where native Claude inference goes.
+
+    :param paths: Settings files to read; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The managed ``ANTHROPIC_BASE_URL``, or ``None`` when no credentialed
+        managed gateway is configured or it points at Anthropic itself.
+    """
+    base_url, has_credential = claude_managed_gateway(paths)
+    if not base_url or not has_credential:
+        return None
+    host = (urlsplit(base_url).hostname or "").lower()
+    if host == "anthropic.com" or host.endswith(".anthropic.com"):
+        return None
+    return base_url
 
 
 def claude_managed_model_picker(
@@ -571,13 +646,13 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
     """A human label for the managed-settings credential, when one is delivered.
 
     Used by the setup / ``/model`` display layer to show the Claude credential
-    as its actual backing (e.g. ``"Databricks AI Gateway"``) rather than the
+    as its actual backing (e.g. ``"Databricks Unity Gateway"``) rather than the
     generic ``"Subscription"``. Purely a display derivation from live managed
     settings — nothing is persisted.
 
     :param paths: Settings files to read; defaults to
         :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
-    :returns: ``"Databricks AI Gateway"`` for a recognized Databricks gateway,
+    :returns: ``"Databricks Unity Gateway"`` for a recognized Databricks gateway,
         the gateway host for another gateway, ``"Claude Code gateway"`` for a
         credential with no pinned base URL, or ``None`` when no credential is
         delivered.
@@ -592,7 +667,7 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
     from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
     if is_databricks_ai_gateway_url(base_url):
-        return "Databricks AI Gateway"
+        return "Databricks Unity Gateway"
     return urlsplit(base_url).hostname or "Claude Code gateway"
 
 
@@ -812,7 +887,7 @@ def _detect_providers_now() -> list[DetectedProvider]:
         )
 
     # 3. A custom model provider in ~/.codex/config.toml (e.g. the
-    #    Databricks AI Gateway written by ``isaac configure codex``, which
+    #    Databricks Unity Gateway written by ``isaac configure codex``, which
     #    writes config.toml only — never auth.json — so the login check
     #    below cannot see it). Ordered BEFORE the codex login check so that
     #    on a machine with both, the auto-default matches what a plain

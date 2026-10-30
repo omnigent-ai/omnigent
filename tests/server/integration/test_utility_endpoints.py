@@ -16,7 +16,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.app import ServerInfoResponse
+from omnigent.server.routes.sessions import CLIENT_SESSION_EVENT_TYPES
+from omnigent.stores.agent_store import AgentStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -86,10 +88,20 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert isinstance(data["databricks_features"], bool)
     assert isinstance(data["managed_sandboxes_enabled"], bool)
     assert data["features"] == {
+        "sandbox_profiles": False,
         "usage_page": False,
-        "customize": False,
         "harness_install": False,
         "canvas": False,
+        "arca_shutdown_warnings": False,
+        "import_review": False,
+        "custom_agents_settings_ui": False,
+        "sidebar_grouping_ui": False,
+        "workspace_content_search": False,
+        "grid_sessions_display_ui": False,
+        "automations_v2": False,
+        "splittable_terminal_view_ui": False,
+        "session_orchestration": True,
+        "codex_plan_at_launch": True,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
@@ -97,10 +109,56 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # while the feature is off so the UI never offers an install the disabled
     # route would reject.
     assert data["installable_harnesses"] == []
+    # Gates the web's archive worktree prompt; older servers omit it.
+    assert data["archive_worktree_cleanup"] is True
+    # Gates the palette's grouped session search; older servers omit it.
+    assert data["session_search_scope"] is True
+    # Gates the automation dialog's Session control; older servers reject the fields.
+    assert data["scheduled_task_session_modes"] is True
+    assert data["agent_detail"] is True
+    assert data["agent_config_edit"] is True
+    # Gates the web's /clear for native sessions; older servers reject it.
+    assert data["session_event_types"] == sorted(CLIENT_SESSION_EVENT_TYPES)
+    assert "clear" in data["session_event_types"]
+    # Browser-posted despite its prefix; runner-only events stay unadvertised.
+    assert "external_btw_dismiss" in data["session_event_types"]
+    assert "external_output_text_delta" not in data["session_event_types"]
+    # This app wires no project store, so automations cannot take a project.
+    assert data["scheduled_task_projects"] is False
+    # This app wires no scheduled-task store, so it has no automations to offer.
+    assert data["automations_enabled"] is False
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
     assert data["single_user"] is True
+    # Without the curation keys the picker block is present and empty, never missing.
+    assert data["picker"] == {"restrict_to_agent_names": [], "default_agent_name": None}
+
+    # Older servers omit capabilities they do not support.
+    del data["agent_detail"]
+    assert ServerInfoResponse.model_validate(data).agent_detail is False
+    del data["agent_config_edit"]
+    assert ServerInfoResponse.model_validate(data).agent_config_edit is False
+    del data["session_event_types"]
+    assert ServerInfoResponse.model_validate(data).session_event_types == []
+    del data["automations_enabled"]
+    assert ServerInfoResponse.model_validate(data).automations_enabled is False
+
+
+async def test_info_disables_config_edit_for_unsupported_store(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stores inheriting the default capability cannot advertise configuration edits."""
+    monkeypatch.setattr(
+        type(app.state.agent_store), "supports_config_edit", AgentStore.supports_config_edit
+    )
+
+    response = await client.get("/v1/info")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["agent_config_edit"] is False
 
 
 async def test_info_single_user_false_without_marker(
@@ -137,8 +195,7 @@ async def test_info_advertises_installable_harnesses_when_enabled(
     """
     from omnigent.onboarding.harness_install import ui_installable_harnesses
 
-    enabled = FeatureFlags(frozenset({Feature.HARNESS_INSTALL}))
-    monkeypatch.setattr(app.state, "feature_flags", enabled)
+    monkeypatch.setattr(app.state, "harness_install", True)
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     data = resp.json()
@@ -232,7 +289,7 @@ def _sources_caps(*, external: bool, local: bool, factory: bool) -> object:
             _sources_caps(external=False, local=False, factory=False),
             {"external": False, "oss": False},
         ),
-        # The workspace AI Gateway alone: no fallback for an ungatewayed harness.
+        # The workspace Unity Gateway alone: no fallback for an ungatewayed harness.
         (
             _sources_caps(external=True, local=False, factory=False),
             {"external": True, "oss": False},

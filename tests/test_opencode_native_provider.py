@@ -120,7 +120,7 @@ def test_build_provider_block_is_v2_shape() -> None:
     block = build_opencode_provider_block(res)
     assert block == {
         "databricks-gateway": {
-            "name": "Databricks AI Gateway",
+            "name": "Databricks Unity Gateway",
             "package": OPENAI_COMPATIBLE_PACKAGE,
             "settings": {
                 "baseURL": "https://ws/serving-endpoints",
@@ -150,6 +150,38 @@ def test_write_provider_config_is_0600_and_valid_json(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     parsed = json.loads(path.read_text())
     assert parsed["providers"]["databricks-gateway"]["settings"]["apiKey"] == "tok"
+
+
+def test_write_provider_config_attributes_unity_gateway_models(tmp_path: Path) -> None:
+    """Each model of a Unity Gateway provider names OpenCode and Omnigent (+ ug)."""
+    config = {
+        "providers": {
+            "databricks": {
+                "settings": {"baseURL": "https://dbc-1.cloud.databricks.com/ai-gateway/mlflow/v1"},
+                "models": {
+                    "system.ai.glm-5": {"headers": {"User-Agent": "ucode/0.1.0 opencode/1.2.0"}},
+                },
+            },
+            "serving": {
+                "settings": {"baseURL": "https://dbc-1.cloud.databricks.com/serving-endpoints"},
+                "models": {"databricks-x": {"name": "databricks-x"}},
+            },
+        }
+    }
+
+    path = write_opencode_provider_config(tmp_path, config)
+
+    providers = json.loads(path.read_text())["providers"]
+    assert providers["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 opencode/1.2.0",
+        "Databricks-Custom-Coding-Agent": "opencode",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert providers["serving"]["models"]["databricks-x"] == {"name": "databricks-x"}
+    # The caller's config is left as it was.
+    assert config["providers"]["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 opencode/1.2.0"
+    }
 
 
 @pytest.mark.parametrize(
@@ -558,9 +590,7 @@ def test_merge_warns_and_continues_on_malformed_user_config(
     with caplog.at_level("WARNING"):
         result = maybe_merge_user_provider_config(config)
     assert result == config
-    assert any(
-        "Failed to parse user OpenCode config" in record.message for record in caplog.records
-    )
+    assert any("Skipping user OpenCode config" in record.message for record in caplog.records)
 
 
 def test_merge_user_provider_config_handles_jsonc_comments(
@@ -608,6 +638,107 @@ def test_strip_trailing_commas_nested_with_string_values() -> None:
     raw = '{"a": "x, }", "b": [1, 2,],}'
     expected = '{"a": "x, }", "b": [1, 2]}'
     assert _strip_trailing_commas(raw) == expected
+
+
+def test_merge_user_provider_config_handles_jsonc_trailing_commas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Trailing commas in JSONC are handled (they're valid in JSONC but not JSON)."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        "{\n"
+        '  "provider": {\n'
+        '    "my-openai": {\n'
+        '      "options": {"baseURL": "https://my-gw/v1",},\n'  # trailing comma
+        "    },\n"  # trailing comma
+        "  },\n"  # trailing comma
+        "}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    result = maybe_merge_user_provider_config({})
+    assert result["providers"]["my-openai"]["settings"]["baseURL"] == "https://my-gw/v1"
+
+
+def _write_user_configs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str, str]
+) -> Path:
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    for name, text in files.items():
+        (cfg_dir / name).write_text(text, encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    return cfg_dir
+
+
+def test_merge_user_provider_config_deep_merges_all_user_config_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Files merge like ``opencode debug config``: later files win per key, then convert to v2."""
+    _write_user_configs(
+        monkeypatch,
+        tmp_path,
+        {
+            "config.json": '{"provider": {"my-gw": {"options": '
+            '{"baseURL": "https://old/v1", "apiKey": "sk-user"}}}}',
+            "opencode.json": '{"provider": {"other": {"options": {"baseURL": "https://other/v1"}}}}',
+            "opencode.jsonc": '{\n  // pin the default model\n  "model": "my-gw/gpt-4",\n'
+            '  "provider": {"my-gw": {"options": {"baseURL": "https://new/v1"}}}\n}\n',
+        },
+    )
+
+    result = maybe_merge_user_provider_config({})
+
+    assert result["providers"] == {
+        "my-gw": {"settings": {"baseURL": "https://new/v1", "apiKey": "sk-user"}},
+        "other": {"settings": {"baseURL": "https://other/v1"}},
+    }
+    assert result["model"] == "my-gw/gpt-4"
+
+
+def test_merge_user_provider_config_later_plugin_list_replaces_earlier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Lists are replaced, not concatenated, across the user's files."""
+    _write_user_configs(
+        monkeypatch,
+        tmp_path,
+        {
+            "opencode.json": '{"plugin": ["/opt/plugins/from-json", "/opt/plugins/shared"]}',
+            "opencode.jsonc": '{"plugin": ["/opt/plugins/from-jsonc"]}',
+        },
+    )
+
+    result = maybe_merge_user_provider_config({"plugins": ["/tmp/omnigent-policy"]})
+
+    assert result["plugins"] == ["/tmp/omnigent-policy", "/opt/plugins/from-jsonc"]
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [b"{ not valid json", b"\xff\xfe not utf-8", b"[]"],
+    ids=["unparseable", "undecodable", "not-an-object"],
+)
+def test_merge_user_provider_config_skips_bad_file_keeps_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, broken: bytes
+) -> None:
+    """A file that cannot be used is skipped; the files around it still merge."""
+    cfg_dir = _write_user_configs(
+        monkeypatch,
+        tmp_path,
+        {
+            "config.json": '{"provider": {"my-gw": {"options": {"baseURL": "https://my-gw/v1"}}}}',
+            "opencode.jsonc": '{"model": "my-gw/gpt-4"}',
+        },
+    )
+    (cfg_dir / "opencode.json").write_bytes(broken)
+
+    result = maybe_merge_user_provider_config({})
+
+    assert result["providers"] == {"my-gw": {"settings": {"baseURL": "https://my-gw/v1"}}}
+    assert result["model"] == "my-gw/gpt-4"
 
 
 def test_build_mcp_block_preserves_custom_timeout() -> None:

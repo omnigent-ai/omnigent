@@ -160,6 +160,61 @@ def test_successful_active_sandbox_returns_owned_launcher(
     assert not launcher.exists()
 
 
+@pytest.mark.parametrize("grant_skills", [True, False])
+def test_worker_grants_only_selected_skills_directory_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, grant_skills: bool
+) -> None:
+    """Skill access is explicit and never widens the private home's write grant."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    codex.touch()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    skills_dir = tmp_path / "session-a-skills"
+    skills_dir.mkdir()
+    unrelated_skills = tmp_path / "session-b-skills"
+    unrelated_skills.mkdir()
+    launcher = tmp_path / "launcher"
+    launcher.touch()
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
+    create_launcher = Mock(return_value=str(launcher))
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.resolve_sandbox",
+        Mock(return_value=_active_policy(workspace)),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
+
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=workspace,
+        codex_home=codex_home,
+        skills_dir=skills_dir if grant_skills else None,
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        spawn_env_names=["PATH", "CODEX_HOME"],
+    )
+    try:
+        for policy in (
+            backend.wrap_launcher_argv.call_args.args[1],
+            create_launcher.call_args.args[1],
+        ):
+            assert policy.read_roots is not None
+            assert (
+                any(skills_dir.resolve().is_relative_to(root) for root in policy.read_roots)
+                is grant_skills
+            )
+            assert not any(
+                unrelated_skills.resolve().is_relative_to(root)
+                for root in [*policy.read_roots, *policy.write_roots]
+            )
+            assert policy.write_roots == [codex_home.resolve()]
+    finally:
+        worker.close()
+
+
 def test_brokered_catalog_probe_is_network_denied(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

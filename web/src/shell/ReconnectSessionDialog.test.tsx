@@ -20,10 +20,24 @@
 // stubbed so these tests pin the dialog's own contract: which tab is
 // default, what each tab shows, and what props reach the form.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ReconnectSessionDialog, buildReconnectCommand } from "./ReconnectSessionDialog";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
+
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: vi.fn(),
+}));
+
+beforeEach(() => {
+  vi.mocked(useSessionActionRestrictions).mockReturnValue({
+    forkDisabledReason: undefined,
+    switchHostDisabledReason: undefined,
+  });
+});
 
 vi.mock("./ForkSessionDialog", () => ({
   ForkSessionForm: (props: {
@@ -32,10 +46,12 @@ vi.mock("./ForkSessionDialog", () => ({
     sourceWorkspace?: string | null;
     sourceHostId?: string | null;
     sourceGitBranch?: string | null;
+    visible: boolean;
     onClose: () => void;
   }) => (
     <div
       data-testid="fork-session-form-stub"
+      data-visible={String(props.visible)}
       data-source-session-id={props.sourceSessionId}
       data-source-title={props.sourceTitle ?? ""}
       data-source-workspace={props.sourceWorkspace ?? ""}
@@ -198,9 +214,43 @@ describe("buildReconnectCommand", () => {
 });
 
 describe("<ReconnectSessionDialog />", () => {
+  it.each([
+    ["Clone session", "Forking this sandbox session is not supported yet."],
+    ["Switch host", "Switching hosts is not supported for this sandbox session yet."],
+  ])("disables managed actions and explains %s to keyboard users", async (name, reason) => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      switchHostDisabledReason: "Switching hosts is not supported for this sandbox session yet.",
+    });
+    render(
+      <ReconnectSessionDialog
+        open
+        onOpenChange={vi.fn()}
+        conversationId="conv_managed"
+        serverUrl="http://localhost:6767"
+        state="host_offline"
+        isOwner
+      />,
+    );
+    expect(screen.getByTestId("reconnect-session-tab-clone")).toBeDisabled();
+    const switchHost = screen.getByTestId("reconnect-session-switch-host");
+    expect(switchHost).toBeDisabled();
+    const user = userEvent.setup();
+    const target = screen.getByRole("group", { name });
+    expect(target).toHaveAttribute("tabindex", "0");
+    act(() => target.focus());
+    expect(target).toHaveFocus();
+    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent(reason));
+    expect(target).toHaveAccessibleDescription(reason);
+    await user.keyboard("{Enter} ");
+    await user.click(target);
+    expect(clonePanelState()).toBe("inactive");
+    expect(screen.queryByTestId("switch-host-dialog-stub")).not.toBeInTheDocument();
+  });
+
   function renderDialog(props: Partial<React.ComponentProps<typeof ReconnectSessionDialog>> = {}) {
     const onOpenChange = vi.fn();
-    render(
+    const dialog = (updates: Partial<React.ComponentProps<typeof ReconnectSessionDialog>> = {}) => (
       <ReconnectSessionDialog
         open
         onOpenChange={onOpenChange}
@@ -209,9 +259,15 @@ describe("<ReconnectSessionDialog />", () => {
         state="host_offline"
         isOwner
         {...props}
-      />,
+        {...updates}
+      />
     );
-    return { onOpenChange };
+    const { rerender } = render(dialog());
+    return {
+      onOpenChange,
+      rerender: (updates?: Partial<React.ComponentProps<typeof ReconnectSessionDialog>>) =>
+        rerender(dialog(updates)),
+    };
   }
 
   // Radix Tabs activates a trigger on mousedown (not click), so fire both.
@@ -284,6 +340,73 @@ describe("<ReconnectSessionDialog />", () => {
     expect(screen.getByText("Host is offline")).toBeInTheDocument();
   });
 
+  it("does not suggest cloning an unsupported session to a non-owner", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      switchHostDisabledReason: "Switching hosts is not supported for this sandbox session yet.",
+    });
+    renderDialog({ state: "host_offline", isOwner: false });
+    expect(clonePanelState()).toBe("inactive");
+    expect(screen.getByTestId("reconnect-session-description")).toHaveTextContent(
+      "Forking this sandbox session is not supported yet.",
+    );
+    expect(screen.queryByText(/Clone the session to continue/)).not.toBeInTheDocument();
+  });
+
+  it("keeps a non-owner on Clone while loading, then selects Reconnect when unsupported", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: SESSION_ACTIONS_LOADING,
+      switchHostDisabledReason: SESSION_ACTIONS_LOADING,
+    });
+    const { rerender } = renderDialog({ state: "host_offline", isOwner: false });
+    // The fork form gates itself while loading; a disabled trigger would let
+    // the dialog's initial focus activate Reconnect instead.
+    expect(clonePanelState()).toBe("active");
+    expect(screen.getByTestId("reconnect-session-tab-clone")).not.toBeDisabled();
+    switchToTab("reconnect-session-tab-reconnect");
+    expect(screen.getByTestId("reconnect-session-description")).toHaveTextContent(
+      "Clone the session to continue in a copy you own.",
+    );
+    expect(screen.queryByText(SESSION_ACTIONS_LOADING)).not.toBeInTheDocument();
+    switchToTab("reconnect-session-tab-clone");
+    expect(clonePanelState()).toBe("active");
+
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      switchHostDisabledReason: "Switching hosts is not supported for this sandbox session yet.",
+    });
+    rerender();
+    expect(clonePanelState()).toBe("inactive");
+    expect(screen.getByTestId("reconnect-session-tab-reconnect")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByTestId("reconnect-session-description")).toHaveTextContent(
+      "Forking this sandbox session is not supported yet.",
+    );
+    expect(screen.getByTestId("reconnect-session-tab-clone")).toBeDisabled();
+  });
+
+  it("restores the default Clone tab when a non-owner reopens a supported session", () => {
+    const { rerender } = renderDialog({ state: "host_offline", isOwner: false });
+    switchToTab("reconnect-session-tab-reconnect");
+    expect(clonePanelState()).toBe("inactive");
+    rerender({ open: false });
+    expect(screen.queryByTestId("reconnect-session-dialog")).not.toBeInTheDocument();
+    rerender({ open: true });
+    expect(clonePanelState()).toBe("active");
+  });
+
+  it("keeps the switch-host prompt for an owner while restrictions are still loading", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: SESSION_ACTIONS_LOADING,
+      switchHostDisabledReason: SESSION_ACTIONS_LOADING,
+    });
+    renderDialog({ state: "host_offline", isOwner: true, sourceHostId: "host_dead" });
+    expect(screen.getByText(/Can't bring that machine back/)).toBeInTheDocument();
+    expect(screen.getByTestId("reconnect-session-switch-host")).toBeDisabled();
+  });
+
   it("explains owner-only reconnect (no command) on a non-owner's Reconnect tab", () => {
     renderDialog({ state: "host_offline", isOwner: false });
     switchToTab("reconnect-session-tab-reconnect");
@@ -343,6 +466,15 @@ describe("<ReconnectSessionDialog />", () => {
     expect(form).toHaveAttribute("data-source-git-branch", "main");
   });
 
+  it("shows the force-mounted fork form only while the Clone tab is active", () => {
+    renderDialog();
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "false");
+    switchToTab("reconnect-session-tab-clone");
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "true");
+    switchToTab("reconnect-session-tab-reconnect");
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "false");
+  });
+
   it("the fork form's onClose closes the dialog", () => {
     const { onOpenChange } = renderDialog();
     switchToTab("reconnect-session-tab-clone");
@@ -386,5 +518,35 @@ describe("<ReconnectSessionDialog />", () => {
     const button = screen.getByRole("button", { name: "Reconnecting this machine…" });
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("offers an explicit Arca reconnect for the remembered remote host", () => {
+    const onReconnect = vi.fn();
+    renderDialog({
+      arcaReconnect: { reconnecting: false, error: null, onReconnect },
+    });
+
+    expect(screen.getByTestId("reconnect-session-description")).toHaveTextContent(
+      "Arca host is offline",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect Arca" }));
+    expect(onReconnect).toHaveBeenCalledOnce();
+  });
+
+  it("shows Arca reconnect progress and failures in the current session dialog", () => {
+    renderDialog({
+      arcaReconnect: {
+        reconnecting: true,
+        error: "Couldn't reach Arca.",
+        onReconnect: vi.fn(),
+      },
+    });
+
+    const button = screen.getByRole("button", { name: "Reconnecting Arca…" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByTestId("reconnect-session-arca-error")).toHaveTextContent(
+      "Couldn't reach Arca.",
+    );
   });
 });

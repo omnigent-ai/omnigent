@@ -1,6 +1,13 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import {
+  TerminalFirstContextProvider,
+  type TerminalFirstContextValue,
+} from "@/shell/TerminalFirstContext";
+import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { BubbleView, WorkingIndicator } from "./ChatPage";
@@ -23,6 +30,7 @@ afterEach(() => {
     sandboxStatus: null,
     backgroundTaskCount: 0,
     blockedOn: null,
+    blocks: [],
     sessionStatus: "idle",
     status: "idle",
   });
@@ -180,6 +188,121 @@ describe("WorkingIndicator", () => {
     rerender(<WorkingIndicator />);
     expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
   });
+
+  describe("parked on a terminal permission prompt", () => {
+    const sideChatId = "conv_side_child";
+    const terminalFirstSession: TerminalFirstContextValue = {
+      isClaudeNative: true,
+      isNativeWrapper: true,
+      isTerminalFirst: true,
+      isShellView: false,
+      view: "chat",
+      terminalViewKey: null,
+      setView: () => {},
+      terminalsAvailable: true,
+      terminalStartingUp: false,
+    };
+    const pendingApproval: ElicitationBlock = {
+      type: "elicitation",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+      elicitationId: "elic_1",
+      targetSessionId: null,
+      message: "Allow shell command?",
+      phase: "tool_call",
+      policyName: "ask-before-shell",
+      contentPreview: "{}",
+      requestedSchema: {},
+      url: null,
+      status: "pending",
+      response: null,
+    };
+
+    afterEach(() => {
+      cleanup();
+      conversationRegistry.release(sideChatId);
+      useChatStore.setState({ conversationId: null });
+    });
+
+    function renderInTerminalFirstSession(scope: string | null = null) {
+      return render(
+        <TerminalFirstContextProvider value={terminalFirstSession}>
+          <ConversationScopeContext.Provider value={scope}>
+            <WorkingIndicator />
+          </ConversationScopeContext.Provider>
+        </TerminalFirstContextProvider>,
+      );
+    }
+
+    it("sends the user to the Terminal view when no chat card mirrors the prompt", () => {
+      useChatStore.setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      renderInTerminalFirstSession();
+
+      const expected =
+        "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.";
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(expected);
+      expect(screen.getByRole("status")).toHaveTextContent(expected);
+    });
+
+    it("keeps the block reason beside a pending approval card", () => {
+      useChatStore.setState({
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [pendingApproval],
+      });
+      renderInTerminalFirstSession();
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Blocked on: permission prompt",
+      );
+    });
+
+    it("still points at the terminal when the only pending card is a sub-agent's", () => {
+      useChatStore.setState({
+        conversationId: "conv_root",
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, targetSessionId: "conv_sub_agent" }],
+      });
+      renderInTerminalFirstSession();
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.",
+      );
+    });
+
+    it("keeps the block reason beside a side chat's own pending card", () => {
+      conversationRegistry.acquire(sideChatId).setState({
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, targetSessionId: sideChatId }],
+      });
+      renderInTerminalFirstSession(sideChatId);
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Blocked on: permission prompt",
+      );
+    });
+
+    it("leaves out the Terminal view hint outside a terminal-first session", () => {
+      useChatStore.setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      render(<WorkingIndicator />);
+
+      const indicator = screen.getByTestId("working-indicator");
+      expect(indicator).toHaveTextContent("Waiting for your approval in the agent's terminal.");
+      expect(indicator).not.toHaveTextContent("Open the Terminal view");
+    });
+
+    it("does not offer the root session's Terminal view from a side chat", () => {
+      conversationRegistry
+        .acquire(sideChatId)
+        .setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      renderInTerminalFirstSession(sideChatId);
+
+      const indicator = screen.getByTestId("working-indicator");
+      expect(indicator).toHaveTextContent("Waiting for your approval in the agent's terminal.");
+      expect(indicator).not.toHaveTextContent("Open the Terminal view");
+    });
+  });
 });
 
 describe("BubbleView dispatch", () => {
@@ -286,6 +409,7 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(screen.queryByTestId("turn-worked-fold")).not.toBeInTheDocument();
     expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
@@ -349,11 +473,7 @@ describe("BubbleView dispatch", () => {
     continued: true,
   });
 
-  it("gives fold-only turns the same chrome whether or not the hidden trace narrated", () => {
-    // WHY: the copy/fork row keys off ALL the bubble's text, including text
-    // sealed inside the fold — so an otherwise identical collapsed row grew a
-    // row of hover-only chrome purely because its hidden trace happened to
-    // narrate, and consecutive "Worked for" rows sat at two different gaps.
+  it("keeps narration and its actions visible while tool-only turns stay fold-only", () => {
     render(
       <BubbleView
         bubble={foldOnlyBubble([
@@ -363,9 +483,8 @@ describe("BubbleView dispatch", () => {
       />,
     );
     expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
-    // Nothing below the fold: the collapsed row is the bubble's whole height.
-    expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
+    expect(screen.getByText("Let me look at the code.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
     cleanup();
 
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c2"), toolItem("c3")])} />);
@@ -377,11 +496,30 @@ describe("BubbleView dispatch", () => {
   it("spans the column for a fold-only turn so the row's hairline draws", () => {
     // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
     // (a flex-1 span) collapses to zero width and the click target stops
-    // short of the column. The max-w-3xl cap keeps it aligned with the rule
+    // short of the column. The prose cap keeps it aligned with the rule
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble.firstElementChild).not.toHaveClass("w-fit");
+  });
+
+  it("spans the prose width for tool rows beside a short reply", () => {
+    // WHY: shrink-wrapped to "Done.", the rows above it would cut their titles off mid-column.
+    render(
+      <BubbleView
+        bubble={{
+          ...foldOnlyBubble([
+            toolItem("c5"),
+            { kind: "text", itemId: "t5", text: "Done.", final: true },
+          ]),
+          continued: false,
+        }}
+      />,
+    );
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });

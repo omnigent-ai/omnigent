@@ -24,6 +24,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _close_entry_models,
@@ -31,7 +32,6 @@ from tests.e2e_ui.start_session.test_start_session import (
     _open_entry_models,
     _register_common_routes,
     _run_in_fresh_loop,
-    _wait_until,
 )
 
 # Host catalog rows for codex-native, shaped like Codex's own ``model/list``
@@ -154,7 +154,7 @@ async def _drive_codex_effort_prelaunch(base_url: str, session_id: str) -> None:
             # (test_start_session_select_effort asserts the same field).
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body.get("reasoning_effort") == "high", body

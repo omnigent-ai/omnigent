@@ -1,9 +1,13 @@
 """GitHub integration for the session workspace, backed by the ``gh`` CLI.
 
-Powers the session PR selector, details, and link/unlink actions. Tracked PRs
-use explicit host/repository/number identities. Branch and commit discovery
-remains a fallback for sessions without recorded PRs. Files and patches come
-from GitHub; recording an association does not modify the remote PR.
+Implements GitHub's steps of the session PR panel: details, files, patches, and
+the attach check. :mod:`omnigent.runner.pr_resource` selects the PR and the
+provider and reaches these steps through the GitHub facet
+(:mod:`omnigent.runner.git_providers.github`). The ``github_*`` functions here
+delegate to ``pr_resource``. Tracked PRs use explicit host/repository/number
+identities. Branch and commit discovery remains a fallback for sessions
+without recorded PRs. Files and patches come from GitHub; recording an
+association does not modify the remote PR.
 
 Design notes:
 
@@ -42,6 +46,10 @@ Design notes:
   was pushed to (the fork for a fork PR) — see :func:`_resolve_pr_via_commit`.
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
+- A token without the Checks permission (a fine-grained PAT) can read a PR but
+  not its check runs: GitHub refuses just ``statusCheckRollup`` and ``gh`` fails
+  the whole call, so PR reads retry without that field and report
+  ``checks_supported: false`` rather than pretending there is no PR.
 """
 
 from __future__ import annotations
@@ -53,17 +61,28 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 from urllib.parse import quote
 
-from filelock import Timeout as FileLockTimeout
-
 from omnigent import config as _config
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
+from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.runner import pr_resource
+from omnigent.runner.git_providers import (
+    MERGE_OPTIONS_OBJECT,
+    PR_ATTACHMENT_OBJECT,
+    PR_DETAILS_OBJECT,
+    PR_LABELS_OBJECT,
+    PR_MERGE_OBJECT,
+    PR_REVIEWERS_OBJECT,
+    ReviewerRef,
+    local_git,
+)
+from omnigent.runner.session_prs import PullRequestRef
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -72,22 +91,25 @@ _logger = logging.getLogger(__name__)
 # slightly more generous timeout than the local ``git`` reads. Overridable via
 # ``OMNIGENT_GH_TIMEOUT_SECONDS`` so operators can tune it without a restart.
 _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
-# Cache failed lookups too so inaccessible PRs do not add work to every poll.
-_PR_TITLE_CACHE_SECONDS = 300.0
-_PR_TITLE_TIMEOUT_RETRY_SECONDS = 15.0
-_PR_TITLE_LOOKUP_SECONDS = 2.0
-# Leave headroom for persistence and the runner proxy's ten-second response limit.
-_PR_TITLE_REQUEST_SECONDS = 8.0
-_pr_title_deadline: ContextVar[float | None] = ContextVar("pr_title_deadline", default=None)
-_pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default=False)
+# A request with its own time budget bounds every ``gh`` call by this monotonic
+# deadline (see :func:`_gh_deadline_scope`); ``_gh_timed_out`` records a cut-off call.
+_gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
+_gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
 
-# Fields requested from ``gh pr view``. Always pass ``--json`` — bare
-# ``gh pr view`` opens an interactive/pager view and misbehaves in a
-# non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
-# both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
+# Always pass --json (bare gh pr view opens a pager); body, comments,
+# reviews, labels, and the merge fields feed the Summary and Comments tabs.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
+    ",reviews,reviewRequests,latestReviews,labels,mergeStateStatus,autoMergeRequest"
 )
+_PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
+_PR_COMMENTS_FIELD = "reviews"
+# Older ``gh`` releases lack these; :func:`_gh_pr_view` retries without them.
+_PR_MERGE_FIELDS = frozenset({"mergeStateStatus", "autoMergeRequest"})
+# Reading check runs needs the Checks permission, which a fine-grained personal
+# access token cannot hold; GitHub refuses just this field and ``gh`` fails the
+# whole call, so :func:`_gh_pr_view` retries without it.
+_PR_CHECKS_FIELD = "statusCheckRollup"
 
 
 def _gh_timeout_seconds() -> float:
@@ -154,16 +176,19 @@ def _git(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
 
 def _in_sandbox() -> bool:
     """Whether the panel is running inside a managed sandbox (``IS_SANDBOX=1``)."""
-    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
+    return in_managed_sandbox()
 
 
-def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
-    timeout = _gh_timeout_seconds()
-    if (deadline := _pr_title_deadline.get()) is not None:
+def _gh(
+    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
+) -> tuple[int | None, str, str]:
+    # ``timeout`` raises the per-call limit for a slow call, such as a video upload.
+    timeout = timeout or _gh_timeout_seconds()
+    if (deadline := _gh_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
         if timeout <= 0:
-            _pr_title_timed_out.set(True)
-            return None, "", "title lookup deadline exceeded"
+            _gh_timed_out.set(True)
+            return None, "", "gh deadline exceeded"
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -195,8 +220,23 @@ def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | N
         and result[2] == "timed out"
         and time.monotonic() >= deadline
     ):
-        _pr_title_timed_out.set(True)
+        _gh_timed_out.set(True)
     return result
+
+
+@contextmanager
+def _gh_deadline_scope(deadline: float) -> Iterator[None]:
+    """End every ``gh`` call in the block by ``deadline``, a ``time.monotonic()`` value.
+
+    ``_gh_timed_out`` starts false and turns true once the deadline cuts a call short.
+    """
+    deadline_token = _gh_deadline.set(deadline)
+    timed_out_token = _gh_timed_out.set(False)
+    try:
+        yield
+    finally:
+        _gh_timed_out.reset(timed_out_token)
+        _gh_deadline.reset(deadline_token)
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -345,7 +385,7 @@ _MAX_CHECK_RUNS = 300
 
 
 def _classify_check(check: dict[str, Any]) -> str:
-    """Bucket a single ``statusCheckRollup`` entry: passing / failing / pending."""
+    """Bucket a single ``statusCheckRollup`` entry by its outcome."""
     # CheckRun carries status/conclusion; StatusContext carries state.
     state = check.get("state")
     if state is not None:
@@ -358,16 +398,18 @@ def _classify_check(check: dict[str, Any]) -> str:
     if str(check.get("status", "")).upper() != "COMPLETED":
         return "pending"
     conclusion = str(check.get("conclusion", "")).upper()
-    return "passing" if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED") else "failing"
+    if conclusion in ("CANCELLED", "SKIPPED"):
+        return conclusion.lower()
+    return "passing" if conclusion in ("SUCCESS", "NEUTRAL") else "failing"
 
 
 def _summarize_checks(rollup: Any) -> dict[str, Any]:
     """Summarize a ``statusCheckRollup`` into bucket counts + per-check details.
 
-    :returns: ``{passing, failing, pending, total, runs}`` where ``runs`` is a
-        list of ``{name, bucket, url}`` (the job names the UI shows on hover).
+    :returns: Outcome counts, a total, and ``runs`` containing
+        ``{name, bucket, url}`` (the job names the UI shows on hover).
     """
-    counts = {"passing": 0, "failing": 0, "pending": 0}
+    counts = {"passing": 0, "failing": 0, "pending": 0, "cancelled": 0, "skipped": 0}
     runs: list[dict[str, Any]] = []
     if isinstance(rollup, list):
         for check in rollup:
@@ -387,34 +429,63 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
                     }
                 )
     return {
-        "passing": counts["passing"],
-        "failing": counts["failing"],
-        "pending": counts["pending"],
-        "total": counts["passing"] + counts["failing"] + counts["pending"],
+        **counts,
+        "total": sum(counts.values()),
         "runs": runs,
     }
 
 
-# Cap the comments list so a very chatty PR can't bloat the payload; ``gh``
-# returns them oldest-first, so the cap keeps the earliest ``_MAX_COMMENTS``.
+# Cap the comments list so a very chatty PR can't bloat the payload; keep the
+# latest comments after merging issue comments and review bodies.
 _MAX_COMMENTS = 100
 
 
-def _shape_comments(raw: Any) -> list[dict[str, Any]]:
-    """Shape ``gh``'s PR ``comments`` into the Summary tab's comment list.
-
-    Keeps the top-level conversation comments GitHub shows by default: a
-    minimized/collapsed comment is dropped (mirroring the PR page). Each entry
-    is ``{author, body, created_at, url}``; the list is capped at
-    ``_MAX_COMMENTS``.
-    """
-    shaped: list[dict[str, Any]] = []
-    if not isinstance(raw, list):
-        return shaped
-    for comment in raw:
-        if not isinstance(comment, dict):
+def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
+    """Combine completed reviews with outstanding requests, including re-requests."""
+    reviewers: dict[tuple[str, str], dict[str, str]] = {}
+    reviews = data.get("latestReviews")
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
             continue
-        if comment.get("isMinimized"):
+        author = review.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        state = review.get("state")
+        if (
+            not isinstance(login, str)
+            or not login
+            or state
+            not in (
+                "APPROVED",
+                "COMMENTED",
+                "CHANGES_REQUESTED",
+                "DISMISSED",
+            )
+        ):
+            continue
+        reviewers[("user", login.lower())] = {"login": login, "kind": "user", "state": state}
+
+    requests = data.get("reviewRequests")
+    for request in requests if isinstance(requests, list) else []:
+        if not isinstance(request, dict):
+            continue
+        kind = "team" if request.get("__typename") == "Team" else "user"
+        login = (
+            request.get("slug") or request.get("name") if kind == "team" else request.get("login")
+        )
+        if not isinstance(login, str) or not login:
+            continue
+        # A re-request is pending even if the reviewer previously approved.
+        reviewers[(kind, login.lower())] = {"login": login, "kind": kind, "state": "PENDING"}
+    return list(reviewers.values())
+
+
+def _shape_comments(
+    raw: Any, reviews: Any = None, *, pr_url: str | None = None, cap: bool = True
+) -> list[dict[str, Any]]:
+    """Merge PR conversation comments and submitted review bodies by timestamp."""
+    shaped: list[dict[str, Any]] = []
+    for comment in raw if isinstance(raw, list) else []:
+        if not isinstance(comment, dict) or comment.get("isMinimized"):
             continue
         author = comment.get("author")
         shaped.append(
@@ -425,8 +496,90 @@ def _shape_comments(raw: Any) -> list[dict[str, Any]]:
                 "url": comment.get("url") or None,
             }
         )
-        if len(shaped) >= _MAX_COMMENTS:
-            break
+    for review in reviews if isinstance(reviews, list) else []:
+        if (
+            not isinstance(review, dict)
+            or not review.get("submittedAt")
+            or not str(review.get("body") or "").strip()
+        ):
+            continue
+        author = review.get("author")
+        shaped.append(
+            {
+                "author": author.get("login") if isinstance(author, dict) else None,
+                "body": review["body"],
+                "created_at": review.get("submittedAt") or None,
+                # gh's review objects have no URL; the PR conversation contains
+                # the review body, so link there rather than inventing an anchor.
+                "url": pr_url,
+            }
+        )
+    shaped.sort(key=lambda comment: comment["created_at"] or "")
+    return shaped[-_MAX_COMMENTS:] if cap else shaped
+
+
+def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
+    comments = data.get("comments")
+    reviews = data.get(_PR_COMMENTS_FIELD)
+    shaped = _shape_comments(comments, reviews, pr_url=data.get("url"), cap=False)
+    result: dict[str, Any] = {"comments": shaped[-_MAX_COMMENTS:]}
+    if (
+        not isinstance(comments, list)
+        or not isinstance(reviews, list)
+        or len(comments) >= _MAX_COMMENTS
+        or len(reviews) >= _MAX_COMMENTS
+        or len(shaped) > _MAX_COMMENTS
+    ):
+        result["comments_partial"] = True
+    return result
+
+
+# GitHub label colors are six hex digits; the panel puts them in inline styles.
+_LABEL_COLOR = re.compile(r"[0-9a-fA-F]{6}")
+# The label picker lists at most this many of the repository's labels.
+_MAX_REPO_LABELS = 1000
+# Every ``gh`` call of one label, reviewer, or merge request shares this budget,
+# under the 20-second waits of the server and the host tunnel.
+_PR_EDIT_REQUEST_SECONDS = 15.0
+_LABEL_EDIT_TIMED_OUT = "GitHub took too long to update the labels. Refresh to see which applied."
+_MERGE_TIMED_OUT = (
+    "GitHub took too long to merge the pull request. Refresh to see whether it merged."
+)
+_DISABLE_AUTO_MERGE_TIMED_OUT = (
+    "GitHub took too long to disable auto-merge. Refresh to see whether it is still on."
+)
+# ``gh pr merge`` method flags in the order the merge picker offers them, keyed
+# by the ``gh repo view`` field that allows each.
+_MERGE_METHODS = (
+    ("merge", "mergeCommitAllowed"),
+    ("squash", "squashMergeAllowed"),
+    ("rebase", "rebaseMergeAllowed"),
+)
+
+
+def _shape_labels(raw: Any) -> list[dict[str, str | None]]:
+    """Shape GitHub labels into ``{name, color, description}``, skipping malformed entries.
+
+    Accepts both ``gh pr view --json labels`` and REST label objects.
+    """
+    shaped: list[dict[str, str | None]] = []
+    for label in raw if isinstance(raw, list) else []:
+        name = label.get("name") if isinstance(label, dict) else None
+        if not isinstance(name, str) or not name:
+            continue
+        color = label.get("color")
+        description = label.get("description")
+        shaped.append(
+            {
+                "name": name,
+                "color": color.lower()
+                if isinstance(color, str) and _LABEL_COLOR.fullmatch(color)
+                else None,
+                "description": description
+                if isinstance(description, str) and description
+                else None,
+            }
+        )
     return shaped
 
 
@@ -528,6 +681,129 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     return None
 
 
+def _refused_pr_fields(stderr: str) -> set[str]:
+    """Read rejected JSON fields or GraphQL error paths, excluding CLI help catalogs."""
+    if match := re.search(r'^Unknown JSON field: "([^"]+)"', stderr, re.MULTILINE):
+        return {match[1]}
+    return {
+        field
+        for path in re.findall(r"\(([\w.]+(?:,\s*[\w.]+)*)\)", stderr)
+        for field in re.findall(r"\w+", path)
+    }
+
+
+def _gh_pr_view(
+    args: list[str], fields: str, *, cwd: str, token: str | None = None
+) -> dict[str, Any] | None:
+    """Return ``gh pr view <args> --json <fields>`` as a dict, or ``None``.
+
+    Retry without optional checks, reviewer, or merge fields only when the error
+    names them. Each retry removes fields, so unrelated failures never retry here.
+    """
+    rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
+    while rc != 0:
+        refused = _refused_pr_fields(err) & set(fields.split(","))
+        refused &= _PR_REVIEW_FIELDS | _PR_MERGE_FIELDS | {_PR_CHECKS_FIELD, _PR_COMMENTS_FIELD}
+        if refused & _PR_REVIEW_FIELDS:
+            refused.update(_PR_REVIEW_FIELDS)
+        remaining = ",".join(field for field in fields.split(",") if field not in refused)
+        if not remaining or remaining == fields:
+            return None
+        fields = remaining
+        rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    comments = data.get("comments")
+    if isinstance(comments, list) and len(comments) >= _MAX_COMMENTS:
+        _refresh_latest_comments(data, cwd=cwd, token=token)
+    return data
+
+
+def _refresh_latest_comments(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
+    """Read the latest page when gh's bounded conversation list may omit new posts."""
+    url = data.get("url")
+    if not isinstance(url, str):
+        return
+    try:
+        reference = PullRequestRef.from_url(url)
+        host = _host_args(cwd, reference)
+    except ValueError:
+        return
+    owner, name = reference.repository.split("/", 1)
+    query = """query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          comments(last: 100) {
+            nodes { author { login } body createdAt url isMinimized }
+          }
+        }
+      }
+    }"""
+    rc, out, _ = _gh(
+        [
+            "api",
+            *host,
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"name={name}",
+            "-F",
+            f"number={reference.number}",
+        ],
+        cwd=cwd,
+        token=token,
+    )
+    if rc != 0:
+        return
+    try:
+        latest = json.loads(out)["data"]["repository"]["pullRequest"]["comments"]["nodes"]
+    except (ValueError, KeyError, TypeError):
+        return
+    if isinstance(latest, list):
+        data["comments"] = latest
+
+
+def _checks_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """``checks`` and ``checks_supported`` for a ``gh pr view`` object; the field is
+    absent only after :func:`_gh_pr_view` dropped it."""
+    return {
+        "checks": _summarize_checks(data.get(_PR_CHECKS_FIELD)),
+        "checks_supported": _PR_CHECKS_FIELD in data,
+    }
+
+
+def _merge_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """``merge_state_status`` and ``auto_merge`` for a ``gh pr view`` object.
+
+    Each is left out when :func:`_gh_pr_view` dropped its field for an older ``gh``.
+    """
+    fields: dict[str, Any] = {}
+    if "mergeStateStatus" in data:
+        status = data["mergeStateStatus"]
+        fields["merge_state_status"] = status.upper() if isinstance(status, str) else None
+    if "autoMergeRequest" in data:
+        request = data["autoMergeRequest"]
+        if isinstance(request, dict):
+            method = request.get("mergeMethod")
+            enabled_by = request.get("enabledBy")
+            login = enabled_by.get("login") if isinstance(enabled_by, dict) else None
+            fields["auto_merge"] = {
+                "merge_method": method.upper() if isinstance(method, str) else None,
+                "enabled_by": login if isinstance(login, str) else None,
+                "enabled_at": request.get("enabledAt"),
+            }
+        else:
+            fields["auto_merge"] = None
+    return fields
+
+
 def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[str, Any] | None:
     """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
 
@@ -547,14 +823,9 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
 
     :param token: Optional GH_TOKEN to run the calls as the selected account.
     """
-    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root, token=token)
-    if rc == 0:
-        try:
-            data = json.loads(out)
-        except ValueError:
-            data = None
-        if isinstance(data, dict):
-            return data
+    data = _gh_pr_view([], fields, cwd=root, token=token)
+    if data is not None:
+        return data
 
     resolved = _resolve_pr_via_commit(root, token=token)
     if resolved is None:
@@ -566,16 +837,7 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
     # itself doesn't need it (the explicit ``-R`` below carries the base).
     if not _resolved_base_nwo(root):
         _gh(["repo", "set-default", base_repo], cwd=root, token=token)
-    rc, out, _ = _gh(
-        ["pr", "view", str(number), "-R", base_repo, "--json", fields], cwd=root, token=token
-    )
-    if rc != 0:
-        return None
-    try:
-        data = json.loads(out)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
+    return _gh_pr_view([str(number), "-R", base_repo], fields, cwd=root, token=token)
 
 
 def _workspace_github_info(root: str) -> dict[str, Any]:
@@ -592,7 +854,9 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         ``authenticated`` report whether the ``gh`` CLI is present and signed in;
         ``repo`` / ``pr`` / ``base_ref`` are null without it. ``accounts`` /
         ``selected_account`` are populated only when the repo can't be reached (to
-        drive the account selector), so the happy path stays fast.
+        drive the account selector), so the happy path stays fast. The GitHub
+        facet copies these four fields into ``auth``; at the top level they are
+        deprecated and will be removed in 0.19.0.
 
     Ordering is a fast-path optimization: resolve the PR first, and only fall to
     the ``gh repo view`` reachability probe (and, if that fails, the ``gh auth
@@ -642,12 +906,16 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             "author": author.get("login") if isinstance(author, dict) else None,
             "base_ref": data.get("baseRefName"),
             "head_ref": data.get("headRefName"),
-            "checks": _summarize_checks(data.get("statusCheckRollup")),
-            # PR description + conversation comments feed the Summary tab; an
-            # empty body is null so the UI shows its "no description" state.
+            **_checks_fields(data),
+            # An empty body is null so the Summary tab shows its empty state.
             "body": body if isinstance(body, str) and body.strip() else None,
-            "comments": _shape_comments(data.get("comments")),
+            **_comments_payload(data),
+            **_merge_fields(data),
         }
+        if _PR_REVIEW_FIELDS.issubset(data):
+            payload["pr"]["reviewers"] = _shape_reviewers(data)
+        if "labels" in data:
+            payload["pr"]["labels"] = _shape_labels(data["labels"])
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
         payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
@@ -677,27 +945,20 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
     return payload
 
 
-def _selected_pr(session_id: str, pr_url: str) -> PullRequestRef:
-    reference = PullRequestRef.from_url(pr_url)
-    for entry in SessionPrRegistry(session_id).list():
-        if entry.url == reference.url:
-            return entry
-    raise ValueError("This pull request is not associated with the session")
+def _repo_argument(ref: PullRequestRef) -> str:
+    """The ``gh -R`` selector, including a GitHub Enterprise host.
 
-
-def _default_pr(session_id: str | None, pr_url: str | None) -> PullRequestRef | None:
-    if session_id is None:
-        return None
-    if pr_url:
-        return _selected_pr(session_id, pr_url)
-    entries = SessionPrRegistry(session_id).list()
-    return entries[0] if entries else None
+    It is also the key of saved per-PR account preferences, so its format is fixed.
+    """
+    if ref.provider != "github":
+        raise ValueError("This resource supports only GitHub pull requests")
+    return f"{ref.host}/{ref.repository}"
 
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
     if _in_sandbox():
         return None
-    login = _config.github_account_preference(reference.repo_argument)
+    login = _config.github_account_preference(_repo_argument(reference))
     if login:
         return _gh_auth_token(root, login, reference.host)
     return None
@@ -708,18 +969,12 @@ def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any
         _, accounts = _list_accounts(root)
         if reference.host not in {account.get("host") for account in accounts}:
             return None
-    rc, out, _ = _gh(
-        ["pr", "view", str(reference.number), "-R", reference.repo_argument, "--json", fields],
+    return _gh_pr_view(
+        [str(reference.number), "-R", _repo_argument(reference)],
+        fields,
         cwd=root,
         token=_pr_token(root, reference),
     )
-    if rc != 0:
-        return None
-    try:
-        result = json.loads(out)
-    except ValueError:
-        return None
-    return result if isinstance(result, dict) else None
 
 
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
@@ -736,7 +991,8 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         return info
     _, accounts = _list_accounts(root)
     info["accounts"] = [a for a in accounts if a.get("host") == reference.host]
-    info["selected_account"] = _config.github_account_preference(reference.repo_argument) or next(
+    preferred = _config.github_account_preference(_repo_argument(reference))
+    info["selected_account"] = preferred or next(
         (a["login"] for a in info["accounts"] if a.get("active")), None
     )
     data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
@@ -757,10 +1013,15 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "head_ref": data.get("headRefName"),
         "head_sha": data.get("headRefOid"),
         "base_sha": data.get("baseRefOid"),
-        "checks": _summarize_checks(data.get("statusCheckRollup")),
+        **_checks_fields(data),
         "body": data.get("body") or None,
-        "comments": _shape_comments(data.get("comments")),
+        **_comments_payload(data),
+        **_merge_fields(data),
     }
+    if _PR_REVIEW_FIELDS.issubset(data):
+        info["pr"]["reviewers"] = _shape_reviewers(data)
+    if "labels" in data:
+        info["pr"]["labels"] = _shape_labels(data["labels"])
     return info
 
 
@@ -771,119 +1032,85 @@ def _pr_title(data: dict[str, Any] | None) -> str | None:
     return title.strip() or None
 
 
-def _session_prs_with_titles(
+def _gh_installed() -> bool:
+    """Whether the ``gh`` CLI is on ``PATH``."""
+    return shutil.which("gh") is not None
+
+
+def _pr_title_before(
+    root: str, reference: PullRequestRef, deadline: float
+) -> tuple[str | None, bool]:
+    """Look up one PR's title, with every ``gh`` call ending by ``deadline``.
+
+    :param deadline: A ``time.monotonic()`` value.
+    :returns: ``(title, timed_out)``; ``timed_out`` is true only when the
+        deadline ended the lookup.
+    """
+    with _gh_deadline_scope(deadline):
+        data = _pr_json(root, reference, "title")
+        return _pr_title(data), data is None and _gh_timed_out.get()
+
+
+def _verify_pr_access(root: str, reference: PullRequestRef) -> None:
+    """Raise unless ``gh`` on the host can read the PR.
+
+    :raises ValueError: When ``gh`` cannot read it.
+    """
+    if _pr_json(root, reference, "number,url") is None:
+        raise ValueError("Cannot access this pull request using gh on the host")
+
+
+def _adopt_workspace_account(root: str, reference: PullRequestRef) -> None:
+    """Give a branch-inferred PR the workspace's account unless it has its own."""
+    key = _workspace_key(root)
+    account = _config.github_account_preference(key) if key else None
+    if account and not _config.github_account_preference(_repo_argument(reference)):
+        _config.set_github_account_preference(_repo_argument(reference), account)
+
+
+def _set_preference(
     root: str,
-    info: dict[str, Any],
-    registry: SessionPrRegistry,
-    entries: list[SessionPullRequest],
-    request_deadline: float,
-) -> list[dict[str, Any]]:
-    if not info.get("gh_available"):
-        return [entry.model_dump() for entry in entries]
+    reference: PullRequestRef | None,
+    *,
+    account: str | None,
+    remote: str | None,
+) -> None:
+    """Save a gh account choice for one PR or the workspace, and the base remote.
 
-    now = time.time()
-    titles: dict[str, str | None] = {}
-    timed_out_urls: set[str] = set()
-    pending: list[SessionPullRequest] = []
-    for entry in entries:
-        cache_seconds = (
-            _PR_TITLE_TIMEOUT_RETRY_SECONDS
-            if entry.title_lookup_timed_out
-            else _PR_TITLE_CACHE_SECONDS
-        )
-        stale = now - entry.title_checked_at >= cache_seconds
-        if entry.url == info.get("selected_pr_url"):
-            title = _pr_title(info.get("pr"))
-            if stale or (title is not None and title != entry.title):
-                titles[entry.url] = title
-        elif stale:
-            pending.append(entry)
+    The workspace account preference is keyed by the main worktree path, shared
+    across a repo's worktrees, and persisted with
+    :func:`omnigent.config.set_github_account_preference`; an empty ``account``
+    clears it, falling back to ``gh``'s active account. The remote is
+    ``gh repo set-default`` (persisted by ``gh`` in ``.git/config``); the base
+    is normally resolved automatically, so this is only an escape hatch.
 
-    # Short-backoff retries must not starve PRs that have waited longer or never ran.
-    pending.sort(key=lambda entry: entry.title_checked_at)
-    deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
-
-    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
-        if time.monotonic() >= deadline:
-            return None
-        token = _pr_title_deadline.set(deadline)
-        timeout_token = _pr_title_timed_out.set(False)
-        try:
-            data = _pr_json(root, entry, "title")
-            return entry.url, _pr_title(data), data is None and _pr_title_timed_out.get()
-        finally:
-            _pr_title_timed_out.reset(timeout_token)
-            _pr_title_deadline.reset(token)
-
-    may_cache = time.monotonic() < request_deadline
-    if pending and time.monotonic() < deadline:
-        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
-            for result in executor.map(fetch_title, pending):
-                if result is not None:
-                    url, title, timed_out = result
-                    titles[url] = title
-                    if timed_out:
-                        timed_out_urls.add(url)
-    if titles and may_cache:
-        try:
-            registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
-        except (OSError, ValueError, FileLockTimeout):
-            _logger.debug("Could not cache session PR titles", exc_info=True)
-
-    return [
-        {**entry.model_dump(), "title": titles.get(entry.url) or entry.title} for entry in entries
-    ]
+    :param reference: The PR whose account to set; ``None`` for the workspace.
+    :param account: GitHub login to prefer, ``None`` to leave it, or empty to clear it.
+    :param remote: Git remote name or ``owner/repo`` to set as the workspace's
+        base repo; ignored with a ``reference``.
+    """
+    if reference is not None:
+        if account is not None:
+            _config.set_github_account_preference(_repo_argument(reference), account or None)
+        return
+    if remote:
+        _gh(["repo", "set-default", remote], cwd=root)
+    if account is not None:
+        key = _workspace_key(root)
+        if key:
+            _config.set_github_account_preference(key, account or None)
 
 
 def github_info(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
-    """Read the selected session PR, with branch inference for untracked sessions."""
-    if session_id is None:
-        return _workspace_github_info(root)
-    request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
-    registry = SessionPrRegistry(session_id)
-    entries = registry.list()
-    if pr_url:
-        info = _reference_info(root, _selected_pr(session_id, pr_url))
-    elif entries:
-        info = _reference_info(root, entries[0])
-    else:
-        info = _workspace_github_info(root)
-        pr = info.get("pr")
-        if isinstance(pr, dict) and isinstance(pr.get("url"), str):
-            reference = PullRequestRef.from_url(pr["url"])
-            registry.record([reference], relationship="inferred", source="branch")
-            entries = registry.list()
-            if any(entry.url == reference.url for entry in entries):
-                key = _workspace_key(root)
-                account = _config.github_account_preference(key) if key else None
-                if account and not _config.github_account_preference(reference.repo_argument):
-                    _config.set_github_account_preference(reference.repo_argument, account)
-                info["selected_pr_url"] = reference.url
-            else:
-                info["pr"] = None
-    info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
-    info["tracking_available"] = True
-    return info
+    """Return the panel payload; see :func:`pr_resource.pr_info`."""
+    return pr_resource.pr_info(root, session_id=session_id, pr_url=pr_url)
 
 
 def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
-    """Attach a verified PR or persist an explicit exclusion."""
-    reference = PullRequestRef.from_url(url)
-    registry = SessionPrRegistry(session_id)
-    try:
-        if action == "attach":
-            if _pr_json(root, reference, "number,url") is None:
-                raise ValueError("Cannot access this pull request using gh on the host")
-            registry.record([reference], relationship="attached", source="user")
-            return github_info(root, session_id=session_id, pr_url=reference.url)
-        if action == "remove":
-            registry.remove(reference.url)
-            return github_info(root, session_id=session_id)
-    except FileLockTimeout as exc:
-        raise ValueError("PR tracking is busy; try again.") from exc
-    raise ValueError("Expected attach or remove")
+    """Attach or remove a session PR; see :func:`pr_resource.update_session_pr`."""
+    return pr_resource.update_session_pr(root, session_id, url, action)
 
 
 def set_github_preference(
@@ -894,41 +1121,14 @@ def set_github_preference(
     session_id: str | None = None,
     pr_url: str | None = None,
 ) -> dict[str, Any]:
-    """Apply an account and/or remote selection, then return refreshed info.
-
-    The account preference is keyed per workspace (the main worktree path, shared
-    across a repo's worktrees) and persisted to the user config via
-    :func:`omnigent.config.set_github_account_preference`; an empty ``account``
-    clears the entry, falling back to ``gh``'s active account. The remote is
-    ``gh repo set-default`` (persisted by ``gh`` in ``.git/config``) — the
-    normal-case base is auto-resolved, so this is only an escape hatch.
-
-    :param root: Absolute workspace path.
-    :param account: GitHub login to prefer for this workspace, or ``None`` to
-        leave it unchanged (empty string clears it).
-    :param remote: Git remote name or ``owner/repo`` to set as the base repo, or
-        ``None`` to leave the base unchanged.
-    :returns: The refreshed :func:`github_info` payload.
-    """
-    if pr_url and session_id:
-        reference = _selected_pr(session_id, pr_url)
-        if account is not None:
-            _config.set_github_account_preference(reference.repo_argument, account or None)
-        return github_info(root, session_id=session_id, pr_url=pr_url)
-    if remote:
-        _gh(["repo", "set-default", remote], cwd=root)
-    if account is not None:
-        key = _workspace_key(root)
-        if key:
-            _config.set_github_account_preference(key, account or None)
-    return github_info(root, session_id=session_id)
+    """Apply an account or remote choice; see :func:`pr_resource.set_pr_preference`."""
+    return pr_resource.set_pr_preference(
+        root, account=account, remote=remote, session_id=session_id, pr_url=pr_url
+    )
 
 
 def resolve_base_ref(root: str, base: str | None) -> str | None:
-    """Return an explicit base branch, else the repo's default diff base.
-
-    Shared by the runner routes and the host reader so both resolve an omitted
-    ``?base=`` identically (via :func:`github_info`).
+    """Return an explicit base branch, else the base of the workspace branch's PR.
 
     :param root: Absolute workspace path.
     :param base: Explicit base branch name, or ``None`` to derive the default.
@@ -936,69 +1136,32 @@ def resolve_base_ref(root: str, base: str | None) -> str | None:
     """
     if base:
         return base
-    return github_info(root).get("base_ref")
+    return _workspace_github_info(root).get("base_ref")
+
+
+def _git_run(root: str) -> local_git.TextRun:
+    """Run git commands in ``root`` through :func:`_git`, for :mod:`local_git`."""
+
+    def run(argv: list[str]) -> tuple[int | None, str]:
+        rc, out, _ = _git(argv, cwd=root)
+        return rc, out
+
+    return run
 
 
 def _resolve_diff_base(root: str, base: str) -> str:
     """Resolve a base branch name to the ref to diff HEAD against.
 
-    Prefers the merge-base of ``origin/<base>`` (or ``<base>``) and HEAD, giving
-    the three-dot / "Files changed" semantics GitHub shows. A missing merge base
-    in a shallow repository raises instead of comparing branch tips. Full-history
-    repositories retain the base-tip fallback. An unavailable base ref raises.
+    See :func:`omnigent.runner.git_providers.local_git.resolve_diff_base`.
 
-    :param root: Absolute workspace path.
-    :param base: Base branch name, e.g. ``"main"``.
-    :returns: A ref (SHA or name) to diff against.
     :raises OmnigentError: If the base is unavailable or shallow ancestry is missing.
     """
-    candidates = [f"origin/{base}", base]
-    resolved: str | None = None
-    for candidate in candidates:
-        rc, _, _ = _git(["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], cwd=root)
-        if rc == 0:
-            resolved = candidate
-            break
-    if resolved is None:
-        raise OmnigentError(
-            f"Diff base {base!r} is not available locally. Fetch the base branch explicitly "
-            "with `git fetch origin <base>:refs/remotes/origin/<base>` (replace <base> "
-            "with the branch name), then retry. Single-branch clones do not fetch "
-            "other branches automatically.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    rc, out, _ = _git(["merge-base", resolved, "HEAD"], cwd=root)
-    if rc == 0 and out.strip():
-        return out.strip()
-    if rc == 1:
-        shallow_rc, shallow, _ = _git(["rev-parse", "--is-shallow-repository"], cwd=root)
-        if shallow_rc == 0 and shallow.strip() == "true":
-            raise OmnigentError(
-                f"No merge base found between HEAD and {resolved!r} in this shallow repository. "
-                "Fetch more history with `git fetch --deepen=100 origin` or "
-                "`git fetch --unshallow origin`, then retry. "
-                "Include both branch refspecs if origin tracks only one branch.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-    return resolved
+    return local_git.resolve_diff_base(_git_run(root), base)
 
 
 def _read_diff_content(root: str, ref: str, path: str) -> str | None:
     """Read a local diff side; only a confirmed absent tree entry means no content."""
-    rc, out, _ = _git(["show", f"{ref}:{path}"], cwd=root)
-    if rc == 0:
-        return out
-    # Tree entries remain available in blobless clones even if a lazy blob fetch fails.
-    tree_rc, entries, _ = _git(
-        ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", ref, "--", path], cwd=root
-    )
-    if tree_rc == 0 and not entries:
-        return None
-    raise OmnigentError(
-        f"Unable to read file content for {path!r} at {ref!r}. Check repository access "
-        "and connectivity, then retry; a partial clone may need to fetch missing objects.",
-        code=ErrorCode.INTERNAL_ERROR,
-    )
+    return local_git.read_file(_git_run(root), ref, path)
 
 
 # GitHub pulls/files ``status`` → the status vocabulary the web list uses.
@@ -1031,6 +1194,11 @@ def _pr_number(root: str, *, token: str | None = None) -> int | None:
 def github_changed_files(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
+    """List the selected PR's files; see :func:`pr_resource.pr_changed_files`."""
+    return pr_resource.pr_changed_files(root, session_id=session_id, pr_url=pr_url)
+
+
+def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, Any]:
     """List the PR's changed files, straight from GitHub.
 
     Sourced from ``gh api .../pulls/<n>/files`` so the set (and each file's
@@ -1038,11 +1206,11 @@ def github_changed_files(
     local ``git diff``. Empty when the branch has no PR.
 
     :param root: Absolute workspace path.
+    :param reference: The tracked PR, or ``None`` for the workspace branch's PR.
     :returns: A ``list`` object whose ``data`` entries carry ``path`` / ``name``
         / ``status`` / ``lines_added`` / ``lines_removed``.
     """
     empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
-    reference = _default_pr(session_id, pr_url)
     token = _pr_token(root, reference) if reference else _account_token_for(root)
     number = reference.number if reference else _pr_number(root, token=token)
     if number is None:
@@ -1061,13 +1229,15 @@ def github_changed_files(
         token=token,
     )
     if rc != 0:
-        return empty
+        raise ValueError("GitHub could not load the PR's changed files. Refresh to retry.")
     try:
         entries = json.loads(out)
     except ValueError:
-        return empty
+        raise ValueError(
+            "GitHub returned an invalid changed-file list. Refresh to retry."
+        ) from None
     if not isinstance(entries, list):
-        return empty
+        raise ValueError("GitHub returned an invalid changed-file list. Refresh to retry.")
 
     if reference:
         entries = [
@@ -1106,18 +1276,42 @@ def github_file_diff(
     head_sha: str | None = None,
     base_sha: str | None = None,
 ) -> dict[str, Any]:
+    """Return one file's before/after; see :func:`pr_resource.pr_file_diff`."""
+    return pr_resource.pr_file_diff(
+        root,
+        base,
+        path,
+        session_id=session_id,
+        pr_url=pr_url,
+        previous_path=previous_path,
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+
+
+def _pr_file_diff(
+    root: str,
+    reference: PullRequestRef | None,
+    path: str,
+    *,
+    base: str,
+    previous_path: str | None,
+    head_sha: str | None,
+    base_sha: str | None,
+) -> dict[str, Any]:
     """Return before/after content for one file, HEAD vs the base merge-base.
 
     :param root: Absolute workspace path.
-    :param base: Base branch name, e.g. ``"main"``.
+    :param reference: The tracked PR, read from GitHub; ``None`` diffs the local
+        checkout.
     :param path: Repo-root-relative path, as returned by
         :func:`github_changed_files`.
+    :param base: Base branch name for the local diff, e.g. ``"main"``.
     :returns: A ``session.github.file_diff`` object with ``before`` (merge-base
         content, ``None`` for an added file) and ``after`` (HEAD content,
         ``None`` for a deleted file).
     :raises OmnigentError: If the local diff base or file content is unavailable.
     """
-    reference = _default_pr(session_id, pr_url)
     if reference:
         return _pr_file_contents(
             root,
@@ -1144,6 +1338,11 @@ def github_file_diff(
 def github_pr_diff(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
+    """Return the selected PR's patch; see :func:`pr_resource.pr_diff`."""
+    return pr_resource.pr_diff(root, session_id=session_id, pr_url=pr_url)
+
+
+def _pr_patch(root: str, reference: PullRequestRef | None) -> dict[str, Any]:
     """Return the whole PR as one unified diff patch, straight from GitHub.
 
     ``gh pr diff <number>`` yields the PR's "Files changed" patch (server-computed
@@ -1153,20 +1352,42 @@ def github_pr_diff(
     the branch has no PR.
 
     :param root: Absolute workspace path.
+    :param reference: The tracked PR, or ``None`` for the workspace branch's PR.
     :returns: A ``session.github.pr_diff`` object with the ``patch`` text
         (empty when there's no PR / no changes).
     """
     empty: dict[str, Any] = {"object": "session.github.pr_diff", "patch": ""}
-    reference = _default_pr(session_id, pr_url)
     token = _pr_token(root, reference) if reference else _account_token_for(root)
     number = reference.number if reference else _pr_number(root, token=token)
     if number is None:
         return empty
     if reference:
         _host_args(root, reference)
-    repo_args = ["-R", reference.repo_argument] if reference else []
+    repo_args = ["-R", _repo_argument(reference)] if reference else []
     rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
-    return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
+    if rc != 0:
+        raise ValueError("GitHub could not load the PR diff. Refresh or open the PR on GitHub.")
+    return {"object": "session.github.pr_diff", "patch": out}
+
+
+def _pr_patch_at_revision(
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+) -> dict[str, Any]:
+    """Reject a patch if the PR moves before or during its fetch."""
+
+    def check_revision() -> None:
+        pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
+        if (
+            _api_string(pr, "head", "sha") != head_sha
+            or _api_string(pr, "base", "sha") != base_sha
+        ):
+            raise ValueError("The pull request changed; refresh before viewing its conversations.")
+
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        check_revision()
+        result = _pr_patch(root, reference)
+        check_revision()
+    return {**result, "head_sha": head_sha, "base_sha": base_sha}
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:
@@ -1266,3 +1487,673 @@ def _pr_file_contents(
         "before": contents(reference.repository, merge_base, previous_path or path),
         "after": contents(head_repository, current_head, path),
     }
+
+
+def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    """List the PR repository's labels by name for the label picker.
+
+    :raises ValueError: When ``gh`` cannot list them within :data:`_PR_EDIT_REQUEST_SECONDS`.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        _host_args(root, reference)
+        rc, out, _ = _gh(
+            [
+                "label",
+                "list",
+                "-R",
+                _repo_argument(reference),
+                "--json",
+                "name,color,description",
+                "--limit",
+                # One past the cap tells a full list from a truncated one.
+                str(_MAX_REPO_LABELS + 1),
+            ],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
+    if rc != 0:
+        raise ValueError("GitHub could not list this repository's labels. Refresh to retry.")
+    try:
+        raw = json.loads(out)
+    except ValueError as exc:
+        raise ValueError("GitHub returned an unexpected label list") from exc
+    raw = raw if isinstance(raw, list) else []
+    labels = sorted(
+        _shape_labels(raw[:_MAX_REPO_LABELS]), key=lambda label: str(label["name"]).casefold()
+    )
+    return {"object": "list", "data": labels, "has_more": len(raw) > _MAX_REPO_LABELS}
+
+
+def _labels_api(
+    root: str, host: list[str], token: str | None, args: list[str], *, missing_ok: bool = False
+) -> list[Any] | None:
+    """Run one ``gh api`` issue-labels request and return the PR's labels after it.
+
+    :param missing_ok: Return ``None`` when GitHub reports that the PR lacks the
+        label being removed.
+    :raises ValueError: With a user-facing message when GitHub refuses the request.
+    """
+    rc, out, err = _gh(["api", *host, *args], cwd=root, token=token)
+    try:
+        body = json.loads(out) if out.strip() else None
+    except ValueError:
+        body = None
+    if rc == 0 and isinstance(body, list):
+        return body
+    message = body.get("message") if isinstance(body, dict) else None
+    if missing_ok and message == "Label does not exist":
+        return None
+    raise _pr_edit_error(err, message, "label")
+
+
+def _pr_edit_error(err: str, message: object, subject: str) -> ValueError:
+    """The user-facing error for a refused ``gh api`` edit of the PR's ``subject``s."""
+    if re.search(r"\(HTTP 40[134]\)", err):
+        return ValueError(
+            f"The GitHub account on the host cannot edit this pull request's {subject}s."
+        )
+    if isinstance(message, str) and "(HTTP 422)" in err:
+        return ValueError(f"GitHub rejected the {subject} change: {message}")
+    return ValueError(f"GitHub could not update the {subject}s. Refresh to retry.")
+
+
+def _edit_labels(
+    root: str, reference: PullRequestRef, *, add: Sequence[str], remove: Sequence[str]
+) -> dict[str, Any]:
+    """Remove, then add, the PR's labels through GitHub's issue labels API.
+
+    Every ``gh`` call, including the account and host lookups, shares
+    :data:`_PR_EDIT_REQUEST_SECONDS`; running out reports that the outcome is unknown.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        try:
+            return _apply_label_edit(root, reference, add=add, remove=remove)
+        except ValueError:
+            if _gh_timed_out.get():
+                raise ValueError(_LABEL_EDIT_TIMED_OUT) from None
+            raise
+
+
+def _apply_label_edit(
+    root: str, reference: PullRequestRef, *, add: Sequence[str], remove: Sequence[str]
+) -> dict[str, Any]:
+    """Make the edit's requests; each returns the PR's labels, so the last one is the result.
+
+    A final read supplies the labels when every removed label was already absent.
+    """
+    host = _host_args(root, reference)
+    token = _pr_token(root, reference)
+    if _gh_timed_out.get():
+        # The selected account's token is unknown, so the edit must not run as another.
+        raise ValueError(_LABEL_EDIT_TIMED_OUT)
+    endpoint = f"repos/{reference.repository}/issues/{reference.number}/labels"
+    labels: list[Any] | None = None
+    for name in remove:
+        removed = _labels_api(
+            root,
+            host,
+            token,
+            ["-X", "DELETE", f"{endpoint}/{quote(name, safe='')}"],
+            missing_ok=True,
+        )
+        labels = removed if removed is not None else labels
+    if add:
+        fields = [arg for name in add for arg in ("-f", f"labels[]={name}")]
+        labels = _labels_api(root, host, token, ["-X", "POST", endpoint, *fields])
+    if labels is None:
+        labels = _labels_api(root, host, token, [f"{endpoint}?per_page=100"])
+    return {"object": PR_LABELS_OBJECT, "labels": _shape_labels(labels)}
+
+
+def _merge_options(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    """Return the merge methods the PR's repository allows and the one to preselect.
+
+    The default is the viewer's last-used method, or the repository default,
+    when it is allowed; otherwise the first allowed method.
+
+    :raises ValueError: When ``gh`` cannot read the repository's merge settings.
+    """
+    fields = ",".join(["viewerDefaultMergeMethod", *(field for _, field in _MERGE_METHODS)])
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        _host_args(root, reference)
+        rc, out, _ = _gh(
+            ["repo", "view", _repo_argument(reference), "--json", fields],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
+    if rc != 0:
+        raise ValueError(
+            "GitHub could not read this repository's merge settings. Refresh to retry."
+        )
+    try:
+        data = json.loads(out)
+    except ValueError as exc:
+        raise ValueError("GitHub returned unexpected merge settings") from exc
+    if not isinstance(data, dict):
+        raise ValueError("GitHub returned unexpected merge settings")
+    methods = [method for method, field in _MERGE_METHODS if data.get(field) is True]
+    preferred = data.get("viewerDefaultMergeMethod")
+    preferred = preferred.lower() if isinstance(preferred, str) else None
+    default = preferred if preferred in methods else next(iter(methods), None)
+    return {"object": MERGE_OPTIONS_OBJECT, "methods": methods, "default": default}
+
+
+def _merge_error(stderr: str, *, action: str) -> str:
+    """Turn ``gh pr merge``'s error output into a user-facing message.
+
+    :param action: What failed, e.g. ``"merge this pull request"``.
+    """
+    if "Head branch was modified" in stderr:
+        return (
+            "The pull request's branch changed since the panel loaded. "
+            "Review the new commits, then merge again."
+        )
+    if re.search(r"\(HTTP 40[13]\)|Resource not accessible|must have (?:write|push)", stderr):
+        return f"The GitHub account on the host cannot {action}."
+    detail = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
+    # gh prefixes GraphQL errors and its failure marks; neither helps the reader.
+    detail = re.sub(r"^(?:X |GraphQL: )+", "", detail).strip()[:300]
+    if not detail:
+        return f"GitHub could not {action}. Refresh to retry."
+    return f"GitHub could not {action}: {detail}"
+
+
+def _run_pr_merge(
+    root: str, reference: PullRequestRef, flags: list[str], *, action: str, timed_out: str
+) -> None:
+    """Run ``gh pr merge <flags>`` on the PR as its selected account.
+
+    Every ``gh`` call shares :data:`_PR_EDIT_REQUEST_SECONDS`. Without a saved
+    account, ``gh``'s active account runs it; a saved one without a token refuses.
+
+    :param action: What the command does, for error messages.
+    :param timed_out: Message when the deadline leaves the outcome unknown.
+    :raises ValueError: With a user-facing message when GitHub refuses.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        _host_args(root, reference)
+        token = _pr_token(root, reference)
+        # Without the selected account's token gh would run as another account.
+        if _gh_timed_out.get():
+            raise ValueError(timed_out)
+        login = (
+            None if _in_sandbox() else _config.github_account_preference(_repo_argument(reference))
+        )
+        if login and token is None:
+            raise ValueError(
+                f"The selected GitHub account {login} isn't signed in on the host. "
+                "Sign in with gh or choose another account."
+            )
+        rc, _, err = _gh(
+            ["pr", "merge", str(reference.number), "-R", _repo_argument(reference), *flags],
+            cwd=root,
+            token=token,
+        )
+        if rc != 0:
+            raise ValueError(
+                timed_out if _gh_timed_out.get() else _merge_error(err, action=action)
+            )
+
+
+def _merge_pr(
+    root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+) -> dict[str, Any]:
+    """Merge the PR with ``gh pr merge``, only while its head is ``expected_head``.
+
+    ``--match-head-commit`` makes GitHub refuse the merge when the branch moved
+    since the panel showed it.
+
+    :raises ValueError: With a user-facing message when GitHub refuses the merge.
+    """
+    _run_pr_merge(
+        root,
+        reference,
+        [f"--{merge_method}", "--match-head-commit", expected_head],
+        action="merge this pull request",
+        timed_out=_MERGE_TIMED_OUT,
+    )
+    return {"object": PR_MERGE_OBJECT, "pr_url": reference.url}
+
+
+def _disable_auto_merge(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    """Turn off the PR's auto-merge with ``gh pr merge --disable-auto``.
+
+    :raises ValueError: With a user-facing message when GitHub refuses.
+    """
+    _run_pr_merge(
+        root,
+        reference,
+        ["--disable-auto"],
+        action="disable auto-merge",
+        timed_out=_DISABLE_AUTO_MERGE_TIMED_OUT,
+    )
+    return {"object": PR_MERGE_OBJECT, "pr_url": reference.url}
+
+
+# The reviewer picker lists at most this many of the repository's assignable users.
+_MAX_REVIEW_CANDIDATES = 1000
+# One page of the repository's teams; a repository rarely grants more.
+_MAX_REVIEW_TEAMS = 100
+_REVIEWER_EDIT_TIMED_OUT = (
+    "GitHub took too long to update the reviewers. Refresh to see which applied."
+)
+_ASSIGNABLE_USERS_QUERY = """
+query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    assignableUsers(first: 100, after: $after) {
+      nodes { login name }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+
+def _assignable_users(
+    root: str, host: list[str], token: str | None, reference: PullRequestRef
+) -> tuple[list[dict[str, Any]], bool]:
+    """Page through the repository's assignable users, who can be asked to review.
+
+    :returns: ``(users, has_more)``, capped at :data:`_MAX_REVIEW_CANDIDATES`.
+    :raises ValueError: When ``gh`` cannot list them.
+    """
+    owner, name = reference.repository.split("/", 1)
+    users: list[dict[str, Any]] = []
+    after: str | None = None
+    while True:
+        args = ["api", "graphql", *host, "-f", f"query={_ASSIGNABLE_USERS_QUERY}"]
+        args += ["-f", f"owner={owner}", "-f", f"name={name}"]
+        if after:
+            args += ["-f", f"after={after}"]
+        rc, out, _ = _gh(args, cwd=root, token=token)
+        try:
+            page = json.loads(out)["data"]["repository"]["assignableUsers"] if rc == 0 else None
+        except (ValueError, KeyError, TypeError):
+            page = None
+        if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+            raise ValueError(
+                "GitHub could not list this repository's reviewers. Refresh to retry."
+            )
+        for node in page["nodes"]:
+            login = node.get("login") if isinstance(node, dict) else None
+            if isinstance(login, str) and login:
+                display = node.get("name")
+                users.append(
+                    {
+                        "login": login,
+                        "kind": "user",
+                        "name": display if isinstance(display, str) and display else None,
+                    }
+                )
+        info = page.get("pageInfo") if isinstance(page.get("pageInfo"), dict) else {}
+        cursor = info.get("endCursor")
+        if not info.get("hasNextPage") or not isinstance(cursor, str):
+            return users, False
+        if len(users) >= _MAX_REVIEW_CANDIDATES:
+            return users[:_MAX_REVIEW_CANDIDATES], True
+        after = cursor
+
+
+def _repo_teams(
+    root: str, host: list[str], token: str | None, reference: PullRequestRef
+) -> tuple[list[dict[str, Any]], bool]:
+    """List the teams with access to the repository; none when ``gh`` cannot.
+
+    A user-owned repository has no teams, and listing them may need more access
+    than requesting a review does, so a failure only leaves the teams out.
+    """
+    rc, out, _ = _gh(
+        ["api", *host, f"repos/{reference.repository}/teams?per_page={_MAX_REVIEW_TEAMS}"],
+        cwd=root,
+        token=token,
+    )
+    try:
+        raw = json.loads(out) if rc == 0 else []
+    except ValueError:
+        raw = []
+    teams: list[dict[str, Any]] = []
+    for team in raw if isinstance(raw, list) else []:
+        slug = team.get("slug") if isinstance(team, dict) else None
+        if isinstance(slug, str) and slug:
+            display = team.get("name")
+            teams.append(
+                {
+                    "login": slug,
+                    "kind": "team",
+                    "name": display if isinstance(display, str) and display else None,
+                }
+            )
+    return teams, isinstance(raw, list) and len(raw) >= _MAX_REVIEW_TEAMS
+
+
+def _review_candidates(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    """List the users and teams the reviewer picker offers, each sorted by login.
+
+    :raises ValueError: When ``gh`` cannot list the users within
+        :data:`_PR_EDIT_REQUEST_SECONDS`.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        users, more_users = _assignable_users(root, host, token, reference)
+        teams, more_teams = _repo_teams(root, host, token, reference)
+
+    def by_login(candidate: dict[str, Any]) -> str:
+        return str(candidate["login"]).casefold()
+
+    return {
+        "object": "list",
+        "data": sorted(users, key=by_login) + sorted(teams, key=by_login),
+        "has_more": more_users or more_teams,
+    }
+
+
+def _reviewer_fields(reviewers: Sequence[ReviewerRef]) -> list[str]:
+    """``gh api`` fields naming ``reviewers`` in a requested reviewers request body.
+
+    A withdrawal must carry ``reviewers`` even for teams alone, so ``reviewers[]``
+    without a value sends an empty array then.
+    """
+    fields = [
+        arg
+        for reviewer in reviewers
+        for arg in (
+            "-f",
+            f"{'team_reviewers' if reviewer.kind == 'team' else 'reviewers'}[]={reviewer.login}",
+        )
+    ]
+    if all(reviewer.kind == "team" for reviewer in reviewers):
+        fields = ["-f", "reviewers[]", *fields]
+    return fields
+
+
+def _reviewers_api(root: str, host: list[str], token: str | None, args: list[str]) -> None:
+    """Run one ``gh api`` requested reviewers request.
+
+    :raises ValueError: With a user-facing message when GitHub refuses the request.
+    """
+    rc, out, err = _gh(["api", *host, *args], cwd=root, token=token)
+    if rc == 0:
+        return
+    try:
+        body = json.loads(out) if out.strip() else None
+    except ValueError:
+        body = None
+    raise _pr_edit_error(err, body.get("message") if isinstance(body, dict) else None, "reviewer")
+
+
+def _edit_reviewers(
+    root: str,
+    reference: PullRequestRef,
+    *,
+    add: Sequence[ReviewerRef],
+    remove: Sequence[ReviewerRef],
+) -> dict[str, Any]:
+    """Withdraw, then request, reviews through GitHub's requested reviewers API.
+
+    Every ``gh`` call shares :data:`_PR_EDIT_REQUEST_SECONDS`; running out reports
+    that the outcome is unknown.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        try:
+            return _apply_reviewer_edit(root, reference, add=add, remove=remove)
+        except ValueError:
+            if _gh_timed_out.get():
+                raise ValueError(_REVIEWER_EDIT_TIMED_OUT) from None
+            raise
+
+
+def _apply_reviewer_edit(
+    root: str,
+    reference: PullRequestRef,
+    *,
+    add: Sequence[ReviewerRef],
+    remove: Sequence[ReviewerRef],
+) -> dict[str, Any]:
+    """Make the edit's requests, then read the PR's reviewers with their review states."""
+    host = _host_args(root, reference)
+    token = _pr_token(root, reference)
+    if _gh_timed_out.get():
+        # The selected account's token is unknown, so the edit must not run as another.
+        raise ValueError(_REVIEWER_EDIT_TIMED_OUT)
+    endpoint = f"repos/{reference.repository}/pulls/{reference.number}/requested_reviewers"
+    if remove:
+        _reviewers_api(root, host, token, ["-X", "DELETE", endpoint, *_reviewer_fields(remove)])
+    if add:
+        _reviewers_api(root, host, token, ["-X", "POST", endpoint, *_reviewer_fields(add)])
+    data = _gh_pr_view(
+        [str(reference.number), "-R", _repo_argument(reference)],
+        ",".join(sorted(_PR_REVIEW_FIELDS)),
+        cwd=root,
+        token=token,
+    )
+    if data is None or not _PR_REVIEW_FIELDS.issubset(data):
+        raise ValueError(
+            "GitHub updated the reviewers but could not list them. Refresh to see them."
+        )
+    return {"object": PR_REVIEWERS_OBJECT, "reviewers": _shape_reviewers(data)}
+
+
+_DETAILS_EDIT_TIMED_OUT = (
+    "GitHub took too long to update the pull request. Refresh to see whether it applied."
+)
+# One attachment upload's ``gh`` calls share this budget, under the server's wait,
+# so a video has time to reach GitHub.
+_ATTACHMENT_REQUEST_SECONDS = 110.0
+_ATTACHMENT_TIMED_OUT = "GitHub took too long to upload the file. Try again."
+
+
+def _pr_json_write(
+    root: str,
+    *,
+    host: list[str],
+    token: str | None,
+    method: str,
+    endpoint: str,
+    fields: dict[str, Any],
+) -> tuple[int | None, str, str]:
+    """Send Markdown in a JSON file so shell syntax and long bodies remain literal."""
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", encoding="utf-8", delete_on_close=False
+    ) as payload:
+        json.dump(fields, payload)
+        payload.close()
+        return _gh(
+            ["api", *host, "-X", method, endpoint, "--input", payload.name],
+            cwd=root,
+            token=token,
+        )
+
+
+def _create_comment(root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+    """Post once and return GitHub's canonical comment, without a follow-up read."""
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        result = _post_comment(
+            root,
+            reference,
+            endpoint=f"repos/{reference.repository}/issues/{reference.number}/comments",
+            body=body,
+        )
+    author = result.get("user")
+    return {
+        "object": "session.github.pr_comment",
+        "comment": {
+            "author": author.get("login") if isinstance(author, dict) else None,
+            "body": result.get("body") or "",
+            "created_at": result.get("created_at"),
+            "url": result["html_url"],
+        },
+    }
+
+
+def _post_comment(
+    root: str, reference: PullRequestRef, *, endpoint: str, body: str
+) -> dict[str, Any]:
+    """Publish once within the caller's deadline; preserve uncertainty after dispatch."""
+    uncertain = "Could not confirm comment posting. Check GitHub before retrying."
+    host = _host_args(root, reference)
+    token = _pr_token(root, reference)
+    if _gh_timed_out.get():
+        raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+    rc, out, err = _pr_json_write(
+        root,
+        host=host,
+        token=token,
+        method="POST",
+        endpoint=endpoint,
+        fields={"body": body},
+    )
+    if _gh_timed_out.get():
+        raise ValueError(uncertain)
+    try:
+        result = json.loads(out)
+    except ValueError:
+        result = None
+    if rc != 0 or not isinstance(result, dict):
+        if re.search(r"\(HTTP 40[134]\)", err):
+            raise ValueError("The GitHub account on the host cannot post to this conversation.")
+        if "(HTTP 422)" in err:
+            raise ValueError("GitHub rejected the comment. Check its length and try again later.")
+        raise ValueError(uncertain)
+    if not result.get("id") or not isinstance(result.get("html_url"), str):
+        raise ValueError(uncertain)
+    return result
+
+
+def _edit_details(
+    root: str, reference: PullRequestRef, *, title: str | None, body: str | None
+) -> dict[str, Any]:
+    """Update the PR's title and/or body with one pull requests API ``PATCH``.
+
+    The body travels in a JSON file, since a long description could pass the
+    command-line length limit as a field.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        if _gh_timed_out.get():
+            # The selected account's token is unknown, so the edit must not run as another.
+            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+        fields = {
+            key: value for key, value in (("title", title), ("body", body)) if value is not None
+        }
+        rc, out, err = _pr_json_write(
+            root,
+            host=host,
+            token=token,
+            method="PATCH",
+            endpoint=f"repos/{reference.repository}/pulls/{reference.number}",
+            fields=fields,
+        )
+        if _gh_timed_out.get():
+            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+    try:
+        result = json.loads(out) if out.strip() else None
+    except ValueError:
+        result = None
+    if rc != 0 or not isinstance(result, dict):
+        message = result.get("message") if isinstance(result, dict) else None
+        if re.search(r"\(HTTP 40[134]\)", err):
+            raise ValueError("The GitHub account on the host cannot edit this pull request.")
+        if isinstance(message, str) and "(HTTP 422)" in err:
+            raise ValueError(f"GitHub rejected the change: {message}")
+        raise ValueError("GitHub could not update the pull request. Refresh to retry.")
+    body_after = result.get("body")
+    return {
+        "object": PR_DETAILS_OBJECT,
+        "title": str(result.get("title") or ""),
+        "body": body_after if isinstance(body_after, str) else "",
+    }
+
+
+def _attachments_endpoint(host: str) -> str:
+    """The user attachments upload URL that ``gh --attach`` posts to on ``host``."""
+    if host == "github.com":
+        return "https://uploads.github.com/user-attachments/assets"
+    return f"https://{host}/api/uploads/user-attachments/assets"
+
+
+def _is_attachment_url(url: str, host: str) -> bool:
+    """Whether ``url`` is a user-attachments asset on ``host``, as an upload returns."""
+    return (
+        re.fullmatch(rf"https://{re.escape(host)}/user-attachments/assets/[0-9a-f-]+", url)
+        is not None
+    )
+
+
+def _upload_attachment(
+    root: str, reference: PullRequestRef, *, name: str, content_type: str, content: bytes
+) -> dict[str, Any]:
+    """Upload a file to GitHub's user attachments as the PR's selected account.
+
+    GitHub keeps the file whether or not a description ends up linking to it.
+    """
+    with _gh_deadline_scope(time.monotonic() + _ATTACHMENT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        if _gh_timed_out.get():
+            # The selected account's token is unknown, so the upload must not run as another.
+            raise ValueError(_ATTACHMENT_TIMED_OUT)
+        rc, out, _ = _gh(
+            ["api", *host, f"repos/{reference.repository}", "--jq", ".id"],
+            cwd=root,
+            token=token,
+        )
+        repository_id = out.strip()
+        if rc != 0 or not repository_id.isdigit():
+            if _gh_timed_out.get():
+                raise ValueError(_ATTACHMENT_TIMED_OUT)
+            raise ValueError("GitHub could not find this pull request's repository.")
+        query = (
+            f"content_type={quote(content_type, safe='')}"
+            f"&name={quote(name, safe='')}&repository_id={repository_id}"
+        )
+        with tempfile.NamedTemporaryFile(suffix=f"-{name}", delete_on_close=False) as upload:
+            upload.write(content)
+            upload.close()
+            rc, out, err = _gh(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"{_attachments_endpoint(reference.host)}?{query}",
+                    "-H",
+                    "Content-Type: application/octet-stream",
+                    "--input",
+                    upload.name,
+                ],
+                cwd=root,
+                token=token,
+                timeout=_ATTACHMENT_REQUEST_SECONDS,
+            )
+        if _gh_timed_out.get():
+            raise ValueError(_ATTACHMENT_TIMED_OUT)
+    try:
+        result = json.loads(out) if out.strip() else None
+    except ValueError:
+        result = None
+    url = result.get("url") if isinstance(result, dict) else None
+    if rc == 0 and isinstance(url, str) and _is_attachment_url(url, reference.host):
+        return {
+            "object": PR_ATTACHMENT_OBJECT,
+            "url": url,
+            "name": name,
+            "content_type": content_type,
+        }
+    if re.search(r"\(HTTP 40[134]\)", err):
+        raise ValueError(
+            "The GitHub account on the host needs push access to attach files "
+            "to this pull request."
+        )
+    errors = result.get("errors") if isinstance(result, dict) else None
+    detail = next(
+        (
+            error["message"]
+            for error in (errors if isinstance(errors, list) else [])
+            if isinstance(error, dict) and isinstance(error.get("message"), str)
+        ),
+        None,
+    )
+    if detail and "(HTTP 422)" in err:
+        raise ValueError(f"GitHub rejected the file: {detail}")
+    raise ValueError("GitHub could not upload the file. Try again.")

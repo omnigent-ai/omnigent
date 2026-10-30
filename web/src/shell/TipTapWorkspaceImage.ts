@@ -18,6 +18,8 @@ import { Image } from "@tiptap/extension-image";
 import { Link } from "@tiptap/extension-link";
 import type { AnyExtension } from "@tiptap/core";
 import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
+import { escapeHtmlAttr } from "@/lib/html";
+import { referenceAttributes, referenceSuffix } from "./TipTapLinkReferences";
 
 /**
  * Link extension that survives image-only links (GitHub badge pattern).
@@ -34,8 +36,20 @@ import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
  * markdown token registration.
  */
 export const ImageAwareLink = Link.extend({
+  addAttributes() {
+    const kept = { default: null, rendered: false };
+    return {
+      ...this.parent?.(),
+      // The reference form of `[text][label]` links, so saves write it back.
+      reference: kept,
+      referenceLabel: kept,
+      referenceHref: kept,
+      referenceTitle: kept,
+    };
+  },
+
   parseMarkdown: (token, helpers) => {
-    const attrs = { href: token.href, title: token.title || null };
+    const attrs = { href: token.href, title: token.title || null, ...referenceAttributes(token) };
     const content = helpers.parseInline(token.tokens || []);
     if (content.length > 0 && content.every((node) => node.type === "image")) {
       return content.map((node) => ({
@@ -44,6 +58,15 @@ export const ImageAwareLink = Link.extend({
       }));
     }
     return helpers.applyMark("link", content, attrs);
+  },
+
+  renderMarkdown: (node, helpers) => {
+    const text = helpers.renderChildren(node);
+    const suffix = referenceSuffix(node.attrs ?? {});
+    if (suffix !== null) return `[${text}]${suffix}`;
+    const href = node.attrs?.href ?? "";
+    const title = node.attrs?.title ?? "";
+    return title ? `[${text}](${href} "${title}")` : `[${text}](${href})`;
   },
 });
 
@@ -97,16 +120,6 @@ export function resolveWorkspacePath(filePath: string, src: string): string {
     else segments.push(segment);
   }
   return segments.join("/");
-}
-
-/**
- * Minimal HTML attribute-value escaping for serialised ``<img>`` tags.
- *
- * :param value: Raw attribute value, e.g. an image alt text.
- * :returns: Value safe to embed inside a double-quoted HTML attribute.
- */
-function escapeHtmlAttr(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
 /**

@@ -459,7 +459,7 @@ def _seed_via_core(
                     "name": _AGENT_NAME,
                     "bundle_location": _AGENT_BUNDLE,
                     "version": 1,
-                    "kind": encode_agent_kind("session"),
+                    "kind": encode_agent_kind("user"),
                     "description": None,
                     "updated_at": None,
                 }

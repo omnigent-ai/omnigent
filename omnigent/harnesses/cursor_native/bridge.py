@@ -30,6 +30,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.harnesses.cursor_native.main import CursorModelOption
+    from omnigent.inner.terminal import TerminalInstance
 
 
 #: Env var carrying the bridge dir into the harness executor process.
@@ -1015,3 +1016,14 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Cursor's composer placeholder is on screen.
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live terminal; the watcher already captured its pane.
+    """
+    del session_id
+    pane = instance.last_pane_text() or ""
+    return any(marker in pane for marker in _IDLE_MARKERS)

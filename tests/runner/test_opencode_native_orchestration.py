@@ -163,6 +163,29 @@ def test_prepare_native_fork_skips_other_workspace(bridge_root: Path) -> None:
     assert not opencode_db_path_for_bridge_dir(clone_dir).exists()
 
 
+def test_prepare_native_fork_keeps_an_existing_clone_db(bridge_root: Path) -> None:
+    """A relaunch before the clone saved its session id must not wipe its turns."""
+    import sqlite3
+
+    _seed_source("/repo")
+    clone_dir = opencode_bridge.prepare_bridge_dir("conv_clone")
+    assert _prepare_opencode_native_fork(_fork_config(), bridge_dir=clone_dir, workspace="/repo")
+    clone_db = opencode_db_path_for_bridge_dir(clone_dir)
+    with sqlite3.connect(clone_db) as conn:
+        conn.execute("INSERT INTO session_v2 VALUES ('ses_clone', NULL)")
+    conn.close()
+
+    relaunched = _prepare_opencode_native_fork(
+        _fork_config(), bridge_dir=clone_dir, workspace="/repo"
+    )
+
+    assert relaunched == "ses_src"
+    with sqlite3.connect(clone_db) as conn:
+        ids = {row[0] for row in conn.execute("SELECT id FROM session_v2")}
+    conn.close()
+    assert ids == {"ses_src", "ses_clone"}
+
+
 def test_prepare_native_fork_skips_unreachable_source(bridge_root: Path) -> None:
     clone_dir = opencode_bridge.prepare_bridge_dir("conv_clone")
     assert (
@@ -196,7 +219,7 @@ def test_auto_create_opencode_terminal_has_no_v1_session_calls() -> None:
     source = inspect.getsource(orchestration._auto_create_opencode_terminal)
     assert "create_session({" not in source, "v1 dict-payload create_session must be gone"
     assert "_resolve_opencode_session(" in source
-    assert "_prepare_opencode_native_fork(" in source
+    assert "_prepare_opencode_native_fork" in source
     assert "_sanitize_opencode_tui_args(" in source
 
 

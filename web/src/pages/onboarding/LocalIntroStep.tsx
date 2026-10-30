@@ -34,11 +34,14 @@ export function HarnessIconRow() {
 
 export function LocalIntroStep({
   installed,
+  startsLocal,
   onBack,
   onInstall,
 }: {
-  /** Returning user (CLI installed) → "Open Omnigent"; new → "Install Omnigent". */
+  /** CLI installed → "Start"/"Open Omnigent"; missing → "Install Omnigent". */
   installed?: boolean;
+  /** The local server is stopped, so the action boots it ("Start Omnigent"). */
+  startsLocal?: boolean;
   onBack: () => void;
   onInstall: () => void;
 }) {
@@ -53,7 +56,7 @@ export function LocalIntroStep({
 
       <OnboardingRail>
         <OnboardingBackButton onClick={onBack} />
-        <InstallActionButton installed={installed} onClick={onInstall} />
+        <InstallActionButton installed={installed} startsLocal={startsLocal} onClick={onInstall} />
       </OnboardingRail>
     </div>
   );

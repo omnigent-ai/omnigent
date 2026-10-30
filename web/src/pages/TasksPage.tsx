@@ -1,7 +1,8 @@
 /**
  * Scheduled tasks page (`/tasks`) — the list of the user's recurring agent
- * tasks, a search + Active/Paused filter, a "New task" manual-create action,
- * and a static Suggestions section below.
+ * tasks, a search + Active/Paused filter, a "New automation" menu,
+ * and a static Suggestions section below (prompt suggestions plus the
+ * Jira/Slack/GitHub trigger templates).
  *
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
  * update/delete mutations, which invalidate the list.
@@ -10,18 +11,44 @@
  * endpoint.
  */
 
-import { useMemo, useState } from "react";
-import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import {
+  ArrowLeftIcon,
+  ChevronDownIcon,
+  ClockIcon,
+  LayoutGridIcon,
+  Loader2Icon,
+  PencilIcon,
+  SearchIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import {
   SCHEDULED_TASK_SUGGESTIONS,
   type ScheduledTaskSuggestion,
 } from "@/components/scheduled/suggestions";
+import {
+  SESSION_LINK_ID_PLACEHOLDER,
+  TRIGGER_SOURCES,
+  TRIGGER_TEMPLATES,
+  type TriggerSource,
+} from "@/components/scheduled/triggerTemplates";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { Link, useRebasePath } from "@/lib/routing";
+import { getShareableSessionLink } from "@/lib/shareLink";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -41,7 +68,8 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "paused", label: "Paused" },
 ];
 
-export function TasksPage() {
+export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }) {
+  const newTaskButtonRef = useRef<HTMLButtonElement>(null);
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
@@ -58,17 +86,38 @@ export function TasksPage() {
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
   // Prefill for the manual create dialog when opened from a "Suggestions" chip.
   // Null → the normal manual path (empty fields). Cleared on dialog close so a
-  // stale prefill never leaks into a subsequent plain "New task" open.
+  // stale prefill never leaks into a subsequent plain "New automation" open.
   const [prefill, setPrefill] = useState<ScheduledTaskSuggestion["prefill"] | null>(null);
+  const [trigger, setTrigger] = useState<TriggerSource | null>(null);
+  // A trigger's manager keeps one session and starts its workers from it, so
+  // the templates need "continue in the same session" and session orchestration.
+  const info = useServerInfo();
+  const triggersSupported =
+    info !== "loading" &&
+    info.scheduled_task_session_modes === true &&
+    isFeatureEnabled(info, "session_orchestration");
+  // Workers' links are posted outside Omnigent, so they go through the same
+  // share-link path as the Share dialog, host transform included.
+  const rebasePath = useRebasePath();
+  const sessionLink = getShareableSessionLink(SESSION_LINK_ID_PLACEHOLDER, rebasePath);
 
   function openManual() {
     setPrefill(null);
+    setTrigger(null);
     setEditingTask(null);
     setManualOpen(true);
   }
 
   function openFromSuggestion(s: ScheduledTaskSuggestion) {
     setPrefill(s.prefill);
+    setTrigger(null);
+    setEditingTask(null);
+    setManualOpen(true);
+  }
+
+  function openFromTrigger(source: TriggerSource) {
+    setPrefill(null);
+    setTrigger(source);
     setEditingTask(null);
     setManualOpen(true);
   }
@@ -77,6 +126,7 @@ export function TasksPage() {
     setManualOpen(next);
     if (!next) {
       setPrefill(null);
+      setTrigger(null);
       setEditingTask(null);
     }
   }
@@ -142,14 +192,54 @@ export function TasksPage() {
 
   function handleEdit(task: ScheduledTask) {
     setPrefill(null);
+    setTrigger(null);
     setEditingTask(task);
     setManualOpen(true);
   }
 
   const hasAnyTasks = (tasks ?? []).length > 0;
 
+  const createDialog = (
+    <CreateScheduledTaskDialog
+      open={manualOpen}
+      onOpenChange={handleManualOpenChange}
+      initialName={prefill?.name}
+      initialPrompt={prefill?.prompt}
+      initialTrigger={trigger}
+      sessionLink={sessionLink}
+      editingTask={editingTask}
+    />
+  );
+
+  if (templatesOnly) {
+    return (
+      <PageScroll contentClassName="px-4 md:px-6">
+        <Button asChild variant="ghost" size="sm" className="mb-4">
+          <Link to="/tasks" componentId="tasks.templates.back">
+            <ArrowLeftIcon className="size-4" />
+            Back to automations
+          </Link>
+        </Button>
+        <h1 className="text-2xl font-semibold">Automation templates</h1>
+        <p className="mt-1 text-ui text-muted-foreground">
+          Choose a template to customize your automation.
+        </p>
+        <SuggestionsSection
+          onPick={openFromSuggestion}
+          onPickTrigger={triggersSupported ? openFromTrigger : null}
+          showHeading={false}
+          className="mt-6 border-t-0 pt-0"
+        />
+        {createDialog}
+      </PageScroll>
+    );
+  }
+
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-4 md:px-6">
+      {tasks !== undefined && (
+        <AutomationsIntro onClose={() => newTaskButtonRef.current?.focus()} />
+      )}
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-semibold">Automations</h1>
@@ -157,14 +247,31 @@ export function TasksPage() {
             Run agent sessions on a recurring schedule.
           </p>
         </div>
-        <Button
-          data-testid="new-task-button"
-          className="shrink-0"
-          onClick={openManual}
-          componentId="tasks.new"
-        >
-          New task
-        </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              ref={newTaskButtonRef}
+              data-testid="new-task-button"
+              className="shrink-0"
+              componentId="tasks.new"
+            >
+              New automation
+              <ChevronDownIcon className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={openManual} data-testid="new-task-manual">
+              <PencilIcon className="size-4" />
+              Create manually
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link to="/tasks/templates" componentId="tasks.templates">
+                <LayoutGridIcon className="size-4" />
+                Create from template
+              </Link>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
 
       {/* Search + filter tabs. No "Mark all as read" control: there is no unread
@@ -183,7 +290,7 @@ export function TasksPage() {
           />
         </div>
         {hasAnyTasks && (
-          <div aria-label="Filter tasks" className="flex items-center gap-1">
+          <div aria-label="Filter automations" className="flex items-center gap-1">
             {FILTER_TABS.map((tab) => (
               <button
                 key={tab.value}
@@ -235,6 +342,7 @@ export function TasksPage() {
           hasAny={hasAnyTasks}
           showSuggestions={filter === "all"}
           onPickSuggestion={openFromSuggestion}
+          onPickTrigger={triggersSupported ? openFromTrigger : null}
         />
       ) : (
         // Card list — each row is a bordered card (see ScheduledTaskRow), stacked
@@ -261,16 +369,13 @@ export function TasksPage() {
           all isn't selected, suggestions should disappear"). Driven by the same
           `filter` state as the list, so switching tabs toggles it live. */}
       {filter === "all" && filtered.length > 0 && (
-        <SuggestionsSection onPick={openFromSuggestion} />
+        <SuggestionsSection
+          onPick={openFromSuggestion}
+          onPickTrigger={triggersSupported ? openFromTrigger : null}
+        />
       )}
 
-      <CreateScheduledTaskDialog
-        open={manualOpen}
-        onOpenChange={handleManualOpenChange}
-        initialName={prefill?.name}
-        initialPrompt={prefill?.prompt}
-        editingTask={editingTask}
-      />
+      {createDialog}
     </PageScroll>
   );
 }
@@ -279,10 +384,12 @@ function EmptyState({
   hasAny,
   showSuggestions,
   onPickSuggestion,
+  onPickTrigger,
 }: {
   hasAny: boolean;
   showSuggestions: boolean;
   onPickSuggestion: (s: ScheduledTaskSuggestion) => void;
+  onPickTrigger: ((source: TriggerSource) => void) | null;
 }) {
   return (
     <div className="py-8" data-testid="tasks-empty-state">
@@ -294,11 +401,12 @@ function EmptyState({
           <ClockIcon className="size-8 text-muted-foreground/50" />
           <p className="text-ui font-medium">No automations yet</p>
           <p className="max-w-sm text-sm text-muted-foreground">
-            Create a task to run an agent session automatically on a recurring schedule.
+            Create an automation to run an agent session automatically on a recurring schedule.
           </p>
           {showSuggestions && (
             <SuggestionsSection
               onPick={onPickSuggestion}
+              onPickTrigger={onPickTrigger}
               showHeading={false}
               className="mt-3 border-t-0 pt-0"
             />
@@ -312,10 +420,13 @@ function EmptyState({
 /** Static suggestions rendered below the list. See `suggestions.ts` for the TODO. */
 function SuggestionsSection({
   onPick,
+  onPickTrigger,
   showHeading = true,
   className,
 }: {
   onPick: (s: ScheduledTaskSuggestion) => void;
+  /** Null hides the trigger chips (the server can't keep a manager session). */
+  onPickTrigger: ((source: TriggerSource) => void) | null;
   showHeading?: boolean;
   className?: string;
 }) {
@@ -329,6 +440,23 @@ function SuggestionsSection({
       {showHeading && <h2 className="mb-3 text-ui text-muted-foreground">Suggestions</h2>}
       {/* Compact chips that wrap onto multiple lines. */}
       <div className="flex flex-wrap gap-2">
+        {onPickTrigger !== null &&
+          TRIGGER_SOURCES.map((source) => {
+            const t = TRIGGER_TEMPLATES[source];
+            const Icon = t.icon;
+            return (
+              <button
+                key={source}
+                type="button"
+                onClick={() => onPickTrigger(source)}
+                data-testid={`suggestion-trigger-${source}`}
+                className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-1.5 text-ui font-normal transition-colors hover:bg-muted hover:text-foreground"
+              >
+                <Icon className={cn("size-4 shrink-0", t.iconClassName)} />
+                <span className="truncate">{t.title}</span>
+              </button>
+            );
+          })}
         {SCHEDULED_TASK_SUGGESTIONS.map((s) => {
           const Icon = s.icon;
           return (

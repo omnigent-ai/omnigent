@@ -15,6 +15,7 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  ClockIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
@@ -43,26 +44,30 @@ import {
 } from "@/components/blocks/BlockRenderer";
 import {
   CompactionMarker,
+  CONTINUE_TURN_ERROR_CODES,
   ErrorBanner,
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
+import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
-import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
+import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
+  hasPendingOwnElicitation,
   imagePreview,
   isTextBlock,
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
+import { QueryClientContext } from "@tanstack/react-query";
+import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -71,15 +76,18 @@ import {
   useScopedConversationId,
 } from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
-import { UserMessageNav } from "@/components/UserMessageNav";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
+import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
+import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
 import type { SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
@@ -89,7 +97,7 @@ import {
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\][ \t]*(?:\r?\n)*/g;
 
 const COLLAPSE_THRESHOLD = 12000;
 
@@ -108,7 +116,7 @@ export function extractUserText(content: MessageContentBlock[]): string {
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")
-    .trim();
+    .trimEnd();
 }
 
 // An absolute filesystem path in any form a native executor might materialize
@@ -214,6 +222,7 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
+      ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -352,6 +361,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
+  if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -395,47 +405,84 @@ export function isBackgroundTasksOnly(
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
+export function computeIsTurnActive(sessionStatus: SessionStatus, localSending: boolean): boolean {
+  return computeIsWorking(sessionStatus) || localSending;
+}
+
 function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
-  return computeIsWorking(sessionStatus) || localSending;
+  return computeIsTurnActive(sessionStatus, localSending);
+}
+
+/** Whether any elicitation card is still awaiting the user's answer. */
+function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
+  return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
 }
 
 /**
  * The label shown next to the working shimmer. When the agent is parked on a
  * dialog (`blockedOn`) it says so; otherwise it rotates through
  * `WORKING_MESSAGES` by wall-clock `tick`.
+ *
+ * @param options.answerableInChat - A pending chat card can answer the block.
+ * @param options.terminalView - The Chat/Terminal toggle reaches the agent's terminal.
  */
-export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
+export function workingIndicatorLabel(
+  tick = 0,
+  blockedOn: string | null = null,
+  { answerableInChat = false, terminalView = false } = {},
+): string {
   if (blockedOn) {
     // A "dialog open" block lives only in the terminal tab, so point the user
     // there to respond rather than leaving the session looking hung.
     if (blockedOn === "dialog open") {
       return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
     }
-    return `Blocked on: ${blockedOn}`;
+    if (answerableInChat) return `Blocked on: ${blockedOn}`;
+    const waiting =
+      blockedOn === "permission prompt"
+        ? "Waiting for your approval in the agent's terminal."
+        : `Waiting for you in the agent's terminal (${blockedOn}).`;
+    return terminalView ? `${waiting} Open the Terminal view to respond.` : waiting;
   }
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
 
 export function WorkingIndicator() {
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const agentWorking = useAgentTurnActive();
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const scopedState = useConversationEntryState(scopedConversationId);
+  const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBlockedOn = useChatStore((s) => s.blockedOn);
+  const rootHasOwnPendingElicitation = useChatStore((s) =>
+    hasPendingOwnElicitation(s.blocks, s.conversationId),
+  );
+  const rootAgentWorking = useAgentTurnActive();
+  const terminalFirst = useTerminalFirst();
+  const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
+  const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
+  const hasOwnPendingElicitation = scopedConversationId
+    ? hasPendingOwnElicitation(scopedState.blocks, scopedConversationId)
+    : rootHasOwnPendingElicitation;
+  const agentWorking = scopedConversationId
+    ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
+    : rootAgentWorking;
   const tick = useWorkingLabelTick();
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
   // the state and the shimmer stays off (it would misread as the agent still
   // thinking). While the turn is active the shimmer shows, with the pill beside it.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
-  const label = workingIndicatorLabel(tick, blockedOn);
+  const label = workingIndicatorLabel(tick, blockedOn, {
+    answerableInChat: hasOwnPendingElicitation,
+    // The toggle switches to the root session's terminal, not a side chat's.
+    terminalView: !scopedConversationId && (terminalFirst?.isTerminalFirst ?? false),
+  });
   return (
     <>
-      {/* Sole aria-live region for the working state. A stable "Working…" (not
-          the rotating label) so screen readers announce the turn once, without
-          re-announcing every few seconds; the visible shimmer below stays
-          aria-hidden. */}
+      {/* Sole aria-live region: a stable "Working…" or block reason, so the rotating
+          label isn't re-announced. The visible shimmer below stays aria-hidden. */}
       <span role="status" aria-live="polite" className="sr-only">
-        Working…
+        {blockedOn ? label : "Working…"}
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
@@ -540,17 +587,23 @@ export const BubbleView = memo(
     isLastAssistant = false,
     showsWorking = false,
     actionsPersistent = false,
+    recoveryDisabled = false,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
     actionsPersistent?: boolean;
+    /** Hide retry/recovery controls when the surrounding session is sealed. */
+    recoveryDisabled?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "subagent_activity") {
+      return <SubagentActivityMessage data={bubble.data} />;
+    }
     if (bubble.kind === "routing_decision") {
       return (
         <RoutingDecisionCard
@@ -568,6 +621,7 @@ export const BubbleView = memo(
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
         actionsPersistent={actionsPersistent}
+        recoveryDisabled={recoveryDisabled}
       />
     );
   },
@@ -575,6 +629,7 @@ export const BubbleView = memo(
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
+    (prev.recoveryDisabled ?? false) === (next.recoveryDisabled ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -582,9 +637,14 @@ export const BubbleView = memo(
  * Copy-to-clipboard handler for a message bubble's "Copy" action.
  *
  * @param getText - Produces the text to copy at click time.
+ * @param copy - Clipboard writer; assistant bubbles pass {@link copyMarkdown}
+ *   so the paste keeps its formatting.
  * @returns `{ isCopied, handleCopy }` for the action button.
  */
-function useCopyMessage(getText: () => string): {
+function useCopyMessage(
+  getText: () => string,
+  copy: (value: string) => Promise<void> = copyText,
+): {
   isCopied: boolean;
   handleCopy: () => void;
 } {
@@ -598,7 +658,7 @@ function useCopyMessage(getText: () => string): {
     if (isCopied) return;
     const text = getText();
     if (!text) return;
-    copyText(text).then(
+    copy(text).then(
       () => {
         setIsCopied(true);
         window.clearTimeout(timeoutRef.current);
@@ -611,7 +671,7 @@ function useCopyMessage(getText: () => string): {
         console.warn("Failed to copy message", error);
       },
     );
-  }, [getText, isCopied, isMobile]);
+  }, [copy, getText, isCopied, isMobile]);
 
   return { isCopied, handleCopy };
 }
@@ -689,14 +749,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
-  const text = extractUserText(bubble.content);
+  const isShellCommand = bubble.shellCommand !== undefined;
+  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
   // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
   // markers (no input_file block), so surface them as chips.
-  const mentionedChips = extractAttachedPaths(bubble.content);
+  const mentionedChips = isShellCommand ? [] : extractAttachedPaths(bubble.content);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
@@ -708,6 +769,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // a large DOM for text the user hasn't asked to read yet.
   const isLong = text.length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
+  const visibleText = isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
@@ -843,13 +905,19 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {text && (
               <>
                 <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
-                  <FilePathAwareMessageResponse
-                    breaks
-                    mode="static"
-                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                  >
-                    {isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text}
-                  </FilePathAwareMessageResponse>
+                  {isShellCommand ? (
+                    <pre className="whitespace-pre-wrap break-words font-mono text-sm">
+                      <code>{visibleText}</code>
+                    </pre>
+                  ) : (
+                    <FilePathAwareMessageResponse
+                      breaks
+                      mode="static"
+                      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                    >
+                      {visibleText}
+                    </FilePathAwareMessageResponse>
+                  )}
                   {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
                   {isCollapsed && isLong && (
@@ -871,6 +939,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </MessageContent>
         </div>
+        {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
+        {bubble.pending && bubble.awaitingAgent && (
+          <div
+            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
+            data-testid="message-awaiting-agent"
+          >
+            <ClockIcon size={12} aria-hidden />
+            The agent will read this after its current step
+          </div>
+        )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           {ts && (
@@ -913,11 +991,13 @@ function AssistantBubble({
   isLastAssistant = false,
   showsWorking = false,
   actionsPersistent = false,
+  recoveryDisabled = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
   actionsPersistent?: boolean;
+  recoveryDisabled?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
@@ -932,25 +1012,28 @@ function AssistantBubble({
   const activeConversationId = useChatStore((s) => s.conversationId);
   const conversationId = scopedConversationId ?? activeConversationId;
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
-  const rootHasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
-  );
+  const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
   const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
   // A pending elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
   const hasPendingElicitation = scopedConversationId
-    ? scopedState.blocks.some((b) => b.type === "elicitation" && b.status === "pending")
+    ? hasPendingElicitationBlock(scopedState.blocks)
     : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
-  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
+  const { isCopied, handleCopy } = useCopyMessage(
+    () => collectBubbleMarkdown(bubble.items),
+    copyMarkdown,
+  );
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
+  const foldNarration = useFoldAssistantNarration();
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
-      if (item.code === "rate_limit_exceeded") {
+      if (CONTINUE_TURN_ERROR_CODES.has(item.code)) {
         // Read a FRESH snapshot of the target conversation at click time: the
         // scoped child's own entry in a side chat, else the root store. The
         // child tab is fixed, so only the main chat guards against the user
@@ -973,15 +1056,23 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
-        await retryRateLimitedTurn(conversationId);
+        await continueFailedTurn(conversationId);
         return;
       }
-      const result = await retrySession(conversationId);
-      if (!result.recovered) {
-        throw new Error("The session is already connected; no recovery was performed");
+      try {
+        const result = await retrySession(conversationId);
+        if (!result.recovered) {
+          throw new Error("The session is already connected; no recovery was performed");
+        }
+      } catch (error) {
+        // Resume can seal a lost side chat; refresh its read-only state immediately.
+        if (error instanceof ApiError && error.code === "conflict") {
+          void queryClient?.invalidateQueries({ queryKey: ["session", conversationId] });
+        }
+        throw error;
       }
     },
-    [conversationId, scopedConversationId, isLastAssistant],
+    [conversationId, scopedConversationId, isLastAssistant, queryClient],
   );
 
   if (bubble.items.length === 0) return null;
@@ -1000,6 +1091,7 @@ function AssistantBubble({
     hasPendingElicitation,
     showsWorking,
     defaultExpanded: bubble.defaultExpanded,
+    foldNarration,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -1014,25 +1106,29 @@ function AssistantBubble({
   // A bubble carrying an error but no prose stands alone as a thread-level
   // element — the hover footer belongs to assistant text, not to the error.
   const errorOnly = hasError && !markdownText;
+  // A bubble whose items are all errors (e.g. an undelivered-message notice) is a
+  // thread-level card, not an assistant reply, so it takes the "error" role; a
+  // failed turn that still produced tool or reasoning output keeps the assistant role.
+  const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
   const spansFullColumn = isWide || hasError;
+  const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
+  // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
+  const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
 
   return (
     <>
       <Message
         from="assistant"
         data-testid="message-bubble"
-        data-role="assistant"
+        data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
-        }
+        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
       >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap rather
-            than shrink-wrapping to the summary row's ~110px. */}
+        {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
-            (spansFullColumn || foldOnly) && "w-full",
+            (spansFullColumn || foldOnly || hasSubagentNotice || hasToolRows) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
@@ -1047,7 +1143,8 @@ function AssistantBubble({
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
             defaultExpanded={bubble.defaultExpanded}
-            onRetryError={handleRetryError}
+            foldNarration={foldNarration}
+            onRetryError={recoveryDisabled ? undefined : handleRetryError}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -1084,15 +1181,24 @@ function AssistantBubble({
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
               {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                <MessageAction
-                  tooltip="Fork from here"
-                  size="icon-xxs"
-                  data-testid="fork-from-response"
-                  onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-                  componentId="chat.message.fork"
-                >
-                  <SplitIcon size={14} />
-                </MessageAction>
+                <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
+                  <MessageAction
+                    tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
+                    label="Fork from here"
+                    disabled={!!forkDialog.disabledReason}
+                    size="icon-xxs"
+                    data-testid="fork-from-response"
+                    onClick={() =>
+                      forkDialog.openForkDialog({
+                        sourceSessionId: scopedConversationId ?? undefined,
+                        upToResponseId: bubble.responseId,
+                      })
+                    }
+                    componentId="chat.message.fork"
+                  >
+                    <SplitIcon size={14} />
+                  </MessageAction>
+                </DisabledActionTooltip>
               )}
               <MessageAction
                 tooltip={isLinkCopied ? "Copied!" : "Copy link"}
@@ -1127,18 +1233,6 @@ function AssistantBubble({
 // ---------------------------------------------------------------------------
 // Scroll helpers — rendered inside <Conversation> / as its siblings.
 // ---------------------------------------------------------------------------
-
-export function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
-  const { isAtBottom } = useStickToBottomContext();
-  return (
-    <UserMessageNav
-      {...props}
-      // Mobile-only: the TurnRail replaces these buttons on desktop. Hidden at
-      // the bottom on mobile too. Keyboard ⌘⌥↑↓ still works on all sizes.
-      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
-    />
-  );
-}
 
 /**
  * Forces the conversation back to the bottom when this client submits a new
@@ -1623,7 +1717,7 @@ export function LatestTurnSpacer({
   // Bounded rAF retries for capturing the anchor when committed blocks exist but
   // their rows haven't mounted yet (windowed transcript, published a frame
   // before the virtualizer fills its window). A resize we could observe isn't
-  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
+  // guaranteed — the wrapper's height tracks the estimate — so we drive the
   // retry ourselves rather than wait for one. When the budget runs out (e.g. a
   // tool-only trailing turn that never has an anchor) capture settles to `null`.
   const captureFrameRef = useRef(0);
@@ -1998,14 +2092,14 @@ export function JumpToTopButton({
       // the safe-area inset, so add --omnigent-inset-top (0px off-shell).
       style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
       className={cn(
-        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
+        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150 max-md:hidden",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
       <Button
         type="button"
         variant="outline"
-        size="sm"
+        size="icon-sm"
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
@@ -2014,7 +2108,7 @@ export function JumpToTopButton({
         tabIndex={visible ? 0 : -1}
         aria-hidden={!visible}
         className={cn(
-          "h-7 gap-1.5 rounded-full px-3 text-sm shadow-sm",
+          "size-7 rounded-full p-0 shadow-sm",
           // Force an OPAQUE background in both themes and on hover, so the faded
           // chat text behind the pill doesn't bleed through.
           "bg-background hover:bg-background hover:brightness-95",
@@ -2027,7 +2121,6 @@ export function JumpToTopButton({
         ) : (
           <ArrowUpIcon className="size-3.5" aria-hidden />
         )}
-        {jumping ? "Loading history…" : "Jump to top"}
       </Button>
     </div>
   );

@@ -4,8 +4,11 @@ Omnigent stores **no** OpenCode credentials: OpenCode owns provider auth via
 ``opencode auth login`` or ambient provider env vars. OpenCode 2.x keeps
 credentials in the ``credential`` table of its SQLite DB
 (``~/.local/share/opencode/opencode.db``) and imports a legacy ``auth.json``
-once. This module reads both, read-only and best-effort, so setup can report
-which providers are reachable and the runner can seed per-session data dirs.
+once. Amazon Bedrock is the exception: OpenCode loads it from a provider block in
+``opencode.json`` or from the AWS credential-chain variables, and the AWS SDK
+authenticates at run time. This module reads all of these, read-only and
+best-effort, so setup can report which providers are reachable and the runner
+can seed per-session data dirs.
 """
 
 from __future__ import annotations
@@ -33,6 +36,22 @@ _ENV_PROVIDER_VARS: tuple[tuple[str, str, str], ...] = (
     ("xai", "xAI", "XAI_API_KEY"),
     ("mistral", "Mistral", "MISTRAL_API_KEY"),
     ("deepseek", "DeepSeek", "DEEPSEEK_API_KEY"),
+    # OpenCode autoloads Bedrock when any of these AWS credential-chain variables
+    # is set; the AWS SDK resolves the actual credential at run time.
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_ACCESS_KEY_ID"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_SECRET_ACCESS_KEY"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_PROFILE"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_REGION"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_BEARER_TOKEN_BEDROCK"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_WEB_IDENTITY_TOKEN_FILE"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"),
+)
+
+# AWS credential-chain variables count toward reachability but are not API keys,
+# so they are never handed to OpenCode as a ``connect/key`` value.
+_NON_KEY_PROVIDER_VARS = frozenset(
+    var for provider_id, _label, var in _ENV_PROVIDER_VARS if provider_id == "amazon-bedrock"
 )
 
 
@@ -143,7 +162,7 @@ def _stored_providers() -> tuple[str, ...]:
 
 
 def _env_providers(environ: dict[str, str] | None = None) -> tuple[str, ...]:
-    """Return provider labels whose API-key env var is present."""
+    """Return provider labels whose credential env var is present."""
     env = os.environ if environ is None else environ
     seen: list[str] = []
     for _provider_id, label, var in _ENV_PROVIDER_VARS:
@@ -157,8 +176,22 @@ def _env_providers(environ: dict[str, str] | None = None) -> tuple[str, ...]:
 OPENCODE_FREE_PROVIDER_ID = "opencode"
 
 
+def _configured_providers() -> tuple[str, ...]:
+    """Return ``("amazon-bedrock",)`` when the user's ``opencode.json(c)`` declares it.
+
+    OpenCode loads Bedrock from any ``amazon-bedrock`` provider block and lets the
+    AWS SDK authenticate at run time, so only the declaration is checked.
+    """
+    from omnigent.harnesses.opencode_native.provider import maybe_merge_user_provider_config
+
+    providers = maybe_merge_user_provider_config({}).get("providers")
+    if isinstance(providers, dict) and isinstance(providers.get("amazon-bedrock"), dict):
+        return ("amazon-bedrock",)
+    return ()
+
+
 def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[str]:
-    """Return OpenCode provider ids reachable from stored auth + env keys.
+    """Return OpenCode provider ids from stored auth, env keys, and AWS profiles.
 
     Always includes :data:`OPENCODE_FREE_PROVIDER_ID`, whose free models need
     no credential.
@@ -168,6 +201,7 @@ def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[s
     """
     env = os.environ if environ is None else environ
     ids = set(_stored_providers()) | {OPENCODE_FREE_PROVIDER_ID}
+    ids.update(_configured_providers())
     for provider_id, _label, var in _ENV_PROVIDER_VARS:
         if env.get(var, "").strip():
             ids.add(provider_id)
@@ -180,17 +214,19 @@ class OpenCodeAuthSummary:
 
     :param installed: ``opencode`` binary present on ``PATH``.
     :param stored_providers: Provider ids with credentials in ``auth.json``.
-    :param env_providers: Provider labels whose API-key env var is set.
+    :param env_providers: Provider labels whose credential env var is set.
+    :param configured_providers: Provider ids declared in the user's ``opencode.json``.
     """
 
     installed: bool
     stored_providers: tuple[str, ...]
     env_providers: tuple[str, ...]
+    configured_providers: tuple[str, ...] = ()
 
     @property
     def has_provider(self) -> bool:
-        """Whether any provider is reachable (stored credential or env key)."""
-        return bool(self.stored_providers or self.env_providers)
+        """Whether any provider is reachable (stored credential, env var, or config block)."""
+        return bool(self.stored_providers or self.env_providers or self.configured_providers)
 
     @property
     def ready(self) -> bool:
@@ -208,6 +244,8 @@ class OpenCodeAuthSummary:
             )
         if self.env_providers:
             parts.append(f"env: {', '.join(self.env_providers)}")
+        if self.configured_providers:
+            parts.append(f"config: {', '.join(self.configured_providers)}")
         return " · ".join(parts) if parts else "free models only (no provider signed in)"
 
 
@@ -217,4 +255,5 @@ def opencode_auth_summary() -> OpenCodeAuthSummary:
         installed=harness_cli_installed(OPENCODE_KEY),
         stored_providers=_stored_providers(),
         env_providers=_env_providers(),
+        configured_providers=_configured_providers(),
     )

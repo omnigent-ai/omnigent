@@ -1,6 +1,6 @@
 // Tests for the Scheduled tasks page (`/tasks`): list rendering, the
-// Active/Paused filter + search, the Paused badge/dimming, the New task
-// manual create action, and the pause/delete row actions dispatching the
+// Active/Paused filter + search, the Paused badge/dimming, the New automation
+// creation menu and templates page, and the pause/delete row actions dispatching the
 // mutation hooks.
 //
 // The scheduled-tasks hooks are mocked at their seam; the create dialog is
@@ -8,11 +8,17 @@
 // internals (covered by its own tests).
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TasksPage } from "./TasksPage";
+import { useViewerId } from "@/hooks/useViewerId";
 import * as hooks from "@/hooks/useScheduledTasks";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
@@ -29,11 +35,15 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     open,
     initialName,
     initialPrompt,
+    initialTrigger,
+    sessionLink,
     editingTask,
   }: {
     open: boolean;
     initialName?: string;
     initialPrompt?: string;
+    initialTrigger?: string | null;
+    sessionLink?: string;
     editingTask?: ScheduledTask | null;
   }) =>
     open ? (
@@ -41,6 +51,8 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-testid="manual-dialog-open"
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
+        data-initial-trigger={initialTrigger ?? ""}
+        data-session-link={sessionLink ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
       />
@@ -61,9 +73,12 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    sessionMode: "new",
+    sessionId: null,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -77,7 +92,10 @@ const mutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
 
-function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?: boolean } = {}) {
+function setTasks(
+  tasks: ScheduledTask[] | undefined,
+  state: { isLoading?: boolean; isError?: boolean } = {},
+) {
   vi.mocked(hooks.useScheduledTasks).mockReturnValue({
     data: tasks,
     isLoading: state.isLoading ?? false,
@@ -87,6 +105,8 @@ function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?
 }
 
 beforeEach(() => {
+  localStorage.clear();
+  vi.mocked(useViewerId).mockReturnValue(null);
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
@@ -109,15 +129,53 @@ beforeEach(() => {
 
 afterEach(() => cleanup());
 
-function renderPage() {
+function renderPage(path = "/tasks", basename = "") {
   return render(
-    <MemoryRouter>
-      <TasksPage />
+    <MemoryRouter initialEntries={[`${basename}${path}`]}>
+      <RoutingProvider value={basenamedRouting(basename)}>
+        <Routes>
+          <Route path={`${basename}/tasks`} element={<TasksPage />} />
+          <Route
+            path={`${basename}/tasks/templates`}
+            element={<TasksPage key="templates" templatesOnly />}
+          />
+        </Routes>
+      </RoutingProvider>
     </MemoryRouter>,
   );
 }
 
 describe("TasksPage list", () => {
+  it("waits for the first task load and keeps the guide's step through a failed refetch", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
+    const content = () => (
+      <MemoryRouter>
+        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+          <TasksPage />
+        </CapabilitiesProvider>
+      </MemoryRouter>
+    );
+    setTasks(undefined, { isLoading: true });
+    const view = render(content());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    setTasks(undefined, { isError: true });
+    view.rerender(content());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    setTasks([]);
+    view.rerender(content());
+    expect(screen.getByRole("dialog", { name: "Introducing Automations" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    const step = screen.getByText(/of .* · Make it yours/).textContent;
+    setTasks([], { isError: true });
+    view.rerender(content());
+    expect(screen.getByRole("dialog")).toBeVisible();
+    expect(screen.getByText(step!)).toBeVisible();
+    setTasks([]);
+    view.rerender(content());
+    expect(screen.getByText(step!)).toBeVisible();
+  });
+
   it("renders the title, subtitle and task rows with schedule text", () => {
     setTasks([task()]);
     renderPage();
@@ -167,7 +225,7 @@ describe("TasksPage list", () => {
     expect(screen.getByText("No automations yet")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Create a task to run an agent session automatically on a recurring schedule.",
+        "Create an automation to run an agent session automatically on a recurring schedule.",
       ),
     ).toBeInTheDocument();
     expect(screen.queryByTestId("tasks-filter-all")).toBeNull();
@@ -262,6 +320,7 @@ describe("filtering + search", () => {
     ]);
     renderPage();
     expect(screen.getAllByTestId("scheduled-task-row")).toHaveLength(2);
+    expect(screen.getByLabelText("Filter automations")).toBeInTheDocument();
     expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "true");
 
     fireEvent.click(screen.getByTestId("tasks-filter-paused"));
@@ -287,22 +346,45 @@ describe("filtering + search", () => {
   });
 });
 
-describe("New task button", () => {
-  it("opens the manual create dialog directly (no dropdown)", () => {
+describe("New automation menu", () => {
+  it("opens an empty manual form only after selecting Create manually", () => {
     setTasks([]);
     renderPage();
-    fireEvent.click(screen.getByTestId("new-task-button"));
-    expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "New automation" });
+    fireEvent.pointerDown(button, { button: 0 });
+    expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Create manually",
+      "Create from template",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-name", "");
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-trigger", "");
   });
 
-  it("does not offer a 'Create with Omnigent' entry point", () => {
-    setTasks([]);
-    renderPage();
-    // No dropdown and no deferred create option: the manual dialog is the only
-    // create path on this page.
+  it.each(["", "/mount"])("opens templates and returns to the list under '%s'", (basename) => {
+    setTasks([task()]);
+    renderPage("/tasks", basename);
     fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
-    expect(screen.queryByTestId("new-task-omnigent")).toBeNull();
-    expect(screen.queryByTestId("new-task-manual")).toBeNull();
+    const templates = screen.getByRole("menuitem", { name: "Create from template" });
+    expect(templates).toHaveAttribute("href", `${basename}/tasks/templates`);
+    fireEvent.click(templates);
+    expect(screen.getByRole("heading", { name: "Automation templates" })).toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-list")).toBeNull();
+    expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
+    fireEvent.click(screen.getByRole("link", { name: "Back to automations" }));
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
+  });
+
+  it("opens a template from a direct link even when the task list failed to load", () => {
+    setTasks([], { isError: true });
+    renderPage("/tasks/templates");
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "PR sweep" }));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-name",
+      "PR sweep",
+    );
   });
 });
 
@@ -317,10 +399,11 @@ describe("suggestion prefill", () => {
     expect(dialog.getAttribute("data-initial-prompt")).toContain("Review recent email");
   });
 
-  it("opens EMPTY from the plain 'New task' button (no prefill)", () => {
+  it("opens EMPTY from the 'Create manually' menu item (no prefill)", () => {
     setTasks([]);
     renderPage();
-    fireEvent.click(screen.getByTestId("new-task-button"));
+    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
     const dialog = screen.getByTestId("manual-dialog-open");
     expect(dialog.getAttribute("data-initial-name")).toBe("");
     expect(dialog.getAttribute("data-initial-prompt")).toBe("");
@@ -344,7 +427,8 @@ describe("suggestion prefill", () => {
     );
 
     // Now the plain manual open must be EMPTY — no stale prefill from the chips.
-    fireEvent.click(screen.getByTestId("new-task-button"));
+    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe("");
   });
 });
@@ -377,5 +461,83 @@ describe("row actions", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-delete"));
     expect(deleteMutate).toHaveBeenCalledWith("st_1");
+  });
+});
+
+describe("trigger templates", () => {
+  const TRIGGER_INFO = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    scheduled_task_session_modes: true,
+    features: { session_orchestration: true },
+  };
+
+  function renderWithSessionModes(
+    info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO,
+    templatesOnly = false,
+  ) {
+    return render(
+      <CapabilitiesProvider info={info}>
+        <MemoryRouter initialEntries={["/tasks"]}>
+          <TasksPage templatesOnly={templatesOnly} />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it.each([false, true])("shows all existing templates (templatesOnly=%s)", (templatesOnly) => {
+    setTasks([task()]);
+    renderWithSessionModes(TRIGGER_INFO, templatesOnly);
+    const chips = within(screen.getByTestId("tasks-suggestions")).getAllByTestId(/^suggestion-/);
+    expect(chips.map((c) => c.getAttribute("data-testid"))).toEqual([
+      "suggestion-trigger-jira",
+      "suggestion-trigger-slack",
+      "suggestion-trigger-github",
+      "suggestion-follow-up-monitor",
+      "suggestion-pr-sweep",
+      "suggestion-news-digest",
+    ]);
+  });
+
+  it("opens the dialog on the picked template with an absolute session link", () => {
+    setTasks([]);
+    renderWithSessionModes();
+    fireEvent.click(screen.getByTestId("suggestion-trigger-slack"));
+    const dialog = screen.getByTestId("manual-dialog-open");
+    expect(dialog.getAttribute("data-initial-trigger")).toBe("slack");
+    expect(dialog.getAttribute("data-initial-prompt")).toBe("");
+    expect(dialog.getAttribute("data-session-link")).toBe(
+      `${window.location.origin}/c/CONVERSATION_ID`,
+    );
+
+    // A later plain open drops the template.
+    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
+    expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-trigger")).toBe("");
+  });
+
+  it.each(["jira", "slack", "github"])("opens the %s builder from the templates page", (source) => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
+    setTasks([]);
+    renderWithSessionModes(TRIGGER_INFO, true);
+    expect(
+      screen.queryByRole("dialog", { name: "Introducing Automations" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-trigger",
+      source,
+    );
+  });
+
+  it.each([
+    ["can't keep one session per automation", { scheduled_task_session_modes: false }],
+    ["has session orchestration turned off", { features: { session_orchestration: false } }],
+    // Older servers don't report the feature at all.
+    ["doesn't report session orchestration", { features: {} }],
+  ])("hides the chips when the server %s", (_name, overrides) => {
+    setTasks([]);
+    renderWithSessionModes({ ...TRIGGER_INFO, ...overrides }, true);
+    expect(screen.getByTestId("suggestion-follow-up-monitor")).toBeInTheDocument();
+    expect(screen.queryByTestId("suggestion-trigger-jira")).toBeNull();
   });
 });

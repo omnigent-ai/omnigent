@@ -13,7 +13,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import secrets
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -23,6 +25,7 @@ from fastapi import Response
 
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
+from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -30,6 +33,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -42,12 +46,21 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.native.input_diagnostics import (
+    INPUT_FIELDS,
+    input_attributes,
+    input_delivery_scope,
+    log_input_event,
+)
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
+from omnigent.runtime.prompt import dedupe_tool_output_images
 from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.server.ask_user_question import structured_ask_user_question
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
+    ElicitationResult,
     InjectionConsumedEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
@@ -101,6 +114,33 @@ def _strip_mcp_tool_prefix(name: str) -> str:
     return name
 
 
+# Tool names that load a skill (after MCP-prefix stripping): Claude Code's native
+# "Skill" and Omnigent's builtin "load_skill". Coverage gaps: designs/OBSERVABILITY.md §13.
+_SKILL_TOOL_NAMES = frozenset({"Skill", "load_skill"})
+
+# Arg keys that carry the skill name, per tool. Native ``Skill`` uses ``skill``
+# (``command`` in older Claude Code); ``load_skill`` uses ``name``.
+_SKILL_NAME_ARG_KEYS: dict[str, tuple[str, ...]] = {
+    "Skill": ("skill", "command"),
+    "load_skill": ("name",),
+}
+
+# A skill name, optionally plugin-qualified (``plugin:skill``). Values that don't
+# match are treated as content and never exported.
+_SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][\w.-]{0,63}(?::[A-Za-z0-9][\w.-]{0,63})?", re.ASCII)
+
+
+def _extract_skill_name(tool_name: str, args: dict[str, Any]) -> str | None:
+    """Validated skill name from a skill tool call's name field, else ``None``."""
+    if not isinstance(args, dict):
+        return None
+    for key in _SKILL_NAME_ARG_KEYS.get(tool_name, ()):
+        value = args.get(key)
+        if isinstance(value, str) and _SKILL_NAME_RE.fullmatch(value.strip()):
+            return value.strip()
+    return None
+
+
 # Prefix for local host-tool-bridge calls (``sys_os_*``). An orphaned host-tool callback
 # is the deterministic respawn-desync signature, so it triggers a Tier-1 reset on the first
 # occurrence rather than waiting for the consecutive-orphan threshold.
@@ -114,14 +154,14 @@ def _is_host_tool(tool_name: str) -> bool:
 
 class InnerExecutorError(RuntimeError):
     """
-    An executor-reported failure that names its own semantic error code.
+    An executor-reported failure with a code or explicit delivery evidence.
 
     Raised by :class:`ExecutorAdapter` when an :class:`ExecutorError` event
-    carries a ``code``, so the terminal ``response.failed`` reports that code,
-    headline and next step instead of the exception class name.
+    carries a ``code`` or ``undelivered`` flag. Uncoded failures retain their
+    RuntimeError classification while carrying delivery evidence to the relay.
 
     :param message: Human-readable failure text shown to the user.
-    :param code: Semantic failure code, e.g. ``"databricks_sign_in_pending"``.
+    :param code: Semantic failure code, or ``None`` for the generic classifier.
     :param title: Short headline for the error card, or ``None``.
     :param remediation: Concrete next step for the user, or ``None``.
     :param undelivered: ``True`` when the harness never received the message.
@@ -131,7 +171,7 @@ class InnerExecutorError(RuntimeError):
         self,
         message: str,
         *,
-        code: str,
+        code: str | None,
         title: str | None = None,
         remediation: str | None = None,
         undelivered: bool = False,
@@ -204,7 +244,11 @@ class ExecutorAdapter(HarnessApp):
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
         executor = self._ensure_executor()
-        messages = _translate_input_to_messages(request.input)
+        messages = _translate_input_to_messages(
+            request.input,
+            include_tool_history=executor.replays_tool_history(),
+            preserve_content_blocks=executor.preserves_message_content_blocks(),
+        )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
         for message in messages:
@@ -235,6 +279,24 @@ class ExecutorAdapter(HarnessApp):
             executor._elicitation_choice_handler = (  # type: ignore[attr-defined]
                 self._stable_elicitation_choice_handler
             )
+        # PiExecutor parks ``ctx.ui`` dialogs as form elicitations. Decline must
+        # not abort the turn (unlike the binary permission card).
+        if (
+            hasattr(executor, "_form_elicitation_handler")
+            and executor._form_elicitation_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._form_elicitation_handler = (  # type: ignore[attr-defined]
+                self._stable_form_elicitation_handler
+            )
+        # The claude-sdk executor also accepts an AskUserQuestion bridge that
+        # renders the question as a clickable form and feeds selections back;
+        # other executors don't define the attribute.
+        if (
+            hasattr(executor, "_ask_question_handler") and executor._ask_question_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._ask_question_handler = (  # type: ignore[attr-defined]
+                self._stable_ask_question_handler
+            )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
@@ -246,12 +308,20 @@ class ExecutorAdapter(HarnessApp):
         # Set True before each genuine-completion return so the finally can schedule a
         # bounded interrupt only on abnormal exits (CancelledError, ExecutorError, etc.).
         clean_exit = False
+        input_identity = input_attributes(request.model_dump(include=set(INPUT_FIELDS)))
+        input_outcome_logged = False
         self._dispatched_call_ids.clear()
         self._observed_tool_calls.clear()
         self._pr_tool_calls.clear()
 
         tracing = is_tracing_enabled()
-        from omnigent.runtime.telemetry import current_session_id, session_scope
+        from omnigent.runtime import skill_metrics
+        from omnigent.runtime.telemetry import (
+            current_session_id,
+            reset_active_skill,
+            session_scope,
+            set_active_skill,
+        )
 
         turn_session_id = ctx.session_id or current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
@@ -261,6 +331,12 @@ class ExecutorAdapter(HarnessApp):
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
         _active_tool_span = None
         _active_tool_parent = None
+        # Skill telemetry, turn-scoped: one (name, start) per skill call, the most
+        # recent last. The first token restores the pre-turn active skill.
+        _active_skill_token: Any = None
+        _skill_calls: list[tuple[str, float]] = []
+        _seen_tool_call_ids: set[str] = set()
+        _turn_outcome: str | None = None
 
         user_message = _extract_last_user_message(request.input)
 
@@ -278,7 +354,16 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            with session_scope(turn_session_id), phase_scope(ErrorPhase.TURN), trace_cm:
+            with (
+                session_scope(turn_session_id),
+                phase_scope(ErrorPhase.TURN),
+                trace_cm,
+                input_delivery_scope(input_identity, response_id=ctx.response_id),
+                native_shell_authorization(request.authorized_native_shell_command),
+            ):
+                log_input_event(
+                    _logger, "native_input_execution_started", session_id=turn_session_id
+                )
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
@@ -294,6 +379,13 @@ class ExecutorAdapter(HarnessApp):
                     config=config,
                 ):
                     if ctx.cancelled.is_set():
+                        log_input_event(
+                            _logger,
+                            "native_input_execution_finished",
+                            session_id=turn_session_id,
+                            outcome="cancelled",
+                        )
+                        input_outcome_logged = True
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
 
@@ -303,16 +395,38 @@ class ExecutorAdapter(HarnessApp):
                         # Mark clean_exit AFTER the interrupt completes: if it raises,
                         # the finally's _safe_interrupt fallback still fires.
                         await executor.interrupt_session(self._session_key)
+                        _turn_outcome = "cancelled"
                         clean_exit = True
                         return
                     # --- Tracing: emit spans per event ---
                     if tctx is not None:
                         if isinstance(event, ToolCallRequest):
                             _active_tool_parent = tctx._current_span
+                            _bare_tool_name = _strip_mcp_tool_prefix(event.name)
                             _active_tool_span = tctx.start_tool_span(
-                                _strip_mcp_tool_prefix(event.name),
+                                _bare_tool_name,
                                 event.args or {},
                             )
+                            if _bare_tool_name in _SKILL_TOOL_NAMES:
+                                _skill_name = _extract_skill_name(
+                                    _bare_tool_name, event.args or {}
+                                )
+                                if _skill_name:
+                                    tctx.set_skill_name(_active_tool_span, _skill_name)
+                                    _token = set_active_skill(_skill_name)
+                                    if _active_skill_token is None:
+                                        _active_skill_token = _token
+                                    _skill_calls.append((_skill_name, time.monotonic()))
+                            else:
+                                # Codex reports the same call at start and completion.
+                                _call_id = _call_id_from_metadata(event.metadata)
+                                if not _call_id or _call_id not in _seen_tool_call_ids:
+                                    if _skill_calls:
+                                        skill_metrics.record_skill_tool_call(
+                                            _skill_calls[-1][0], _bare_tool_name
+                                        )
+                                    if _call_id:
+                                        _seen_tool_call_ids.add(_call_id)
                         elif isinstance(event, ToolCallComplete):
                             if _active_tool_span is not None:
                                 tctx.end_tool_span(
@@ -333,12 +447,27 @@ class ExecutorAdapter(HarnessApp):
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):
+                        log_input_event(
+                            _logger,
+                            "native_input_execution_finished",
+                            session_id=turn_session_id,
+                            outcome="executor_returned",
+                        )
+                        input_outcome_logged = True
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(agent_span, response=response_text)
                             agent_span = None
+                        _turn_outcome = "success"
                         clean_exit = True
                         return
                     if isinstance(event, TurnCancelled):
+                        log_input_event(
+                            _logger,
+                            "native_input_execution_finished",
+                            session_id=turn_session_id,
+                            outcome="cancelled",
+                        )
+                        input_outcome_logged = True
                         ctx.cancelled.set()
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
@@ -346,9 +475,19 @@ class ExecutorAdapter(HarnessApp):
                             record_cancellation(agent_span)
                             tctx.end_agent_span(agent_span, response=None, error="cancelled")
                         # Inner executor wound down cleanly.
+                        _turn_outcome = "cancelled"
                         clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
+                        _turn_outcome = "error"
+                        log_input_event(
+                            _logger,
+                            "native_input_execution_finished",
+                            session_id=turn_session_id,
+                            outcome="reported_undelivered" if event.undelivered else "error",
+                            error_code=event.code,
+                        )
+                        input_outcome_logged = True
                         clean_exit = event.preserve_session
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(
@@ -366,24 +505,42 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
-                        if event.code:
-                            # The executor named the failure: keep its code, headline
-                            # and next step so the card reads as that failure rather
-                            # than as a bare exception class.
+                        if event.code or event.undelivered:
+                            # Delivery evidence must survive even when the executor
+                            # leaves classification to the generic error path.
                             raise InnerExecutorError(
-                                detail,
+                                detail if event.code else f"inner executor error: {detail}",
                                 code=event.code,
                                 title=event.title,
                                 remediation=event.remediation,
                                 undelivered=event.undelivered,
                             )
                         raise RuntimeError(f"inner executor error: {detail}")
+                log_input_event(
+                    _logger,
+                    "native_input_execution_finished",
+                    session_id=turn_session_id,
+                    outcome="executor_stream_ended",
+                )
+                input_outcome_logged = True
         except ElicitationDeclinedError:
+            if input_identity and not input_outcome_logged:
+                log_input_event(
+                    _logger,
+                    "native_input_execution_finished",
+                    session_id=turn_session_id,
+                    attributes=input_identity,
+                    response_id=ctx.response_id,
+                    outcome="cancelled",
+                    cancellation_reason="elicitation_declined",
+                )
+                input_outcome_logged = True
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
             _logger.info(
                 "elicitation explicitly declined for response %s — aborting turn",
                 ctx.response_id,
             )
+            _turn_outcome = "cancelled"
             if tctx is not None and agent_span is not None:
                 from omnigent.runtime.telemetry import record_cancellation
 
@@ -392,7 +549,19 @@ class ExecutorAdapter(HarnessApp):
             ctx.cancelled.set()
             if self._executor is not None:
                 await self._executor.interrupt_session(self._session_key)
-        except BaseException:
+        except BaseException as exc:
+            _turn_outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+            if input_identity and not input_outcome_logged:
+                log_input_event(
+                    _logger,
+                    "native_input_execution_finished",
+                    session_id=turn_session_id,
+                    attributes=input_identity,
+                    response_id=ctx.response_id,
+                    outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                    exception_type=type(exc).__name__,
+                )
+                input_outcome_logged = True
             # Close the span so it doesn't leak on the OTel provider.
             if tctx is not None and agent_span is not None:
                 tctx.end_agent_span(agent_span, response=None, error="unhandled exception")
@@ -403,6 +572,17 @@ class ExecutorAdapter(HarnessApp):
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await injection_watcher
+            # Record each skill call (count + call-to-turn-end duration), then clear
+            # the active skill so it can't leak into the next turn.
+            _turn_end = time.monotonic()
+            for _skill, _start in _skill_calls:
+                skill_metrics.record_skill_invocation(_skill, _turn_outcome or "unknown")
+                skill_metrics.record_skill_execution_duration(
+                    _skill, (_turn_end - _start) * 1000.0
+                )
+            if _active_skill_token is not None:
+                with contextlib.suppress(Exception):
+                    reset_active_skill(_active_skill_token)
             if tctx is not None:
                 try:
                     from opentelemetry import trace as otel_trace
@@ -554,17 +734,55 @@ class ExecutorAdapter(HarnessApp):
             if injection is None:
                 # None signals a sentinel or protocol change; bail to avoid spinning.
                 return
-            text = _extract_user_text(injection.input)
-            if not text:
+            content = (
+                _normalize_message_content(injection.input, preserve_content_blocks=True)
+                if executor.preserves_message_content_blocks()
+                else _extract_user_text(injection.input)
+            )
+            if not content:
                 _logger.warning(
-                    "skipping in-band injection with no text payload: %r",
+                    "skipping in-band injection with no supported payload: %r",
                     injection.input,
                 )
                 continue
             if ctx.cancelled.is_set():
                 return
             try:
-                accepted = await executor.enqueue_session_message(self._session_key, text)
+                with (
+                    input_delivery_scope(
+                        injection.model_dump(include=set(INPUT_FIELDS)),
+                        response_id=ctx.response_id,
+                    ),
+                    native_shell_authorization(injection.authorized_native_shell_command),
+                ):
+                    log_input_event(
+                        _logger, "native_input_steering_started", session_id=ctx.session_id
+                    )
+                    try:
+                        accepted = await executor.enqueue_session_message(
+                            self._session_key, content
+                        )
+                        outcome = "executor_accepted" if accepted else "executor_refused"
+                    except InjectionDeliveryAmbiguous:
+                        # The harness may already hold the message; resending could duplicate it.
+                        accepted, outcome = True, "executor_ambiguous"
+                    except BaseException as exc:
+                        log_input_event(
+                            _logger,
+                            "native_input_steering_finished",
+                            session_id=ctx.session_id,
+                            outcome="cancelled"
+                            if isinstance(exc, asyncio.CancelledError)
+                            else "error",
+                            exception_type=type(exc).__name__,
+                        )
+                        raise
+                    log_input_event(
+                        _logger,
+                        "native_input_steering_finished",
+                        session_id=ctx.session_id,
+                        outcome=outcome,
+                    )
             except Exception:
                 _logger.exception(
                     "inner executor.enqueue_session_message failed; in-band injection lost"
@@ -673,11 +891,14 @@ class ExecutorAdapter(HarnessApp):
         tool_input: dict[str, Any],
         *,
         requested_schema: dict[str, Any] | None = None,
+        ask_user_question: dict[str, Any] | None = None,
+        phase: str = "tool_call",
     ) -> ElicitationRequestParams:
         """Build the approval-card params for a tool-permission elicitation.
 
         With *requested_schema* the card renders one button per choice instead of
-        Approve/Reject; without it, the usual binary card.
+        Approve/Reject; with *ask_user_question* it renders that question form;
+        without either, the usual binary card.
         """
         # Build a concise preview: truncate long args so the UI widget
         # stays readable. 300 chars matches AP's policy-engine preview.
@@ -688,14 +909,19 @@ class ExecutorAdapter(HarnessApp):
         preview = preview[:300]
 
         label = self._harness_label
+        # Extra field, stamped only when present so other cards serialize unchanged.
+        extras: dict[str, Any] = (
+            {"ask_user_question": ask_user_question} if ask_user_question else {}
+        )
         return ElicitationRequestParams(
             mode="form",
             message=f"{label} wants to use **{tool_name}**",
             requestedSchema=requested_schema,
             url=None,
-            phase="tool_call",
+            phase=phase,
             policy_name=f"{label.lower()}_sdk_permission",
             content_preview=f"{tool_name}({preview})",
+            **extras,
         )
 
     async def _stable_elicitation_choice_handler(
@@ -743,6 +969,67 @@ class ExecutorAdapter(HarnessApp):
             return None
         answer = (result.content or {}).get("answer")
         return answer if isinstance(answer, str) else None
+
+    async def _stable_form_elicitation_handler(
+        self,
+        elicitation_id: str,
+        params: ElicitationRequestParams,
+    ) -> ElicitationResult:
+        """Forward a form without treating a decline as turn cancellation."""
+        ctx = self._current_ctx
+        if ctx is None:
+            _logger.error(
+                "form elicitation callback fired with no active turn context; cancelling"
+            )
+            return ElicitationResult(action="cancel")
+
+        return await ctx.elicit(elicitation_id, params)
+
+    async def _stable_ask_question_handler(
+        self,
+        tool_input: dict[str, Any],
+    ) -> dict[str, Any] | str:
+        """Stable bridge for a claude-sdk ``AskUserQuestion`` tool call.
+
+        Renders the tool's questions as the clickable ``ask_user_question``
+        form. On accept, returns the tool input with the user's selections
+        merged under ``answers`` — the shape Claude Code reads to skip its own
+        picker and report those selections as the tool result. Otherwise
+        returns the reason the model should see for the call being denied.
+
+        Reads ``_current_ctx`` at call time, mirroring
+        :meth:`_stable_elicitation_handler`.
+        """
+        ctx = self._current_ctx
+        if ctx is None:
+            _logger.error("ask-question callback fired with no active turn context; denying")
+            return "AskUserQuestion is unavailable outside an active Omnigent turn."
+        ask_payload = structured_ask_user_question(tool_input)
+        if ask_payload is None:
+            return (
+                "AskUserQuestion input had no question with selectable options, so "
+                "nothing was shown to the user. Fix the input or ask in plain text."
+            )
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        # Own phase so the REPL's "approve always" cache for tool calls never
+        # auto-accepts a question (an accept with no answers).
+        params = self._permission_card(
+            "AskUserQuestion", tool_input, ask_user_question=ask_payload, phase="pre_tool_use"
+        )
+        result = await ctx.elicit(elicitation_id, params)
+        # ``result.content`` is MCP-shaped (question -> selection), the same
+        # shape the claude-native permission hook feeds back as ``answers``.
+        if result.action == "accept" and isinstance(result.content, dict) and result.content:
+            return {**tool_input, "answers": result.content}
+        if result.action == "accept":
+            # A client without the question form (e.g. the terminal REPL) can
+            # only approve; the user agreed to answer but picked nothing.
+            return (
+                "The user's client could not show these options and no answer came "
+                "back. Ask the question again in plain text."
+            )
+        # Dismissing a question is an answer, not a cancel: the turn continues.
+        return "The user dismissed the question without answering."
 
     async def _stable_policy_evaluator(
         self,
@@ -989,11 +1276,16 @@ class ExecutorAdapter(HarnessApp):
     def _build_error_detail(self, exception: BaseException) -> Any:
         """Map an exception to a semantic code the Omnigent retry allowlist recognizes.
 
-        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``.
-        Unknown types fall back to base class (``type(exception).__name__``).
+        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``,
+        then a text check for a CLI too old for the model. Unknown types fall back to base
+        class (``type(exception).__name__``).
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
+        from omnigent.runner.launch_failure import (
+            diagnose_client_update_required,
+            diagnose_model_unavailable,
+        )
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, ProviderAuthRequired):
@@ -1005,6 +1297,11 @@ class ExecutorAdapter(HarnessApp):
                 remediation=exception.remediation,
             )
         if isinstance(exception, InnerExecutorError):
+            if not exception.code:
+                detail = self._build_error_detail(RuntimeError(str(exception)))
+                return detail.model_copy(
+                    update={"undelivered": True if exception.undelivered else None}
+                )
             return ErrorDetail(
                 code=exception.code,
                 message=str(exception),
@@ -1018,6 +1315,24 @@ class ExecutorAdapter(HarnessApp):
         code = classify_inner_exception(exception)
         if code is not None:
             return ErrorDetail(code=code, message=str(exception))
+
+        # An old-CLI model refusal reaches here as a bare RuntimeError; its text names the fix.
+        message = str(exception)
+        diagnosis = diagnose_client_update_required(message)
+        if diagnosis is not None:
+            return ErrorDetail(
+                code="client_update_required",
+                message=message,
+                title=diagnosis.title,
+                cause=diagnosis.cause,
+                remediation=diagnosis.remediation,
+            )
+
+        # Preserve the failure metadata; add only the recovery guidance.
+        model_diagnosis = diagnose_model_unavailable(message)
+        if model_diagnosis is not None:
+            detail = super()._build_error_detail(exception)
+            return detail.model_copy(update={"remediation": model_diagnosis.remediation})
 
         return super()._build_error_detail(exception)
 
@@ -1254,43 +1569,120 @@ def _extract_user_text(
 
 def _translate_input_to_messages(
     input_value: str | list[dict[str, Any]],
+    *,
+    include_tool_history: bool = False,
+    preserve_content_blocks: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
-    Accepts conversation-history shape (role-keyed messages; tool items dropped) and
-    single-turn fallback shape (plain string or content blocks, collapsed to one user message).
+    Accepts conversation-history shape (role-keyed messages, plus tool history when
+    *include_tool_history*) and single-turn fallback shape (plain string or content
+    blocks, collapsed to one user message).
     """
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
 
-    history_messages = _extract_role_keyed_messages(input_value)
+    history_messages = _extract_role_keyed_messages(
+        input_value,
+        include_tool_history=include_tool_history,
+        preserve_content_blocks=preserve_content_blocks,
+    )
     if history_messages:
         return history_messages
 
-    content = _normalize_message_content(input_value)
+    content = _normalize_message_content(
+        input_value, preserve_content_blocks=preserve_content_blocks
+    )
     return [{"role": "user", "content": content}]
 
 
 def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
+    *,
+    include_tool_history: bool,
+    preserve_content_blocks: bool,
 ) -> list[Message]:
-    """Extract role-keyed message items from an Omnigent input list.
+    """Extract role-keyed messages from an Omnigent input list.
 
-    Tool-call items (function_call, function_call_output, etc.) are skipped — the inner SDK
-    reconstructs its own tool state. Returns an empty list for non-history inputs.
+    With *include_tool_history*, ``function_call`` / ``function_call_output`` items
+    become ``tool_call`` / ``tool_result`` messages for an executor that replays them
+    into a fresh inner session (a fork or restart). Returns an empty list for
+    non-history inputs.
     """
     messages: list[Message] = []
+    seen_call_ids: set[str] = set()
     for item in input_value:
         if not isinstance(item, dict):
             continue
-        if item.get("type") != "message" or "role" not in item:
+        item_type = item.get("type")
+        if include_tool_history and item_type == "function_call":
+            # Live history repeats a call once per status update; keep the first.
+            call_id = item.get("call_id")
+            if isinstance(call_id, str) and call_id in seen_call_ids:
+                continue
+            tool_call = _tool_call_message(item)
+            if tool_call is not None:
+                messages.append(tool_call)
+                if isinstance(call_id, str):
+                    seen_call_ids.add(call_id)
+            continue
+        if include_tool_history and item_type == "function_call_output":
+            messages.append(_tool_result_message(item))
+            continue
+        if item_type != "message" or "role" not in item:
             continue
         role = item["role"]
-        content = _normalize_message_content(item.get("content"))
+        content = _normalize_message_content(
+            item.get("content"), preserve_content_blocks=preserve_content_blocks
+        )
         if not content:
             continue
         messages.append({"role": role, "content": content})
     return messages
+
+
+# Per-output budget for replayed tool history: a fresh session gets the gist of
+# each result without one large read crowding out the conversation.
+_REPLAYED_TOOL_OUTPUT_MAX_BYTES = 16 * 1024
+
+
+def _tool_call_message(item: dict[str, Any]) -> Message | None:
+    """Translate a ``function_call`` input item into a ``tool_call`` history message.
+
+    Returns ``None`` when the item carries no tool name (nothing replayable).
+    """
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    args: Any = item.get("arguments")
+    if isinstance(args, str):
+        with contextlib.suppress(TypeError, json.JSONDecodeError):
+            args = json.loads(args)
+    if not isinstance(args, dict):
+        args = {}
+    message: Message = {"role": "tool_call", "content": {"tool": name, "args": args}}
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id:
+        message["metadata"] = {"call_id": call_id}
+    return message
+
+
+def _tool_result_message(item: dict[str, Any]) -> Message:
+    """Translate a ``function_call_output`` input item into a ``tool_result`` message.
+
+    The output is image-stripped and capped: a fresh session replays every one.
+    """
+    output = item.get("output")
+    if not isinstance(output, str):
+        output = "" if output is None else json.dumps(output)
+    output = cap_tool_output(
+        dedupe_tool_output_images(output), max_bytes=_REPLAYED_TOOL_OUTPUT_MAX_BYTES
+    )
+    message: Message = {"role": "tool_result", "content": output}
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id:
+        message["metadata"] = {"call_id": call_id}
+    return message
 
 
 _MULTIMODAL_BLOCK_TYPES: frozenset[str] = frozenset({"input_image", "input_file", "input_audio"})
@@ -1298,14 +1690,18 @@ _MULTIMODAL_BLOCK_TYPES: frozenset[str] = frozenset({"input_image", "input_file"
 
 def _normalize_message_content(
     content: Any,
+    *,
+    preserve_content_blocks: bool = False,
 ) -> str | list[dict[str, Any]]:
-    """Normalize message content: plain string for text-only; full block list for multimodal."""
+    """Keep blocks for opted-in executors and attachments; otherwise join plain text."""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return ""
+    if preserve_content_blocks:
+        return content
 
     has_multimodal = any(
         isinstance(block, dict) and block.get("type") in _MULTIMODAL_BLOCK_TYPES
@@ -1345,23 +1741,84 @@ def _serialize_tool_result(event: ToolCallComplete) -> str:
     return ""
 
 
-def _stringify_tool_payload(value: Any) -> str:
-    """Coerce a result payload to string (str pass-through, content-block join, JSON fallback)."""
-    import json
+_ACP_TOOL_CALL_CONTENT_TYPES = frozenset({"content", "diff", "terminal"})
 
+
+def _stringify_tool_payload(value: Any) -> str:
+    """Coerce a result payload to string (str pass-through, content-block join, JSON fallback).
+
+    Handles Anthropic-style flat text blocks and the ACP ``ToolCallContent`` union
+    (``content`` wrapper, ``diff``, ``terminal``; agentclientprotocol.com/protocol/tool-calls).
+    """
     if isinstance(value, str):
         return value
     if isinstance(value, list):
+        if any(
+            isinstance(block, dict)
+            and isinstance(block.get("type"), str)
+            and block["type"] in _ACP_TOOL_CALL_CONTENT_TYPES
+            for block in value
+        ):
+            # ACP entries are self-contained summaries; keep each on its own line.
+            return "\n".join(_render_acp_tool_call_content(block) for block in value)
         # Anthropic-style content blocks: join text fields; skip non-text (image, tool_use, etc.).
-        text_parts: list[str] = []
-        for block in value:
-            if not isinstance(block, dict):
-                continue
-            block_text = block.get("text")
-            if isinstance(block_text, str):
-                text_parts.append(block_text)
+        text_parts = [
+            block["text"]
+            for block in value
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
         if text_parts:
             return "".join(text_parts)
+    return _json_or_repr(value)
+
+
+def _render_acp_tool_call_content(block: Any) -> str:
+    """Render one ACP ``ToolCallContent`` entry.
+
+    Non-text ``content`` blocks are named rather than dumped; unknown shapes keep a JSON fallback.
+    """
+    if isinstance(block, dict):
+        block_type = block.get("type")
+        if block_type == "content":
+            inner = block.get("content")
+            inner_blocks = [
+                b for b in (inner if isinstance(inner, list) else [inner]) if isinstance(b, dict)
+            ]
+            texts = [b["text"] for b in inner_blocks if isinstance(b.get("text"), str)]
+            # Image, audio and resource blocks can carry large base64 payloads; name them instead.
+            kinds = sorted(
+                {
+                    str(b.get("type", "unknown"))
+                    for b in inner_blocks
+                    if not isinstance(b.get("text"), str)
+                }
+            )
+            parts = ["".join(texts)] if texts else []
+            if kinds:
+                parts.append(f"[content: {', '.join(kinds)}]")
+            if parts:
+                return "\n".join(parts)
+        elif block_type == "diff":
+            path = block.get("path")
+            new_text = block.get("newText")
+            line_count = len(new_text.splitlines()) if isinstance(new_text, str) else 0
+            count = f"{line_count} line" + ("" if line_count == 1 else "s")
+            label = f"diff {path} ({count})" if path else f"diff ({count})"
+            return f"{label}\n{new_text}" if isinstance(new_text, str) and new_text else label
+        elif block_type == "terminal":
+            terminal_id = block.get("terminalId")
+            return f"[terminal {terminal_id}]" if terminal_id else "[terminal]"
+        # Preserve the text of flat text blocks mixed into an ACP list.
+        block_text = block.get("text")
+        if isinstance(block_text, str):
+            return block_text
+    return _json_or_repr(block)
+
+
+def _json_or_repr(value: Any) -> str:
+    """JSON-encode ``value``, falling back to ``repr`` for non-serializable payloads."""
+    import json
+
     try:
         return json.dumps(value)
     except (TypeError, ValueError):

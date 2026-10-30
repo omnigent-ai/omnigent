@@ -36,18 +36,26 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from PIL import Image, ImageSequence, UnidentifiedImageError
 
 from omnigent.server.admin_list import resolve_data_dir
 
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+
 logger = logging.getLogger(__name__)
 
 SESSION_TITLE_INSTRUCTIONS_KEY = "session_title_instructions"
+#: Agent names the New Chat picker should offer, e.g. ``["polly"]``. Empty or
+#: absent offers the full roster.
+RESTRICT_TO_AGENT_NAMES_KEY = "restrict_to_agent_names"
+#: Agent name a fresh New Chat starts on, e.g. ``"polly"``.
+DEFAULT_AGENT_NAME_KEY = "default_agent_name"
 SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 
 
@@ -135,6 +143,80 @@ def session_title_instructions(config: Mapping[str, Any]) -> str | None:
         )
         return None
     return value
+
+
+@dataclass(frozen=True)
+class PickerCuration:
+    """Which agents the New Chat picker offers, and which one it starts on.
+
+    Display only: see "Curating the New Chat picker" in ``deploy/README.md``.
+
+    :param restrict_to_agent_names: Names the picker may show. Empty means no
+        restriction, which is the default.
+    :param default_agent_name: Name a fresh New Chat pre-selects, or ``None``.
+        A user's remembered pick still wins; this only decides where someone
+        with no history starts.
+    """
+
+    restrict_to_agent_names: tuple[str, ...] = ()
+    default_agent_name: str | None = None
+
+    @property
+    def restricted(self) -> bool:
+        """Whether the picker is limited to a named set."""
+        return bool(self.restrict_to_agent_names)
+
+    def config(self) -> dict[str, Any]:
+        """Return the public picker block surfaced by ``GET /v1/info``."""
+        return {
+            "restrict_to_agent_names": list(self.restrict_to_agent_names),
+            "default_agent_name": self.default_agent_name,
+        }
+
+
+def load_picker_curation(config: Mapping[str, Any]) -> PickerCuration:
+    """Read the New Chat picker's display curation from the server config.
+
+    Both keys fail open: a malformed value logs and is ignored rather than
+    emptying a deployment's picker over a typo. A default outside a non-empty
+    allowlist is dropped, since it could never be selected.
+
+    :param config: Loaded server config carrying the optional
+        ``restrict_to_agent_names`` and ``default_agent_name`` keys.
+    :returns: The curation, empty when neither key is set.
+    """
+    raw_names = config.get(RESTRICT_TO_AGENT_NAMES_KEY)
+    # Each element has to be a string too: ``[42]`` would otherwise become an
+    # active restriction on ``"42"`` that matches nothing.
+    elements = raw_names if isinstance(raw_names, list) else [raw_names]
+    if raw_names is not None and not all(isinstance(item, str) for item in elements):
+        logger.warning(
+            "server config %s must be a name or a list of names — ignoring it",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+        )
+        raw_names = None
+    # Order is the operator's: the picker shows a restricted roster in the
+    # order it was configured, so a deployment can put its own agent first.
+    names: tuple[str, ...] = tuple(dict.fromkeys(config_str_list(raw_names)))
+
+    raw_default = config.get(DEFAULT_AGENT_NAME_KEY)
+    default: str | None = None
+    if raw_default is not None:
+        if not isinstance(raw_default, str):
+            logger.warning(
+                "server config %s must be a string — ignoring it", DEFAULT_AGENT_NAME_KEY
+            )
+        else:
+            default = raw_default.strip() or None
+    if default is not None and names and default not in names:
+        logger.warning(
+            "server config %s is %r, which %s does not offer — ignoring the default",
+            DEFAULT_AGENT_NAME_KEY,
+            default,
+            RESTRICT_TO_AGENT_NAMES_KEY,
+        )
+        default = None
+    return PickerCuration(restrict_to_agent_names=names, default_agent_name=default)
 
 
 def _config_positive_int(key: str, default: int) -> int:
@@ -271,6 +353,79 @@ def filesystem_attachment_denied_extensions() -> frozenset[str]:
     return frozenset(denied)
 
 
+def parse_filesystem_attachment_policy(raw: object) -> FilesystemAttachmentPolicy:
+    """Build the filesystem attachment policy from a configured value.
+
+    ``None`` keeps the default extensions. A list replaces them, with or
+    without leading dots (``[".gz", "har"]``), and ``[]`` delivers nothing as
+    a file. ``"*"``, alone or as a list entry, adds the default extensions and
+    every other file that can't be inlined. An unusable value keeps the
+    defaults, so a typo cannot turn off attachments that worked before.
+
+    :param raw: The configured value, e.g. ``"*"`` or ``[".zip", ".gz"]``.
+    :returns: The policy the upload route applies.
+    """
+    from omnigent.inner.native_attachments import (
+        DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS,
+        DEFAULT_FILESYSTEM_ATTACHMENT_POLICY,
+        FilesystemAttachmentPolicy,
+    )
+
+    if raw is None:
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    entries = [raw] if isinstance(raw, str) else raw
+    if not isinstance(entries, list):
+        logger.warning(
+            "filesystem_attachment_allowed_extensions=%r is not a list, using the defaults",
+            raw,
+        )
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    extensions: set[str] = set()
+    all_types = False
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            logger.warning(
+                "filesystem_attachment_allowed_extensions entry %r is not a "
+                "non-empty string, skipping",
+                entry,
+            )
+            continue
+        value = entry.strip().lower()
+        if value == "*":
+            all_types = True
+            continue
+        extension = value if value.startswith(".") else f".{value}"
+        if PurePath(f"file{extension}").suffix != extension:
+            # Files match on their last extension only, so ".tar.gz" would match nothing.
+            logger.warning(
+                "filesystem_attachment_allowed_extensions entry %r is not a single "
+                "extension such as '.gz', skipping",
+                entry,
+            )
+            continue
+        extensions.add(extension)
+    if entries and not extensions and not all_types:
+        logger.warning(
+            "filesystem_attachment_allowed_extensions=%r has no usable entry, using the defaults",
+            raw,
+        )
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    if all_types:
+        extensions |= DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
+    return FilesystemAttachmentPolicy(extensions=frozenset(extensions), all_types=all_types)
+
+
+def filesystem_attachment_policy() -> FilesystemAttachmentPolicy:
+    """Which uploads this deployment delivers through native filesystem tools.
+
+    Config key ``filesystem_attachment_allowed_extensions``; see
+    :func:`parse_filesystem_attachment_policy` for the accepted values.
+    """
+    return parse_filesystem_attachment_policy(
+        load_server_config().get("filesystem_attachment_allowed_extensions")
+    )
+
+
 def _branding_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     """Return the ``branding:`` mapping, or ``{}`` when absent/not a map."""
     section = config.get("branding")
@@ -317,12 +472,19 @@ class BrandingAsset:
 
 @dataclass(frozen=True)
 class BrandingSnapshot:
-    """Immutable branding metadata and validated assets for one app instance."""
+    """Immutable branding metadata and validated assets for one app instance.
+
+    ``server_name`` names this deployment for clients that list several
+    servers (the desktop's server list). It is published in the
+    ``/.well-known/omnigent.json`` manifest, not in the ``/v1/info``
+    branding block, and has no fallback to ``app_name``.
+    """
 
     app_name: str | None
     heading: str | None
     logo_assets: Mapping[str, BrandingAsset]
     powered_by: bool
+    server_name: str | None = None
 
     def config(self) -> dict[str, Any]:
         """Return the public branding block surfaced by ``GET /v1/info``."""
@@ -694,6 +856,7 @@ def load_branding_snapshot(config: Mapping[str, Any] | None = None) -> BrandingS
         heading=_branding_heading(section),
         logo_assets=MappingProxyType(logo_assets),
         powered_by=_branding_powered_by(section),
+        server_name=_branding_str(section, "server_name"),
     )
 
 

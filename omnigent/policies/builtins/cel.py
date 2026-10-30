@@ -13,6 +13,8 @@ The expression receives the full ``PolicyEvent`` dict as an
 ``{"key": string, "action": "set"|"increment"|"delete"|"append", "value": any}``.
 ``value`` is required for ``set``, ``increment``, and ``append``, and ignored
 for ``delete``.
+Keys beginning with ``_policy_`` belong to the runtime and cannot be changed
+by CEL expressions.
 
 Register statically in an agent's YAML, or dynamically on a running
 session via the policy API.
@@ -61,12 +63,14 @@ CEL reference: https://cel.dev/overview/cel-overview
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Mapping, Sequence
 
 try:
     import celpy
     import celpy.celtypes
+    from celpy import Environment, Runner
     from celpy.adapter import json_to_cel
     from celpy.celparser import CELParseError
     from celpy.evaluation import CELEvalError
@@ -77,10 +81,15 @@ from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
     PolicyResponse,
+    is_reserved_state_key,
     request_user_text,
 )
 
 _log = logging.getLogger(__name__)
+
+# Engines are rebuilt for every evaluation, so compiled programs are reused
+# across builds from a bounded cache. A multi-KB expression's AST is up to ~1 MB.
+_PROGRAM_CACHE_SIZE = 64
 
 
 def cel_policy(
@@ -126,14 +135,15 @@ def cel_policy(
             "Install it with: pip install cel-python"
         )
 
-    env = celpy.Environment()
+    # Environment() raises the recursion limit deep expressions need; cache
+    # hits skip it, so keep that side effect on every build.
+    Environment()
     try:
-        ast = env.compile(expression)
+        prog = _compile(expression)
     except CELParseError as exc:
         _log.warning("CEL compile error: %s", exc)
         raise ValueError(f"CEL policy: compile error in expression: {exc}") from exc
 
-    prog = env.program(ast)
     _result_key = celpy.celtypes.StringType("result")
     _reason_key = celpy.celtypes.StringType("reason")
     _state_updates_key = celpy.celtypes.StringType("state_updates")
@@ -179,10 +189,33 @@ def cel_policy(
             state_updates = _plain_cel_value(result[_state_updates_key])
             if not isinstance(state_updates, list):
                 raise TypeError("CEL policy: state_updates must be a list of maps.")
+            # Approval checkpoints may only be written by trusted runtime policies.
+            for update in state_updates:
+                if isinstance(update, dict):
+                    key = update.get("key")
+                    if isinstance(key, str) and is_reserved_state_key(key):
+                        raise ValueError("CEL policy: state_updates cannot change reserved keys.")
             out["state_updates"] = state_updates  # type: ignore[typeddict-item]
         return out
 
     return evaluate
+
+
+@functools.lru_cache(maxsize=_PROGRAM_CACHE_SIZE)
+def _compile(expression: str) -> Runner:
+    """
+    Parse and program a CEL expression, memoised per process.
+
+    The interpreted runner is reentrant: each ``evaluate`` call builds its
+    own evaluator and activation and only reads the shared AST. Parse
+    errors are not cached, so invalid expressions raise on every call.
+
+    :param expression: CEL source text.
+    :returns: A runner ready to evaluate.
+    :raises CELParseError: If the expression has syntax errors.
+    """
+    env = Environment()
+    return env.program(env.compile(expression))
 
 
 def _plain_cel_value(value: object) -> object:
@@ -252,6 +285,9 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                             '"set"|"increment"|"delete"|"append", "value": any}; '
                             "`value` is required for set/increment/append and ignored "
                             "for delete. "
+                            "Keys beginning with `_policy_` are reserved for the runtime. "
+                            "Attempting to update one denies the event and discards this "
+                            "CEL result's entire state-update list. "
                             "Event fields: "
                             'event.type ("request"|"tool_call"|"tool_result"|'
                             '"response"|"llm_request"|"llm_response"|"output_logged"); '

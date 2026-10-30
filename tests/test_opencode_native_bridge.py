@@ -28,7 +28,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     update_last_applied_model,
     update_last_event_id,
     update_model_override,
-    user_opencode_config_path,
+    user_opencode_config_paths,
     write_bridge_state,
     write_cost_popup_config,
     write_opencode_policy_plugin,
@@ -443,58 +443,36 @@ def test_seed_opencode_auth_noop_without_source(
     assert bridge.seeded_provider_ids(bridge_dir) == frozenset()
 
 
-def test_user_opencode_config_path_default_location(
+def test_user_opencode_config_paths_default_location(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Without XDG_CONFIG_HOME, looks at ~/.config/opencode/opencode.jsonc."""
+    """Without XDG_CONFIG_HOME, looks under ~/.config/opencode."""
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     fake_home = tmp_path / "fake_home"
     monkeypatch.setattr(Path, "home", lambda: fake_home)
-    # File does not exist → returns None.
-    assert user_opencode_config_path() is None
-    # Create the file and verify the path is as expected.
+    # No config files exist: empty list.
+    assert user_opencode_config_paths() == []
+    # Create a file and verify the path is as expected.
     (fake_home / ".config" / "opencode").mkdir(parents=True)
     (fake_home / ".config" / "opencode" / "opencode.jsonc").write_text("{}")
     expected = fake_home / ".config" / "opencode" / "opencode.jsonc"
-    assert user_opencode_config_path() == expected
+    assert user_opencode_config_paths() == [expected]
 
 
-def test_user_opencode_config_path_honors_xdg_config_home(
+def test_user_opencode_config_paths_ordered_by_merge_precedence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """XDG_CONFIG_HOME env var redirects the lookup."""
-    cfg_dir = tmp_path / "my-config" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "my-config"))
-    path = user_opencode_config_path()
-    assert path is not None and path.exists()
-    assert path.name == "opencode.jsonc"
-
-
-def test_user_opencode_config_path_falls_back_to_json(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """When only opencode.json exists (no .jsonc), returns the .json path."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    path = user_opencode_config_path()
-    assert path is not None and path.name == "opencode.json"
-
-
-def test_user_opencode_config_path_prefers_jsonc(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """When both .jsonc and .json exist, .jsonc is preferred."""
+    """XDG_CONFIG_HOME redirects the lookup; files come back in opencode's merge order."""
     cfg_dir = tmp_path / "pref" / "opencode"
     cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
-    (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
+    for name in ("opencode.jsonc", "opencode.json", "config.json"):
+        (cfg_dir / name).write_text("{}", encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "pref"))
-    path = user_opencode_config_path()
-    assert path is not None and path.name == "opencode.jsonc"
+    assert [p.name for p in user_opencode_config_paths()] == [
+        "config.json",
+        "opencode.json",
+        "opencode.jsonc",
+    ]
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
@@ -674,6 +652,21 @@ async def test_connect_env_provider_keys_skips_stored_and_failures() -> None:
 async def test_connect_env_provider_keys_noop_without_env() -> None:
     client = _KeyClient()
     assert await bridge.connect_env_provider_keys(client, environ={}) == []
+    assert client.calls == []
+
+
+async def test_connect_env_provider_keys_never_posts_aws_chain_vars() -> None:
+    """AWS credential-chain variables are not API keys; OpenCode reads them itself."""
+    client = _KeyClient()
+    connected = await bridge.connect_env_provider_keys(
+        client,
+        environ={
+            "AWS_ACCESS_KEY_ID": "AKIAEXAMPLE",
+            "AWS_REGION": "us-east-1",
+            "AWS_BEARER_TOKEN_BEDROCK": "bedrock-token",
+        },
+    )
+    assert connected == []
     assert client.calls == []
 
 

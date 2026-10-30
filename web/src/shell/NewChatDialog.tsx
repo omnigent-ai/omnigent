@@ -1,20 +1,33 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
+import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
+import { McpRegistryLaunchPicker } from "./McpRegistryLaunchPicker";
 import {
   HarnessPicker,
   HarnessPickerEntry,
   HarnessPickerConfigPage,
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "@/lib/routing";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
   ComposerWorkspaceBar,
   ComposerWorkspaceTrigger,
   ComposerHostTrigger,
   ComposerPermissionPicker,
   ComposerConfigTooltipRows,
+  ComposerMenuTooltip,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import {
@@ -22,9 +35,17 @@ import {
   HarnessMenuNavigationLabel,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
-import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerConfigSections,
+  type ComposerConfigSection,
+} from "@/components/composer/ComposerConfigSections";
+import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { buildFusionSections } from "@/components/composer/fusionSections";
-import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
+import {
+  compactModelTriggerLabel,
+  nativeModelTooltip,
+  normalizeEffortLabel,
+} from "@/lib/composerModelLabel";
 import {
   codexCreateApprovalOptions,
   applyCodexApprovalSelection,
@@ -37,16 +58,21 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  SandboxProfilePicker,
+  useSandboxProfileCatalog,
+  type SandboxProfileSelection,
+} from "@/components/SandboxProfilePicker";
+import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
   CircleHelpIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  ChevronsUpDownIcon,
   GitBranchIcon,
-  LockIcon,
+  FileTextIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
@@ -54,13 +80,12 @@ import {
   ShuffleIcon,
   WandSparklesIcon,
   TriangleAlertIcon,
-  XIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/AgentCard";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
@@ -72,6 +97,7 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   defaultModelLabel,
+  nativeEffortOptions,
   nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
@@ -89,22 +115,35 @@ import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
-import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
+import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
+  MAX_SANDBOX_REPOS,
+  SANDBOX_WORKSPACE_LENGTH_MESSAGE,
+  composeSandboxWorkspaces,
+  deriveRepoName,
+  isValidSandboxBranch,
+  isValidSandboxRepoUrl,
+  isValidSandboxWorkspaceLength,
+} from "@/lib/sandboxRepositories";
+
+export {
+  SANDBOX_REPO_LABEL_KEY,
+  composeSandboxWorkspace,
+  composeSandboxWorkspaces,
+  deriveRepoName,
+  isValidSandboxRepoUrl,
+  splitSandboxWorkspace,
+} from "@/lib/sandboxRepositories";
+import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { HarnessFixDialog } from "@/pages/settings/HarnessFixDialog";
+import { applyHarnessFixResult, harnessFixMode, harnessStatus } from "@/lib/harnessFix";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
 import {
   harnessReadinessOnHost,
@@ -114,13 +153,27 @@ import {
   isCodexHarness,
   isNativeCursorHarness,
   isNativeOpenCodeHarness,
+  skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  pickerCuration,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+  sandboxProfilesEnabled,
+} from "@/lib/capabilities";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
-import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
+import {
+  isSlashCommandText,
+  matchSlashCommandInvocation,
+  skillDisplayNames,
+  skillMenuDescription,
+  SlashCommandMenu,
+} from "@/components/SlashCommandMenu";
 import {
   beginLocalConversation,
   hasPendingLocalMessage,
@@ -134,7 +187,7 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
-import { isNavigablePath } from "./WorkspacePicker";
+import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
@@ -147,12 +200,18 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  withProjectLaunchDefaults,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import {
+  onProjectLaunchDefaultsCleared,
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import {
   readLastHostChoice,
   writeLastHostChoice,
@@ -166,6 +225,7 @@ import {
   writeLastHarness,
 } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
+import { useHiddenPickerAgents } from "@/hooks/useHiddenPickerAgents";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
@@ -207,8 +267,8 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
-  isAcpHarnessAgent,
   partitionAgentsByKind,
+  partitionPickerEntries,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
@@ -239,20 +299,32 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
+import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
-import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
+import {
+  previewIsUnsupported,
+  sandboxModelOptionsKey,
+  useSandboxModelOptions,
+  useSandboxUnsupportedAgents,
+} from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
-import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
+  checkDbcert,
   getDesktopFeatures,
   getHostIdentity,
+  hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
+import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
 import {
+  fetchUserAgents,
+  USER_AGENTS_QUERY_KEY,
   useAvailableAgents,
   prefetchAvailableAgentDetails,
   type AvailableAgent,
@@ -314,6 +386,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
+import { installAgentBundle } from "@/lib/agentsApi";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
@@ -480,9 +553,12 @@ function ConnectingText({ className }: { className?: string }) {
 export function ConnectHostInstructions({
   serverUrl,
   label,
+  onSshConnected,
 }: {
   serverUrl: string;
   label?: string;
+  /** After the desktop shell connects a machine over SSH, with its host id. */
+  onSshConnected?: (hostId: string) => void;
 }) {
   // Databricks/internal deployments add the "Databricks Lakebox" connect
   // path; OSS deployments (where the lakebox launcher is excluded) show
@@ -492,6 +568,7 @@ export function ConnectHostInstructions({
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
+  const sshConnectAvailable = useSshConnectAvailable();
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
@@ -528,26 +605,17 @@ export function ConnectHostInstructions({
           testIdPrefix="connect-host"
         />
       )}
+      {sshConnectAvailable && <SshConnectForm onConnected={onSshConnected} />}
     </div>
   );
 }
 
 /**
- * Return true when ``workspace`` is acceptable to send to the backend.
- *
- * Per designs/SESSION_WORKSPACE_SELECTION.md: only fully-absolute
- * paths (starting with ``/``) are accepted. Tilde-prefixed and
- * relative paths are rejected because the server never expands ``~``
- * — that's the host's job, and the workspace request body must be
- * an unambiguous absolute path. Empty / whitespace-only input is
- * also rejected so the submit button is disabled until the user
- * has typed something usable.
- *
- * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * Match session-create validation: accept absolute POSIX or drive-letter paths.
+ * The host must expand tilde and relative paths before submission.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  return isHostAbsolutePath(workspace.trim());
 }
 
 /**
@@ -846,7 +914,8 @@ function harnessWarningMessage(
  *
  * Gated on the setup feature: when OFF, renders the original "run omnigent
  * setup" guidance so the flag-off UI is unchanged. When ON, offers a "Set up
- * <agent>" action that opens the shared {@link HarnessSetupDialog}.
+ * <agent>" action that repairs native agents on user hosts in place, or opens
+ * the setup checklist for other agents and managed hosts.
  */
 function HarnessSetupNotice({
   agentName,
@@ -905,8 +974,8 @@ function HarnessSetupNotice({
  * agent's input when the runner injects the text via ``tmux
  * send-keys`` (Claude Code / Codex native), while preserving newlines
  * (``\n``) and tabs (``\t``) so multi-line prompts survive. Mirrors
- * openui's server-side terminal-input sanitization. Trailing/leading
- * whitespace is trimmed so a whitespace-only prompt collapses to "".
+ * openui's server-side terminal-input sanitization. Preserve Markdown
+ * indentation; whitespace-only prompts still collapse to "".
  *
  * @param prompt Raw textarea value the user typed, e.g.
  *   ``"read the README\nand summarize"``.
@@ -918,299 +987,19 @@ export function sanitizeInitialPrompt(prompt: string): string {
   // prompts need. The control chars in the class are the point of the
   // rule, so suppress no-control-regex here (oxlint honors this).
   // eslint-disable-next-line no-control-regex
-  return prompt.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "").trim();
-}
-
-/**
- * Session label recording the repository a managed session was created
- * with, as the raw ``<url>[#<branch>]`` request value (the server's
- * ``MANAGED_REPO_LABEL_KEY``). A sandbox relaunch re-clones from it, and
- * the fork dialog seeds its repository field from it so cloning a sandbox
- * session lands in the same checkout — which is why it lives beside the
- * workspace grammar below rather than with the server-capability probe.
- */
-export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
-
-/**
- * Return true when ``url`` is acceptable as a sandbox repository URL.
- *
- * Mirrors the server's accepted forms (``parse_repo_workspace``):
- * ``https://<host>/<path>`` or scp-style ``git@<host>:<path>``. The
- * server is the authority — this only gates the submit button so an
- * obviously unusable value gets inline feedback instead of a 422.
- *
- * @param url Value the user typed in the repository input.
- * @returns true when ``url.trim()`` matches one of the two forms.
- */
-export function isValidSandboxRepoUrl(url: string): boolean {
-  const t = url.trim();
-  return /^https:\/\/[^\s#/]+\/[^\s#]+$/.test(t) || /^git@[^\s#:]+:[^\s#]+$/.test(t);
-}
-
-/**
- * Compose the managed session's ``workspace`` string from the split
- * repository inputs.
- *
- * The API takes one Docker-build-context-style string —
- * ``<url>[#<branch>]`` — and the UI presents split fields, so this is
- * the reassembly step.
- *
- * @param url Repository URL input, e.g. ``"https://github.com/org/repo"``.
- * @param branch Branch input, e.g. ``"main"``; blank means the repo's
- *   default branch.
- * @returns The composed workspace string, or ``undefined`` when no
- *   repository was given (empty sandbox workspace).
- */
-export function composeSandboxWorkspace(url: string, branch: string): string | undefined {
-  const u = url.trim();
-  if (u === "") return undefined;
-  const b = branch.trim();
-  return b === "" ? u : `${u}#${b}`;
-}
-
-/**
- * Split a composed sandbox workspace back into its two inputs.
- *
- * The inverse of {@link composeSandboxWorkspace}: the API carries one
- * ``<url>[#<branch>]`` string, the UI presents a URL field and a branch
- * field. Splits on the FIRST ``#``, matching the server's own parse.
- *
- * @param workspace Composed workspace, e.g.
- *   ``"https://github.com/org/repo#main"``, or ``null`` when unset.
- * @returns The url and branch, each ``""`` when absent.
- */
-export function splitSandboxWorkspace(workspace: string | null): {
-  url: string;
-  branch: string;
-} {
-  if (workspace === null) return { url: "", branch: "" };
-  const hash = workspace.indexOf("#");
-  if (hash === -1) return { url: workspace, branch: "" };
-  return { url: workspace.slice(0, hash), branch: workspace.slice(hash + 1) };
-}
-
-/**
- * Compose the managed session's ``workspaces`` list from the selected repos.
- *
- * Each ``{url, branch}`` becomes a ``<url>[#<branch>]`` string; blank-URL
- * entries are dropped. The API clones them in parallel and starts the agent in
- * the single repo (one entry) or the parent that holds them all (several).
- *
- * @param repos The selected repos, in the order the user added them.
- * @returns The composed workspace strings (may be empty for no repo).
- */
-export function composeSandboxWorkspaces(repos: LastSandboxRepo[]): string[] {
-  return repos
-    .map((r) => composeSandboxWorkspace(r.url, r.branch))
-    .filter((w): w is string => w !== undefined);
-}
-
-// Max repos a managed sandbox may clone — mirrors the server's
-// `_MAX_MANAGED_WORKSPACES` so the picker stops adding before a create 422s.
-const MAX_SANDBOX_REPOS = 10;
-
-/**
- * Derive a repository's display name from its URL.
- *
- * Last path segment with a trailing ``.git`` stripped — the same rule
- * the server uses for the clone directory, so the chip label matches
- * the workspace directory the session will get.
- *
- * @param url Repository URL, e.g. ``"https://github.com/org/repo.git"``.
- * @returns The name, e.g. ``"repo"``; ``null`` when underivable.
- */
-export function deriveRepoName(url: string): string | null {
-  const t = url.trim().replace(/\/+$/, "");
-  if (t === "") return null;
-  const last = t.split(/[/:]/).pop() ?? "";
-  const name = last.endsWith(".git") ? last.slice(0, -4) : last;
-  return name === "" ? null : name;
-}
-
-/** Shared trigger styling for the repo/branch comboboxes. */
-const COMBOBOX_TRIGGER_CLASS =
-  "flex w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors hover:border-ring/60 focus-visible:border-ring";
-
-/**
- * Searchable combobox for picking one of the caller's GitHub repos.
- *
- * A trigger button opens a `cmdk` search list (repos are filtered as you
- * type on ``owner/name``), which scales to accounts with many repos far
- * better than a native ``<select>``. Selecting a repo fills the same
- * URL/branch state the free-text inputs drive; the empty value shows the
- * "Choose a repository…" placeholder.
- *
- * @param repos The caller's accessible repos (newest-first from the API).
- * @param value The selected repo's ``owner/name`` ("" = none).
- * @param onSelect Called with the chosen repo (or ``null`` to clear).
- */
-function SandboxRepoCombobox({
-  repos,
-  value,
-  onSelect,
-}: {
-  repos: GithubRepo[];
-  value: string;
-  onSelect: (repo: GithubRepo | null) => void;
-}): ReactNode {
-  const [open, setOpen] = useState(false);
-  const selected = repos.find((r) => r.full_name === value) ?? null;
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          role="combobox"
-          aria-expanded={open}
-          aria-label="GitHub repository"
-          className={COMBOBOX_TRIGGER_CLASS}
-          data-testid="new-chat-landing-repo-select"
-        >
-          <span className="truncate">{selected ? selected.full_name : "Choose a repository…"}</span>
-          <ChevronsUpDownIcon className="ml-auto size-3.5 shrink-0 opacity-50" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
-        <Command>
-          <CommandInput
-            placeholder="Search repositories…"
-            data-testid="new-chat-landing-repo-search"
-          />
-          <CommandList>
-            <CommandEmpty>No repositories found.</CommandEmpty>
-            <CommandGroup>
-              {repos.map((r) => (
-                <CommandItem
-                  key={r.full_name}
-                  value={r.full_name}
-                  data-checked={r.full_name === value}
-                  onSelect={() => {
-                    onSelect(r);
-                    setOpen(false);
-                  }}
-                >
-                  <span className="truncate">{r.full_name}</span>
-                  {r.private && (
-                    <LockIcon
-                      className="size-3 shrink-0 opacity-60"
-                      aria-label="Private repository"
-                    />
-                  )}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-/**
- * Searchable branch combobox for the connected-GitHub repo picker.
- *
- * Lazily fetches the chosen repo's branches and filters them as you type.
- * The empty value is the "default branch" sentinel: leaving it selected
- * appends no ``#branch`` fragment, so the server clones the repo's default
- * branch.
- *
- * @param fullName The chosen repo's ``owner/name``.
- * @param value The currently selected branch ("" = default).
- * @param defaultBranch The repo's default branch, for the sentinel label.
- * @param onChange Called with the newly selected branch.
- */
-function SandboxRepoBranchSelect({
-  fullName,
-  value,
-  defaultBranch,
-  onChange,
-}: {
-  fullName: string;
-  value: string;
-  defaultBranch: string | null;
-  onChange: (branch: string) => void;
-}): ReactNode {
-  const [open, setOpen] = useState(false);
-  const { data, isPending } = useQuery({
-    queryKey: ["github-branches", fullName],
-    queryFn: () => fetchGithubBranches(fullName),
-    staleTime: 5 * 60_000,
-  });
-  const branches = data?.connected ? data.branches : [];
-  const defaultLabel = defaultBranch ? `Default (${defaultBranch})` : "Default branch";
-  // Options: the fetched branches minus the default (represented by the
-  // empty-value sentinel). Include the current value even before the list
-  // loads (e.g. a draft-restored branch) so the trigger label always
-  // resolves to a real option.
-  const options = branches.filter((b) => b !== defaultBranch);
-  if (value !== "" && !options.includes(value)) {
-    options.unshift(value);
-  }
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          role="combobox"
-          aria-expanded={open}
-          aria-label={`Branch for ${fullName}`}
-          className={COMBOBOX_TRIGGER_CLASS}
-          data-testid="new-chat-landing-repo-branch-select"
-        >
-          <GitBranchIcon className="size-3.5 shrink-0 opacity-60" />
-          <span className="truncate">{value === "" ? defaultLabel : value}</span>
-          <ChevronsUpDownIcon className="ml-auto size-3.5 shrink-0 opacity-50" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
-        <Command>
-          <CommandInput
-            placeholder="Search branches…"
-            data-testid="new-chat-landing-repo-branch-search"
-          />
-          <CommandList>
-            <CommandEmpty>{isPending ? "Loading branches…" : "No branches found."}</CommandEmpty>
-            <CommandGroup>
-              <CommandItem
-                value={defaultLabel}
-                data-checked={value === ""}
-                onSelect={() => {
-                  onChange("");
-                  setOpen(false);
-                }}
-              >
-                {defaultLabel}
-              </CommandItem>
-              {options.map((b) => (
-                <CommandItem
-                  key={b}
-                  value={b}
-                  data-checked={b === value}
-                  onSelect={() => {
-                    onChange(b);
-                    setOpen(false);
-                  }}
-                >
-                  {b}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
+  const sanitized = prompt.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+  return isSlashCommandText(sanitized) ? sanitized.trim() : sanitized.trimEnd();
 }
 
 /**
  * Match a first message against the available bundled and host skills.
  *
- * Uses the in-session composer's shared command-shape guard
- * (:func:`isSlashCommandText`): the first token must read as ``/name``
- * (file paths like ``/etc/hosts`` never match), while the args after it
- * may carry anything — including paths and URLs, e.g.
- * ``"/review-pr https://github.com/..."``. The command name must
- * exactly match an available skill. Unknown commands are sent as plain text.
+ * The message must be ``/`` plus an available skill's full name (which may
+ * contain spaces or punctuation), followed by nothing or by whitespace and
+ * args that may carry anything, including paths and URLs, e.g.
+ * ``"/review-pr https://github.com/..."``. File paths like ``/etc/hosts``
+ * never match because no skill has that name; unknown commands are sent as
+ * plain text.
  *
  * @param text The sanitized first message, e.g. ``"/review-pr 123"``.
  * @param skills The chosen agent's bundled skills and the selected host's catalog.
@@ -1221,12 +1010,11 @@ export function matchSkillInvocation(
   text: string,
   skills: readonly { name: string }[],
 ): { name: string; args: string } | null {
-  const trimmed = text.trim();
-  if (!isSlashCommandText(trimmed)) return null;
-  const command = trimmed.split(/\s+/)[0]!;
-  const name = command.slice(1);
-  if (!skills.some((s) => s.name === name)) return null;
-  return { name, args: trimmed.slice(command.length).trim() };
+  const match = matchSlashCommandInvocation(
+    text,
+    skills.map((s) => `/${s.name}`),
+  );
+  return match && { name: match.command.slice(1), args: match.args };
 }
 
 /**
@@ -1319,6 +1107,16 @@ function visibleModelLabel(label: string): string {
 }
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
+type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
+
+// Harness icon kinds preferred for the picker's inline list, in display order.
+// A deployment that seeds none of these (OMNIGENT_SEEDED_AGENTS) backfills the
+// list from whatever is launchable rather than showing an empty group.
+const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
+// Preferred order within the "Other..." submenu.
+const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
+// How many rows the backfill promotes — matches the inline list's usual size.
+const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
 
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
@@ -1366,6 +1164,10 @@ function NewChatPickerLoading({
   );
 }
 
+function noReachableModelsMessage(name: string | undefined): string {
+  return `No models are available for ${name ?? "this harness"}. Ask an admin to enable model access.`;
+}
+
 /**
  * Unified two-level agent/harness picker for the landing composer.
  *
@@ -1402,6 +1204,7 @@ export function AgentHarnessPicker({
   triggerTooltip,
   triggerTooltipRows,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
+  modelCatalogAvailability,
   triggerIcon,
   selectedConfigContent,
   isEntryConfigurable,
@@ -1410,6 +1213,12 @@ export function AgentHarnessPicker({
   autoHarnessActive = false,
   onSelectAutoHarness,
   openNonce = 0,
+  cyclePreview,
+  onDismissCyclePreview,
+  blockedReasons,
+  onPrefetchEntries,
+  curatedEntries,
+  entriesFailed = false,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -1462,6 +1271,10 @@ export function AgentHarnessPicker({
   triggerTooltipRows?: readonly { label: string; value: string }[];
   /** Model / effort values joined inside the harness trigger. */
   triggerDetails?: readonly { label: string; value: string }[];
+  /** Explicit status for the selected model catalog. `unknown` means there is
+   * no known catalog because lookup is disabled or still loading; omit it for
+   * consumers without catalog state. */
+  modelCatalogAvailability?: ModelCatalogAvailability;
   /** Harness glyph rendered before the joined model / effort label. */
   triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
@@ -1480,6 +1293,18 @@ export function AgentHarnessPicker({
   onSelectAutoHarness?: () => void;
   /** Bump to open the menu imperatively (the landing's model-picker hotkey). */
   openNonce?: number;
+  cyclePreview?: ComposerConfigSection;
+  onDismissCyclePreview?: () => void;
+  /** Agent id → why the target can't run it; those rows render disabled. */
+  blockedReasons?: ReadonlyMap<string, string>;
+  /** Called with the ids of rows the menu is about to show. */
+  onPrefetchEntries?: (agentIds: string[]) => void;
+  /** Set when the deployment curates New Chat: exactly these rows, in this
+   *  order, as one flat list. Other embedders leave it unset. */
+  curatedEntries?: AvailableAgent[];
+  /** Whether the roster could not be loaded, so an empty curated list is a
+   *  failed fetch rather than the deployment's doing. */
+  entriesFailed?: boolean;
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
@@ -1512,15 +1337,20 @@ export function AgentHarnessPicker({
     : null;
   const triggerModelText = triggerModel ? compactModelTriggerLabel(triggerModel.value) : "";
   const triggerEffortText = triggerEffort ? compactModelTriggerLabel(triggerEffort.value) : "";
+  const modelCatalogUnavailable = modelCatalogAvailability === "unavailable";
   const visibleModelText = selectedUnavailable
     ? ""
-    : triggerModelText === "Default"
+    : modelCatalogUnavailable
       ? "Models unavailable"
       : triggerModelText;
   const visibleEffortText =
     triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
   const triggerAccessibleDetails = triggerDetails
-    .map((detail) => `${detail.label} ${compactModelTriggerLabel(detail.value)}`)
+    .map((detail) =>
+      detail.label === "Model" && modelCatalogUnavailable
+        ? "Model unavailable"
+        : `${detail.label} ${compactModelTriggerLabel(detail.value)}`,
+    )
     .join(", ");
   const triggerAccessibleName = [
     hasAgents ? agentLabel : "No agents",
@@ -1537,10 +1367,15 @@ export function AgentHarnessPicker({
     : visibleEffortText;
   const previewOnly = loading && !interactiveWhileLoading;
   const cachedPreview = previewOnly ? readNewChatPickerCache(cacheKey) : null;
-  const visibleCachedPreview = selectedUnavailable ? null : cachedPreview;
+  const visibleCachedPreview =
+    selectedUnavailable || modelCatalogUnavailable ? null : cachedPreview;
   const resolvedPreview = useMemo<NewChatPickerPreview | null>(
     () =>
-      selectedEntry && hasAgents && visibleModelText !== "Models unavailable"
+      selectedEntry &&
+      hasAgents &&
+      !selectedUnavailable &&
+      modelCatalogAvailability !== "unavailable" &&
+      modelCatalogAvailability !== "unknown"
         ? {
             agent: { name: selectedEntry.name, harness: selectedEntry.harness },
             label: triggerAccessibleName,
@@ -1552,7 +1387,8 @@ export function AgentHarnessPicker({
     [
       selectedEntry,
       hasAgents,
-      visibleModelText,
+      selectedUnavailable,
+      modelCatalogAvailability,
       triggerAccessibleName,
       triggerText,
       triggerSecondaryText,
@@ -1624,14 +1460,16 @@ export function AgentHarnessPicker({
     const summary = details || entrySummaries?.[agent.id] || "Default";
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
     const readiness = harnessReadinessOnHost(agent.harness, host);
-    const unavailable = !readiness.selectable && readiness.fallbackRelevant;
-    const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
-    const warningMessage = harnessWarningMessage(
-      agent.display_name,
-      host?.name,
-      readiness.reason,
-      agent.harness,
-    );
+    const blockedReason = blockedReasons?.get(agent.id);
+    const unavailable =
+      blockedReason !== undefined || (!readiness.selectable && readiness.fallbackRelevant);
+    const warning =
+      blockedReason !== undefined
+        ? "No models available"
+        : harnessWarningBadgeText(readiness.reason, collapsedBadge);
+    const warningMessage =
+      blockedReason ??
+      harnessWarningMessage(agent.display_name, host?.name, readiness.reason, agent.harness);
     return (
       <HarnessPickerEntry
         key={agent.id}
@@ -1684,32 +1522,109 @@ export function AgentHarnessPicker({
   // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
   // nothing is hidden in those cases, and unrecognized harnesses stay visible.
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
+  // Per-entry hides from Settings › Appearance; the selected entry is never
+  // hidden, so a stored pick can't vanish from its own picker.
+  const hiddenAgents = useHiddenPickerAgents();
+  const isHiddenEntry = useCallback(
+    (agent: AvailableAgent) => agent.id !== effectiveAgentId && hiddenAgents.has(agent.name),
+    [hiddenAgents, effectiveAgentId],
+  );
+  const { readyHarnessEntries, moreHarnessEntries, hidOfferedHarness } = useMemo(() => {
     const ready: AvailableAgent[] = [];
-    const more: AvailableAgent[] = [];
-    const primaryOrder = ["claude", "cursor", "codex"];
-    const secondaryOrder = ["opencode", "pi"];
+    let more: AvailableAgent[] = [];
+    let hidOffered = false;
+    // Recorded during the split so the backfill below asks the same question
+    // rather than restating it inverted.
+    const unavailableIds = new Set<string>();
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
       const readiness = harnessReadinessOnHost(agent.harness, host);
       const unavailable = !readiness.selectable && readiness.fallbackRelevant;
       if (!selected && hideUnconfigured && unavailable) continue;
+      // Readiness runs first, so this records only hides that removed an offered row.
+      if (isHiddenEntry(agent)) {
+        hidOffered = true;
+        continue;
+      }
+      if (unavailable) unavailableIds.add(agent.id);
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      const primary = primaryOrder.includes(key) || agent.id === promotedHarnessId;
+      const primary = PRIMARY_HARNESS_ORDER.includes(key) || agent.id === promotedHarnessId;
       // Unavailable primaries demote to "Other..." — the main list stays
       // launch-ready; the selected harness always keeps its slot.
       if (primary && (selected || !unavailable)) {
         ready.push(agent);
       } else more.push(agent);
     }
-    const rank = (agent: AvailableAgent, order: string[]) => {
+    const rank = (agent: AvailableAgent, order: readonly string[]) => {
       const index = order.indexOf(nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "");
       return index < 0 ? order.length : index;
     };
-    ready.sort((first, second) => rank(first, primaryOrder) - rank(second, primaryOrder));
-    more.sort((first, second) => rank(first, secondaryOrder) - rank(second, secondaryOrder));
-    return { readyHarnessEntries: ready, moreHarnessEntries: more };
-  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
+    ready.sort(
+      (first, second) => rank(first, PRIMARY_HARNESS_ORDER) - rank(second, PRIMARY_HARNESS_ORDER),
+    );
+    more.sort(
+      (first, second) =>
+        rank(first, SECONDARY_HARNESS_ORDER) - rank(second, SECONDARY_HARNESS_ORDER),
+    );
+    // No preferred harness survived: promote the best launchable ones inline.
+    if (ready.length === 0) {
+      const promoted = more
+        .filter((agent) => !unavailableIds.has(agent.id))
+        .slice(0, INLINE_HARNESS_FALLBACK);
+      if (promoted.length > 0) {
+        ready.push(...promoted);
+        const promotedIds = new Set(promoted.map((agent) => agent.id));
+        more = more.filter((agent) => !promotedIds.has(agent.id));
+      }
+    }
+    return { readyHarnessEntries: ready, moreHarnessEntries: more, hidOfferedHarness: hidOffered };
+  }, [harnessEntries, host, hideUnconfigured, isHiddenEntry, effectiveAgentId, promotedHarnessId]);
+  // A curated list keeps the deployment's order but honours the same per-entry
+  // hides and "hide unconfigured harnesses" preference as the grouped menu, with
+  // the selected row always kept so the trigger's choice stays in the list.
+  const visibleCuratedEntries = useMemo(() => {
+    if (curatedEntries === undefined) return undefined;
+    const harnessIds = new Set(harnessEntries.map((agent) => agent.id));
+    return curatedEntries.filter((agent) => {
+      if (isHiddenEntry(agent)) return false;
+      if (agent.id === effectiveAgentId || !hideUnconfigured || !harnessIds.has(agent.id)) {
+        return true;
+      }
+      const readiness = harnessReadinessOnHost(agent.harness, host);
+      return readiness.selectable || !readiness.fallbackRelevant;
+    });
+  }, [curatedEntries, harnessEntries, hideUnconfigured, isHiddenEntry, effectiveAgentId, host]);
+  // Why a curated list is empty, which is not always the deployment's doing:
+  // a failed roster fetch and a harness this host lacks read differently.
+  const curatedEmptyState = entriesFailed
+    ? { title: "Agents could not be loaded.", detail: "Check your connection and try again." }
+    : curatedEntries?.some(isHiddenEntry)
+      ? {
+          title: "Every entry is hidden.",
+          detail: "Turn some back on in Settings, under Appearance.",
+        }
+      : {
+          title: "No agents are available here.",
+          detail:
+            curatedEntries?.length === 0
+              ? "This deployment limits which agents New Chat offers."
+              : "The offered harnesses are not set up on this host and are hidden by your settings.",
+        };
+  // What a menu open prefetches sandbox support for: every harness row it shows.
+  const prefetchIds = useMemo(
+    () =>
+      (visibleCuratedEntries ?? readyHarnessEntries)
+        .filter((agent) => harnessEntries.some((entry) => entry.id === agent.id))
+        .map((agent) => agent.id),
+    [visibleCuratedEntries, readyHarnessEntries, harnessEntries],
+  );
+  // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
+  const prefetchedOpenNonce = useRef(0);
+  useEffect(() => {
+    if (!openNonce || openNonce === prefetchedOpenNonce.current) return;
+    prefetchedOpenNonce.current = openNonce;
+    onPrefetchEntries?.(prefetchIds);
+  }, [openNonce, onPrefetchEntries, prefetchIds]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
@@ -1720,9 +1635,12 @@ export function AgentHarnessPicker({
   // in the main list; user-registered custom agents fold into an "Other..."
   // submenu so a long roster doesn't crowd out the recommended picks.
   const { builtins: bundleEntries, customs: customEntries } = useMemo(
-    () => partitionAgentsByKind(agentEntries),
-    [agentEntries],
+    () => partitionAgentsByKind(agentEntries.filter((agent) => !isHiddenEntry(agent))),
+    [agentEntries, isHiddenEntry],
   );
+
+  // Curated deployments get one flat list in config order.
+  const curated = curatedEntries !== undefined;
 
   // Existing custom / pending agents fold into an "Other..." submenu so a
   // long roster doesn't crowd the recommended picks. When there are none, the
@@ -1773,6 +1691,16 @@ export function AgentHarnessPicker({
       )}
     </>
   );
+  // Nothing is left to pick and the per-entry hides removed at least one row,
+  // so point at Settings ("Create custom agent" may still render).
+  const allEntriesHidden =
+    (hidOfferedHarness || agentEntries.some(isHiddenEntry)) &&
+    !autoHarnessAvailable &&
+    readyHarnessEntries.length === 0 &&
+    moreHarnessEntries.length === 0 &&
+    bundleEntries.length === 0 &&
+    customEntries.length === 0 &&
+    pendingAgent == null;
   const showMore = isMobile && menuPage === "more" && moreHarnessEntries.length > 0;
   const showCustom = isMobile && menuPage === "custom" && hasCustomGroup;
   const showConfig = isMobile && menuPage === "config" && selectedConfigContent != null;
@@ -1807,6 +1735,8 @@ export function AgentHarnessPicker({
   return (
     <HarnessPicker
       modal={dropdownModal}
+      cyclePreview={cyclePreview}
+      onDismissCyclePreview={onDismissCyclePreview}
       open={open}
       onOpenChange={(next) => {
         if (!next) {
@@ -1821,10 +1751,11 @@ export function AgentHarnessPicker({
           for (const agent of [...harnessEntries, ...agentEntries]) {
             void prefetchAvailableAgentDetails(agent, queryClient);
           }
+          onPrefetchEntries?.(prefetchIds);
         }
       }}
       trigger={{
-        disabled: disabledLabel !== undefined || previewOnly || !hasAgents,
+        disabled: disabledLabel !== undefined || previewOnly || (!hasAgents && !curated),
         "aria-busy": loading || undefined,
         label: disabledLabel ?? visibleCachedPreview?.label ?? triggerAccessibleName,
         model: disabledLabel ?? visibleCachedPreview?.model ?? triggerText,
@@ -1922,6 +1853,37 @@ export function AgentHarnessPicker({
           <DropdownMenuSeparator />
           {customAgentsBody}
         </div>
+      ) : curated ? (
+        // One flat list: the agents this deployment offers, in its order.
+        <div data-testid="new-chat-landing-curated">
+          {visibleCuratedEntries?.length === 0 ? (
+            <div
+              data-testid="new-chat-landing-no-agents"
+              role="status"
+              // The menu is whitespace-nowrap; this copy is a sentence and has to wrap.
+              className="px-2 py-3 text-ui whitespace-normal text-muted-foreground"
+            >
+              {curatedEmptyState.title}
+              <div className="text-xs leading-4">{curatedEmptyState.detail}</div>
+            </div>
+          ) : (
+            visibleCuratedEntries?.map(renderEntry)
+          )}
+        </div>
+      ) : allEntriesHidden ? (
+        <>
+          <div
+            data-testid="new-chat-landing-all-hidden"
+            role="status"
+            className="px-2 py-3 text-ui whitespace-normal text-muted-foreground"
+          >
+            Every entry is hidden.
+            <div className="text-xs leading-4">
+              Turn some back on in Settings, under Appearance.
+            </div>
+          </div>
+          {createAgentItem}
+        </>
       ) : (
         <>
           {/* Smart Routing sits in its own unlabeled group above the
@@ -1965,6 +1927,7 @@ export function AgentHarnessPicker({
                     data-testid="new-chat-landing-harness-more"
                     onSelect={(e) => {
                       e.preventDefault();
+                      onPrefetchEntries?.(moreHarnessEntries.map((agent) => agent.id));
                       setMenuPage("more");
                     }}
                     className="items-center"
@@ -1974,7 +1937,11 @@ export function AgentHarnessPicker({
                   </DropdownMenuItem>
                 ) : (
                   // Desktop: hover flyout submenu.
-                  <DropdownMenuSub>
+                  <DropdownMenuSub
+                    onOpenChange={(next) => {
+                      if (next) onPrefetchEntries?.(moreHarnessEntries.map((agent) => agent.id));
+                    }}
+                  >
                     <DropdownMenuSubTrigger
                       data-testid="new-chat-landing-harness-more"
                       className="cursor-pointer items-center"
@@ -1999,11 +1966,18 @@ export function AgentHarnessPicker({
                     </HarnessPickerSubContent>
                   </DropdownMenuSub>
                 ))}
-              <DropdownMenuSeparator />
+              {/* Only when something follows it. A trimmed deployment can have
+                no bundle agents and no custom group, and a rule closing the
+                menu with nothing under it is the same leftover the Agents
+                header below avoids. */}
+              {(bundleEntries.length > 0 || hasCustomGroup) && <DropdownMenuSeparator />}
             </>
           )}
-          {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
-          <PickerSectionHeader>Agents</PickerSectionHeader>
+          {/* Agents group — bundle agents inline; header only when the group
+            has content, like "Harnesses" above. */}
+          {(bundleEntries.length > 0 || hasCustomGroup) && (
+            <PickerSectionHeader>Agents</PickerSectionHeader>
+          )}
           {bundleEntries.map(renderEntry)}
           {/* Existing custom agents fold into an "Other..." submenu (with
             the pending upload and the create action). With no custom agents the
@@ -2055,6 +2029,7 @@ export function AgentHarnessPicker({
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
 interface LandingDraft {
+  mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
   // attachments — the agent/host/workspace slots are discarded so the new
@@ -2066,6 +2041,7 @@ interface LandingDraft {
   selectedHostId: string | null;
   sandboxSelected: boolean;
   sandboxProvider: string | null;
+  sandboxProfile: SandboxProfileSelection | null;
   sandboxRepoSelections: LastSandboxRepo[];
   workspace: string;
   branchName: string;
@@ -2073,6 +2049,7 @@ interface LandingDraft {
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
+  codexPlanMode: boolean;
   cursorExecMode: string;
   agySkipMode: string;
   devinPermissionMode: string;
@@ -2104,7 +2081,9 @@ export function resetLandingDraft(): void {
 
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
+  const linkedPrompt = searchParams.get("prompt");
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2140,7 +2119,7 @@ export function NewChatLandingScreen() {
     [pickerCacheKey],
   );
   // Project prefill source: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree).
+  // project's stored defaults, overlaid with its last start (localStorage).
   // `?project=` carries the project NAME, so resolve it to the first-class id
   // the config endpoint needs; a label-only folder (id null) or plain visit
   // has no config to read. Resolved before the agent catalog below so the
@@ -2155,6 +2134,33 @@ export function NewChatLandingScreen() {
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
+  // The project's last start wins until its stored defaults are saved after it;
+  // a Project settings save clears it, so re-read it then.
+  const [launchClears, setLaunchClears] = useState(0);
+  useEffect(() => onProjectLaunchDefaultsCleared(() => setLaunchClears((count) => count + 1)), []);
+  const projectLaunch = useMemo(() => {
+    void launchClears;
+    return configProjectId === null || projectConfigLoading
+      ? null
+      : readProjectLaunchDefaults(configProjectId, storedProjectConfig ?? {});
+  }, [configProjectId, projectConfigLoading, storedProjectConfig, launchClears]);
+  // Option keys picked per harness during this visit. A pick also updates the
+  // app-global memory, so those keys keep coming from there.
+  const pickedOptionKeysRef = useRef(new Map<string, Set<string>>());
+  // The options the last start's harness launched with outrank the app-global
+  // per-harness memory for that harness, except keys picked during this visit.
+  const readRememberedHarnessOptions = useCallback(
+    (harness: string | null | undefined): HarnessOptions => {
+      const remembered = readHarnessOptions(harness);
+      if (harness == null || projectLaunch?.harness !== harness) return remembered;
+      const picked = pickedOptionKeysRef.current.get(harness);
+      const launched = Object.entries(projectLaunch.harnessOptions ?? {}).filter(
+        ([key]) => !picked?.has(key),
+      );
+      return { ...remembered, ...Object.fromEntries(launched) };
+    },
+    [projectLaunch],
+  );
   // Normalize into the machine's shape. `undefined` = still loading (the machine
   // waits so a generic default can't win the race); `{}` = nothing to wait for
   // (plain visit / label-only folder / genuinely empty config), so it settles
@@ -2166,20 +2172,24 @@ export function NewChatLandingScreen() {
     if (projectParam !== "" && projectListLoading) return undefined;
     if (configProjectId !== null && projectConfigLoading) return undefined;
     const c = storedProjectConfig;
-    if (!c) return {};
-    return {
-      hostId: c.host_id,
-      workspace: c.workspace,
-      agentId: c.agent_id,
-      useWorktree: c.use_worktree,
-      model: c.model,
-    };
+    const stored: ProjectPrefillConfig = c
+      ? {
+          hostId: c.host_id,
+          workspace: c.workspace,
+          agentId: c.agent_id,
+          useWorktree: c.use_worktree,
+          model: c.model,
+          effort: c.effort,
+        }
+      : {};
+    return withProjectLaunchDefaults(stored, projectLaunch);
   }, [
     projectParam,
     projectListLoading,
     configProjectId,
     projectConfigLoading,
     storedProjectConfig,
+    projectLaunch,
   ]);
 
   // Preserve a configured agent through name deduplication when it is in the
@@ -2190,7 +2200,9 @@ export function NewChatLandingScreen() {
     isError: agentsError,
     isPlaceholderData: agentsArePlaceholder,
   } = useAvailableAgents({
-    pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
+    pinnedAgentIds: [prefillConfig?.agentId, prefillConfig?.launchAgentId].filter(
+      (id): id is string => id != null,
+    ),
   });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
@@ -2209,26 +2221,29 @@ export function NewChatLandingScreen() {
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
 
-  const agentList = useMemo(
-    () =>
-      selectableSessionAgents(
-        (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
-      ),
-    [agents, agentsLoading, cachedPickerOptions],
-  );
+  // Filter and order selectable agents by deployment curation.
+  const info = useServerInfo();
+  const curation = pickerCuration(info);
+  const agentList = useMemo(() => {
+    const selectable = selectableSessionAgents(
+      (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
+    );
+    if (curation.restrictToAgentNames.size === 0) return selectable;
+    const allowed = selectable.filter((agent) => curation.restrictToAgentNames.has(agent.name));
+    const order = [...curation.restrictToAgentNames];
+    return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
+  }, [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames]);
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
   // and "Agents" (composed SDK / bundle agents like Polly & Debby plus custom
   // user-registered agents). Harness-backed vs composed, NOT the builtins/customs
   // split: Polly & Debby are built-ins but are composed agents, so they stay
-  // under "Agents". ACP agents aren't native, so they fold into "More".
-  const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
-    [agentList],
-  );
-  const agentEntries = useMemo(
-    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+  // under "Agents". ACP agents aren't native, so they fold into "More". The
+  // user's own agents stay under "Agents" even on a native harness, so one never
+  // passes for a harness row (or for the Claude Code wrapper Smart Routing binds).
+  const { harnesses: harnessEntries, agents: agentEntries } = useMemo(
+    () => partitionPickerEntries(agentList),
     [agentList],
   );
 
@@ -2263,6 +2278,7 @@ export function NewChatLandingScreen() {
           selectedHostId: null,
           sandboxSelected: false,
           sandboxProvider: null,
+          sandboxProfile: null,
           // The repo inputs compose the managed create's workspace string, so
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
@@ -2275,10 +2291,29 @@ export function NewChatLandingScreen() {
           autoSeededBranch: "",
         };
 
-  const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [message, setMessage] = useState<string>(() =>
+    linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
+  );
+  useEffect(() => {
+    if (!searchParams.has("prompt")) return;
+    if (linkedPrompt?.trim()) setMessage(linkedPrompt);
+    // Consume the link once so returning to the composer preserves edits.
+    const remaining = new URLSearchParams(searchParams);
+    remaining.delete("prompt");
+    navigate(
+      { search: remaining.toString(), hash: location.hash },
+      { replace: true, state: location.state },
+    );
+  }, [linkedPrompt, searchParams, location.hash, location.state, navigate]);
+  const [checkingDbcert, setCheckingDbcert] = useState(false);
+  const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const submitTooltipTriggerRef = useRef<HTMLSpanElement>(null);
+  const [submitTooltipState, setSubmitTooltipState] = useState<"closed" | "open" | "pinned">(
+    "closed",
+  );
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(message, setMessage, textareaRef);
@@ -2293,19 +2328,37 @@ export function NewChatLandingScreen() {
   // — without it the upload only fails after the session is created and
   // navigated into, where the first turn's 415 strands the typed message in
   // a session the user never wanted.
-  const { files, attachmentError, addFiles, removeFile, restoreFiles, onPaste, clearError } =
-    useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
+  const {
+    files,
+    attachmentError,
+    accept: fileAccept,
+    addFiles,
+    removeFile,
+    restoreFiles,
+    onPaste,
+    clearError,
+  } = useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
-  const isDragActive = useFileDropTarget(landingSurface, addFiles);
+  const isDragActive = useFileDropTarget(landingSurface, (droppedFiles) => {
+    if (!checkingDbcert) addFiles(droppedFiles);
+  });
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
-  const info = useServerInfo();
+  const profilesEnabled = sandboxProfilesEnabled(info);
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
+  const {
+    selected: mcpRegistryServices,
+    toggle: toggleMcpRegistryService,
+    catalog: mcpRegistryCatalog,
+    selectionError: mcpSelectionError,
+    servicesForLaunch: mcpServicesForLaunch,
+  } = useMcpRegistrySelection(restoredDraft?.mcpRegistryServices, mcpRegistryEnabled);
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers
   // a family the host runs through the gateway; the built-in judge covers any
@@ -2379,6 +2432,12 @@ export function NewChatLandingScreen() {
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => restoredDraft?.sandboxProvider ?? null,
   );
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfileSelection | null>(
+    () => restoredDraft?.sandboxProfile ?? null,
+  );
+  useEffect(() => {
+    if (info !== "loading" && !profilesEnabled) setSandboxProfile(null);
+  }, [info, profilesEnabled]);
   const hostSelected = !sandboxSelected && selectedHostId !== null;
   const rememberedHostChoice = readLastHostChoice();
   const executionTargetSelectionPending =
@@ -2396,7 +2455,12 @@ export function NewChatLandingScreen() {
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
+  // The runner picked during desktop onboarding, preselected once it's online.
+  const onboardingHost = useOnboardingRunnerHost(hosts);
+  // Applied (or given up) once, after the first prefill; later resets use the usual defaults.
+  const onboardingHostSettled = useRef(false);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
+  const [hostMenuOpen, setHostMenuOpen] = useState(false);
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
   // so the failure isn't silently swallowed and the user isn't stranded on the
@@ -2409,6 +2473,7 @@ export function NewChatLandingScreen() {
   // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
   // set, the picker offers connecting the user's Arca dev instance as a host.
   const [arcaEnabled, setArcaEnabled] = useState(false);
+  const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
   const [connectingArca, setConnectingArca] = useState(false);
   const [arcaError, setArcaError] = useState<string | null>(null);
   // Mirrors pendingConnectRef for the Arca row: connect after the menu closes.
@@ -2430,52 +2495,16 @@ export function NewChatLandingScreen() {
   // is what the launch will use.
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const { launchError: sandboxProfileError, selection: selectedSandboxProfile } =
+    useSandboxProfileCatalog(sandboxSelected ? effectiveSandboxProvider : null, sandboxProfile);
   const sandboxMultiRepo =
     info !== "loading" &&
     effectiveSandboxProvider !== null &&
     info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.multi_repo === true;
   const maxSandboxRepos = sandboxMultiRepo ? MAX_SANDBOX_REPOS : 1;
-  // Append a repo (deduped by URL — adding one already picked is a no-op),
-  // remove one, or repoint its branch. Order is preserved so the list reads
-  // the way the user built it.
-  const addSandboxRepo = useCallback(
-    (url: string, branch = ""): void => {
-      const u = url.trim();
-      if (u === "") return;
-      setSandboxRepoSelections((prev) =>
-        // Cap at the provider's limit so a selection can't only fail with a 422
-        // at create; a duplicate URL is a no-op.
-        prev.some((r) => r.url === u) || prev.length >= maxSandboxRepos
-          ? prev
-          : [...prev, { url: u, branch: branch.trim() }],
-      );
-    },
-    [maxSandboxRepos],
-  );
-  const removeSandboxRepo = useCallback((url: string): void => {
-    setSandboxRepoSelections((prev) => prev.filter((r) => r.url !== url));
-  }, []);
-  const setSandboxRepoBranch = useCallback((url: string, branch: string): void => {
-    setSandboxRepoSelections((prev) => prev.map((r) => (r.url === url ? { ...r, branch } : r)));
-  }, []);
-  // Free-text URL being typed into the "paste a URL" adder (not yet added).
-  const [pendingRepoUrl, setPendingRepoUrl] = useState<string>("");
-  // When the server advertises the GitHub App and the caller has connected
-  // their account, offer a picker over their repos instead of only the
-  // free-text URL. The /repos endpoint returns `connected: false` when the
-  // account isn't linked, so gating the query on `enabled_connections` and
-  // reading `connected` off the payload doubles as the connection check.
-  const githubReposEnabled =
-    info !== "loading" && (info.enabled_connections ?? []).includes("github");
-  const { data: sandboxRepoData, isError: sandboxReposErrored } = useQuery({
-    queryKey: ["github-repos"],
-    queryFn: fetchGithubRepos,
-    enabled: githubReposEnabled,
-    staleTime: 5 * 60_000,
-  });
-  const sandboxRepoPickerConnected = sandboxRepoData?.connected ?? false;
-  const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
-  const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
+  const [pendingRepoUrl, setPendingRepoUrl] = useState("");
+  const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
+  const sandboxRepoPopoverRef = useRef<HTMLDivElement>(null);
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
@@ -2527,6 +2556,11 @@ export function NewChatLandingScreen() {
   // preset CLI flags; the runner ignores the preset while bypass is enabled.
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => restoredDraft?.bypassSandbox ?? false,
+  );
+  // Codex Plan mode armed before the first prompt; sent as the session's
+  // collaboration-mode label, which the in-session Plan toggle also drives.
+  const [codexPlanMode, setCodexPlanMode] = useState<boolean>(
+    () => restoredDraft?.codexPlanMode ?? false,
   );
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
@@ -2589,16 +2623,38 @@ export function NewChatLandingScreen() {
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [dbcertRequired, setDbcertRequired] = useState(false);
+  const createAttemptRef = useRef<symbol | null>(null);
+  const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
+  const [offlineHostLimit, setOfflineHostLimit] = useState(0);
   // Harness "Set up" dialog target, opened from the composer notice or a picker
   // row; null when closed. One dialog serves every entry point.
   const [setupTarget, setSetupTarget] = useState<{
     agentName: string | undefined;
+    nativeAgent: ReturnType<typeof nativeCodingAgentForAvailableAgent>;
     harness: string | null;
     host: Host | undefined | null;
   } | null>(null);
+
+  const fixStatus = setupTarget?.nativeAgent
+    ? harnessStatus(setupTarget.nativeAgent.harness, setupTarget.host ?? null)
+    : null;
+  const fixTarget =
+    harnessInstallEnabled &&
+    setupTarget?.host &&
+    !setupTarget.host.sandbox_provider &&
+    setupTarget.nativeAgent &&
+    fixStatus?.needsSetup
+      ? {
+          host: setupTarget.host,
+          harness: setupTarget.nativeAgent.harness,
+          label: setupTarget.nativeAgent.displayName,
+          mode: harnessFixMode(fixStatus.reason),
+        }
+      : null;
 
   // Ctrl+Shift+M opens the agent/model picker here, the keyboard equivalent of the
   // existing-chat model-picker shortcut. The picker owns model selection on the
@@ -2618,6 +2674,7 @@ export function NewChatLandingScreen() {
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    mcpRegistryServices,
     project: projectParam,
     message,
     files,
@@ -2625,6 +2682,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     sandboxSelected,
     sandboxProvider,
+    sandboxProfile,
     sandboxRepoSelections,
     workspace,
     branchName,
@@ -2632,6 +2690,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    codexPlanMode,
     cursorExecMode,
     agySkipMode,
     devinPermissionMode,
@@ -2704,7 +2763,10 @@ export function NewChatLandingScreen() {
     if (!isElectronShell()) return;
     let cancelled = false;
     void getDesktopFeatures().then((features) => {
-      if (!cancelled) setArcaEnabled(features?.databricksInternalFeatures === true);
+      if (!cancelled) {
+        setArcaEnabled(features?.databricksInternalFeatures === true);
+        setArcaPreviewRecovery(features?.arcaPreviewRecovery === true);
+      }
     });
     return () => {
       cancelled = true;
@@ -2754,6 +2816,7 @@ export function NewChatLandingScreen() {
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
+    setSandboxProfile(null);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
@@ -2769,6 +2832,7 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     setPickerEdits(null);
+    pickedOptionKeysRef.current.clear();
     seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
   }, [projectParam, prefill.project, prefillConfigSig]);
@@ -2792,6 +2856,15 @@ export function NewChatLandingScreen() {
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
     if (!prefillSettled) return;
+    if (!onboardingHostSettled.current) {
+      if (onboardingHost.pending) return;
+      onboardingHostSettled.current = true;
+      if (onboardingHost.hostId && !sandboxSelected && selectedHostId === null) {
+        writeLastHostChoice(onboardingHost.hostId);
+        setSelectedHostId(onboardingHost.hostId);
+        return;
+      }
+    }
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
 
@@ -2841,6 +2914,8 @@ export function NewChatLandingScreen() {
     info,
     prefillSettled,
     defaultSandboxProvider,
+    onboardingHost.pending,
+    onboardingHost.hostId,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -3037,8 +3112,21 @@ export function NewChatLandingScreen() {
           : (agentsLoading || prefillConfig === undefined) &&
               agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
             ? cachedPickerOptions!.agent.id
-            : (agentList[0]?.id ?? null);
+            : // No remembered pick: use the configured default, else the first agent.
+              (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+              agentList[0]?.id ??
+              null);
   const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
+  // The remembered agent is not one this deployment offers, so the configured
+  // default runs in its place. Drives the harness re-seed below: an override
+  // belongs to the agent it was stored under, not to whatever runs instead.
+  const curationRejectedTheRememberedPick =
+    curation.restrictToAgentNames.size > 0 &&
+    agents !== undefined &&
+    !agentsArePlaceholder &&
+    pickedAgentId !== null &&
+    pickedAgentId !== PENDING_AGENT_ID &&
+    !agentList.some((agent) => agent.id === pickedAgentId);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -3137,12 +3225,20 @@ export function NewChatLandingScreen() {
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
-  const sandboxPreviewEnabled =
+  const sandboxModelCapabilities =
+    info !== "loading" && previewSandboxProvider !== null
+      ? info.sandbox_provider_capabilities?.[previewSandboxProvider]
+      : undefined;
+  const sandboxDefaultModelsOffered =
+    sandboxSelected &&
+    sandboxModelCapabilities?.default_models === true &&
+    sandboxModelCapabilities.inference_models !== true;
+  const sandboxPreviewsOffered =
     sandboxSelected &&
     previewSandboxProvider !== null &&
-    previewHarness !== null &&
     info !== "loading" &&
-    info.sandbox_provider_capabilities?.[previewSandboxProvider]?.inference_models === true;
+    (sandboxModelCapabilities?.inference_models === true || sandboxDefaultModelsOffered);
+  const sandboxPreviewEnabled = sandboxPreviewsOffered && previewHarness !== null;
   const sandboxModels = useSandboxModelOptions(
     previewSandboxProvider,
     previewHarness,
@@ -3150,17 +3246,78 @@ export function NewChatLandingScreen() {
     cacheUser,
     sandboxPreviewEnabled,
   );
+  // Only harness rows gray out; agents can switch brains, so the submit check blocks them.
+  const sandboxPreviewEntries = useMemo(
+    () =>
+      harnessEntries.flatMap((agent) => {
+        const harness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness;
+        return harness ? [{ agentId: agent.id, harness }] : [];
+      }),
+    [harnessEntries],
+  );
+  const { unsupported: sandboxUnsupportedAgents, prefetch: prefetchSandboxPreviews } =
+    useSandboxUnsupportedAgents(
+      previewSandboxProvider,
+      sandboxPreviewEntries,
+      cacheUser,
+      sandboxPreviewsOffered,
+    );
+  const sandboxBlockedReasons = useMemo(
+    () =>
+      new Map(
+        harnessEntries.flatMap((agent) => {
+          if (!sandboxUnsupportedAgents.has(agent.id)) return [];
+          const reason = sandboxUnsupportedAgents.get(agent.id);
+          return [[agent.id, reason ?? noReachableModelsMessage(agent.display_name)] as const];
+        }),
+      ),
+    [sandboxUnsupportedAgents, harnessEntries],
+  );
+  // A harness the default catalog cannot serve keeps its ordinary picker.
+  const sandboxDefaultModelsEnabled =
+    sandboxDefaultModelsOffered && sandboxModels.data?.status !== "unconfigured";
   const sandboxInferenceConfigured =
     sandboxPreviewEnabled && sandboxModels.data?.configured === true;
+  const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
   const sandboxCatalogPending =
     sandboxPreviewEnabled && sandboxModels.data === undefined && sandboxModels.isLoading;
-  const sandboxCatalogError = sandboxPreviewEnabled
+  // Advisory catalogs never block launch; only a provider's certain "unsupported" does.
+  const sandboxSelectedUnsupported = sandboxPreviewEnabled && previewIsUnsupported(sandboxModels);
+  const sandboxBlockedName =
+    selectedNativeHarness === null && pickedHarness !== null
+      ? (brainHarnessLabelsAll[pickedHarness] ?? pickedHarness)
+      : selectedAgent?.display_name;
+  const sandboxCatalogError = sandboxSelectedUnsupported
+    ? (sandboxModels.data?.error ?? noReachableModelsMessage(sandboxBlockedName))
+    : sandboxPreviewEnabled && !sandboxDefaultModelsEnabled
+      ? (sandboxModels.error?.message ??
+        (sandboxModels.data?.configured && sandboxModels.data.status !== "ready"
+          ? (sandboxModels.data.error ?? "No usable models are available for this harness.")
+          : null))
+      : null;
+  const sandboxDefaultCatalogError = sandboxDefaultModelsEnabled
     ? (sandboxModels.error?.message ??
-      (sandboxModels.data?.configured && sandboxModels.data.status !== "ready"
-        ? (sandboxModels.data.error ?? "No usable models are available for this harness.")
+      (sandboxModels.data !== undefined &&
+      ["unavailable", "empty"].includes(sandboxModels.data.status)
+        ? (sandboxModels.data.error ?? "Could not load AI Gateway models.")
         : null))
     : null;
-  const sandboxCatalog = sandboxInferenceConfigured ? sandboxModels.data!.models : undefined;
+  const sandboxCatalog = useMemo(
+    () =>
+      sandboxDefaultModelsEnabled
+        ? sandboxDefaultCatalogError
+          ? []
+          : (sandboxModels.data?.models ?? [])
+        : sandboxInferenceConfigured
+          ? sandboxModels.data!.models
+          : undefined,
+    [
+      sandboxDefaultModelsEnabled,
+      sandboxDefaultCatalogError,
+      sandboxInferenceConfigured,
+      sandboxModels.data,
+    ],
+  );
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -3223,12 +3380,12 @@ export function NewChatLandingScreen() {
   // ``/model`` when cost_control_mode_override is "on"). Everything else routes
   // via the fully-auto harness instead, which picks harness + model up front.
   // Each family gates on its OWN source: the external router's apply layer
-  // rewrites the model through the workspace AI gateway, so a host whose Claude
+  // rewrites the model through the workspace Unity Gateway, so a host whose Claude
   // Code runs off something else falls back to the built-in judge for that
   // family instead of losing the row — and loses it only when neither router
   // can answer.
   const smartRoutingEligible =
-    !sandboxInferenceConfigured &&
+    !sandboxHasModelCatalog &&
     smartRoutingEnabled &&
     selectedNativeHarness !== null &&
     SMART_ROUTING_ARMS.some((harness) => harness === selectedNativeHarness) &&
@@ -3259,7 +3416,7 @@ export function NewChatLandingScreen() {
     return rest;
   }, [brainHarnessLabelsAll, brainRoutable]);
   const isEntryConfigurable = (agent: AvailableAgent) =>
-    (sandboxInferenceConfigured && agent.id === effectiveAgentId) ||
+    (sandboxHasModelCatalog && agent.id === effectiveAgentId) ||
     agentHasModelSettings(agent) ||
     agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
   // Only an eligible harness can display active per-turn Smart Routing.
@@ -3274,7 +3431,7 @@ export function NewChatLandingScreen() {
   const configSummary = useMemo((): { label: string; value: string }[] => {
     const sourceRows = (options: readonly NativeModelOption[]) => {
       if (routingOn) return [];
-      if (sandboxInferenceConfigured && sandboxModels.data?.provider_label) {
+      if (sandboxHasModelCatalog && sandboxModels.data?.provider_label) {
         return [{ label: "Connection", value: sandboxModels.data.provider_label }];
       }
       const source =
@@ -3282,13 +3439,14 @@ export function NewChatLandingScreen() {
         options.find((option) => option.source)?.source;
       return modelConfigurationSourceRows(source);
     };
-    if (sandboxInferenceConfigured && selectedNativeHarness === null) {
+    if (sandboxHasModelCatalog && selectedNativeHarness === null) {
       const model = sandboxCatalog?.find((row) => row.id === pickedModel);
       return [
         {
           label: "Model",
           value: model ? nativeModelLabel(model) : defaultModelLabel(sandboxCatalog ?? []),
         },
+        ...(pickedEffort ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }] : []),
         ...(sandboxModels.data?.provider_label
           ? [{ label: "Connection", value: sandboxModels.data.provider_label }]
           : []),
@@ -3399,7 +3557,7 @@ export function NewChatLandingScreen() {
     }
     return routingRow;
   }, [
-    sandboxInferenceConfigured,
+    sandboxHasModelCatalog,
     sandboxCatalog,
     sandboxModels.data?.provider_label,
     smartRoutingHarnessSelected,
@@ -3436,7 +3594,7 @@ export function NewChatLandingScreen() {
   const permissionConfigRow = configSummary.find(
     (row) => row.label === "Permission mode" || row.label === "Mode",
   );
-  const pickerModelOptions: readonly NativeModelOption[] = sandboxInferenceConfigured
+  const pickerModelOptions: readonly NativeModelOption[] = sandboxHasModelCatalog
     ? (sandboxCatalog ?? [])
     : supportsPermissionMode
       ? claudeModelOptions
@@ -3447,7 +3605,6 @@ export function NewChatLandingScreen() {
           : selectedNativeHarness === "codex-native"
             ? codexModelOptions
             : [];
-  const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     sandboxCatalogPending ||
     (!sandboxSelected &&
@@ -3462,8 +3619,8 @@ export function NewChatLandingScreen() {
               ? hostDevinModelsLoading
               : false));
   const pickerModelsError = sandboxSelected
-    ? sandboxCatalogError
-      ? new Error(sandboxCatalogError)
+    ? sandboxCatalogError || sandboxDefaultCatalogError
+      ? new Error((sandboxCatalogError ?? sandboxDefaultCatalogError)!)
       : null
     : selectedNativeHarness === "claude-native"
       ? hostClaudeModelsError
@@ -3472,8 +3629,18 @@ export function NewChatLandingScreen() {
         : selectedNativeHarness === "devin-native"
           ? hostDevinModelsError
           : null;
-  const pickerDataLoading =
-    sandboxCatalogPending ||
+  const modelCatalogLookupEnabled = sandboxSelected
+    ? sandboxPreviewEnabled && sandboxInferenceConfigured
+    : selectedNativeHarness !== null && canLoadHostModels(selectedNativeHarness);
+  const modelCatalogAvailability: ModelCatalogAvailability | undefined =
+    harnessTriggerDetails.some((row) => row.label === "Model") && !routingOn
+      ? pickerModelOptions.length > 0
+        ? "available"
+        : !modelCatalogLookupEnabled || pickerModelsLoading
+          ? "unknown"
+          : "unavailable"
+      : undefined;
+  const pickerDataLoadingBesidesCatalog =
     agentsLoading ||
     (cachedPickerOptions !== null && (hostsLoading || info === "loading")) ||
     (projectParam !== "" &&
@@ -3487,6 +3654,7 @@ export function NewChatLandingScreen() {
       !routingOn &&
       harnessTriggerDetails.some((row) => row.label === "Model") &&
       (hostsLoading || info === "loading" || pickerModelsLoading));
+  const pickerDataLoading = sandboxCatalogPending || pickerDataLoadingBesidesCatalog;
   const pickerTarget = JSON.stringify([
     projectParam,
     selectedHostId,
@@ -3500,18 +3668,27 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     setPickerReadyTarget(pickerDataLoading ? null : pickerTarget);
   }, [pickerDataLoading, pickerTarget]);
-  const pickerLoading = pickerDataLoading || pickerReadyTarget !== pickerTarget;
+  // The embed shows an offline fallback after 1.5s; it carries no curation.
+  const curationPending = info === "loading" || isBootFallbackInfo(info);
+  const pickerLoading = pickerDataLoading || pickerReadyTarget !== pickerTarget || curationPending;
   const [interactiveCacheKey, setInteractiveCacheKey] = useState<string | null>(null);
   useEffect(() => {
     setInteractiveCacheKey(cachedPickerOptions ? pickerCacheKey : null);
   }, [cachedPickerOptions, pickerCacheKey]);
+  // A cached roster is only safe to open once the server's curation is known:
+  // before that it could show agents this deployment does not offer.
   const interactiveWhileLoading =
     cachedPickerOptions !== null &&
     interactiveCacheKey === pickerCacheKey &&
+    !curationPending &&
     selectedAgent !== undefined &&
     (!harnessTriggerDetails.some((row) => row.label === "Model") ||
       pickerModelOptions.length > 0 ||
       routingOn);
+  // Keep the menu open while only the sandbox catalog loads; submit stays gated.
+  const pickerInteractiveWhileLoading =
+    interactiveWhileLoading ||
+    (sandboxPreviewEnabled && selectedAgent !== undefined && !pickerDataLoadingBesidesCatalog);
   const pickerOptions = useMemo<NewChatPickerOptions | null>(
     () =>
       selectedAgent && selectedAgent.id !== PENDING_AGENT_ID
@@ -3571,27 +3748,34 @@ export function NewChatLandingScreen() {
   }, [pickerCacheKey, pickerLoading, permissionPreview]);
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
-  useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
-  const pickerEffortOptions = supportsPermissionMode
-    ? CLAUDE_NATIVE_EFFORTS
-    : selectedNativeHarness === "devin-native"
-      ? // Devin encodes effort as a model-variant suffix, and the rung set is
-        // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a
-        // different Fusion model), so derive it from the selected model's catalog
-        // entry rather than offering a fixed ladder the model can't honor.
-        codexEffortLevelsForModel(
-          devinModelOptions,
-          pickedModel || devinModelOptions.find((option) => option.isDefault)?.id,
-        ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-      : selectedNativeHarness === "pi-native"
-        ? PI_NATIVE_EFFORTS
-        : selectedNativeHarness === "codex-native"
-          ? codexEffortLevelsForModel(
-              codexModelOptions,
-              pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-            ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-          : [];
+  const pickerEffortOptions = sandboxDefaultModelsEnabled
+    ? codexEffortLevelsForModel(pickerModelOptions, pickedModel).map((value) => ({
+        value,
+        label: normalizeEffortLabel(value),
+      }))
+    : supportsPermissionMode
+      ? CLAUDE_NATIVE_EFFORTS
+      : selectedNativeHarness === "devin-native"
+        ? // Devin encodes effort as a model-variant suffix, and the rung set is
+          // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a
+          // different Fusion model), so derive it from the selected model's catalog
+          // entry rather than offering a fixed ladder the model can't honor.
+          codexEffortLevelsForModel(
+            devinModelOptions,
+            pickedModel || devinModelOptions.find((option) => option.isDefault)?.id,
+          ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
+        : selectedNativeHarness === "pi-native"
+          ? PI_NATIVE_EFFORTS
+          : selectedNativeHarness === "codex-native"
+            ? codexEffortLevelsForModel(
+                codexModelOptions,
+                pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
+              ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
+            : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
+    const picked = pickedOptionKeysRef.current.get(harness) ?? new Set<string>();
+    for (const key of Object.keys(options)) picked.add(key);
+    pickedOptionKeysRef.current.set(harness, picked);
     const previous = pickerEdits;
     setPickerEdits({
       agentId: effectiveAgentId,
@@ -3608,9 +3792,11 @@ export function NewChatLandingScreen() {
   };
   const selectPickerModel = (model: string) => {
     const selectionHarness =
-      selectedNativeHarness ?? (sandboxInferenceConfigured ? previewHarness : null);
+      selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
     if (!selectionHarness) return;
+    // Every model-picker commit also settles the effort (routing and Fusion clear it).
     userPickedModelRef.current = true;
+    userPickedEffortRef.current = true;
     if (model === MODEL_SELECT_SMART) {
       setPickedModel("");
       setPickedEffort("");
@@ -3633,11 +3819,15 @@ export function NewChatLandingScreen() {
       return;
     }
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
+    // Gateway catalogs carry no default row, so Default keeps no effort.
+    const effortModel = sandboxDefaultModelsEnabled
+      ? picked
+      : picked || codexModelOptions.find((option) => option.isDefault)?.id;
     const effort =
-      selectedNativeHarness === "codex-native" &&
+      (sandboxDefaultModelsEnabled || selectedNativeHarness === "codex-native") &&
       !codexEffortLevelsForModel(
-        codexModelOptions,
-        picked || codexModelOptions.find((option) => option.isDefault)?.id,
+        sandboxDefaultModelsEnabled ? pickerModelOptions : codexModelOptions,
+        effortModel,
       ).includes(pickedEffort)
         ? ""
         : pickedEffort;
@@ -3647,10 +3837,20 @@ export function NewChatLandingScreen() {
     rememberPickerOptions(selectionHarness, { model: picked, effort, routing: "off" });
   };
   const selectPickerEffort = (effort: string) => {
-    if (!selectedNativeHarness) return;
+    const selectionHarness =
+      selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
+    if (!selectionHarness) return;
     const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
+    userPickedEffortRef.current = true;
     setPickedEffort(picked);
-    rememberPickerOptions(selectedNativeHarness, { effort: picked });
+    // Record the visible routing "off" so the remembered-routing restore can't
+    // turn it back on (and drop this effort) once the project pin is released.
+    rememberPickerOptions(
+      selectionHarness,
+      smartRoutingEligible && costControlMode !== "on"
+        ? { effort: picked, routing: "off" }
+        : { effort: picked },
+    );
   };
   const handleSetPickedHarness = useCallback(
     (harness: string | null, agentId?: string) => {
@@ -3686,11 +3886,125 @@ export function NewChatLandingScreen() {
   const selectFusionModel = (modelUid: string) => {
     if (!selectedNativeHarness) return;
     userPickedModelRef.current = true;
+    userPickedEffortRef.current = true;
     setPickedModel(modelUid);
     setPickedEffort("");
     setCostControlMode(null);
     rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
   };
+  const modelSection: ComposerConfigSection | undefined =
+    sandboxHasModelCatalog ||
+    supportsModelPicker ||
+    supportsPermissionMode ||
+    supportsDevinMode ||
+    selectedNativeHarness === "codex-native"
+      ? {
+          testId: "new-chat-landing-agent-models",
+          header: "Models",
+          leading: (
+            <>
+              {sandboxHasModelCatalog &&
+                !sandboxSelectedUnsupported &&
+                sandboxModels.data?.provider_label && (
+                  <div
+                    className="px-2 py-1 text-xs text-muted-foreground"
+                    data-testid="sandbox-model-provider"
+                  >
+                    {sandboxModels.data.provider_label}
+                  </div>
+                )}
+              {pickerModelsLoading && pickerModelOptions.length === 0 && (
+                <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
+              )}
+              {!pickerModelsLoading && pickerModelOptions.length === 0 && (
+                <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
+                  {pickerModelsError?.message ?? "Models unavailable"}
+                </div>
+              )}
+            </>
+          ),
+          choices: [
+            // Default can't launch once the provider rules the harness out.
+            ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
+            (!sandboxInferenceConfigured &&
+              pickerModelOptions.length > 0 &&
+              !pickerModelOptions.some((option) => option.isDefault))
+              ? [
+                  {
+                    key: "__default__",
+                    label: "Default",
+                    checked: !routingOn && pickedModel === "",
+                    onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
+                    testId: "new-chat-landing-agent-model-default",
+                  },
+                ]
+              : []),
+            ...pickerModelOptions.map((option) => ({
+              key: option.id,
+              label: visibleModelLabel(nativeModelLabel(option)),
+              checked:
+                !routingOn &&
+                (option.fusion !== undefined
+                  ? isFusionModelUid(pickedModel) ||
+                    (pickedModel === "" && option.isDefault === true)
+                  : pickedModel === option.id || (pickedModel === "" && option.isDefault === true)),
+              // The Fusion row always opens its Lead/Sidekick selectors,
+              // even when Fusion is the catalog default (routing it
+              // through MODEL_SELECT_DEFAULT would hide them).
+              onSelect: option.fusion
+                ? () => selectFusionModel(option.fusion!.default)
+                : () => selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+              testId: `new-chat-landing-agent-model-${option.id}`,
+              title: nativeModelTooltip(option),
+              className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+              modelOption: option,
+            })),
+          ],
+        }
+      : undefined;
+  const effortSection: ComposerConfigSection | undefined =
+    pickerEffortOptions.length > 0
+      ? {
+          testId: "new-chat-landing-agent-efforts",
+          header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+          choices: [
+            {
+              key: "__default__",
+              label: "Default",
+              checked: !routingOn && pickedEffort === "",
+              disabled: routingOn,
+              onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
+              testId: "new-chat-landing-agent-effort-default",
+            },
+            ...pickerEffortOptions.map((option) => ({
+              key: option.value,
+              label: option.label,
+              checked: !routingOn && pickedEffort === option.value,
+              disabled: routingOn,
+              onSelect: () => selectPickerEffort(option.value),
+              testId: `new-chat-landing-agent-effort-${option.value}`,
+            })),
+          ],
+        }
+      : undefined;
+  const fusionSections: readonly ComposerConfigSection[] | undefined =
+    pickerFusion !== undefined && fusionSelected && !routingOn
+      ? buildFusionSections({
+          descriptor: pickerFusion,
+          modelUid: fusionModelUid,
+          testIdPrefix: "new-chat-landing-agent",
+          onChange: selectFusionModel,
+        })
+      : undefined;
+  const { preview, dismissPreview } = useComposerConfigCycleHotkeys(
+    modelSection?.choices,
+    effortSection?.choices ?? fusionSections?.[1]?.choices.filter(({ key }) => key !== "__fast__"),
+    !!selectedAgent &&
+      isEntryConfigurable(selectedAgent) &&
+      !noExecutionTargetSelected &&
+      !creating &&
+      (!pickerLoading || pickerInteractiveWhileLoading),
+  );
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
       <>
@@ -3698,7 +4012,11 @@ export function NewChatLandingScreen() {
           <>
             <DropdownMenuCheckboxItem
               checked={routingOn}
-              onCheckedChange={() => selectPickerModel(MODEL_SELECT_SMART)}
+              // Unchecking returns to the harness default, so the pick stays
+              // reversible even when the Models list below has no row to click.
+              onCheckedChange={(checked) =>
+                selectPickerModel(checked ? MODEL_SELECT_SMART : MODEL_SELECT_DEFAULT)
+              }
               onSelect={(event) => event.preventDefault()}
               data-testid="new-chat-landing-agent-model-smart-routing"
             >
@@ -3750,134 +4068,9 @@ export function NewChatLandingScreen() {
                 }
               : undefined
           }
-          models={
-            sandboxInferenceConfigured ||
-            supportsModelPicker ||
-            supportsPermissionMode ||
-            supportsDevinMode ||
-            selectedNativeHarness === "codex-native"
-              ? {
-                  testId: "new-chat-landing-agent-models",
-                  header: "Models",
-                  leading: (
-                    <>
-                      {sandboxInferenceConfigured && sandboxModels.data?.provider_label && (
-                        <div
-                          className="px-2 py-1 text-xs text-muted-foreground"
-                          data-testid="sandbox-model-provider"
-                        >
-                          {sandboxModels.data.provider_label}
-                        </div>
-                      )}
-                      {selectedNativeHarness === "pi-native" && (
-                        <Input
-                          aria-label="Search models"
-                          placeholder="Search models…"
-                          value={pickerModelSearch}
-                          onChange={(event) => setPickerModelSearch(event.target.value)}
-                          onKeyDown={(event) => event.stopPropagation()}
-                          data-testid="new-chat-landing-agent-model-search"
-                        />
-                      )}
-                      {pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="px-2 py-1 text-xs text-muted-foreground">
-                          Loading models…
-                        </div>
-                      )}
-                      {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="px-2 py-1 text-xs text-muted-foreground">
-                          {pickerModelsError?.message ?? "Models unavailable"}
-                        </div>
-                      )}
-                    </>
-                  ),
-                  choices: [
-                    ...(!sandboxInferenceConfigured &&
-                    pickerModelOptions.length > 0 &&
-                    !pickerModelOptions.some((option) => option.isDefault)
-                      ? [
-                          {
-                            key: "__default__",
-                            label: "Harness default",
-                            checked: !routingOn && pickedModel === "",
-                            onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
-                            testId: "new-chat-landing-agent-model-default",
-                          },
-                        ]
-                      : []),
-                    ...pickerModelOptions
-                      .filter((option) =>
-                        pickerModelSearch
-                          .toLowerCase()
-                          .trim()
-                          .split(/\s+/)
-                          .every((term) =>
-                            `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
-                          ),
-                      )
-                      .map((option) => ({
-                        key: option.id,
-                        label: visibleModelLabel(nativeModelLabel(option)),
-                        checked:
-                          !routingOn &&
-                          (option.fusion !== undefined
-                            ? isFusionModelUid(pickedModel) ||
-                              (pickedModel === "" && option.isDefault === true)
-                            : pickedModel === option.id ||
-                              (pickedModel === "" && option.isDefault === true)),
-                        // The Fusion row always opens its Lead/Sidekick selectors,
-                        // even when Fusion is the catalog default (routing it
-                        // through MODEL_SELECT_DEFAULT would hide them).
-                        onSelect: option.fusion
-                          ? () => selectFusionModel(option.fusion!.default)
-                          : () =>
-                              selectPickerModel(
-                                option.isDefault ? MODEL_SELECT_DEFAULT : option.id,
-                              ),
-                        testId: `new-chat-landing-agent-model-${option.id}`,
-                        title: nativeModelLabel(option),
-                        className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
-                      })),
-                  ],
-                }
-              : undefined
-          }
-          efforts={
-            pickerEffortOptions.length > 0
-              ? {
-                  testId: "new-chat-landing-agent-efforts",
-                  header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
-                  choices: [
-                    {
-                      key: "__default__",
-                      label: "Default",
-                      checked: !routingOn && pickedEffort === "",
-                      disabled: routingOn,
-                      onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
-                      testId: "new-chat-landing-agent-effort-default",
-                    },
-                    ...pickerEffortOptions.map((option) => ({
-                      key: option.value,
-                      label: option.label,
-                      checked: !routingOn && pickedEffort === option.value,
-                      disabled: routingOn,
-                      onSelect: () => selectPickerEffort(option.value),
-                      testId: `new-chat-landing-agent-effort-${option.value}`,
-                    })),
-                  ],
-                }
-              : undefined
-          }
-          extra={
-            pickerFusion !== undefined && fusionSelected && !routingOn
-              ? buildFusionSections({
-                  descriptor: pickerFusion,
-                  modelUid: fusionModelUid,
-                  testIdPrefix: "new-chat-landing-agent",
-                  onChange: selectFusionModel,
-                })
-              : undefined
-          }
+          models={modelSection}
+          efforts={effortSection}
+          extra={fusionSections}
         />
       </>
     ) : null;
@@ -3894,9 +4087,9 @@ export function NewChatLandingScreen() {
         const harness = agent.id === effectiveAgentId ? pickedHarness : readLastHarness(agent.id);
         return [agent.id, brainHarnessLabelsAll[harness ?? agent.harness ?? ""] ?? "Default"];
       }
-      const saved = readHarnessOptions(native.harness);
+      const saved = readRememberedHarnessOptions(native.harness);
       if (saved.routing === "on") return [agent.id, SMART_ROUTING_LABEL];
-      const catalogSuppressed = sandboxInferenceConfigured && native.harness !== previewHarness;
+      const catalogSuppressed = sandboxHasModelCatalog && native.harness !== previewHarness;
       const catalog = catalogSuppressed
         ? []
         : native.iconKind === "claude"
@@ -3948,6 +4141,18 @@ export function NewChatLandingScreen() {
             : supportsDevinPermission
               ? DEVIN_NATIVE_PERMISSION_MODES
               : [];
+  // Unsaved custom agents launch through the host runners route, which cannot
+  // refuse a host too old to start Codex in Plan mode.
+  const codexPlanLaunchEnabled = isFeatureEnabled(info, "codex_plan_at_launch");
+  const codexPlanModeSelectable =
+    codexPlanLaunchEnabled &&
+    !smartRoutingHarnessSelected &&
+    selectedNativeHarness === "codex-native" &&
+    effectiveAgentId !== PENDING_AGENT_ID;
+  const toggleCodexPlanMode = codexPlanModeSelectable
+    ? () => setCodexPlanMode((armed) => !armed)
+    : undefined;
+  const codexPlanToggleLabel = codexPlanMode ? "Exit Plan mode" : "Enter Plan mode";
   const selectDirectMode = (mode: string) => {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
@@ -3977,12 +4182,16 @@ export function NewChatLandingScreen() {
   // cache refresh must not reseed the project default over the user's choice;
   // an agent switch starts a fresh visit and re-arms the seed.
   const userPickedModelRef = useRef(false);
+  // Same guard for an explicit effort pick against the project's default effort.
+  const userPickedEffortRef = useRef(false);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
     if (prev === undefined || prev === null || prev === effectiveAgentId) return;
     userPickedModelRef.current = false;
+    userPickedEffortRef.current = false;
     setBypassSandbox(false);
+    setCodexPlanMode(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
   // A project-configured default model (Project settings) outranks the user's
@@ -4015,6 +4224,21 @@ export function NewChatLandingScreen() {
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
       : null;
+  // A project-configured default effort, scoped to the project's agent like the
+  // model. The seeds below validate it against the harness's effort ladder.
+  const projectDefaultEffort =
+    prefillConfig?.effort != null &&
+    prefillConfig.agentId != null &&
+    effectiveAgentId === prefillConfig.agentId
+      ? prefillConfig.effort
+      : null;
+  const projectDefaultEffortValid =
+    projectDefaultEffort != null &&
+    (
+      nativeEffortOptions(selectedNativeHarness, projectModelVocab, projectDefaultModelValid) ?? []
+    ).some((option) => option.value === projectDefaultEffort)
+      ? projectDefaultEffort
+      : null;
   // Seed the harness's knobs from the user's last picks when the selected
   // harness changes (including the first mount), so a returning user starts a
   // new session on the options they used last for that harness instead of the
@@ -4028,7 +4252,7 @@ export function NewChatLandingScreen() {
         ? pickerEdits.options
         : {};
     const stored = {
-      ...readHarnessOptions(selectedNativeHarness),
+      ...readRememberedHarnessOptions(selectedNativeHarness),
       ...editedOptions,
     };
     // Resolve the mode to the stored value when it's still valid for this
@@ -4056,6 +4280,24 @@ export function NewChatLandingScreen() {
       options.some((m) => m.id === projectDefaultModel)
         ? projectDefaultModel
         : null;
+    // Project effort outranks the remembered effort when the seeded model's ladder offers it.
+    const projectEffortSeed = (
+      modelOptions: readonly NativeModelOption[],
+      model: string,
+    ): string | null =>
+      !userPickedEffortRef.current &&
+      projectDefaultEffort != null &&
+      (nativeEffortOptions(selectedNativeHarness, modelOptions, model) ?? []).some(
+        (option) => option.value === projectDefaultEffort,
+      )
+        ? projectDefaultEffort
+        : null;
+    // A seeded project effort is an explicit pin like the project model, so it
+    // turns off a routing "on" restored from a parked draft.
+    const seedEffort = (projectEffort: string | null, fallback: string) => {
+      if (projectEffort != null) _setCostControlMode((mode) => (mode === "on" ? null : mode));
+      setPickedEffort(projectEffort ?? fallback);
+    };
     if (selectedNativeHarness === "pi-native") {
       setPickedModel(
         projectSeed(piModelOptions) ??
@@ -4063,7 +4305,8 @@ export function NewChatLandingScreen() {
             ? stored.model
             : ""),
       );
-      setPickedEffort(
+      seedEffort(
+        projectEffortSeed(piModelOptions, ""),
         stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
           ? stored.effort
           : "",
@@ -4085,7 +4328,8 @@ export function NewChatLandingScreen() {
             ? stored.model
             : ""),
       );
-      setPickedEffort(
+      seedEffort(
+        projectEffortSeed(claudeModelOptions, ""),
         !storedRoutingOn &&
           stored.effort != null &&
           CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
@@ -4114,7 +4358,8 @@ export function NewChatLandingScreen() {
       // ladder (the catalog default's when no model is pinned) still offers
       // it — anything else resolves to "" so a level another harness left in
       // the shared state never rides a Codex create.
-      setPickedEffort(
+      seedEffort(
+        projectEffortSeed(codexModelOptions, seededCodexModel),
         !storedRoutingOn &&
           selectedNativeHarness === "codex-native" &&
           stored.effort != null &&
@@ -4134,10 +4379,8 @@ export function NewChatLandingScreen() {
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
     }
-    // Reseed on harness changes, when the selected host's catalog resolves,
-    // and when the project's configured default model settles (its config
-    // loads async, so the first run may see it as null); capability flags are
-    // derived from the same harness and stay omitted.
+    // Reseed on harness, host-catalog, and async project model/effort or
+    // last-start changes; capability flags derive from the harness.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sandboxInferenceConfigured,
@@ -4146,6 +4389,42 @@ export function NewChatLandingScreen() {
     codexModelOptions,
     piModelOptions,
     projectDefaultModel,
+    projectDefaultEffort,
+    readRememberedHarnessOptions,
+  ]);
+  useEffect(() => {
+    if (!sandboxDefaultModelsEnabled || !previewHarness) return;
+    const edited =
+      pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === previewHarness
+        ? pickerEdits.options
+        : {};
+    const saved = { ...readRememberedHarnessOptions(previewHarness), ...edited };
+    const candidate =
+      !userPickedModelRef.current && projectDefaultModel != null
+        ? projectDefaultModel
+        : saved.model;
+    const model = sandboxCatalog?.find((row) => row.id === candidate);
+    setPickedModel(model?.id ?? "");
+    const effortLevels = codexEffortLevelsForModel(sandboxCatalog ?? [], model?.id);
+    const effortCandidate =
+      !userPickedEffortRef.current &&
+      projectDefaultEffort != null &&
+      effortLevels.includes(projectDefaultEffort)
+        ? projectDefaultEffort
+        : saved.effort;
+    setPickedEffort(
+      effortCandidate && effortLevels.includes(effortCandidate) ? effortCandidate : "",
+    );
+  }, [
+    sandboxDefaultModelsEnabled,
+    previewHarness,
+    effectiveAgentId,
+    sandboxCatalog,
+    pickerEdits,
+    projectDefaultModel,
+    projectDefaultEffort,
+    readRememberedHarnessOptions,
+    setPickedModel,
   ]);
   useEffect(() => {
     if (!sandboxInferenceConfigured || sandboxModels.data?.status !== "ready") return;
@@ -4173,15 +4452,14 @@ export function NewChatLandingScreen() {
   // switch itself (the router always routes), so it's left alone.
   useEffect(() => {
     if (!selectedNativeHarness || autoRoutingSelected) return;
-    // A *valid* project-configured default model is an explicit pin: a
-    // remembered routing "on" must not re-enter routing and clear it (the
-    // setter drops the model pick when routing turns on). An invalid stored
-    // id never seeds a pin, so it must not suppress the remembered routing.
+    // A valid project model or effort is an explicit pin that remembered routing
+    // would drop; an invalid stored value seeds no pin and doesn't suppress it.
     if (projectDefaultModelValid != null && !userPickedModelRef.current) return;
+    if (projectDefaultEffortValid != null && !userPickedEffortRef.current) return;
     const storedRouting =
       (pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
         ? pickerEdits.options.routing
-        : undefined) ?? readHarnessOptions(selectedNativeHarness).routing;
+        : undefined) ?? readRememberedHarnessOptions(selectedNativeHarness).routing;
     if (storedRouting === undefined) return;
     setCostControlMode(smartRoutingEligible && storedRouting === "on" ? "on" : null);
   }, [
@@ -4190,8 +4468,10 @@ export function NewChatLandingScreen() {
     effectiveAgentId,
     autoRoutingSelected,
     projectDefaultModelValid,
+    projectDefaultEffortValid,
     setCostControlMode,
     pickerEdits,
+    readRememberedHarnessOptions,
   ]);
   // Top-level Smart Routing pins permissions to Default (no override sent), so
   // entering it resets the mode rather than restoring one: nothing is remembered
@@ -4244,10 +4524,14 @@ export function NewChatLandingScreen() {
       }),
     [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, externalRoutingConfigured],
   );
-  const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
+  // The curated menu has no Smart Routing row, so a remembered pick of it has
+  // nothing behind it either.
+  const smartRoutingCuratedAway = curation.restrictToAgentNames.size > 0;
+  const smartRoutingHarnessAvailable =
+    smartRoutingUnavailableCause === null && !smartRoutingCuratedAway;
   // The fully-auto brain needs SOME router able to answer for both model
   // families — the router may land the session's work on either, and an arm the
-  // external router can't reach (off the workspace AI gateway) is only a loss
+  // external router can't reach (off the workspace Unity Gateway) is only a loss
   // when the built-in judge can't cover it either. The judge picks the bundle
   // brain's harness as well as its model, so unlike the native-pane row above
   // this surface stays on a judge-only deployment. Source availability ONLY:
@@ -4285,12 +4569,18 @@ export function NewChatLandingScreen() {
     if (!smartRoutingHarnessSelected || smartRoutingHarnessAvailable) return;
     setPickedHarness(null);
     _setCostControlMode(null);
-    if (wasAvailable) setSmartRoutingDropped(smartRoutingUnavailableCause);
+    // The placeholder wrapper was picked only to carry Smart Routing; under
+    // curation the configured default decides instead of that leftover.
+    if (smartRoutingCuratedAway) setPickedAgentId(null);
+    if (wasAvailable && smartRoutingUnavailableCause !== null) {
+      setSmartRoutingDropped(smartRoutingUnavailableCause);
+    }
   }, [
     smartRoutingHarnessSelected,
     smartRoutingAvailabilityKnown,
     smartRoutingHarnessAvailable,
     smartRoutingUnavailableCause,
+    smartRoutingCuratedAway,
   ]);
   // Routing came back (host switched again, or the missing arm installed) —
   // there is nothing left to explain. An explicit pick clears it too, from the
@@ -4310,6 +4600,17 @@ export function NewChatLandingScreen() {
     setPickedHarness(null);
     _setCostControlMode(null);
   }, [info, smartRoutingEnabled, pickedHarness]);
+  // Curation replaced the remembered agent: re-seed brain and cost control
+  // from the agent that runs.
+  useEffect(() => {
+    if (!curationRejectedTheRememberedPick || effectiveAgentId === null) return;
+    const remembered = readLastHarness(effectiveAgentId);
+    // Top-level Smart Routing has no curated row either, so its sentinel is no
+    // more adopted here than it is restored above.
+    const inherited = remembered === AUTO_NATIVE_HARNESS_ID ? null : remembered;
+    setPickedHarness(inherited);
+    _setCostControlMode(isAutoHarness(inherited) ? "on" : null);
+  }, [curationRejectedTheRememberedPick, effectiveAgentId]);
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -4487,7 +4788,13 @@ export function NewChatLandingScreen() {
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
       if (pickedAgentId === null) {
-        setPickedHarness(readLastHarness(writes.agentId));
+        // The last start's own harness pick (e.g. Smart Routing) outranks the
+        // app-global one, which another project's start may have changed.
+        setPickedHarness(
+          writes.agentId === projectLaunch?.agentId && projectLaunch.pickedHarness !== undefined
+            ? projectLaunch.pickedHarness
+            : readLastHarness(writes.agentId),
+        );
         // Config-sourced seed into an empty slot (as opposed to the last-agent
         // fallback): the create omits the field until any other write flips this.
         agentFromConfigRef.current = writes.agentId === prefillConfig?.agentId;
@@ -4515,6 +4822,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    projectLaunch,
     defaultSandboxProvider,
   ]);
 
@@ -4560,51 +4868,75 @@ export function NewChatLandingScreen() {
     worktreeSeededForRef.current = null;
   }, [prefillConfig, branchName, autoSeededBranch]);
 
-  // Sandbox repo inputs are valid when empty (empty workspace) or when every
-  // selected repo's URL passes the shape check. A half-typed URL in the paste
-  // adder never blocks submit — it isn't a selection until the user adds it.
-  // ...AND the count fits the provider's limit. The count guard matters on a
-  // stale selection the per-insert cap can't stop after the fact: repos
-  // remembered/drafted under a multi-repo provider, then the provider switched
-  // to a single-repo one. Without it the create would submit and be rejected
-  // server-side only after the session row is announced.
+  // Keep provider changes and unfinished URL edits from silently dropping repositories.
   const sandboxRepoOverCap = sandboxRepoSelections.length > maxSandboxRepos;
+  const sandboxRepoPending = pendingRepoUrl.trim() !== "";
+  const sandboxBranchesValid = sandboxRepoSelections.every((repo) =>
+    isValidSandboxBranch(repo.branch),
+  );
+  const sandboxWorkspaceLengthsValid = sandboxRepoSelections.every((repo) =>
+    isValidSandboxWorkspaceLength(repo.url, repo.branch),
+  );
   const sandboxRepoValid =
-    sandboxRepoSelections.every((r) => isValidSandboxRepoUrl(r.url)) && !sandboxRepoOverCap;
+    sandboxRepoSelections.every((repo) => isValidSandboxRepoUrl(repo.url)) &&
+    sandboxBranchesValid &&
+    sandboxWorkspaceLengthsValid &&
+    !sandboxRepoOverCap &&
+    !sandboxRepoPending;
 
   const skillsHarness = autoRoutingSelected
     ? null
     : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
-  const skillsUnavailableMessage = sandboxSelected
-    ? "Host skills will be available after the sandbox starts."
-    : selectedAgent?.id === PENDING_AGENT_ID
-      ? "Skills will be available after this session starts."
-      : !selectedHostId
-        ? "Choose a host to discover skills."
-        : selectedHost?.status !== "online"
-          ? "Skills unavailable while the host is offline."
-          : !workspaceValid
-            ? "Choose a working directory to discover skills."
-            : !skillsHarness
-              ? "Choose a harness to discover host skills."
-              : undefined;
+  // Native prompts stay plain text; SDK skill invocations require the sandbox's catalog.
+  const arcletSkills =
+    sandboxSelected && effectiveSandboxProvider === "arclet" && isNativeTerminalAgent;
+  function getSkillsHost() {
+    if (!sandboxSelected) return selectedHost;
+    if (arcletSkills) return findConnectedArcaHost(allHosts, readArcaHostId());
+    return undefined;
+  }
+  const skillsHost = getSkillsHost();
+  const skillsHostId = sandboxSelected ? skillsHost?.host_id : selectedHostId;
+  const skillsPath = sandboxSelected ? "~" : workspaceTrimmed;
+  function getSkillsUnavailableMessage() {
+    if (sandboxSelected && !arcletSkills) {
+      return "Host skills will be available after the sandbox starts.";
+    }
+    if (selectedAgent?.id === PENDING_AGENT_ID) {
+      return "Skills will be available after this session starts.";
+    }
+    if (!skillsHostId) {
+      if (arcletSkills) return "Connect your Arca to discover skills before the sandbox starts.";
+      return "Choose a host to discover skills.";
+    }
+    if (!sandboxSelected && skillsHost?.status !== "online") {
+      return "Skills unavailable while the host is offline.";
+    }
+    if (!sandboxSelected && !workspaceValid) {
+      return "Choose a working directory to discover skills.";
+    }
+    if (!skillsHarness) return "Choose a harness to discover host skills.";
+    return undefined;
+  }
+  const skillsUnavailableMessage = getSkillsUnavailableMessage();
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
   const {
     skills: hostSkills,
+    skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
   } = useSkills({
     target:
-      selectedHostId && skillsHarness && workspaceTrimmed
+      skillsHostId && skillsHarness && skillsPath
         ? {
-            hostId: selectedHostId,
+            hostId: skillsHostId,
             harness: skillsHarness,
-            path: workspaceTrimmed,
+            path: skillsPath,
             agentId: selectedAgent?.id,
           }
         : null,
     enabled: canDiscoverHostSkills,
-    starting: !sandboxSelected && (hostsLoading || agentsLoading),
+    starting: (!sandboxSelected || arcletSkills) && (hostsLoading || agentsLoading),
   });
   const availableSkills = useMemo(
     () => (skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? [])),
@@ -4613,12 +4945,19 @@ export function NewChatLandingScreen() {
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
-  const skillPrefix = skillsHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(skillsHarness);
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
-        availableSkills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description]),
+        availableSkills.map((skill) => [
+          `${skillPrefix}${skill.name}`,
+          skillMenuDescription(skill),
+        ]),
       ),
+    [availableSkills, skillPrefix],
+  );
+  const skillLabels = useMemo(
+    () => skillDisplayNames(availableSkills, skillPrefix),
     [availableSkills, skillPrefix],
   );
   // Insert the selected skill at the caret while preserving surrounding text.
@@ -4629,6 +4968,7 @@ export function NewChatLandingScreen() {
     text: message,
     commands: skillCommands,
     skills: skillCommands,
+    labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
@@ -4736,7 +5076,13 @@ export function NewChatLandingScreen() {
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
-  const workspaceDataLoading =
+  const workspaceSettling = workspaceReadyTarget !== workspaceTarget;
+  const worktreeDiscoveryPending =
+    worktreesEnabled && (hostWorktreesLoading || hostWorktreesArePlaceholder);
+  // What a session start waits for. Worktree discovery is left out: a host
+  // whose `git worktree list` is slow must not hold the start, so it only
+  // drives the chip's loading state and the worktree control.
+  const workspaceStartLoading =
     !sandboxSelected &&
     (hostsLoading ||
       info === "loading" ||
@@ -4744,17 +5090,25 @@ export function NewChatLandingScreen() {
         (projectListLoading ||
           projectConfigLoading ||
           ((!prefillSettled || prefill.project !== projectParam) && !hostsError))) ||
-      (workspaceReadyTarget !== workspaceTarget &&
-        ((selectedHostId !== null &&
-          workspaceTrimmed === "" &&
-          (autoSeedCandidate !== null ||
-            (needsHomeFallback && (homeListingLoading || homeListingIsPlaceholder)))) ||
-          (worktreesEnabled && (hostWorktreesLoading || hostWorktreesArePlaceholder)))));
+      (workspaceSettling &&
+        selectedHostId !== null &&
+        workspaceTrimmed === "" &&
+        (autoSeedCandidate !== null ||
+          (needsHomeFallback && (homeListingLoading || homeListingIsPlaceholder)))));
+  const workspaceDataLoading =
+    workspaceStartLoading || (!sandboxSelected && workspaceSettling && worktreeDiscoveryPending);
   // Directory and worktree defaults settle independently of the model catalog.
   useEffect(() => {
     setWorkspaceReadyTarget(workspaceDataLoading ? null : workspaceTarget);
   }, [workspaceDataLoading, workspaceTarget]);
-  const workspaceLoading = workspaceDataLoading || workspaceReadyTarget !== workspaceTarget;
+  const workspaceLoading = workspaceDataLoading || workspaceSettling;
+  // A drafted branch needs the discovery result unless the repository is
+  // already verified; the always-use-worktree default needs it to seed one.
+  const worktreeRequestPending =
+    worktreeDiscoveryPending &&
+    (branchName.trim() !== ""
+      ? !workspaceIsGit
+      : (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true);
   const worktreeHeader = composerWorktreeHeaderState({
     workspace: workspaceTrimmed,
     worktrees: hostWorktrees ?? [],
@@ -4803,58 +5157,126 @@ export function NewChatLandingScreen() {
   const visibleWorktreeHeader = cachedWorkspace ?? worktreeHeader;
 
   const pickerSelectionError =
-    pickerLoading || !pickerEdits?.pendingValidation
-      ? null
-      : pickerEdits && pickerEdits.agentId !== effectiveAgentId
-        ? "The selected agent is no longer available. Choose an agent to continue."
-        : pickerEdits?.options.model &&
-            !pickerModelOptions.some((option) => option.id === pickerEdits.options.model)
-          ? "The selected model is no longer available. Choose a model to continue."
-          : null;
+    sandboxDefaultModelsEnabled &&
+    !pickerLoading &&
+    pickerEdits?.agentId === effectiveAgentId &&
+    pickerEdits.harness === previewHarness &&
+    pickerEdits.options.model &&
+    !pickerModelOptions.some((option) => option.id === pickerEdits.options.model)
+      ? "The selected model is unavailable. Choose another model or Default."
+      : pickerLoading || !pickerEdits?.pendingValidation
+        ? null
+        : pickerEdits && pickerEdits.agentId !== effectiveAgentId
+          ? "The selected agent is no longer available. Choose an agent to continue."
+          : pickerEdits?.options.model &&
+              !pickerModelOptions.some((option) => option.id === pickerEdits.options.model)
+            ? "The selected model is no longer available. Choose a model to continue."
+            : null;
   useEffect(() => {
     if (!pickerLoading && pickerSelectionError === null && pickerEdits?.pendingValidation) {
       setPickerEdits({ ...pickerEdits, pendingValidation: false });
     }
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
-  const canSubmit =
-    (message.trim().length > 0 || files.length > 0) &&
-    !pickerLoading &&
-    !workspaceLoading &&
-    !pendingSkillCompletion &&
-    pickerSelectionError === null &&
-    sandboxCatalogError === null &&
-    selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
-    !creating;
+  // Keep the disabled reason and its recovery target in the same priority order.
+  const submitBlocker = ((): {
+    field: "sandboxRepo" | "other";
+    message: string | null;
+  } | null => {
+    if (mcpAuthorizing || mcpSelectionError !== null) {
+      return {
+        field: "other",
+        message: mcpSelectionError ?? "Finish signing in to the MCP service…",
+      };
+    }
+    if (pendingSkillCompletion) return { field: "other", message: "Loading skills…" };
+    if (pickerLoading || workspaceStartLoading || worktreeRequestPending) {
+      return { field: "other", message: "Loading session configuration…" };
+    }
+    if (
+      pickerSelectionError !== null ||
+      sandboxCatalogError !== null ||
+      sandboxProfileError !== null
+    ) {
+      return {
+        field: "other",
+        message: pickerSelectionError ?? sandboxCatalogError ?? sandboxProfileError,
+      };
+    }
+    if (sandboxSelected) {
+      if (sandboxRepoOverCap) {
+        return {
+          field: "sandboxRepo",
+          message: `This sandbox provider clones at most ${maxSandboxRepos} ${maxSandboxRepos === 1 ? "repository" : "repositories"} — remove the extras`,
+        };
+      }
+      if (sandboxRepoPending) {
+        return {
+          field: "sandboxRepo",
+          message: "Finish or clear the repository URL before starting",
+        };
+      }
+      if (!sandboxWorkspaceLengthsValid) {
+        return { field: "sandboxRepo", message: SANDBOX_WORKSPACE_LENGTH_MESSAGE };
+      }
+      if (!sandboxBranchesValid) {
+        return { field: "sandboxRepo", message: "Please enter a valid repository branch" };
+      }
+      if (!sandboxRepoValid) {
+        return { field: "sandboxRepo", message: "Please enter a valid repository URL" };
+      }
+    } else {
+      if (selectedHostId && selectedHost?.status !== "online") {
+        return {
+          field: "other",
+          message: "Selected host is unavailable. Reconnect it or choose another host.",
+        };
+      }
+      if (!selectedHostId || !workspaceValid) {
+        return { field: "other", message: "Please choose a host and working directory" };
+      }
+    }
+    if (configuredAgentUnavailable && selectedAgent == null) {
+      return {
+        field: "other",
+        message: "This project's configured agent is unavailable — pick an agent to continue",
+      };
+    }
+    if (message.trim().length === 0 && files.length === 0) {
+      return { field: "other", message: "Enter a message to get started" };
+    }
+    if (selectedAgent == null || creating) return { field: "other", message: null };
+    return null;
+  })();
+  const canSubmit = submitBlocker === null;
+  const submitDisabledReason = submitBlocker?.message ?? null;
+  useLayoutEffect(() => {
+    if (submitDisabledReason !== null) return;
+    setSubmitTooltipState("closed");
+    if (document.activeElement === submitTooltipTriggerRef.current) {
+      submitTooltipTriggerRef.current
+        ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+        ?.focus();
+    }
+  }, [submitDisabledReason]);
 
-  // Why submit is disabled, surfaced as the button's tooltip. Checked in the
-  // order a user fills the form — location first, then message — so the
-  // tooltip always names the next missing input. Null when nothing is
-  // actionable (submitting, or mid-create).
-  const submitDisabledReason = canSubmit
-    ? null
-    : pendingSkillCompletion
-      ? "Loading skills…"
-      : pickerLoading || workspaceLoading
-        ? "Loading session configuration…"
-        : pickerSelectionError || sandboxCatalogError
-          ? (pickerSelectionError ?? sandboxCatalogError)
-          : sandboxSelected && sandboxRepoOverCap
-            ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-                maxSandboxRepos === 1 ? "repository" : "repositories"
-              } — remove the extras`
-            : sandboxSelected && !sandboxRepoValid
-              ? "Please enter a valid repository URL"
-              : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                ? "Selected host is unavailable. Reconnect it or choose another host."
-                : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                  ? "Please choose a host and working directory"
-                  : configuredAgentUnavailable && selectedAgent == null
-                    ? "This project's configured agent is unavailable — pick an agent to continue"
-                    : message.trim().length === 0 && files.length === 0
-                      ? "Enter a message to get started"
-                      : null;
+  function focusSandboxRepositoryIssue(): boolean {
+    const field = sandboxRepoPopoverRef.current?.querySelector<HTMLElement>(
+      sandboxRepoPending ? "#new-chat-landing-repo-input" : '[aria-invalid="true"]',
+    );
+    field?.focus();
+    return field !== undefined && field !== null;
+  }
+
+  function handleBlockedSubmit(): void {
+    if (submitBlocker?.field === "sandboxRepo") {
+      setSubmitTooltipState("closed");
+      setSandboxRepoPopoverOpen(true);
+      focusSandboxRepositoryIssue();
+    } else if (submitDisabledReason !== null) {
+      setSubmitTooltipState("pinned");
+    }
+  }
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -4862,15 +5284,12 @@ export function NewChatLandingScreen() {
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
-  // The Arca box's row in the host list, known only from the host id stored
-  // when Run on Arca connected it (a host's name is its machine hostname —
-  // no reliable relationship to the arca instance name, so no matching).
-  // While that host is online the Arca option disappears entirely; otherwise
-  // one click connects (starting a stopped instance along the way — the
-  // connect console shows what's happening, so no status needs pre-fetching).
+  // The Arca row is remembered by host ID, never inferred from its machine hostname.
+  // A recovery-capable desktop restores preview identity on demand. Older
+  // shells keep Run on Arca visible because reconnecting is their only recovery.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
-  const showArcaOption = arcaEnabled && !arcaHostOnline;
+  const showArcaOption = arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca
@@ -4878,27 +5297,34 @@ export function NewChatLandingScreen() {
       : sandboxSelected
         ? selectedSandboxLabel
         : (selectedHostDisplayName ?? "No host selected");
+  const hostTooltipRows =
+    connectingThisMachine || connectingArca
+      ? [
+          {
+            label: "Host",
+            value: connectingArca ? "Arca" : localMachineLabel(navigator.userAgent),
+          },
+          { label: "Status", value: "Connecting…" },
+        ]
+      : sandboxSelected
+        ? [
+            { label: "Host", value: selectedSandboxLabel },
+            { label: "Status", value: "Starts when you send" },
+          ]
+        : selectedHostDisplayName !== null
+          ? [
+              { label: "Host", value: selectedHostDisplayName },
+              {
+                label: "Status",
+                value: selectedHost?.status === "online" ? "Connected" : "Disconnected",
+              },
+            ]
+          : [{ label: "Host", value: "None" }];
   const worktreeControlAvailable =
     !sandboxSelected &&
     workspaceIsGit &&
     (branchName.trim() !== "" ||
       (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
-  const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
-  // The connected-GitHub repo (if any) a selection URL names, so its row can
-  // offer that repo's branch list. Repos not in the picker (pasted URLs, or a
-  // repo the account lost access to) resolve to undefined and fall back to a
-  // free-text branch input.
-  const repoForUrl = (url: string): GithubRepo | undefined =>
-    sandboxRepos.find(
-      (r) => (r.clone_url ?? `https://github.com/${r.full_name}.git`) === url.trim(),
-    );
-  // The clone URL of a connected repo, matching the server's derivation.
-  const repoCloneUrl = (r: GithubRepo): string =>
-    r.clone_url ?? `https://github.com/${r.full_name}.git`;
-  // Repos not yet selected — the "Add repository" combobox offers only these.
-  const unselectedRepos = sandboxRepos.filter(
-    (r) => !sandboxRepoSelections.some((s) => s.url === repoCloneUrl(r)),
-  );
   // Sandbox repository chip label: the single repo's name[#branch] (server's
   // clone-dir rule), a count when several, or a placeholder when none.
   const sandboxRepoLabel =
@@ -5021,6 +5447,7 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox(provider: string | null = null) {
+    if (provider !== sandboxProvider) setSandboxProfile(null);
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
     // sticky default for the next visit, on the provider just picked.
@@ -5097,6 +5524,12 @@ export function NewChatLandingScreen() {
         }
         return;
       }
+      if (res.identity) {
+        writeArcaHostId(res.identity.hostId);
+        await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+        selectHost(res.identity.hostId);
+        return;
+      }
       // The box's daemon was already connected — its host has been in the
       // list all along (just not recognized as Arca, e.g. enrolled before
       // this app remembered ids), so waiting for a NEW online host would
@@ -5162,22 +5595,30 @@ export function NewChatLandingScreen() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
-    if (!canSubmit) return;
-    // A create is actually happening: report it for pointer clicks (via the
-    // form submit) and Enter-key sends alike. After the guard so guarded no-ops
-    // don't emit, matching the disabled Start button.
-    trackClick("new_chat.start_session", "button");
+    if (!canSubmit) {
+      handleBlockedSubmit();
+      return;
+    }
+    if (createAttemptRef.current !== null) return;
+    const createAttempt = Symbol();
+    createAttemptRef.current = createAttempt;
     // BrowserRouter may defer its React update even though history already
     // changed. Remember the submit location so a late create cannot redirect
     // after the user has navigated elsewhere while this component is still
     // mounted in the outgoing transition tree.
     const createLocation = window.location.href;
-    // Remember the repos/branches for next time (seeds the picker on the next
-    // visit). Only when a repo is actually set — a no-repo session leaves the
-    // remembered repos untouched rather than clearing them.
-    if (sandboxRepoSelections.length > 0) {
-      writeLastSandboxRepos(sandboxRepoSelections);
-    }
+    const returnToCanvas = searchParams.has(CANVAS_QUERY_PARAM) && isFeatureEnabled(info, "canvas");
+    let createdCanvasId = selectedProject
+      ? (configProjectId ?? `name:${selectedProject}`)
+      : MAIN_CANVAS_ID;
+    const sessionLocation = (sessionId: string) =>
+      returnToCanvas ? canvasLocation(createdCanvasId, sessionId) : `/c/${sessionId}`;
+    const stillViewingLocalSession = (sessionId: string) => {
+      const destination = sessionLocation(sessionId);
+      return window.location.pathname.endsWith(
+        typeof destination === "string" ? destination : destination.pathname,
+      );
+    };
     setCreating(true);
     setCreateError(null);
     let localConv: {
@@ -5192,19 +5633,56 @@ export function NewChatLandingScreen() {
     // failure after the navigate-first jump strands a read-only phantom chat.
     const tearDownLocalConversation = () => {
       if (localConv === null) return;
-      const stillOnTempRoute = window.location.pathname.endsWith(`/c/${localConv.tempConvId}`);
+      const stillOnTempRoute = stillViewingLocalSession(localConv.tempConvId);
       const wasViewing = removeLocalConversation(localConv.tempConvId);
       // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
-      if (wasViewing && stillOnTempRoute) navigate("/");
+      if (wasViewing && stillOnTempRoute) {
+        navigate(returnToCanvas ? { pathname: "/", search: `?${searchParams.toString()}` } : "/");
+      }
     };
-    // The draft is spent from the moment it is submitted: it belongs to the
-    // session now being created, so a detour back to this screen must not
-    // hand it back pre-filled. Flipped here rather than on the response
-    // because the create outlives an unmount; a create that fails hands the
-    // draft back via returnDraftToUser.
-    submittedDraftRevisionRef.current = landingDraftRevision;
-    submittedRef.current = true;
     try {
+      if (sandboxSelected && effectiveSandboxProvider === "arclet" && hasDbcertPreflightBridge()) {
+        const skipCheck = new Promise<null>((resolve) => {
+          skipDbcertCheckRef.current = () => resolve(null);
+        });
+        setCheckingDbcert(true);
+        setDbcertRequired(false);
+        const credentials = await Promise.race([
+          getDesktopFeatures().then((features) =>
+            createAttemptRef.current === createAttempt &&
+            skipDbcertCheckRef.current !== null &&
+            onScreenRef.current &&
+            window.location.href === createLocation &&
+            features?.databricksInternalFeatures === true &&
+            features.canRefreshDbcert === true
+              ? checkDbcert()
+              : null,
+          ),
+          skipCheck,
+        ]);
+        skipDbcertCheckRef.current = null;
+        if (
+          createAttemptRef.current !== createAttempt ||
+          !onScreenRef.current ||
+          window.location.href !== createLocation
+        )
+          return;
+        setCheckingDbcert(false);
+        if (credentials !== null && !credentials.ok) {
+          setCreateError(credentials.error);
+          return;
+        }
+        const needsDbcert = credentials !== null && !credentials.valid;
+        setDbcertRequired(needsDbcert);
+        if (needsDbcert) return;
+      }
+      // Spend the draft only once provisioning starts, after the laptop credential check.
+      submittedDraftRevisionRef.current = landingDraftRevision;
+      submittedRef.current = true;
+      trackClick("new_chat.start_session", "button");
+      if (sandboxRepoSelections.length > 0) {
+        writeLastSandboxRepos(sandboxRepoSelections);
+      }
       const trimmedBranch = branchName.trim();
       const composerContextLabels = composerContextToLabels(composerContextState);
       // `shouldCreateWorktree` (component scope): true only when a branch is
@@ -5267,7 +5745,7 @@ export function NewChatLandingScreen() {
         // `modelPicker`), so — like codex-native — pin the pick by harness or
         // the New-Chat selection never reaches `_auto_create_devin_terminal`
         // and Devin launches on its own config default.
-        (sandboxInferenceConfigured ||
+        (sandboxHasModelCatalog ||
           agentSupportsModelPicker ||
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native") &&
@@ -5277,7 +5755,8 @@ export function NewChatLandingScreen() {
       const normalizedReasoningEffort =
         !smartRoutingHarnessSelected &&
         !routingOwnsModel &&
-        (agentSupportsPermissionMode ||
+        (sandboxDefaultModelsEnabled ||
+          agentSupportsPermissionMode ||
           selectedNativeHarness === "pi-native" ||
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native") &&
@@ -5306,10 +5785,15 @@ export function NewChatLandingScreen() {
       // when the toggle is armed for a codex-native agent) so the runner
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
       // survives reload.
-      const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
-          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-          : nativeLabels;
+      const baseLabels = {
+        ...(nativeLabels ?? {}),
+        ...(agentSupportsApprovalMode && bypassSandbox
+          ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : {}),
+        ...(codexPlanModeSelectable && codexPlanMode
+          ? { [CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY]: "plan" }
+          : {}),
+      };
       // First-class project filing: a project-driven visit whose `?project=`
       // name resolved to a real project id sends `project_id` so the server
       // files the session atomically at create (born filed, no follow-up
@@ -5323,17 +5807,17 @@ export function NewChatLandingScreen() {
       // from the config. Any user interaction — even re-picking the exact
       // config value — cleared the ref, so an explicit choice is always SENT
       // (the server treats it as authoritative and only warns on mismatch).
-      // The value-equality guard covers seeds later displaced without a write.
+      // The value-equality guard checks the server's config, so it also sends last-start seeds.
       const agentFromProjectConfig =
         createProjectId !== null &&
         agentFromConfigRef.current &&
-        prefillConfig?.agentId != null &&
-        effectiveAgentId === prefillConfig.agentId;
+        storedProjectConfig?.agent_id != null &&
+        effectiveAgentId === storedProjectConfig.agent_id;
       const workspaceFromProjectConfig =
         createProjectId !== null &&
         workspaceFromConfigRef.current &&
-        prefillConfig?.workspace != null &&
-        workspaceTrimmed === prefillConfig.workspace;
+        storedProjectConfig?.workspace != null &&
+        workspaceTrimmed === storedProjectConfig.workspace;
       // When filing into a project by LABEL, stamp its legacy `omni_project`
       // label at create so the session is BORN FILED. The sidebar dual-reads
       // project membership from this label OR the first-class `project_id` the
@@ -5351,16 +5835,32 @@ export function NewChatLandingScreen() {
             }
           : { ...(baseLabels ?? {}), ...composerContextLabels };
 
+      const skill = isNativeTerminalAgent
+        ? null
+        : matchSkillInvocation(initialPrompt, availableSkills);
+      const serverOwnsInitialInput =
+        sandboxSelected && info !== "loading" && info.durable_initial_input === true;
+      const initialInput =
+        skill !== null
+          ? {
+              type: "slash_command",
+              data: { kind: "skill", name: skill.name, arguments: skill.args },
+            }
+          : {
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: initialPrompt }] },
+            };
       let data: { id: string };
+      // The agent the create ran; a custom agent's id comes back from its create.
+      let launchedAgentId = effectiveAgentId;
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
-        // Custom agent path: build bundle client-side and use multipart POST.
-        // The multipart create only stores the agent + session rows — it does
-        // NOT launch a runner on the host. We must follow up with launchRunner
-        // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
-        // same way the fork-resume path does.
+        // Custom agents upload their bundle with the session, then launch on the host below.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = { labels: createLabels };
+        if (mcpServicesForLaunch.length) {
+          metadata.mcp_registry_services = mcpServicesForLaunch;
+        }
         // A config-seeded workspace is omitted on a `project_id` create so the
         // server default-fills it (same field semantics as the JSON path).
         if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
@@ -5377,6 +5877,7 @@ export function NewChatLandingScreen() {
           metadata as Parameters<typeof createBundledSession>[1],
         );
         data = { id: bundled.id };
+        launchedAgentId = bundled.agentId ?? null;
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
@@ -5422,7 +5923,7 @@ export function NewChatLandingScreen() {
             // real host (null for a sandbox create).
             hostId: sandboxSelected ? null : selectedHostId,
           });
-          if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
+          if (localConv !== null) navigate(sessionLocation(localConv.tempConvId));
         } catch {
           /* non-fatal: the response still opens the server session */
         }
@@ -5430,104 +5931,121 @@ export function NewChatLandingScreen() {
         const matchOwnCreate = (item: SessionListWireItem) =>
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
+        const createPayload = JSON.stringify({
+          ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
+          // Config-seeded agent on a `project_id` create: omitted so the
+          // server default-fills it from the project config.
+          ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
+          ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
+          ...(createProjectId !== null ? { project_id: createProjectId } : {}),
+          ...(sandboxSelected
+            ? {
+                host_type: "managed",
+                // The repos to clone in parallel; the agent starts in the one
+                // repo, or the parent that holds them all. Empty = empty
+                // sandbox workspace.
+                workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
+                // On a `project_id` create an ABSENT (path) workspace would be
+                // default-filled with the config's path workspace, which a
+                // managed create rejects — pin an explicit null (explicit
+                // values are never replaced by project hints). Same guard for
+                // a config-stored `git` block: a sandbox has no host for the
+                // server to create a worktree on.
+                ...(createProjectId !== null ? { workspace: null, git: null } : {}),
+                // Omitted when null so a default create is unchanged.
+                ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
+                ...(selectedSandboxProfile !== null
+                  ? {
+                      sandbox_profile_id: selectedSandboxProfile.id,
+                      sandbox_profile_revision: selectedSandboxProfile.revision,
+                    }
+                  : {}),
+                // The new sandbox host's id, in the server's minted shape;
+                // keys the create and the session's requests until it binds.
+                ...(info !== "loading" && info.request_managed_sandbox_host_id
+                  ? { host_id: randomUUID().replace(/-/g, "") }
+                  : {}),
+                ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
+                  ? {
+                      inference_configuration_revision: sandboxModels.data.configuration_revision,
+                    }
+                  : {}),
+              }
+            : {
+                host_id: selectedHostId,
+                // Config-seeded workspace on a `project_id` create: omitted
+                // so the server default-fills it (see agent_id above).
+                ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
+                // Create a new worktree, or bind an existing one
+                // (`existing_worktree` records the branch for the sidebar +
+                // delete flow without creating anything), or neither. Always
+                // explicit when set: the branch name is generated (or typed)
+                // client-side, so the server cannot default-fill it.
+                git: shouldCreateWorktree
+                  ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
+                  : startInExistingWorktree
+                    ? { branch_name: activeWorktree!.branch!, existing_worktree: true }
+                    : createProjectId !== null && workspaceIsNonGit
+                      ? null
+                      : undefined,
+              }),
+          // Native-wrapper labels + codex bypass + the born-filed project
+          // label (see `createLabels` above).
+          // Smart Routing sends none of these: the bound agent is only a
+          // placeholder, so the placeholder's wrapper labels, launch args and
+          // model would all describe a CLI the router may not pick. The
+          // server stamps the routed wrapper's labels once it has rebound.
+          labels: {
+            ...(smartRoutingHarnessSelected ? {} : createLabels),
+            [CLIENT_CREATE_TOKEN_LABEL]: createToken,
+          },
+          // Permission / approval / cursor mode → CLI flag pair, persisted as
+          // terminal_launch_args. Omitted for the default and non-native agents.
+          terminal_launch_args: smartRoutingHarnessSelected
+            ? undefined
+            : agentSupportsPermissionMode &&
+                permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+              ? ["--permission-mode", permissionMode]
+              : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+                ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
+                : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
+                  ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
+                  : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
+                    ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
+                    : agentSupportsDevinPermission &&
+                        devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
+                      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === devinPermissionMode)
+                          ?.args ?? [])
+                      : undefined,
+          // Model + reasoning effort, persisted on the session row before
+          // the runner launches. An unselected ("") knob is omitted so the
+          // harness keeps its own configured/default value.
+          model_override: normalizedModelOverride ?? undefined,
+          reasoning_effort: normalizedReasoningEffort ?? undefined,
+          cost_control_mode_override: costControlOverride,
+          // Top-level Smart Routing sends the same "auto" sentinel the bundle
+          // path does; the server tells them apart by the bound agent being a
+          // native wrapper, and routes at create time (the terminal launches
+          // with the row, so there is no first message to wait for). The
+          // routing hint is separate from first-input delivery.
+          harness_override: smartRoutingHarnessSelected
+            ? AUTO_HARNESS_ID
+            : (pickedHarness ?? undefined),
+          smart_routing_message:
+            smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
+        });
+        const createForm = serverOwnsInitialInput && files.length > 0 ? new FormData() : null;
+        if (createForm !== null) {
+          createForm.append("metadata", createPayload);
+          for (const file of files) createForm.append("initial_files", file, file.name);
+        }
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
           headers: {
-            "Content-Type": "application/json",
+            ...(createForm === null ? { "Content-Type": "application/json" } : {}),
             ...backgroundSessionTitlesRequestHeaders(),
           },
-          body: JSON.stringify({
-            // Config-seeded agent on a `project_id` create: omitted so the
-            // server default-fills it from the project config.
-            ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
-            ...(createProjectId !== null ? { project_id: createProjectId } : {}),
-            ...(sandboxSelected
-              ? {
-                  host_type: "managed",
-                  // The repos to clone in parallel; the agent starts in the one
-                  // repo, or the parent that holds them all. Empty = empty
-                  // sandbox workspace.
-                  workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
-                  // On a `project_id` create an ABSENT (path) workspace would be
-                  // default-filled with the config's path workspace, which a
-                  // managed create rejects — pin an explicit null (explicit
-                  // values are never replaced by project hints). Same guard for
-                  // a config-stored `git` block: a sandbox has no host for the
-                  // server to create a worktree on.
-                  ...(createProjectId !== null ? { workspace: null, git: null } : {}),
-                  // Omitted when null so a default create is unchanged.
-                  ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
-                  ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
-                    ? {
-                        inference_configuration_revision: sandboxModels.data.configuration_revision,
-                      }
-                    : {}),
-                }
-              : {
-                  host_id: selectedHostId,
-                  // Config-seeded workspace on a `project_id` create: omitted
-                  // so the server default-fills it (see agent_id above).
-                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
-                  // Create a new worktree, or bind an existing one
-                  // (`existing_worktree` records the branch for the sidebar +
-                  // delete flow without creating anything), or neither. Always
-                  // explicit when set: the branch name is generated (or typed)
-                  // client-side, so the server cannot default-fill it.
-                  git: shouldCreateWorktree
-                    ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                    : startInExistingWorktree
-                      ? { branch_name: activeWorktree!.branch!, existing_worktree: true }
-                      : createProjectId !== null && workspaceIsNonGit
-                        ? null
-                        : undefined,
-                }),
-            // Native-wrapper labels + codex bypass + the born-filed project
-            // label (see `createLabels` above).
-            // Smart Routing sends none of these: the bound agent is only a
-            // placeholder, so the placeholder's wrapper labels, launch args and
-            // model would all describe a CLI the router may not pick. The
-            // server stamps the routed wrapper's labels once it has rebound.
-            labels: {
-              ...(smartRoutingHarnessSelected ? {} : createLabels),
-              [CLIENT_CREATE_TOKEN_LABEL]: createToken,
-            },
-            // Permission / approval / cursor mode → CLI flag pair, persisted as
-            // terminal_launch_args. Omitted for the default and non-native agents.
-            terminal_launch_args: smartRoutingHarnessSelected
-              ? undefined
-              : agentSupportsPermissionMode &&
-                  permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
-                ? ["--permission-mode", permissionMode]
-                : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
-                  ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
-                  : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
-                    ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
-                    : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
-                      ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
-                      : agentSupportsDevinPermission &&
-                          devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
-                        ? (DEVIN_NATIVE_PERMISSION_MODES.find(
-                            (m) => m.value === devinPermissionMode,
-                          )?.args ?? [])
-                        : undefined,
-            // Model + reasoning effort, persisted on the session row before
-            // the runner launches. An unselected ("") knob is omitted so the
-            // harness keeps its own configured/default value.
-            model_override: normalizedModelOverride ?? undefined,
-            reasoning_effort: normalizedReasoningEffort ?? undefined,
-            cost_control_mode_override: costControlOverride,
-            // Top-level Smart Routing sends the same "auto" sentinel the bundle
-            // path does; the server tells them apart by the bound agent being a
-            // native wrapper, and routes at create time (the terminal launches
-            // with the row, so there is no first message to wait for). The
-            // message text rides along for routing only — the client still
-            // delivers the real message after navigation.
-            harness_override: smartRoutingHarnessSelected
-              ? AUTO_HARNESS_ID
-              : (pickedHarness ?? undefined),
-            smart_routing_message:
-              smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
-          }),
+          body: createForm ?? createPayload,
         });
         // Managed launch validation continues after the row is announced, so
         // only its HTTP response can resolve the temp chat.
@@ -5538,6 +6056,9 @@ export function NewChatLandingScreen() {
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) {
+            if (sandboxSelected) {
+              void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+            }
             if (sandboxPreviewEnabled && response.status === 409) {
               void queryClient.invalidateQueries({
                 queryKey: sandboxModelOptionsKey(
@@ -5552,7 +6073,13 @@ export function NewChatLandingScreen() {
           }
           const created = (await response.json()) as {
             id: string;
+            labels?: Record<string, string>;
           };
+          // Route the new session's first requests by its chosen host id
+          // before any snapshot of it loads. Only seeds: a null here would
+          // erase a host the session's snapshot already recorded.
+          const requestedHostId = sessionRoutingHostId(null, created.labels);
+          if (requestedHostId !== null) setSessionHost(created.id, requestedHostId);
           return { id: created.id };
         })();
         // Once the create answers, its id is authoritative — stop listening.
@@ -5589,8 +6116,9 @@ export function NewChatLandingScreen() {
       // storage eagerly so an immediate Send cannot observe stale state; this
       // successful-create snapshot also covers restored drafts and every
       // harness-specific creation path.
+      let launchedOptions: HarnessOptions | null = null;
       if (!smartRoutingHarnessSelected) {
-        const launchedOptions = createdHarnessOptions({
+        launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
           supportsPermissionMode: agentSupportsPermissionMode,
           supportsDevinMode,
@@ -5615,6 +6143,7 @@ export function NewChatLandingScreen() {
           writeHarnessOption(selectedNativeHarness, launchedOptions);
         }
       }
+      let launchProjectId = createProjectId;
       if (createProjectId !== null) {
         // The create filed the session atomically via first-class
         // `project_id` — no follow-up move. Still refresh the project lists:
@@ -5634,7 +6163,11 @@ export function NewChatLandingScreen() {
           // File via first-class project_id; the helper resolves the picked
           // name to a project id, creating an empty project on demand when the
           // name is new or label-only.
-          await moveConversationToProject(data.id, selectedProject);
+          const filed = await moveConversationToProject(data.id, selectedProject);
+          if (filed?.project_id) {
+            createdCanvasId = filed.project_id;
+            launchProjectId = filed.project_id;
+          }
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -5647,6 +6180,29 @@ export function NewChatLandingScreen() {
           // still shows it under the project.
         }
       }
+      // This start becomes the project's default for its next session.
+      if (launchProjectId !== null) {
+        writeProjectLaunchDefaults(
+          launchProjectId,
+          {
+            ...(launchedAgentId !== null && launchedAgentId !== PENDING_AGENT_ID
+              ? {
+                  agentId: launchedAgentId,
+                  pickedHarness,
+                  ...(launchedOptions !== null
+                    ? {
+                        harness: selectedNativeHarness ?? undefined,
+                        harnessOptions: launchedOptions,
+                      }
+                    : {}),
+                }
+              : {}),
+            hostId: sandboxSelected ? SANDBOX_HOST_CHOICE : (selectedHostId ?? undefined),
+            workspace: sandboxSelected ? undefined : workspaceTrimmed,
+          },
+          storedProjectConfig ?? {},
+        );
+      }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
       // Remember the launched harness so the picker promotes it out of "More"
@@ -5654,9 +6210,6 @@ export function NewChatLandingScreen() {
       // merely browsed past never earns a primary slot.
       if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
       // SDK invocations resolve on the runner after create; native CLIs receive plain text.
-      const skill = isNativeTerminalAgent
-        ? null
-        : matchSkillInvocation(initialPrompt, availableSkills);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
       // the freshly-opened chat. Sanitized text so recall reproduces what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
@@ -5666,12 +6219,11 @@ export function NewChatLandingScreen() {
         writeLandingDraft(null);
       }
 
-      // `localConv` is set only when a real agent id was resolved up front, so
-      // it's safe to POST the first message with it.
+      // `localConv` is set only when a real agent id was resolved up front.
       if (localConv !== null && effectiveAgentId !== null) {
-        const tempRouteSuffix = `/c/${localConv.tempConvId}`;
+        const tempConvId = localConv.tempConvId;
         promoteSessionDraft(localConv.tempConvId, data.id);
-        // Hydrate the temp id onto the real id and POST the first message.
+        // Hydrate the temp id, binding server-owned input or sending on older servers.
         hydrateLocalConversation(
           localConv.tempConvId,
           data.id,
@@ -5680,19 +6232,21 @@ export function NewChatLandingScreen() {
           files,
           localConv.pendingMsgTempId,
           skill,
-          navigate,
-          () => window.location.pathname.endsWith(tempRouteSuffix),
+          returnToCanvas ? (_to, options) => navigate(sessionLocation(data.id), options) : navigate,
+          () => stillViewingLocalSession(tempConvId),
           localProject,
+          serverOwnsInitialInput,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
       } else {
         // Server-first: a pending custom agent (or no client cache in tests).
-        // Label the row, stash the first message for ChatPage to send, navigate.
+        // Keep a browser delivery draft only when the create did not accept the input.
         recordOptimisticTitle(data.id, initialPrompt);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
-        setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        if (!serverOwnsInitialInput)
+          setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
         if (onScreenRef.current && window.location.href === createLocation) {
-          navigate(`/c/${data.id}`);
+          navigate(sessionLocation(data.id));
         }
       }
     } catch {
@@ -5703,7 +6257,12 @@ export function NewChatLandingScreen() {
       if (localConv !== null) showToast(msg);
       else setCreateError(msg);
     } finally {
-      setCreating(false);
+      if (createAttemptRef.current === createAttempt) {
+        createAttemptRef.current = null;
+        skipDbcertCheckRef.current = null;
+        setCheckingDbcert(false);
+        setCreating(false);
+      }
     }
   }
 
@@ -5712,20 +6271,34 @@ export function NewChatLandingScreen() {
     : "Describe a task to start a new session…";
 
   const isCloudHostEntry = (host: Host) =>
-    host.host_id === arcaHostId ||
-    !!host.sandbox_provider ||
-    host.name.toLowerCase().includes("cloud");
-  const orderedHosts = [...onlineHosts, ...offlineHosts];
-  const cloudHosts = orderedHosts.filter(isCloudHostEntry);
-  const localHosts = orderedHosts.filter((host) => !isCloudHostEntry(host));
+    !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
+  const isReconnectRow = (host: Host) =>
+    host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
+  // Keep the selected host and this machine's reconnect action above the fold.
+  const listedHosts = [
+    ...onlineHosts,
+    ...offlineHosts.filter((host) => host.host_id === selectedHostId || isReconnectRow(host)),
+  ];
+  // Preserve /v1/hosts order: most recently updated first.
+  const otherOfflineHosts = offlineHosts.filter(
+    (host) => host.host_id !== selectedHostId && !isReconnectRow(host),
+  );
+  const cloudHosts = listedHosts.filter(isCloudHostEntry);
+  const localHosts = listedHosts.filter((host) => !isCloudHostEntry(host));
+  const myMachines = allHosts.filter((host) => !isCloudHostEntry(host));
+  let myMachinesEmptyText: string | null = null;
+  if (myMachines.length === 0) {
+    myMachinesEmptyText = "No hosts connected yet.";
+  } else if (!myMachines.some((host) => host.status === "online")) {
+    myMachinesEmptyText = "No hosts online.";
+  }
   const hasCloudOptions =
     managedSandboxesEnabled ||
     showDisabledSandboxWithDocs ||
     cloudHosts.length > 0 ||
     showArcaOption;
   const renderHostMenuItem = (host: Host) => {
-    const reconnect =
-      host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
+    const reconnect = isReconnectRow(host);
     return (
       <DropdownMenuItem
         key={host.host_id}
@@ -5763,12 +6336,24 @@ export function NewChatLandingScreen() {
     );
   };
 
+  const mcpRegistryPicker = mcpRegistryEnabled ? (
+    <McpRegistryLaunchPicker
+      key="mcp-registry-picker"
+      selected={mcpRegistryServices}
+      catalog={mcpRegistryCatalog}
+      disabled={creating}
+      onAuthorizingChange={setMcpAuthorizing}
+      onToggle={toggleMcpRegistryService}
+    />
+  ) : null;
+
   // The two compact triggers preserve the existing directory and worktree
   // actions while exposing their distinct state truthfully.
   const workspaceChip = (
     <ComposerWorkspaceTrigger
       kind="directory"
       label={noExecutionTargetSelected ? "No host selected" : visibleWorktreeHeader.repositoryLabel}
+      iconOnly={noExecutionTargetSelected}
       icon={
         workspaceIsGit ? (
           <FolderGit2Icon
@@ -5802,18 +6387,18 @@ export function NewChatLandingScreen() {
   );
 
   return (
-    // pb-24 lifts the centered hero and composer by 48px for optical balance.
+    // Desktop keeps the centered composition; mobile docks the composer.
     <div
       ref={setLandingSurface}
-      className="relative flex flex-1 items-center justify-center pb-24"
+      className="relative flex min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24"
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 800px cap, so the composer surface reaches
           its shared 48rem column (800 − 32 = 768px) on desktop. px-4 (16px
           gutters) keeps the composer from feeling cramped against the
           viewport edges on phones. */}
-      <div className="flex w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-16 md:select-none">
-        <div className="mb-6 flex w-full flex-col items-center justify-center gap-3.5">
+      <div className="flex min-h-0 w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-[max(20px,env(safe-area-inset-bottom))] md:pb-16 md:select-none">
+        <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 md:flex-none">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
             // icon — the default pink folder, or a chosen emoji — and name the
@@ -5836,25 +6421,35 @@ export function NewChatLandingScreen() {
             <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
           )}
           {selectedProject || heading ? (
-            <h1 className="min-w-0 break-words text-center text-[1.5em] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
+            <h1 className="min-w-0 break-words text-center text-[24px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
               {selectedProject || heading}
             </h1>
           ) : null}
         </div>
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
-        <div
-          className={cn("relative flex flex-col gap-0", COMPOSER_COLUMN_WIDTH)}
+        <fieldset
+          disabled={checkingDbcert}
+          className={cn(
+            "relative flex min-w-0 flex-col gap-0 max-md:w-[calc(100%-1rem)]",
+            COMPOSER_COLUMN_WIDTH,
+          )}
           data-testid="new-chat-landing-composer-surface"
         >
+          {/* Keep the tray mounted while the execution target changes. */}
           {sandboxSelected && (
-            <ComposerWorkspaceBar data-testid="new-chat-landing-workspace-controls">
+            <ComposerWorkspaceBar
+              key="workspace-controls"
+              className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
+              data-testid="new-chat-landing-workspace-controls"
+              trailingContent={mcpRegistryPicker}
+            >
               {/* Sandbox repository chip — the sandbox counterpart of the
               working-directory chip. There is no filesystem to browse
               before the sandbox exists, so the workspace is specified as
               a git repository URL (+ optional branch) the server clones
               at create time. Blank = empty server-created workspace. */}
-              <Popover>
+              <Popover open={sandboxRepoPopoverOpen} onOpenChange={setSandboxRepoPopoverOpen}>
                 <PopoverTrigger asChild>
                   <button
                     type="button"
@@ -5877,7 +6472,22 @@ export function NewChatLandingScreen() {
                     <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </PopoverTrigger>
-                <PopoverContent align="start" className="w-96 p-3">
+                <PopoverContent
+                  ref={sandboxRepoPopoverRef}
+                  align="start"
+                  className="w-96 p-3"
+                  onOpenAutoFocus={(event) => {
+                    if (focusSandboxRepositoryIssue()) event.preventDefault();
+                  }}
+                  onPointerDownOutside={(event) => {
+                    if (
+                      !sandboxRepoValid &&
+                      submitTooltipTriggerRef.current?.contains(event.target as Node)
+                    ) {
+                      event.preventDefault();
+                    }
+                  }}
+                >
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <span className="text-sm font-medium text-foreground">
@@ -5900,151 +6510,13 @@ export function NewChatLandingScreen() {
                         </Tooltip>
                       )}
                     </div>
-                    {/* Stale over-cap selection (repos remembered/added under
-                  a multi-repo provider, then switched to a single-repo one):
-                  warn and block submit rather than 422 after the session row
-                  is created. */}
-                    {sandboxRepoOverCap && (
-                      <p
-                        className="text-sm text-warning"
-                        data-testid="new-chat-landing-repo-overcap"
-                      >
-                        This sandbox provider clones at most {maxSandboxRepos}{" "}
-                        {maxSandboxRepos === 1 ? "repository" : "repositories"}. Remove the extra{" "}
-                        {maxSandboxRepos === 1 ? "repositories" : "ones"} to continue.
-                      </p>
-                    )}
-                    {/* Selected repos: each clones into its own sibling dir.
-                  A connected repo gets its branch combobox; a pasted URL a
-                  free-text branch. The remove button drops it. */}
-                    {sandboxRepoSelections.map((sel) => {
-                      const repo = repoForUrl(sel.url);
-                      const name = repo?.full_name ?? deriveRepoName(sel.url) ?? sel.url;
-                      return (
-                        <div
-                          key={sel.url}
-                          className="flex items-center gap-2"
-                          data-testid="new-chat-landing-repo-row"
-                        >
-                          <span className="min-w-0 flex-1 truncate text-sm" title={sel.url}>
-                            {name}
-                          </span>
-                          {repo ? (
-                            <div className="w-36 shrink-0">
-                              <SandboxRepoBranchSelect
-                                fullName={repo.full_name}
-                                value={sel.branch}
-                                defaultBranch={repo.default_branch}
-                                onChange={(b) => setSandboxRepoBranch(sel.url, b)}
-                              />
-                            </div>
-                          ) : (
-                            <input
-                              type="text"
-                              value={sel.branch}
-                              onChange={(e) => setSandboxRepoBranch(sel.url, e.target.value)}
-                              placeholder="branch"
-                              aria-label={`Branch for ${name}`}
-                              className="w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-xs outline-none transition-colors focus-visible:border-ring"
-                            />
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => removeSandboxRepo(sel.url)}
-                            aria-label={`Remove ${name}`}
-                            className="shrink-0 rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
-                            data-testid="new-chat-landing-repo-remove"
-                          >
-                            <XIcon className="size-3.5" />
-                          </button>
-                        </div>
-                      );
-                    })}
-                    {sandboxRepoSelections.length > 0 && (
-                      <div className="my-0.5 border-t border-border" />
-                    )}
-                    {/* Add-repository controls, hidden once the provider's
-                  repo cap is reached — so a single-repo provider shows one
-                  slot and no multi-repo affordance. */}
-                    {sandboxRepoSelections.length < maxSandboxRepos && (
-                      <>
-                        {/* Add from the connected account's repos (only those
-                      not already picked); the free-text URL below is the
-                      fallback for a repo not in the list or no GitHub link. */}
-                        {showGithubRepoPicker && (
-                          <>
-                            <SandboxRepoCombobox
-                              repos={unselectedRepos}
-                              value=""
-                              onSelect={(repo) => {
-                                if (repo) {
-                                  addSandboxRepo(
-                                    repo.clone_url ?? `https://github.com/${repo.full_name}.git`,
-                                  );
-                                }
-                              }}
-                            />
-                            {sandboxReposTruncated && (
-                              <p
-                                className="text-sm text-muted-foreground"
-                                data-testid="new-chat-landing-repo-truncated"
-                              >
-                                Showing your most recently pushed repositories. Don't see one? Paste
-                                its URL below.
-                              </p>
-                            )}
-                            <p className="text-sm text-muted-foreground">
-                              or paste a repository URL:
-                            </p>
-                          </>
-                        )}
-                        {/* Connected but the repo list failed to load: say so
-                      explicitly, so a transient error isn't mistaken for
-                      "GitHub not connected" (the picker just wouldn't render). */}
-                        {githubReposEnabled && sandboxReposErrored && !showGithubRepoPicker && (
-                          <p
-                            className="text-sm text-destructive"
-                            data-testid="new-chat-landing-repo-error"
-                          >
-                            Couldn't load your GitHub repositories. Paste a repository URL below.
-                          </p>
-                        )}
-                        <div className="flex items-center gap-2">
-                          <input
-                            id="landing-repo-url"
-                            type="text"
-                            value={pendingRepoUrl}
-                            onChange={(e) => setPendingRepoUrl(e.target.value)}
-                            onKeyDown={(e) => {
-                              // Enter adds the repo (same as the Add button), so a
-                              // paste-then-Enter flow never needs the mouse.
-                              if (e.key === "Enter" && isValidSandboxRepoUrl(pendingRepoUrl)) {
-                                e.preventDefault();
-                                addSandboxRepo(pendingRepoUrl);
-                                setPendingRepoUrl("");
-                              }
-                            }}
-                            placeholder="https://github.com/org/repo"
-                            aria-label="Repository URL"
-                            className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-                            data-testid="new-chat-landing-repo-input"
-                          />
-                          <button
-                            type="button"
-                            disabled={!isValidSandboxRepoUrl(pendingRepoUrl)}
-                            onClick={() => {
-                              addSandboxRepo(pendingRepoUrl);
-                              setPendingRepoUrl("");
-                            }}
-                            className="flex shrink-0 items-center gap-1 rounded-md border border-input px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-                            data-testid="new-chat-landing-repo-add"
-                          >
-                            <PlusIcon className="size-3.5" />
-                            Add
-                          </button>
-                        </div>
-                      </>
-                    )}
+                    <SandboxRepositoryPicker
+                      selections={sandboxRepoSelections}
+                      onChange={setSandboxRepoSelections}
+                      maxRepos={maxSandboxRepos}
+                      pendingUrl={pendingRepoUrl}
+                      onPendingUrlChange={setPendingRepoUrl}
+                    />
                     <p className="text-sm text-muted-foreground">
                       {maxSandboxRepos > 1
                         ? "Cloned into the sandbox at startup. Several repos are cloned side by side and the agent starts in the parent that holds them; pick one and it starts directly inside it. Leave empty for a blank workspace."
@@ -6053,10 +6525,20 @@ export function NewChatLandingScreen() {
                   </div>
                 </PopoverContent>
               </Popover>
+              <SandboxProfilePicker
+                provider={effectiveSandboxProvider}
+                value={sandboxProfile}
+                onChange={setSandboxProfile}
+              />
             </ComposerWorkspaceBar>
           )}
           {!sandboxSelected && (
-            <ComposerWorkspaceBar data-testid="new-chat-landing-workspace-controls">
+            <ComposerWorkspaceBar
+              key="workspace-controls"
+              className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
+              data-testid="new-chat-landing-workspace-controls"
+              trailingContent={mcpRegistryPicker}
+            >
               {workspaceLoading && cachedWorkspace === null && (
                 <NewChatPickerLoading
                   label="Loading working directory"
@@ -6131,6 +6613,7 @@ export function NewChatLandingScreen() {
                             ? "No host selected"
                             : visibleWorktreeHeader.branchLabel
                         }
+                        iconOnly={noExecutionTargetSelected}
                         aria-label={
                           noExecutionTargetSelected
                             ? "No host selected"
@@ -6306,7 +6789,7 @@ export function NewChatLandingScreen() {
               e.preventDefault();
               void handleCreate();
             }}
-            className="relative z-10"
+            className="relative z-30"
           >
             <ChatComposer
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
@@ -6382,7 +6865,9 @@ export function NewChatLandingScreen() {
                         onSelect={applySlashSelection}
                         commands={slashCompletion.commands}
                         builtinNames={slashCompletion.builtinNames}
+                        labels={slashCompletion.labels}
                         skillsStatus={skillsStatus}
+                        skillsWarnings={skillsWarnings}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}
                       />
@@ -6422,7 +6907,7 @@ export function NewChatLandingScreen() {
                       ref={fileInputRef}
                       type="file"
                       multiple
-                      accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
+                      accept={fileAccept}
                       className="hidden"
                       data-testid="new-chat-landing-file-input"
                       onChange={(e) => {
@@ -6465,11 +6950,22 @@ export function NewChatLandingScreen() {
                         onPlan={
                           directModeOptions.some((mode) => mode.value === "plan")
                             ? () => selectDirectMode("plan")
-                            : undefined
+                            : toggleCodexPlanMode
                         }
                         planActive={
                           (supportsPermissionMode && permissionMode === "plan") ||
-                          (supportsCursorMode && cursorExecMode === "plan")
+                          (supportsCursorMode && cursorExecMode === "plan") ||
+                          (codexPlanModeSelectable && codexPlanMode)
+                        }
+                        planLabel={codexPlanModeSelectable ? codexPlanToggleLabel : undefined}
+                        planUnavailableReason={
+                          selectedNativeHarness === "codex-native"
+                            ? !codexPlanLaunchEnabled
+                              ? "This server does not support starting Codex in Plan mode"
+                              : effectiveAgentId === PENDING_AGENT_ID
+                                ? "Turn Plan mode on after this custom agent's session starts"
+                                : undefined
+                            : undefined
                         }
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
@@ -6483,6 +6979,8 @@ export function NewChatLandingScreen() {
                     {/* Host chip */}
                     <DropdownMenu
                       onOpenChange={(open) => {
+                        setHostMenuOpen(open);
+                        if (!open) setOfflineHostLimit(0);
                         // Run a requested "connect this machine" only once the menu
                         // has closed.
                         if (!open && pendingConnectRef.current) {
@@ -6495,23 +6993,35 @@ export function NewChatLandingScreen() {
                         }
                       }}
                     >
-                      <DropdownMenuTrigger asChild>
-                        <ComposerHostTrigger
-                          label={`Host: ${hostLabel}, ${selectedHost?.status === "online" && !sandboxSelected ? "Online" : "Offline"}`}
-                          status={
-                            selectedHost?.status === "online" && !sandboxSelected
-                              ? "online"
-                              : "offline"
-                          }
-                          cloud={isCloudHost}
-                          className={cn(
-                            connectingThisMachine &&
-                              "w-auto gap-1 pr-2 after:animate-pulse after:text-xs after:font-normal after:content-['Connecting…']",
-                          )}
-                          testIdPrefix="new-chat-landing"
-                          data-testid="new-chat-landing-host-chip"
-                        />
-                      </DropdownMenuTrigger>
+                      <ComposerMenuTooltip
+                        menuOpen={hostMenuOpen}
+                        content={<ComposerConfigTooltipRows rows={hostTooltipRows} />}
+                        variant="session-info"
+                        testId="new-chat-landing-host-tooltip"
+                        className="shrink-0"
+                        // Two short rows: size to the text, wrapping at the pill's width.
+                        contentClassName="w-max max-w-64"
+                      >
+                        <DropdownMenuTrigger asChild>
+                          <ComposerHostTrigger
+                            label={
+                              sandboxSelected
+                                ? `Host: ${hostLabel}`
+                                : `Host: ${hostLabel}, ${selectedHost?.status === "online" ? "Online" : "Offline"}`
+                            }
+                            status={
+                              sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
+                            }
+                            cloud={isCloudHost}
+                            className={cn(
+                              connectingThisMachine &&
+                                "w-auto gap-1 pr-2 after:animate-pulse after:text-xs after:font-normal after:content-['Connecting…']",
+                            )}
+                            testIdPrefix="new-chat-landing"
+                            data-testid="new-chat-landing-host-chip"
+                          />
+                        </DropdownMenuTrigger>
+                      </ComposerMenuTooltip>
                       <DropdownMenuContent
                         align="start"
                         sideOffset={6}
@@ -6604,13 +7114,15 @@ export function NewChatLandingScreen() {
                         )}
                         {hasCloudOptions && <DropdownMenuSeparator />}
                         <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                          Local
+                          My machines
                         </div>
-                        {allHosts.length === 0 && !showConnectThisMachine && (
-                          <div className="px-2 py-1.5 text-sm text-muted-foreground">
-                            No hosts connected yet.
-                          </div>
-                        )}
+                        {localHosts.length === 0 &&
+                          !showConnectThisMachine &&
+                          myMachinesEmptyText && (
+                            <div className="px-2 py-1.5 text-sm text-muted-foreground">
+                              {myMachinesEmptyText}
+                            </div>
+                          )}
                         {localHosts.map(renderHostMenuItem)}
                         {/* Desktop shell, no active host and machine not listed:
                     show the disconnected local-machine state inline. */}
@@ -6640,6 +7152,51 @@ export function NewChatLandingScreen() {
                             </span>
                           </DropdownMenuItem>
                         )}
+                        {otherOfflineHosts.length > 0 && (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              aria-expanded={offlineHostLimit > 0}
+                              onSelect={(event) => {
+                                event.preventDefault();
+                                setOfflineHostLimit((limit) => (limit > 0 ? 0 : 5));
+                              }}
+                              className="text-muted-foreground"
+                            >
+                              {offlineHostLimit > 0 ? (
+                                <ChevronDownIcon className="size-4" />
+                              ) : (
+                                <ChevronRightIcon className="size-4" />
+                              )}
+                              Offline hosts ({otherOfflineHosts.length})
+                            </DropdownMenuItem>
+                            {offlineHostLimit > 0 && (
+                              <>
+                                <div
+                                  role="group"
+                                  aria-label="Offline hosts"
+                                  className="max-h-48 overflow-y-auto"
+                                >
+                                  {otherOfflineHosts
+                                    .slice(0, offlineHostLimit)
+                                    .map(renderHostMenuItem)}
+                                </div>
+                                {offlineHostLimit < otherOfflineHosts.length && (
+                                  <DropdownMenuItem
+                                    onSelect={(event) => {
+                                      event.preventDefault();
+                                      setOfflineHostLimit((limit) => limit + 5);
+                                    }}
+                                    className="text-muted-foreground"
+                                  >
+                                    Show more ({otherOfflineHosts.length - offlineHostLimit}{" "}
+                                    remaining)
+                                  </DropdownMenuItem>
+                                )}
+                              </>
+                            )}
+                          </>
+                        )}
                         <DropdownMenuSeparator />
                         {/* Persistent escape hatch: open the connect-a-host
                     instructions. Present even with zero hosts so a fresh user
@@ -6661,6 +7218,7 @@ export function NewChatLandingScreen() {
                         value="No host selected"
                         harness={selectedNativeHarness}
                         disabled
+                        iconOnly
                         options={directModeOptions}
                         onSelect={selectDirectMode}
                         testIdPrefix="new-chat-landing"
@@ -6697,6 +7255,15 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                       />
                     ) : null}
+                    {codexPlanModeSelectable && codexPlanMode && (
+                      <span
+                        data-testid="new-chat-landing-plan-mode"
+                        className="inline-flex shrink-0 items-center gap-1 px-1 text-sm font-medium text-foreground"
+                      >
+                        <FileTextIcon className="ui-icon" />
+                        <span>Plan mode</span>
+                      </span>
+                    )}
 
                     {/* The session's project membership (from a `?project=` landing)
                 is shown in the hero heading instead of a tray chip; filing on
@@ -6710,13 +7277,27 @@ export function NewChatLandingScreen() {
                     the selected entry's submenu owns run configuration. */}
                       <AgentHarnessPicker
                         openNonce={modelPickerOpenNonce}
+                        cyclePreview={
+                          preview === "models"
+                            ? modelSection
+                            : preview === "efforts"
+                              ? (effortSection ?? fusionSections?.[1])
+                              : undefined
+                        }
+                        onDismissCyclePreview={dismissPreview}
                         agentEntries={agentEntries}
                         harnessEntries={harnessEntries}
+                        blockedReasons={sandboxSelected ? sandboxBlockedReasons : undefined}
+                        onPrefetchEntries={prefetchSandboxPreviews}
                         effectiveAgentId={effectiveAgentId}
                         agentLabel={agentLabel}
                         hasAgents={agentList.length > 0}
+                        curatedEntries={
+                          curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                        }
+                        entriesFailed={agentsError}
                         loading={pickerLoading}
-                        interactiveWhileLoading={interactiveWhileLoading}
+                        interactiveWhileLoading={pickerInteractiveWhileLoading}
                         disabledLabel={noExecutionTargetSelected ? "No host selected" : undefined}
                         cacheKey={pickerCacheKey}
                         host={harnessWarningHost}
@@ -6735,6 +7316,7 @@ export function NewChatLandingScreen() {
                             : undefined
                         }
                         triggerDetails={harnessTriggerDetails}
+                        modelCatalogAvailability={modelCatalogAvailability}
                         triggerIcon={
                           selectedAgent ? (
                             <span
@@ -6771,9 +7353,41 @@ export function NewChatLandingScreen() {
                       onInterim={dictation.replaceInterim}
                     />
                     <TooltipProvider>
-                      <Tooltip>
+                      <Tooltip
+                        open={submitTooltipState !== "closed"}
+                        onOpenChange={(open) =>
+                          setSubmitTooltipState((current) =>
+                            current === "pinned" ? current : open ? "open" : "closed",
+                          )
+                        }
+                      >
                         <TooltipTrigger asChild>
-                          <span className="inline-flex shrink-0">
+                          <span
+                            ref={submitTooltipTriggerRef}
+                            role={submitDisabledReason !== null ? "group" : undefined}
+                            tabIndex={submitDisabledReason !== null ? 0 : -1}
+                            aria-label={submitDisabledReason !== null ? "Start session" : undefined}
+                            aria-disabled={submitDisabledReason !== null ? true : undefined}
+                            onPointerDown={(event) => {
+                              if (submitDisabledReason === null) return;
+                              event.preventDefault();
+                              handleBlockedSubmit();
+                            }}
+                            onKeyDown={(event) => {
+                              if (
+                                submitDisabledReason !== null &&
+                                (event.key === "Enter" || event.key === " ")
+                              ) {
+                                event.preventDefault();
+                                handleBlockedSubmit();
+                              }
+                            }}
+                            onBlur={() => setSubmitTooltipState("closed")}
+                            className={cn(
+                              "inline-flex shrink-0 rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                              !canSubmit && "cursor-not-allowed",
+                            )}
+                          >
                             <ComposerSendButton
                               disabled={!canSubmit}
                               label={creating ? "Starting session" : "Start session"}
@@ -6786,6 +7400,14 @@ export function NewChatLandingScreen() {
                           <TooltipContent
                             className="border border-border bg-popover text-popover-foreground shadow-menu ring-1 ring-foreground/10"
                             data-testid="new-chat-landing-submit-error-tooltip"
+                            onPointerDownOutside={(event) => {
+                              if (submitTooltipTriggerRef.current?.contains(event.target as Node)) {
+                                event.preventDefault();
+                              } else {
+                                setSubmitTooltipState("closed");
+                              }
+                            }}
+                            onEscapeKeyDown={() => setSubmitTooltipState("closed")}
                           >
                             {submitDisabledReason}
                           </TooltipContent>
@@ -6823,7 +7445,7 @@ export function NewChatLandingScreen() {
                 : undefined
             }
           />
-        </div>
+        </fieldset>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {supportsAgySkipPermissions &&
             !autoRoutingSelected &&
@@ -6855,6 +7477,7 @@ export function NewChatLandingScreen() {
               onSetup={() =>
                 setSetupTarget({
                   agentName: selectedAgent?.display_name,
+                  nativeAgent: nativeCodingAgentForAvailableAgent(selectedAgent),
                   harness: selectedAgent?.harness ?? null,
                   host: harnessWarningHost,
                 })
@@ -6915,6 +7538,11 @@ export function NewChatLandingScreen() {
               )}
             </p>
           )}
+          {sandboxProfileError && (
+            <p className="text-sm text-muted-foreground" role="status">
+              {sandboxProfileError}
+            </p>
+          )}
           {pickerSelectionError && (
             <p className="mt-3 text-sm text-destructive" role="alert">
               {pickerSelectionError}
@@ -6924,6 +7552,31 @@ export function NewChatLandingScreen() {
             <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
             </p>
+          )}
+
+          {checkingDbcert && (
+            <div
+              className="flex items-center gap-2 text-sm text-muted-foreground"
+              data-testid="new-chat-landing-dbcert-status"
+            >
+              <Spinner className="size-4 shrink-0" />
+              <p role="status">Checking laptop credentials…</p>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => skipDbcertCheckRef.current?.()}
+              >
+                Skip
+              </Button>
+            </div>
+          )}
+
+          {dbcertRequired && sandboxSelected && effectiveSandboxProvider === "arclet" && (
+            <LaptopDbcertBanner
+              onReady={() => setDbcertRequired(false)}
+              onDismiss={() => setDbcertRequired(false)}
+            />
           )}
 
           {connectError && (
@@ -6993,22 +7646,35 @@ export function NewChatLandingScreen() {
           <ConnectHostInstructions
             serverUrl={serverUrl}
             label="Run this on the machine you want to use, then pick it from the host menu:"
+            onSshConnected={(hostId) => {
+              setConnectOpen(false);
+              selectHost(hostId);
+            }}
           />
         </DialogContent>
       </Dialog>
 
-      {/* Harness "Set up" dialog — the single home for install/login (and later
-          API key / gateway) setup, opened from the composer notice or a picker
-          row's "Set up →". */}
-      <HarnessSetupDialog
-        open={setupTarget !== null}
-        onOpenChange={(open) => {
-          if (!open) setSetupTarget(null);
-        }}
-        agentName={setupTarget?.agentName}
-        harness={setupTarget?.harness ?? null}
-        host={setupTarget?.host}
-      />
+      {fixTarget ? (
+        <HarnessFixDialog
+          open
+          onOpenChange={(open) => !open && setSetupTarget(null)}
+          mode={fixTarget.mode}
+          host={fixTarget.host}
+          harness={fixTarget.harness}
+          harnessLabel={fixTarget.label}
+          onFixed={(result) => applyHarnessFixResult(queryClient, fixTarget.host.host_id, result)}
+        />
+      ) : (
+        <HarnessSetupDialog
+          open={setupTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setSetupTarget(null);
+          }}
+          agentName={setupTarget?.agentName}
+          harness={setupTarget?.harness ?? null}
+          host={setupTarget?.host}
+        />
+      )}
 
       {/* Create custom agent dialog — opened from the agent picker dropdown. */}
       <CreateAgentDialog
@@ -7018,6 +7684,39 @@ export function NewChatLandingScreen() {
           setPendingAgent(input);
           handleSelectPending();
         }}
+        onImport={
+          info !== "loading" && info.agent_install === true
+            ? async (bundle) => {
+                const installed = await installAgentBundle(bundle);
+                try {
+                  const mine = await queryClient.fetchQuery({
+                    queryKey: USER_AGENTS_QUERY_KEY,
+                    queryFn: fetchUserAgents,
+                    staleTime: 0,
+                  });
+                  // The composer resolves its pick against the merged picker list, so
+                  // wait for it; while it still waits on sessions, your agents decide.
+                  await queryClient.invalidateQueries({ queryKey: ["available-agents"] });
+                  const lists = queryClient
+                    .getQueriesData<AvailableAgent[]>({ queryKey: ["available-agents"] })
+                    .flatMap(([, data]) => (data ? [data] : []));
+                  const agent = (lists.length > 0 ? lists.flat() : mine).find(
+                    (a) => a.id === installed.id,
+                  );
+                  if (!agent) throw new Error("it is not in the agent list");
+                  handleSelectAgent(agent);
+                } catch (err) {
+                  const reason = err instanceof Error ? err.message : String(err);
+                  throw new Error(
+                    `Installed ${installed.name}, but couldn't select it: ${reason}`,
+                    {
+                      cause: err,
+                    },
+                  );
+                }
+              }
+            : undefined
+        }
       />
     </div>
   );

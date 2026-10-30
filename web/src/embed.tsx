@@ -13,9 +13,7 @@ import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 //   - injects the host transport config (API fetcher + WebSocket URL),
 //   - tags a root element with `.omnigent-app` so the scoped stylesheet
 //     applies and Radix overlays portal back into this subtree,
-//   - applies the host-provided color scheme (`isDarkMode`): the embed is not
-//     user-toggleable (the theme switcher is hidden via `useIsEmbedded`); the
-//     host drives light/dark and the embed mirrors it,
+//   - follows the host color scheme by default, with per-device overrides,
 //   - owns its OWN QueryClient (react-query is bundled, not shared).
 //
 // Only React/ReactDOM, react/jsx-runtime, and react-router(-dom) are left as
@@ -26,7 +24,8 @@ import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 // rspack then ingests the single intermediate module and emits the final chunks.
 
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
-import { ThemeProvider as NextThemesProvider } from "next-themes";
+import { ThemeProvider } from "./components/theme/ThemeProvider";
+import { useResolvedThemeMode } from "./components/theme/useResolvedThemeMode";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import App from "./App";
 import { TooltipProvider } from "./components/ui/tooltip";
@@ -44,11 +43,11 @@ import {
 } from "./lib/host";
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
+import { isMacElectronShell, isNativeShell } from "./lib/nativeBridge";
 import {
-  applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
-  readUiFontSizePx,
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
@@ -59,6 +58,7 @@ import {
   reactRouterRouting,
 } from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
+import { cn } from "./lib/utils";
 import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 import "./index.css";
@@ -66,7 +66,7 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 
-export type { OmnigentHostConfig } from "./lib/host";
+export type { HtmlPreviewFrameProps, OmnigentHostConfig } from "./lib/host";
 export type { RoutingApi } from "./lib/routing";
 
 // Re-export the host-config setter so the host can install transport config
@@ -106,9 +106,8 @@ export interface OmnigentAppProps extends OmnigentHostConfig {
    */
   routing?: Partial<RoutingApi>;
   /**
-   * Host-provided color scheme. The embed has no theme switcher of its own
-   * (see `useIsEmbedded`); the host owns the theme and passes it here (e.g.
-   * `theme.isDarkMode` from `useDesignSystemTheme`). Defaults to light.
+   * Host color scheme used by automatic mode in a browser. Explicit light/dark
+   * overrides it; Electron automatic mode follows the OS. Defaults to light.
    */
   isDarkMode?: boolean;
 }
@@ -156,13 +155,12 @@ function OmnigentProviders({
   sidebarConfig: sidebarOverrides,
   routing,
   basename,
-  isDarkMode,
 }: {
   sidebarConfig?: Partial<SidebarConfig>;
   routing: RoutingApi;
   basename?: string;
-  isDarkMode?: boolean;
 }) {
+  const isDarkMode = useResolvedThemeMode() === "dark";
   // Reuse the host's QueryClient (read from the ambient provider) and run the
   // one-time side effects (wire the chat store to that client + resolve
   // identity). `initChatStore` only stashes the client for later cache
@@ -172,7 +170,9 @@ function OmnigentProviders({
     initChatStore(hostQueryClient);
     // Resolve a session's routing host on demand (a hostless sub-agent child
     // walks up to its host-bound ancestor) before host-scoped requests key.
-    setSessionHostResolver((sessionId) => prefetchSessionHostChain(hostQueryClient, sessionId));
+    setSessionHostResolver((sessionId, options) =>
+      prefetchSessionHostChain(hostQueryClient, sessionId, options),
+    );
     void resolveIdentity();
     return null;
   });
@@ -194,7 +194,7 @@ function OmnigentProviders({
   const scopeRootRef = useCallback((el: HTMLDivElement | null) => {
     setEmbedScopeRoot(el);
     if (el) {
-      applyDesktopUiFontSize(readUiFontSizePx());
+      applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
       applyCustomTheme(readCustomTheme());
@@ -207,49 +207,43 @@ function OmnigentProviders({
     //     rewrites `:root` → `.omnigent-app` (light tokens) and `.dark` →
     //     `.omnigent-app .dark`, so the dark class must be a DESCENDANT of the
     //     scope root, not the root itself.
-    //   - the inner div carries the host-driven `dark` class (when dark) and is
+    //   - the inner div carries the selected `dark` class (when dark) and is
     //     the Radix portal root, so both the app and its overlays read the dark
-    //     token overrides. Light mode = no class → inherits the scope root's
-    //     light tokens.
-    <div ref={scopeRootRef} className="omnigent-app" style={{ height: "100%", width: "100%" }}>
+    //     token overrides. Light mode = no `dark` class → inherits the scope
+    //     root's light tokens. It re-applies `text-foreground` because the scope
+    //     root resolves `color` from the light tokens, and overlays without
+    //     their own text color would inherit that value.
+    <div
+      ref={scopeRootRef}
+      className="omnigent-app"
+      data-electron-mac={isMacElectronShell() ? "true" : undefined}
+      style={{ height: "100%", width: "100%" }}
+    >
       <div
         ref={scopeRef}
-        className={isDarkMode ? "dark" : undefined}
-        style={{ height: "100%", width: "100%" }}
+        tabIndex={isNativeShell() ? undefined : -1}
+        className={cn(isDarkMode && "dark", "text-foreground")}
+        style={{ height: "100%", width: "100%", colorScheme: isDarkMode ? "dark" : "light" }}
       >
-        <EmbeddedProvider>
-          {/* next-themes is kept as the JS source of truth for `resolvedTheme`
-              (Monaco + the xterm terminal read it via `useTheme()`); the host
-              drives the value via `forcedTheme`. A private attribute +
-              `enableColorScheme={false}` keep it from mutating the host's
-              `<html>` class or `color-scheme`. */}
-          <NextThemesProvider
-            attribute="data-omnigent-theme"
-            forcedTheme={isDarkMode ? "dark" : "light"}
-            enableColorScheme={false}
-            disableTransitionOnChange
-          >
-            <TooltipProvider>
-              <ImageLightboxProvider>
-                <RoutingProvider value={routing}>
-                  <EmbedCapabilitiesProvider>
-                    <IdentityAwareSidebarDataProvider
-                      config={{ ...appConfig.sidebar, ...sidebarOverrides }}
-                    >
-                      <SessionUpdatesProvider>
-                        <RunnerHealthProvider>
-                          <QueueFlushProvider>
-                            <App basename={basename} />
-                          </QueueFlushProvider>
-                        </RunnerHealthProvider>
-                      </SessionUpdatesProvider>
-                    </IdentityAwareSidebarDataProvider>
-                  </EmbedCapabilitiesProvider>
-                </RoutingProvider>
-              </ImageLightboxProvider>
-            </TooltipProvider>
-          </NextThemesProvider>
-        </EmbeddedProvider>
+        <TooltipProvider>
+          <ImageLightboxProvider>
+            <RoutingProvider value={routing}>
+              <EmbedCapabilitiesProvider>
+                <IdentityAwareSidebarDataProvider
+                  config={{ ...appConfig.sidebar, ...sidebarOverrides }}
+                >
+                  <SessionUpdatesProvider>
+                    <RunnerHealthProvider>
+                      <QueueFlushProvider>
+                        <App basename={basename} />
+                      </QueueFlushProvider>
+                    </RunnerHealthProvider>
+                  </SessionUpdatesProvider>
+                </IdentityAwareSidebarDataProvider>
+              </EmbedCapabilitiesProvider>
+            </RoutingProvider>
+          </ImageLightboxProvider>
+        </TooltipProvider>
       </div>
     </div>
   );
@@ -301,12 +295,15 @@ export function OmnigentApp({
   return (
     <QueryClientProvider client={queryClient}>
       <ExtensionProvider>
-        <OmnigentProviders
-          routing={routingApi}
-          basename={basename}
-          isDarkMode={isDarkMode}
-          sidebarConfig={sidebarConfig}
-        />
+        <EmbeddedProvider isDarkMode={isDarkMode}>
+          <ThemeProvider embedded>
+            <OmnigentProviders
+              routing={routingApi}
+              basename={basename}
+              sidebarConfig={sidebarConfig}
+            />
+          </ThemeProvider>
+        </EmbeddedProvider>
       </ExtensionProvider>
     </QueryClientProvider>
   );

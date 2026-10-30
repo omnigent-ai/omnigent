@@ -43,7 +43,6 @@ from omnigent.inner.bwrap_sandbox import (
     _ALLOWED_SOCKET_FAMILIES,
     _CLONE_NEW_FLAG_BITS,
     _DEFAULT_CWD_ALLOW_HIDDEN,
-    _HOST_SANDBOX_BACKEND_ENV,
     _PROC_BIND_HOST_BACKENDS,
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
@@ -51,7 +50,11 @@ from omnigent.inner.bwrap_sandbox import (
     _should_bind_host_proc,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
+from omnigent.inner.sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
+    SandboxPolicy,
+    with_denied_unix_sockets,
+)
 
 BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 
@@ -1057,7 +1060,7 @@ def _clear_host_backend_signals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     path that does not exist, isolating the test from the machine it runs
     on — which must not be assumed to be (or not to be) a lakebox microVM.
     """
-    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.delenv(HOST_SANDBOX_BACKEND_ENV, raising=False)
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", tmp_path / "no-such-marker")
 
 
@@ -1074,17 +1077,18 @@ def test_detect_host_backend_none_without_signals(
     assert _should_bind_host_proc() is False
 
 
-def test_detect_host_backend_env_declaration_is_normalised(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("declared", ["  LakeBox  ", "PHOENIX-KUBERNETES"])
+def test_detect_host_backend_env_declaration_is_normalised_and_vetted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, declared: str
 ) -> None:
     """
     ``OMNIGENT_HOST_SANDBOX_BACKEND`` is the explicit, authoritative
-    signal; it is trimmed and lower-cased so callers don't have to match
-    an exact casing, and ``lakebox`` is on the proc-bind allow-list.
+    signal; it is trimmed and lower-cased before checking the proc-bind
+    allow-list.
     """
     _clear_host_backend_signals(monkeypatch, tmp_path)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "  LakeBox  ")
-    assert _detect_host_sandbox_backend() == "lakebox"
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, declared)
+    assert _detect_host_sandbox_backend() == declared.strip().lower()
     assert _should_bind_host_proc() is True
 
 
@@ -1099,7 +1103,7 @@ def test_detect_host_backend_env_non_lakebox_keeps_fresh_proc(
     marker = tmp_path / "run-lakebox"
     marker.mkdir()
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "modal")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "modal")
     assert _detect_host_sandbox_backend() == "modal"
     assert "modal" not in _PROC_BIND_HOST_BACKENDS
     assert _should_bind_host_proc() is False
@@ -1109,14 +1113,11 @@ def test_detect_host_backend_marker_autodetects_lakebox(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    When no env var is set, the ``/run/lakebox`` marker directory
-    autodetects lakebox. This is the prune-proof fallback the re-exec
-    launcher path relies on (the env var may be stripped by the spawn
-    allow-list, but the filesystem marker survives).
+    Without an env declaration, the ``/run/lakebox`` marker detects lakebox.
     """
     marker = tmp_path / "run-lakebox"
     marker.mkdir()
-    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.delenv(HOST_SANDBOX_BACKEND_ENV, raising=False)
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
     assert _detect_host_sandbox_backend() == "lakebox"
     assert _should_bind_host_proc() is True
@@ -1137,27 +1138,33 @@ def test_wrap_launcher_argv_fresh_proc_by_default(
     assert not _has_pair(argv, "--bind", "/proc", "/proc")
 
 
-def test_wrap_launcher_argv_binds_proc_on_lakebox(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("frozen", "declared", "expected_bind"),
+    [
+        (None, "phoenix-kubernetes", True),
+        (None, "lakebox", True),
+        (False, "phoenix-kubernetes", False),
+        (False, "lakebox", False),
+        (True, None, True),
+    ],
+)
+def test_wrap_launcher_argv_respects_proc_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    frozen: bool | None,
+    declared: str | None,
+    expected_bind: bool,
 ) -> None:
-    """
-    On a lakebox host the wrap binds the existing ``/proc`` instead of
-    mounting a fresh procfs (lakebox's masked ``/proc`` overmounts make
-    the fresh mount fail under ``--unshare-pid``). ``/dev`` and ``/tmp``
-    are unaffected.
-    """
+    """A frozen choice wins over host detection, even without a host signal."""
     _clear_host_backend_signals(monkeypatch, tmp_path)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "lakebox")
+    if declared is not None:
+        monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, declared)
     backend = _make_backend()
     policy = _make_policy(tmp_path)
+    policy.bind_host_proc = frozen
     argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
-    assert _has_pair(argv, "--bind", "/proc", "/proc"), (
-        "lakebox host must bind the existing /proc; got no `--bind /proc /proc`."
-    )
-    assert not _has_pair_single_dest(argv, "--proc", "/proc"), (
-        "lakebox host must NOT also mount a fresh procfs — the two would "
-        "conflict at the same mountpoint."
-    )
+    assert _has_pair(argv, "--bind", "/proc", "/proc") is expected_bind
+    assert _has_pair_single_dest(argv, "--proc", "/proc") is not expected_bind
     assert _has_pair_single_dest(argv, "--dev", "/dev")
     assert "--tmpfs" in argv
 
@@ -2236,3 +2243,137 @@ def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_bwrap(tmp_path: Path
     assert "TMPOK" in completed.stdout, (
         f"target did not reach the scratch-write marker. stdout={completed.stdout!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Harness-staged codex skill exposure
+# ---------------------------------------------------------------------------
+
+
+def _stage_codex_skills_root(tmproot: Path) -> tuple[Path, Path]:
+    """Create a staged codex home under *tmproot* posing as the temp dir.
+
+    :returns: ``(home, skills)`` — the staged home and its skills subdir.
+    """
+    from omnigent.inner.codex_staging import CODEX_HOME_PREFIX
+
+    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    root = tmproot / f"omnigent-codex-homes{suffix}"
+    root.mkdir(mode=0o700)
+    home = root / f"{CODEX_HOME_PREFIX}test"
+    skills = home / "skills" / "demo-skill"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("methodology body\n")
+    (home / "auth.json").write_text('{"secret": "never-expose"}')
+    return home, home / "skills"
+
+
+def _bind_triples(argv: list[str], op: str) -> list[tuple[str, str]]:
+    """All ``(src, dst)`` pairs emitted for mount option *op* in *argv*."""
+    return [(argv[i + 1], argv[i + 2]) for i, tok in enumerate(argv) if tok == op]
+
+
+def test_wrap_launcher_argv_exposes_staged_codex_skills_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The skills subtree of a staged codex home is re-exposed read-only,
+    and nothing else from the home is mounted.
+
+    The wrapped codex executor publishes ``$CODEX_HOME/skills/...`` paths
+    in the model's skill manifest; without this bind the ``--tmpfs /tmp``
+    default leaves those paths dangling inside the namespace. The home's
+    siblings (``auth.json``) carry bridged credentials and must never
+    appear as a mount source.
+    """
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(cwd, read_roots=[skills]), cwd
+    )
+
+    ro_pairs = _bind_triples(argv, "--ro-bind-try")
+    assert (str(skills), str(skills)) in ro_pairs, (
+        "staged codex skills subtree is not re-exposed; the paths codex "
+        "publishes in its skill manifest dangle inside the namespace"
+    )
+    # Fail-closed on the rest of the home: neither the home itself nor its
+    # credential files may be mounted by any bind flavor.
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try", "--dev-bind"):
+        for src, _dst in _bind_triples(argv, op):
+            assert src != str(home), f"{op} mounts the whole staged home"
+            assert "auth.json" not in src, f"{op} mounts a credential file"
+
+
+def test_wrap_launcher_argv_staged_codex_skills_dedupe_with_read_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skills dir already granted via ``read_paths`` is bound once."""
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    _home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"],
+        _make_policy(cwd, read_roots=[skills]),
+        cwd,
+    )
+
+    pair = (str(skills), str(skills))
+    assert _bind_triples(argv, "--ro-bind-try").count(pair) == 1
+
+
+def test_wrap_launcher_argv_does_not_discover_other_sessions_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staged home is not a read grant for an unrelated sandbox."""
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    argv = _make_backend().wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(cwd), cwd
+    )
+
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try"):
+        assert (str(skills), str(skills)) not in _bind_triples(argv, op)
+        assert (str(home), str(home)) not in _bind_triples(argv, op)
+
+
+@pytest.mark.skipif(not Path("/bin/sh").exists(), reason="needs a depth-2 POSIX binary")
+def test_wrap_launcher_argv_never_binds_the_filesystem_root(tmp_path: Path) -> None:
+    """A depth-2 executable (``/bin/sh``) must not drag in ``--ro-bind / /``.
+
+    The interpreter-visibility walk binds each hop's parent and
+    grandparent; for ``/bin/sh`` the grandparent is ``/``, and binding it
+    would re-expose the entire host read-only — defeating the hermetic
+    default view ($HOME included).
+    """
+    backend = _make_backend()
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    argv = backend.wrap_launcher_argv(["/bin/sh", "-c", "true"], _make_policy(cwd), cwd)
+
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try"):
+        assert ("/", "/") not in _bind_triples(argv, op), (
+            f"{op} / / re-exposes the whole host inside the sandbox"
+        )

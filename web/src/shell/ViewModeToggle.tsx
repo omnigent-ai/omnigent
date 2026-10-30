@@ -1,10 +1,14 @@
 import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
+import { ARIA_MOD_KEY, VIEW_MODE_TOGGLE_KEYS } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useViewModeToggleHotkey } from "@/hooks/useViewModeToggleHotkey";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "./TerminalFirstContext";
+
+const ignoreViewChange = () => {};
 
 /**
  * Header Chat/Terminal switcher for terminal-first sessions. Two icon
@@ -25,12 +29,17 @@ import { useTerminalFirst } from "./TerminalFirstContext";
  * {@link ViewModeMenuItems}), so the narrow header pill isn't split between a
  * view switch and the "…" menu.
  */
-export function ViewModeToggle() {
+export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } = {}) {
   const ctx = useTerminalFirst();
   const isMobile = useIsMobileViewport();
+  useViewModeToggleHotkey({
+    enabled: Boolean(hotkeyEnabled && ctx?.isTerminalFirst && !ctx.isShellView),
+    view: ctx?.view ?? "chat",
+    setView: ctx?.setView ?? ignoreViewChange,
+  });
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
   // Mobile folds the switch into the header kebab (ViewModeMenuItems).
-  if (isMobile) return null;
+  if (isMobile && !alwaysVisible) return null;
 
   const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
@@ -42,7 +51,7 @@ export function ViewModeToggle() {
       data-testid="view-mode-toggle"
       // Two 36×24 segments separated by 2px make a flush 74×24 track.
       // Desktop-only — mobile folds the switch into the header kebab.
-      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0"
+      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0 dark:bg-[var(--segmented-trough-bg)]"
     >
       <ViewModeSegment
         label="Chat view"
@@ -101,14 +110,15 @@ function ViewModeSegment({
             size="icon-xs"
             aria-label={label}
             aria-pressed={active}
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+\\`}
             onClick={onClick}
             data-testid={testId}
             componentId={componentId}
             className={cn(
               "h-6 w-9 rounded-[6px] border px-2.5 py-0",
               active
-                ? "border-border bg-background text-foreground shadow-sm hover:bg-background"
-                : "border-transparent text-muted-foreground hover:bg-transparent hover:text-foreground",
+                ? "border-border bg-background text-foreground shadow-sm hover:bg-background dark:border-transparent dark:bg-[var(--segmented-active-bg)] dark:hover:bg-[var(--segmented-active-bg)]"
+                : "border-transparent text-muted-foreground hover:bg-transparent hover:text-foreground dark:bg-[var(--segmented-inactive-bg)] dark:hover:bg-[var(--segmented-inactive-bg)]",
             )}
           >
             {children}
@@ -117,7 +127,9 @@ function ViewModeSegment({
       </TooltipTrigger>
       {/* Bottom placement: the header sits at top-0, so a top-side tooltip
           would render above the viewport edge and get clipped. */}
-      <TooltipContent side="bottom">{label}</TooltipContent>
+      <TooltipContent side="bottom" shortcut={VIEW_MODE_TOGGLE_KEYS}>
+        <span>{label}</span>
+      </TooltipContent>
     </Tooltip>
   );
 }

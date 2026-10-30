@@ -27,6 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent.databricks_ai_gateway import (
+    OPENCODE_AGENT,
+    is_databricks_ai_gateway_url,
+    with_gateway_attribution,
+)
 from omnigent.models import model_catalog
 from omnigent.process_logging import DATA_DIR_ENV_VAR
 
@@ -40,7 +45,7 @@ _logger = logging.getLogger(__name__)
 # Provider id used in the synthesized opencode.json for the Databricks gateway.
 # The per-prompt model is pinned as ``{DATABRICKS_GATEWAY_PROVIDER_ID}/<endpoint>``.
 DATABRICKS_GATEWAY_PROVIDER_ID = "databricks-gateway"
-DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
+DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks Unity Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
 # Optional deployment default: a ``databricks-*`` serving-endpoint id used when a
@@ -213,9 +218,53 @@ def build_opencode_config(
     return config
 
 
+def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, object]:
+    """
+    Add usage-attribution headers to each model of a Unity Gateway provider.
+
+    Per-model ``headers`` are where ug puts its own: OpenCode merges them
+    last, after its built-in ``User-Agent``.
+
+    :param config: An ``opencode.json`` dict; it is not modified.
+    :returns: *config*, with gateway providers' model entries copied and stamped.
+    """
+    providers = config.get("providers")
+    if not isinstance(providers, Mapping):
+        return config
+    stamped: dict[str, object] = {}
+    for provider_id, provider in providers.items():
+        stamped[provider_id] = provider
+        if not isinstance(provider, Mapping):
+            continue
+        settings = provider.get("settings")
+        base_url = settings.get("baseURL") if isinstance(settings, Mapping) else None
+        models = provider.get("models")
+        if not isinstance(base_url, str) or not is_databricks_ai_gateway_url(base_url):
+            continue
+        if not isinstance(models, Mapping):
+            continue
+        stamped_models: dict[str, object] = {}
+        for model_id, model in models.items():
+            stamped_models[model_id] = model
+            if isinstance(model, Mapping):
+                headers = model.get("headers")
+                stamped_models[model_id] = {
+                    **model,
+                    "headers": with_gateway_attribution(
+                        headers if isinstance(headers, Mapping) else None,
+                        OPENCODE_AGENT,
+                        base_url,
+                    ),
+                }
+        stamped[provider_id] = {**provider, "models": stamped_models}
+    return {**config, "providers": stamped}
+
+
 def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:
     """
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).
+
+    Unity Gateway providers get usage-attribution headers on the way out.
 
     :param xdg_config_home: The per-session ``XDG_CONFIG_HOME`` the server uses.
     :param config: The v2 config dict (see :func:`build_opencode_config`).
@@ -224,7 +273,7 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     cfg_dir = xdg_config_home / "opencode"
     cfg_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = cfg_dir / "opencode.json"
-    payload = json.dumps(config, indent=2, sort_keys=True) + "\n"
+    payload = json.dumps(_with_gateway_attribution(config), indent=2, sort_keys=True) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix="opencode.json.", dir=str(cfg_dir))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -436,7 +485,7 @@ def resolve_databricks_gateway(
     model_id: str | None = None,
 ) -> OpenCodeGatewayResolution | None:
     """
-    Resolve a Databricks AI gateway for opencode from a ``~/.databrickscfg`` profile.
+    Resolve a Databricks Unity Gateway for opencode from a ``~/.databrickscfg`` profile.
 
     Uses ``databricks-sdk`` (the ``databricks`` extra) to obtain the workspace
     host + a bearer token for *profile*, then targets the workspace's
@@ -653,25 +702,72 @@ def _strip_trailing_commas(text: str) -> str:
 _AISDK_PREFIX = "aisdk:"
 
 
-def _read_user_opencode_config() -> dict[str, object] | None:
-    """Parse the user's global ``opencode.json(c)``; ``None`` when absent or invalid."""
-    from omnigent.harnesses.opencode_native.bridge import user_opencode_config_path
+_SKIPPED_CONFIG_CONSEQUENCE = (
+    "any provider defined only here is dropped, so a model pin in another config "
+    "file that points at it may no longer resolve"
+)
 
-    user_path = user_opencode_config_path()
-    if user_path is None:
-        return None
+
+def _load_user_config_file(path: Path) -> dict[str, object] | None:
+    """Parse one user OpenCode config file (JSON, with a JSONC fallback).
+
+    A file that cannot be read or parsed is skipped with a warning so the
+    other config files still contribute.
+    """
     try:
-        raw = user_path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            parsed = json.loads(_strip_trailing_commas(_strip_jsonc_comments(raw)))
-    except (OSError, UnicodeDecodeError):
+            cleaned = _strip_jsonc_comments(raw)
+            cleaned = _strip_trailing_commas(cleaned)
+            parsed = json.loads(cleaned)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+        _logger.warning(
+            "Skipping user OpenCode config at %s: %s; %s",
+            path,
+            err,
+            _SKIPPED_CONFIG_CONSEQUENCE,
+        )
         return None
-    except json.JSONDecodeError:
-        _logger.warning("Failed to parse user OpenCode config at %s — ignoring it", user_path)
+    if not isinstance(parsed, dict):
+        _logger.warning(
+            "Skipping user OpenCode config at %s: top level is not an object; %s",
+            path,
+            _SKIPPED_CONFIG_CONSEQUENCE,
+        )
         return None
-    return parsed if isinstance(parsed, dict) else None
+    return parsed
+
+
+def _deep_merge_configs(
+    base: dict[str, object], override: Mapping[str, object]
+) -> dict[str, object]:
+    """Merge *override* into *base* the way OpenCode merges its global config:
+    nested dicts merge recursively; any other value, lists included, is
+    replaced by *override*."""
+    merged = dict(base)
+    for key, value in override.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, Mapping):
+            merged[key] = _deep_merge_configs(existing, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_user_opencode_config() -> dict[str, object] | None:
+    """Deep-merge the user's global OpenCode config files; ``None`` when none loads."""
+    from omnigent.harnesses.opencode_native.bridge import user_opencode_config_paths
+
+    merged: dict[str, object] = {}
+    loaded_any = False
+    for user_path in user_opencode_config_paths():
+        parsed = _load_user_config_file(user_path)
+        if parsed is not None:
+            merged = _deep_merge_configs(merged, parsed)
+            loaded_any = True
+    return merged if loaded_any else None
 
 
 def _string_map(value: object) -> dict[str, str]:
@@ -836,8 +932,10 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     """
     Merge the user's global OpenCode config into the synthesized v2 config.
 
-    The per-session ``XDG_CONFIG_HOME`` hides ``~/.config/opencode``, so carry over
-    the user's providers, default model, plugins and MCP servers. Both v1
+    The per-session ``XDG_CONFIG_HOME`` hides ``~/.config/opencode``, so resolve the
+    user's config the way OpenCode does (``config.json``, ``opencode.json`` and
+    ``opencode.jsonc`` deep-merged, later files win) and carry over its providers,
+    default model, plugins and MCP servers. Both v1
     (``provider``, ``plugin``, flat ``mcp``) and v2 (``providers``, ``plugins``,
     ``mcp.servers``) spellings are read; the result uses v2 keys only.
     Synthesized entries always win; the user's model applies only when none is set.
@@ -928,7 +1026,7 @@ def _configure_opencode_on_demand() -> None:
             # ucode has no use for the host's launch token; don't hand it over.
             configure_env.pop("OMNIGENT_HOST_TOKEN", None)
             subprocess.run(argv, capture_output=True, timeout=120, env=configure_env)
-    except Exception:  # noqa: BLE001 - best-effort; the caller declines if config is still absent.
+    except Exception:  # best-effort; the caller declines if config is still absent.
         _logger.info("opencode on-demand ucode configure failed", exc_info=True)
 
 

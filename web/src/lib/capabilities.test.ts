@@ -7,7 +7,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
-import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
+import {
+  pickerCuration,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+  UNRESTRICTED_PICKER,
+} from "./capabilities";
 import type { ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
@@ -90,6 +95,30 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
+  it.each([undefined, false, "true", true])(
+    "requires an explicit durable-input capability (%s)",
+    async (value) => {
+      expect((await probe({ durable_initial_input: value })).durable_initial_input).toBe(
+        value === true,
+      );
+    },
+  );
+
+  it.each([undefined, null, "", "manage", 2, true])(
+    "defaults an absent or invalid public ceiling %s to Read",
+    async (value) => {
+      expect((await probe({ public_sharing_max_level: value })).public_sharing_max_level).toBe(
+        "read",
+      );
+    },
+  );
+
+  it("recognizes an explicit public Edit ceiling", async () => {
+    expect((await probe({ public_sharing_max_level: "edit" })).public_sharing_max_level).toBe(
+      "edit",
+    );
+  });
+
   it("keeps the provider list from the probe", async () => {
     // Regression: the probe rebuilds ServerInfo field by field, so a
     // forgotten field is dropped before any component sees it.
@@ -124,9 +153,20 @@ describe("resolveServerInfo sandbox_providers", () => {
 describe("resolveServerInfo release features", () => {
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({
-      features: { usage_page: true, harness_install: false, malformed: "yes" },
+      features: {
+        usage_page: true,
+        harness_install: false,
+        automations_v2: true,
+        malformed: "yes",
+      },
     });
-    expect(parsed.features).toEqual({ usage_page: true, harness_install: false });
+    expect(parsed.features).toEqual({
+      usage_page: true,
+      harness_install: false,
+      automations_v2: true,
+    });
+    const { isFeatureEnabled } = await import("./capabilities");
+    expect(isFeatureEnabled(parsed, "automations_v2")).toBe(true);
   });
 
   it("defaults missing features off", async () => {
@@ -149,6 +189,87 @@ describe("resolveServerInfo release features", () => {
     const parsed = await resolveServerInfo();
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+  });
+});
+
+describe("resolveServerInfo session_search_scope", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ session_search_scope: true })).session_search_scope).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).session_search_scope).toBe(false);
+  });
+});
+
+describe("resolveServerInfo scheduled_task_projects", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["yes", false],
+  ])("reads %j as %j", async (advertised, expected) => {
+    const payload = advertised === undefined ? {} : { scheduled_task_projects: advertised };
+    expect((await probe(payload)).scheduled_task_projects).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo scheduled_task_session_modes", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ scheduled_task_session_modes: true })).scheduled_task_session_modes).toBe(
+      true,
+    );
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).scheduled_task_session_modes).toBe(false);
+  });
+});
+
+describe("resolveServerInfo archive_worktree_cleanup", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).archive_worktree_cleanup).toBe(false);
+  });
+});
+
+describe("resolveServerInfo request_managed_sandbox_host_id", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ request_managed_sandbox_host_id: advertised });
+    expect(parsed.request_managed_sandbox_host_id).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo session_fork_workspaces", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ session_fork_workspaces: advertised });
+    expect(parsed.session_fork_workspaces).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo session_event_types", () => {
+  it.each([
+    [undefined, []],
+    ["clear", []],
+    [
+      ["message", 1, "clear"],
+      ["message", "clear"],
+    ],
+  ])("parses %o as %o", async (advertised, expected) => {
+    expect((await probe({ session_event_types: advertised })).session_event_types).toEqual(
+      expected,
+    );
   });
 });
 
@@ -221,5 +342,80 @@ describe("resolveServerInfo branding", () => {
     vi.resetModules();
     const malformed = await probe({ branding: "Acme" });
     expect(malformed.branding).toBeNull();
+  });
+});
+
+describe("custom agents settings capability", () => {
+  it.each([undefined, false, "true", true])(
+    "parses agent_config_edit strictly: %s",
+    async (edit) => {
+      expect((await probe({ agent_config_edit: edit })).agent_config_edit).toBe(edit === true);
+    },
+  );
+  it.each([undefined, false, "true", true])("parses agent_detail strictly: %s", async (detail) => {
+    const parsed = await probe({ agent_detail: detail });
+    expect(parsed.agent_detail).toBe(detail === true);
+  });
+
+  it.each([undefined, false, "true", true])(
+    "parses session_pull_requests strictly: %s",
+    async (stored) => {
+      const parsed = await probe({ session_pull_requests: stored });
+      expect(parsed.session_pull_requests).toBe(stored === true);
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
+    "requires a boolean install capability: %s",
+    async (install) => {
+      const parsed = await probe({
+        features: { custom_agents_settings_ui: true },
+        agent_install: install,
+      });
+      const { customAgentsSettingsEnabled } = await import("./capabilities");
+      expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
+    },
+  );
+});
+
+describe("picker curation", () => {
+  it("reads the names and the default off the probe", async () => {
+    const parsed = await probe({
+      picker: { restrict_to_agent_names: ["polly", "debby"], default_agent_name: "debby" },
+    });
+
+    expect([...parsed.picker!.restrictToAgentNames]).toEqual(["polly", "debby"]);
+    expect(parsed.picker!.defaultAgentName).toBe("debby");
+  });
+
+  it("reads an older server, which reports nothing, as unrestricted", async () => {
+    const parsed = await probe({});
+
+    expect(parsed.picker).toEqual(UNRESTRICTED_PICKER);
+  });
+
+  it("drops a default the restriction does not offer", async () => {
+    // It could never be selected; pinning it would strand the picker.
+    const parsed = await probe({
+      picker: { restrict_to_agent_names: ["polly"], default_agent_name: "debby" },
+    });
+
+    expect(parsed.picker!.defaultAgentName).toBeNull();
+  });
+
+  it.each([
+    { restrict_to_agent_names: "polly", default_agent_name: 7 },
+    // A list with one bad member is dropped whole, as the server drops it.
+    { restrict_to_agent_names: ["polly", 42], default_agent_name: 7 },
+  ])("ignores malformed values rather than emptying the picker: %j", async (picker) => {
+    const parsed = await probe({ picker });
+
+    expect(parsed.picker!.restrictToAgentNames.size).toBe(0);
+    expect(parsed.picker!.defaultAgentName).toBeNull();
+  });
+
+  it("treats a loading probe and a missing block as unrestricted", () => {
+    expect(pickerCuration("loading").restrictToAgentNames.size).toBe(0);
+    expect(pickerCuration(info({})).defaultAgentName).toBeNull();
   });
 });

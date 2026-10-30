@@ -10,38 +10,20 @@ the real UI without a live host or a real credential write.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
 # The stub host reports codex installed-but-not-configured; the credential POST
 # flips it to ready so the warning clears.
 _HARNESS = "codex-native"
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def _agents_body() -> str:
@@ -188,6 +170,7 @@ async def _register_routes(page, *, credential_requests: list[dict[str, Any]]) -
     await page.route(
         re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
     )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/harnesses", handle_harnesses)
     await page.route("**/v1/hosts/*/credentials/detected", handle_detect)
     await page.route(f"**/v1/hosts/*/harnesses/{_HARNESS}/credential", handle_credential)

@@ -7,9 +7,9 @@
  *  A "Browser" tab in the Workspace rail, so it mounts only while selected.
  *  Flex column: a fixed toolbar row (URL bar + nav + DevTools + design-mode)
  *  always on top so the URL bar is reachable from a cold start; below it the
- *  content switches on `viewActive` (measuring placeholder once a view attaches,
+ *  content switches on `hasView` (measuring placeholder once a view exists,
  *  else a hint). Bounds-sync (containerRef + syncBounds + rAF/ResizeObserver) is
- *  gated on `viewActive` and measures only below the toolbar.
+ *  gated on `hasView` and measures only below the toolbar.
  *
  *  The agent relay is NOT here (it must listen before the first browser_navigate
  *  auto-selects the tab) — it's hoisted to the always-mounted AppShell. On
@@ -18,12 +18,31 @@
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
+  CookieIcon,
   RotateCwIcon,
   SquareDashedMousePointerIcon,
   WrenchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { supportsBrowser } from "@/lib/nativeBridge";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import type { ChromeCookieImportResult, ChromeCookiePreviewResult } from "@/lib/nativeBridge";
+import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 
@@ -64,11 +83,15 @@ interface BrowserPaneBridge {
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Local Chrome profiles holding cookies for the current site (metadata only). */
+  browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
+  /** Copy the current site's Chrome cookies into this conversation's session. */
+  browserChromeCookieImport?: (
+    conversationId: string,
+    args: { profileId: string; expectedHost: string; scope?: string },
+  ) => Promise<ChromeCookieImportResult>;
   browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  onBrowserHostActiveChanged?: (
-    callback: (payload: { conversationId: string | null }) => void,
-  ) => () => void;
   onBrowserViewCreated?: (callback: (payload: { conversationId: string }) => void) => () => void;
   onBrowserViewClosed?: (
     callback: (payload: { conversationId: string; reason: string | null }) => void,
@@ -97,6 +120,24 @@ function getBridge(): BrowserPaneBridge | null {
   return w.omnigentDesktop ?? null;
 }
 
+/**
+ * Scopes the user may target for one Chrome profile: the page's host first,
+ * then only the parent domains that profile actually holds a domain cookie for
+ * (main-derived; the shell rejects anything else).
+ */
+function cookieScopeOptions(
+  preview: ChromeCookiePreviewResult | null,
+  profileId: string,
+): string[] {
+  const profile =
+    preview?.profiles?.find((candidate) => candidate.id === profileId) ?? preview?.profiles?.[0];
+  if (profile?.scopes && profile.scopes.length > 0) {
+    return profile.scopes.map((entry) => entry.host);
+  }
+  if (preview?.scopes && preview.scopes.length > 0) return preview.scopes;
+  return preview?.host ? [preview.host] : [];
+}
+
 export interface BrowserPaneProps {
   /** Native view key: the session ID or a session-scoped browser tab ID. */
   conversationId: string;
@@ -120,9 +161,8 @@ export function BrowserPane({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
-  // Whether a native view is attached for THIS conversation — drives when the
-  // measuring placeholder mounts (no empty pane on an idle conversation).
-  const [viewActive, setViewActive] = useState(false);
+  // A detached view still exists; only `active` controls its attachment.
+  const [hasView, setHasView] = useState(false);
 
   // Toolbar state. `currentUrl` tracks the real view URL EXCEPT while the user
   // edits the input (urlEditingRef gates the stomp); canGoBack/Forward drive
@@ -138,45 +178,56 @@ export function BrowserPane({
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
+  // "Import cookies from Chrome" needs BOTH an optional bridge method (older
+  // shells predate it) and the shell's desktop feature flag (macOS only).
+  const [cookieImportSupported, setCookieImportSupported] = useState(false);
+  const [cookiePreview, setCookiePreview] = useState<ChromeCookiePreviewResult | null>(null);
+  const [cookieProfileId, setCookieProfileId] = useState("");
+  const [cookieScope, setCookieScope] = useState("");
+  const [cookieBusy, setCookieBusy] = useState(false);
 
-  // Feed `viewActive` from three signals so the placeholder mounts exactly when
-  // a view exists: (1) browser-view-created — first navigate (often detached,
-  // no host-active event; breaks the activation deadlock); (2) browserHasView
-  // probe on re-mount; (3) host-active-changed for later attach/detach.
-  // browser-view-closed flips it false.
+  // Switching profiles can drop the scope the previous one offered; keep the
+  // state (and therefore the import request) on a scope that is still offered.
+  useEffect(() => {
+    if (!cookiePreview) return;
+    const offered = cookieScopeOptions(cookiePreview, cookieProfileId);
+    if (offered.length > 0 && !offered.includes(cookieScope)) setCookieScope(offered[0]);
+  }, [cookiePreview, cookieProfileId, cookieScope]);
+
+  // Track existence through create/close events and a remount probe.
+  // Host attach/detach events do not change whether the retained page exists.
   useEffect(() => {
     if (!browserSupported) return;
     const bridge = getBridge();
     if (!bridge) return;
     let cancelled = false;
+    let viewChanged = false;
 
-    // (2) Re-show an already-created view when the pane remounts.
+    // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && r?.exists) {
-        setViewActive(true);
+      if (!cancelled && !viewChanged && r?.exists) {
+        setHasView(true);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
       }
     });
 
-    // (1) A view was just created for this conversation (first navigate).
     const unsubCreated = bridge.onBrowserViewCreated?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
-    });
-    // (3) Attach/detach transitions. An attach for another conversation, or a
-    // detach (null), means this pane's view is no longer the visible one.
-    const unsubActive = bridge.onBrowserHostActiveChanged?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
-      else if (payload.conversationId === null) setViewActive(false);
+      if (payload.conversationId !== conversationId) return;
+      viewChanged = true;
+      setHasView(true);
     });
     const unsubClosed = bridge.onBrowserViewClosed?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(false);
+      if (payload.conversationId !== conversationId) return;
+      viewChanged = true;
+      setHasView(false);
+      setCanGoBack(false);
+      setCanGoForward(false);
     });
     return () => {
       cancelled = true;
       unsubCreated?.();
-      unsubActive?.();
       unsubClosed?.();
     };
   }, [conversationId, browserSupported]);
@@ -269,14 +320,104 @@ export function BrowserPane({
     }
   }, [conversationId, designMode]);
 
+  // Probe the shell's feature gate once: the bridge method alone doesn't mean
+  // the machine can decrypt Chrome's cookies (Windows/Linux report false).
+  useEffect(() => {
+    if (!browserSupported) return;
+    const bridge = getBridge();
+    if (!bridge?.browserChromeCookiePreview || !bridge.browserChromeCookieImport) return;
+    let cancelled = false;
+    void getDesktopFeatures().then((features) => {
+      if (!cancelled) setCookieImportSupported(features?.chromeCookieImport === true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [browserSupported]);
+
+  // Step 1: ask main what Chrome holds for THIS site (metadata only — the
+  // Keychain prompt belongs to the import, not to opening the dialog).
+  const handlePreviewChromeCookies = useCallback(async () => {
+    const bridge = getBridge();
+    if (!bridge?.browserChromeCookiePreview) return;
+    setCookieBusy(true);
+    try {
+      const preview = await bridge.browserChromeCookiePreview(conversationId);
+      if (!preview?.ok) {
+        toast.error(preview?.error || "Couldn't look for Chrome cookies.");
+        return;
+      }
+      const profiles = preview.profiles ?? [];
+      if (!preview.host || profiles.length === 0) {
+        toast.info(`No Chrome cookies found for ${preview.host ?? "this site"}.`);
+        return;
+      }
+      // Prefer a profile that actually holds cookies for this page.
+      const preferred = profiles.find((profile) => (profile.cookieCount ?? 0) > 0) ?? profiles[0];
+      setCookieProfileId(preferred.id);
+      setCookieScope(preview.host);
+      setCookiePreview({ ...preview, profiles });
+    } catch {
+      toast.error("Couldn't look for Chrome cookies.");
+    } finally {
+      setCookieBusy(false);
+    }
+  }, [conversationId]);
+
+  // Step 2: the user confirmed in the dialog — copy and reload so the site
+  // picks the session up immediately.
+  const handleImportChromeCookies = useCallback(async () => {
+    const bridge = getBridge();
+    const preview = cookiePreview;
+    if (!bridge?.browserChromeCookieImport || !preview?.host || !cookieProfileId) return;
+    const scope = cookieScopeOptions(preview, cookieProfileId).includes(cookieScope)
+      ? cookieScope
+      : preview.host;
+    setCookieBusy(true);
+    try {
+      const result = await bridge.browserChromeCookieImport(conversationId, {
+        profileId: cookieProfileId,
+        expectedHost: preview.host,
+        scope,
+      });
+      if (!result?.ok) {
+        // Declining the shell's own confirmation is not an error.
+        if (result?.cancelled) return;
+        toast.error(result?.error || "Couldn't import cookies from Chrome.");
+        return;
+      }
+      const imported = result.imported ?? 0;
+      const unusable = (result.skipped ?? 0) + (result.failed ?? 0);
+      if (imported === 0) {
+        // Keep the dialog open — another Chrome profile may hold the session.
+        toast.error(
+          (result.failed ?? 0) > 0
+            ? `Chrome's cookies for ${scope} couldn't be saved in this browser session.`
+            : `Chrome had no usable cookies for ${scope}.`,
+        );
+        return;
+      }
+      setCookiePreview(null);
+      const suffix = imported === 1 ? "cookie" : "cookies";
+      toast.success(
+        `Imported ${imported} ${suffix} from Chrome${unusable > 0 ? ` (${unusable} couldn't be used)` : ""}.`,
+      );
+      void bridge.browserReload?.(conversationId);
+    } catch {
+      toast.error("Couldn't import cookies from Chrome.");
+    } finally {
+      setCookieBusy(false);
+    }
+  }, [conversationId, cookiePreview, cookieProfileId, cookieScope]);
+
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
   useEffect(() => {
-    if ((!viewActive || !active) && designMode) {
+    if ((!hasView || !active) && designMode) {
       designModeRef.current = false;
       setDesignMode(false);
     }
-  }, [viewActive, active, designMode]);
+  }, [hasView, active, designMode]);
 
   // Measure the placeholder and push bounds to the main process. These are
   // renderer CSS pixels; the main process converts to WebContentsView DIPs
@@ -316,7 +457,7 @@ export function BrowserPane({
   // present; DETACH (not destroy) on unmount so a background agent's page keeps
   // running when the user switches away. A later mount re-attaches.
   useEffect(() => {
-    if (!browserSupported || !viewActive || !active) return;
+    if (!browserSupported || !hasView || !active) return;
     const bridge = getBridge();
     if (!bridge?.browserSetActive) return;
     void bridge.browserSetActive(conversationId);
@@ -345,7 +486,7 @@ export function BrowserPane({
         /* swallow — window may be tearing down */
       }
     };
-  }, [conversationId, browserSupported, viewActive, active, syncBounds]);
+  }, [conversationId, browserSupported, hasView, active, syncBounds]);
 
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
@@ -353,7 +494,7 @@ export function BrowserPane({
   // teardown still schedules the next frame — else the rAF chain dies and the
   // overlay strands.
   useEffect(() => {
-    if (!browserSupported || !viewActive || !active) return;
+    if (!browserSupported || !hasView || !active) return;
     let rafId = 0;
     const tick = () => {
       try {
@@ -365,13 +506,13 @@ export function BrowserPane({
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [browserSupported, viewActive, active, syncBounds]);
+  }, [browserSupported, hasView, active, syncBounds]);
 
   // Defense-in-depth against a hung rAF chain: ResizeObserver (size), window
   // resize, and visibilitychange (tab-back, where rAFs were throttled) each
   // recover bounds on the next interaction.
   useEffect(() => {
-    if (!browserSupported || !viewActive || !active || !containerRef.current) return;
+    if (!browserSupported || !hasView || !active || !containerRef.current) return;
     const el = containerRef.current;
     const ro = new ResizeObserver(() => syncBounds());
     ro.observe(el);
@@ -386,7 +527,7 @@ export function BrowserPane({
       window.removeEventListener("resize", onResize);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [browserSupported, viewActive, active, syncBounds]);
+  }, [browserSupported, hasView, active, syncBounds]);
 
   // No browser-capable shell (plain web build, or a desktop build too old for
   // the embedded browser): render nothing so there's no empty split pane. The
@@ -395,23 +536,32 @@ export function BrowserPane({
 
   // Flex column: the toolbar (shrink-0) is ALWAYS the first child so the URL bar
   // is reachable from a cold start (typing a URL creates the view on demand →
-  // viewActive flips true → the measuring container mounts). Gating the toolbar
-  // on viewActive was a deadlock: no page → no toolbar → no way to open a page.
+  // hasView flips true → the measuring container mounts). Gating the toolbar
+  // on hasView was a deadlock: no page → no toolbar → no way to open a page.
   //
   // LAYOUT TRAP (verified): the native view paints OVER the measured containerRef
   // rect, so the toolbar must be ABOVE it, never inside. The container is the LAST
   // child, flex-1 min-h-0 (not inset:0), so getBoundingClientRect covers only the
   // region below the toolbar and the view fills exactly that.
   //
-  // Content area below the always-present toolbar switches on viewActive:
-  //   - viewActive: the measuring `containerRef` placeholder. `containerRef` +
-  //     syncBounds + the rAF/observer effects (all gated on viewActive above)
+  // Content area below the always-present toolbar switches on hasView:
+  //   - hasView: the measuring `containerRef` placeholder. `containerRef` +
+  //     syncBounds + the rAF/observer effects (all gated on hasView above)
   //     keep the native view positioned over the container. NO containerRef is
-  //     mounted while !viewActive, so nothing measures an empty div.
-  //   - !viewActive: a centered hint. Back/forward are already disabled off
+  //     mounted while !hasView, so nothing measures an empty div.
+  //   - !hasView: a centered hint. Back/forward are already disabled off
   //     canGoBack/canGoForward (both false with no view); reload + DevTools are
   //     explicitly disabled (nothing to reload / no devtools target yet). The
   //     URL bar stays editable so the user can open the first page.
+  const cookieProfiles = cookiePreview?.profiles ?? [];
+  const selectedCookieProfile =
+    cookieProfiles.find((profile) => profile.id === cookieProfileId) ?? cookieProfiles[0];
+  const cookieScopes = cookieScopeOptions(cookiePreview, cookieProfileId);
+  const activeCookieScope = cookieScope || cookieScopes[0] || "";
+  /** Cookies the selected profile holds for one scope. */
+  const countForScope = (scope: string) =>
+    selectedCookieProfile?.scopes?.find((entry) => entry.host === scope)?.cookieCount ??
+    (scope === cookiePreview?.host ? (selectedCookieProfile?.cookieCount ?? 0) : 0);
   return (
     <div
       className={cn("flex min-h-0 min-w-0 flex-col", className)}
@@ -441,7 +591,7 @@ export function BrowserPane({
         <button
           type="button"
           onClick={handleReload}
-          disabled={!viewActive}
+          disabled={!hasView}
           aria-label="Reload"
           title="Reload"
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
@@ -470,22 +620,34 @@ export function BrowserPane({
               e.currentTarget.blur();
             }
           }}
-          className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-foreground text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring dark:bg-input/30"
+          className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-foreground text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring dark:bg-input"
         />
         <button
           type="button"
           onClick={handleDevTools}
-          disabled={!viewActive}
+          disabled={!hasView}
           aria-label="Toggle DevTools"
           title="Toggle DevTools"
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <WrenchIcon className="size-4" />
         </button>
+        {cookieImportSupported && (
+          <button
+            type="button"
+            onClick={handlePreviewChromeCookies}
+            disabled={!hasView || cookieBusy}
+            aria-label="Import cookies from Chrome"
+            title="Import this site's cookies from Chrome so you're signed in here too"
+            className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
+          >
+            <CookieIcon className="size-4" />
+          </button>
+        )}
         <button
           type="button"
           onClick={handleToggleDesignMode}
-          disabled={!viewActive}
+          disabled={!hasView}
           aria-pressed={designMode}
           aria-label={designMode ? "Exit design mode" : "Enter design mode"}
           title={
@@ -506,10 +668,10 @@ export function BrowserPane({
           {navigationError}
         </div>
       )}
-      {viewActive ? (
+      {hasView ? (
         /* Measuring region — the native WebContentsView paints over this.
            flex-1 min-h-0 so it fills everything BELOW the toolbar; its rect
-           is what syncBounds() pushes. Mounted only while viewActive so the
+           is what syncBounds() pushes. Mounted only while hasView so the
            effects never measure an empty div.
            ml-1 (4px, matching the WorkspacePanel resize handle's w-1) shifts
            this box right so the native view's rect.left clears the handle at
@@ -524,6 +686,97 @@ export function BrowserPane({
           {agentBrowser ? " — the agent will open pages here too." : "."}
         </div>
       )}
+      {/* DialogContent mounts SuppressBrowserView, hiding the native view. */}
+      <Dialog
+        open={cookiePreview !== null}
+        onOpenChange={(open) => {
+          if (!open && !cookieBusy) setCookiePreview(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Import cookies from Chrome</DialogTitle>
+            <DialogDescription>
+              Copies {activeCookieScope}'s cookies into this conversation's browser, so the site
+              reuses the sign-in you already have in Chrome. Nothing is written back to Chrome, and
+              the copy disappears when Omnigent quits.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1">
+              <span className="text-muted-foreground text-xs">Site</span>
+              {cookieScopes.length > 1 ? (
+                <Select value={activeCookieScope} onValueChange={setCookieScope}>
+                  <SelectTrigger aria-label="Site scope" className="w-full">
+                    <SelectValue>{activeCookieScope}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {cookieScopes.map((scope) => (
+                      <SelectItem key={scope} value={scope}>
+                        {scope} ({countForScope(scope)})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <span className="break-all font-medium text-sm">{cookiePreview?.host}</span>
+              )}
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-muted-foreground text-xs">Chrome profile</span>
+              {cookieProfiles.length > 1 ? (
+                <Select value={cookieProfileId} onValueChange={setCookieProfileId}>
+                  <SelectTrigger aria-label="Chrome profile" className="w-full">
+                    <SelectValue>{selectedCookieProfile?.name}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {cookieProfiles.map((profile) => (
+                      <SelectItem key={profile.id} value={profile.id}>
+                        {profile.name} (
+                        {profile.scopes?.find((entry) => entry.host === activeCookieScope)
+                          ?.cookieCount ?? profile.cookieCount}
+                        )
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <span className="font-medium text-sm">{selectedCookieProfile?.name}</span>
+              )}
+            </div>
+            <p className="text-muted-foreground text-xs">
+              {countForScope(activeCookieScope)}{" "}
+              {countForScope(activeCookieScope) === 1 ? "cookie" : "cookies"} for{" "}
+              {activeCookieScope} and its subdomains. Other sites' cookies stay out of Omnigent
+              entirely.
+            </p>
+            {activeCookieScope !== cookiePreview?.host && (
+              <p className="text-muted-foreground text-xs">
+                Cookies from other subdomains stay bound to their own host, so they only apply once
+                the tab visits them.
+              </p>
+            )}
+            <p className="text-muted-foreground text-xs">
+              macOS asks for permission to read Chrome's key from your login Keychain. Choose Allow,
+              not Always Allow: Always Allow lets any local process read the key.
+            </p>
+            <p className="text-destructive text-xs">
+              {/* Agent and user tabs share one jar per conversation: the agent can
+                  act as you on this site whether or not it drives this tab. */}
+              This conversation's tabs share one cookie jar, including any tab the agent controls,
+              so the agent can act as you on this site while these cookies are loaded.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCookiePreview(null)} disabled={cookieBusy}>
+              Cancel
+            </Button>
+            <Button onClick={handleImportChromeCookies} disabled={cookieBusy}>
+              {cookieBusy ? "Importing…" : "Import cookies"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

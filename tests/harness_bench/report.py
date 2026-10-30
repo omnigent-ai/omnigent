@@ -141,6 +141,8 @@ def render_table(
         # only the footer so we add the legend + explanations, not a duplicate.
         out = [_legend()]
 
+    out += ["", _coverage_line(matrix)]
+
     drift = _drift_lines(matrix)
     if drift:
         out += ["", "Drift (observed disagrees with declared):", *drift]
@@ -192,10 +194,15 @@ def render_markdown(matrix: BenchMatrix, *, declared: bool = False) -> str:
 
     heading = "# Harness capability matrix" + (" (declared, not observed)" if declared else "")
     out = [heading, "", *lines, "", _legend()]
+    out += ["", _coverage_line(matrix)]
 
     drift = _drift_lines(matrix)
     if drift:
         out += ["", "## Drift (observed disagrees with declared)", "", *drift]
+
+    notes = _note_lines(matrix)
+    if notes:
+        out += ["", "## Notes", "", *notes]
 
     skips = _skip_lines(matrix)
     if skips:
@@ -254,8 +261,15 @@ def render_json(matrix: BenchMatrix) -> str:
     payload = {
         "harnesses": [_report_json(r) for r in matrix.reports],
         "has_drift": matrix.has_drift,
+        "complete": matrix.complete,
     }
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _coverage_line(matrix: BenchMatrix) -> str:
+    if matrix.complete:
+        return "Coverage: complete for the selected checks (see verdicts for correctness)."
+    return "Coverage: incomplete; some selected checks were not observed."
 
 
 def _report_json(report: HarnessReport) -> dict[str, Any]:

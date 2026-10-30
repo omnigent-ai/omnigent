@@ -74,6 +74,35 @@ describe("BlockStream — response_start", () => {
 });
 
 describe("BlockStream — block ctx carries response_id and item_id", () => {
+  it("does not adopt lifecycle notice ids as the parent stream identity", () => {
+    const blocks = reduce([
+      {
+        type: "native_tool_call",
+        toolType: "subagent_activity",
+        data: {},
+        itemId: "notice_1",
+        responseId: "subagent_returned",
+      },
+      { type: "text_delta", delta: "Before identity\n" },
+      {
+        type: "tool_call",
+        name: "Read",
+        arguments: {},
+        callId: "call_1",
+        status: "completed",
+        agentName: "parent",
+        itemId: "tool_1",
+        responseId: "parent_turn",
+      },
+      { type: "text_delta", delta: "After identity\n" },
+    ]);
+
+    expect(blocks[0]?.ctx.responseId).toBe("subagent_returned");
+    expect(
+      blocks.filter((block) => block.type === "text_chunk").map((block) => block.ctx.responseId),
+    ).toEqual(["", "parent_turn"]);
+  });
+
   it("every block ctx.responseId is the active response id from response.created", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_xyz" }) },
@@ -292,6 +321,33 @@ describe("BlockStream — text", () => {
     expect(textDone.ctx.itemId).toBe("msg_terminal_1");
     expect(textDone.ctx.responseId).toBe("resp_terminal_1");
     expect(textDone.fullText).toBe("Hello from transcript");
+  });
+
+  it("message_done phase lands on the text_done it closes or emits", () => {
+    const streamed = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_1" }) },
+      { type: "text_delta", delta: "Checking." },
+      {
+        type: "message_done",
+        content: [],
+        itemId: "msg_1",
+        responseId: "resp_1",
+        phase: "commentary",
+      },
+    ]);
+    const closed = streamed.find((b): b is TextDone => b.type === "text_done");
+    expect(closed?.phase).toBe("commentary");
+
+    const [emitted] = reduce([
+      {
+        type: "message_done",
+        content: [{ type: "output_text", text: "Done." }],
+        itemId: "msg_2",
+        responseId: "resp_2",
+        phase: "final_answer",
+      },
+    ]);
+    expect((emitted as TextDone).phase).toBe("final_answer");
   });
 
   it("simple text response → start, text, done, end", () => {
@@ -774,12 +830,16 @@ describe("BlockStream — multi-response (session-lifetime reducer)", () => {
         content: [{ type: "output_text", text: "Hi! 👋" }],
         itemId: "msg_X",
         responseId: "resp_X",
+        phase: "commentary",
       },
     ]);
 
     const textDones = blocks.filter((b): b is TextDone => b.type === "text_done");
     expect(textDones).toHaveLength(1);
     expect(textDones[0]!.fullText).toBe("Hi! 👋");
+    // The deduped message keeps its identity, so live and reloaded folds agree.
+    expect(textDones[0]!.ctx.itemId).toBe("msg_X");
+    expect(textDones[0]!.phase).toBe("commentary");
   });
 
   it("response_in_progress sets the responseId when response.created is absent", () => {

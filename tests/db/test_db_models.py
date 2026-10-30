@@ -8,10 +8,14 @@ behave as expected.
 from __future__ import annotations
 
 import hashlib
+import random
+import string
 import time
 
 import pytest
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy import make_url
+from sqlalchemy.dialects import mysql, sqlite
+from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 
 from omnigent.db.db_models import (
     SqlAccountToken,
@@ -51,7 +55,7 @@ def _now() -> int:
 def _make_agent(
     id: str = "0ecf75a6ff1ff86bcc1902eb0951ef45",
     name: str = "test-agent",
-    kind: str = "template",
+    kind: str = "server",
 ) -> SqlAgent:
     return SqlAgent(
         id=id,
@@ -95,6 +99,12 @@ def _make_metadata(
     )
 
 
+def _incompressible_text(length: int) -> str:
+    """Seeded high-entropy text, which zstd cannot shrink much."""
+    rng = random.Random(42)
+    return "".join(rng.choices(string.ascii_letters + string.digits, k=length))
+
+
 def _make_item(
     id: str = "a47da81d0587d7c42e53978d629c5ab8",
     conversation_id: str = "a9930027fd3e2e979e65844f7af7bf88",
@@ -132,7 +142,7 @@ class TestSqlAgent:
             assert loaded.version == 1
             assert loaded.description is None
             assert loaded.updated_at is None
-            assert loaded.kind == encode_agent_kind("template")
+            assert loaded.kind == encode_agent_kind("server")
 
     def test_nullable_columns(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -155,22 +165,22 @@ class TestSqlAgent:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        agent = _make_agent(kind="session")
+        agent = _make_agent(kind="user")
         with managed() as session:
             session.add(agent)
 
         with managed() as session:
             loaded = session.get(SqlAgent, (0, "0ecf75a6ff1ff86bcc1902eb0951ef45"))
             assert loaded is not None
-            assert loaded.kind == encode_agent_kind("session")
+            assert loaded.kind == encode_agent_kind("user")
 
     def test_multiple_session_agents_allowed(self, db_uri: str) -> None:
         """Multiple session-scoped agents are permitted (no unique constraint on kind)."""
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        a1 = _make_agent(id="880b5afda28ad55ff74cbeb9b5fc67fb", name="agent-1", kind="session")
-        a2 = _make_agent(id="0fa804039e209a10554da55135751438", name="agent-2", kind="session")
+        a1 = _make_agent(id="880b5afda28ad55ff74cbeb9b5fc67fb", name="agent-1", kind="user")
+        a2 = _make_agent(id="0fa804039e209a10554da55135751438", name="agent-2", kind="user")
 
         with managed() as session:
             session.add(a1)
@@ -393,6 +403,45 @@ class TestSqlConversation:
             loaded_conv = session.get(SqlConversation, (0, "a9930027fd3e2e979e65844f7af7bf88"))
             assert loaded_conv is not None
             assert loaded_conv.archived is False
+
+    @pytest.mark.parametrize("column", ["session_state", "session_usage", "terminal_launch_args"])
+    def test_metadata_blob_columns_cap_stored_size_only_on_mysql(self, column: str) -> None:
+        """MySQL BLOB holds 65,535 bytes; other dialects store larger values."""
+        column_type = SqlConversationMetadata.__table__.c[column].type
+        assert column_type.compile(dialect=mysql.dialect()) == "BLOB"
+        value = _incompressible_text(100_000)
+        with pytest.raises(ValueError, match="size limit"):
+            column_type.dialect_impl(mysql.dialect()).process_bind_param(value, None)
+        uncapped = column_type.dialect_impl(sqlite.dialect())
+        stored = uncapped.process_bind_param(value, None)
+        assert uncapped.process_result_value(stored, None) == value
+
+    def test_metadata_blob_columns_store_values_over_mysql_limit(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+        value = _incompressible_text(100_000)
+        meta = _make_metadata()
+        meta.session_state = value
+        meta.session_usage = value
+        meta.terminal_launch_args = value
+
+        if make_url(db_uri).get_backend_name() == "mysql":
+            # Rejected while binding parameters, before MySQL sees the statement.
+            with pytest.raises(StatementError) as raised, managed() as session:
+                session.add(meta)
+            assert isinstance(raised.value.orig, ValueError)
+            return
+
+        with managed() as session:
+            session.add(meta)
+        with managed() as session:
+            loaded = session.get(SqlConversationMetadata, (0, "a9930027fd3e2e979e65844f7af7bf88"))
+            assert loaded is not None
+            assert (loaded.session_state, loaded.session_usage, loaded.terminal_launch_args) == (
+                value,
+                value,
+                value,
+            )
 
     def test_metadata_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)

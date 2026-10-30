@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from tests._helpers.messages import all_message_text as _extract_all_text
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -36,18 +37,6 @@ def _tool_names_in_output(body: dict[str, Any]) -> list[str]:
         for item in body.get("output", [])
         if item.get("type") == "function_call" and item.get("name")
     ]
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """Concatenate all assistant output_text blocks."""
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def test_first_session_to_working_code_journey(

@@ -2,17 +2,42 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import subprocess
+import sys
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
+import psutil  # type: ignore[import-untyped]
 import pytest
 from packaging.version import Version
 
 import omnigent._platform as _platform
+from omnigent.inner import _proc
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+from tests._helpers.polling import poll_until
+
+# Captured before the autouse fixture forbids Popen, for the tests that need a
+# real installer process tree.
+_REAL_POPEN = subprocess.Popen
+
+# Installer stand-in: prints to stderr, records the pid of a child that holds stderr and
+# touches a marker only if it lives 60s, then sleeps and exits.
+# argv: pid_file, marker, sleep_s, exit_code.
+_INSTALLER_LEAVING_A_CHILD = (
+    "import pathlib, subprocess, sys, time\n"
+    "print('npm error code EACCES', file=sys.stderr, flush=True)\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import pathlib, sys, time; "
+    "time.sleep(60); pathlib.Path(sys.argv[1]).touch()', sys.argv[2]])\n"
+    "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+    "time.sleep(float(sys.argv[3]))\n"
+    "sys.exit(int(sys.argv[4]))\n"
+)
 
 # Captured before the autouse fixture below monkeypatches ``subprocess.run``
 # (on the shared module object), so tests that need a real subprocess call
@@ -37,6 +62,8 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
 
     def _stub_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
@@ -46,6 +73,61 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError(f"unexpected subprocess in harness_install tests: {argv!r}")
 
     monkeypatch.setattr(hi.subprocess, "run", _stub_version_run)
+
+    def _forbid_popen(argv: list[str], **k: object) -> object:
+        raise AssertionError(
+            f"unstubbed installer Popen in harness_install tests: {argv!r} — "
+            "stub it with fake_installer() rather than letting it really run "
+            "'npm install -g' / a vendor install script on the dev machine"
+        )
+
+    monkeypatch.setattr(hi.subprocess, "Popen", _forbid_popen)
+
+
+class FakeInstaller:
+    """Stand-in for an installer ``Popen``, exercising the stderr tee.
+
+    :param argv: The argv the installer was asked to run.
+    :param returncode: Exit status :meth:`wait` reports.
+    :param stderr: Text the installer writes to stderr, teed line by line.
+    """
+
+    def __init__(self, argv: list[str], *, returncode: int = 0, stderr: str = "") -> None:
+        self.args = argv
+        self.returncode = returncode
+        self.stderr = io.StringIO(stderr)
+        self.killed = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def fake_installer(
+    *,
+    returncode: int = 0,
+    stderr: str = "",
+    calls: list[list[str]] | None = None,
+    on_call: Callable[[], None] | None = None,
+):
+    """Build a ``subprocess.Popen`` replacement yielding :class:`FakeInstaller`.
+
+    :param returncode: Exit status the installer reports.
+    :param stderr: Stderr text the installer emits.
+    :param calls: Appended with each argv, for asserting what was run.
+    :param on_call: Side effect per invocation, e.g. marking a binary present.
+    """
+
+    def _popen(argv: list[str], **_kwargs: object) -> FakeInstaller:
+        if calls is not None:
+            calls.append(argv)
+        if on_call is not None:
+            on_call()
+        return FakeInstaller(argv, returncode=returncode, stderr=stderr)
+
+    return _popen
 
 
 @pytest.mark.parametrize(
@@ -238,6 +320,31 @@ def test_login_probe_caches_positive_verdicts_with_ttl(
     assert len(runs) == 2
 
 
+def test_invalidate_probe_caches_forces_fresh_login_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual readiness refreshes must not reuse a cached login verdict."""
+    hi.invalidate_harness_probe_caches()
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    hi.invalidate_harness_probe_caches()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 2
+    hi.invalidate_harness_probe_caches()
+
+
 def test_login_probe_never_caches_negative_verdicts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -293,8 +400,7 @@ def test_version_probe_caches_by_binary_signature(
 ) -> None:
     """``--version`` parses cache against (path, mtime, size); failures don't.
 
-    The output is a pure function of the binary bytes, so a swap (upgrade)
-    must re-probe and an unchanged binary must never be probed twice.
+    A changed executable must re-probe even while the cached version is fresh.
     """
     binary = tmp_path / "fake-cli"
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -323,6 +429,94 @@ def test_version_probe_caches_by_binary_signature(
     os.utime(binary, ns=(1, 1))
     assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
     assert len(runs) == 3
+
+
+@pytest.mark.parametrize("refresh", ["expiry", "manual", "install"])
+def test_version_probe_refreshes_an_unchanged_launcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refresh: str
+) -> None:
+    """Upgrading a launcher's delegated executable must restore readiness."""
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    now = 100.0
+    monkeypatch.setattr(hi, "time", SimpleNamespace(monotonic=lambda: now))
+    version = "0.1.0"
+    probes = 0
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal probes
+        assert argv == [str(binary), "--version"], f"only version probes run here: {argv!r}"
+        probes += 1
+        return subprocess.CompletedProcess(argv, 0, f"codex-cli {version}\n", "")
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    install_calls: list[list[str]] = []
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(calls=install_calls))
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    version = spec.min_version
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert probes == 1
+    if refresh == "expiry":
+        now += 60.0
+    elif refresh == "manual":
+        hi.invalidate_harness_probe_caches()
+    else:
+        assert hi.try_install_harness_cli(OPENAI_FAMILY).installed
+        assert install_calls == [hi.harness_install_command(OPENAI_FAMILY)]
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == version
+    assert probes == 2
+
+
+@pytest.mark.parametrize("returncode", [1, -15])
+@pytest.mark.parametrize("output_stream", ["stdout", "stderr"])
+def test_failed_version_probe_does_not_admit_or_cache_a_broken_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    output_stream: str,
+) -> None:
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    runs = 0
+    repaired = False
+
+    def run_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal runs
+        runs += 1
+        if repaired:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"codex-cli {spec.min_version}\n", stderr=""
+            )
+        diagnostic = "Error: missing optional dependency\nNode.js v22.18.0\n"
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=returncode,
+            stdout=diagnostic if output_stream == "stdout" else "",
+            stderr=diagnostic if output_stream == "stderr" else "",
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", run_probe)
+
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") == spec
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] is None
+    assert runs == 3
+
+    # Repairing a dependency need not change the launcher's file signature.
+    repaired = True
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") is None
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == spec.min_version
+    assert runs == 4
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
@@ -645,14 +839,174 @@ def test_try_install_harness_cli_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -
         return "/usr/bin/npm" if name == "npm" else None
 
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=1),
-    )
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1))
     installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
     assert installed is False
     assert reason is not None and "code 1" in reason
+
+
+NPM_EACCES = (
+    "npm error code EACCES\n"
+    "npm error syscall mkdir\n"
+    "npm error path /usr/local/lib/node_modules/@openai\n"
+    "npm error Error: EACCES: permission denied, mkdir "
+    "'/usr/local/lib/node_modules/@openai'\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (NPM_EACCES, "permission denied writing the global install directory (npm EACCES)"),
+        (
+            "npm error code ECONNREFUSED\nnpm error request to "
+            "https://registry.npmjs.org/@openai%2fcodex failed\n",
+            "could not reach the npm registry (npm ECONNREFUSED)",
+        ),
+        ("npm error code E401\nnpm error Incorrect or missing password.\n", "rejected the creden"),
+        ("npm error code ENOSPC\nnpm error nospc ENOSPC: no space left\n", "no space left"),
+        # npm 9 and earlier spell the same line differently.
+        ("npm ERR! code EACCES\nnpm ERR! syscall mkdir\n", "permission denied"),
+    ],
+)
+def test_try_install_names_the_npm_failure_cause(
+    monkeypatch: pytest.MonkeyPatch, stderr: str, expected: str
+) -> None:
+    """A failed install reports what the user can fix, not just an exit code.
+
+    An unwritable global directory and an unreachable registry are both exit
+    code 1; reporting only that left the two indistinguishable in the toast.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1, stderr=stderr))
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason is not None and expected in reason
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (1, NPM_EACCES, "permission denied writing the global install directory (npm EACCES)"),
+        (0, "", "installer completed but 'codex' is still 0.1.0 (requires "),
+    ],
+)
+def test_try_install_reports_an_upgrade_that_left_the_old_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    stderr: str,
+    expected: str,
+) -> None:
+    """An upgrade that leaves the outdated CLI in place is a failure, not an install.
+
+    The old binary still resolves, so only the version check tells the two apart.
+    """
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv == [str(binary), "--version"], f"only version probes run here: {argv!r}"
+        return subprocess.CompletedProcess(argv, 0, "codex-cli 0.1.0\n", "")
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    monkeypatch.setattr(
+        hi.subprocess, "Popen", fake_installer(returncode=returncode, stderr=stderr)
+    )
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason is not None and expected in reason
+
+
+def test_try_install_falls_back_to_the_exit_code_for_unrecognized_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Output that identifies no known cause still yields a reason.
+
+    A vendor install script's output is not npm-shaped, so the bare exit code
+    remains the fallback rather than an error.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(returncode=2, stderr="curl: (22) The requested URL returned 404\n"),
+    )
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason == "installer exited with code 2"
+
+
+def test_installer_stderr_still_reaches_this_process(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reading the installer's stderr must not stop it being displayed.
+
+    The output is what makes a failure visible in the setup terminal and the
+    host log, so it is teed — captured for the reason *and* written through.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1, stderr=NPM_EACCES))
+
+    hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert NPM_EACCES in capsys.readouterr().err
+
+
+def test_installer_timeout_kills_children_holding_stderr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A timed-out installer's children die with it instead of holding stderr open.
+
+    Waiting on a pipe that a surviving child still writes to would stretch the
+    install timeout to that child's lifetime.
+    """
+    monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
+    pid_file, marker = tmp_path / "child.pid", tmp_path / "child-lived-60s"
+    installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD]
+    installer += [str(pid_file), str(marker), "60", "0"]
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        hi._run_installer(installer, timeout=3)
+
+    assert not marker.exists(), "the timeout waited for the installer's child to finish"
+    child_pid = int(pid_file.read_text())
+    poll_until(lambda: not _proc.process_alive(child_pid), timeout_s=5, interval_s=0.05)
+
+
+def test_installer_returns_when_a_child_keeps_stderr_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An installer that exits while its child holds stderr returns without waiting for it.
+
+    The reason comes from what was teed before the drain wait gave up.
+    """
+    monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
+    monkeypatch.setattr(hi, "_INSTALLER_TEE_DRAIN_TIMEOUT_S", 0.5)
+    pid_file, marker = tmp_path / "child.pid", tmp_path / "child-lived-60s"
+    installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD]
+    installer += [str(pid_file), str(marker), "0", "1"]
+
+    try:
+        returncode, stderr_tail = hi._run_installer(installer, timeout=30)
+        returned_before_child_finished = not marker.exists()
+    finally:
+        if pid_file.exists():
+            with contextlib.suppress(psutil.NoSuchProcess):
+                psutil.Process(int(pid_file.read_text())).kill()
+
+    assert returncode == 1
+    assert "npm error code EACCES" in stderr_tail
+    assert returned_before_child_finished, "the install call waited for the installer's child"
 
 
 def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -666,12 +1020,12 @@ def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> Non
             return "/usr/bin/codex" if state["installed"] else None
         return None
 
-    def _run(argv: list[str], **k: object):
-        state["installed"] = True
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(on_call=lambda: state.__setitem__("installed", True)),
+    )
     assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
 
 
@@ -697,13 +1051,7 @@ def test_try_install_harness_cli_success_when_binary_off_path(
     monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
 
-    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
-        if len(argv) >= 2 and argv[1] == "--version":
-            out = "9.9.9\n"
-            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer())
 
     # Install verdict agrees with readiness: both see it installed.
     assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
@@ -737,11 +1085,7 @@ def test_try_install_prepends_resolved_dir_so_login_can_find_binary(
     (npm_dir / "npm").chmod(0o755)
     monkeypatch.setenv("PATH", str(npm_dir))
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
-    )
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer())
 
     # Before: a bare PATH lookup (what harness_login uses) can't find codex.
     assert shutil.which("codex") is None
@@ -766,13 +1110,12 @@ def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPa
             return "/usr/bin/codex" if state["installed"] else None
         return None
 
-    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
-        calls.append(argv)
-        state["installed"] = True
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(calls=calls, on_call=lambda: state.__setitem__("installed", True)),
+    )
 
     assert hi.install_harness_cli(OPENAI_FAMILY) is True
     assert calls == [["npm", "install", "-g", "@openai/codex"]]
@@ -799,6 +1142,18 @@ def test_opencode_install_never_removes_v1_package() -> None:
     assert hi.harness_install_display(hi.OPENCODE_KEY) == ("npm install -g @opencode/cli@~2.0.18")
 
 
+def _stub_opencode_version(monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+    """Make ``opencode --version`` report *version* (other ``--version`` probes stay 9.9.9)."""
+
+    def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            reported = version if Path(argv[0]).name == "opencode" else "9.9.9"
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{reported}\n")
+        raise AssertionError(f"unexpected subprocess in harness_install tests: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+
 def test_install_harness_cli_runs_opencode_guard_and_install(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -813,19 +1168,45 @@ def test_install_harness_cli_runs_opencode_guard_and_install(
             return "/usr/local/bin/opencode"
         return None
 
-    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
-        calls.append(argv)
-        state["installed"] = True
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(calls=calls, on_call=lambda: state.update(installed=True)),
+    )
+    _stub_opencode_version(monkeypatch, "2.0.18")
 
     assert hi.install_harness_cli(hi.OPENCODE_KEY) is True
     assert calls == [["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT]]
 
 
-def test_opencode_install_script_blocks_when_v1_present(tmp_path: Path) -> None:
+def test_try_install_opencode_reports_the_v1_guard_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With 1.x still installed the guard exits 1; the old binary must not read as success."""
+    guard_message = (
+        "npm notice\n"
+        f"{hi._INSTALLER_REASON_PREFIX}OpenCode 1.x (opencode-ai) is installed; "
+        "run 'npm rm -g opencode-ai'\n"
+    )
+
+    def _which(name: str) -> str | None:
+        return {"bash": "/bin/bash", "opencode": "/usr/local/bin/opencode"}.get(name)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1, stderr=guard_message))
+    _stub_opencode_version(monkeypatch, "1.14.0")
+
+    result = hi.try_install_harness_cli(hi.OPENCODE_KEY)
+
+    assert result == hi.HarnessInstallResult(
+        False, "OpenCode 1.x (opencode-ai) is installed; run 'npm rm -g opencode-ai'"
+    )
+
+
+def test_opencode_install_script_blocks_when_v1_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Run the real install script through bash with a fake npm that reports
     ``opencode-ai`` installed: it must exit 1, print the message on stderr,
     and never invoke ``npm rm`` or ``npm install``."""
@@ -836,6 +1217,7 @@ def test_opencode_install_script_blocks_when_v1_present(tmp_path: Path) -> None:
     )
     fake_npm.chmod(0o755)
 
+    monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
     result = _REAL_SUBPROCESS_RUN(
         ["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT],
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
@@ -851,7 +1233,9 @@ def test_opencode_install_script_blocks_when_v1_present(tmp_path: Path) -> None:
     assert not any(call.startswith("install") for call in calls)
 
 
-def test_opencode_install_script_installs_when_v1_absent(tmp_path: Path) -> None:
+def test_opencode_install_script_installs_when_v1_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """When ``npm ls -g opencode-ai`` fails (not installed), the script
     proceeds straight to ``npm install -g @opencode/cli@~2.0.18``."""
     npm_log = tmp_path / "npm-calls.log"
@@ -861,6 +1245,7 @@ def test_opencode_install_script_installs_when_v1_absent(tmp_path: Path) -> None
     )
     fake_npm.chmod(0o755)
 
+    monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
     result = _REAL_SUBPROCESS_RUN(
         ["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT],
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
@@ -887,13 +1272,12 @@ def test_install_harness_cli_runs_hermes_installer_then_rechecks(
             return "/usr/local/bin/hermes"
         return None
 
-    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
-        calls.append(argv)
-        state["installed"] = True
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(calls=calls, on_call=lambda: state.__setitem__("installed", True)),
+    )
 
     assert hi.install_harness_cli(hi.HERMES_KEY) is True
     spec = hi.harness_install_spec(hi.HERMES_KEY)
@@ -925,11 +1309,7 @@ def test_install_harness_cli_refreshes_user_local_bin(
     (bin_dir / "bash").chmod(0o755)
     monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (user_bin,))
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, *, check=False, timeout=None: subprocess.CompletedProcess(argv, 0),
-    )
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer())
 
     assert hi.install_harness_cli(hi.HERMES_KEY) is True
     # The resolving dir (~/.local/bin) is now first on PATH, so a bare
@@ -1185,7 +1565,7 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["claude", "auth", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/claude", "auth", "status"]  # discovered absolute binary
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1212,7 +1592,7 @@ def test_harness_cli_logged_in_codex_uses_exit_code(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["codex", "login", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/codex", "login", "status"]  # discovered absolute binary
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1243,7 +1623,7 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["cursor-agent", "status", "--format", "json"]
+        assert argv == ["/usr/bin/cursor-agent", "status", "--format", "json"]
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1396,7 +1776,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
 @pytest.mark.parametrize(
     "key,min_version,max_version_exclusive",
     [
-        (hi.OPENCODE_KEY, "2.0.0", "3.0.0"),
+        (hi.OPENCODE_KEY, "2.0.18", "2.1.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
@@ -1423,10 +1803,11 @@ def test_versioned_specs_declare_bounds(
     "version,expected",
     [
         ("1.18.16", False),  # v1 line, below min
-        ("3.0.0", False),  # at max exclusive
-        ("3.1.0", False),  # above max
-        ("2.0.0", True),  # min inclusive
-        ("opencode v2.0.18", True),  # real v2 --version output
+        ("2.0.17", False),  # 2.0.x before the validated release
+        ("2.1.0", False),  # at max exclusive: an unvalidated minor
+        ("3.0.0", False),  # above max
+        ("2.0.18", True),  # min inclusive
+        ("opencode v2.0.25", True),  # real v2 --version output, later patch
     ],
 )
 def test_harness_cli_installed_checks_version_for_versioned_specs(
@@ -1438,7 +1819,7 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's supported range is [2.0.0, 3.0.0).
+            # OpenCode's supported range is [2.0.18, 2.1.0).
             return subprocess.CompletedProcess(
                 args=argv, returncode=0, stdout=f"{version}\n", stderr=""
             )

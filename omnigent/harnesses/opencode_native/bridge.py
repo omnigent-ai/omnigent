@@ -37,12 +37,15 @@ import urllib.parse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from omnigent.native import native_bridge_common
 from omnigent.process_logging import data_dir
 
 _logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
@@ -550,25 +553,26 @@ def copy_opencode_database_for_fork(source_bridge_dir: Path, dest_bridge_dir: Pa
     )
 
 
-def user_opencode_config_path() -> Path | None:
+def user_opencode_config_paths() -> list[Path]:
     """
-    Return the user's real OpenCode config path (not the per-session one).
+    Return the user's real OpenCode config paths (not the per-session ones).
 
     Honors ``XDG_CONFIG_HOME`` (the runner's own env, which is the user's real
     config home — the per-session override is set only on the spawned server),
-    defaulting to ``~/.config/opencode/opencode.jsonc``.
+    defaulting to ``~/.config/opencode``.
 
-    OpenCode accepts both ``.jsonc`` (with comments) and ``.json`` extensions;
-    the ``.jsonc`` variant is checked first.
+    OpenCode deep-merges ``config.json``, ``opencode.json`` and
+    ``opencode.jsonc`` in that order (later files win), so every existing file
+    is returned in that order.
     """
     xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     base = Path(xdg) if xdg else Path.home() / ".config"
     cfg_dir = base / "opencode"
-    for name in ("opencode.jsonc", "opencode.json"):
-        path = cfg_dir / name
-        if path.is_file():
-            return path
-    return None
+    return [
+        path
+        for name in ("config.json", "opencode.json", "opencode.jsonc")
+        if (path := cfg_dir / name).is_file()
+    ]
 
 
 def _per_session_auth_path(bridge_dir: Path) -> Path:
@@ -651,13 +655,13 @@ async def connect_env_provider_keys(
     :param environ: Environment to read; ``None`` uses ``os.environ``.
     :returns: Provider ids connected.
     """
-    from omnigent.onboarding.opencode_auth import _ENV_PROVIDER_VARS
+    from omnigent.onboarding.opencode_auth import _ENV_PROVIDER_VARS, _NON_KEY_PROVIDER_VARS
 
     env = os.environ if environ is None else environ
     skip = set(stored)
     connected: list[str] = []
     for provider_id, _label, var in _ENV_PROVIDER_VARS:
-        if provider_id in skip:
+        if provider_id in skip or var in _NON_KEY_PROVIDER_VARS:
             continue
         key = env.get(var, "").strip()
         if not key:
@@ -665,7 +669,7 @@ async def connect_env_provider_keys(
         skip.add(provider_id)
         try:
             ok = await client.connect_provider_key(provider_id, key)
-        except Exception:  # noqa: BLE001 - best effort; opencode can still read the env itself.
+        except Exception:
             _logger.info("opencode env key connect failed for %s", provider_id, exc_info=True)
             continue
         if ok:
@@ -930,3 +934,20 @@ def update_last_applied_model(bridge_dir: Path, model: str | None) -> bool:
         bridge_dir, dataclasses.replace(state, last_applied_model=normalized or None)
     )
     return True
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: ``opencode serve`` is bound to *session_id*.
+
+    Web turns go to the server over HTTP, which the runner records in bridge
+    state (cleared at each launch) once the server is up.
+
+    :param session_id: Omnigent conversation id currently owning the terminal.
+    :param instance: The live attach terminal; its ``XDG_DATA_HOME`` locates the
+        bridge directory (see :func:`xdg_data_home_for_bridge_dir`).
+    """
+    xdg_data_home = instance.env.get("XDG_DATA_HOME")
+    if not xdg_data_home:
+        return False
+    state = read_bridge_state(Path(xdg_data_home).parent)
+    return state is not None and state.session_id == session_id

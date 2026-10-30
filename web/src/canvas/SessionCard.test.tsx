@@ -7,6 +7,13 @@ import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversa
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { SessionCard, type SessionCardData, type SessionCardNode } from "./SessionCard";
 
+const FORGE_DISPLAY = {
+  id: "example_forge",
+  display_name: "Example Forge",
+  request_name: "pull request",
+  number_prefix: "!",
+};
+
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
   return {
     id: "conv_1",
@@ -25,6 +32,7 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
 function renderCard(
   data: Partial<SessionCardData> & { conversation: Conversation },
   selected = false,
+  onParentClick?: () => void,
 ) {
   const props = {
     id: data.conversation.id,
@@ -33,7 +41,9 @@ function renderCard(
   } as unknown as NodeProps<SessionCardNode>;
   render(
     <TooltipProvider>
-      <SessionCard {...props} />
+      <div onClick={onParentClick}>
+        <SessionCard {...props} />
+      </div>
     </TooltipProvider>,
   );
   return { card: screen.getByTestId("session-card"), onOpen: props.data.onOpen };
@@ -102,7 +112,47 @@ describe("SessionCard", () => {
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
     expect(link).toHaveTextContent("#7 Ship it");
+    expect(link).toHaveAttribute("title", "Ship it (open)");
   });
+
+  it("says how old a stale pull request state is", () => {
+    renderCard({
+      conversation: conversation(),
+      pullRequest: {
+        number: 7,
+        title: "Ship it",
+        state: "OPEN",
+        url: "https://github.com/acme/repo/pull/7",
+        state_checked_at: Date.now() / 1000 - 2 * 3600,
+      },
+    });
+    expect(screen.getByRole("link", { name: "Open pull request #7" })).toHaveAttribute(
+      "title",
+      "Ship it (open, as of 2h ago)",
+    );
+  });
+
+  it.each([
+    { provider: "github", prefix: "#", url: "https://github.com/acme/repo/pull/7" },
+    {
+      provider: "example_forge",
+      provider_display: FORGE_DISPLAY,
+      prefix: "!",
+      url: "https://forge.example.test/acme/proj/_git/repo/pullrequest/7",
+    },
+    { provider: null, prefix: "#", url: "https://github.com/acme/repo/pull/7" },
+  ])(
+    "puts $prefix before the number of a $provider pull request",
+    ({ provider, prefix, url, ...metadata }) => {
+      renderCard({
+        conversation: conversation({ git_branch: "feat/canvas" }),
+        pullRequest: { number: 7, title: "Ship it", state: "OPEN", url, provider, ...metadata },
+      });
+      const link = screen.getByRole("link", { name: `Open pull request ${prefix}7` });
+      expect(link).toHaveAttribute("href", url);
+      expect(link.textContent).toBe(`${prefix}7 Ship it`);
+    },
+  );
 
   it("uses explicit fallbacks for missing fields", () => {
     renderCard({ conversation: conversation({ title: null, workspace: null, status: "failed" }) });
@@ -112,12 +162,15 @@ describe("SessionCard", () => {
   });
 
   it("opens from the keyboard but leaves pointer clicks to selection and drag", () => {
-    const { card, onOpen } = renderCard({ conversation: conversation() });
+    const onParentClick = vi.fn();
+    const { card, onOpen } = renderCard({ conversation: conversation() }, false, onParentClick);
     fireEvent.click(card, { detail: 1 });
     expect(onOpen).not.toHaveBeenCalled();
+    expect(onParentClick).toHaveBeenCalledOnce();
     fireEvent.keyDown(card, { key: "Enter" });
     fireEvent.click(card, { detail: 0 });
     expect(onOpen).toHaveBeenCalledTimes(2);
     expect(onOpen).toHaveBeenCalledWith("conv_1");
+    expect(onParentClick).toHaveBeenCalledOnce();
   });
 });

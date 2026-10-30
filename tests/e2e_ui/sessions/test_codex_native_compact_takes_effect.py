@@ -4,7 +4,7 @@ Guarded hazard: after a Codex (codex-native) session runs a turn to
 completion, ``/compact`` from the web composer can silently do nothing — no
 "Compacting conversation…" spinner, no "Conversation compacted" marker, no
 error. The compact POST 200s: the server forwards the control to the runner,
-whose ``_inject_codex_compact`` (``omnigent/runner/app.py``) types
+whose ``_inject_codex_slash_command`` (``omnigent/runner/native_controls.py``) types
 ``/compact`` into the Codex TUI's tmux pane and presses Enter. Codex's
 slash-command popup renders asynchronously, so an Enter sent back-to-back
 with the typed command is swallowed by the still-opening popup and the
@@ -33,6 +33,7 @@ its sign-in screen, hence the dedicated server here.)
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -42,6 +43,7 @@ import sys
 import time
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -164,6 +166,7 @@ def codex_native_mock_session(
     server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}
     runner_env = {
         **shared_env,
+        "OMNIGENT_PROCESS_LOG_FILE": str(runner_log_path),
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
@@ -344,3 +347,79 @@ def test_codex_native_compact_compacts_after_completed_turn(
         page.get_by_text("Conversation compacted", exact=False)
     )
     expect(compaction_feedback.first).to_be_visible(timeout=_COMPACTION_FEEDBACK_TIMEOUT_MS)
+
+
+@pytest.mark.timeout(180)
+def test_codex_message_refused_during_compaction_is_delivered_once(
+    page: Page,
+    codex_native_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A web input survives a real compact-turn refusal and a browser reload."""
+    base_url, session_id = codex_native_mock_session
+    nonce = uuid.uuid4().hex[:8]
+    first, initial_reply = f"compact-seed-{nonce}", f"seed-reply-{nonce}"
+    followup, reply = f"compact-followup-{nonce}", f"followup-reply-{nonce}"
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'true')")
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _ensure_chat_view(page)
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, [{"text": initial_reply}], match=first)
+    _send(page, first)
+    expect(page.locator(_ASSISTANT, has_text=initial_reply).first).to_be_visible(timeout=90_000)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=90_000)
+
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Conversation summary: one completed seed turn.", "block": True}],
+        key=_CODEX_MOCK_MODEL,
+    )
+    configure_mock_llm(mock_llm_server_url, [{"text": reply}], match=followup)
+    logs = {
+        path.resolve()
+        for path in tmp_path_factory.getbasetemp().glob("e2e_ui_codex_compact_server*/runner.log")
+    }
+    own_logs = [path for path in logs if session_id in path.read_text()]
+    assert len(own_logs) == 1
+    runner_log: Path = own_logs[0]
+    with httpx.Client(trust_env=False, timeout=10) as client:
+        try:
+            composer = page.get_by_label("Message the agent")
+            composer.fill("/compact")
+            composer.press("Enter")
+            deadline = time.monotonic() + 30
+            while not client.get(f"{mock_llm_server_url}/gate/pending").json()["pending"]:
+                assert time.monotonic() < deadline, runner_log.read_text()[-2500:]
+                page.wait_for_timeout(100)
+            expect(page.get_by_test_id("compacting-indicator")).to_be_visible(timeout=15_000)
+            composer.fill(followup)
+            composer.press("Enter")
+            deadline = time.monotonic() + 25
+            while "codex_native_compaction_wait" not in runner_log.read_text():
+                assert time.monotonic() < deadline, runner_log.read_text()[-3500:]
+                page.wait_for_timeout(100)
+            assert client.post(f"{mock_llm_server_url}/gate/release").json()["released"]
+            expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1, timeout=60_000)
+            expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)
+            assert runner_log.read_text().count("codex_native_compaction_wait") == 2
+            items = client.get(
+                f"{base_url}/v1/sessions/{session_id}/items", params={"limit": 100}
+            ).json()["data"]
+            matching = [
+                item
+                for item in items
+                if item.get("role") == "user" and followup in json.dumps(item)
+            ]
+            assert len(matching) == 1
+            page.reload()
+            _ensure_chat_view(page)
+            expect(
+                page.locator('[data-testid="message-bubble"][data-role="user"]', has_text=followup)
+            ).to_have_count(1)
+            expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1)
+        finally:
+            client.post(f"{mock_llm_server_url}/gate/release")

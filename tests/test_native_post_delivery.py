@@ -684,3 +684,28 @@ async def test_post_external_session_status_attaches_failure_reason() -> None:
         "output": "transcript item item-1 rejected",
     }
     assert captured[1]["data"] == {"status": "idle"}
+
+
+@pytest.mark.asyncio
+async def test_optional_failure_context_cannot_break_utf8_status_delivery() -> None:
+    captured = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await post_external_session_status(
+            client,
+            session_id="conv_test",
+            status="failed",
+            failure_detail="Original error",
+            failure_context={"native_error_message": "synthetic\ud800detail"},
+        )
+    assert captured[0]["data"] == {
+        "status": "failed",
+        "failure_detail": "Original error",
+        "failure_context": {"native_error_message": "synthetic?detail"},
+    }

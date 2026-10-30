@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ntpath
+import re
 from functools import partialmethod
 from pathlib import Path
 from types import SimpleNamespace
@@ -780,6 +781,68 @@ def test_parse_skill(agent_dir: Path) -> None:
     assert skill.skill_dir == skill_dir
     # Absent ``user-invocable`` frontmatter defaults to invocable.
     assert skill.user_invocable is True
+    # A frontmatter name equal to the directory carries no separate label.
+    assert skill.display_name is None
+
+
+def test_parse_skill_name_comes_from_directory(agent_dir: Path) -> None:
+    """The directory is the invocation name; the frontmatter name is a free-form label."""
+    skill_dir = agent_dir / "skills" / "asd-ste100"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Simplified Technical English (ASD-STE100)\n"
+        "description: Write in Simplified Technical English.\n"
+        "---\n"
+        "Body."
+    )
+    skill = parse(agent_dir).skills[0]
+    assert skill.name == "asd-ste100"
+    assert skill.display_name == "Simplified Technical English (ASD-STE100)"
+
+
+def _write_loadable_config(agent_dir: Path) -> None:
+    """Give *agent_dir* the executor that validated ``load()`` requires."""
+    config = {
+        "spec_version": 1,
+        "name": "test-agent",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    }
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+
+
+def test_load_keeps_frontmatter_name_when_skill_directory_is_invalid(agent_dir: Path) -> None:
+    """A bundle that validated on its frontmatter name still loads under that name."""
+    from omnigent.spec import load
+
+    _write_loadable_config(agent_dir)
+
+    for directory, name in (("Code_Review", "code-review"), ("review", "code-review")):
+        skill_dir = agent_dir / "skills" / directory
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Review code.\n---\nBody."
+        )
+
+    skills = load(agent_dir).skills
+    assert [(s.name, s.display_name) for s in skills] == [
+        ("code-review", None),
+        ("review", "code-review"),
+    ]
+
+
+def test_load_rejects_skill_without_any_valid_name(agent_dir: Path) -> None:
+    """The legacy fallback only applies when the frontmatter name is itself valid."""
+    from omnigent.spec import load
+
+    _write_loadable_config(agent_dir)
+
+    skill_dir = agent_dir / "skills" / "Code_Review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: Code Review\ndescription: x\n---\nBody.")
+
+    with pytest.raises(OmnigentError, match="skill directory name must match"):
+        load(agent_dir)
 
 
 def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:
@@ -3415,6 +3478,107 @@ def test_parse_timers_true_sets_flag(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
     assert spec.timers is True
+
+
+# ─── Top-level ``tool_groups:`` block (framework tool opt-out) ─
+
+
+def test_parse_tool_groups_default_every_group_on(agent_dir: Path) -> None:
+    """
+    Without a ``tool_groups:`` block every framework-owned group stays
+    registered, so specs authored before the key keep their tool surface.
+    """
+    spec = parse(agent_dir)
+    assert spec.tool_groups.browser is True
+    assert spec.tool_groups.scheduled_tasks is True
+    assert spec.tool_groups.comments is True
+    assert spec.tool_groups.policies is True
+    assert spec.tool_groups.agent_discovery is True
+
+
+def test_parse_tool_groups_false_disables_named_groups_only(tmp_path: Path) -> None:
+    """A ``false`` entry turns off that group; unnamed groups stay on."""
+    config = {
+        "spec_version": 1,
+        "name": "trimmed-agent",
+        "tool_groups": {"browser": False, "scheduled_tasks": False},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.tool_groups.browser is False
+    assert spec.tool_groups.scheduled_tasks is False
+    assert spec.tool_groups.comments is True
+    assert spec.tool_groups.policies is True
+    assert spec.tool_groups.agent_discovery is True
+
+
+def test_parse_tool_groups_rejects_unknown_group(tmp_path: Path) -> None:
+    """
+    A misspelled group must fail the load: the block exists to remove
+    tools, and a silently ignored typo would leave every group registered.
+    """
+    config = {"spec_version": 1, "name": "typo", "tool_groups": {"scheduled-tasks": False}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"unknown group\(s\) \['scheduled-tasks'\]") as exc:
+        parse(tmp_path)
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_parse_tool_groups_rejects_non_boolean_value(tmp_path: Path) -> None:
+    """``browser: "no"`` is truthy under ``bool()`` — refuse it outright."""
+    config = {"spec_version": 1, "name": "stringy", "tool_groups": {"browser": "no"}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(
+        OmnigentError, match=r"tool_groups\.browser must be a boolean, got str"
+    ) as exc:
+        parse(tmp_path)
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_parse_tool_groups_rejects_non_mapping(tmp_path: Path) -> None:
+    """The block is a mapping of group name to boolean, never a list."""
+    config = {"spec_version": 1, "name": "listy", "tool_groups": ["browser"]}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="tool_groups must be a YAML mapping, got list"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("extra", "dependent"),
+    [
+        (
+            {"spawn": True, "tool_groups": {"agent_discovery": False, "scheduled_tasks": False}},
+            "spawn: true",
+        ),
+        ({"tool_groups": {"agent_discovery": False}}, "tool_groups.scheduled_tasks"),
+    ],
+)
+def test_parse_tool_groups_rejects_discovery_off_with_agent_id_consumer(
+    tmp_path: Path, extra: dict[str, object], dependent: str
+) -> None:
+    """
+    ``sys_session_create`` and ``sys_scheduled_task_create`` send the model
+    to ``sys_agent_list`` for an ``agent_id``; dropping discovery under
+    either would point it at a tool the runner refuses.
+    """
+    config = {"spec_version": 1, "name": "orphaned", **extra}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=re.escape(dependent)) as exc:
+        parse(tmp_path)
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_parse_tool_groups_discovery_off_once_its_consumers_are_off(tmp_path: Path) -> None:
+    """With no spawn grant and no scheduled tasks, discovery can go too."""
+    config = {
+        "spec_version": 1,
+        "name": "headless",
+        "tool_groups": {"agent_discovery": False, "scheduled_tasks": False},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.tool_groups.agent_discovery is False
+    assert spec.tool_groups.scheduled_tasks is False
 
 
 # ─── Top-level ``spawn:`` flag (spawn-write opt-in) ───────────

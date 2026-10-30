@@ -481,14 +481,14 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
 
-# The exact shape `isaac configure codex` writes (AI Gateway mode): a custom
+# The exact shape `isaac configure codex` writes (Unity Gateway mode): a custom
 # [model_providers.Databricks] table authenticated by a token-printing
 # command, selected via a top-level model_provider — and NO auth.json.
 _ISAAC_STYLE_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
@@ -511,7 +511,7 @@ _ISAAC_STYLE_DETECTION = DetectedProvider(
     family="openai",
     source="~/.codex/config.toml provider 'Databricks'",
     model_provider="Databricks",
-    display_name="Databricks AI Gateway",
+    display_name="Databricks Unity Gateway",
 )
 
 
@@ -539,7 +539,19 @@ def test_codex_config_custom_provider_detected(clean_env) -> None:
     assert detect_providers() == [_ISAAC_STYLE_DETECTION]
 
 
-def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> None:
+@pytest.mark.parametrize(
+    ("settings", "refresh_interval", "timeout"),
+    [
+        ("timeout_ms = 5000\nrefresh_interval_ms = 1500000", 1_500_000, 5_000),
+        ("", 0, 20_000),
+        ("timeout_ms = 0\nrefresh_interval_ms = -1", 0, 20_000),
+        ('timeout_ms = "slow"\nrefresh_interval_ms = "often"', 0, 20_000),
+        ("timeout_ms = true\nrefresh_interval_ms = true", 0, 20_000),
+    ],
+)
+def test_codex_config_provider_transport_reads_base_url_and_auth(
+    clean_env, settings: str, refresh_interval: int, timeout: int
+) -> None:
     """``codex_config_provider_transport`` returns base_url + a shell auth command.
 
     The runtime-routing counterpart of the detection: pi-native reads this to
@@ -551,13 +563,20 @@ def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> N
         codex_config_provider_transport,
     )
 
-    _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
+    _write_codex_config(
+        clean_env,
+        _ISAAC_STYLE_CODEX_CONFIG.replace(
+            "timeout_ms = 5000\nrefresh_interval_ms = 1500000", settings
+        ),
+    )
     transport = codex_config_provider_transport(_codex_config_path(), "Databricks")
     assert transport is not None
     assert transport.base_url == "https://example.ai-gateway.cloud.databricks.com/codex/v1"
     assert transport.auth_command == (
         "jq -r .access_token /home/user/.databricks/model-serving-token.json"
     )
+    assert transport.auth_refresh_interval_ms == refresh_interval
+    assert transport.auth_timeout_ms == timeout
 
 
 def test_codex_config_provider_transport_missing_table_returns_none(clean_env) -> None:
@@ -955,7 +974,7 @@ def test_claude_managed_gateway_synthesizes_a_subscription_entry(clean_env, monk
 @pytest.mark.parametrize(
     "payload,expected",
     [
-        (_ISAAC_CLAUDE_SETTINGS, "Databricks AI Gateway"),
+        (_ISAAC_CLAUDE_SETTINGS, "Databricks Unity Gateway"),
         (
             {
                 "env": {"ANTHROPIC_BASE_URL": "https://llm.corp.example.com/v1"},
@@ -974,6 +993,23 @@ def test_claude_managed_gateway_display_name(
     """The display label reflects the backing; None when no credential is delivered."""
     _write_managed_settings(clean_env, monkeypatch, payload)
     assert ambient.claude_managed_gateway_display_name() == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (_ISAAC_CLAUDE_SETTINGS, "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, "apiKeyHelper": "t"}, None),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}}, None),
+        ({"apiKeyHelper": "print-token"}, None),
+    ],
+)
+def test_claude_managed_gateway_routes(
+    clean_env, monkeypatch, payload: object, expected: str | None
+) -> None:
+    """Only a credentialed, non-Anthropic managed gateway owns Claude routing."""
+    _write_managed_settings(clean_env, monkeypatch, payload)
+    assert ambient.claude_managed_gateway_routes() == expected
 
 
 def test_claude_managed_gateway_missing_file_is_graceful(clean_env, monkeypatch) -> None:

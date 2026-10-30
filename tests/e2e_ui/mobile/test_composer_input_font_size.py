@@ -1,7 +1,4 @@
-"""Composer inputs avoid Safari's small-text focus-zoom trigger without capping preferences.
-
-Desktop WebKit verifies CSS and focus, not the real iOS software keyboard's zoom.
-"""
+"""Composer inputs follow the interface font preference across app surfaces."""
 
 from __future__ import annotations
 
@@ -12,6 +9,7 @@ from typing import Any
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.conftest import seed_committed_turn
 from tests.e2e_ui.mobile.test_ios_ipad_safe_layout import _IOS_SHELL_INIT_SCRIPT
 from tests.e2e_ui.sessions.test_reply_quotes_session_switch import _reply_to
@@ -69,7 +67,7 @@ def _exercise_input(page: Page, element: Locator, *, mobile: bool) -> None:
         pytest.param(390, 18, True, marks=_TOUCH, id="ios-large"),
     ],
 )
-def test_composer_input_font_floor_and_alignment(
+def test_composer_input_font_setting_and_alignment(
     page: Page,
     seeded_session: tuple[str, str],
     tmp_path: Path,
@@ -77,7 +75,7 @@ def test_composer_input_font_floor_and_alignment(
     font_size: int,
     native: bool,
 ) -> None:
-    """Landing, command backdrops and interleaved replies share readable input typography."""
+    """Landing, command backdrops and interleaved replies share the chosen typography."""
     base_url, session_id = seeded_session
     mobile = width < 768
     page.set_viewport_size({"width": width, "height": 844})
@@ -106,6 +104,7 @@ def test_composer_input_font_floor_and_alignment(
         ),
     )
     page.route(_AGENT_SCAN, lambda route: route.fulfill(json={"data": []}))
+    page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     page.goto(f"{base_url}/")
     landing = page.get_by_test_id("new-chat-landing-input")
     hint = page.get_by_text("Describe a task, or try a skill", exact=True)
@@ -120,6 +119,7 @@ def test_composer_input_font_floor_and_alignment(
     page.screenshot(path=tmp_path / "landing-composer.png", animations="disabled")
     page.unroute("**/v1/agents")
     page.unroute(_AGENT_SCAN)
+    page.unroute(OWN_AGENTS)
 
     page.goto(f"{base_url}/c/{session_id}")
     if native:
@@ -159,16 +159,15 @@ def test_composer_input_font_floor_and_alignment(
 
     # Preserve every surface's baseline evidence before reporting typography failures.
     print(f"Composer typography ({width}px, preference={font_size}, native={native}): {observed}")
-    ui_size = font_size * (14 / 13) if mobile else font_size
-    expected_size = max(16, ui_size) if mobile else ui_size
+    expected_size = font_size
     for name, measured in observed.items():
         assert measured["fontSize"] == pytest.approx(expected_size, abs=0.01), (name, measured)
         assert measured["lineHeight"] == pytest.approx(expected_size * 1.6, abs=0.02), (
             name,
             measured,
         )
-    assert quote_metrics["fontSize"] == pytest.approx(ui_size * 0.9, abs=0.01)
-    assert skill_metrics["fontSize"] == pytest.approx(ui_size, abs=0.01)
+    assert quote_metrics["fontSize"] == pytest.approx(expected_size * 0.9, abs=0.01)
+    assert skill_metrics["fontSize"] == pytest.approx(expected_size, abs=0.01)
 
     textarea_metrics, overlay_metrics = observed["slash-input"], observed["slash-overlay"]
     for property_name in (

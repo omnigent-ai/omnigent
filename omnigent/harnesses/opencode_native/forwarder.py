@@ -63,6 +63,7 @@ _EXTERNAL_SUBAGENT_START = "external_subagent_start"
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
 _STATUS_FAILED = "failed"
+_MESSAGE_ABORTED_ERROR = "MessageAbortedError"
 
 # Appended to a failed edge's output when opencode reports a provider-auth
 # error so the web surface can prompt a re-auth.
@@ -564,7 +565,7 @@ class OpenCodeNativeForwarder:
                     await self._consume_once()
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 - reconnect on any transient SSE failure.
+                except Exception:  # reconnect on any transient SSE failure.
                     _logger.warning(
                         "OpenCode forwarder SSE error for session=%s; reconnecting",
                         self._session_id,
@@ -1438,7 +1439,7 @@ class OpenCodeNativeForwarder:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - surface it: OpenCode stays blocked on the request.
+        except Exception:
             _logger.warning(
                 "OpenCode permission reply failed for request=%s",
                 request.request_id,
@@ -1494,7 +1495,7 @@ class OpenCodeNativeForwarder:
             verdict = await self._policy_evaluator(normalized)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - policy errors fail closed.
+        except Exception:
             _logger.warning("OpenCode policy evaluation failed", exc_info=True)
             return "ask"
         if verdict is None:
@@ -1587,7 +1588,7 @@ class OpenCodeNativeForwarder:
             await self._opencode.reply_form(session_id, form_id, answer)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - any failure must still release the form.
+        except Exception:
             _logger.warning(
                 "OpenCode form handling failed for session=%s form=%s",
                 self._session_id,
@@ -1607,7 +1608,7 @@ class OpenCodeNativeForwarder:
             await self._opencode.cancel_form(session_id, form_id)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - best effort; the TUI may have answered already.
+        except Exception:
             _logger.debug("OpenCode form cancel for form=%s failed", form_id, exc_info=True)
 
     async def _park_elicitation(
@@ -1741,7 +1742,7 @@ class OpenCodeNativeForwarder:
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
-        except Exception:  # noqa: BLE001 - seeding is best effort.
+        except Exception:
             _logger.debug("OpenCode forwarder could not seed dedupe from history", exc_info=True)
             return
         settled_prefix = True
@@ -1756,7 +1757,7 @@ class OpenCodeNativeForwarder:
                 settled_prefix = False
         try:
             await self._post_session_usage()
-        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+        except Exception:
             _logger.debug(
                 "OpenCode forwarder could not re-post usage after seeding", exc_info=True
             )
@@ -1807,7 +1808,7 @@ class OpenCodeNativeForwarder:
             messages = await self._opencode.list_messages(
                 self._opencode_session_id, after_id=self._last_seen_message_id
             )
-        except Exception:  # noqa: BLE001 - catch-up is best effort.
+        except Exception:
             _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
             return
         turn = self._turns[self._opencode_session_id]
@@ -1823,7 +1824,7 @@ class OpenCodeNativeForwarder:
                 settled_prefix = False
         try:
             await self._post_session_usage()
-        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+        except Exception:
             _logger.debug(
                 "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
             )

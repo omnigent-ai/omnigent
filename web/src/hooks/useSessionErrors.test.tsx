@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ErrorBlock } from "@/lib/blocks";
 import type { ErrorItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
@@ -202,6 +203,45 @@ describe("useSessionErrors", () => {
     await waitFor(() => expect(hook.result.current).toEqual([false]));
   });
 
+  it("drops tail caches superseded by a newer updated_at", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { wrapper, client } = harness();
+      const hook = renderHook(({ updated_at }) => useSessionErrors([{ ...session, updated_at }]), {
+        wrapper,
+        initialProps: { updated_at: 100 },
+      });
+      for (let updated_at = 101; updated_at <= 105; updated_at++) {
+        hook.rerender({ updated_at });
+      }
+      await waitFor(() => expect(client.isFetching()).toBe(0));
+      act(() => vi.advanceTimersByTime(60_000));
+      const cached = client
+        .getQueryCache()
+        .findAll({ queryKey: ["session-latest-error", session.id] });
+      expect(cached.map((query) => query.queryKey[2])).toEqual([105]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses the tail cache when the sidebar remounts within the gc window", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      fetchPage.mockResolvedValue(errorPage);
+      const { wrapper } = harness();
+      const first = renderHook(() => useSessionErrors([session]), { wrapper });
+      await waitFor(() => expect(first.result.current).toEqual([true]));
+      first.unmount();
+      act(() => vi.advanceTimersByTime(10_000));
+      const reopened = renderHook(() => useSessionErrors([session]), { wrapper });
+      expect(reopened.result.current).toEqual([true]);
+      expect(fetchPage).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not let an older tail request resurrect an error after a newer message", async () => {
     const old = deferredPage();
     fetchPage.mockReturnValueOnce(old.promise).mockResolvedValueOnce(normalPage);
@@ -244,6 +284,30 @@ describe("useSessionErrors", () => {
     expect(hook.result.current).toEqual([true]);
     act(() => entry.setState({ status: "streaming" }));
     expect(hook.result.current).toEqual([false]);
+    expect(fetchPage).not.toHaveBeenCalled();
+  });
+
+  it("clears a live status-only failure once a resume moves the session off failed", () => {
+    const statusCard = {
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      message: "Required terminal exited unexpectedly.",
+      source: "",
+      code: "required_terminal_exited",
+      fromSessionStatus: true,
+    } satisfies ErrorBlock;
+    const entry = conversationRegistry.acquire(session.id);
+    entry.setState({
+      blocks: [...itemsToBlocks(normalPage.items), statusCard],
+      sessionStatus: "failed",
+      loadingConversation: false,
+      abortController: new AbortController(),
+    });
+    const { wrapper } = harness();
+    const hook = renderHook(() => useSessionErrorStates([session]), { wrapper });
+    expect(hook.result.current).toEqual(["error"]);
+    act(() => entry.setState({ sessionStatus: "idle" }));
+    expect(hook.result.current).toEqual([null]);
     expect(fetchPage).not.toHaveBeenCalled();
   });
 

@@ -2,7 +2,7 @@
 
 Adding a ``kind: databricks`` provider runs ``ucode configure`` (see
 :mod:`omnigent.onboarding.ucode_setup`), which wires the Claude / Codex
-CLIs to a workspace's Unity AI Gateway. Most of that wiring lives in
+CLIs to a workspace's Unity Gateway. Most of that wiring lives in
 ucode-owned sidecar files, but two pieces land in files the *user* owns:
 
 - **Codex < 0.134.0 (ucode's legacy layout):** ucode deep-merges into the

@@ -28,7 +28,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TextIO
 
@@ -1598,10 +1598,10 @@ async def _collect_previews_async(
 
     async def fetch_one(conv: _ConversationRow) -> tuple[str, _Preview | None]:
         try:
-            items = await client.sessions.list_items(conv.id, limit=10, order="desc")
+            page = await client.sessions.list_items(conv.id, limit=10, order="desc")
         except Exception:  # noqa: BLE001 — preview is best-effort, swallow per-conv errors
             return conv.id, None
-        return conv.id, _last_message_preview_from_dicts(items)
+        return conv.id, _last_message_preview_from_dicts(page.data)
 
     capped = conversations[:_PREVIEW_PREFETCH_CAP]
     pairs = await asyncio.gather(*(fetch_one(c) for c in capped))
@@ -1777,7 +1777,7 @@ def _format_when(created_at: int) -> str:
         return f"{delta // 3600}h ago"
     if delta < 7 * 86400:
         return f"{delta // 86400}d ago"
-    return datetime.fromtimestamp(created_at, tz=timezone.utc).astimezone().strftime("%b %d %H:%M")
+    return datetime.fromtimestamp(created_at, tz=UTC).astimezone().strftime("%b %d %H:%M")
 
 
 def _read_line_choice(in_: TextIO) -> str | None:

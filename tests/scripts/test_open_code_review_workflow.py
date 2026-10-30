@@ -188,6 +188,60 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         self.assertEqual(result["outputs"], {})
         self.assertIn("default branch", result["error"])
 
+    def pull_request(self, *, action="opened", draft=False, state="open", fork=False):
+        context = self.comment()
+        context["eventName"] = "pull_request_target"
+        context["payload"] = {
+            "repository": {"default_branch": "main"},
+            "action": action,
+            "pull_request": {
+                "number": 7878,
+                "draft": draft,
+                "state": state,
+                "head": {
+                    "repo": {
+                        "fork": fork,
+                        "full_name": "contributor/omnigent" if fork else "omnigent-ai/omnigent",
+                    }
+                },
+            },
+        }
+        return context
+
+    def test_automatic_reviews_match_polly_lifecycle_events_from_trusted_base(self):
+        # PyYAML's YAML 1.1 loader reads the workflow's `on` key as True.
+        triggers = WORKFLOW[True]
+        polly = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
+        self.assertEqual(triggers["pull_request_target"], polly[True]["pull_request_target"])
+        self.assertNotIn("pull_request", triggers)
+        self.assertNotIn("synchronize", triggers["pull_request_target"]["types"])
+        for action in triggers["pull_request_target"]["types"]:
+            for fork in (False, True):
+                with self.subTest(action=action, fork=fork):
+                    context = self.pull_request(action=action, fork=fork)
+                    result = self.run_script(context)
+                    self.assertNotIn("error", result)
+                    self.assertEqual(result["outputs"], {} if fork else {"pr": "7878"})
+                    self.assertEqual(result["calls"], [])
+                    self.assertEqual(self.acknowledge(context)["calls"], [])
+
+    def test_automatic_reviews_require_the_head_repository_to_match(self):
+        for repo in (None, {"fork": False, "full_name": "another/repo"}):
+            with self.subTest(repo=repo):
+                context = self.pull_request()
+                context["payload"]["pull_request"]["head"]["repo"] = repo
+                result = self.run_script(context)
+                self.assertNotIn("error", result)
+                self.assertEqual(result["outputs"], {})
+                self.assertEqual(result["calls"], [])
+
+    def test_draft_and_closed_pr_events_do_not_enter_review_queue(self):
+        for context in (self.pull_request(draft=True), self.pull_request(state="closed")):
+            result = self.run_script(context)
+            self.assertNotIn("error", result)
+            self.assertEqual(result["outputs"], {})
+            self.assertEqual(result["calls"], [])
+
     def acknowledge(self, context, **kwargs):
         authorized = self.run_script(context, **kwargs)
         self.assertNotIn("error", authorized)
@@ -256,6 +310,26 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                 )
                 self.assertEqual(result["outputs"], expected)
 
+    def test_requested_head_cannot_silently_change_while_queued(self):
+        for expected_head in ("old-head", "new-head", ""):
+            with self.subTest(expected_head=expected_head):
+                result = self.run_script(
+                    self.comment(),
+                    script=RESOLVE,
+                    pr={
+                        "state": "open",
+                        "draft": False,
+                        "base": {"ref": "main"},
+                        "head": {"sha": "new-head"},
+                    },
+                    extra_env={"EXPECTED_HEAD": expected_head},
+                )
+                if expected_head == "old-head":
+                    self.assertEqual(result["outputs"], {})
+                    self.assertIn("PR moved", result["error"])
+                else:
+                    self.assertEqual(result["outputs"], {"base": "main", "head": "new-head"})
+
     def completed_comment(self, marker=None, *, login="github-actions[bot]", user_type="Bot"):
         return {
             "body": marker or f"<!-- ocr-reviewed-sha: {HEAD} -->",
@@ -299,9 +373,10 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
 
     def test_completed_commit_skips_before_gateway_and_posts_one_notice(self):
         artifact, run = self.completion()
-        for event in ("issue_comment", "workflow_dispatch"):
+        for event in ("pull_request_target", "issue_comment", "workflow_dispatch"):
             with self.subTest(event=event):
                 run["event"] = event
+                run["head_branch"] = "feature-branch" if event == "pull_request_target" else "main"
                 result = self.resolve(artifacts=[artifact], runs={123: run})
                 self.assertNotIn("error", result)
                 self.assertEqual(result["outputs"], {})
@@ -337,7 +412,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             self.assertEqual(result["outputs"], {"base": "main", "head": HEAD})
             self.assertEqual(result["calls"], [])
 
-    def test_only_successful_default_branch_workflow_receipts_suppress_review(self):
+    def test_only_successful_trusted_workflow_receipts_suppress_review(self):
         cases = [
             ("artifact", {"name": f"ocr-completed-999-{HEAD}"}),
             ("artifact", {"name": f"ocr-completed-7878-{'b' * 40}"}),
@@ -472,15 +547,18 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         self.assertNotIn("always()", STEPS["receipt"]["if"])
         self.assertNotIn("!cancelled()", STEPS["receipt"]["if"])
 
-    def run_report(self, status, log="", resolved_head=HEAD):
+    def run_report(self, status, log="", resolved_head=HEAD, summary=None, failed=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "ocr-result.json").write_text(
                 json.dumps(
                     {
                         "status": status,
-                        "summary": {},
-                        "manifest": {"input": {"resolved_head": resolved_head}},
+                        "summary": summary or {},
+                        "manifest": {
+                            "input": {"resolved_head": resolved_head},
+                            "coverage": {"failed": failed or []},
+                        },
                     }
                 )
             )
@@ -519,6 +597,43 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             with self.subTest(status=status):
                 result, _, _ = self.run_report(status)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_budget_only_partial_warns_without_completion_receipt(self):
+        budget = "aggregate token budget reached before dispatch completed"
+        result, summary, outputs = self.run_report(
+            "partial",
+            summary={"budget_exceeded": True},
+            failed=[
+                {"path": "b`.ts\n::error::injected", "reason": budget},
+                {"path": "a.ts", "reason": budget},
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "::warning::OCR token budget reached; 2 file(s) were not reviewed. "
+                "See the job summary for the list."
+            ],
+        )
+        self.assertIn("- `a.ts`\n- `b'.ts ::error::injected`\n", summary)
+        self.assertEqual(outputs, "")
+        budget_only = [{"path": "a.ts", "reason": budget}]
+        for status, summary_value, failed in (
+            (
+                "partial",
+                {"budget_exceeded": True},
+                [{"path": "a.ts", "reason": budget}, {"path": "b.ts", "reason": "LLM error"}],
+            ),
+            ("partial", {"budget_exceeded": True}, []),
+            ("partial", {}, budget_only),
+            ("failed", {"budget_exceeded": True}, budget_only),
+        ):
+            with self.subTest(status=status, summary=summary_value, failed=failed):
+                result, _, outputs = self.run_report(status, summary=summary_value, failed=failed)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("incomplete", result.stderr)
+                self.assertEqual(outputs, "")
 
     def test_filter_failure_remains_visible_for_complete_review(self):
         for log in (

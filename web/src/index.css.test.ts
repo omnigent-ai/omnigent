@@ -6,12 +6,19 @@ import { readFileSync } from "node:fs";
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
 import { type ComponentProps, createElement } from "react";
+import { createPortal } from "react-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "./components/ui/tooltip";
 import type * as UseTerminalsModule from "./hooks/useTerminals";
-import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/uiFontPreferences";
+import {
+  UI_FONT_SIZE_DEFAULT,
+  UI_FONT_SIZE_MAX,
+  UI_FONT_SIZE_MIN,
+  UI_FONT_SIZE_MOBILE_DEFAULT,
+} from "./lib/uiFontPreferences";
 import { WorkspacePanel } from "./shell/WorkspacePanel";
 
 // Rendering the real WorkspacePanel below is a layout test: stub its content
@@ -33,6 +40,7 @@ vi.mock("./hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined 
 // URL inside vitest's module graph, so it can't locate the file.
 const indexCssSource = readFileSync("src/index.css", "utf8");
 const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8");
+const centerGlowSvgSource = readFileSync("src/assets/omnigent-center-glow.svg", "utf8");
 const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 
 // Innermost `selector { ... }` blocks with their match indices, shared by
@@ -164,6 +172,94 @@ describe("index.css backdrop-filter glass rules", () => {
   );
 });
 
+describe("palette-aware surface composition", () => {
+  const lightTokens = indexCssSource.match(/:root \{[^}]*\}/)?.[0];
+  const darkTokens = indexCssSource.match(/\.dark \{[^}]*\}/)?.[0];
+  const appShellRule = indexCssSource.match(/\.dark \.app-shell \{[^}]*\}/)?.[0];
+  const sidebarRule = indexCssSource.match(
+    /\.dark \.omnigent-native-sidebar-surface,[\s\S]*?\.dark \.omnigent-sidebar-panel \{[^}]*\}/,
+  )?.[0];
+  const composerRule = indexCssSource.match(/\.dark \.composer-reference-surface \{[^}]*\}/)?.[0];
+  const composerContextRule = indexCssSource.match(/\.composer-context-bar \{[^}]*\}/)?.[0];
+  const dockedComposerContextRule = indexCssSource.match(
+    /\.composer-context-bar\.rounded-t-none \{[^}]*\}/,
+  )?.[0];
+  const lightMenuRule = indexCssSource.match(/:root:not\(\.dark\) \.menu-surface \{[^}]*\}/)?.[0];
+  const menuRule = indexCssSource.match(/\.dark \.menu-surface \{[^}]*\}/)?.[0];
+  const cardRule = extractBackdropFilterRules().find((rule) => rule.includes(".bg-card"));
+
+  it("keeps generated palette CSS limited to root tokens", () => {
+    expect(generatedPaletteCssSource).not.toContain(".app-shell");
+    expect(generatedPaletteCssSource).not.toContain(".conversations-sidebar");
+    expect(generatedPaletteCssSource).toContain("--shell-background:");
+    expect(generatedPaletteCssSource).toContain("--sidebar-background:");
+  });
+
+  it("uses the palette canvas under the fixed white SVG glow", () => {
+    expect(darkTokens).toContain("--app-shell-bg: var(--background)");
+    expect(darkTokens).toContain("--session-composer-mask-bg: var(--app-shell-bg)");
+    expect(appShellRule).toContain("background-color: var(--app-shell-bg)");
+    expect(appShellRule).toContain('background-image: url("./assets/omnigent-center-glow.svg")');
+    const stopColors = [...centerGlowSvgSource.matchAll(/stop-color="([^"]+)"/g)].map(
+      (match) => match[1],
+    );
+    expect(stopColors).toHaveLength(7);
+    expect(new Set(stopColors)).toEqual(new Set(["white"]));
+    expect(centerGlowSvgSource).toContain('baseFrequency="1.15"');
+    expect(centerGlowSvgSource).toContain('slope="0.012"');
+    expect(centerGlowSvgSource).toContain('filter="url(#microDither)"');
+    expect(centerGlowSvgSource).toContain('opacity="0.32"');
+  });
+
+  it("keeps sidebar, menu, and card effects white over semantic bases", () => {
+    expect(darkTokens).toContain("linear-gradient(transparent 35%, rgb(255 255 255 / 6%))");
+    expect(darkTokens).toContain("linear-gradient(135deg, rgb(255 255 255 / 4%)");
+    expect(darkTokens).toContain(
+      "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
+    );
+    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("color-mix(in srgb, var(--card) 95%, white)");
+    expect(darkTokens).not.toContain("#5c306c");
+    expect(sidebarRule).toContain("background-color: var(--sidebar)");
+    expect(composerRule).toContain("background-color: var(--composer-surface-bg)");
+    expect(menuRule).toContain("background-color: var(--menu-surface-bg)");
+    expect(cardRule).toContain("background-color: var(--card-surface-bg)");
+  });
+
+  it("keeps the composer context bar mode-aware", () => {
+    expect(lightTokens).toContain(
+      "--composer-header-bg: color-mix(in srgb, var(--background) 94%, black)",
+    );
+    expect(darkTokens).toContain(
+      "--composer-header-bg: color-mix(in srgb, var(--app-shell-bg) 97%, white)",
+    );
+    expect(composerContextRule).toContain("background-color: var(--composer-header-bg)");
+    expect(dockedComposerContextRule).toContain("border-top-width: 0");
+    expect(dockedComposerContextRule).toContain("border-top-left-radius: 0");
+    expect(dockedComposerContextRule).toContain("border-top-right-radius: 0");
+  });
+
+  it("keeps primary CTA colors independent from palette accents", () => {
+    expect(lightTokens).toContain("--primary-cta: #11171c");
+    expect(lightTokens).toContain("--primary-cta-foreground: #fff");
+    expect(darkTokens).toContain("--primary-cta: #e8ecf0");
+    expect(darkTokens).toContain("--primary-cta-foreground: #11171c");
+    expect(generatedPaletteCssSource).not.toContain("--primary-cta");
+  });
+
+  it("keeps menu surfaces white in light mode", () => {
+    expect(lightMenuRule).toContain("background-color: #fff");
+    expect(lightMenuRule).toContain("border: 1px solid rgb(0 0 0 / 8%)");
+  });
+
+  it("does not let surface shorthands erase fixed effect layers", () => {
+    for (const rule of [sidebarRule, menuRule, cardRule]) {
+      expect(rule).toBeDefined();
+      expect(rule).not.toMatch(/(?<!-)background\s*:/);
+    }
+  });
+});
+
 /* Regression test for the "page gets wider when the kebab menu opens" bug.
  *
  * The bg-card glass rule used to exclude `[aria-hidden="true"]` to skip
@@ -209,6 +305,45 @@ describe("index.css bg-card glass rule selector", () => {
     aside.setAttribute("data-collapsed", "true");
     expect(aside.matches(selector)).toBe(false);
     aside.remove();
+  });
+
+  it("applies the same glass composition to nested bg-card surfaces", () => {
+    const aside = makeAside();
+    const nested = document.createElement("div");
+    nested.className = "bg-card";
+    aside.appendChild(nested);
+    expect(nested.matches(selector)).toBe(true);
+    aside.remove();
+  });
+});
+
+describe("workspace panel content border", () => {
+  const surfaceRule = cssBlocks
+    .map(([block]) => block)
+    .find(
+      (block) =>
+        block.includes("[data-workspace-panel-content] > *") &&
+        block.includes("border: none !important"),
+    )!;
+
+  it("leaves the rail edge intact while removing nested surface borders", () => {
+    const dark = document.createElement("div");
+    dark.className = "dark";
+    const rail = document.createElement("aside");
+    rail.setAttribute("aria-label", "Workspace");
+    const content = document.createElement("div");
+    content.setAttribute("data-workspace-panel-content", "");
+    const surface = document.createElement("div");
+    surface.className = "bg-card";
+    content.appendChild(surface);
+    rail.appendChild(content);
+    dark.appendChild(rail);
+    document.body.appendChild(dark);
+
+    const selector = selectorOf(surfaceRule);
+    expect(surface.matches(selector)).toBe(true);
+    expect(rail.matches(selector)).toBe(false);
+    dark.remove();
   });
 });
 
@@ -501,6 +636,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
     shell.setAttribute("data-android-native", "");
     document.body.appendChild(shell);
     shells.push(shell);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       createElement(
         TooltipProvider,
@@ -513,6 +649,8 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           handleProps: { tabIndex: 0 },
           rightRailTab: "files",
           onRightRailTabChange: () => {},
+          openPanels: [],
+          onClosePanel: () => {},
           showFilesPanel: true,
           showGithubTab: false,
           showBrowserTab: false,
@@ -539,7 +677,12 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           onShowHiddenChange: () => {},
         }),
       ),
-      { container: shell },
+      {
+        container: shell,
+        // The panel reads session snapshots for its tab labels.
+        wrapper: ({ children }) =>
+          createElement(QueryClientProvider, { client: queryClient }, children),
+      },
     );
     const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');
     expect(rail, "the rail <aside> the CSS selector keys on is gone").not.toBeNull();
@@ -674,28 +817,31 @@ describe("index.css table cell wrapping rule", () => {
 });
 
 describe("index.css sidebar canvas", () => {
-  const omniLightRule = cssSource.match(
-    /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
+  const lightCanvasRule = indexCssSource.match(
+    /:root:not\(\.dark\) \.conversations-sidebar \{[^}]*\}/,
   )?.[0];
-  const omniDarkRule = cssSource.match(
-    /\.dark:not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
+  const darkCanvasRule = indexCssSource.match(
+    /\.dark \.omnigent-native-sidebar-surface,[\s\S]*?\.dark \.omnigent-sidebar-panel \{[^}]*\}/,
   )?.[0];
   const lightEdgeRule = cssSource.match(
     /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
   const darkEdgeRule = cssSource.match(/\.dark \.conversations-sidebar \{[^}]*\}/)?.[0];
   const peekBackgroundRule = cssSource.match(
-    /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?\.dark\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
+    /:root:not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?:root\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
   )?.[0];
 
-  it("uses the specified left-to-right gradient for Omnigent light", () => {
-    expect(omniLightRule).toContain("background: linear-gradient(90deg, #fffefe, #fcf6fa)");
+  it("uses palette-owned bases in both modes", () => {
+    expect(lightCanvasRule).toContain("background: var(--sidebar-background, var(--sidebar))");
+    expect(darkCanvasRule).toContain("background-color: var(--sidebar)");
+    expect(darkCanvasRule).toContain("background-image: var(--sidebar-surface-image)");
+    expect(darkCanvasRule).not.toMatch(/\bbackground\s*:/);
   });
 
   it("removes the dot-grid layer from both modes", () => {
     expect(cssSource).not.toContain("--sidebar-dot-color");
-    expect(omniLightRule).not.toContain("radial-gradient");
-    expect(omniDarkRule).not.toContain("radial-gradient");
+    expect(lightCanvasRule).not.toContain("radial-gradient");
+    expect(darkCanvasRule).not.toContain("radial-gradient");
   });
 
   it("uses the shared inset shadow with a dark-only right border", () => {
@@ -703,15 +849,30 @@ describe("index.css sidebar canvas", () => {
     expect(lightEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
-    expect(darkEdgeRule).toContain("border-right: 1px solid rgb(255 255 255 / 2%)");
+    expect(darkEdgeRule).toContain("border-right: 1px solid var(--sidebar-edge-border)");
   });
 
-  it("backs floating peek cards with the opaque card color in every theme", () => {
-    expect(peekBackgroundRule).toContain(".dark:not([data-theme]) .conversations-sidebar.is-peek");
-    expect(peekBackgroundRule).toContain(
-      ":root:not(.dark)[data-theme] .conversations-sidebar.is-peek",
-    );
+  it("backs floating peek cards in both modes with the opaque card color", () => {
+    expect(peekBackgroundRule).toContain(":root[data-theme] .conversations-sidebar.is-peek");
     expect(peekBackgroundRule).toContain("background-color: var(--card-solid)");
+  });
+});
+
+describe("index.css composer and menu surfaces", () => {
+  const darkTokens = cssSource.match(/\.dark \{\s*--app-shell-bg:[\s\S]*?\n\}/)?.[0];
+  const queuedSurface = cssSource.match(/\.composer-queued-surface \{[^}]*\}/)?.[0];
+
+  it("composes dark elevated surfaces over the opaque app-shell base", () => {
+    expect(darkTokens).toContain(
+      "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
+    );
+    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).not.toContain("--composer-surface-bg: rgb(255 255 255 /");
+  });
+
+  it("uses one opaque surface token for queued rows and workspace metadata", () => {
+    expect(queuedSurface).toContain("background-color: var(--composer-header-bg)");
+    expect(queuedSurface).toContain("background-image: none");
   });
 });
 
@@ -786,41 +947,35 @@ describe("index.css body text tokens", () => {
     expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
     expect(mobileMap).toContain(`--text-sm: calc(var(--mobile-ui-font-size) * ${CAPTION_RATIO})`);
     expect(mobileMap).toContain("--text-ui: var(--mobile-ui-font-size)");
+    expect(mobileMap).toContain("--text-base: var(--mobile-ui-font-size)");
   });
 
-  /* Contract: the Appearance font-size setting applies on mobile.
-   *
-   * The mobile base used to be a hard-coded 14px with zero references to
-   * --desktop-ui-font-size, so the Settings stepper's value was persisted and
-   * set on <html> but never consumed below 48rem — saved but not applied. The
-   * mobile base must scale off the preference. */
+  /* Contract: mobile gets its own unset default, while a saved Appearance
+   * value applies directly instead of being silently rescaled. */
   describe("mobile branch consumes the font-size preference", () => {
-    const MOBILE_BASE_RATIO = 14 / 13;
-
-    it("derives the mobile base from the preference, not a hard-coded px", () => {
+    it("uses the mobile default and aliases the effective body size to the preference", () => {
       expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
-      // A literal `--mobile-ui-font-size: 14px` is the saved-but-not-applied
-      // bug: the preference would be a dead store below 48rem.
-      expect(mobileMap).not.toMatch(/--mobile-ui-font-size:\s*\d/);
-      expect(mobileMap).toContain(
-        "--mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13))",
-      );
+      expect(mobileMap).toContain(`--desktop-ui-font-size: ${UI_FONT_SIZE_MOBILE_DEFAULT}px`);
+      expect(mobileMap).toContain("--mobile-ui-font-size: var(--desktop-ui-font-size)");
+      expect(mobileMap).not.toContain("--mobile-ui-font-size: calc(");
     });
 
-    it("keeps the historical 14px mobile base at the default preference", () => {
-      // The ratio must map the shipped default onto the long-standing mobile
-      // base exactly, so users who never touch the setting see no change.
-      expect(UI_FONT_SIZE_DEFAULT * MOBILE_BASE_RATIO).toBe(14);
+    it("keeps the desktop and mobile defaults distinct", () => {
+      expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+      expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(14);
     });
 
-    it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX])(
-      "moves the rendered mobile base when the preference is %ipx",
-      (px) => {
-        // The applied size must actually change with the setting — the
-        // user-visible half of the fix.
-        expect(px * MOBILE_BASE_RATIO).not.toBe(UI_FONT_SIZE_DEFAULT * MOBILE_BASE_RATIO);
-      },
-    );
+    it("routes inherited body text through the same effective token", () => {
+      expect(cssSource).toContain("font-size: var(--mobile-ui-font-size)");
+      expect(cssSource).not.toContain("font-size: max(16px, var(--text-ui))");
+    });
+
+    it("scales mobile headings from the effective body step", () => {
+      expect(mobileMap).toContain("--ui-ramp-anchor: var(--mobile-ui-font-size)");
+      expect(mobileMap).toContain("--text-lg: calc(var(--ui-ramp-anchor) * 1.125)");
+      expect(mobileMap).toContain("--text-xl: calc(var(--ui-ramp-anchor) * 1.25)");
+      expect(mobileMap).toContain("--text-2xl: calc(var(--ui-ramp-anchor) * 1.5)");
+    });
   });
 
   it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX])(
@@ -885,15 +1040,8 @@ describe("index.css shadow tokens", () => {
 });
 
 /* Regression test for the "mobile sidebar is see-through" bug.
- *
- * Below md the sidebar is a full-screen overlay on top of the chat. The
- * per-theme `.conversations-sidebar` rules paint its canvas with the
- * `background` SHORTHAND, which resets background-color to transparent — and
- * the dark stack is entirely translucent, so the conversation showed straight
- * through. A later media-query rule restores an opaque fill under the
- * gradients. It only works if it keeps matching the theme rules' specificity
- * (they'd win the tie otherwise) and stays declared after them.
- */
+ * Below md the sidebar overlays the chat, so both canvas rules are followed
+ * by an opaque fill. */
 describe("index.css mobile sidebar opacity", () => {
   const mobileRule = cssSource.match(
     /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
@@ -904,44 +1052,24 @@ describe("index.css mobile sidebar opacity", () => {
     expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
   });
 
-  it("declares it after the per-theme canvas rules so it wins the cascade", () => {
-    // Matching specificity — the shorthand in the theme rules would otherwise
-    // keep background-color transparent.
-    const palette = generatedPaletteCssSource.lastIndexOf(".conversations-sidebar {");
+  it("declares it after both shared canvas rules so it wins the cascade", () => {
+    const lightPalette = indexCssSource.indexOf(":root:not(.dark) .conversations-sidebar {");
+    const darkPalette = indexCssSource.indexOf(".dark .omnigent-native-sidebar-surface,");
     const mobile = cssSource.indexOf(mobileRule!);
-    expect(palette).toBeGreaterThan(-1);
-    expect(mobile).toBeGreaterThan(palette);
-    // Every palette/mode selector must be covered, or one can go transparent.
-    expect(mobileRule).toContain(":root:not(.dark):not([data-theme]) .conversations-sidebar");
-    expect(mobileRule).toContain(":root:not(.dark)[data-theme] .conversations-sidebar");
-    expect(mobileRule).toContain(".dark:not([data-theme]) .conversations-sidebar");
-    expect(mobileRule).toContain(".dark[data-theme] .conversations-sidebar");
+    expect(lightPalette).toBeGreaterThan(-1);
+    expect(darkPalette).toBeGreaterThan(-1);
+    expect(mobile).toBeGreaterThan(lightPalette);
+    expect(mobile).toBeGreaterThan(darkPalette);
+    expect(mobileRule).toContain(":root:not([data-theme]) .conversations-sidebar");
+    expect(mobileRule).toContain(":root[data-theme] .conversations-sidebar");
+    expect(mobileRule).not.toContain(":not(.dark)");
+    expect(generatedPaletteCssSource).not.toContain(".conversations-sidebar {");
   });
 });
 
-/* Regression test for the "mobile floating Settings/Search chip is see-through"
- * bug.
- *
- * The two floating chips (`.sidebar-glass-chip`) frost their fill with
- * `backdrop-filter`, but WebKit drops that filter on mobile once a Radix popper
- * opens. With a purely translucent fill (rgba white) the scrolling session rows
- * then show straight through and the chip reads as transparent. An opaque
- * `--card-solid` base UNDER the tint keeps it a chip whether or not the blur
- * survives.
- */
-describe("index.css mobile sidebar glass chip opacity", () => {
-  const chipRule = cssSource.match(/\.sidebar-glass-chip \{[^}]*\}/)?.[0];
-
-  it("has the glass chip rule this test exists to protect", () => {
-    expect(chipRule, "the .sidebar-glass-chip rule is gone from index.css").toBeDefined();
-  });
-
-  it("bases the chip on an opaque fill so it never goes see-through", () => {
-    // The translucent tint lives on background-image (a layer over the base),
-    // NOT on background-color — that must stay the opaque token, or the chip
-    // turns transparent the moment WebKit drops the backdrop-filter.
-    expect(chipRule).toMatch(/background-color:\s*var\(--card-solid\)/);
-    expect(chipRule).not.toMatch(/background-color:\s*rgba/);
+describe("index.css mobile sidebar actions", () => {
+  it("does not restore the removed circular glass container", () => {
+    expect(cssSource).not.toContain(".sidebar-glass-chip");
   });
 });
 
@@ -954,6 +1082,177 @@ describe("index.css text selection colors", () => {
     expect(selectionRule).not.toContain("--sidebar-active");
     expect(selectionRule).not.toContain("--brand-accent");
     expect(cssSource).not.toContain(".dark ::selection");
+  });
+});
+
+describe("index.css mobile settings title", () => {
+  const titleRule = cssSource.match(/\.settings-page-title \{[^}]*\}/)?.[0];
+  const headerFadeRule = cssSource.match(/\.settings-mobile-header::before \{[^}]*\}/)?.[0];
+
+  it("centers the settings title in the fixed mobile header row", () => {
+    expect(headerFadeRule, "the mobile settings header rule is gone").toBeDefined();
+    expect(titleRule, "the mobile settings title rule is gone").toBeDefined();
+    expect(titleRule).toContain("position: fixed");
+    expect(titleRule).toContain("height: var(--omnigent-header-height)");
+    expect(titleRule).toContain("text-align: center");
+  });
+
+  it("fades the settings header into the page like the session header", () => {
+    expect(headerFadeRule).toContain("height: 80px");
+    expect(headerFadeRule).toContain(
+      "background: linear-gradient(to bottom, var(--background) 0 48px, transparent 80px)",
+    );
+  });
+});
+
+describe("index.css electron-mac window drag region", () => {
+  const dragRule = cssBlocks
+    .map(([block]) => block)
+    .find((block) => selectorOf(block) === "html[data-electron-mac] .electron-drag-strip");
+  const controlsRule = cssBlocks
+    .map(([block]) => block)
+    .find(
+      (block) =>
+        selectorOf(block).replace(/\s+/g, " ").startsWith("html[data-electron-mac] :is(") &&
+        block.includes("-webkit-app-region: no-drag"),
+    );
+  let dragSelector: string;
+  let controlsSelector: string;
+
+  beforeAll(() => {
+    expect(dragRule, "expected the macOS window drag-strip rule").toBeDefined();
+    expect(controlsRule, "expected the macOS interactive-control exclusions").toBeDefined();
+    dragSelector = selectorOf(dragRule!);
+    controlsSelector = selectorOf(controlsRule!);
+  });
+
+  // The mac shell marks <html> at boot (applyMacElectronShellAttribute).
+  const root = document.documentElement;
+  const markMacShell = () => root.setAttribute("data-electron-mac", "true");
+  const unmarkMacShell = () => root.removeAttribute("data-electron-mac");
+
+  afterEach(() => {
+    cleanup();
+    unmarkMacShell();
+  });
+
+  it("scopes the no-drag exclusions without :has() so DOM edits stay cheap", () => {
+    // `html:has(...)` restyles the whole page on DOM mutations, e.g. every
+    // keystroke in a controlled textarea.
+    expect(controlsSelector).not.toContain(":has(");
+  });
+
+  it("covers the full width and height of the desktop header", () => {
+    expect(dragRule).toContain("inset: 0 0 auto 0");
+    expect(dragRule).toContain("height: var(--mac-titlebar-height)");
+    expect(dragRule).toContain("-webkit-app-region: drag");
+  });
+
+  it.each<[string, ComponentProps<"div">]>([
+    ["a", {}],
+    ["button", {}],
+    ["input", {}],
+    ["textarea", {}],
+    ["select", {}],
+    ["iframe", {}],
+    ["video", {}],
+    ["audio", {}],
+    ["label", {}],
+    ["summary", {}],
+    ["div", { tabIndex: 0 }],
+    ["span", { tabIndex: 1 }],
+    ["div", { className: "no-drag" }],
+    ["div", { role: "button" }],
+    ["div", { role: "link" }],
+    ["div", { role: "tab" }],
+    ["div", { role: "separator" }],
+    ["div", { role: "menuitem" }],
+    ["div", { role: "menuitemcheckbox" }],
+    ["div", { role: "menuitemradio" }],
+    ["div", { role: "combobox" }],
+    ["div", { role: "option" }],
+    ["div", { role: "radio" }],
+    ["div", { role: "checkbox" }],
+    ["div", { role: "switch" }],
+    ["div", { role: "slider" }],
+    ["div", { role: "listbox" }],
+    ["div", { role: "textbox" }],
+    ["div", { role: "searchbox" }],
+    ["div", { role: "spinbutton" }],
+    ["div", { role: "menu" }],
+    ["div", { role: "dialog" }],
+    ["div", { role: "tooltip" }],
+    ["div", { contentEditable: true }],
+  ])("keeps %s %j interactive inside the drag band", (tag, props) => {
+    markMacShell();
+    const { container } = render(createElement("div", {}, createElement(tag, props)));
+    const control = container.firstElementChild!.firstElementChild!;
+    expect(control.matches(controlsSelector)).toBe(true);
+    unmarkMacShell();
+    expect(control.matches(controlsSelector)).toBe(false);
+  });
+
+  it.each(["", "plaintext-only", "TRUE", "True", "PLAINTEXT-ONLY", "PlainText-Only"])(
+    "excludes contenteditable=%j from dragging",
+    (value) => {
+      markMacShell();
+      const { container } = render(createElement("div", {}, createElement("div")));
+      const control = container.firstElementChild!.firstElementChild!;
+      control.setAttribute("contenteditable", value);
+      expect(control.matches(controlsSelector)).toBe(true);
+    },
+  );
+
+  it.each(["menu", "dialog", "tooltip"])("excludes portaled %s containers", (role) => {
+    markMacShell();
+    const { container, getByRole } = render(
+      createElement(
+        "div",
+        { className: "app-shell" },
+        createPortal(createElement("div", { role }), document.body),
+      ),
+    );
+    const shell = container.firstElementChild!;
+    const overlay = getByRole(role);
+    expect(shell.contains(overlay)).toBe(false);
+    expect(overlay.matches(controlsSelector)).toBe(true);
+    unmarkMacShell();
+    expect(overlay.matches(controlsSelector)).toBe(false);
+  });
+
+  it("keeps unfocusable and noneditable content draggable unless explicitly opted out", () => {
+    markMacShell();
+    const { container } = render(
+      createElement(
+        "div",
+        {},
+        createElement("span", { tabIndex: -1 }),
+        createElement("span", { contentEditable: false }),
+      ),
+    );
+    const shell = container.firstElementChild!;
+    expect(shell.firstElementChild!.matches(controlsSelector)).toBe(false);
+    expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
+    shell.firstElementChild!.classList.add("no-drag");
+    expect(shell.firstElementChild!.matches(controlsSelector)).toBe(true);
+  });
+
+  it("leaves noninteractive title-bar space draggable and other platforms unchanged", () => {
+    markMacShell();
+    const { container } = render(
+      createElement(
+        "div",
+        {},
+        createElement("div", { className: "electron-drag-strip" }),
+        createElement("span", {}, "Session title"),
+      ),
+    );
+    const shell = container.firstElementChild!;
+    const strip = shell.firstElementChild!;
+    expect(strip.matches(dragSelector)).toBe(true);
+    expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
+    unmarkMacShell();
+    expect(strip.matches(dragSelector)).toBe(false);
   });
 });
 
@@ -1001,10 +1300,8 @@ describe("index.css electron-mac sidebar header", () => {
     expect(brandRule).toContain("display: none");
   });
 
-  it("collapses the emptied header row instead of leaving a dead band", () => {
-    // Both the wordmark and the cluster are gone from this row on mac, so a
-    // 3rem row would reintroduce the empty strip this change set out to remove.
-    expect(headerRowRule).toContain("height: 2.25rem");
+  it("reserves the entire drag band before the sidebar content", () => {
+    expect(headerRowRule).toContain("height: var(--mac-titlebar-height)");
   });
 
   it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
@@ -1044,18 +1341,12 @@ describe("index.css electron-mac sidebar header", () => {
   });
 
   it("floats the peek card below the title-bar controls", () => {
-    // The card's own inset-2 would put its first row level with the lights and
-    // the icon cluster, so it slides up UNDER the window controls. Its top edge
-    // must clear the 2.25rem strip (2.75rem = strip + the same 0.5rem gap the
-    // card's other edges use).
-    expect(peekCardRule).toContain("top: 2.75rem");
+    expect(peekCardRule).toContain("top: calc(var(--mac-titlebar-height) + 0.5rem)");
   });
 
   it("drops the header row inside the peek card", () => {
-    // The row reserves the title-bar strip for the lights and cluster, which
-    // only applies to the docked sidebar starting at y=0. The peek card already
-    // floats clear of all of it, so the row is 2.25rem of empty canvas above the
-    // first entry — the content should line up against the card's own padding.
+    // The peek card already clears the title bar, so its content starts
+    // against its own top padding without another reserved header row.
     expect(peekHeaderRowRule).toContain("display: none");
   });
 
@@ -1068,7 +1359,20 @@ describe("index.css electron-mac sidebar header", () => {
   it("pushes the settings sidebar's Back row below the lights", () => {
     // /settings swaps the header row out entirely; without this its Back row
     // would sit underneath the window controls.
-    expect(settingsHeaderRule).toContain("padding-top: 2.75rem");
+    expect(settingsHeaderRule).toContain("padding-top: calc(var(--mac-titlebar-height) + 0.5rem)");
+  });
+
+  it("hands the phone layout's headers the lights' corner below md", () => {
+    // Electron's 720px minimum is below md, where the drawer and chat header
+    // carry their own controls; a fixed rem pad would drift with zoom.
+    const narrowBlock = cssSource.match(
+      /@media \(width < 48rem\) \{(?=\s*html\[data-electron-mac\] \.electron-sidebar-header-actions \{)(?:[^{}]|\{[^{}]*\})*\}/,
+    )?.[0];
+    expect(narrowBlock, "expected the macOS sub-md header block").toBeDefined();
+    expect(narrowBlock).toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
+    expect(narrowBlock).toMatch(
+      /\.traffic-light-clearance,\s*html\[data-electron-mac\] \.sidebar-header-row \{\s*padding-left: var\(--mac-traffic-light-width\);/,
+    );
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {
@@ -1107,7 +1411,8 @@ describe("index.css electron-mac sidebar header", () => {
  * (z above the rail) then covers that corner — the lights sit over IT, and the
  * strip starts to the sidebar's right with nothing to clear — so the clearance
  * must drop, or the padding shoves the tabs into the middle. The rule keys off
- * `data-sidebar-open` on the app shell (set by AppShell) to do this; asserted at
+ * `data-sidebar-open` on the app shell (set by AppShell) under the
+ * `data-electron-mac` root (set on <html> at boot); asserted at
  * the CSS level because the lights are painted by macOS OUTSIDE the page, so no
  * DOM test or screenshot can see them. This selector IS the alignment.
  */
@@ -1120,7 +1425,10 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .trim();
 
-  function makeStrip(shellAttrs: Record<string, string>): HTMLElement {
+  afterEach(() => document.documentElement.removeAttribute("data-electron-mac"));
+
+  function makeStrip(macShell: boolean, shellAttrs: Record<string, string> = {}): HTMLElement {
+    if (macShell) document.documentElement.setAttribute("data-electron-mac", "true");
     const shell = document.createElement("div");
     shell.className = "app-shell";
     for (const [k, v] of Object.entries(shellAttrs)) shell.setAttribute(k, v);
@@ -1137,11 +1445,11 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
 
   it("has the clearance rule this test exists to protect", () => {
     expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
-    expect(rule).toMatch(/padding-left:\s*10\.5rem/);
+    expect(rule).toContain("padding-left: calc(var(--mac-traffic-light-width) + 5rem)");
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {
-    const strip = makeStrip({ "data-electron-mac": "true" });
+    const strip = makeStrip(true);
     expect(strip.matches(selector)).toBe(true);
     strip.closest(".app-shell")?.remove();
   });
@@ -1149,13 +1457,13 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
   it("drops the clearance once the sidebar is reopened over the maximized rail", () => {
     // The exact bug: sidebar open covers the window corner, so the 10.5rem
     // padding has nothing to clear and would push the tabs into the middle.
-    const strip = makeStrip({ "data-electron-mac": "true", "data-sidebar-open": "true" });
+    const strip = makeStrip(true, { "data-sidebar-open": "true" });
     expect(strip.matches(selector)).toBe(false);
     strip.closest(".app-shell")?.remove();
   });
 
   it("never clears in a plain browser (no lights to avoid)", () => {
-    const strip = makeStrip({});
+    const strip = makeStrip(false);
     expect(strip.matches(selector)).toBe(false);
     strip.closest(".app-shell")?.remove();
   });

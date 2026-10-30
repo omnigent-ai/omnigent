@@ -41,9 +41,9 @@ docker compose down -v
 
 ## Release features
 
-Release features are deployment-wide and off by default. Enable one or more
-with the comma-separated `OMNIGENT_FEATURES` variable in `.env`, then recreate
-the server container:
+Override release-feature defaults with comma-separated names in
+`OMNIGENT_FEATURES` in `.env`: a name enables a feature, and `-name` disables
+it. Empty or unset uses the defaults. Then recreate the server container:
 
 ```dotenv
 OMNIGENT_FEATURES=usage_page
@@ -57,8 +57,9 @@ curl -s http://localhost:8000/v1/info | jq '.features'
 Known keys and their lifecycle are documented in
 [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md). Unknown keys fail
 server startup so a typo cannot silently produce the wrong rollout. To roll
-back, remove the key (or empty the variable), run `docker compose up -d` again,
-and reload the web app.
+back, add `-feature_name`, run `docker compose up -d` again, and reload the
+web app. Runner overrides such as `-claude_osc_status` must also be set on
+separately running hosts; restart their host/runners and launch fresh terminals.
 
 ## Extra built-in agents
 
@@ -108,6 +109,41 @@ configuration, recreate the service instead:
 ```bash
 docker compose up -d --force-recreate omnigent
 ```
+
+## Trimming the packaged built-in agents
+
+`OMNIGENT_SEEDED_AGENTS` is a comma-separated allowlist naming which packaged
+built-ins the deployment keeps — the native CLI harnesses (`claude-native-ui`,
+`codex-native-ui`, …), the builtin ACP rows, `polly` and `debby`. Leave it
+unset to keep them all (the default). Set it to keep only what you name:
+
+```dotenv
+# Keep Claude Code, drop everything else packaged:
+OMNIGENT_SEEDED_AGENTS=claude-native-ui
+
+# Keep nothing packaged — the picker offers only your own agents:
+OMNIGENT_SEEDED_AGENTS=
+```
+
+Names are the agent's slug, not its display label (`claude-native-ui`, not
+"Claude Code"). `docker-compose.yaml` forwards the variable from `.env`
+without a default, so leaving it out of `.env` keeps it unset (keep all)
+rather than empty (keep none). Use `docker compose logs omnigent | grep
+Suppressing` to see what a given value trimmed.
+
+Agents from `OMNIGENT_BUILTIN_AGENT_DIRS` are never filtered — pairing an
+empty allowlist with your own specs is the supported way to run a picker that
+offers only your agents.
+
+Trimming hides, it never deletes. A packaged agent already seeded by an
+earlier boot keeps its database row, so sessions bound to it keep working and
+their history is untouched; only the new-session picker omits it. The native
+CLI harness rows are always seeded, even when trimmed, because transcript
+imports bind to them. Adding a name back to the allowlist brings it straight
+back on the next restart.
+
+Trimming is not access control: a hidden agent can still be read and launched
+by its id through the API.
 
 Built-ins are keyed by name. If an extra's file stem or directory name matches
 an existing built-in, startup refreshes that stable row with the extra bundle;
@@ -220,9 +256,8 @@ OMNIGENT_OIDC_ALLOWED_DOMAINS=example.com,subsidiary.example.com
 
 ### Generic OIDC (Okta, Auth0, Keycloak, Entra ID)
 
-Any IdP that publishes `/.well-known/openid-configuration` works.
-Set `OMNIGENT_OIDC_ISSUER` to the base URL; the server fetches
-discovery at startup.
+For standard discovery, set `OMNIGENT_OIDC_ISSUER` to your provider's issuer;
+the server fetches `/.well-known/openid-configuration` at startup.
 
 ```bash
 OMNIGENT_AUTH_PROVIDER=oidc
@@ -232,6 +267,65 @@ OMNIGENT_OIDC_CLIENT_SECRET=…
 OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
 OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
 ```
+
+#### Public PKCE clients and explicit endpoints
+
+For an IdP application registered as a **public client**, set
+`OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none` and **unset**
+`OMNIGENT_OIDC_CLIENT_SECRET`. Omnigent still sends its client ID, redirect URI,
+and PKCE verifier, but omits the client-secret field entirely. This is an
+explicit opt-in: the default `client_secret_post` continues to require a secret,
+including for GitHub login. PKCE S256 is used in both modes.
+
+If discovery is unavailable or advertises endpoints unsuitable for your
+deployment, configure **all three** endpoint overrides:
+
+```dotenv
+OMNIGENT_OIDC_ISSUER=https://identity.example.com
+OMNIGENT_OIDC_CLIENT_ID=omnigent
+OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none
+OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT=https://login.example.com/authorize
+OMNIGENT_OIDC_TOKEN_ENDPOINT=https://tokens.example.com/token
+OMNIGENT_OIDC_JWKS_URI=https://keys.example.com/jwks
+OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
+OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
+```
+
+With all three overrides, discovery is skipped. Partial overrides fail at
+startup rather than mixing endpoint sources. Leave all three unset to retain
+discovery. Overrides also work with confidential clients; public-client mode
+also works with discovery. Overrides do not apply to GitHub's special OAuth
+login flow.
+
+Authorization URL query parameters (for example, `?p=policy`) are preserved.
+Omnigent-generated OAuth parameters take precedence on name collisions.
+
+Only trusted operators should configure these addresses: the token endpoint
+receives authorization codes and, for confidential clients, the client secret;
+the JWKS endpoint determines which signing keys are trusted. Overrides must
+use HTTPS without embedded credentials or fragments. HTTP is allowed only for
+`localhost`, `127.0.0.1`, or `[::1]` for local testing. Endpoint hosts may differ
+from the issuer, but the token's issuer must still match
+`OMNIGENT_OIDC_ISSUER` exactly, and its audience must match the client ID.
+
+PS256-signed identity tokens are supported alongside the existing RSA and EC
+algorithms. These options do not disable signature, expiration, email
+verification, admission, or reauthentication checks. They configure **Omnigent
+login**, not upstream MCP credentials or shared-session credential ownership.
+
+When migrating from a custom integration that inferred public-client mode from
+an absent secret, explicitly add `OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none`.
+If your trusted enterprise directory omits `email_verified`, the existing
+`OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1` remains a separate operator choice;
+these compatibility options never enable it automatically. Likewise, if CLI or
+device sign-in fails with "IdP did not confirm re-authentication" because the
+IdP omits `auth_time` (for example, Cloudflare Access), opt out with
+`OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off.
+
+To verify a deployment, restart with the settings above, sign in from a private
+browser window, then run `omnigent login <server-url>` and finish the browser
+flow. Confirm both identify the expected account. The identity provider must
+enforce PKCE and one-time authorization codes; Omnigent supplies the verifier.
 
 ### HTTPS for the callback URL
 
@@ -346,6 +440,7 @@ trusts whatever value reaches it.
 | `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `OMNIGENT_BUILTIN_AGENT_DIRS` | unset | Colon-separated paths (in-container) to extra always-available built-in agents, seeded once at startup. See [Extra built-in agents](#extra-built-in-agents). |
+| `OMNIGENT_SEEDED_AGENTS` | unset (keep all) | Comma-separated allowlist of packaged built-in agent names to keep. Empty value keeps none. Never filters `OMNIGENT_BUILTIN_AGENT_DIRS` agents. See [Trimming the packaged built-in agents](#trimming-the-packaged-built-in-agents). |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and

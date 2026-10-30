@@ -10,7 +10,9 @@ import {
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
   isNativeOpenCodeHarness,
+  missingHarnessCredentialCopy,
   resolveSetupSteps,
+  skillInvocationPrefix,
 } from "./harnessSetup";
 import type { SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
@@ -32,6 +34,19 @@ const info = (overrides: Partial<ServerInfo> = {}): ServerInfo =>
     installable_harnesses: ["codex", "codex-native", "pi", "pi-native"],
     ...overrides,
   }) as ServerInfo;
+
+describe("missingHarnessCredentialCopy", () => {
+  it.each([
+    ["codex-native", "Codex", "No ChatGPT account or API key on laptop"],
+    ["native-claude", "Claude Code", "No Claude subscription or API key on laptop"],
+    ["pi-native", "Pi", "No API key or gateway credential on laptop"],
+    ["cursor-native", "Cursor", "No credentials on laptop"],
+  ])("uses the credential wording for %s", (harness, harnessName, expectedStart) => {
+    expect(missingHarnessCredentialCopy(harness, harnessName, "laptop")).toBe(
+      `${expectedStart}, so new sessions can’t use ${harnessName}.`,
+    );
+  });
+});
 
 // A codex-shaped server descriptor: one-click install, then a UI-authable auth
 // step (the form lists subscription / API key / gateway; `command` is the
@@ -469,5 +484,26 @@ describe("OpenCode setup", () => {
     expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBeNull();
     const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
     expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "done"]]);
+  });
+});
+
+describe("skillInvocationPrefix", () => {
+  it("returns $ for codex-native", () => {
+    expect(skillInvocationPrefix("codex-native")).toBe("$");
+  });
+
+  it("returns / for non-Codex native harnesses", () => {
+    expect(skillInvocationPrefix("claude-native")).toBe("/");
+    expect(skillInvocationPrefix("cursor-native")).toBe("/");
+  });
+
+  it("returns / for SDK and bare harness spellings", () => {
+    expect(skillInvocationPrefix("codex")).toBe("/");
+    expect(skillInvocationPrefix("claude")).toBe("/");
+  });
+
+  it("returns / for null and undefined", () => {
+    expect(skillInvocationPrefix(null)).toBe("/");
+    expect(skillInvocationPrefix(undefined)).toBe("/");
   });
 });

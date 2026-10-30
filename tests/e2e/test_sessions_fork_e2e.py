@@ -31,6 +31,7 @@ from typing import Any
 import httpx
 import pytest
 
+from tests._helpers.messages import all_message_text as _extract_all_text
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -51,24 +52,6 @@ _BUILTIN_TARGET = "sdk-chat-builtin"
 # copied history — nonsense token pairs, not real words it might guess.
 _CODEWORD_1 = "aurora-zebra-17"
 _CODEWORD_2 = "breeze-falcon-42"
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """
-    Concatenate all output_text blocks from a response body.
-
-    :param body: The terminal response body from
-        :func:`poll_session_until_terminal`.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def _session_item_texts(client: httpx.Client, session_id: str) -> str:

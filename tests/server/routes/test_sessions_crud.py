@@ -29,8 +29,10 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
+from tests.server.helpers import create_test_agent
 
 
 @pytest_asyncio.fixture()
@@ -45,6 +47,43 @@ async def session_id(db_uri: str) -> str:
 
 
 # ── GET /v1/sessions (list) ─────────────────────────────────────────
+
+
+async def test_creating_client_surface_survives_create_child_and_fork(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    client.headers["X-Omnigent-Client"] = "desktop"
+    agent = await create_test_agent(client, name="client-surface")
+    source = store.get_conversation(agent["_session_id"])
+    assert source is not None
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    response = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert response.status_code == 201, response.text
+    source_id = response.json()["id"]
+    source = store.get_conversation(source_id)
+    assert source is not None
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    # A backend spawn's HTTP transport must not turn its desktop parent into CLI traffic.
+    del client.headers["X-Omnigent-Client"]
+    child = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "parent_session_id": source_id}
+    )
+    assert child.status_code == 201, child.text
+    child_row = store.get_conversation(child.json()["id"])
+    assert child_row is not None
+    assert child_row.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    fork = await client.post(
+        f"/v1/sessions/{source_id}/fork", json={}, headers={"X-Omnigent-Client": "web"}
+    )
+    assert fork.status_code == 201, fork.text
+    fork_row = store.get_conversation(fork.json()["id"])
+    assert fork_row is not None
+    assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
 async def test_list_sessions_empty(client: httpx.AsyncClient) -> None:
@@ -118,6 +157,42 @@ async def test_delete_session(
     assert resp.status_code == 200
     body = resp.json()
     assert body["deleted"] is True
+
+
+async def test_delete_session_survives_blob_delete_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing attachment blob delete is logged; the session is still deleted."""
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    file_store = SqlAlchemyFileStore(db_uri)
+    file_ids = [
+        file_store.create(f"f{i}.txt", 1, "text/plain", session_id=session_id).id for i in range(3)
+    ]
+    attempted: list[str] = []
+
+    def flaky_delete(self: LocalArtifactStore, key: str) -> None:
+        del self
+        attempted.append(key)
+        if key == file_ids[0]:
+            raise RuntimeError("Barnacle 500")
+
+    with (
+        patch.object(LocalArtifactStore, "delete", flaky_delete),
+        caplog.at_level(logging.WARNING),
+    ):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    assert sorted(attempted) == sorted(file_ids)
+    assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 404
+    assert f"Failed to delete attachment blob {file_ids[0]} for session" in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
@@ -788,3 +863,18 @@ async def test_list_sessions_pinned_filter(
     assert plain.id not in ids
     # A pin belonging to another user must not appear for the caller.
     assert other_user_pin.id not in ids
+
+
+async def test_patch_rejects_forged_worktree_identity(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """The cleanup identity must remain server-owned after creation."""
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}}
+    )
+    assert response.status_code == 400, response.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels

@@ -480,7 +480,7 @@ def test_keeper_timeout_stops_process_tree(monkeypatch):
     process = Mock()
     process.wait.side_effect = [subprocess.TimeoutExpired("bwrap", 5), 0]
     kill = Mock()
-    monkeypatch.setattr("omnigent.sandbox.copy_on_write.kill_tree", kill)
+    monkeypatch.setattr("omnigent.inner._proc.kill_tree", kill)
     CopyOnWriteEnvironment._stop(process)
     process.stdin.close.assert_called_once()
     kill.assert_called_once_with(process)
@@ -511,7 +511,7 @@ def test_agent_parser_rejects_unshared_harness(tmp_path, harness, legacy):
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
 
     def load():
-        return _parse_agent_def(config) if legacy else parse(tmp_path)
+        return _parse_agent_def(config, allow_dynamic_tools=True) if legacy else parse(tmp_path)
 
     if harness == "openai-agents":
         assert load().os_env is not None

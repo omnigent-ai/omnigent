@@ -86,12 +86,11 @@ def test_parse_opencode_version() -> None:
 
 
 def test_check_version_in_range() -> None:
-    check_opencode_version("2.0.0")
     check_opencode_version("2.0.18")
-    check_opencode_version("2.9.99")
+    check_opencode_version("2.0.99")
 
 
-@pytest.mark.parametrize("version", ["1.17.7", "1.18.16", "1.99.0", "3.0.0"])
+@pytest.mark.parametrize("version", ["1.18.16", "1.99.0", "2.0.0", "2.0.17", "2.1.0", "3.0.0"])
 def test_check_version_out_of_range_raises(version: str) -> None:
     with pytest.raises(OpenCodeVersionError):
         check_opencode_version(version)

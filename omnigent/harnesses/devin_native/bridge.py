@@ -39,9 +39,13 @@ import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent._platform import stable_user_id
 from omnigent.util.json_types import JsonObject as _JsonObject
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 DEVIN_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_DEVIN_NATIVE_BRIDGE_DIR"
 DEVIN_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_DEVIN_NATIVE_REQUEST_SESSION_ID"
@@ -1616,3 +1620,13 @@ def build_devin_launch_args(
         args.append("--sandbox")
     args.extend(passthrough)
     return args
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Devin's composer is on screen (same gate as delivery).
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live terminal; the watcher already captured its pane.
+    """
+    del session_id
+    return devin_input_ready(instance.last_pane_text() or "")

@@ -76,6 +76,30 @@ function makePartitionCapturingRegistry() {
 }
 
 describe("browserViewRegistry — storage partition isolation", () => {
+  it("shares storage across the agent browser and user tabs while keeping views independent", () => {
+    const { registry, createdPrefs } = makePartitionCapturingRegistry();
+    const ids = ["conv_A", "browser-tab:conv_A:first", "browser-tab:conv_A:second"];
+    for (const id of ids) registry.openOrNavigate(id, "https://example.com/");
+    assert.equal(new Set(createdPrefs.map((prefs) => prefs.partition)).size, 1);
+    assert.equal(new Set(ids.map((id) => registry.get(id).view)).size, 3);
+
+    registry.close(ids[1]);
+    registry.openOrNavigate(ids[1], "https://example.com/");
+    assert.equal(createdPrefs[3].partition, createdPrefs[0].partition);
+    registry.openOrNavigate("browser-tab:conv_B:first", "https://example.com/");
+    assert.notEqual(createdPrefs[4].partition, createdPrefs[0].partition);
+  });
+
+  it("decodes the owning session ID and leaves malformed tab keys isolated", () => {
+    assert.equal(
+      agentPartition("w1", "browser-tab:session%3Aone%2Ftwo:tab"),
+      agentPartition("w1", "session:one/two"),
+    );
+    for (const id of ["browser-tab:conv_A", "browser-tab:conv_A:", "browser-tab:%ZZ:tab"]) {
+      assert.equal(agentPartition("w1", id), `omnigent-agent-w1-${id}`);
+    }
+  });
+
   it("passes a non-empty partition to WebContentsViewCtor for each created view", () => {
     const { registry, createdPrefs } = makePartitionCapturingRegistry();
 
