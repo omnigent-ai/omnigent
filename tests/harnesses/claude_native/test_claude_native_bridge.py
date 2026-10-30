@@ -11,6 +11,7 @@ import os
 import queue
 import select
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -14705,6 +14706,49 @@ async def test_curl_evaluate_policy_command_round_trips(
         output = json.loads(result.stdout)
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+        # A failing curl replays stdin into the Python hook, which reaches the
+        # same verdict through the relay's policy proxy.
+        (bridge_dir / "bridge.json").write_text(
+            json.dumps({"active_session_id": "conv_hook_eval"}), encoding="utf-8"
+        )
+        failing_bin = tmp_path / "failing-curl"
+        failing_bin.mkdir()
+        (failing_bin / "curl").write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        (failing_bin / "curl").chmod(0o755)
+        calls_before = client.calls
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": f"{failing_bin}{os.pathsep}{os.environ['PATH']}"},
+        )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+        assert client.calls == calls_before + 1
+
+        # Without curl on PATH, the command goes straight to the Python hook.
+        no_curl_bin = tmp_path / "no-curl"
+        no_curl_bin.mkdir()
+        for tool in ("cat", "date", "env"):
+            (no_curl_bin / tool).symlink_to(shutil.which(tool))
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": str(no_curl_bin)},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "not found" not in result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert client.calls == calls_before + 2
     finally:
         relay.close()
 
@@ -14731,6 +14775,118 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.fixture
+def unaccepting_relay_url() -> Iterator[str]:
+    """Yield the URL of a relay that accepts no connections, like one whose runner is stuck.
+
+    One unaccepted connection fills the listener's accept queue, so the kernel
+    drops later connection attempts and curl's connect hangs.
+    """
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(0)
+        with socket.create_connection(server.getsockname()):
+            yield f"http://127.0.0.1:{server.getsockname()[1]}"
+
+
+def test_policy_hook_runs_python_soon_when_the_relay_accepts_no_connections(
+    tmp_path: Path, unaccepting_relay_url: str
+) -> None:
+    """The policy hook gives up on the connection after seconds, not its day-long ``--max-time``.
+
+    Then it hands the event to the Python hook, which evaluates it without the relay.
+    """
+    python = tmp_path / "python"
+    received = tmp_path / "python-stdin"
+    python.write_text(f"#!/bin/sh\ncat > {shlex.quote(str(received))}\n", encoding="utf-8")
+    python.chmod(0o755)
+    settings = claude_native_bridge.build_hook_settings(
+        tmp_path, python_executable=str(python), ap_server_url="http://127.0.0.1:9"
+    )
+    command = next(entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry)[
+        "hooks"
+    ][0]["command"]
+    (tmp_path / "tool_relay.env").write_text(
+        f"OMNIGENT_RELAY_URL='{unaccepting_relay_url}'\nOMNIGENT_RELAY_TOKEN='token'\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert received.read_text() == json.dumps(_PRE_TOOL_USE_PAYLOAD)
+
+
+@pytest.mark.asyncio
+async def test_curl_evaluate_policy_command_keeps_the_relay_token_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The policy hook's curl gets the relay token from a here-doc, not its arguments.
+
+    It also ignores the user's ``.curlrc`` and proxy settings: through the
+    refusing proxy, the verdict would come from the Python fallback ("ask")
+    instead of the relay ("deny").
+    """
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "curl says no"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        args = augment_claude_args((), bridge_dir=bridge_dir, ap_server_url="http://127.0.0.1:9")
+        settings = _load_invocation_settings(args)
+        command = next(
+            entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry
+        )["hooks"][0]["command"]
+        relay_info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+        home = tmp_path / "home"
+        home.mkdir()
+        trace = home / "trace.log"
+        (home / ".curlrc").write_text(f'verbose\ntrace-ascii = "{trace}"\n', encoding="utf-8")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        argv_file = tmp_path / "curl-argv"
+        (bin_dir / "curl").write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$@" > {shlex.quote(str(argv_file))}\n'
+            f'exec {shlex.quote(str(shutil.which("curl")))} "$@"\n',
+            encoding="utf-8",
+        )
+        (bin_dir / "curl").chmod(0o755)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            refusing_proxy = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "HOME": str(home),
+            **dict.fromkeys(
+                ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"), refusing_proxy
+            ),
+        }
+
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+    finally:
+        relay.close()
+
+    assert result.returncode == 0, result.stderr
+    assert relay_info["token"] not in argv_file.read_text()
+    assert not trace.exists()
+    output = json.loads(result.stdout)
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 @pytest.mark.asyncio

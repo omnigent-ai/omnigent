@@ -2525,7 +2525,7 @@ def build_hook_settings(
         # publish live token deltas to the web UI.
         "MessageDisplay": [{"hooks": [message_display_hook]}],
     }
-    from omnigent.native.tool_observer_hook import hook_settings
+    from omnigent.native.tool_observer_hook import hook_settings, relay_curl
 
     observer_hook = hook_settings(
         bridge_dir,
@@ -2601,12 +2601,11 @@ def build_hook_settings(
         )
         evaluate_policy_command = (
             "p=$(cat); "
-            f"if [ -r {relay_env_quoted} ]; then . {relay_env_quoted}; "
-            "out=$(printf '%s' \"$p\" | curl -sf --max-time 86400 "
-            '-H "Authorization: Bearer $OMNIGENT_RELAY_TOKEN" '
-            "-H 'Content-Type: application/json' --data-binary @- "
-            '"$OMNIGENT_RELAY_URL/hook/claude/evaluate-policy" 2>/dev/null) '
-            "&& { printf '%s' \"$out\"; exit 0; }; fi; "
+            f"if [ -r {relay_env_quoted} ] && command -v curl >/dev/null 2>&1; then "
+            f". {relay_env_quoted}; "
+            "out=$(printf '%s' \"$p\" | "
+            + relay_curl("/hook/claude/evaluate-policy", max_time=86400, options="-sf")
+            + ") && { printf '%s' \"$out\"; exit 0; }; fi; "
             f"printf '%s' \"$p\" | {evaluate_policy_python}"
         )
         evaluate_policy_hook: _JsonObject = {
