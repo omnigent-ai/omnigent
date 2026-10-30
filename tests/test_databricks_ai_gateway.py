@@ -20,6 +20,12 @@ from omnigent.databricks_ai_gateway import (
 _GW = "https://dbc-1.cloud.databricks.com/ai-gateway/anthropic"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ci_attribution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv(CI_CONTEXT_ENV, raising=False)
+
+
 def test_ci_context_is_opted_in_and_contains_only_known_fields() -> None:
     source = {
         "OMNIGENT_CI_PIPELINE": "polly-review",
@@ -76,7 +82,8 @@ def test_ci_tags_merge_with_existing_headers_and_survive_child_env(monkeypatch) 
     previous = '{"team":"tools","pipeline":"old"}'
     mapped = with_gateway_attribution({REQUEST_TAGS_HEADER.lower(): previous}, "codex", _GW)
     lines = with_gateway_attribution_lines(
-        f"X-Team: tools\n{REQUEST_TAGS_HEADER.lower()}: {previous}", "claude-code"
+        f"X-Team: tools\nX-Extra:  preserve spacing  \n{REQUEST_TAGS_HEADER.lower()}: {previous}",
+        "claude-code",
     )
     expected = {
         "team": "tools",
@@ -90,6 +97,7 @@ def test_ci_tags_merge_with_existing_headers_and_survive_child_env(monkeypatch) 
     parsed_lines = dict(line.split(": ", 1) for line in lines.splitlines())
     assert json.loads(parsed_lines[REQUEST_TAGS_HEADER]) == expected
     assert parsed_lines["X-Team"] == "tools"
+    assert "X-Extra:  preserve spacing  " in lines.splitlines()
     assert json.loads(gateway_request_tag_headers(_GW)[REQUEST_TAGS_HEADER])["run_id"] == "123"
     assert gateway_request_tag_headers("https://api.openai.com/v1") == {}
     assert (
@@ -147,14 +155,13 @@ def test_with_gateway_attribution_marks_ug_providers_by_user_agent() -> None:
 
 def test_with_gateway_attribution_lines_appends_to_the_claude_block() -> None:
     block = with_gateway_attribution_lines(
-        "x-databricks-use-coding-agent-mode: true\nX-Extra:  preserve spacing  ",
+        "x-databricks-use-coding-agent-mode: true",
         "claude-code",
         via_ug=True,
     )
 
     assert block.splitlines() == [
         "x-databricks-use-coding-agent-mode: true",
-        "X-Extra:  preserve spacing  ",
         "Databricks-Custom-Coding-Agent: claude-code",
         "Databricks-Custom-Client-Surfaces: omnigent, ug",
     ]

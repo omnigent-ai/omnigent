@@ -18,7 +18,7 @@ from omnigent.databricks_ai_gateway import (
 def ocr_request_headers() -> str:
     """Encode JSON for OCR's quoted, comma-separated extra-header input."""
     encoded = {
-        key: json.dumps(value).replace('\\"', "\\u0022").replace(",", "\\u002c")
+        key: '"' + json.dumps(value)[1:-1].replace('\\"', "\\u0022").replace(",", "\\u002c") + '"'
         for key, value in ci_request_tags().items()
     }
     tags = "{" + ",".join(json.dumps(key) + ":" + value for key, value in encoded.items()) + "}"

@@ -4570,6 +4570,8 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
         materialize_codex_provider_config,
     )
 
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     if ci:
         monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
 

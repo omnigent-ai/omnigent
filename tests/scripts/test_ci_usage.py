@@ -10,14 +10,25 @@ from dev.ci_usage import ocr_request_headers, probe
 from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
 
 
-def test_ocr_header_preserves_json_commas_and_quoted_values(monkeypatch) -> None:
-    tags = {"pipeline": "open-code-review", "source_session_id": 'a,"b\\c\n', "run_id": "123"}
+@pytest.mark.parametrize(
+    "source_session_id", ['a,"b\\c\n', "session\\", "session\\\\", 'session\\"']
+)
+def test_ocr_header_preserves_json_commas_and_quoted_values(
+    monkeypatch, source_session_id
+) -> None:
+    tags = {
+        "pipeline": "open-code-review",
+        "source_session_id": source_session_id,
+        "run_id": "123",
+    }
     monkeypatch.setenv("OMNIGENT_CI_CONTEXT", json.dumps(tags))
     header, value = ocr_request_headers().split("=", 1)
     assert header == REQUEST_TAGS_HEADER
     assert value.startswith('"') and value.endswith('"')
-    assert '\\"' not in value
-    assert r"a\u002c\u0022b\\c\n" in value
+    if "," in source_session_id:
+        assert r"\u002c" in value
+    if '"' in source_session_id:
+        assert r"\u0022" in value
     assert "\n" not in value
     assert json.loads(value[1:-1]) == tags
 
