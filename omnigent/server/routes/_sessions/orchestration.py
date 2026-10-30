@@ -92,6 +92,7 @@ from omnigent.policies.types import (
     EvaluationContext,
     PolicyResult,
 )
+from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
@@ -13591,7 +13592,10 @@ async def _get_session_snapshot(
             and (status != "idle" or not runner_ran)
             and (status != "failed" or last_task_error is None or stale_cause)
         ):
-            last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
+            last_task_error = {
+                "code": RUNNER_PROCESS_CRASH if runner_ran else "runner_failed_to_start",
+                "message": exit_error,
+            }
             status = "failed"
     llm_model: str | None = None
     context_window: int | None = None

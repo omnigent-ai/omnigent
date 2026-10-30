@@ -2465,7 +2465,7 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
 
     error = _persisted_task_error(conv_store, conv.id)
     assert error is not None
-    assert error["code"] == "runner_failed_to_start"
+    assert error["code"] == "runner_process_crash"
     decision = _disconnect_decisions(caplog, conv.id)[0]
     attributes = getattr(decision, "attributes", {})
     assert attributes["decision"] == "failed_mid_turn"

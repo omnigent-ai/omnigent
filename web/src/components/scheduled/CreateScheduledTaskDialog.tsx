@@ -238,7 +238,9 @@ export function CreateScheduledTaskDialog({
       event.preventDefault();
     }
   }
-  // Optional pinned host/workspace. "" = unset (server resolves at fire time).
+  // Pinned host/workspace. "" = none: a new task waits for a pick (it starts on
+  // the first online host), and an older unpinned task keeps resolving its host
+  // when it fires.
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
@@ -314,6 +316,14 @@ export function CreateScheduledTaskDialog({
     wasOpen.current = open;
   }, [open, initialName, initialPrompt, initialTrigger, editingTask]);
 
+  // A new task pins a host, starting on the first online one as New Chat does.
+  const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
+  useEffect(() => {
+    if (open && !isEdit && !sandboxMode && hostId === "" && defaultHostId !== undefined) {
+      setHostId(defaultHostId);
+    }
+  }, [open, isEdit, sandboxMode, hostId, defaultHostId]);
+
   const savedProjectId = editingTask?.projectId ?? null;
   const savedProjectName =
     savedProjectId !== null ? projects.find((p) => p.id === savedProjectId)?.name : "";
@@ -334,17 +344,11 @@ export function CreateScheduledTaskDialog({
   );
 
   const hostOptions = hosts ?? [];
-  const preservePinnedHost = isEdit && editingTask?.hostId != null;
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
   // Host whose `configured_harnesses` drives the picker's "needs setup" badges.
-  // Host is optional on scheduled tasks; unset means resolve the connected host
-  // at fire time, so we must not require the user to pin one before the
-  // readiness affordance appears. Fall back to the first ONLINE host for badge
-  // computation only — this does NOT change the form's `hostId` value (which
-  // stays "" = resolve-at-fire); it just gives the picker a readiness map so
-  // unconfigured agents show "needs setup" immediately, matching how the
-  // interactive New Chat dialog auto-selects the first online host on mount.
+  // Before a host is picked (or for an older unpinned task), fall back to the
+  // first ONLINE host so unconfigured agents show "needs setup" right away.
   const badgeHost =
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
 
@@ -374,6 +378,7 @@ export function CreateScheduledTaskDialog({
     name.trim() !== "" &&
     effectivePrompt.trim() !== "" &&
     (isEdit || effectiveAgentId !== null) &&
+    (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
     !mutationPending;
@@ -675,7 +680,7 @@ export function CreateScheduledTaskDialog({
                 <SelectContent position="popper" align="start">
                   <SelectItem value="new">New session each run</SelectItem>
                   <SelectItem value="continue" data-testid="task-session-mode-continue">
-                    Continue one session
+                    Continue in the same session
                   </SelectItem>
                 </SelectContent>
               </Select>
@@ -760,11 +765,11 @@ export function CreateScheduledTaskDialog({
               composer): choosing it provisions a FRESH sandbox per fire, or one
               kept sandbox for a continue task (execution_target=managed_sandbox,
               hostless), instead of a connected host. Otherwise the picker is the
-              optional connected-host pin. */}
+              connected-host pin. */}
           <div className="flex flex-col gap-1.5" data-testid="task-host-field">
-            <Label htmlFor="task-host">Host (optional)</Label>
+            <Label htmlFor="task-host">Host</Label>
             <Select
-              value={sandboxMode ? SANDBOX_HOST : hostId === "" ? UNSET_HOST : hostId}
+              value={sandboxMode ? SANDBOX_HOST : hostId}
               componentId="tasks.scheduled.host"
               onValueChange={(v) => {
                 if (v === SANDBOX_HOST) {
@@ -775,23 +780,19 @@ export function CreateScheduledTaskDialog({
                   setWorkspaceBrowserOpen(false);
                   return;
                 }
-                if (preservePinnedHost && v === UNSET_HOST) return;
                 setSandboxMode(false);
-                const next = v === UNSET_HOST ? "" : v;
-                setHostId(next);
-                // Clearing the host invalidates any pinned workspace.
-                if (next === "") setWorkspace("");
+                // Keep the workspace on a host switch: an update omits an empty
+                // one, which leaves the saved path in place, so the form must
+                // show what gets saved. The server checks it against the new host.
+                setHostId(v);
                 setWorkspaceBrowserOpen(false);
               }}
               onOpenChange={handleSelectOpenChange}
             >
               <SelectTrigger id="task-host" data-testid="task-host-trigger" className="w-full">
-                <SelectValue />
+                <SelectValue placeholder={isEdit ? UNPINNED_HOST_LABEL : "Pick a host"} />
               </SelectTrigger>
               <SelectContent position="popper" align="start">
-                <SelectItem value={UNSET_HOST} disabled={preservePinnedHost}>
-                  Resolve at fire time
-                </SelectItem>
                 {(managedSandboxesEnabled || sandboxMode) && (
                   <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
                     {sandboxLabel}
@@ -809,7 +810,11 @@ export function CreateScheduledTaskDialog({
                 ? sessionMode === "continue"
                   ? "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration."
                   : "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
-                : "Leave unset to run on your connected host when the automation fires."}
+                : hostId === ""
+                  ? isEdit
+                    ? "Runs on the connected host you used most recently. Pick a host to pin it."
+                    : "Pick the host this automation runs on."
+                  : "Runs on this host. A run fails while the host is offline."}
             </p>
           </div>
 
@@ -917,8 +922,8 @@ async function projectChangeInput(
 
 const HOURLY_SCHEDULE_MODEL: ScheduleModel = { ...DEFAULT_SCHEDULE_MODEL, preset: "hourly" };
 
-/** Sentinel Select value for "no pinned host" — Radix Select disallows "". */
-const UNSET_HOST = "__unset_host__";
+/** How an older task with no pinned host reads; the task detail page uses the same words. */
+const UNPINNED_HOST_LABEL = "Most recently active host";
 
 /** Sentinel Select value for the "New Sandbox" option (execution_target=managed_sandbox). */
 const SANDBOX_HOST = "__sandbox__";
