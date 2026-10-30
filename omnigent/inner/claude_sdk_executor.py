@@ -925,6 +925,39 @@ def _claude_mcp_auth_statuses() -> dict[str, str]:
     }
 
 
+async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) -> set[str]:
+    """Reconnect the named servers the CLI reports failed; return those to check again."""
+    try:
+        response = await asyncio.wait_for(
+            client.get_mcp_status(), timeout=_MCP_STATUS_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.warning("Reading MCP status before reconnect failed", exc_info=True)
+        return names
+    retry: set[str] = set()
+    servers = response.get("mcpServers")
+    for server in servers if isinstance(servers, list) else []:
+        name = server.get("name") if isinstance(server, Mapping) else None
+        if not isinstance(name, str) or name not in names:
+            continue
+        status = server.get("status")
+        if status == "pending":
+            retry.add(name)
+        if status not in ("failed", "needs-auth"):
+            continue
+        try:
+            await asyncio.wait_for(
+                client.reconnect_mcp_server(name), timeout=_MCP_RECONNECT_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            # Not retried, so a server that hangs cannot stall every later turn.
+            logger.warning("Reconnecting MCP server %r timed out", name)
+        except Exception:
+            logger.warning("Reconnecting MCP server %r failed", name, exc_info=True)
+            retry.add(name)
+    return retry
+
+
 @dataclass(frozen=True)
 class PreparedClaudeCli:
     """Result of wrapping the Claude CLI in an Omnigent sandbox.
@@ -2119,35 +2152,17 @@ class ClaudeSDKExecutor(Executor):
         The CLI connects MCP servers only at startup, so one that failed while its
         sign-in was pending stays failed for the life of the client.
         """
-        previous, state.mcp_auth = state.mcp_auth, _claude_mcp_auth_statuses()
+        current = _claude_mcp_auth_statuses()
         signed_in = {
             name
-            for name, status in state.mcp_auth.items()
-            if status == "connected" and previous.get(name) != "connected"
+            for name, status in current.items()
+            if status == "connected" and state.mcp_auth.get(name) != "connected"
         }
-        if not signed_in:
-            return
-        try:
-            response = await asyncio.wait_for(
-                state.client.get_mcp_status(), timeout=_MCP_STATUS_TIMEOUT_SECONDS
-            )
-        except Exception:
-            logger.warning("Reading MCP status before reconnect failed", exc_info=True)
-            return
-        servers = response.get("mcpServers")
-        for server in servers if isinstance(servers, list) else []:
-            name = server.get("name") if isinstance(server, Mapping) else None
-            if not isinstance(name, str) or name not in signed_in:
-                continue
-            if server.get("status") not in ("failed", "needs-auth"):
-                continue
-            try:
-                await asyncio.wait_for(
-                    state.client.reconnect_mcp_server(name),
-                    timeout=_MCP_RECONNECT_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                logger.warning("Reconnecting MCP server %r failed", name, exc_info=True)
+        retry = (
+            await _reconnect_failed_mcp_servers(state.client, signed_in) if signed_in else set()
+        )
+        # A server left out of the snapshot is checked again next turn.
+        state.mcp_auth = {name: status for name, status in current.items() if name not in retry}
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)

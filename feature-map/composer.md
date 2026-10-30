@@ -120,7 +120,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
-  to the active harness; a claude-sdk session lists the host's Claude servers,
+  to the active harness; a claude-sdk session on a host lists its Claude servers,
   only the organization-managed ones when its agent sets `skills: none`. A host
   lookup failure leaves known agent entries visible. It is absent before a session starts and from side chat. When the
   server has the MCP registry on, each registry service row also shows its
@@ -587,7 +587,8 @@ Other connection providers alone do not enable the managed MCP picker.
   Native host entries must match the active harness; a host error is shown
   without hiding MCPs declared by the bound session agent. While the host loads,
   its loading status stays visible alongside agent entries; a session without a
-  known host shows unavailable status rather than an empty inventory. In a
+  known host shows unavailable status rather than an empty inventory (a claude-sdk session
+  without a host lists only its agent's servers). In a
   claude-sdk session on a host with Claude MCP servers, expect them listed, and
   only the managed ones when the agent sets `skills: none`. Click
   **Go to Settings** and confirm the session’s harness and host are selected.

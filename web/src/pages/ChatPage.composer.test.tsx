@@ -4009,6 +4009,30 @@ describe("Composer MCP status command", () => {
     },
   );
 
+  it("shows only the agent's servers in a claude-sdk session with no host", () => {
+    setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
+    render(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [
+              {
+                id: "agent_sdk",
+                name: "SDK agent",
+                mcp_servers: [{ name: "github", transport: "http", description: "GitHub tools" }],
+              },
+            ],
+          })}
+        />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    expect(screen.getByTestId("mcp-server-row-github")).toHaveTextContent("GitHub tools");
+    expect(screen.queryByText(/Host MCP servers unavailable/)).toBeNull();
+    expect(hostMcpQueryMock).toHaveBeenLastCalledWith(null, false, expect.any(Function));
+  });
+
   it("does not lend a host server's account state to an agent server of the same name", () => {
     composerSessionSnapshot.hostId = "host_native";
     setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });

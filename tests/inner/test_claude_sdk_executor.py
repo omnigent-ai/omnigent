@@ -3720,6 +3720,7 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
 
     status_file = tmp_path / "mcp-auth-status.json"
     monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 0.05)
 
     def report(**statuses: str) -> None:
         entries = [{"harness": "claude", "name": n, "status": s} for n, s in statuses.items()]
@@ -3729,10 +3730,14 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
     live = {
         "notes": "failed",
         "wiki": "needs-auth",
+        "docs": "pending",
+        "slow": "failed",
         "linear": "connected",
         "jira": "failed",
         "codex-docs": "failed",
     }
+    status_unavailable = False
+    fail_once = {"notes"}
     reconnects: list[str] = []
 
     class _StubClient:
@@ -3748,12 +3753,18 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
             pass
 
         async def get_mcp_status(self) -> dict[str, object]:
+            if status_unavailable:
+                raise RuntimeError("control channel busy")
             return {"mcpServers": [{"name": n, "status": s} for n, s in live.items()]}
 
         async def reconnect_mcp_server(self, server_name: str) -> None:
             reconnects.append(server_name)
-            if server_name == "notes":
+            if server_name == "slow":
+                await asyncio.sleep(5)
+            if server_name in fail_once:
+                fail_once.discard(server_name)
                 raise RuntimeError("still unauthorized")
+            live[server_name] = "connected"
 
     class _StubSDK:
         ClaudeSDKClient = _StubClient
@@ -3768,18 +3779,36 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
             model=None,
         )
 
-    report(notes="sign_in_required", wiki="sign_in_required", jira="connected")
+    pending = "sign_in_required"
+    report(notes=pending, wiki=pending, docs=pending, slow=pending, jira="connected")
     client = await start_turn()
     assert await start_turn() is client
     assert reconnects == []
 
-    report(notes="connected", wiki="connected", linear="connected", jira="connected")
-    # A failed reconnect neither fails the turn nor stops the remaining servers.
+    report(
+        notes="connected",
+        wiki="connected",
+        docs="connected",
+        slow="connected",
+        linear="connected",
+        jira="connected",
+    )
+    status_unavailable = True
     assert await start_turn() is client
-    assert reconnects == ["notes", "wiki"]
+    assert reconnects == []
+
+    # A failed reconnect neither fails the turn nor stops the remaining servers.
+    status_unavailable = False
+    assert await start_turn() is client
+    assert reconnects == ["notes", "wiki", "slow"]
+
+    # The failed and still-pending servers are checked again; the timed-out one is not.
+    live["docs"] = "failed"
+    assert await start_turn() is client
+    assert reconnects == ["notes", "wiki", "slow", "notes", "docs"]
 
     assert await start_turn() is client
-    assert reconnects == ["notes", "wiki"]
+    assert reconnects == ["notes", "wiki", "slow", "notes", "docs"]
 
 
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:

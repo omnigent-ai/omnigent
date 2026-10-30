@@ -2527,9 +2527,19 @@ function ComposerImpl(
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
   const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
+  const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
+    composerSessionId === null ? null : getSessionHost(composerSessionId),
+  );
+  const hostMcpRoutingId =
+    sessionRoutingHostId(composerSession?.hostId, composerSession?.labels) ?? inheritedHostId;
   const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
-  // claude-sdk runs the Claude Code CLI, so its /mcp lists the host's Claude servers too.
-  const hostMcpKey = sessionHarness === "claude-sdk" ? "claude" : nativeMcpHarness;
+  // claude-sdk runs the Claude Code CLI, so on a host its /mcp lists the host's Claude servers.
+  const hostMcpKey =
+    sessionHarness === "claude-sdk"
+      ? hostMcpRoutingId !== null
+        ? "claude"
+        : undefined
+      : nativeMcpHarness;
   const hostMcpHarness = hostMcpKey !== undefined && isBrandHarness(hostMcpKey) ? hostMcpKey : null;
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
   // A claude-sdk session run without setting sources (`skills: none`) loads only managed servers.
@@ -2540,11 +2550,6 @@ function ComposerImpl(
       server.harness === hostMcpHarness && (server.managed === true || hostUserServersLoaded),
     [hostMcpHarness, hostUserServersLoaded],
   );
-  const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
-    composerSessionId === null ? null : getSessionHost(composerSessionId),
-  );
-  const hostMcpRoutingId =
-    sessionRoutingHostId(composerSession?.hostId, composerSession?.labels) ?? inheritedHostId;
   // Poll while a host server awaits sign-in: the user completes it elsewhere.
   const hostMcpQuery = useHostMcpServers(
     hostMcpRoutingId,

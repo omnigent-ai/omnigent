@@ -38,7 +38,8 @@ to `connected` updates the row.
 
 Flipping a `claude` entry to `connected` also lets a running claude-sdk session use the
 server: Claude Code connects MCP servers only when the session starts, so at its next
-turn the session reconnects a server that failed to connect before the sign-in.
+turn the session reconnects a server that failed to connect before the sign-in. A server
+the CLI is still connecting, or whose reconnect fails, is checked again at the following turn.
 
 ## Rules the reader enforces
 
