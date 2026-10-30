@@ -1149,6 +1149,8 @@ class SqlComment(OmnigentBase):
     :param created_by: Email of the user who created this comment,
         e.g. ``"alice@example.com"``. ``NULL`` for legacy comments or
         comments created in single-user mode.
+    :param anchor_metadata: Bounded provider-specific coordinates for comments
+        that are not anchored by workspace-file character offsets.
     """
 
     __tablename__ = "comments"
@@ -1182,6 +1184,10 @@ class SqlComment(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger)
     anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    anchor_metadata: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=16_383), nullable=True
+    )
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 

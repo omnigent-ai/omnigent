@@ -551,7 +551,9 @@ function FileViewerBody({
   // marked seen too.
   useEffect(() => {
     if (!open || !commentsOpen || commentsQuery.data === undefined) return;
-    markCommentsSeen(commentsQuery.data.map((c) => c.id));
+    markCommentsSeen(
+      commentsQuery.data.filter((comment) => !comment.anchor_metadata).map((c) => c.id),
+    );
   }, [open, commentsOpen, commentsQuery.data]);
   // Notify parent when comments panel opens or closes (e.g. so the parent
   // can widen the inline panel to fit both the code viewer and comments).
@@ -639,7 +641,10 @@ function FileViewerBody({
 
   const sender = useOptionalCommentSender();
 
-  const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
+  const allComments = useMemo(
+    () => (commentsQuery.data ?? []).filter((comment) => !comment.anchor_metadata),
+    [commentsQuery.data],
+  );
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const [remapFormatted, setRemapFormatted] = useState<
     ((comment: Comment, content: string) => Comment) | null

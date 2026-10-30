@@ -787,8 +787,8 @@ def test_reply_to_inline_review_conversation(
         ],
         "has_more": False,
         "next_cursor": None,
-        "head_sha": "head",
-        "base_sha": "base",
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
     }
     info = {
         **_INFO,
@@ -800,7 +800,7 @@ def test_reply_to_inline_review_conversation(
             "review_thread_replies": True,
             "review_thread_creation": True,
         },
-        "pr": {**_INFO["pr"], "head_sha": "head", "base_sha": "base"},
+        "pr": {**_INFO["pr"], "head_sha": "a" * 40, "base_sha": "b" * 40},
     }
     thread_reads = []
     pending_reads: list[Route] = []
@@ -858,7 +858,7 @@ def test_reply_to_inline_review_conversation(
     page.route(re.compile(r"/resources/github(?:\?|$)"), read_info)
     page.route(
         re.compile(r"/resources/github/diff(?:\?|$)"),
-        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
+        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "a" * 40, "base_sha": "b" * 40}),
     )
     page.route(re.compile(r"/resources/github/review-threads/thread-1/replies$"), reply)
     page.route(re.compile(r"/resources/github/review-threads$"), create_thread)
@@ -870,6 +870,8 @@ def test_reply_to_inline_review_conversation(
 
         _stub_server_info(page, canvas=True, session_pull_requests=True)
     page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
+    main_composer = page.get_by_label("Message the agent", exact=True)
+    main_composer.fill("Please keep the public API stable.")
     panel = (
         page.get_by_test_id("github-panel-drawer")
         if mobile
@@ -1150,6 +1152,50 @@ def test_reply_to_inline_review_conversation(
     ]
     ranged.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-range-posted.png"))
+
+    # Local comments use the session API; provider writes remain unchanged.
+    for side, body in [
+        ("deletions", "Keep the original guard."),
+        ("additions", "Handle empty input."),
+    ]:
+        file.locator(
+            f'[data-code][data-{side}] [data-column-number="2"] [data-line-number-content]'
+        ).click()
+        plus.click()
+        draft.get_by_role("button", name="Local comment", exact=True).click()
+        draft.get_by_role("textbox", name="New review comment").fill(body)
+        tabs.get_by_role("tab", name="Summary", exact=True).click()
+        tabs.get_by_role("tab", name="Changes", exact=False).click()
+        expect(draft.get_by_role("button", name="Local comment", exact=True)).to_have_attribute(
+            "aria-pressed", "true"
+        )
+        draft.get_by_role("button", name="Save local comment", exact=True).click()
+        expect(
+            file.get_by_role("region", name="Local review comment").filter(has_text=body)
+        ).to_be_visible()
+    assert len(new_posts) == 2
+    response = page.request.get(f"{base_url}/v1/sessions/{session_id}/comments")
+    assert response.ok
+    local_comments = response.json()
+    assert len(local_comments) == 2
+    assert {comment["anchor_metadata"]["side"] for comment in local_comments} == {"LEFT", "RIGHT"}
+    batch = panel.get_by_role("button", name="Add 2 local comments to chat", exact=True)
+    expect(batch).to_be_in_viewport()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-local-review.png"))
+    batch.click()
+    if mobile:
+        expect(panel).to_have_attribute("data-state", "closed")
+    expect(main_composer).to_be_visible()
+    expect(main_composer).to_have_value(
+        re.compile(
+            r"^Please keep the public API stable\.\n\nPlease address these local review comments:"
+        )
+    )
+    draft_text = main_composer.input_value()
+    for comment in local_comments:
+        assert f"[Comment {comment['id']}]" in draft_text
+        assert comment["body"] in draft_text
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-local-review-in-chat.png"))
 
 
 # Two additions match "added": the first on line 2, the second on line 4.

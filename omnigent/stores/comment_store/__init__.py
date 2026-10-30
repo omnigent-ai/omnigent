@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 
 from omnigent.entities import Comment, CommentsFingerprint
+from omnigent.entities.comment import PullRequestCommentAnchor
 
 
 class CommentStore(ABC):
@@ -48,6 +49,7 @@ class CommentStore(ABC):
         end_index: int,
         anchor_content: str | None = None,
         created_by: str | None = None,
+        anchor_metadata: PullRequestCommentAnchor | None = None,
     ) -> Comment:
         """Create and persist a new comment.
 
@@ -65,6 +67,8 @@ class CommentStore(ABC):
             not provided.
         :param created_by: Email of the creating user, e.g.
             ``"alice@example.com"``. ``None`` in single-user mode.
+        :param anchor_metadata: Immutable provider-specific coordinates used
+            to locate the comment outside a workspace file, if applicable.
         :returns: The newly created :class:`Comment`.
         """
         ...

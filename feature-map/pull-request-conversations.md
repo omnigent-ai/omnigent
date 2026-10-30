@@ -1,7 +1,8 @@
 # Pull request conversations
 
 Read, reply to and start GitHub review conversations beside the code in a pull
-request's Changes subtab. Top-level comments, commits and force pushes appear
+request's Changes subtab. Save local session comments alongside them and prepare
+a batch for the agent in chat. Top-level comments, commits and force pushes appear
 together in Comments.
 
 ## Sub-features
@@ -28,6 +29,10 @@ together in Comments.
   unresolved navigation and original context for unplaceable conversations.
   Conversations on files hidden by the path filter are hidden with their file.
   Navigating to one clears the filter and shows **Filter cleared to show <file>**.
+- `local-review`: Save session-only comments on either diff side, edit/delete or
+  mark them addressed. **Add to chat · N** appends all open local comments for
+  this PR to the session composer, preserving existing text and attachments.
+  The user reviews the generated references and sends the message separately.
 - `file-controls`: The sidebar **Filter changed files** input (on narrow screens a
   toolbar button opens it above the list; hiding it clears the filter). Escape
   clears it, and **Clear filter** restores the list. Each file header has a
@@ -102,6 +107,19 @@ render exception in the panel and open it through each entry above. Confirm
 chat, Workspace tabs or mobile Close still work; clear the fault and choose
 **Try again**. Also navigate to another session and confirm recovery.
 
+For local review, use any of the four entry points above, select a diff line,
+choose **Local comment**, and save comments on two files. Reload and confirm
+both remain. Click **Add to chat · 2** with an existing chat draft: its text and
+attachments should remain, both comment references should be appended, and no
+message should be sent yet. Mark a comment addressed and confirm the count
+decreases. Switch PRs and sessions to check isolation. After a new commit,
+verify earlier comments retain their old line references. Repeat in split and
+unified layouts and on mobile, where the drawer should close on Add to chat.
+
+The four browser variants also save local comments on both diff sides,
+cross-check session storage through the REST API, and append both comments to
+an existing chat draft. Provider write counts remain unchanged.
+
 For a live check, use a disposable GitHub PR with current, old-side, resolved
 and outdated threads. Open Changes, compare both layouts to GitHub, focus the
 reply input and type a draft. Cancel, reopen and confirm the text survives.
@@ -125,6 +143,10 @@ outdated thread and confirm the suggestion uses its labeled original context.
   Timeline-only reads may be cached for 30 seconds; comments still refresh normally.
 - Session file comments addressed to the agent and PR top-level comments are
   separate features. Review replies publish immediately, without a draft review.
+- Local review comments reuse session comment storage, with immutable PR
+  coordinates in `anchor_metadata` separate from Files character offsets. They
+  persist across reloads and are never posted to GitHub. Batches are scoped to
+  the current PR; Files comments are not included.
 - Older history refreshes on demand; a first-page poll does not refresh every page.
 - Hidden-context and outdated conversations use an explicit original snippet;
   they are never attached to an unrelated current line.
