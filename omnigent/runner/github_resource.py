@@ -403,6 +403,21 @@ def _classify_check(check: dict[str, Any]) -> str:
     return "passing" if conclusion in ("SUCCESS", "NEUTRAL") else "failing"
 
 
+def _latest_checks(rollup: list[Any]) -> list[dict[str, Any]]:
+    """Keep each check's newest entry; a re-triggered workflow leaves stale runs behind."""
+    latest: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for check in rollup:
+        if not isinstance(check, dict):
+            continue
+        # ponytail: gh's export omits the trigger event, so one workflow's push and
+        # pull_request runs on a commit collapse too; key on the event if that matters.
+        key = (check.get("workflowName"), check.get("name"), check.get("context"))
+        kept = latest.get(key)
+        if kept is None or str(check.get("startedAt") or "") >= str(kept.get("startedAt") or ""):
+            latest[key] = check
+    return list(latest.values())
+
+
 def _summarize_checks(rollup: Any) -> dict[str, Any]:
     """Summarize a ``statusCheckRollup`` into bucket counts + per-check details.
 
@@ -412,9 +427,7 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     counts = {"passing": 0, "failing": 0, "pending": 0, "cancelled": 0, "skipped": 0}
     runs: list[dict[str, Any]] = []
     if isinstance(rollup, list):
-        for check in rollup:
-            if not isinstance(check, dict):
-                continue
+        for check in _latest_checks(rollup):
             bucket = _classify_check(check)
             counts[bucket] += 1
             if len(runs) < _MAX_CHECK_RUNS:

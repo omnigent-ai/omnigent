@@ -962,6 +962,54 @@ def test_summarize_checks_mixed() -> None:
     assert {"name": "skipped job", "bucket": "skipped", "url": None} in result["runs"]
 
 
+def test_summarize_checks_keeps_latest_run_per_check() -> None:
+    """A re-triggered workflow's stale runs drop out; other workflows' same-named jobs stay."""
+    rollup = [
+        # The superseded run's always() aggregator failed after the cancel.
+        {
+            "workflowName": "Docker",
+            "name": "result",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "startedAt": "2026-10-30T22:08:12Z",
+            "detailsUrl": "old",
+        },
+        {
+            "workflowName": "Docker",
+            "name": "result",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "startedAt": "2026-10-30T22:12:07Z",
+            "detailsUrl": "new",
+        },
+        # The newer run wins even when GitHub lists it first.
+        {
+            "workflowName": "CI",
+            "name": "pytest",
+            "status": "IN_PROGRESS",
+            "startedAt": "2026-10-30T22:09:21Z",
+        },
+        {
+            "workflowName": "CI",
+            "name": "pytest",
+            "status": "COMPLETED",
+            "conclusion": "CANCELLED",
+            "startedAt": "2026-10-30T22:08:09Z",
+        },
+        {
+            "workflowName": "Lint",
+            "name": "result",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "startedAt": "2026-10-30T22:08:12Z",
+        },
+    ]
+    result = _summarize_checks(rollup)
+    assert (result["passing"], result["failing"], result["pending"]) == (1, 1, 1)
+    assert (result["cancelled"], result["total"]) == (0, 3)
+    assert {"name": "result", "bucket": "passing", "url": "new"} in result["runs"]
+
+
 def test_summarize_checks_empty() -> None:
     """A missing/empty rollup summarizes to all zeros with no runs."""
     assert _summarize_checks(None) == {
