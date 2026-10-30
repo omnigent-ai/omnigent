@@ -1730,8 +1730,8 @@ async def _send_to_in_flight_child(
             f"Held the message for sub-agent {agent!r} title {title!r}: its terminal is "
             "waiting on a prompt or dialog (e.g. a permission approval), so the message "
             "has not been delivered yet. It is delivered once that prompt is resolved; "
-            "resending queues another copy. sys_session_get_info lists it under "
-            "pending_inputs until then, and the turn's result still arrives via "
+            "resending queues another copy. sys_session_get_info shows the currently "
+            "retained pending_inputs, and the turn's result still arrives via "
             "sys_read_inbox."
         )
     else:

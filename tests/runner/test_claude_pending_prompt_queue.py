@@ -144,6 +144,27 @@ async def test_question_buffers_messages_and_resumes_fifo(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_open", [True, False])
+async def test_active_turn_reply_reports_pending_prompt_hold(
+    prompt_open: bool, pending_prompt: dict[str, bool]
+) -> None:
+    """A delivery turn waiting on a question still reports follow-ups as held."""
+    app, harness = _build_app()
+    sid = uuid.uuid4().hex
+    pending_prompt["pending"] = prompt_open
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        app.state.active_turns[sid] = None
+        response = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
+        assert response.status_code == 202
+        assert response.json()["status"] == "buffered"
+        expected_reason = PENDING_PROMPT_HOLD_REASON if prompt_open else None
+        assert response.json().get("reason") == expected_reason
+        assert len(app.state.session_message_buffers[sid]) == 1
+        assert harness.posted_bodies == []
+
+
+@pytest.mark.asyncio
 async def test_each_buffered_drain_checks_for_new_question(
     pending_prompt: dict[str, bool],
 ) -> None:
@@ -288,7 +309,7 @@ async def test_stop_during_drain_probe_does_not_restart_session(
         calls += 1
         if from_waiter and calls == 1:
             return True
-        if calls == (3 if from_waiter else 1):
+        if calls == (3 if from_waiter else 2):
             probe_started.set()
             assert release_probe.wait(5)
         return False

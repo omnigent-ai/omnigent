@@ -708,7 +708,7 @@ class SysSessionGetInfoTool(Tool):
             "host + configured harness readiness, reasoning effort, model, "
             "parent session, workspace, "
             "persisted last-activity time, outstanding approval "
-            "prompts, and messages it has not consumed yet (pending_inputs). "
+            "prompts, and recently queued messages it has not consumed yet (pending_inputs). "
             "Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
