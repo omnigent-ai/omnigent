@@ -260,6 +260,13 @@ describe("parseJsonLoose", () => {
 });
 
 describe("matchesServer", () => {
+  for (const field of ["server_url", "target", "resolved_server_url"]) {
+    it(`matches loopback aliases in ${field} without matching a different port`, () => {
+      const record = { [field]: "http://localhost:6767" };
+      assert.equal(matchesServer(record, "http://127.0.0.1:6767"), true);
+      assert.equal(matchesServer(record, "http://127.0.0.1:6768"), false);
+    });
+  }
   it("matches on server_url or target, ignoring trailing slashes", () => {
     assert.equal(matchesServer({ server_url: "https://x.com/" }, "https://x.com"), true);
     assert.equal(matchesServer({ target: "https://x.com" }, "https://x.com/"), true);

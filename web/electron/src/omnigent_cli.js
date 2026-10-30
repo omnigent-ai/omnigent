@@ -814,25 +814,14 @@ async function stopHost(cliPath, serverUrl) {
   return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
 }
 
-/**
- * True when a daemon record refers to the given server URL. Compares its
- * `server_url`, `target`, AND `resolved_server_url` (after trailing-slash
- * normalization) — the last matters for a local-mode daemon (target `"local"`,
- * server_url null) whose loopback URL only appears as `resolved_server_url`, so
- * connecting by that loopback URL still recognizes it.
- *
- * @param {Record<string, unknown>} daemon One entry from the daemons array.
- * @param {string} serverUrl
- * @returns {boolean}
- */
+/** True when any recorded server URL matches, including loopback aliases.
+ * Local-mode records may carry the URL only in resolved_server_url. */
 function matchesServer(daemon, serverUrl) {
   if (!daemon || typeof daemon !== "object") return false;
   const want = normalizeServerUrl(serverUrl);
   if (want === "") return false;
-  return (
-    normalizeServerUrl(daemon.server_url) === want ||
-    normalizeServerUrl(daemon.target) === want ||
-    normalizeServerUrl(daemon.resolved_server_url) === want
+  return [daemon.server_url, daemon.target, daemon.resolved_server_url].some(
+    (field) => normalizeServerUrl(field) === want || sameLoopbackServer(field, serverUrl),
   );
 }
 
@@ -1156,12 +1145,7 @@ async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000
 function liveDaemonRecordFor(serverUrl) {
   return (
     readDaemonRecords().find(
-      (record) =>
-        isPidAlive(record.pid) &&
-        (matchesServer(record, serverUrl) ||
-          [record.server_url, record.target, record.resolved_server_url].some((field) =>
-            sameLoopbackServer(field, serverUrl),
-          )),
+      (record) => isPidAlive(record.pid) && matchesServer(record, serverUrl),
     ) ?? null
   );
 }

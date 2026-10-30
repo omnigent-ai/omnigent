@@ -77,7 +77,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
-const { isHostThisMachine } = require("./hostIdentity");
+const { isHostThisMachine, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -125,8 +125,6 @@ const omnigentCli = require("./omnigent_cli");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
-
-const SESSION_HOST_PROTOCOL = 1;
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");

@@ -72,6 +72,8 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     const tabId = randomUUID();
     newViewId = browserViewId(conversationId, tabId);
     const hostId = await fetchSessionHostId(conversationId);
+    // Chat and file content can come from an agent, so their links use the
+    // agent policy even when a user clicks them.
     const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, {
       agent: true,
       ...navigationHostOptions(hostId),

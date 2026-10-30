@@ -1,12 +1,14 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type * as NativeBridge from "@/lib/nativeBridge";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { BrowserPane } from "./BrowserPane";
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
 // unsupported-shell (returns null) path is covered by reading the early return.
-vi.mock("@/lib/fetchSessionHostId", () => ({ fetchSessionHostId: vi.fn() }));
+const getSessionSlim = vi.fn();
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
 
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridge>()),
@@ -62,7 +64,11 @@ function installBridge(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
-  vi.mocked(fetchSessionHostId).mockResolvedValue(null);
+  getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
+    id,
+    hostId: null,
+    parentSessionId: null,
+  }));
   // jsdom has no ResizeObserver; the measuring-container effect (viewActive path)
   // constructs one. Stub it so mounting the container doesn't throw.
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
@@ -330,7 +336,11 @@ describe("BrowserPane design-mode toggle", () => {
 
 describe("BrowserPane toolbar navigation + URL bar", () => {
   it("sends the owning session host and protocol for a manually typed localhost preview", async () => {
-    vi.mocked(fetchSessionHostId).mockResolvedValue("local-host");
+    getSessionSlim.mockResolvedValue({
+      id: "conv_preview",
+      hostId: "local-host",
+      parentSessionId: null,
+    });
     const bridge = installBridge();
     render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
     const bar = screen.getByRole("textbox", { name: "Address bar" });
@@ -345,7 +355,7 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
         { force: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
       ),
     );
-    expect(fetchSessionHostId).toHaveBeenCalledWith("conv_preview");
+    expect(getSessionSlim).toHaveBeenCalledWith("conv_preview");
     expect(bar).toHaveValue("http://localhost:5273/preview");
   });
 
@@ -382,6 +392,29 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /reload/i })).not.toBeDisabled());
     return { bridge, fireUrl: () => fireUrl, fireNav: () => fireNav };
   }
+
+  it("resolves the current host on address-bar navigation after the session moves", async () => {
+    getSessionSlim
+      .mockResolvedValueOnce({ id: "conv_preview", hostId: "local-host", parentSessionId: null })
+      .mockResolvedValue({ id: "conv_preview", hostId: "remote-host", parentSessionId: null });
+    const bridge = installBridge();
+    render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+    const bar = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.change(bar, { target: { value: "http://127.0.0.1:5173/before" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await waitFor(() => expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+    fireEvent.change(bar, { target: { value: "http://127.0.0.1:5173/after" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+        "browser-tab:conv_preview:two",
+        "http://127.0.0.1:5173/after",
+        undefined,
+        { force: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
+      ),
+    );
+    expect(getSessionSlim).toHaveBeenCalledTimes(2);
+  });
 
   it("reload button calls the reload IPC once a view is active", async () => {
     const { bridge } = await renderActive("conv_reload");

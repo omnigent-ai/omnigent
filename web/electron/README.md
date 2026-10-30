@@ -508,10 +508,7 @@ request. Both an updated desktop and web bundle are required; older web bundles
 remain public-only without destroying existing views.
 
 Other remote and unknown sessions have public-only **document** access. Use a
-public preview URL or your regular browser. The verified Arca exception below
-also applies to the address bar and chat/file links; Companion or another
-external tool must forward the remote app's port to the desktop first.
-Omnigent does not establish forwarding or verify who owns a local endpoint.
+public preview URL or your regular browser.
 
 Eligibility is per view: a public page in an eligible view can frame loopback
 documents too. Private networks, link-local/metadata addresses, `*.localhost`,
@@ -523,6 +520,10 @@ Closing the tab destroys it. User-created Browser tabs are separate from the
 session's agent browser view and are not targeted by the agent relay.
 
 ### Agent previews on Arca
+
+The verified Arca exception also applies to the address bar and chat/file links.
+Companion or another external tool must forward the remote app's port to the
+desktop first.
 
 On a Databricks-managed server with internal desktop features enabled, an
 Arca session's agent can open and inspect an app through Companion forwarding
@@ -549,10 +550,10 @@ a mismatch requires consent and is offered only when the host list identifies
 the source as Arca, so an incorrect remembered host can be recaptured and
 corrected without prompting from sandbox sessions. Both paths verify that the
 captured host ID matches the source session. Consent or auto-connect opt-in, the
-captured identity check, and the agent-context gate remain the trust boundaries. A decline briefly
-suppresses repeat prompts, while failed runs remain retryable. **Run on Arca** is
-hidden for an online remembered host only when the desktop advertises preview
-recovery; older shells keep the action visible.
+captured identity check, and the agent-context gate remain the trust boundaries.
+A decline briefly suppresses repeat prompts, while failed runs remain retryable.
+**Run on Arca** is hidden for an online remembered host only when the desktop
+advertises preview recovery; older shells keep the action visible.
 
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
 redirects and links that would open a new window (which stay in the same pane).
@@ -734,8 +735,9 @@ the native view); no server flag.
 All renderer IPC navigation uses the same URL policy, including the URL bar.
 A renderer's `agent: false` flag does not exempt a tab from address checks.
 Main-owned eligibility for sessions on this machine and verified Arca sessions
-applies to exact loopback hosts. Other internal sites must be opened in a separate browser; this also keeps later redirects in these tabs
-under the same policy.
+applies to exact loopback hosts. Other internal sites must be opened in a
+separate browser; this also keeps later redirects in these tabs under the same
+policy.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the

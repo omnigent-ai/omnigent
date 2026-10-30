@@ -3,12 +3,14 @@ import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
-import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
-vi.mock("@/lib/fetchSessionHostId", () => ({ fetchSessionHostId: vi.fn() }));
+const getSessionSlim = vi.fn();
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
 
 const CONV = "conv-1";
 const URL_ = "https://example.com/page";
@@ -20,7 +22,11 @@ let surfaced: { conversationId: string; tabId: string }[];
 let unsubscribe: () => void;
 
 beforeEach(() => {
-  vi.mocked(fetchSessionHostId).mockResolvedValue("local-host");
+  getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
+    id,
+    hostId: "local-host",
+    parentSessionId: null,
+  }));
   openOrNavigate = vi.fn().mockResolvedValue({ ok: true });
   hasView = vi.fn().mockResolvedValue({ exists: false });
   closeView = vi.fn().mockResolvedValue({ ok: true });
@@ -256,12 +262,30 @@ it.each([
 });
 
 it("omits host options when the owning session has no resolvable host", async () => {
-  vi.mocked(fetchSessionHostId).mockResolvedValue(null);
+  getSessionSlim.mockRejectedValue(new Error("host unavailable"));
   maybeOpenLinkInApp(CONV, URL_);
   await vi.waitFor(() =>
     expect(openOrNavigate).toHaveBeenCalledWith(expect.any(String), URL_, undefined, {
       agent: true,
     }),
   );
-  expect(fetchSessionHostId).toHaveBeenCalledWith(CONV);
+  expect(getSessionSlim).toHaveBeenCalledWith(CONV);
+});
+
+it("resolves the current host for a new link after the session moves", async () => {
+  getSessionSlim
+    .mockResolvedValueOnce({ id: CONV, hostId: "local-host", parentSessionId: null })
+    .mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
+  maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/before");
+  await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+  maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/after");
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenLastCalledWith(
+      expect.any(String),
+      "http://127.0.0.1:5173/after",
+      undefined,
+      { agent: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
+    ),
+  );
+  expect(getSessionSlim).toHaveBeenCalledTimes(2);
 });

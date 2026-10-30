@@ -61,6 +61,7 @@ function jsonResponse(body: unknown, ok = true): Response {
 function installBridge(overrides: Record<string, unknown> = {}) {
   const bridge = {
     browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, created: true }),
+    browserHasView: vi.fn().mockResolvedValue({ exists: true, hostIsThisMachine: false }),
     browserScreenshot: vi
       .fn()
       .mockResolvedValue({ ok: true, dataUrl: "data:image/png;base64,AAA" }),
@@ -383,28 +384,33 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     );
   });
 
-  it("uses an authoritative cached child snapshot without refetching or trusting parent hints", async () => {
+  it("uses the current remote host after a move despite another window's cached local host", async () => {
     const bridge = installBridge();
     const client = new QueryClient();
     client.setQueryData(["session", "conv_background_A"], {
       id: "conv_background_A",
-      hostId: "other-host",
+      hostId: "local-host",
       parentSessionId: "parent",
     });
     setSessionHost("parent", "arca-host");
     setSessionParent("conv_background_A", "parent");
+    getSessionSlim.mockResolvedValue({
+      id: "conv_background_A",
+      hostId: "remote-host",
+      parentSessionId: "parent",
+    });
     renderRelay(CONV, client);
     emitBrowserActionRequest(
       actionEvent("navigate", { url: "http://localhost:5173" }),
       "conv_background_A",
     );
     await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
-    expect(getSessionSlim).not.toHaveBeenCalled();
+    expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith("conv_background_A");
     expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
       "conv_background_A",
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "other-host", sessionHostProtocol: 1 },
+      { force: true, agent: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
     );
   });
 
@@ -428,7 +434,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     );
   });
 
-  it("inherits only through authoritative hostless hops and reuses cached ancestor snapshots", async () => {
+  it("revalidates every hostless ancestry hop despite cached ancestor snapshots", async () => {
     const bridge = installBridge();
     const client = new QueryClient();
     client.setQueryData(["session", "middle"], {
@@ -441,20 +447,18 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       hostId: "arca-host",
       parentSessionId: null,
     });
-    const fetchQuery = vi.spyOn(client, "fetchQuery");
     setSessionParent(CONV, "middle");
     setSessionParent("middle", "root");
     setSessionHost("root", "arca-host");
-    getSessionSlim.mockResolvedValue({ id: CONV, hostId: null, parentSessionId: "middle" });
+    getSessionSlim.mockImplementation(async (id: string) => ({
+      id,
+      hostId: id === "root" ? "arca-host" : null,
+      parentSessionId: id === CONV ? "middle" : id === "middle" ? "root" : null,
+    }));
     renderRelay(CONV, client);
     emitBrowserActionRequest(actionEvent("navigate", { url: "http://localhost:5173" }), CONV);
     await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
-    expect(fetchQuery.mock.calls.map(([query]) => query.queryKey)).toEqual([
-      ["session", CONV],
-      ["session", "middle"],
-      ["session", "root"],
-    ]);
-    expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual([CONV]);
+    expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual([CONV, "middle", "root"]);
     expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
       CONV,
       "http://localhost:5173",
@@ -789,6 +793,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     async (action) => {
       const bridge = installBridge({
         browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, hostIsThisMachine: true }),
+        browserHasView: vi.fn().mockResolvedValue({ exists: true, hostIsThisMachine: true }),
         browserPerformAction: vi.fn().mockResolvedValue({ ok: true, result: "{}" }),
       });
       const client = new QueryClient();
@@ -797,13 +802,14 @@ describe("useBrowserAgentRelay — privileged reads", () => {
         hostId: "local-host",
         parentSessionId: null,
       });
+      getSessionSlim.mockResolvedValue({ id: CONV, hostId: "local-host", parentSessionId: null });
       renderRelay(CONV, client);
       emitBrowserActionRequest(
         actionEvent("navigate", { url: "http://127.0.0.1:5173" }, "nav"),
         CONV,
       );
       await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
-      expect(getSessionSlim).not.toHaveBeenCalled();
+      expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
       getSessionSlim.mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
       emitBrowserActionRequest(actionEvent(action, { ref: "e1", text: "hello" }, "read"), CONV);
       const opts = { sessionHostProtocol: 1, sourceHostId: "remote-host" };
@@ -818,7 +824,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
             opts,
           );
       });
-      expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
+      expect(getSessionSlim).toHaveBeenCalledTimes(2);
     },
   );
 
@@ -854,6 +860,25 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
       sessionHostProtocol: 1,
       sourceHostId: null,
+    });
+  });
+
+  it("revalidates the host when the view privilege probe rejects", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockRejectedValue(new Error("view unavailable")),
+    });
+    const client = new QueryClient();
+    client.setQueryData(["session", CONV], {
+      id: CONV,
+      hostId: "local-host",
+      parentSessionId: null,
+    });
+    getSessionSlim.mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
+    await runAction(actionEvent("screenshot"), { client });
+    expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
+    expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
+      sessionHostProtocol: 1,
+      sourceHostId: "remote-host",
     });
   });
 });

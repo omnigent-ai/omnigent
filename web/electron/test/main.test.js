@@ -646,6 +646,7 @@ function loadNavigationHarness({
       WEB_SCHEMES: new Set(),
     },
     "./hostIdentity": {
+      ...require("../src/hostIdentity"),
       isHostThisMachine: (context) =>
         require("../src/hostIdentity").isHostThisMachine(context, localHostCli),
     },

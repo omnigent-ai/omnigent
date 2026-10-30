@@ -123,7 +123,6 @@ async function dispatch(
   sourceHostId: string | null,
   rememberedArcaHostId: string | null,
   sourceIsArcaHost: boolean,
-  privilegedViews: Set<string>,
   readHostOptions?: BrowserHostOptions,
 ): Promise<ActionResult> {
   try {
@@ -144,8 +143,6 @@ async function dispatch(
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
-        if (r.hostIsThisMachine) privilegedViews.add(conversationId);
-        else privilegedViews.delete(conversationId);
         if (
           isLoopbackPreview(url) &&
           sourceHostId &&
@@ -265,7 +262,6 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
     if (!supportsBrowser()) return;
 
     let cancelled = false;
-    const privilegedViews = new Set<string>();
     const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
       if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
@@ -273,22 +269,24 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const isRead = ["screenshot", "snapshot", "click", "type"].includes(evt.action);
-      if (isRead && desktop.browserHasView) {
+      const needsHostRevalidation = ["screenshot", "snapshot", "click", "type"].includes(
+        evt.action,
+      );
+      let privilegedView = true;
+      if (needsHostRevalidation && desktop.browserHasView) {
         try {
           const view = await desktop.browserHasView(sourceConversationId);
-          if (view.hostIsThisMachine) privilegedViews.add(sourceConversationId);
+          privilegedView = view.hostIsThisMachine === true;
         } catch {
-          // A failed probe must not let a formerly local view use stale host data.
-          privilegedViews.add(sourceConversationId);
+          // A failed probe requires current host metadata before acting.
         }
       }
-      const fresh = isRead && privilegedViews.has(sourceConversationId);
+      const revalidateHost = needsHostRevalidation && privilegedView;
       const sourceHostId =
-        evt.action === "navigate" || fresh
-          ? await fetchSessionHostId(sourceConversationId, { queryClient, fresh })
+        evt.action === "navigate" || revalidateHost
+          ? await fetchSessionHostId(sourceConversationId, { queryClient })
           : null;
-      const readHostOptions = fresh
+      const readHostOptions = revalidateHost
         ? { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId }
         : undefined;
       const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
@@ -311,7 +309,6 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
             sourceHostId,
             rememberedArcaHostId,
             sourceIsArcaHost,
-            privilegedViews,
             readHostOptions,
           );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);

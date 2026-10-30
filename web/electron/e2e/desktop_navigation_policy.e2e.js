@@ -363,7 +363,9 @@ it(
     const recordDir =
       process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
       fs.mkdtempSync(path.join(os.tmpdir(), "omni-localhost-recordings-"));
-    const fixture = http.createServer((_request, response) => {
+    let previewLoads = 0;
+    const fixture = http.createServer((request, response) => {
+      if (request.url === "/") previewLoads++;
       response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
       response.end("<title>This machine preview</title><h1>Localhost preview works</h1>");
     });
@@ -397,11 +399,12 @@ it(
         env: { HOME: machineHome, OMNIGENT_CONFIG_HOME: stateDir },
       });
       const { window, electronApp } = desktop;
+      let sessionIsLocal = true;
       await window.route(/\/v1\/sessions\/[a-f0-9]+(?:\?.*)?$/, async (route) => {
         if (route.request().method() !== "GET") return route.continue();
         const response = await route.fetch();
         const body = await response.json();
-        const local = body.id === backend.sessionId;
+        const local = body.id === backend.sessionId && sessionIsLocal;
         await route.fulfill({
           response,
           json: { ...body, host_id: local ? hostId : "b".repeat(32) },
@@ -451,6 +454,12 @@ it(
         return entry.view.webContents.executeJavaScript("document.body.innerText");
       }, backend.sessionId);
       assert.match(content, /Localhost preview works/);
+      const loadsBeforeMove = previewLoads;
+      sessionIsLocal = false;
+      const moved = await action(backend.sessionId);
+      assert.equal(moved.ok, false, JSON.stringify(moved));
+      assert.match(moved.error, /blocked/i);
+      assert.equal(previewLoads, loadsBeforeMove, "a moved session sends no loopback request");
       await window.goto(`${backend.serverUrl}/c/${backend.otherSessionId}`);
       await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
       const denied = await action(backend.otherSessionId);
