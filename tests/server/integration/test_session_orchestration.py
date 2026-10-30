@@ -22,11 +22,9 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
-from tests.server.integration.test_managed_startup_inputs import (
-    startup_permissions as startup_permissions,
-)
 from tests.server.integration.test_sessions_attribution import _bind_runner
 from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
 from tests.server.integration.test_sessions_permissions import _create_session_as
@@ -35,6 +33,17 @@ from tests.server.integration.test_sessions_subagent_context import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+class LegacyPermissionStore(SqlAlchemyPermissionStore):
+    """Reuse the SQL backend for the old interface, leaving the new check unimplemented."""
+
+    has_other_write_grants = PermissionStore.has_other_write_grants
+
+
+@pytest.fixture
+def startup_permissions(db_uri, request):
+    return getattr(request, "param", SqlAlchemyPermissionStore)(db_uri)
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +91,9 @@ async def _send(client, source, target, message="Please inspect the PR", *, requ
 @pytest.mark.parametrize("policy_denied", [False, True])
 @pytest.mark.parametrize("delegation_policy", ["requester", "no_edit_sharing"])
 @pytest.mark.parametrize(
+    "startup_permissions", [SqlAlchemyPermissionStore, LegacyPermissionStore], indirect=True
+)
+@pytest.mark.parametrize(
     "orchestration_environment",
     [None, "", "usage_page", "-session_orchestration"],
     indirect=True,
@@ -94,6 +106,7 @@ async def test_private_sender_can_message_shared_receiver(
     policy_denied,
     orchestration_environment,
     delegation_policy,
+    startup_permissions,
 ):
     from omnigent.server.routes.sessions import routes_events
 
@@ -116,6 +129,31 @@ async def test_private_sender_can_message_shared_receiver(
     result = await _send(auth_client, source, target, requester=requester)
     if orchestration_environment == "-session_orchestration":
         assert "Session orchestration is disabled" in result["detail"]
+        assert not captured.get("posts")
+        return
+    if (
+        isinstance(startup_permissions, LegacyPermissionStore)
+        and delegation_policy == "no_edit_sharing"
+    ):
+        assert result["error"] == "Session message refused", result
+        assert json.loads(result["detail"])["error"]["code"] == "forbidden"
+        assert "Implement PermissionStore.has_other_write_grants" in result["detail"]
+        assert not captured.get("posts")
+        store = SqlAlchemyConversationStore(db_uri)
+        assert store.list_pending_inputs(target["id"]) == []
+        before = {session.id for session in store.list_conversations().data}
+        for route in ("/v1/sessions", "/v1/sessions/orchestrated"):
+            response = await auth_client.post(
+                route,
+                headers={
+                    ORCHESTRATION_SOURCE_HEADER: source["id"],
+                    REQUESTER_HEADER: requester.model_dump_json(),
+                },
+                json={"agent_id": source["agent_id"]},
+            )
+            assert response.status_code == 403, response.text
+            assert "Implement PermissionStore.has_other_write_grants" in response.text
+        assert {session.id for session in store.list_conversations().data} == before
         assert not captured.get("posts")
         return
     if policy_denied:
