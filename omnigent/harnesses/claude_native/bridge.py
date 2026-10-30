@@ -5914,7 +5914,9 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     return _ClaudePaneState(None)
 
 
-def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
+def _request_claude_repaint(
+    socket_path: str, tmux_target: str, bridge_dir: Path | None = None
+) -> int:
     """
     Ask Claude Code to redraw its whole screen.
 
@@ -5928,9 +5930,15 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     without a handler ignores it, so the whole tree under the pane gets it: a
     launcher may run Claude Code as its child.
 
+    A launcher may also run Claude Code outside that tree: isaac's fast launch
+    pumps the pane to a pre-started worker's terminal. Claude Code's session
+    registry still names its process, so that process gets the signal too.
+
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge directory whose Claude session the registry
+        is searched for, or ``None`` to signal only the pane's tree.
     :returns: How many processes were signalled; ``0`` when the pane's
         process could not be found.
     """
@@ -5938,6 +5946,8 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     import subprocess
 
     import psutil
+
+    from omnigent.harnesses.claude_native.status_file import session_pids
 
     if IS_WINDOWS:
         return 0
@@ -5960,6 +5970,13 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
         tree = [root, *root.children(recursive=True)]
     except psutil.Error:
         return 0
+    claude_session_id = read_claude_session_id(bridge_dir) if bridge_dir is not None else None
+    if claude_session_id is not None:
+        in_tree = {process.pid for process in tree}
+        for pid in session_pids(claude_session_id):
+            if pid not in in_tree:
+                with contextlib.suppress(psutil.Error):
+                    tree.append(psutil.Process(pid))
     signalled = 0
     for process in tree:
         with contextlib.suppress(psutil.Error):
@@ -7103,7 +7120,7 @@ def _wait_for_claude_prompt_ready(
         if now >= next_repaint:
             # Output from another process can hide a live composer until
             # Claude Code repaints.
-            if _request_claude_repaint(socket_path, tmux_target):
+            if _request_claude_repaint(socket_path, tmux_target, bridge_dir):
                 repaint_requests += 1
                 delivery_diagnostics.record_readiness(prompt_repaint_requests=repaint_requests)
             next_repaint = time.monotonic() + _CLAUDE_REPAINT_INTERVAL_S

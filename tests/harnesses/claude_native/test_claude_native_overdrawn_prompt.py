@@ -60,7 +60,7 @@ def test_prompt_wait_repaints_an_overdrawn_composer(
 ) -> None:
     repainted_at: list[float] = []
 
-    def repaint(socket_path: str, tmux_target: str) -> int:
+    def repaint(socket_path: str, tmux_target: str, bridge_dir: Path | None = None) -> int:
         repainted_at.append(clock.now)
         return 1
 
@@ -267,3 +267,67 @@ def test_real_overdrawn_composer_is_repainted_before_the_wait_gives_up(
     bridge._wait_for_claude_prompt_ready(socket_path, "main", timeout_s=1.0)
 
     assert marker.read_text().splitlines() == ["drawn", "drawn"]
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.timeout(30)
+def test_repaint_reaches_a_claude_outside_the_pane_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The repaint reaches a Claude Code that a launcher runs outside the pane's tree.
+
+    isaac's fast launch leaves only a relay in the pane while Claude Code runs on a
+    pre-started worker's terminal; its session registry still names the process.
+    """
+    script = tmp_path / "tui.py"
+    script.write_text(_REPAINTING_TUI)
+    marker = tmp_path / "draws"
+    config_dir = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "state.json").write_text('{"claude_session_id": "sid-1"}')
+    with tempfile.TemporaryDirectory(prefix="claude-relay-", dir="/tmp") as directory:
+        socket_path = str(Path(directory) / "tmux.sock")
+        tmux = ["tmux", "-S", socket_path]
+        tui: subprocess.Popen[bytes] | None = None
+        try:
+            subprocess.run(
+                [*tmux, "-f", "/dev/null", "new-session", "-d", "-s", "main", "sleep 600"],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
+            pane_tty = subprocess.run(
+                [*tmux, "display-message", "-p", "-t", "main", "#{pane_tty}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            with open(pane_tty, "wb") as terminal:
+                tui = subprocess.Popen(
+                    [sys.executable, str(script), str(marker)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=terminal,
+                )
+            (config_dir / "sessions").mkdir(parents=True)
+            (config_dir / "sessions" / f"{tui.pid}.json").write_text(
+                '{"sessionId": "sid-1", "kind": "interactive"}'
+            )
+            _wait_until(lambda: marker.exists(), "test TUI never drew")
+
+            # The pane's own tree is only the idle relay stand-in.
+            assert bridge._request_claude_repaint(socket_path, "main") == 1
+            assert bridge._request_claude_repaint(socket_path, "main", bridge_dir) == 2
+            _wait_until(
+                lambda: marker.read_text().splitlines() == ["drawn", "drawn"],
+                "the registry-named process was not repainted",
+            )
+        finally:
+            if tui is not None:
+                tui.kill()
+                tui.wait(timeout=5)
+            with contextlib.suppress(subprocess.SubprocessError):
+                subprocess.run([*tmux, "kill-server"], capture_output=True, timeout=5)
