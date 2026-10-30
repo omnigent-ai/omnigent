@@ -76,7 +76,9 @@ def macos_account(monkeypatch: pytest.MonkeyPatch) -> Callable[[list[int]], None
     return _set_groups
 
 
-def _configure_and_record(returncode: int = 0) -> list[list[str]]:
+def _configure_and_record(
+    returncode: int = 0, agents: tuple[str, ...] = ("claude", "codex", "pi")
+) -> list[list[str]]:
     """Run ``configure_ucode_for_workspace`` against a stubbed ucode; return its argv."""
     recorded: list[list[str]] = []
 
@@ -88,7 +90,7 @@ def _configure_and_record(returncode: int = 0) -> list[list[str]]:
         patch("omnigent.onboarding.ucode_setup.find_ucode_command", return_value=["ucode"]),
         patch("omnigent.onboarding.ucode_setup.subprocess.run", _run),
     ):
-        configure_ucode_for_workspace(f"{_WORKSPACE_URL}/")
+        configure_ucode_for_workspace(f"{_WORKSPACE_URL}/", agents=agents)
     return recorded
 
 
@@ -321,6 +323,30 @@ def test_configure_ucode_for_workspace_keeps_global_scope_over_managed_settings(
     managed_path.write_text("{}")
 
     assert _configure_and_record() == [_GLOBAL_SCOPE_ARGV]
+
+
+@pytest.mark.parametrize(
+    ("agent", "other_managed_file"),
+    [
+        pytest.param("codex", "ClaudeCode/managed-settings.json", id="codex-with-claude-file"),
+        pytest.param("claude", "codex/managed_config.toml", id="claude-with-codex-file"),
+    ],
+)
+def test_configure_ucode_for_workspace_ignores_other_agents_managed_settings(
+    macos_account: Callable[[list[int]], None],
+    tmp_path: Path,
+    agent: str,
+    other_managed_file: str,
+) -> None:
+    """ucode only refuses ``--user`` over the managed files of the agents it configures."""
+    macos_account([20])
+    managed_path = tmp_path / other_managed_file
+    managed_path.parent.mkdir(parents=True)
+    managed_path.write_text("{}")
+
+    assert _configure_and_record(agents=(agent,)) == [
+        ["ucode", "configure", "--workspaces", _WORKSPACE_URL, "--agents", agent, "--user"]
+    ]
 
 
 @pytest.mark.parametrize("saved_user_scope", [False, True])
