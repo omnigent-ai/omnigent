@@ -167,6 +167,23 @@ def _parse_model_prefixes(
     return [p.strip() for p in raw if isinstance(p, str) and p.strip()]
 
 
+def _parse_native_hook_allow_cache_seconds(raw: object) -> Callable[[], float] | None:
+    """Parse the ``native_hook_allow_cache_seconds`` server config value.
+
+    :param raw: The configured window in seconds, e.g. ``60``; ``None`` when
+        the key is absent.
+    :returns: A resolver for ``RuntimeCaps.native_hook_allow_cache_seconds``,
+        or ``None`` to keep every native policy hook a server round trip.
+    :raises click.ClickException: If the value is not a number.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise click.ClickException("native_hook_allow_cache_seconds must be a number of seconds")
+    seconds = float(raw)
+    return lambda: seconds
+
+
 def _routing_config_text(routing_cfg: Mapping[str, object], key: str) -> str:
     value = routing_cfg.get(key)
     if isinstance(value, str):
@@ -2989,6 +3006,7 @@ def _terminate_host_unit(record: _HostDaemonRecord, *, reason: str) -> None:
     click.echo(
         f"Restarting host daemon for {_host_display_url(record.target)!r} ({reason}).", err=True
     )
+    _record_daemon_stop_requested(record, reason=reason, force=True)
     # Best-effort: a daemon that refuses to die shouldn't hard-fail the
     # run — the fresh daemon's record overwrites this one regardless.
     with contextlib.suppress(click.ClickException):
@@ -4721,7 +4739,7 @@ def server(
     import uvicorn
     import uvicorn.server
 
-    from omnigent.server.app import create_app
+    from omnigent.server.app import _ensure_default_agents, create_app
     from omnigent.server.auth import create_auth_provider
     from omnigent.server.server_config import (
         SESSION_TITLE_INSTRUCTIONS_KEY,
@@ -4831,6 +4849,9 @@ def server(
         routing_client=routing_backends.any(),
         routing_backends=routing_backends,
         routing_settings=routing_settings,
+        native_hook_allow_cache_seconds=_parse_native_hook_allow_cache_seconds(
+            cfg.get("native_hook_allow_cache_seconds")
+        ),
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -4861,14 +4882,21 @@ def server(
         frozenset({_tunnel_token}) if _tunnel_token else None
     )
 
-    # Pre-register agents from --agent directories.
+    # Refresh built-ins first so explicit --agent bundles take precedence.
+    suppressed_agent_names: frozenset[str] = frozenset()
+    if agent_dirs:
+        suppressed_agent_names = _ensure_default_agents(agent_store, artifact_store, agent_cache)
     for agent_dir in agent_dirs:
-        _preregister_agent(
+        agent_id = _preregister_agent(
             Path(agent_dir),
             agent_store,
             artifact_store,
             agent_cache,
         )
+        # An explicit bundle is the operator's own agent, even under a packaged name.
+        registered = agent_store.get(agent_id) if agent_id is not None else None
+        if registered is not None:
+            suppressed_agent_names -= {registered.name}
 
     from omnigent.stores.host_store import HostStore
 
@@ -4995,6 +5023,8 @@ def server(
         policy_store=policy_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
+        default_agents_seeded=bool(agent_dirs),
+        suppressed_agent_names=suppressed_agent_names,
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
@@ -5118,6 +5148,7 @@ def _stop_local_server_and_daemon(*, force: bool) -> bool:
     if local_record is not None:
         # A stubborn daemon shouldn't block stopping the server.
         with contextlib.suppress(click.ClickException):
+            _record_daemon_stop_requested(local_record, reason="local_server_stop", force=force)
             _terminate_daemon(local_record, force=force)
     stop_local_omnigent_server()
     # Also catch an orphan on the canonical port whose pidfile was lost, so
@@ -5322,6 +5353,7 @@ def stop(force: bool) -> None:
         # off-switch doesn't need the graceful per-session HTTP stop that
         # `host stop` does — that keeps teardown quiet and dependency-free.
         try:
+            _record_daemon_stop_requested(record, reason="stop", force=force)
             _terminate_daemon(record, force=force)
             stopped += 1
         except click.ClickException as exc:
@@ -5714,39 +5746,66 @@ def _count_running_sessions(base_url: str) -> int:
     return 0
 
 
+def _wait_for_running_sessions(count_running: Callable[[], int], *, force_hint: str) -> None:
+    """Block until ``count_running`` reports no session mid-turn.
+
+    Polls every :data:`_UPGRADE_DRAIN_POLL_S` seconds and re-prints the count
+    whenever it changes; ``Ctrl-C`` aborts the wait (and the caller) cleanly.
+
+    :param count_running: Returns how many sessions are still running a turn.
+    :param force_hint: How to skip the wait, e.g.
+        ``"re-run with --force to stop them now"``.
+    """
+    count = count_running()
+    if count == 0:
+        return
+    click.echo(
+        f"Waiting for {count} running session(s) to finish — press Ctrl-C to "
+        f"abort, or {force_hint}."
+    )
+    last = count
+    while True:
+        time.sleep(_UPGRADE_DRAIN_POLL_S)
+        count = count_running()
+        if count == 0:
+            return
+        if count != last:
+            click.echo(f"  {count} session(s) still running…")
+            last = count
+
+
 def _wait_for_local_sessions_to_drain() -> None:
     """Block until no local session is actively running a turn.
 
     Used by ``omni upgrade`` (without ``--force``) so an upgrade never
     yanks a running agent turn. Waits only on sessions whose status is
     ``"running"`` (see :func:`_count_running_sessions`) — idle-but-connected
-    sessions do not hold it up. Polls every :data:`_UPGRADE_DRAIN_POLL_S`
-    seconds and re-prints the count whenever it changes; ``Ctrl-C`` aborts
-    the wait (and the upgrade) cleanly. Returns immediately when the server
-    is down or already idle.
+    sessions do not hold it up. Returns immediately when the server is down
+    or already idle.
     """
-    info = local_server_status()
-    if not (info.running and info.url is not None):
-        return
-    count = _count_running_sessions(info.url)
-    if count == 0:
-        return
-    click.echo(
-        f"Waiting for {count} running session(s) to finish — press Ctrl-C to "
-        "abort, or re-run with --force to stop them now."
-    )
-    last = count
-    while True:
-        time.sleep(_UPGRADE_DRAIN_POLL_S)
+
+    def _count() -> int:
         info = local_server_status()
         if not (info.running and info.url is not None):
-            return
-        count = _count_running_sessions(info.url)
-        if count == 0:
-            return
-        if count != last:
-            click.echo(f"  {count} session(s) still running…")
-            last = count
+            return 0
+        return _count_running_sessions(info.url)
+
+    _wait_for_running_sessions(_count, force_hint="re-run with --force to stop them now")
+
+
+def _count_running_daemon_sessions(record: _HostDaemonRecord) -> int:
+    """Count a daemon's sessions that are running a turn.
+
+    A failed session listing counts as none, so an unreachable server never
+    blocks the caller, matching :func:`_count_running_sessions`.
+
+    :param record: Daemon record whose host-bound sessions are counted.
+    :returns: Number of sessions with ``status == "running"``.
+    """
+    result = _sessions_for_daemon(record, connected_only=True)
+    if result.error is not None:
+        return 0
+    return sum(1 for session in result.sessions if session.get("status") == "running")
 
 
 def _drain_and_stop_local_server(*, force: bool) -> None:
@@ -6902,6 +6961,22 @@ class _SessionImportResult:
     link: str | None = None
     message: str | None = None
     raw_exc: BaseException | None = None
+    # Only the history from the last compaction onward was sent, because the
+    # whole session was rejected as too large.
+    trimmed: bool = False
+
+
+_IMPORT_TRIMMED_NOTE = (
+    "The full session was too large for the server, so only its history from the "
+    "last compaction onward was imported."
+)
+
+
+def _import_rejected_as_too_large(response: httpx.Response) -> bool:
+    """Whether the server, or a proxy in front of it, refused an import body as too large."""
+    from omnigent.llms.errors import detect_request_size_overflow
+
+    return response.status_code == 413 or detect_request_size_overflow(response.text) is not None
 
 
 @cli.command("import")
@@ -6972,9 +7047,12 @@ def import_session_command(
 
     from omnigent.chat import _remote_headers
     from omnigent.conversation_browser import conversation_url
+    from omnigent.entities import NewConversationItem
     from omnigent.session_import import (
         ImportSource,
         SessionImportNotFoundError,
+        from_last_compaction,
+        import_item_payload,
     )
     from omnigent.session_import.local import (
         list_recent_local_session_ids,
@@ -7047,25 +7125,32 @@ def import_session_command(
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
             "title": imported.native_title,
+            "archived": imported.archived,
             "force": force,
-            "items": [
-                {
-                    "type": item.type,
-                    "response_id": item.response_id,
-                    "data": item.data.model_dump(mode="json", exclude_none=True),
-                }
-                for item in imported.items
-            ],
         }
         if host_identity is not None:
             payload["host_id"] = host_identity.host_id
-        try:
-            response = httpx.post(
+
+        def _post(items: Sequence[NewConversationItem]) -> httpx.Response:
+            return httpx.post(
                 f"{base_url}/v1/imports",
-                json=payload,
+                json={**payload, "items": [import_item_payload(item) for item in items]},
                 headers=_remote_headers(server_url=base_url, host_id=None),
                 timeout=120.0,
             )
+
+        trimmed = False
+        try:
+            response = _post(imported.items)
+            # A deployment's request-size cap can sit below the server's own limits.
+            suffix = (
+                from_last_compaction(imported.items)
+                if _import_rejected_as_too_large(response)
+                else None
+            )
+            if suffix is not None:
+                response = _post(suffix)
+                trimmed = True
         except httpx.RequestError as exc:
             return _SessionImportResult(
                 sid,
@@ -7103,12 +7188,15 @@ def import_session_command(
             "imported",
             item_count=item_count,
             link=conversation_url(base_url, session_id),
+            trimmed=trimmed,
         )
 
     if not is_batch:
         result = _import_one(import_targets[0])
         if result.status == "imported":
             click.echo(f"Imported {result.item_count} item(s) into {result.link}")
+            if result.trimmed:
+                click.echo(_IMPORT_TRIMMED_NOTE)
             return
         if result.status == "load_error":
             # A missing session is a clean CLI error; a corrupt transcript keeps
@@ -7146,6 +7234,8 @@ def import_session_command(
         if outcome.status == "imported":
             imported_count += 1
             click.echo(f"Imported {outcome.item_count} item(s) from {sid} into {outcome.link}")
+            if outcome.trimmed:
+                click.echo(f"  {_IMPORT_TRIMMED_NOTE}")
         elif outcome.status == "already":
             already_imported_count += 1
             click.echo(f"Already imported {sid}; skipped.")
@@ -9548,6 +9638,7 @@ def _run_background_host(
     except click.ClickException:
         if not reused:
             with contextlib.suppress(click.ClickException):
+                _record_daemon_stop_requested(record, reason="background_start_failed", force=True)
                 _terminate_daemon(record, force=True)
         raise
     headline = _cli_style(
@@ -10022,6 +10113,7 @@ def _daemon_session_request_params(
     *,
     connected_only: bool,
     after: str | None,
+    kind: Literal["default", "sub_agent"] = "default",
 ) -> dict[str, str | int]:
     """
     Build query parameters for one sessions page.
@@ -10030,6 +10122,7 @@ def _daemon_session_request_params(
         sessions only.
     :param after: Optional cursor from the prior page, e.g.
         ``"conv_abc123"``.
+    :param kind: Session kind to fetch; the server omits sub-agents by default.
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
@@ -10037,6 +10130,8 @@ def _daemon_session_request_params(
         "include_archived": "true",
         "visibility": "all",
     }
+    if kind != "default":
+        params["kind"] = kind
     if connected_only:
         params["connected"] = "true"
     if after is not None:
@@ -10101,6 +10196,7 @@ def _fetch_session_pages(
     *,
     base_url: str,
     connected_only: bool,
+    kind: Literal["default", "sub_agent"] = "default",
 ) -> _SessionPagesResult:
     """
     Fetch every available session page from a server.
@@ -10109,6 +10205,7 @@ def _fetch_session_pages(
         ``"https://example.databricksapps.com"``.
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
+    :param kind: Session kind to fetch, e.g. ``"sub_agent"``.
     :returns: Accumulated sessions result. ``error`` is ``None`` on success.
     """
     after: str | None = None
@@ -10121,6 +10218,7 @@ def _fetch_session_pages(
             params=_daemon_session_request_params(
                 connected_only=connected_only,
                 after=after,
+                kind=kind,
             ),
         )
         page = _decode_sessions_page(page_result)
@@ -10164,10 +10262,47 @@ def _local_server_confirmed_dead() -> bool:
     return not _pid_alive(pid)
 
 
+def _daemon_owned_sessions(
+    sessions: list[_HostSessionRow],
+    *,
+    host_id: str,
+    sub_agents: list[_HostSessionRow],
+) -> list[_HostSessionRow]:
+    """
+    Select the sessions a daemon's host runs, optionally with their sub-agents.
+
+    A sub-agent carries no host id of its own: it runs on its parent's host.
+    A sub-agent joins when its parent chain reaches
+    a session this host owns, so a stop reaches children mid-turn.
+
+    :param sessions: Session rows from the server, e.g. ``[{"id": "conv_1", ...}]``.
+    :param host_id: Host id the daemon advertises, e.g. ``"host_abc123"``.
+    :param sub_agents: Rows fetched with ``kind=sub_agent``; list rows have no kind field.
+    :returns: Owned session rows, parents before their children.
+    """
+    owned = [s for s in sessions if s.get("host_id") == host_id]
+    owned_ids = {s.get("id") for s in owned}
+    pending = [s for s in sub_agents if s.get("id") not in owned_ids]
+    grew = True
+    while grew and pending:
+        grew = False
+        still_pending: list[_HostSessionRow] = []
+        for session in pending:
+            if session.get("parent_session_id") in owned_ids:
+                owned.append(session)
+                owned_ids.add(session.get("id"))
+                grew = True
+            else:
+                still_pending.append(session)
+        pending = still_pending
+    return owned
+
+
 def _sessions_for_daemon(
     record: _HostDaemonRecord,
     *,
     connected_only: bool = False,
+    include_sub_agents: bool = False,
 ) -> _DaemonSessionsResult:
     """
     Fetch sessions owned by a daemon's host id.
@@ -10175,6 +10310,8 @@ def _sessions_for_daemon(
     :param record: Daemon record whose sessions should be listed.
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
+    :param include_sub_agents: When ``True``, also return sub-agent sessions
+        of the daemon's sessions.
     :returns: Sessions result. ``error`` is ``None`` on success.
     """
     base_url = _daemon_base_url(record)
@@ -10207,7 +10344,23 @@ def _sessions_for_daemon(
             error=pages.error,
             unreachable=pages.unreachable,
         )
-    owned = [s for s in pages.sessions if s.get("host_id") == host_id]
+    sub_agents: list[_HostSessionRow] = []
+    if include_sub_agents:
+        children = _fetch_session_pages(
+            base_url=base_url,
+            connected_only=connected_only,
+            kind="sub_agent",
+        )
+        if children.error is not None:
+            # The root listing succeeded, so a child-list failure is not proof
+            # the server is dead. Keep the daemon running until the drain succeeds.
+            return _DaemonSessionsResult(base_url=base_url, sessions=[], error=children.error)
+        sub_agents = children.sessions
+    owned = _daemon_owned_sessions(
+        pages.sessions,
+        host_id=host_id,
+        sub_agents=sub_agents,
+    )
     return _DaemonSessionsResult(base_url=base_url, sessions=owned, error=None)
 
 
@@ -10777,17 +10930,25 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
     default=False,
     help="Do not launch browser sign-in while preparing the service.",
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Replace a running host now, even mid-turn.",
+)
 @click.pass_context
 def host_enable(
     ctx: click.Context,
     server: str | None,
     non_interactive: bool,
+    force: bool,
 ) -> None:
     """Install and start the host as a per-user system service.
 
     :param ctx: Click context carrying group-level options.
     :param server: Optional server target; empty selects local mode.
     :param non_interactive: Fail instead of launching browser sign-in.
+    :param force: Replace a running host without waiting for its running turns.
     """
     if server is None:
         server = _host_group_option(ctx, "server")
@@ -10803,6 +10964,13 @@ def host_enable(
     target = _normalize_daemon_target(resolved_server)
     record = _find_daemon_record(target)
     if record is not None:
+        # Replacing the daemon kills its runners, so let running turns finish first.
+        if not force and _daemon_owner_is_live(record):
+            _wait_for_running_sessions(
+                lambda: _count_running_daemon_sessions(record),
+                force_hint="re-run with --force to replace the host now",
+            )
+        _record_daemon_stop_requested(record, reason="host_enable", force=False)
         _terminate_daemon(record, force=False)
 
     from omnigent.host.service import HostServiceError, enable_user_host_service
@@ -10953,7 +11121,7 @@ def _stop_daemon_sessions(
     :returns: Number of sessions successfully stopped.
     :raises click.ClickException: If session listing or any stop fails.
     """
-    result = _sessions_for_daemon(record)
+    result = _sessions_for_daemon(record, include_sub_agents=True)
     if result.error is not None:
         if result.unreachable:
             # A dead server holds no reachable sessions to stop; failing here
@@ -11072,6 +11240,41 @@ def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> str:
     return _SIGNAL_DELIVERED
 
 
+def _record_daemon_stop_requested(record: _HostDaemonRecord, *, reason: str, force: bool) -> None:
+    """
+    Log which command is about to signal a live host daemon, and why.
+
+    A host exit by SIGTERM names no sender, so this row is the only record of
+    a CLI teardown. Sent through the debug-log sink, which flushes at exit.
+
+    :param record: Daemon record about to be signalled.
+    :param reason: Short cause, e.g. ``"host_stop"`` or ``"host tunnel is offline"``.
+    :param force: Whether the stop escalates to SIGKILL after the grace period.
+    """
+    from omnigent.debug_logging import attach_debug_log_sink, debug_event
+    from omnigent.diagnostics import redact_url
+
+    if not _pid_is_recorded_daemon(record):
+        return
+    logger = logging.getLogger("omnigent.host.daemon_stop")
+    logger.setLevel(logging.INFO)
+    attach_debug_log_sink([logger], source="cli", level=logging.INFO)
+    logger.info(
+        "host daemon stop requested: %s",
+        reason,
+        extra=debug_event(
+            "host_daemon_stop_requested",
+            reason=reason,
+            force=force,
+            daemon_pid=record.pid,
+            daemon_mode=record.mode,
+            daemon_target=redact_url(record.target),
+            daemon_uptime_s=round(max(0.0, time.time() - record.started_at), 1),
+            cli_pid=os.getpid(),
+        ),
+    )
+
+
 def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> str:
     """
     Terminate one local daemon process.
@@ -11170,6 +11373,7 @@ def host_stop(
         stopped = 0
         if not daemon_only and not force:
             stopped = _stop_daemon_sessions(record)
+        _record_daemon_stop_requested(record, reason="host_stop", force=force)
         outcome = _terminate_daemon(record, force=force)
         target = _host_display_url(record.target)
         if outcome == _STOP_DROPPED_FOREIGN:

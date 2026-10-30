@@ -87,6 +87,59 @@ Provider-specific JSON fields belong in `pr_from_object`; common `html_url` and
 `url` fields are handled centrally. A failing provider is isolated so it cannot
 change a tool's result or prevent another provider from recording requests.
 
+## Server storage
+
+The server owns which requests belong to a session; the runner or host remains
+the only forge client. The server keeps each session's requests in one
+compressed JSON document on its metadata row
+(`omnigent_conversation_metadata.pull_requests`).
+
+**Discovery.** The runner records each request it discovers in the session
+registry, which keeps the entries the server has not acknowledged, and sends
+them as an `external_pull_requests` session event: right after recording one,
+when a turn ends, and when it first serves a session. Entries are cleared only
+after a 2xx and retried with backoff otherwise, so a request opened during a
+turn reaches the server even if nobody has the session open. Requests the host
+finds while serving a read (the branch's request) ride back in the response.
+Merging is idempotent and never re-adds an unlinked request.
+
+**Import.** A session is *synced* once the server has merged its host's whole
+list, from any proxied pull request response. Until then the host's list still
+decides. `GET /v1/sessions/{id}/pull-requests` reports `synced`, and session
+list items report `pull_requests_synced`, so clients can tell "not known yet"
+from "none". A listed session that isn't synced is imported in the background
+when its runner or host tunnel is on the serving replica.
+
+**Serving.** Once synced, the server checks a requested `pr_url` against its
+list (400 otherwise) and forwards it with `server_tracked`; with no selection it
+sends its first request as `default_pr_url`. The runner or host then serves that
+request even if its own registry never recorded it, and the server's list
+replaces `prs` in the response. Each entry keeps the request's title, state,
+and draft flag with when the server requested that fetch; an older fetch never
+overwrites a newer one, including one that changed nothing and skipped its
+write. The description, checks, comments, changed files, and diff stay on the
+host.
+
+**Freshness.** Summaries carry `state_checked_at`. A listed session whose first
+request is open (or unknown) and older than five minutes is refreshed in the
+background, at most once per five minutes, when its tunnel is on the serving
+replica; clients show older states as stale. After a turn ends the server
+refreshes the session once, unless a client's read already covered that turn.
+
+**Limits.** A session keeps at most 50 linked requests and 50 unlinks. Their
+identities must fit 12,000 stored bytes, checked when a request is added:
+linking at the limit fails with 409 before the host is asked, and reports past
+it are ignored. Titles and states fill the rest of the 16,000-byte document and
+are trimmed first when it overflows, so refreshing them never removes a link.
+
+**Unlinking.** `DELETE /v1/sessions/{id}/pull-requests?url=` unlinks on the
+server whether or not the host is online, and passes the unlink to the runner or
+host when one is reachable so its own list stops reporting the request.
+`GET /v1/sessions/{id}/pull-requests` pages with `limit` and `after` (the
+previous page's `last_id`, a request URL) and never contacts the host. Servers
+that store requests report `session_pull_requests` in `/v1/info`; against older
+servers the web reads only the live host.
+
 ## Verification
 
 Run the existing GitHub resource and tracking suites together with provider
