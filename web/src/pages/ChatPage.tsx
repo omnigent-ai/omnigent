@@ -2809,6 +2809,7 @@ function ComposerImpl(
   const hostOnline = useSessionHostOnline(composerSessionId ?? undefined);
   const {
     skills,
+    skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
   } = useSkills({
@@ -3922,6 +3923,8 @@ function ComposerImpl(
             prCount={composerGit.prCount}
             prNumber={composerGit.prNumber}
             prNumberPrefix={composerGit.prNumberPrefix}
+            prs={composerGit.prs}
+            prStatus={composerGit.prStatus}
             onOpen={openComposerGithubTab}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
@@ -4044,6 +4047,7 @@ function ComposerImpl(
                   builtinNames={slashCompletion.builtinNames}
                   labels={slashCompletion.labels}
                   skillsStatus={skillsStatus}
+                  skillsWarnings={skillsWarnings}
                   onRetrySkills={() => void refreshSkills()}
                   showMcpServers={showMcpServers}
                   mcpServers={mcpServers}

@@ -5287,6 +5287,13 @@ def server_status(json_output: bool) -> None:
     help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
 )
 @click.option(
+    "--open-in-desktop",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_OPEN_IN_DESKTOP",
+    show_envvar=True,
+    help="Open the host web UI in the Omnigent desktop app instead of a browser.",
+)
+@click.option(
     "--non-interactive",
     "non_interactive",
     is_flag=True,
@@ -5297,7 +5304,7 @@ def server_status(json_output: bool) -> None:
         "launching the browser login flow. Use this in scripts and CI."
     ),
 )
-def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
+def start(server: str | None, no_open: bool, open_in_desktop: bool, non_interactive: bool) -> None:
     """Start Omnigent on this machine, in the background.
 
     The on switch, and the counterpart of ``omnigent stop``: brings up the
@@ -5314,6 +5321,8 @@ def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
         ``"https://example.databricksapps.com"``. ``None`` falls back to
         config; empty string forces local mode.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :param non_interactive: When ``True``, never launch the browser login for
         an un-authed remote server — fail with the ``omnigent login`` hint
         instead.
@@ -5324,6 +5333,7 @@ def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
         stop_command=f"{cli_invocation()} stop",
         non_interactive=non_interactive,
         no_open=no_open,
+        open_in_desktop=open_in_desktop,
     )
 
 
@@ -6961,6 +6971,22 @@ class _SessionImportResult:
     link: str | None = None
     message: str | None = None
     raw_exc: BaseException | None = None
+    # Only the history from the last compaction onward was sent, because the
+    # whole session was rejected as too large.
+    trimmed: bool = False
+
+
+_IMPORT_TRIMMED_NOTE = (
+    "The full session was too large for the server, so only its history from the "
+    "last compaction onward was imported."
+)
+
+
+def _import_rejected_as_too_large(response: httpx.Response) -> bool:
+    """Whether the server, or a proxy in front of it, refused an import body as too large."""
+    from omnigent.llms.errors import detect_request_size_overflow
+
+    return response.status_code == 413 or detect_request_size_overflow(response.text) is not None
 
 
 @cli.command("import")
@@ -7031,9 +7057,12 @@ def import_session_command(
 
     from omnigent.chat import _remote_headers
     from omnigent.conversation_browser import conversation_url
+    from omnigent.entities import NewConversationItem
     from omnigent.session_import import (
         ImportSource,
         SessionImportNotFoundError,
+        from_last_compaction,
+        import_item_payload,
     )
     from omnigent.session_import.local import (
         list_recent_local_session_ids,
@@ -7106,25 +7135,32 @@ def import_session_command(
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
             "title": imported.native_title,
+            "archived": imported.archived,
             "force": force,
-            "items": [
-                {
-                    "type": item.type,
-                    "response_id": item.response_id,
-                    "data": item.data.model_dump(mode="json", exclude_none=True),
-                }
-                for item in imported.items
-            ],
         }
         if host_identity is not None:
             payload["host_id"] = host_identity.host_id
-        try:
-            response = httpx.post(
+
+        def _post(items: Sequence[NewConversationItem]) -> httpx.Response:
+            return httpx.post(
                 f"{base_url}/v1/imports",
-                json=payload,
+                json={**payload, "items": [import_item_payload(item) for item in items]},
                 headers=_remote_headers(server_url=base_url, host_id=None),
                 timeout=120.0,
             )
+
+        trimmed = False
+        try:
+            response = _post(imported.items)
+            # A deployment's request-size cap can sit below the server's own limits.
+            suffix = (
+                from_last_compaction(imported.items)
+                if _import_rejected_as_too_large(response)
+                else None
+            )
+            if suffix is not None:
+                response = _post(suffix)
+                trimmed = True
         except httpx.RequestError as exc:
             return _SessionImportResult(
                 sid,
@@ -7162,12 +7198,15 @@ def import_session_command(
             "imported",
             item_count=item_count,
             link=conversation_url(base_url, session_id),
+            trimmed=trimmed,
         )
 
     if not is_batch:
         result = _import_one(import_targets[0])
         if result.status == "imported":
             click.echo(f"Imported {result.item_count} item(s) into {result.link}")
+            if result.trimmed:
+                click.echo(_IMPORT_TRIMMED_NOTE)
             return
         if result.status == "load_error":
             # A missing session is a clean CLI error; a corrupt transcript keeps
@@ -7205,6 +7244,8 @@ def import_session_command(
         if outcome.status == "imported":
             imported_count += 1
             click.echo(f"Imported {outcome.item_count} item(s) from {sid} into {outcome.link}")
+            if outcome.trimmed:
+                click.echo(f"  {_IMPORT_TRIMMED_NOTE}")
         elif outcome.status == "already":
             already_imported_count += 1
             click.echo(f"Already imported {sid}; skipped.")
@@ -9503,6 +9544,7 @@ def _maybe_open_host_web_ui(
     *,
     non_interactive: bool,
     no_open: bool,
+    open_in_desktop: bool,
     cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
 ) -> None:
     """Open the host web UI when interactive and enabled."""
@@ -9524,7 +9566,7 @@ def _maybe_open_host_web_ui(
     if base_path:
         web_url = web_url.rstrip("/") + base_path
     try:
-        opened = open_conversation_url(web_url)
+        opened = open_conversation_url(web_url, desktop=open_in_desktop)
     except OSError:
         opened = False
     if not opened:
@@ -9537,6 +9579,7 @@ def _run_background_host(
     stop_command: str,
     non_interactive: bool,
     no_open: bool,
+    open_in_desktop: bool,
 ) -> None:
     """Spawn (or reuse) the detached host daemon and report it.
 
@@ -9559,6 +9602,8 @@ def _run_background_host(
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :raises click.ClickException: If the daemon cannot be spawned, exits
         immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
@@ -9628,7 +9673,12 @@ def _run_background_host(
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
-    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive, no_open=no_open)
+    _maybe_open_host_web_ui(
+        server_url,
+        non_interactive=non_interactive,
+        no_open=no_open,
+        open_in_desktop=open_in_desktop,
+    )
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -9670,6 +9720,13 @@ def _host_stop_command(explicit_server: str | None) -> str:
     help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
 )
 @click.option(
+    "--open-in-desktop",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_OPEN_IN_DESKTOP",
+    show_envvar=True,
+    help="Open the host web UI in the Omnigent desktop app instead of a browser.",
+)
+@click.option(
     "--background",
     "background",
     is_flag=True,
@@ -9698,6 +9755,7 @@ def host(
     server: str | None,
     background: bool,
     no_open: bool,
+    open_in_desktop: bool,
     non_interactive: bool,
 ) -> None:
     """
@@ -9710,6 +9768,7 @@ def host(
       omnigent host ""   # spawn + connect to a local server
       omnigent host --background   # spawn detached, return immediately
       omnigent host --no-open   # connect without opening the web UI
+      omnigent host --open-in-desktop   # open the web UI in the desktop app
       omnigent host enable   # install and start a per-user system service
       omnigent host disable  # stop and remove the per-user system service
 
@@ -9733,6 +9792,8 @@ def host(
     :param background: When ``True``, spawn the daemon detached and return
         instead of running the daemon loop in the foreground.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :param non_interactive: When ``True``, never launch the browser login
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
@@ -9761,6 +9822,7 @@ def host(
             stop_command=_host_stop_command(explicit_server),
             non_interactive=non_interactive,
             no_open=no_open,
+            open_in_desktop=open_in_desktop,
         )
         return
 
@@ -9810,7 +9872,13 @@ def host(
             if sibling is not None:
                 _raise_live_daemon_conflict(record, sibling)
             workspace_lock = _claim_foreground_workspace(record, server, workspace_id=workspace_id)
-        _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
+        _maybe_open_host_web_ui(
+            server,
+            non_interactive=non_interactive,
+            no_open=no_open,
+            open_in_desktop=open_in_desktop,
+            cfg=cfg,
+        )
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:

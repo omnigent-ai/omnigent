@@ -1283,12 +1283,8 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // A single "⋯" menu folds the view controls that were previously separate
-  // top-level icons: Find in file and Download (all views), plus the diff-only
-  // toggles (wrap lines, whitespace changes). Grouping them frees toolbar width
-  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
-  // diff-settings menu. The toggles keep the menu open; actions close it as they
-  // hand off.
+  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
+  // whitespace toggle to save toolbar width; toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1317,7 +1313,9 @@ function FileViewerBody({
       onSelect: downloadFile,
     });
   }
-  if (viewMode === "diff") {
+  // One wrap preference covers the source editor and the diff. Other views
+  // (rich Markdown, previews, the Shiki source view) already wrap.
+  if (isMonacoFindSurface && (diffViewActive || !isDeletedFile)) {
     settingsMenu.push({
       key: "wrap-lines",
       label: "Wrap lines",
@@ -1327,6 +1325,8 @@ function FileViewerBody({
       keepOpen: true,
       onSelect: () => setWrapLines((prev) => !prev),
     });
+  }
+  if (viewMode === "diff") {
     settingsMenu.push({
       key: "hide-whitespace",
       label: "Hide whitespace changes",
@@ -1836,6 +1836,7 @@ function FileViewerBody({
               searchInputRef={searchInputRef}
               viewMode={viewMode}
               markdownSourceFallback={markdownSourceFallback ?? false}
+              wrapLines={wrapLines}
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
