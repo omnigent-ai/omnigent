@@ -233,7 +233,8 @@ describe("signInLinkRefusal", () => {
       databricksLink("https://evil.example", 8020),
       /isn't this server or a Databricks workspace/,
     ],
-    "a callback port outside 8020 to 8040": [authorizeLink(22), /port 22, outside 8020 to 8040/],
+    "a callback port below 8020": [authorizeLink(22), /port 22, outside 8020 to 8040/],
+    "a callback port above 8040": [authorizeLink(8041), /port 8041, outside 8020 to 8040/],
     "a Databricks Apps host, which serves app content, even with a valid callback": [
       databricksLink("https://attacker-1.aws.databricksapps.com", 8020),
       /isn't this server or a Databricks workspace/,
@@ -989,7 +990,10 @@ describe("createSshSession", () => {
           setImmediate(resolve);
         });
       }
-      t.mock.timers.tick(2_000);
+      // A master that hasn't exited yet still gets the whole grace period.
+      t.mock.timers.tick(1_999);
+      assert.equal(kills, 0);
+      t.mock.timers.tick(1);
       await closing;
 
       assert.ok(spawned.includes("-F /dev/null -S /tmp/s/m -O exit my-ec2"), spawned.join("\n"));
