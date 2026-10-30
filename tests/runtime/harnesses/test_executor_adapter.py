@@ -416,10 +416,10 @@ async def test_executor_error_terminates_with_response_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
-async def test_executor_error_preserves_only_explicitly_idle_sessions(
+async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     preserve_session: bool,
 ) -> None:
-    """Ordinary errors still tear down; pre-prompt failures can retain an idle executor."""
+    """Ordinary errors still tear down; explicitly reusable executors can be retained."""
     import asyncio
     from unittest.mock import AsyncMock, Mock
 
@@ -1047,7 +1047,7 @@ def test_classify_anthropic_exception_maps_known_types(
     monkeypatch arranges.
 
     Regression: Phase 1d/1e wires
-    ``ANTHROPIC_MAX_RETRIES`` into the Claude CLI subprocess,
+    ``CLAUDE_CODE_MAX_RETRIES`` into the Claude CLI subprocess,
     which can still surface raw :class:`anthropic.RateLimitError`
     upward when the SDK's framing layer fails. Without this
     classifier, those would render as ``[llm] RateLimitError``
@@ -1331,6 +1331,71 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
         f"Expected 2 messages (empty assistant skipped), got {len(messages)}: {messages!r}."
     )
     assert [m["role"] for m in messages] == ["user", "user"]
+
+
+def test_translate_input_to_messages_carries_tool_history() -> None:
+    """
+    Tool items are dropped unless the executor opts in. Opted in, each call appears
+    once (live history repeats it per status), a nameless call is dropped, bad
+    arguments become ``{}``, and outputs are image-stripped and capped for replay.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _REPLAYED_TOOL_OUTPUT_MAX_BYTES,
+        _translate_input_to_messages,
+    )
+
+    greet = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "greet",
+        "arguments": '{"name": "Ada"}',
+    }
+    image_output = json.dumps(
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "QUJD" * 64},
+            }
+        ]
+    )
+    input_value = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "greet the new hire"}],
+        },
+        {"type": "function_call", "call_id": "call_0", "arguments": "{}"},
+        greet,
+        {"type": "function_call", "call_id": "call_2", "name": "read", "arguments": "not json"},
+        {"type": "function_call", "call_id": "call_3", "name": "read", "arguments": "{}"},
+        greet,
+        {"type": "function_call_output", "call_id": "call_1", "output": "Hello, Ada!"},
+        {"type": "function_call_output", "call_id": "call_2", "output": "x" * 100_000},
+        {"type": "function_call_output", "call_id": "call_3", "output": image_output},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Done."}],
+        },
+    ]
+
+    assert [m["role"] for m in _translate_input_to_messages(input_value)] == ["user", "assistant"]
+    messages = _translate_input_to_messages(input_value, include_tool_history=True)
+
+    roles = [m["role"] for m in messages]
+    assert roles == ["user", *["tool_call"] * 3, *["tool_result"] * 3, "assistant"]
+    assert messages[1]["content"] == {"tool": "greet", "args": {"name": "Ada"}}
+    assert messages[1]["metadata"] == {"call_id": "call_1"}
+    assert messages[2]["content"] == {"tool": "read", "args": {}}
+    assert messages[4] == {
+        "role": "tool_result",
+        "content": "Hello, Ada!",
+        "metadata": {"call_id": "call_1"},
+    }
+    capped = messages[5]["content"]
+    assert len(capped.encode()) < _REPLAYED_TOOL_OUTPUT_MAX_BYTES + 200
+    assert "[output truncated by omnigent:" in capped
+    assert "QUJD" not in messages[6]["content"]
 
 
 # ── MCP tool-call observed/dispatch correlation ──────────
@@ -1739,6 +1804,37 @@ def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
         ("function_call", "completed"),
         ("function_call_output", None),
     ]
+
+
+def test_claude_native_tool_before_mcp_call_keeps_dispatch_ids_aligned() -> None:
+    """Keep Claude Code's own ``Skill`` call from shifting later dispatch ids.
+
+    claude-sdk's MCP callback carries no call id, so ``_stable_tool_executor``
+    pops the oldest queued id. A ``Skill`` (or ``ToolSearch``) call runs inside
+    the CLI and is never dispatched; queued, its id would be popped by the next
+    Omnigent tool's dispatch, and from then on every call in the turn would pair
+    with the previous call's id and be recorded twice.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.inner.claude_sdk_executor import _tool_call_metadata
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    for name, call_id, args in (
+        ("Skill", "toolu_skill", {"skill": "agent:scout"}),
+        ("mcp__omnigent__sys_os_shell", "toolu_shell", {"command": "pwd"}),
+    ):
+        block = SimpleNamespace(id=call_id, name=name, input=args)
+        adapter._translate_event(
+            ToolCallRequest(name=name, args=args, metadata=_tool_call_metadata(block)),  # type: ignore[arg-type]
+            ctx,  # type: ignore[arg-type]
+        )
+
+    # The shell dispatch pops its own id, not the Skill's.
+    assert list(adapter._pending_mcp_call_ids) == ["toolu_shell"]
 
 
 def test_translate_event_request_without_tool_use_id_does_not_queue() -> None:

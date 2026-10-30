@@ -30,7 +30,7 @@ const ALERT_LABELS: Record<AlertType, string> = {
 
 /** Matches a marker at the start of the quote's first paragraph text,
  *  e.g. "[!NOTE]\nrest of the paragraph…" or a bare "[!NOTE]". */
-const ALERT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](\n|$)/;
+export const ALERT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](\n|$)/;
 
 /** Result of stripping an alert marker from parsed blockquote children. */
 interface ExtractedAlert {
