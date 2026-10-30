@@ -23,13 +23,25 @@ interface TouchSample {
   time: number;
 }
 
-/** Leftward speeds are negative. `samples[0]` is the position at the window start. */
+/**
+ * Average speed (leftward is negative) over the trailing window. `samples[0]` is
+ * the newest sample at or before the window start, if the gesture is that old.
+ */
 function windowVelocity(samples: TouchSample[]): number {
-  const reference = samples[0];
   const latest = samples.at(-1);
-  if (!reference || !latest) return 0;
-  const span = Math.min(VELOCITY_WINDOW_MS, latest.time - reference.time);
-  return span > 0 ? (latest.x - reference.x) / span : 0;
+  if (!latest || samples.length < 2) return 0;
+  const windowStart = latest.time - VELOCITY_WINDOW_MS;
+  const [reference, next] = samples;
+  let startX = reference.x;
+  let startTime = reference.time;
+  if (reference.time < windowStart && next.time > reference.time) {
+    // Interpolate where the finger was when the window opened.
+    startX +=
+      ((next.x - reference.x) * (windowStart - reference.time)) / (next.time - reference.time);
+    startTime = windowStart;
+  }
+  const span = latest.time - startTime;
+  return span > 0 ? (latest.x - startX) / span : 0;
 }
 
 /** True when `target` sits inside content that can itself scroll horizontally. */

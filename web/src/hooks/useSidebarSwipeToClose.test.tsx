@@ -104,25 +104,11 @@ describe("useSidebarSwipeToClose", () => {
   it("springs back open after a short, slow drag", () => {
     const { getByTestId, onSettle } = setup();
 
-    swipe(getByTestId("row"), { dx: -60, steps: 4, stepMs: 80 });
+    const { end } = swipe(getByTestId("row"), { dx: -60, steps: 4, stepMs: 80 });
 
     expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
-  });
-
-  it("closes on a quick leftward flick even over a short distance", () => {
-    const { getByTestId, onSettle } = setup();
-
-    swipe(getByTestId("row"), { dx: -60, steps: 3, stepMs: 16 });
-
-    expect(onSettle).toHaveBeenCalledExactlyOnceWith(true);
-  });
-
-  it("does not treat a flick as closing when the finger rested before lifting", () => {
-    const { getByTestId, onSettle } = setup();
-
-    swipe(getByTestId("row"), { dx: -60, steps: 3, stepMs: 16, liftDelayMs: 300 });
-
-    expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
+    // The lift is still claimed, so the scrim's click can't close the drawer.
+    expect(end.defaultPrevented).toBe(true);
   });
 
   // Each pair sits either side of one cutoff; the moves before it stay slow,
@@ -171,6 +157,19 @@ describe("useSidebarSwipeToClose", () => {
     expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
   });
 
+  it("does not overstate a steady drag reported by sparse moves", () => {
+    const { getByTestId, onSettle } = setup();
+    const row = getByTestId("row");
+
+    // A steady 0.5 px/ms; the window opens between the first two samples.
+    touch(row, "touchstart", 200, 100, 0);
+    touch(row, "touchmove", 170, 100, 60);
+    touch(row, "touchmove", 125, 100, 150);
+    touch(row, "touchend", 0, 0, 160);
+
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
   it("still closes on a flick that ends a slow drag", () => {
     const { getByTestId, onSettle } = setup();
     const row = getByTestId("row");
@@ -179,8 +178,8 @@ describe("useSidebarSwipeToClose", () => {
     touch(row, "touchmove", 186, 100, 100);
     touch(row, "touchmove", 180, 100, 200);
     touch(row, "touchmove", 160, 100, 220);
-    touch(row, "touchmove", 140, 100, 240);
-    touch(row, "touchmove", 120, 100, 260);
+    touch(row, "touchmove", 138, 100, 240);
+    touch(row, "touchmove", 116, 100, 260);
     touch(row, "touchend", 0, 0, 270);
 
     expect(onSettle).toHaveBeenCalledExactlyOnceWith(true);
@@ -262,6 +261,22 @@ describe("useSidebarSwipeToClose", () => {
 
     expect(onDragProgress).toHaveBeenLastCalledWith(null);
     expect(onSettle).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["a second finger lands", (row: Element) => touch(row, "touchstart", 150, 100, 50, 2)],
+    ["the system cancels the touch", (row: Element) => touch(row, "touchcancel", 0, 0, 50)],
+  ])("does not count a fast drag as a flick when %s", (_label, interrupt) => {
+    const { getByTestId, onSettle } = setup();
+    const row = getByTestId("row");
+
+    touch(row, "touchstart", 200, 100, 0);
+    touch(row, "touchmove", 175, 100, 20);
+    touch(row, "touchmove", 150, 100, 40);
+    interrupt(row);
+    touch(row, "touchend", 0, 0, 60);
+
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
   });
 
   it("settles by distance when the system cancels the touch mid-drag", () => {
