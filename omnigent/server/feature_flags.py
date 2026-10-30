@@ -8,10 +8,13 @@ is built, giving each one an immutable snapshot.
 
 from __future__ import annotations
 
+import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+
+_logger = logging.getLogger(__name__)
 
 FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
@@ -20,6 +23,9 @@ _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 class Feature(StrEnum):
     """Canonical release-feature keys accepted by ``OMNIGENT_FEATURES``."""
 
+    SANDBOX_PROFILES = "sandbox_profiles"
+    SESSION_ORCHESTRATION = "session_orchestration"
+    CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
@@ -47,6 +53,28 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.CODEX_PLAN_AT_LAUNCH,
+        description="Start Codex in Plan mode with host compatibility checks",
+        owner="server",
+        review_by_release="0.22.0",
+        default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.SANDBOX_PROFILES,
+        description="Sandbox profile discovery, configuration and launch selection",
+        owner="server",
+        review_by_release="0.22.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SESSION_ORCHESTRATION,
+        description="Private-owner session messaging and independent worker creation",
+        owner="server",
+        review_by_release="0.22.0",
+        # The Automations page offers trigger templates only when managers can
+        # start workers.
+        default_enabled=True,
+    ),
     FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,
         description=(
@@ -148,6 +176,25 @@ class FeatureFlags:
     def enabled_names(self) -> tuple[str, ...]:
         """Return enabled canonical names in stable order."""
         return tuple(sorted(feature.value for feature in self.enabled_features))
+
+
+# A deployment's per-request gate: a static bool, or a callable read on each request.
+DeploymentGate = bool | Callable[[], bool]
+HarnessInstallGate = DeploymentGate
+
+
+def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
+    """Resolve a deployment gate for the current request; a failing gate is off."""
+    try:
+        return bool(gate() if callable(gate) else gate)
+    except Exception:  # deployment gates fail closed
+        _logger.warning("%s gate failed; disabling it", name, exc_info=True)
+        return False
+
+
+def harness_install_enabled(gate: HarnessInstallGate) -> bool:
+    """Resolve the harness-install gate for the current request."""
+    return deployment_gate_enabled(gate, "harness_install")
 
 
 def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFlags:

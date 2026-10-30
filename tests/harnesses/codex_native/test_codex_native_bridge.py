@@ -31,6 +31,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_timeout,
     read_bridge_state,
     read_certificate_failure,
+    read_child_usage_baselines,
     read_codex_config_effort,
     read_codex_config_model,
     read_codex_home_config_effort,
@@ -39,6 +40,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_policy_hook_config,
     record_app_server_stopped,
     record_certificate_failure,
+    record_child_usage_baseline,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -135,6 +137,72 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+
+
+@pytest.mark.parametrize("native_turn", [None, "turn_agent", "turn_shell"])
+def test_shell_reconciliation_requires_idle_or_the_original_parent(
+    tmp_path: Path, native_turn: str | None
+) -> None:
+    """Only authoritative idle or the original model turn makes steering safe."""
+    _seed_active_turn(tmp_path, "turn_agent")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "shell_request")
+    pending = read_bridge_state(tmp_path)
+    assert pending is not None
+    for _ in range(2):
+        codex_native_bridge.reconcile_shell_command_state(tmp_path, pending, native_turn)
+        updated = read_bridge_state(tmp_path)
+        assert updated is not None
+        assert updated.active_turn_id == "turn_agent"
+        assert (updated.pending_shell_command_id is None) == (native_turn != "turn_shell")
+        assert updated.active_shell_turn_id is None
+
+
+@pytest.mark.parametrize(
+    "changed_field", ["pending_shell_command_id", "session_id", "thread_id", "socket_path"]
+)
+def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
+    tmp_path: Path, changed_field: str
+) -> None:
+    """A delayed fence response cannot change state that replaced its captured submission."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, None)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "older_request")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    newer = replace(observed, **{changed_field: "newer_value"})
+    write_bridge_state(tmp_path, newer)
+
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, None)
+
+    assert read_bridge_state(tmp_path) == newer
+
+
+def test_shell_reconciliation_never_restores_a_completed_turn(tmp_path: Path) -> None:
+    """Completion during the probe must not create a stale standalone-shell latch."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_shell")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    observed = replace(state, pending_shell_command_id="submission")
+    write_bridge_state(tmp_path, observed)
+    clear_active_turn_id_if_matches(tmp_path, "turn_shell")
+
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, "turn_shell")
+
+    current = read_bridge_state(tmp_path)
+    assert current is not None
+    assert current.active_turn_id is None
+    assert current.active_shell_turn_id is None
+    assert current.pending_shell_command_id == "submission"
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, current, None)
+    settled = read_bridge_state(tmp_path)
+    assert settled is not None and settled.pending_shell_command_id is None
 
 
 @pytest.mark.parametrize(
@@ -546,6 +614,32 @@ def test_clear_active_turn_id_if_matches(
     # The cleared/preserved active turn id also governs steering: a turn
     # wrongly cleared here means later web messages stop steering it.
     assert state.active_turn_id == expected_active_after
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "next_turn_id"),
+    [(None, None), ("turn_a", "turn_a"), (None, "turn_a"), ("turn_a", "turn_b"), ("turn_a", None)],
+)
+def test_active_turn_update_requires_storage_only_when_state_changes(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_turn_id: str | None,
+    next_turn_id: str | None,
+) -> None:
+    _seed_active_turn(bridge_dir, active_turn_id)
+    before = read_bridge_state(bridge_dir)
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(codex_native_bridge.tempfile, "mkstemp", disk_full)
+    if active_turn_id == next_turn_id:
+        update_active_turn_id(bridge_dir, next_turn_id)
+    else:
+        with pytest.raises(OSError) as raised:
+            update_active_turn_id(bridge_dir, next_turn_id)
+        assert raised.value.errno == errno.ENOSPC
+    assert read_bridge_state(bridge_dir) == before
 
 
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:
@@ -983,6 +1077,45 @@ def test_clear_bridge_state_removes_mcp_startup(bridge_dir: Path) -> None:
     clear_bridge_state(bridge_dir)
 
     assert read_mcp_startup(bridge_dir) == {}
+
+
+@pytest.mark.parametrize(
+    ("patched_owner", "patched_name"),
+    [(Path, "open"), (codex_native_bridge.tempfile, "mkstemp")],
+    ids=["read-fails", "write-fails"],
+)
+def test_child_usage_baseline_storage_failure_keeps_recorded_baselines(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    patched_owner: object,
+    patched_name: str,
+) -> None:
+    """
+    A failed read or write while recording one child keeps the others' baselines
+    and is logged, so a restarted forwarder still subtracts their inherited usage.
+    """
+    record_child_usage_baseline(bridge_dir, "thread_forked", (5000, 4000, 100))
+    record_child_usage_baseline(bridge_dir, "thread_fresh", (0, 0, 0))
+
+    def storage_error(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EIO, "Input/output error")
+
+    with (
+        monkeypatch.context() as patch,
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.bridge"),
+    ):
+        patch.setattr(patched_owner, patched_name, storage_error)
+        record_child_usage_baseline(bridge_dir, "thread_new", (300, 0, 30))
+
+    assert read_child_usage_baselines(bridge_dir) == {
+        "thread_forked": (5000, 4000, 100),
+        "thread_fresh": (0, 0, 0),
+    }
+    assert any(
+        "Could not record inherited Codex child usage" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────

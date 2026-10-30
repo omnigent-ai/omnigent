@@ -90,3 +90,54 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert client.posts == []
+
+
+@pytest.mark.parametrize(
+    ("echoing_replay", "copies", "expected_duplicates"),
+    [
+        (True, ["resumed", "live"], [False, True]),
+        (True, ["live", "resumed"], [False, True]),
+        (True, ["resumed", "resumed", "live", "live"], [False, False, True, True]),
+        (True, ["resumed", "live", "live"], [False, True, False]),
+        (False, ["resumed", "live"], [False, False]),
+        (False, ["live", "resumed", "resumed"], [False, True, False]),
+    ],
+    ids=[
+        "replay_then_echo",
+        "echo_then_replay",
+        "repeated_input",
+        "identical_steer_after_echo",
+        "late_join_then_identical_steer",
+        "live_then_late_join_replay",
+    ],
+)
+def test_pair_user_message_copy_matches_each_resumed_input_once(
+    echoing_replay: bool, copies: list[str], expected_duplicates: list[bool]
+) -> None:
+    """Each resumed copy pairs with at most one live copy of the same input."""
+    state = fwd._CodexForwarderState(parent_session_id="conv_123")
+    if echoing_replay:
+        state.resume_echo_thread_ids.add("thread_123")
+    key = ("thread_123", "turn_123", '[{"text": "Run the tests again.", "type": "text"}]')
+
+    duplicates = [state.pair_user_message_copy(key, resumed=copy == "resumed") for copy in copies]
+
+    assert duplicates == expected_duplicates
+
+
+def test_user_message_copy_balance_keeps_unmatched_copies_until_turn_ends() -> None:
+    """Paired copies and a finished turn's copies are not retained."""
+    state = fwd._CodexForwarderState(parent_session_id="conv_123")
+    state.resume_echo_thread_ids.add("thread_123")
+    paired = ("thread_123", "turn_123", "digest_paired")
+    unmatched = ("thread_123", "turn_123", "digest_unmatched")
+    other_turn = ("thread_123", "turn_456", "digest_unmatched")
+
+    state.pair_user_message_copy(paired, resumed=True)
+    state.pair_user_message_copy(paired, resumed=False)
+    state.pair_user_message_copy(unmatched, resumed=False)
+    state.pair_user_message_copy(other_turn, resumed=False)
+    assert state.user_message_copy_balance == {unmatched: 1, other_turn: 1}
+
+    state.forget_user_message_copies("turn_123")
+    assert state.user_message_copy_balance == {other_turn: 1}

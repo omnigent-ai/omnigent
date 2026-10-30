@@ -234,6 +234,24 @@ def launcher_password_prompt(screen: str | None) -> bool:
     return bool(lines) and _PASSWORD_PROMPT.search(lines[-1]) is not None
 
 
+_INSTALL_PROMPT = re.compile(r"\binstall\b[^?\r\n]*\?\s*\[[yn]/[yn]\]\s*:?\s*$", re.IGNORECASE)
+
+
+def launcher_install_prompt(screen: str | None) -> bool:
+    """Whether a launcher ends on an unanswered installation confirmation.
+
+    The short tail permits a wrapped question; later output or an echoed
+    answer means the launcher already moved past it.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` for an install question ending in a yes/no prompt.
+    """
+    if not screen:
+        return False
+    lines = [line.strip() for line in screen.splitlines() if line.strip()]
+    return bool(lines) and _INSTALL_PROMPT.search(" ".join(lines[-3:])) is not None
+
+
 def sign_in_next_step(agent: str) -> str:
     """Phrase the next step for a card whose harness is waiting on a launcher sign-in.
 
