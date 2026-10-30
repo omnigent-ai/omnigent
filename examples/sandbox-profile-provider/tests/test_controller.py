@@ -130,3 +130,40 @@ def test_controller_requires_safe_url_and_explicit_selection():
     launcher = ControllerSandboxLauncher(config=ControllerConfig(url="https://controller.example"))
     with pytest.raises(SandboxConfigError, match="Select a sandbox profile"):
         launcher.provision("unselected")
+
+
+@pytest.mark.parametrize("profile_result", ["missing", "malformed", "mismatch"])
+def test_provision_cleans_up_invalid_assignment(monkeypatch, profile_result):
+    monkeypatch.setenv("SANDBOX_CONTROLLER_TOKEN", "test-service-token")
+    original = httpx.Client
+    profile = {"id": "build", "name": "Build", "revision": "1"}
+    allocated = set()
+
+    def dispatch(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"profiles": [profile], "profile": profile})
+        if request.method == "POST":
+            assert request.url.path == "/sandboxes"
+            allocated.add("sb-123")
+            result = {"sandbox_id": "sb-123"}
+            if profile_result == "malformed":
+                result["sandbox_profile"] = {"id": "build"}
+            elif profile_result == "mismatch":
+                result["sandbox_profile"] = {**profile, "revision": "2"}
+            return httpx.Response(200, json=result)
+        assert request.method == "DELETE" and request.url.path == "/sandboxes/sb-123"
+        allocated.remove("sb-123")
+        return httpx.Response(204)
+
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: original(transport=httpx.MockTransport(dispatch), **kwargs),
+    )
+    launcher = ControllerSandboxLauncher(config=ControllerConfig(url="http://localhost"))
+    caller = SandboxProfileContext(user_id="alice", workspace_id=0)
+    launcher.select_profile(caller, launcher.list_profiles(caller)[0])
+    error = SandboxProfileChanged if profile_result == "mismatch" else SandboxConfigError
+    with pytest.raises(error):
+        launcher.provision("example")
+    assert allocated == set()

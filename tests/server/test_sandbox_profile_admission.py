@@ -34,10 +34,12 @@ def admission_app(runtime_init: None, db_uri: str, tmp_path: Path):
         ProviderSandboxProfile(id="other", name="Other", revision="1"),
     ]
     launcher.list_profiles = lambda context: offered
+    selections = []
 
     def select(context, profile):
         if profile not in offered:
             raise SandboxProfileChanged("Profile retired")
+        selections.append((profile.id, profile.revision))
 
     launcher.select_profile = select
     app = create_app(
@@ -61,6 +63,7 @@ def admission_app(runtime_init: None, db_uri: str, tmp_path: Path):
     hosts.upsert_on_connect(host_id, "profile-host", "alice")
     profile = app.state.sandbox_profiles.resolve("build", user_id="alice")
     app.state.profile_test_offered = offered
+    app.state.profile_test_selections = selections
     source = conversations.create_conversation(host_id=host_id, workspace="/tmp")
     app.state.sandbox_profiles.bind_session(source.id, profile)
     return app, hosts, conversations, host_id, profile
@@ -98,8 +101,13 @@ def test_profile_binding_waits_for_accepted_host_binding(admission_app, binding)
         host_id=host_id if binding == "existing" else old_host_id,
         workspace="/tmp" if binding != "unbound" else None,
     )
+    app.state.profile_test_selections.clear()
     app.state.host_registry.launch_authorizer(
         host_id, target.id, None, None, binding != "existing", old_host_id
     )
     snapshot = app.state.sandbox_profiles.get_session_snapshot(target.id)
     assert snapshot == (profile if binding == "existing" else None)
+    # Adopting a profile also checks permission at the persistence boundary.
+    assert app.state.profile_test_selections == [("build", "1")] * (
+        2 if binding == "existing" else 1
+    )

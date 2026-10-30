@@ -141,12 +141,19 @@ class ControllerSandboxLauncher(SandboxHostLauncher):
             context=self._context,
             body={"name": name, "sandbox_profile": self._selection()},
         )
-        profile = ProviderSandboxProfile.model_validate(result["sandbox_profile"])
+        sandbox_id = result.get("sandbox_id")
+        if not isinstance(sandbox_id, str) or not sandbox_id:
+            raise SandboxConfigError("Controller returned no sandbox id")
+        try:
+            profile = ProviderSandboxProfile.model_validate(result["sandbox_profile"])
+        except (KeyError, ValueError):
+            self.terminate(sandbox_id)
+            raise SandboxConfigError("Controller returned an invalid sandbox profile") from None
         assert self._profile is not None
         if (profile.id, profile.revision) != (self._profile.id, self._profile.revision):
-            self.terminate(result["sandbox_id"])
+            self.terminate(sandbox_id)
             raise SandboxProfileChanged("Controller allocated a different profile revision")
-        return result["sandbox_id"]
+        return sandbox_id
 
     def resume(self, sandbox_id: str) -> None:
         self._request(

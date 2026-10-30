@@ -2250,14 +2250,10 @@ def create_app(
             sandbox_profiles.require_session_host(
                 session_id,
                 host_id,
-                bind=False,
+                bind=not allow_unbound and transfer_from_host_id is None,
                 sandbox_provider=host.sandbox_provider if host is not None else None,
                 user_id=host.user_id if host is not None else None,
             )
-            # Unbound or transfer launches defer profile binding;
-            # already host-bound creates adopt during admission.
-            if not allow_unbound and transfer_from_host_id is None:
-                sandbox_profiles.require_session_host(session_id, host_id)
 
         host_registry.launch_authorizer = admit_profiled_launch
     app.state.branding_snapshot = branding_snapshot
