@@ -181,6 +181,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     pi: "Pi",
     antigravity: "Antigravity",
     copilot: "Copilot",
+    grok: "Grok Build",
   }),
 }));
 vi.mock("@/lib/goalApi", async (importOriginal) => ({
@@ -712,6 +713,8 @@ describe("Composer send shortcut", () => {
     const tooltip = await screen.findByRole("tooltip");
 
     expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltip).toHaveClass("menu-surface", "bg-popover", "text-popover-foreground");
+    expect(tooltip).not.toHaveClass("bg-slate-900", "text-slate-100");
     expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 
@@ -1036,6 +1039,52 @@ describe("Composer slash-command menu", () => {
     expect(props.onSend).not.toHaveBeenCalled();
   });
 
+  function renderClearComposer(
+    harness: "claude-native" | "codex-native",
+    advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
+  ) {
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    useChatStore.setState({ sessionHarness: harness });
+    const clearContext = vi.spyOn(useChatStore.getState(), "clearContext").mockResolvedValue();
+    const props = composerProps({ isNativeWrapper: true });
+    render(
+      <CapabilitiesProvider
+        info={advertised === "loading" ? "loading" : { ...FALLBACK_SERVER_INFO, ...advertised }}
+      >
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/cle" } });
+    return { clearContext, onSend: props.onSend };
+  }
+
+  it.each(["claude-native", "codex-native"] as const)(
+    "%s /clear runs the clear control when the server accepts it",
+    (harness) => {
+      const { clearContext, onSend } = renderClearComposer(harness, {
+        session_event_types: ["message", "clear"],
+      });
+      fireEvent.click(screen.getByTestId("slash-menu-item-clear"));
+      expect(clearContext).toHaveBeenCalledOnce();
+      expect(onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["claude-native", {}],
+    ["claude-native", { session_event_types: ["message"] }],
+    ["codex-native", {}],
+    ["claude-native", "loading"],
+  ] as const)("%s sends a typed /clear as text when server info is %o", (harness, advertised) => {
+    const { clearContext, onSend } = renderClearComposer(harness, advertised);
+    expect(screen.queryByTestId("slash-menu-item-clear")).toBeNull();
+    fireEvent.change(textarea(), { target: { value: "/clear" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(clearContext).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledExactlyOnceWith("/clear", undefined);
+  });
+
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
     render(<Composer {...composerProps()} />);
     const ta = textarea();
@@ -1186,6 +1235,107 @@ describe("Composer slash-command submit routing", () => {
     expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
     // It's a slash_command event, NOT a plaintext message.
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("keeps a skill in the composer while an offline Arca reconnects, then sends it", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    const onShowReconnectHelp = vi.fn();
+    const handlers = { onSend, onSendSlashCommand, onShowReconnectHelp };
+    const { rerender } = render(
+      <Composer {...composerProps({ ...handlers, unreachable: true, sendReconnectsArca: true })} />,
+    );
+    fireEvent.change(textarea(), { target: { value: "/deslop fix the bug" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onShowReconnectHelp).toHaveBeenCalledOnce();
+    expect(textarea().value).toBe("/deslop fix the bug");
+    expect(screen.getByText("Send this command again once Arca is back online.")).toBeTruthy();
+
+    // Arca is back: the same command now runs.
+    rerender(<Composer {...composerProps(handlers)} />);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith("deslop", "fix the bug");
+  });
+
+  it.each([
+    ["a skill in a native session", "/deslop fix the bug"],
+    ["unknown slash text", "/foo bar"],
+  ])("sends %s as a message while an offline Arca reconnects", (_kind, text) => {
+    const onSend = vi.fn();
+    const onShowReconnectHelp = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          onShowReconnectHelp,
+          unreachable: true,
+          sendReconnectsArca: true,
+        })}
+      />,
+    );
+    fireEvent.change(textarea(), { target: { value: text } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    // ChatPage's onSend queues it for the host, like any other message.
+    expect(onSend).toHaveBeenCalledExactlyOnceWith(text, undefined);
+    expect(onShowReconnectHelp).not.toHaveBeenCalled();
+    expect(screen.queryByText("Send this command again once Arca is back online.")).toBeNull();
+  });
+
+  it("doesn't steer the queue with Mod+Enter while an offline Arca reconnects", () => {
+    const realSteerAll = useChatStore.getState().steerAllQueuedMessages;
+    const steerAll = vi.fn();
+    useChatStore.setState({ steerAllQueuedMessages: steerAll });
+    try {
+      const onSend = vi.fn();
+      render(
+        <Composer {...composerProps({ onSend, unreachable: true, sendReconnectsArca: true })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "hi" } });
+      fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+
+      expect(onSend).toHaveBeenCalledExactlyOnceWith("hi", undefined);
+      expect(steerAll).not.toHaveBeenCalled();
+    } finally {
+      useChatStore.setState({ steerAllQueuedMessages: realSteerAll });
+    }
+  });
+
+  it("keeps /clear in the composer while an offline Arca reconnects, then runs it", () => {
+    const realClearContext = useChatStore.getState().clearContext;
+    const clearContext = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ sessionHarness: "claude-native", clearContext });
+    try {
+      const onShowReconnectHelp = vi.fn();
+      const info = { ...FALLBACK_SERVER_INFO, session_event_types: ["clear"] };
+      const { rerender } = render(
+        <CapabilitiesProvider info={info}>
+          <Composer
+            {...composerProps({ onShowReconnectHelp, unreachable: true, sendReconnectsArca: true })}
+          />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.change(textarea(), { target: { value: "/clear" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(clearContext).not.toHaveBeenCalled();
+      expect(onShowReconnectHelp).toHaveBeenCalledOnce();
+      // The menu completes the command, so it stays ready to send.
+      expect(textarea().value.trim()).toBe("/clear");
+
+      rerender(
+        <CapabilitiesProvider info={info}>
+          <Composer {...composerProps({ onShowReconnectHelp })} />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(clearContext).toHaveBeenCalledOnce();
+    } finally {
+      useChatStore.setState({ clearContext: realClearContext });
+    }
   });
 
   it("routes a skill whose name contains spaces, with and without args", () => {
@@ -2228,6 +2378,30 @@ describe("Composer model/effort label", () => {
       />,
     );
     expect(label()).toHaveTextContent("Polly (Pi)");
+  });
+
+  it("shows the harness identity, not the spec pin, for an own-auth ACP session", () => {
+    // Grok Build runs its own model, so the snapshot leaves llmModel null until
+    // the agent reports one. The spec's pinned model must not appear.
+    useChatStore.setState({
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
+      llmModel: null,
+      sessionHarness: "grok",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "pinned" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Grok Build");
+    expect(label()).not.toHaveTextContent("gpt-4o-mini");
   });
 
   it("names the vendor, not the Task subagent_type, on a Claude Code sub-agent", () => {
@@ -4530,6 +4704,20 @@ describe("Composer placeholder", () => {
     expect(textarea().disabled).toBe(true);
     expect(textarea().placeholder).toMatch(/reconnect below/i);
   });
+
+  it.each([
+    ["ready", false, "Send a message to reconnect Arca…"],
+    ["still loading agents", true, "Waiting for agents…"],
+  ])(
+    "lets an offline Arca session type and says sending reconnects it: %s",
+    (_state, disabled, placeholder) => {
+      render(
+        <Composer {...composerProps({ unreachable: true, sendReconnectsArca: true, disabled })} />,
+      );
+      expect(textarea().disabled).toBe(disabled);
+      expect(textarea().placeholder).toBe(placeholder);
+    },
+  );
 });
 
 // A pending elicitation parks the agent's turn server-side on the verdict
@@ -4777,6 +4965,16 @@ describe("Composer reply quotes", () => {
     expect(hasSessionDraft("conv_test")).toBe(false);
   });
 
+  it("inserts into an unreachable composer whose send reconnects Arca", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(
+      <Composer {...composerProps({ unreachable: true, sendReconnectsArca: true })} ref={ref} />,
+    );
+    act(() => ref.current?.appendReplyQuote("Quoted while offline"));
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted while offline");
+    expect(hasSessionDraft("conv_test")).toBe(true);
+  });
+
   it("removes a quote without stealing focus or reinserting it on rerender", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const props = composerProps();
@@ -4999,8 +5197,6 @@ describe("Composer reply quotes", () => {
       JSON.stringify([{ text: serializeReplyDraft(replyDraft), replyDraft }]),
     );
     render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
-    textarea().setSelectionRange(0, 0);
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
     const edited = "Introduction\n\nAnswer to keep";
@@ -5014,12 +5210,13 @@ describe("Composer reply quotes", () => {
   it("exits history recall on the first manual text edit", () => {
     localStorage.setItem("omnigent:prompt-history:conv_test", JSON.stringify(["Older prompt"]));
     render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
-    textarea().setSelectionRange(0, 0);
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     expect(textarea()).toHaveValue("Older prompt");
     const edited = "My edited prompt";
     fireEvent.change(textarea(), { target: { value: edited } });
+    textarea().setSelectionRange(0, 0);
+    expect(fireEvent.keyDown(textarea(), { key: "ArrowUp" })).toBe(true);
+    expect(textarea()).toHaveValue(edited);
     textarea().setSelectionRange(edited.length, edited.length);
     fireEvent.keyDown(textarea(), { key: "ArrowDown" });
     expect(textarea()).toHaveValue(edited);
@@ -5963,34 +6160,42 @@ describe("Composer — queued-message flush gating", () => {
   // drain the queue while the session is unreachable — flushing would POST
   // into a void, bypassing onSend's reconnect dialog. It must drain once
   // reachable again.
-  it("holds the queue while unreachable, then flushes when reachable", async () => {
-    const sendSpy = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({
-      conversationId: "conv_test",
-      boundAgentId: "agent_xyz",
-      status: "idle",
-      sessionStatus: "idle",
-      send: sendSpy,
-      queuedMessages: [{ queueId: "q_1", text: "held", conversationId: "conv_test" }],
-    });
+  it.each([
+    [false, "idle"],
+    [true, "failed"],
+  ] as const)(
+    "holds the queue while unreachable (sending reconnects Arca: %s, session %s), then flushes when reachable",
+    async (sendReconnectsArca, sessionStatus) => {
+      const sendSpy = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({
+        conversationId: "conv_test",
+        boundAgentId: "agent_xyz",
+        status: "idle",
+        sessionStatus,
+        send: sendSpy,
+        queuedMessages: [{ queueId: "q_1", text: "held", conversationId: "conv_test" }],
+      });
 
-    // Idle + a waiting head, but unreachable → the effect must not flush.
-    // Wrapped in TooltipProvider since the queued-message strip renders the
-    // steer button's tooltip.
-    const { rerender } = renderWithTooltips(<Composer {...composerProps({ unreachable: true })} />);
-    await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
-    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+      // Idle + a waiting head, but unreachable → the effect must not flush.
+      // Wrapped in TooltipProvider since the queued-message strip renders the
+      // steer button's tooltip.
+      const { rerender } = renderWithTooltips(
+        <Composer {...composerProps({ unreachable: true, sendReconnectsArca })} />,
+      );
+      await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
+      expect(useChatStore.getState().queuedMessages).toHaveLength(1);
 
-    // Becomes reachable → the effect re-fires and drains the head.
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ unreachable: false })} />
-      </TooltipProvider>,
-    );
-    await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
-    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
-    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
-  });
+      // Becomes reachable → the effect re-fires and drains the head.
+      rerender(
+        <TooltipProvider>
+          <Composer {...composerProps({ unreachable: false })} />
+        </TooltipProvider>,
+      );
+      await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
+      expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
+      expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    },
+  );
 });
 
 describe("Composer — editing queued messages", () => {
@@ -6209,17 +6414,38 @@ describe("Composer — editing queued messages", () => {
     expect(props.onSend).toHaveBeenCalledWith(QUEUED_TEXT, [file]);
   });
 
-  it("browsing history over a non-empty draft leaves the queued row alone", async () => {
+  it.each(["half-typed draft", "first line\nsecond line", " \n "])(
+    "ArrowUp preserves the draft %j and leaves the queued row alone",
+    (draft) => {
+      appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+      renderWithTooltips(<Composer {...composerProps()} />);
+
+      const ta = textarea();
+      fireEvent.change(ta, { target: { value: draft } });
+      ta.setSelectionRange(0, 0);
+      expect(fireEvent.keyDown(ta, { key: "ArrowUp" })).toBe(true);
+
+      expect(ta).toHaveValue(draft);
+      expect(getSessionDraft(CONV)?.text).toBe(draft);
+      expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    },
+  );
+
+  it("keeps a recalled queued message as an editable draft", () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
     renderWithTooltips(<Composer {...composerProps()} />);
 
     const ta = textarea();
-    fireEvent.change(ta, { target: { value: "half-typed draft" } });
-    ta.setSelectionRange(0, 0);
     fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue(QUEUED_TEXT);
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
 
-    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
-    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    ta.setSelectionRange(0, 0);
+    expect(fireEvent.keyDown(ta, { key: "ArrowUp" })).toBe(true);
+    ta.setSelectionRange(QUEUED_TEXT.length, QUEUED_TEXT.length);
+    expect(fireEvent.keyDown(ta, { key: "ArrowDown" })).toBe(true);
+
+    expect(ta).toHaveValue(QUEUED_TEXT);
   });
 
   it("leaves another conversation's identically-worded queued row alone", async () => {
@@ -6258,6 +6484,198 @@ describe("Composer config gear", () => {
   });
 
   const gear = () => document.querySelector('[data-testid="composer-config-gear"]');
+
+  describe("deferred cycle shortcuts", () => {
+    beforeEach(() => {
+      const previous = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState(previous, true));
+      vi.useFakeTimers();
+      useChatStore.setState({
+        setModel: vi.fn().mockResolvedValue(undefined),
+        setEffort: vi.fn().mockResolvedValue(undefined),
+        llmModel: "fable",
+        sessionReasoningEffort: "medium",
+        codexModelOptions: CLAUDE_MODEL_OPTIONS,
+      });
+    });
+    afterEach(() => vi.useRealTimers());
+
+    const cycle = (code: "KeyM" | "KeyE" = "KeyM") =>
+      fireEvent.keyDown(textarea(), { code, ctrlKey: true, altKey: true });
+    const props = () =>
+      composerProps({
+        status: "streaming",
+        isWorking: true,
+        showModels: true,
+        modelPickerKind: "claude",
+        codexModelOptions: CLAUDE_MODEL_OPTIONS,
+      });
+
+    it.each(["two idle seconds", "Enter"])(
+      "previews every model in a burst and applies only the final choice after %s",
+      async (confirmation) => {
+        const composer = props();
+        const { setModel, setEffort } = useChatStore.getState();
+        renderWithTooltips(<Composer {...composer} />);
+        const input = textarea();
+        fireEvent.change(input, { target: { value: "unfinished follow-up" } });
+        act(() => input.focus());
+
+        for (const model of ["opus", "sonnet", "sonnet_5"]) {
+          act(() => vi.advanceTimersByTime(500));
+          cycle();
+          expect(screen.getByTestId(`composer-agent-model-${model}`)).toHaveAttribute(
+            "aria-checked",
+            "true",
+          );
+          expect(setModel).not.toHaveBeenCalled();
+          expect(setEffort).not.toHaveBeenCalled();
+        }
+        if (confirmation === "Enter") {
+          await act(async () => fireEvent.keyDown(input, { key: "Enter", code: "Enter" }));
+        } else {
+          await act(() => vi.advanceTimersByTimeAsync(1_999));
+          expect(setModel).not.toHaveBeenCalled();
+          await act(() => vi.advanceTimersByTimeAsync(1));
+        }
+        expect(setModel).toHaveBeenCalledExactlyOnceWith("sonnet_5", { expectConfirmation: true });
+        expect(setEffort).not.toHaveBeenCalled();
+        expect(input).toHaveFocus();
+        expect(input).toHaveValue("unfinished follow-up");
+        expect(composer.onSend).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["wrap", "Escape", "navigation", "read-only", "unreachable", "unmount"])(
+      "does not apply a pending choice after %s",
+      async (action) => {
+        const composer = props();
+        const { setModel, setEffort } = useChatStore.getState();
+        const view = renderWithTooltips(<Composer {...composer} />);
+        act(() => textarea().focus());
+        cycle();
+        if (action === "wrap") {
+          for (let remaining = 1; remaining < CLAUDE_MODEL_OPTIONS.length; remaining++) cycle();
+          expect(screen.getByTestId("composer-agent-model-fable")).toHaveAttribute(
+            "aria-checked",
+            "true",
+          );
+        } else if (action === "Escape") {
+          cycle("KeyE");
+          fireEvent.keyDown(textarea(), { key: "Escape", code: "Escape" });
+          expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+          expect(composer.onStop).not.toHaveBeenCalled();
+          expect(textarea()).toHaveFocus();
+        } else if (action === "navigation") {
+          act(() => useChatStore.setState({ conversationId: "another-session" }));
+        } else if (action === "read-only" || action === "unreachable") {
+          view.rerender(
+            <TooltipProvider>
+              <Composer
+                {...composer}
+                permissionLevel={action === "read-only" ? 1 : null}
+                unreachable={action === "unreachable"}
+              />
+            </TooltipProvider>,
+          );
+          expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+        } else {
+          view.unmount();
+        }
+        await act(() => vi.advanceTimersByTimeAsync(3_000));
+        expect(setModel).not.toHaveBeenCalled();
+        expect(setEffort).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["confirmed", "refused", "navigated"])(
+      "cycles the draft model's effort ladder and waits for the model to be %s",
+      async (outcome) => {
+        const options = [
+          {
+            id: "primary",
+            displayName: "Primary",
+            supportedReasoningEfforts: ["low", "medium", "high"].map((reasoningEffort) => ({
+              reasoningEffort,
+            })),
+          },
+          {
+            id: "alternate",
+            displayName: "Alternate",
+            supportedReasoningEfforts: ["medium", "high", "xhigh"].map((reasoningEffort) => ({
+              reasoningEffort,
+            })),
+          },
+        ];
+        let settleModel: () => void = () => {};
+        const setModel = vi.fn(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              settleModel =
+                outcome === "refused" ? () => reject(new Error("Model refused")) : resolve;
+            }),
+        );
+        const setEffort = vi.fn().mockResolvedValue(undefined);
+        useChatStore.setState({
+          setModel,
+          setEffort,
+          llmModel: "primary",
+          codexModelOptions: options,
+        });
+        renderWithTooltips(
+          <Composer {...props()} modelPickerKind="codex" codexModelOptions={options} />,
+        );
+        cycle();
+        cycle("KeyE");
+        cycle("KeyE");
+        expect(screen.getByTestId("composer-agent-effort-xhigh")).toHaveAttribute(
+          "aria-checked",
+          "true",
+        );
+        expect(screen.queryByTestId("composer-agent-effort-low")).toBeNull();
+        expect(setModel).not.toHaveBeenCalled();
+        expect(setEffort).not.toHaveBeenCalled();
+        await act(() => vi.advanceTimersByTimeAsync(2_000));
+        cycle();
+        cycle("KeyE");
+        expect(setModel).toHaveBeenCalledExactlyOnceWith("alternate", { expectConfirmation: true });
+        expect(setEffort).not.toHaveBeenCalled();
+        await act(async () => {
+          if (outcome === "confirmed") useChatStore.setState({ llmModel: "alternate" });
+          if (outcome === "navigated") useChatStore.setState({ conversationId: "another-session" });
+          settleModel();
+        });
+        if (outcome === "confirmed") expect(setEffort).toHaveBeenCalledExactlyOnceWith("xhigh");
+        else expect(setEffort).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  it.each([{ permissionLevel: 1 }, { unreachable: true }])(
+    "ignores model and effort shortcuts when the config is disabled: %j",
+    (overrides) => {
+      const previous = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState(previous, true));
+      const setModel = vi.fn();
+      const setEffort = vi.fn();
+      useChatStore.setState({ setModel, setEffort });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: CLAUDE_MODEL_OPTIONS,
+            ...overrides,
+          })}
+        />,
+      );
+      fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, altKey: true });
+      fireEvent.keyDown(window, { code: "KeyE", ctrlKey: true, altKey: true });
+      expect(setModel).not.toHaveBeenCalled();
+      expect(setEffort).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+    },
+  );
 
   it("renders when the session has a switchable knob (effort)", () => {
     renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
@@ -6946,34 +7364,57 @@ describe("Composer config gear", () => {
     },
   );
 
-  it("leaves no lingering error indicator when a session config update fails", async () => {
-    const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
-    const options = [
-      { id: "opus", model: "opus", displayName: "Opus" },
-      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
-    ] as never;
-    useChatStore.setState({ setModel, codexModelOptions: options });
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showModels: true,
-          modelPickerKind: "claude",
-          codexModelOptions: options,
-        })}
-      />,
-    );
+  it.each(["menu", "shortcut"])(
+    "leaves no lingering error indicator when a %s config update fails",
+    async (entry) => {
+      if (entry === "shortcut") {
+        vi.useFakeTimers();
+        onTestFinished(() => {
+          vi.useRealTimers();
+        });
+      }
+      const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
+      const options = [
+        { id: "opus", model: "opus", displayName: "Opus" },
+        { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+      ] as never;
+      useChatStore.setState({ setModel, codexModelOptions: options, llmModel: "opus" });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+          })}
+        />,
+      );
 
-    await openSessionModels();
-    fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
-    await waitFor(() =>
-      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
-    );
-    await waitFor(() =>
-      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
-    );
-    expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
-    expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
-  });
+      if (entry === "menu") {
+        await openSessionModels();
+        fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+      } else {
+        textarea().focus();
+        fireEvent.keyDown(textarea(), { code: "KeyM", ctrlKey: true, altKey: true });
+        expect(setModel).not.toHaveBeenCalled();
+        await act(() => vi.advanceTimersByTimeAsync(2_000));
+      }
+      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true });
+      if (entry === "menu") {
+        await waitFor(() =>
+          expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
+        );
+      } else {
+        expect(screen.getByTestId("composer-agent-model-opus")).toHaveAttribute(
+          "aria-checked",
+          "true",
+        );
+        expect(textarea()).toHaveFocus();
+        expect(screen.getByTestId("composer-agent-config-value")).toHaveTextContent("Opus");
+      }
+      expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
+      expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
+    },
+  );
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {
     // Codex advertises a per-model effort ladder. Drafting a lower-ceiling
