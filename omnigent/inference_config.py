@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -32,6 +32,22 @@ class HarnessInferenceBinding:
     provider: str
     default_model: str | None = None
     model_allowlist: tuple[str, ...] | None = None
+
+
+class ModelNotAllowedError(OmnigentError):
+    """A model choice falls outside its harness binding's saved model list."""
+
+    def __init__(self, model: str | None, harness: str, allowed_models: Sequence[str]) -> None:
+        """
+        :param model: Rejected model ID, e.g. ``"system.ai.gpt-6-astra"``.
+        :param harness: Harness whose binding rejected it, e.g. ``"codex-native"``.
+        :param allowed_models: The binding's ordered model list.
+        """
+        super().__init__(
+            f"Model {model!r} is not in the configured model list for {harness!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+        self.allowed_models = tuple(allowed_models)
 
 
 def validate_inference_credentials(
@@ -230,10 +246,7 @@ def resolve_bound_model(config: dict[str, object], harness: str, model: str | No
     if selected is None and binding.model_allowlist:
         selected = binding.model_allowlist[0]
     if binding.model_allowlist is not None and selected not in binding.model_allowlist:
-        raise OmnigentError(
-            f"Model {selected!r} is not in the configured model list for {harness!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise ModelNotAllowedError(selected, harness, binding.model_allowlist)
     return selected
 
 

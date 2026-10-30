@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 from fastapi import FastAPI, Query, Request
@@ -66,6 +66,7 @@ from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
 )
+from omnigent.host.launch_audit import request_client_audit_attributes
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
@@ -77,8 +78,14 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_keepalive,
+    session_live_state,
+    session_pull_requests,
+    shutdown_state,
+)
 from omnigent.server.auth import (
+    RESERVED_USER_LOCAL,
     AuthProvider,
     SharingMode,
     auth_mode,
@@ -88,7 +95,14 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
-from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
+from omnigent.server.feature_flags import (
+    Feature,
+    FeatureFlags,
+    deployment_gate_enabled,
+    harness_install_enabled,
+    resolve_feature_flags,
+)
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
@@ -102,6 +116,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -111,15 +126,18 @@ from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.preferences import create_preferences_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
+    CLIENT_SESSION_EVENT_TYPES,
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
+    set_relay_host_offline_probe,
     set_server_host_registry,
     set_server_runner_router,
 )
@@ -133,6 +151,20 @@ from omnigent.server.runner_session_init import (
     runner_response_error_body,
 )
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.scheduled.config import ScheduledTaskSchedulerConfig
+from omnigent.server.scheduled.dispatch_scheduler import (
+    PersistentTaskScheduler,
+    ScheduledTaskDispatchHooks,
+)
+from omnigent.server.seeded_agents import (
+    SEEDED_AGENTS_ENV,
+    seeded_agent_allowed,
+    seeded_agent_allowlist,
+)
+from omnigent.server.server_config import (
+    RESTRICT_TO_AGENT_NAMES_KEY,
+    PickerCuration,
+)
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -149,10 +181,18 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.preference_store import PreferenceStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.stores.scheduled_task_store.dispatch import ScheduledTaskDispatchStore
+from omnigent.util.event_loop_watchdog import monitor_event_loop
+
+if TYPE_CHECKING:
+    from omnigent.entities import Conversation
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 _logger = logging.getLogger(__name__)
+
 _RECONNECT_BINDING_BATCH_SIZE = 128
 
 
@@ -174,6 +214,29 @@ class BrandingInfo(BaseModel):
     powered_by: bool
 
 
+class PickerInfo(BaseModel):
+    """How a deployment curates what the New Chat picker shows.
+
+    Display only: it narrows the picker, never what exists. Every agent stays
+    seeded, forkable and reachable through the API.
+
+    :param restrict_to_agent_names: Names the picker may offer; empty means
+        the full roster.
+    :param default_agent_name: Name a fresh New Chat starts on, or ``None``.
+        A user's remembered pick wins over it.
+    """
+
+    restrict_to_agent_names: list[str] = []
+    default_agent_name: str | None = None
+
+
+class FilesystemAttachmentsInfo(BaseModel):
+    """Which uploads native sessions receive as files, for client-side checks."""
+
+    extensions: list[str]
+    all_types: bool
+
+
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
     single_user: bool
@@ -181,6 +244,7 @@ class ServerInfoResponse(BaseModel):
     needs_setup: bool
     databricks_features: bool
     managed_sandboxes_enabled: bool
+    durable_initial_input: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -197,9 +261,21 @@ class ServerInfoResponse(BaseModel):
     features: dict[str, bool]
     harness_install_enabled: bool
     installable_harnesses: list[str]
+    # Whether the scheduled-tasks routes are mounted and enabled for this caller.
+    automations_enabled: bool = False
     dictation_available: bool
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
+    # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
+    session_search_scope: bool = True
+    # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
+    # reject them.
+    scheduled_task_session_modes: bool = True
+    # A managed create or fork accepts ``host_id`` naming its new sandbox host;
+    # older servers reject it.
+    request_managed_sandbox_host_id: bool = True
+    # A managed fork accepts ``workspaces``; older servers reject the field.
+    session_fork_workspaces: bool = True
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -207,7 +283,17 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
+    # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
+    session_event_types: list[str] = []
+    # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
+    # absent on older servers, which clients treat as unsupported.
+    session_pull_requests: bool = False
+    # Absent on older servers, which clients treat as the default extensions.
+    filesystem_attachments: FilesystemAttachmentsInfo | None = None
+    # Scheduled tasks accept ``project_id``; older servers reject it.
+    scheduled_task_projects: bool = False
     branding: BrandingInfo
+    picker: PickerInfo = PickerInfo()
 
 
 def _resolve_extension_state(
@@ -221,7 +307,7 @@ def _resolve_extension_state(
     # Distribution metadata is an external installation boundary. Preserve the
     # rest of the server if global discovery itself fails before per-plugin
     # failure isolation can apply.
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
         return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
 
@@ -240,7 +326,7 @@ def _resolve_extension_assets(
                 ", ".join(sorted(overrides)),
             )
         return build_asset_index(state, overrides=overrides)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
         return {}, {"registry": str(exc)}
 
@@ -909,29 +995,118 @@ def _ensure_builtin_agent(
     _logger.info("Registered built-in %s agent as %s", name, agent_id)
 
 
+def _warn_on_empty_picker_restriction(
+    agent_store: AgentStore,
+    curation: PickerCuration,
+    suppressed_agent_names: frozenset[str] = frozenset(),
+) -> None:
+    """Say so at startup when ``restrict_to_agent_names`` names an agent New Chat cannot offer.
+
+    The restriction is display-only, so a mistyped name, or one
+    ``OMNIGENT_SEEDED_AGENTS`` leaves out, fails quietly: the picker simply has
+    less in it, or nothing at all. Each name is looked up directly, so the
+    check holds however many agents the server has.
+
+    :param agent_store: Store the picker's roster is read from.
+    :param curation: The configured curation; checked only when it restricts.
+    :param suppressed_agent_names: Packaged agents ``OMNIGENT_SEEDED_AGENTS``
+        leaves out; seeded, but never offered.
+    """
+    if not curation.restricted:
+        return
+    names = curation.restrict_to_agent_names
+    try:
+        missing = [name for name in names if agent_store.get_by_name(name) is None]
+    except Exception:  # noqa: BLE001 — a store hiccup must not stop startup
+        _logger.warning("could not check %s against the agent roster", RESTRICT_TO_AGENT_NAMES_KEY)
+        return
+    suppressed = [name for name in names if name in suppressed_agent_names and name not in missing]
+    if suppressed:
+        # The env var wins: it decides what the server offers at all.
+        _logger.warning(
+            "server config %s names %d agent(s) that %s leaves out, so New Chat will not "
+            "offer them: %s",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            len(suppressed),
+            SEEDED_AGENTS_ENV,
+            ", ".join(suppressed),
+        )
+    if len(missing) + len(suppressed) == len(names):
+        _logger.warning(
+            "server config %s matches no agent this server offers (%s); only a user's own "
+            "agent with one of these names will show in New Chat",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            ", ".join(names),
+        )
+        return
+    if missing:
+        _logger.warning(
+            "server config %s has %d name(s) matching no server agent: %s",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            len(missing),
+            ", ".join(missing),
+        )
+
+
 def _ensure_default_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+) -> frozenset[str]:
     """
     Register all built-in agents that should always be available.
 
-    Called on every server lifespan startup. Each helper is
+    Called during server startup. Each helper is
     content-aware via :func:`_ensure_builtin_agent`: it creates the
     agent if missing and refreshes it in place when the packaged
     bundle changed, so a redeploy picks up a new spec instead of
     serving the row seeded on first boot.
 
+    ``OMNIGENT_SEEDED_AGENTS`` trims the packaged roster. Each helper
+    returns the packaged names it owns (seeded or not), so whatever the
+    allowlist leaves out is returned here and hidden from ``GET /v1/agents``
+    by the caller that stores it. A row seeded by an earlier boot is
+    suppressed rather than deleted: sessions look their agent up by
+    ``conversations.agent_id``, so dropping the row would leave them without one.
+
+    Extras from ``OMNIGENT_BUILTIN_AGENT_DIRS`` are deliberately outside
+    the allowlist — trimming the packaged roster exists to make room for
+    them, so gating them too would empty the picker.
+
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :returns: Packaged built-in names to hide from ``GET /v1/agents``.
     """
-    _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
-    _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
-    _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
-    _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
+    allowlist = seeded_agent_allowlist()
+    packaged = (
+        _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
+        | _ensure_default_acp_agents(agent_store, artifact_store, agent_cache, allowlist)
+        | _ensure_default_debby_agent(agent_store, artifact_store, agent_cache, allowlist)
+        | _ensure_default_polly_agent(agent_store, artifact_store, agent_cache, allowlist)
+    )
+    extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
+    if allowlist is None:
+        return frozenset()
+    unknown = allowlist - packaged
+    if unknown:
+        _logger.warning(
+            "%s names no packaged built-in: %s (packaged: %s)",
+            SEEDED_AGENTS_ENV,
+            ", ".join(sorted(unknown)),
+            ", ".join(sorted(packaged)),
+        )
+    # An extra that overrides a packaged name by design is the operator's own
+    # roster, never a suppressed row.
+    suppressed = (packaged - allowlist) - extras
+    if suppressed:
+        _logger.info(
+            "Suppressing %d packaged built-in agent(s) from the picker (%s): %s",
+            len(suppressed),
+            SEEDED_AGENTS_ENV,
+            ", ".join(sorted(suppressed)),
+        )
+    return suppressed
 
 
 # Env var listing extra built-in agent specs to seed at startup, in addition
@@ -948,7 +1123,7 @@ def _ensure_extra_builtin_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+) -> frozenset[str]:
     """
     Seed extra built-in agents named by :data:`_EXTRA_BUILTIN_AGENTS_ENV`.
 
@@ -967,14 +1142,17 @@ def _ensure_extra_builtin_agents(
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :returns: The names this helper seeded, so a same-named packaged row
+        the allowlist drops is not suppressed out from under the override.
     """
     import tempfile
 
     from omnigent.spec import materialize_bundle
 
+    seeded: set[str] = set()
     raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "").strip()
     if not raw:
-        return
+        return frozenset()
     for entry in raw.split(os.pathsep):
         entry = entry.strip()
         if not entry:
@@ -992,6 +1170,7 @@ def _ensure_extra_builtin_agents(
                 name=name,
                 bundle_bytes=bundle_bytes,
             )
+            seeded.add(name)
         except Exception:  # a bad operator path must not block server startup
             _logger.exception(
                 "Failed to register extra built-in agent from %r (%s); skipping. Check %s.",
@@ -1001,6 +1180,7 @@ def _ensure_extra_builtin_agents(
             )
             continue
         _logger.info("Registered extra built-in agent %r from %s", name, source)
+    return frozenset(seeded)
 
 
 def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
@@ -1043,7 +1223,7 @@ def _ensure_default_native_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+) -> frozenset[str]:
     """
     Register or refresh every built-in native-CLI agent (claude/codex/pi/...).
 
@@ -1054,9 +1234,15 @@ def _ensure_default_native_agents(
     of the name — stays byte-identical and a redeploy does not orphan persisted
     ``conversation.agent_id`` rows.
 
+    These rows are seeded even when ``OMNIGENT_SEEDED_AGENTS`` leaves them
+    out: transcript imports and smart routing bind sessions to them by
+    ``builtin_agent_id``, so a trimmed deployment only hides them from
+    discovery (the caller suppresses the names this returns).
+
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :returns: Every native agent name this helper owns.
     """
     from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
@@ -1073,6 +1259,7 @@ def _ensure_default_native_agents(
             name=agent.agent_name,
             bundle_bytes=_build_native_bundle(provider),
         )
+    return frozenset(agent.agent_name for agent in NATIVE_CODING_AGENTS)
 
 
 # Light framing for a seeded ACP picker agent. ACP agents run their own tool
@@ -1127,19 +1314,23 @@ def _ensure_default_acp_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+    allowlist: frozenset[str] | None = None,
+) -> frozenset[str]:
     """
     Seed a picker agent per builtin ACP CLI row and per configured ``acp:`` agent.
 
     Native harnesses seed a fixed ``<harness>-ui`` agent each
-    (:func:`_ensure_default_native_agents`) unconditionally; the picker hides a row
-    the selected host cannot launch, reading that host's ``configured_harnesses``
+    (:func:`_ensure_default_native_agents`), hidden but still seeded when the
+    allowlist drops them; the picker additionally hides a row the selected host
+    cannot launch, reading that host's ``configured_harnesses``
     readiness map. Builtin ACP CLI harnesses follow the same model, because the
     vendor CLI runs on the *executing* host (the attached runner) rather than on the
     server: gating the row on the server's own PATH left Devin and Grok missing from
     the picker on every remote server, even when the runner had them installed.
 
-    User-configured ``acp:<slug>`` agents stay config-gated. Their launch command is
+    User-configured ``acp:<slug>`` agents are always seeded and never suppressed:
+    they are the operator's roster, which is what trimming the packaged one makes
+    room for. Their launch command is
     resolved from the *host's* own ``acp:`` block at spawn time, so a row naming a
     slug the executing host does not define could never launch; surfacing those on a
     remote server first needs the host to advertise its configured slugs.
@@ -1158,8 +1349,12 @@ def _ensure_default_acp_agents(
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :param allowlist: Packaged names to seed, or ``None`` to seed all.
+    :returns: Every ACP picker name this helper owns, seeded or skipped.
     """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    owned: set[str] = set()
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
     try:
@@ -1167,7 +1362,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
+    except Exception:  # a malformed acp: block must never break startup
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()
@@ -1176,6 +1371,7 @@ def _ensure_default_acp_agents(
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
         # like "Gemini CLI" would fail to load. The web picker capitalizes the slug
         # for display (e.g. ``devin`` -> "Devin").
+        # Configured ACP agents are operator-owned and bypass packaged allowlisting.
         _ensure_builtin_agent(
             agent_store,
             artifact_store,
@@ -1191,6 +1387,9 @@ def _ensure_default_acp_agents(
     for key in ACP_CLI_HARNESSES:
         if key in shadowed:
             continue
+        owned.add(key)
+        if not seeded_agent_allowed(key, allowlist):
+            continue
         _ensure_builtin_agent(
             agent_store,
             artifact_store,
@@ -1198,6 +1397,7 @@ def _ensure_default_acp_agents(
             name=key,
             bundle_bytes=_build_acp_bundle(harness=key, name=key),
         )
+    return frozenset(owned)
 
 
 def _build_debby_bundle() -> bytes:
@@ -1223,7 +1423,8 @@ def _ensure_default_debby_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+    allowlist: frozenset[str] | None = None,
+) -> frozenset[str]:
     """
     Register the debby brainstorming agent if its bundle ships here.
 
@@ -1237,16 +1438,25 @@ def _ensure_default_debby_agent(
     debby spec, the existing row is refreshed in place instead of
     being ignored.
 
+    The name is owned whether or not the bundle ships here, so a deployment
+    that drops debby from the allowlist also hides a row an earlier,
+    bundle-carrying release seeded.
+
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :param allowlist: Packaged names to seed, or ``None`` to seed all.
+    :returns: ``{"debby"}`` — the packaged name this helper owns.
     """
+    owned = frozenset({_DEBBY_AGENT_NAME})
+    if not seeded_agent_allowed(_DEBBY_AGENT_NAME, allowlist):
+        return owned
     if not (_DEBBY_BUNDLE_SOURCE / "config.yaml").is_file():
         _logger.debug(
             "debby bundle not found at %s; skipping seed",
             _DEBBY_BUNDLE_SOURCE,
         )
-        return
+        return owned
 
     _ensure_builtin_agent(
         agent_store,
@@ -1255,6 +1465,7 @@ def _ensure_default_debby_agent(
         name=_DEBBY_AGENT_NAME,
         bundle_bytes=_build_debby_bundle(),
     )
+    return owned
 
 
 def _build_polly_bundle() -> bytes:
@@ -1280,7 +1491,8 @@ def _ensure_default_polly_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+    allowlist: frozenset[str] | None = None,
+) -> frozenset[str]:
     """
     Register the polly orchestrator agent if its bundle ships here.
 
@@ -1295,16 +1507,25 @@ def _ensure_default_polly_agent(
     polly spec, the existing row is refreshed in place instead of
     being ignored.
 
+    The name is owned whether or not the bundle ships here, so a deployment
+    that drops polly from the allowlist also hides a row an earlier,
+    bundle-carrying release seeded.
+
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :param allowlist: Packaged names to seed, or ``None`` to seed all.
+    :returns: ``{"polly"}`` — the packaged name this helper owns.
     """
+    owned = frozenset({_POLLY_AGENT_NAME})
+    if not seeded_agent_allowed(_POLLY_AGENT_NAME, allowlist):
+        return owned
     if not (_POLLY_BUNDLE_SOURCE / "config.yaml").is_file():
         _logger.debug(
             "polly bundle not found at %s; skipping seed",
             _POLLY_BUNDLE_SOURCE,
         )
-        return
+        return owned
 
     _ensure_builtin_agent(
         agent_store,
@@ -1313,6 +1534,7 @@ def _ensure_default_polly_agent(
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
     )
+    return owned
 
 
 def create_app(
@@ -1346,11 +1568,23 @@ def create_app(
     public_sharing: bool | Callable[[], bool] | None = None,
     public_sharing_max_level: str | Callable[[], str] | None = None,
     default_public_sessions: str | Callable[[], str] | None = None,
+    filesystem_attachment_allowed_extensions: (
+        str | list[str] | Callable[[], str | list[str] | None] | None
+    ) = None,
+    harness_install: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
     host_sharded: bool = False,
+    *,
+    automations: bool | Callable[[], bool] | None = None,
+    default_agents_seeded: bool = False,
+    suppressed_agent_names: frozenset[str] = frozenset(),
+    preference_store: PreferenceStore | None = None,
+    preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
+    scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
+    scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1367,6 +1601,10 @@ def create_app(
         file content).
     :param agent_cache: Cache for loaded agent specs and working
         directories.
+    :param default_agents_seeded: The CLI already refreshed built-ins before
+        registering explicit agent bundles; skip a second refresh at startup.
+    :param suppressed_agent_names: With ``default_agents_seeded``, the packaged
+        built-ins the CLI's refresh suppressed; startup computes its own otherwise.
     :param runner_tunnel_tokens: Optional allow-list of binding
         tokens accepted by the runner WebSocket tunnel route, e.g.
         ``frozenset({"uA6Zz..."})``. ``None`` accepts any
@@ -1384,6 +1622,18 @@ def create_app(
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
+    :param preference_store: Optional shared-preference API; no launcher adoption.
+    :param automations: Whether this request's caller can use automations. A static
+        bool or a zero-arg callable resolved per request; ``None`` enables them.
+        When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
+        reports ``automations_enabled`` false. Scheduling of existing tasks is not
+        affected.
+    :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
+        the owner identity fires act under, or a replacement executor. ``None``
+        uses the built-in executor with every host owned by this replica.
+    :param scheduled_task_scheduler_config: Overrides the server config's
+        scheduled_task_scheduler section. With automations_v2 off, only
+        startup_retry_seconds applies. Changes require restarting the app.
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
@@ -1480,6 +1730,12 @@ def create_app(
         ``None`` reads ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (default ``off``)
         with an admin-editable file override; a static value or callable is
         authoritative. Never grants past ``sharing_mode``/``public_sharing``.
+    :param filesystem_attachment_allowed_extensions: Which uploads native
+        Claude Code and Codex sessions receive as files: a list of extensions,
+        ``[]`` for none, or ``"*"`` for everything that can't be inlined (see
+        :func:`~omnigent.server.server_config.parse_filesystem_attachment_policy`).
+        A callable is evaluated per request. ``None`` uses the server config
+        key of the same name, read at startup.
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
@@ -1510,14 +1766,54 @@ def create_app(
 
     from omnigent.server.server_config import (
         load_branding_snapshot,
+        load_picker_curation,
         load_server_config,
         session_title_instructions,
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
     branding_snapshot = load_branding_snapshot(resolved_server_config)
+    picker_curation = load_picker_curation(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    if harness_install is None:
+        app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
+            Feature.HARNESS_INSTALL
+        )
+    else:
+        app_harness_install = harness_install
+    automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
+    if automations_v2_enabled:
+        if scheduled_task_store is None:
+            raise ValueError(
+                "automations_v2 requires a scheduled task store. Pass scheduled_task_store "
+                "to create_app(), or leave automations_v2 disabled until scheduling is configured."
+            )
+        if not isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
+            raise TypeError(
+                "The configured scheduled task store does not implement the operations needed "
+                "to claim runs and manage startup leases. Use a store that implements "
+                "ScheduledTaskDispatchStore, or disable automations_v2 to use the "
+                "existing scheduler."
+            )
+        scheduled_task_store.check_dispatch_support()
+    scheduler_settings = resolved_server_config.get("scheduled_task_scheduler")
+    if not automations_v2_enabled:
+        scheduler_settings = (
+            {"startup_retry_seconds": scheduler_settings["startup_retry_seconds"]}
+            if isinstance(scheduler_settings, dict)
+            and "startup_retry_seconds" in scheduler_settings
+            else {}
+        )
+    dispatch_config = (
+        scheduled_task_scheduler_config
+        if scheduled_task_scheduler_config is not None
+        else ScheduledTaskSchedulerConfig.model_validate(
+            {} if scheduler_settings is None else scheduler_settings
+        )
+    )
+    if isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
+        scheduled_task_store.configure_dispatch(automations_v2_enabled)
     resolved_extension_state = _resolve_extension_state(extension_state)
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
@@ -1560,7 +1856,8 @@ def create_app(
     from omnigent.server.routes._host_launch import configure_host_sharding
 
     configure_host_sharding(host_sharded)
-    tunnel_registry = TunnelRegistry()
+    # A tunnel this replica retires on purpose is a handoff, not a lost runner.
+    tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
@@ -1588,6 +1885,7 @@ def create_app(
         RunnerBackgroundTitleGenerator(runner_router),
         additional_instructions=title_instructions,
     )
+    pull_request_refresher = session_pull_requests.PullRequestRefresher()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
     # them to clients waiting for a launched runner to connect).
@@ -1702,7 +2000,16 @@ def create_app(
         # SessionFilesystemRegistry moved to the runner. Both
         # warmup blocks deleted here.
 
-        _ensure_default_agents(agent_store, artifact_store, agent_cache)
+        if default_agents_seeded:
+            app_inst.state.suppressed_agent_names = suppressed_agent_names
+        else:
+            app_inst.state.suppressed_agent_names = _ensure_default_agents(
+                agent_store, artifact_store, agent_cache
+            )
+        # The roster exists either way, so the check does not depend on seeding here.
+        _warn_on_empty_picker_restriction(
+            agent_store, picker_curation, app_inst.state.suppressed_agent_names
+        )
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
@@ -1744,14 +2051,16 @@ def create_app(
         # which would run context-free (default workspace) over a
         # workspace-blind registry and never stamp a multi-tenant row.
 
-        # Recurring-task scheduler: arm a timer per active
-        # scheduled task and fire the injected ``on_fire`` callback on
-        # schedule. The callback (see scheduled.fire) re-reads the row,
-        # creates + owner-grants a session, launches its runner, and records
-        # the run — all fire-and-forget so the timer re-arms immediately.
-        scheduled_task_scheduler: ScheduledTaskScheduler | None = None
+        # The release flag selects one scheduler for the lifetime of this server.
+        scheduler_start_retry: asyncio.Task[None] | None = None
+        scheduled_task_scheduler: ScheduledTaskScheduler | PersistentTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+            from omnigent.server.scheduled.fire import (
+                ClaimedRunExecutor,
+                FireDeps,
+                build_on_fire,
+                build_run_now,
+            )
 
             fire_deps = FireDeps(
                 scheduled_task_store=scheduled_task_store,
@@ -1771,37 +2080,93 @@ def create_app(
                 # (before this lifespan runs), so it is already on state here.
                 sandbox_config=sandbox_config,
                 managed_launches=app_inst.state.managed_launches,
+                startup_inputs=app_inst.state.startup_inputs,
                 app_state=app_inst.state,
+                project_store=project_store,
+                single_user_owner=RESERVED_USER_LOCAL if auth_provider is not None else None,
             )
-            on_fire = build_on_fire(fire_deps)
-            # The manual "run now" trigger reuses the same fire path (dispatch /
-            # preflight / in-flight guard) as the scheduler; it only differs in
-            # allowing a paused task to fire. Exposed on app.state for the
-            # POST /v1/scheduled-tasks/{id}/run route.
-            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
-            scheduled_task_scheduler = ScheduledTaskScheduler(
-                store=scheduled_task_store,
-                on_fire=on_fire,
-            )
-            app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
-            # Scheduled tasks are a non-critical subsystem: a failure loading the
-            # schedule (e.g. a DB error listing active tasks) must not take
-            # down server boot. Log and continue with the scheduler unstarted.
+            if not automations_v2_enabled:
+                # Legacy Run now uses this fire path, including for paused tasks.
+                # The database scheduler handles Run now itself.
+                app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
+                scheduled_task_scheduler = ScheduledTaskScheduler(
+                    store=scheduled_task_store,
+                    on_fire=build_on_fire(fire_deps),
+                )
+            else:
+                assert isinstance(scheduled_task_store, ScheduledTaskDispatchStore)
+                dispatch_hooks = scheduled_task_dispatch or ScheduledTaskDispatchHooks()
+                executor = ClaimedRunExecutor(
+                    fire_deps, fire_identity=dispatch_hooks.fire_identity
+                )
+                scheduled_task_scheduler = PersistentTaskScheduler(
+                    store=scheduled_task_store,
+                    on_fire=dispatch_hooks.on_fire or executor.fire,
+                    on_expired=dispatch_hooks.on_expired or executor.recover,
+                    owned_hosts=dispatch_hooks.owned_hosts,
+                    dispatch_enabled=dispatch_hooks.dispatch_enabled,
+                    poll_interval=dispatch_hooks.poll_interval,
+                    poll_seconds=dispatch_config.poll_seconds,
+                    renewal_seconds=dispatch_config.renewal_seconds,
+                    lease_seconds=dispatch_config.lease_seconds,
+                    batch_size=dispatch_config.batch_size,
+                    max_startups=dispatch_config.max_startups,
+                    recovery_seconds=dispatch_config.recovery_seconds,
+                )
+            app_inst.state.scheduled_task_scheduler = None
+
+            async def start_scheduled_tasks() -> None:
+                assert scheduled_task_scheduler is not None
+                try:
+                    if not automations_v2_enabled and isinstance(
+                        scheduled_task_store, ScheduledTaskDispatchStore
+                    ):
+                        reset = asyncio.create_task(
+                            asyncio.to_thread(scheduled_task_store.reset_dispatch_cursors),
+                            name="scheduled-task-cursor-reset",
+                        )
+                        try:
+                            await asyncio.shield(reset)
+                        except asyncio.CancelledError:
+                            # A cancelled waiter cannot stop database writes already in progress.
+                            try:
+                                await reset
+                            except Exception:
+                                _logger.exception("Scheduling cursor reset failed during shutdown")
+                            raise
+                    if isinstance(scheduled_task_scheduler, ScheduledTaskScheduler):
+                        app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
+                    await scheduled_task_scheduler.start()
+                except Exception:
+                    if isinstance(scheduled_task_scheduler, ScheduledTaskScheduler):
+                        scheduled_task_scheduler.stop()
+                        app_inst.state.scheduled_task_scheduler = None
+                    raise
+                app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
+
+            async def retry_scheduler_start() -> None:
+                while True:
+                    await asyncio.sleep(dispatch_config.startup_retry_seconds)
+                    try:
+                        await start_scheduled_tasks()
+                    except Exception:
+                        _logger.exception("Scheduled tasks are not ready; startup will retry")
+                    else:
+                        return
+
             try:
-                await scheduled_task_scheduler.start()
-            except Exception as exc:
+                await start_scheduled_tasks()
+            except Exception:
                 _logger.exception(
-                    "scheduled task scheduler failed to start; continuing "
-                    "without recurring tasks (%s)",
-                    exc,
+                    "Scheduled tasks could not start; retrying every %s seconds",
+                    dispatch_config.startup_retry_seconds,
+                )
+                scheduler_start_retry = asyncio.create_task(
+                    retry_scheduler_start(), name="scheduled-task-startup-retry"
                 )
 
-            # Run completion is event-driven (persist_scheduled_run_completion
-            # fires from _publish_status the instant a fired conversation's turn
-            # ends — no poll). The only orphan backstop is a lazy-on-read
-            # force-fail of stale ``running`` runs on the scheduled-task read
-            # endpoints (see routes/scheduled_tasks.py); there is no startup
-            # sweep and no periodic reconcile.
+            # Turn completion is event-driven, with a lazy-on-read stale-running
+            # backstop. Persistent scheduling separately recovers expired startups.
 
         managed_sandbox_reaper: ManagedSandboxReaper | None = None
         if sandbox_config is not None and sandbox_config.reaper.enabled:
@@ -1818,26 +2183,38 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        session_pull_requests.install_refresher(pull_request_refresher)
         try:
-            yield
+            with monitor_event_loop():
+                yield
         finally:
+            session_pull_requests.install_refresher(None)
+            await pull_request_refresher.aclose()
+            if scheduler_start_retry is not None:
+                scheduler_start_retry.cancel()
+                with suppress(asyncio.CancelledError):
+                    await scheduler_start_retry
+            # DB dispatch owns startup tasks/heartbeats; legacy scheduling owns timers.
+            if isinstance(scheduled_task_scheduler, PersistentTaskScheduler):
+                await scheduled_task_scheduler.stop()
+            elif scheduled_task_scheduler is not None:
+                scheduled_task_scheduler.stop()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
-            # Run completion is event-driven (the _publish_status hook) plus a
-            # lazy-on-read stale backstop — there is no run-reconciler task to
-            # cancel. Only the per-job scheduler holds timers that need stopping.
-            if scheduled_task_scheduler is not None:
-                scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
             # Stop in-flight background managed-sandbox launches so a
-            # slow provision doesn't outlive the ASGI shutdown (the
-            # sandbox itself, if already provisioned, is reaped by the
-            # provider lifetime cap — see the hook's docstring).
+            # slow provision doesn't outlive the ASGI shutdown, after giving
+            # unbound ones the deployment's drain to bind their host (see the
+            # hook's docstring).
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
-            await cancel_managed_launch_tasks()
+            await cancel_managed_launch_tasks(
+                drain_s=sandbox_config.shutdown_drain_s if sandbox_config is not None else 0.0
+            )
+            if startup_inputs is not None:
+                await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -1874,6 +2251,16 @@ def create_app(
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+
+    # Only managed creates accept a durable first input, and only managed hosts
+    # need their startup recovered on the replica holding the tunnel.
+    startup_inputs = (
+        ManagedStartupInputs(conversation_store, host_registry)
+        if sandbox_config is not None and sandbox_config.managed_launch_supported
+        else None
+    )
+    app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
@@ -1918,7 +2305,11 @@ def create_app(
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
+    app.state.picker_curation = picker_curation
     app.state.feature_flags = resolved_feature_flags
+    app.state.harness_install = app_harness_install
+    app.state.automations = True if automations is None else automations
+    app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -1947,6 +2338,63 @@ def create_app(
             f"{_provider.name}_client",
             _provider.client_factory(_cfg) if _on else None,
         )
+    # Managed-sandbox owner identity: a launcher that acts as the host's owner
+    # (e.g. the `databricks` provider) resolves that user's
+    # connected credential through these, keyed by connection provider.
+    if sandbox_config is not None:
+        from dataclasses import replace as _dc_replace
+
+        from omnigent.server.connections_registry import blocking_owner_resolver
+
+        _owner_credentials = {
+            _provider.name: blocking_owner_resolver(
+                _provider.owner_identity_resolver,
+                store=getattr(app.state, f"{_provider.name}_store"),
+                client=getattr(app.state, f"{_provider.name}_client"),
+            )
+            for _provider in connection_providers()
+            if _provider.owner_identity_resolver is not None
+            and getattr(app.state, f"{_provider.name}_store", None) is not None
+        }
+        if _owner_credentials:
+            sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
+            app.state.sandbox_config = sandbox_config
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    sandbox_profiles = (
+        SandboxProfileCatalog(conversation_store, sandbox_config, host_store)
+        if host_store is not None and resolved_feature_flags.enabled(Feature.SANDBOX_PROFILES)
+        else None
+    )
+    app.state.sandbox_profiles = sandbox_profiles
+    if host_store is not None and sandbox_profiles is not None:
+
+        def admit_profiled_launch(
+            host_id: str,
+            session_id: str,
+            owner: str | None,
+            generation: str | None,
+            allow_unbound: bool = False,
+            transfer_from_host_id: str | None = None,
+        ) -> None:
+            _admit_host_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+            )
+            host = host_store.get_host(host_id)
+            sandbox_profiles.require_session_host(
+                session_id,
+                host_id,
+                bind=not allow_unbound and transfer_from_host_id is None,
+                sandbox_provider=host.sandbox_provider if host is not None else None,
+                user_id=host.user_id if host is not None else None,
+            )
+
+        host_registry.launch_authorizer = admit_profiled_launch
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -2070,6 +2518,23 @@ def create_app(
         _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
         app.state.default_public_sessions = lambda: _default_public_static
         app.state.default_public_sessions_writable = False
+    from omnigent.server.server_config import parse_filesystem_attachment_policy
+
+    if callable(filesystem_attachment_allowed_extensions):
+        _allowed_extensions = filesystem_attachment_allowed_extensions
+
+        def _resolve_filesystem_attachment_policy() -> "FilesystemAttachmentPolicy":
+            return parse_filesystem_attachment_policy(_allowed_extensions())
+
+        app.state.filesystem_attachment_policy = _resolve_filesystem_attachment_policy
+    else:
+        # A static setting is parsed once; /v1/info serves it without file reads.
+        _static_policy = parse_filesystem_attachment_policy(
+            resolved_server_config.get("filesystem_attachment_allowed_extensions")
+            if filesystem_attachment_allowed_extensions is None
+            else filesystem_attachment_allowed_extensions
+        )
+        app.state.filesystem_attachment_policy = lambda: _static_policy
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -2158,6 +2623,8 @@ def create_app(
         operation, audit_route, audit_session_id = _resolve_audit_route(request)
         set_current_session_id(audit_session_id)
         reset_request_audit_attrs()
+        client_audit = request_client_audit_attributes(request.headers)
+        add_audit_attrs(**client_audit)
         if operation == "create_session":
             _logger.info(
                 "Session creation requested",
@@ -2175,6 +2642,7 @@ def create_app(
                 route=audit_route,
                 method=request.method,
                 request_id=request_id,
+                **client_audit,
             )
 
         failed = False
@@ -3106,10 +3574,10 @@ def create_app(
         except ImportError:
             smart_routing_enabled = False
             smart_routing_sources = {"external": False, "oss": False}
-        # The immutable feature snapshot is shared by capability
-        # advertisement and route enforcement, so frontend and backend cannot
-        # disagree during a process lifetime.
-        harness_install_enabled = app.state.feature_flags.enabled(Feature.HARNESS_INSTALL)
+        # Resolve the gate per request with the same resolver used by route enforcement.
+        current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
+        frontend_features = app.state.feature_flags.frontend_dict()
+        frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -3118,7 +3586,7 @@ def create_app(
         from omnigent.onboarding.harness_install import ui_installable_harnesses
 
         installable_harnesses = (
-            sorted(ui_installable_harnesses()) if harness_install_enabled else []
+            sorted(ui_installable_harnesses()) if current_harness_install_enabled else []
         )
         # dictation_available gates the composer mic button's server
         # speech-to-text fallback (designs/server-dictation.md). Checks
@@ -3127,6 +3595,7 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
+        filesystem_attachment_policy = app.state.filesystem_attachment_policy()
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3135,6 +3604,7 @@ def create_app(
                 "needs_setup": needs_setup,
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "durable_initial_input": startup_inputs is not None,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
@@ -3145,16 +3615,30 @@ def create_app(
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
-                "features": app.state.feature_flags.frontend_dict(),
-                "harness_install_enabled": harness_install_enabled,
+                "features": frontend_features,
+                "harness_install_enabled": current_harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
+                "session_search_scope": True,
+                "request_managed_sandbox_host_id": True,
+                "session_fork_workspaces": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
+                "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
+                "session_pull_requests": session_pull_requests.open_store(conversation_store)
+                is not None,
+                "filesystem_attachments": {
+                    "extensions": sorted(filesystem_attachment_policy.extensions),
+                    "all_types": filesystem_attachment_policy.all_types,
+                },
+                "scheduled_task_projects": project_store is not None,
+                "automations_enabled": scheduled_task_store is not None
+                and deployment_gate_enabled(app.state.automations, "automations"),
                 "branding": branding_snapshot.config(),
+                "picker": picker_curation.config(),
             }
         )
 
@@ -3236,7 +3720,7 @@ def create_app(
             try:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(promote_if_listed, admin_list, permission_store, user_id)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
         # Still report the list, so admin chrome shows even if promotion failed.
         return {"user_id": user_id, "is_admin": flagged or listed}
@@ -3274,6 +3758,15 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            pull_request_refresher=pull_request_refresher,
+            register_startup_dispatch=lambda handler: (
+                setattr(startup_inputs, "dispatch", handler)
+                if startup_inputs is not None
+                else None
+            ),
+            register_initial_file_upload=lambda handler: setattr(
+                app.state, "initial_file_upload", handler
+            ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
             ),
@@ -3353,6 +3846,13 @@ def create_app(
         tags=["extensions"],
     )
     from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+    from omnigent.server.routes.sandbox_profiles import create_sandbox_profiles_router
+
+    app.include_router(
+        create_sandbox_profiles_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["sandbox profiles"],
+    )
 
     app.include_router(
         create_sandbox_inference_router(
@@ -3441,6 +3941,8 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 artifact_store=artifact_store,
+                project_store=project_store,
+                automations=app.state.automations,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
@@ -3468,6 +3970,13 @@ def create_app(
             tags=["projects"],
         )
 
+    if preference_store is not None:
+        app.include_router(
+            create_preferences_router(preference_store, auth_provider, policy=preference_policy),
+            prefix="/v1",
+            tags=["preferences"],
+        )
+
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
 
     # Pending per-runner grace timers: a disconnect schedules the
@@ -3484,7 +3993,11 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None, *, idle_shutdown: bool = False
+        runner_id: str,
+        reference_stamp: int | None,
+        *,
+        idle_shutdown: bool = False,
+        evidence: DisconnectEvidence | None = None,
     ) -> None:
         """Reconcile a dropped runner's sessions once the liveness lease expires.
 
@@ -3523,6 +4036,7 @@ def create_app(
             active work, so a stale mid-turn status is settled like a Stop.
         """
         from omnigent.server.routes.sessions import (
+            HOST_OFFLINE_HOLD_S,
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
             _note_runner_idle_shutdown,
@@ -3541,6 +4055,16 @@ def create_app(
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
                 runner_id,
+            )
+            return
+        # The same holds for one runner this replica handed to another replica.
+        handoff_reason = shutdown_state.runner_handoff_reason(runner_id)
+        if handoff_reason is not None:
+            _logger.info(
+                "Runner %s dropped because this server handed it off (%s); "
+                "skipping offline-marking",
+                runner_id,
+                handoff_reason,
             )
             return
         if reconnected is not None:
@@ -3576,6 +4100,53 @@ def create_app(
                 runner_id,
             )
             return
+        error = ErrorDetail(
+            code="runner_disconnected",
+            message="Runner disconnected unexpectedly.",
+        )
+        hold_started = time.monotonic()
+        hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        hold_s = None if hold is None else time.monotonic() - hold_started
+        if hold in ("runner_reconnected", "server_shutdown"):
+            return
+        if hold is not None:
+            # Sessions may have moved, stopped, or gone live elsewhere meanwhile.
+            affected = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+            if tunnel_registry.get(runner_id) is not None:
+                return
+            if _runner_live_on_another_replica_from_conversations(
+                affected, runner_id, reference_stamp
+            ):
+                for conv in affected:
+                    _relinquish_session_live_state(conv.id)
+                return
+            if hold == "expired":
+                error = ErrorDetail(
+                    code="runner_disconnected",
+                    message=(
+                        "The host for this session went offline and did not come back "
+                        f"within {HOST_OFFLINE_HOLD_S / 3600:g} hours."
+                    ),
+                )
+            elif hold == "host_back_relaunched":
+                # Not runner_disconnected: a passive reconnect clears that code to idle.
+                error = ErrorDetail(
+                    code="runner_interrupted",
+                    message=(
+                        "The host restarted during this turn, so the turn was interrupted. "
+                        "The session is running again; send the message again to retry."
+                    ),
+                )
+            elif hold == "host_back_without_runner":
+                error = ErrorDetail(
+                    code="runner_disconnected",
+                    message=(
+                        "The host for this session came back without the runner that was "
+                        "running this turn, so the turn was lost. Send the message again to retry."
+                    ),
+                )
         if idle_shutdown:
             # The sweep's stop path settles these to idle instead of failing them.
             _note_runner_idle_shutdown(runner_id, affected)
@@ -3597,12 +4168,174 @@ def create_app(
             )
         await _mark_runner_sessions_offline(
             affected,
-            ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            ),
+            error,
             conversation_store,
+            disconnect_evidence=drop_attributes(evidence, hold_s=hold_s, hold_outcome=hold),
         )
+
+    async def _routing_host_id(convs: "list[Conversation]") -> str | None:
+        """Return the host *convs*' shared runner runs on, or ``None`` when unknown."""
+        from omnigent.runner.routing import routing_host_id
+
+        own = next((conv.host_id for conv in convs if conv.host_id is not None), None)
+        if own is not None or not convs:
+            return own
+        try:
+            return await asyncio.to_thread(routing_host_id, convs[0], conversation_store)
+        except Exception:  # an unreadable ancestor leaves the host unknown
+            _logger.warning("Host lookup failed for session=%s", convs[0].id, exc_info=True)
+            return None
+
+    async def _host_offline(host_id: str | None) -> bool | None:
+        """Whether a user-run host is gone from every replica; ``None`` when unreadable."""
+        from omnigent.server.routes.sessions import _host_row_offline
+
+        if host_id is None or host_registry.get(host_id) is not None:
+            return False
+        return await _host_row_offline(host_store, host_id)
+
+    async def _relaunch_held_sessions(held: "list[Conversation]", host_id: str | None) -> bool:
+        """Relaunch the runner of each held root session on a host that came back without it.
+
+        The held turn is not redelivered: its prompt may already have reached the
+        harness, so a resend could run it twice. The relaunch restores the session,
+        so the user's next message runs without a manual resume.
+
+        :returns: ``True`` when the host acknowledged every relaunch.
+        """
+        from omnigent.server.routes.sessions import _launch_runner_on_host
+
+        host_conn = None if host_id is None else host_registry.get(host_id)
+        roots = [conv for conv in held if conv.kind != "sub_agent"]
+        if host_conn is None or not roots:
+            return False
+        acknowledged = True
+        for conv in roots:
+            try:
+                attempt = await _launch_runner_on_host(
+                    conv, conversation_store, host_registry, host_conn
+                )
+            except Exception:  # a failed relaunch keeps the plain failure
+                _logger.warning(
+                    "Relaunch after host return failed for session=%s", conv.id, exc_info=True
+                )
+                return False
+            acknowledged = acknowledged and attempt.acknowledged
+        return acknowledged
+
+    async def _hold_for_offline_host(runner_id: str, affected: "list[Conversation]") -> str | None:
+        """Wait for a runner whose user-run host dropped with it mid-turn.
+
+        A laptop that sleeps or loses Wi-Fi takes its runner along and usually
+        resumes the turn when it wakes, so the turn waits for it instead of
+        failing. A host that comes back without its runner gets one more grace,
+        then its runner is relaunched. A crash report cancels this task and
+        fails the turn as before.
+
+        :returns: ``None`` when nothing was held, else how the hold ended:
+            ``"runner_reconnected"``, ``"server_shutdown"``, ``"expired"``,
+            ``"host_back_relaunched"`` (the host came back and its runner was
+            relaunched) or ``"host_back_without_runner"`` (the relaunch failed).
+        """
+        from omnigent.server.routes.sessions import (
+            _MID_TURN_STATUSES,
+            HOST_OFFLINE_HOLD_S,
+            HOST_OFFLINE_RECHECK_S,
+            RUNNER_DISCONNECT_GRACE_S,
+            _intentional_stop_sessions,
+            _session_status_cache,
+        )
+
+        held = [
+            conv
+            for conv in affected
+            if conv.id not in _intentional_stop_sessions
+            and _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES
+        ]
+        host_id = await _routing_host_id(held)
+        if not held or await _host_offline(host_id) is not True:
+            return None
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + HOST_OFFLINE_HOLD_S
+        host_back_deadline: float | None = None
+        outcome = "cancelled"
+        for conv in held:
+            _logger.info(
+                "Runner %s: host offline, holding session=%s",
+                runner_id,
+                conv.id,
+                extra=debug_event(
+                    "runner_disconnect_held_host_offline",
+                    session_id=conv.id,
+                    runner_id=runner_id,
+                    host_id=host_id,
+                    hold_s=HOST_OFFLINE_HOLD_S,
+                ),
+            )
+        try:
+            while True:
+                now = loop.time()
+                remaining = deadline - now
+                if remaining <= 0:
+                    outcome = "expired"
+                    break
+                if host_back_deadline is not None:
+                    remaining = min(remaining, max(0.0, host_back_deadline - now))
+                if (
+                    await tunnel_registry.wait_for_runner(
+                        runner_id, timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining)
+                    )
+                    is not None
+                ):
+                    outcome = "runner_reconnected"
+                    break
+                if shutdown_state.server_shutting_down():
+                    outcome = "server_shutdown"
+                    break
+                # An unreadable host row keeps holding; only a live one ends it early.
+                if await _host_offline(host_id) is False:
+                    now = loop.time()
+                    if host_back_deadline is None:
+                        host_back_deadline = min(deadline, now + RUNNER_DISCONNECT_GRACE_S)
+                    if now >= host_back_deadline:
+                        relaunched = await _relaunch_held_sessions(held, host_id)
+                        outcome = (
+                            "host_back_relaunched" if relaunched else "host_back_without_runner"
+                        )
+                        break
+                else:
+                    # A brief host return cannot end a sleeping host's absolute hold.
+                    host_back_deadline = None
+        finally:
+            for conv in held:
+                _logger.info(
+                    "Runner %s: host-offline hold ended (%s) for session=%s",
+                    runner_id,
+                    outcome,
+                    conv.id,
+                    extra=debug_event(
+                        "runner_disconnect_hold_ended",
+                        session_id=conv.id,
+                        runner_id=runner_id,
+                        outcome=outcome,
+                        held_s=round(loop.time() - started, 3),
+                    ),
+                )
+        return outcome
+
+    async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
+        """Whether this replica's disconnect task holds a lost relay's turn for its host."""
+        task = _disconnect_grace_tasks.get(runner_id)
+        if task is None or task.done():
+            return False
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before
+            return False
+        return conv is not None and await _host_offline(await _routing_host_id([conv])) is True
+
+    set_relay_host_offline_probe(_relay_turn_held_for_host)
 
     async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
         """Schedule offline-marking for the turns *this* runner interrupted.
@@ -3660,6 +4393,7 @@ def create_app(
                 runner_id=runner_id,
                 peer_close_reason=connection.peer_close_reason,
                 idle_shutdown=idle_shutdown,
+                **shutdown_state.disconnect_attributes(runner_id),
             ),
         )
         if idle_shutdown:
@@ -3671,9 +4405,12 @@ def create_app(
         # one we wrote ourselves (the clear itself never erases this record).
         reference_stamp = session_live_state.last_liveness_stamp(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
-        # flip offline at once. Not on our own shutdown: the runner is alive and
-        # re-tunnels to the replacement, which must not settle its turns to idle.
-        if shutdown_state.server_shutting_down():
+        # flip offline at once. Not on our own shutdown or a handoff: the runner is
+        # alive and re-tunnels elsewhere, which must not settle its turns to idle.
+        if (
+            shutdown_state.server_shutting_down()
+            or shutdown_state.runner_handoff_reason(runner_id) is not None
+        ):
             session_live_state.touch_runner_liveness([runner_id])
         else:
             session_live_state.clear_runner_liveness(runner_id)
@@ -3686,6 +4423,7 @@ def create_app(
                 runner_id,
                 reference_stamp,
                 idle_shutdown=idle_shutdown,
+                evidence=DisconnectEvidence.from_session(connection),
             ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
@@ -3718,6 +4456,7 @@ def create_app(
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
+        from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
         from omnigent.server.routes.host_tunnel import log_runner_exited
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
@@ -3732,6 +4471,8 @@ def create_app(
             runner_exit_reports.was_connected(runner_id)
             or session_live_state.last_liveness_stamp(runner_id) is not None
         )
+        # Only a runner that never connected failed to start; one that ran and died is a crash.
+        failure_code = RUNNER_PROCESS_CRASH if runner_ran else "runner_failed_to_start"
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -3746,7 +4487,7 @@ def create_app(
             log_runner_exited(host_id, runner_id, error, session_id=session_id)
         await _mark_runner_sessions_offline(
             affected,
-            ErrorDetail(code="runner_failed_to_start", message=error),
+            ErrorDetail(code=failure_code, message=error),
             conversation_store,
             fail_idle_top_level=not runner_ran,
         )
@@ -3780,6 +4521,8 @@ def create_app(
             "Runner connected",
             extra=debug_event("runner_connected", runner_id=runner_id),
         )
+        # A runner back on this replica is this replica's to reconcile again.
+        shutdown_state.clear_runner_handoff(runner_id)
         # Other replicas must see the runner online before the first liveness sweep.
         session_live_state.touch_runner_liveness([runner_id])
         # The by-runner lookup is read-after-write consistent and includes archived
@@ -3983,7 +4726,39 @@ def create_app(
                         and not conv.archived
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
+                    if conv.agent_id is None:
+                        reason = "no_agent"
+                    elif conv.archived:
+                        reason = "archived"
+                    else:
+                        reason = "recovery_required" if initialize_runtime else "idle"
+                    runner_session_initializer.log_decision(
+                        conv,
+                        generation=connection.generation,
+                        trigger="runner_connect",
+                        decision="initialize_now" if initialize_runtime else "defer",
+                        reason=reason,
+                        eager_recovery=conv.id in eager_root_ids,
+                        live_status=_session_status_cache.get(conv.id, conv.live_status),
+                        pending_elicitation_count=max(
+                            conv.pending_elicitation_count or 0,
+                            pending_elicitations.count_for(conv.id),
+                        ),
+                        has_last_task_error=_last_task_error_from_labels(conv.labels) is not None,
+                    )
                     # Idle trees reinitialize on demand; active trees recover now.
+                    if not initialize_runtime:
+                        _logger.info(
+                            "Deferred runner session init until first use: session=%s reason=%s",
+                            conv.id,
+                            reason,
+                            extra=debug_event(
+                                "runner_session_init_deferred",
+                                reason=reason,
+                                runner_generation=connection.generation,
+                                init_trigger="runner_connect",
+                            ),
+                        )
                     if initialize_runtime:
                         response = await runner_session_initializer.initialize(
                             conv,
@@ -3991,6 +4766,7 @@ def create_app(
                             timeout=10.0,
                             generation=connection.generation,
                             store_slots=store_slots,
+                            trigger="runner_connect",
                         )
                         # A removed agent was already logged as expected.
                         if is_session_agent_removed(response):
@@ -4096,6 +4872,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            admit_managed_runner=(
+                sandbox_profiles.admit_runner_connection if sandbox_profiles is not None else None
+            ),
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
@@ -4122,6 +4901,8 @@ def create_app(
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
+            if startup_inputs is not None:
+                startup_inputs.host_changed(app, _host_id)
 
         app.include_router(
             create_host_tunnel_router(
@@ -4133,6 +4914,7 @@ def create_app(
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
+                harness_install=app.state.harness_install,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -4147,6 +4929,7 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
+                harness_install=app.state.harness_install,
             ),
             prefix="/v1",
             tags=["hosts"],

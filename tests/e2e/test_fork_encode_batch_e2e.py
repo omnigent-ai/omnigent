@@ -31,7 +31,6 @@ Usage::
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -40,6 +39,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from tests._helpers.live_server import find_free_port
 from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -98,13 +98,6 @@ from omnigent.cli import main
 
 main()
 """
-
-
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
@@ -220,7 +213,7 @@ def test_fork_does_not_pay_per_item_encode_round_trips(tmp_path: Path) -> None:
 
     :param tmp_path: Per-test temp dir (server DB, artifacts, counts file).
     """
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "e2e.db"
     database_uri = f"sqlite:///{db_path}"

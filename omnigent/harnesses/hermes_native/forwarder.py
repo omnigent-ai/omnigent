@@ -1234,7 +1234,7 @@ async def forward_hermes_store_to_session(
                                             status="running",
                                             response_id=action.response_id,
                                         )
-                                    except Exception:  # noqa: BLE001 — live-card edge is best-effort
+                                    except Exception:  # live-card edge is best-effort
                                         _logger.debug(
                                             "hermes forwarder running-edge post failed; "
                                             "cards may not go live; session=%s",
@@ -1301,7 +1301,7 @@ async def forward_hermes_store_to_session(
                                     hermes_session_id=hermes_session_id,
                                 )
                                 compaction_persisted = True
-                            except Exception:  # noqa: BLE001
+                            except Exception:
                                 _logger.warning(
                                     "Failed to persist hermes compaction item for %s",
                                     session_id,
@@ -1355,7 +1355,7 @@ async def forward_hermes_store_to_session(
                                         ),
                                     )
                                     continue
-                            except Exception:  # noqa: BLE001
+                            except Exception:
                                 _logger.warning(
                                     "hermes forwarder failed to re-pin to child session "
                                     "after compaction; staying on %s; session=%s",
@@ -1383,7 +1383,7 @@ async def forward_hermes_store_to_session(
                                     status="running",
                                     response_id=active_turn_id,
                                 )
-                            except Exception:  # noqa: BLE001 — live-card edge is best-effort
+                            except Exception:  # live-card edge is best-effort
                                 _logger.debug(
                                     "hermes forwarder running re-assert failed; "
                                     "card may settle early; session=%s",

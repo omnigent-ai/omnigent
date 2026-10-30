@@ -51,6 +51,15 @@ export const MONACO_SPLIT_BREAKPOINT = 900;
  */
 export const SPLIT_DIFF_MIN_WIDTH = 920;
 
+export const MAX_RICH_MARKDOWN_BYTES = 1024 * 1024;
+
+/** Use source for large Markdown to bound the initial rich-rendering work. */
+export function isMarkdownTooLargeForRichView(lang: string, content: string): boolean {
+  return (
+    lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_RICH_MARKDOWN_BYTES
+  );
+}
+
 // ---------------------------------------------------------------------------
 // File-type helpers
 // ---------------------------------------------------------------------------

@@ -51,7 +51,9 @@ def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
     """
     from tests.e2e.omnigent._pexpect_harness import ensure_repl_test_theme_env
 
+    # Test tool callables live in this repo's ``tests`` package.
     sdk_paths = [
+        str(_REPO_ROOT),
         str(_REPO_ROOT / "sdks" / "python-client"),
         str(_REPO_ROOT / "sdks" / "ui"),
     ]

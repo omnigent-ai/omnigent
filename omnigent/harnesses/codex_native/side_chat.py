@@ -32,6 +32,7 @@ deliberately do NOT pin a ``prompt_cache_key``.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -58,6 +59,8 @@ SIDE_REFERENCE_ONLY_INSTRUCTIONS = (
 # Display name stamped on a side-chat child so the web can tell it apart from a
 # Codex-spawned sub-agent (drives the "this is a side chat" banner).
 SIDE_CHAT_DISPLAY_NAME = "Side chat"
+CAP_SIDE_CHAT_SETTINGS = "codex_side_chat_settings"
+EFFORT_RESET_LABEL = "omnigent.side_chat.effort_reset"
 _NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname"
 
 _SIDE_PREFIX = "/side "
@@ -133,6 +136,7 @@ async def fork_ephemeral_side_thread(
     parent_thread_id: str,
     *,
     developer_instructions: str | None = SIDE_REFERENCE_ONLY_INSTRUCTIONS,
+    settings: Mapping[str, str] | None = None,
 ) -> str | None:
     """
     Fork ``parent_thread_id`` into a new ephemeral side thread.
@@ -141,6 +145,8 @@ async def fork_ephemeral_side_thread(
     :param parent_thread_id: Codex thread id to fork from, e.g. ``"thread_abc"``.
     :param developer_instructions: Reference-only boundary instructions for the
         fork; ``None`` omits them.
+    :param settings: Optional fork ``model`` and ``effort``, e.g. from
+        :func:`parent_side_chat_settings`; ``None`` keeps the fork's defaults.
     :returns: The new child Codex thread id, or ``None`` if the response carried
         no thread id.
     """
@@ -155,6 +161,13 @@ async def fork_ephemeral_side_thread(
     }
     if developer_instructions is not None:
         params["developerInstructions"] = developer_instructions
+    settings = settings or {}
+    if settings.get("model"):
+        params["model"] = settings["model"]
+    # thread/fork has no effort field; a later thread/settings/update would drop
+    # the fork's developer instructions, so set it as a fork config override.
+    if settings.get("effort"):
+        params["config"] = {"model_reasoning_effort": settings["effort"]}
     response = await codex_client.request("thread/fork", params)
     result = response.get("result")
     thread = result.get("thread") if isinstance(result, dict) else None
@@ -164,12 +177,46 @@ async def fork_ephemeral_side_thread(
     return None
 
 
+class SideChatEffortUnavailable(ValueError):
+    """The selected model has no discoverable default effort."""
+
+
+async def _resolve_side_effort(
+    codex_client: CodexAppServerClient,
+    thread_id: str,
+    effort: str | None,
+    model: str | None,
+    transport: str | None,
+) -> str:
+    """Resolve effort against the live thread when no model override was saved."""
+    from omnigent.harnesses.codex_native.app_server import resolve_codex_effort_for_model
+
+    if model is None:
+        response = await codex_client.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}
+        )
+        result = response.get("result")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        actual_model = thread.get("model") if isinstance(thread, dict) else None
+        model = actual_model if isinstance(actual_model, str) and actual_model else None
+    try:
+        return await resolve_codex_effort_for_model(
+            codex_client, effort, model, transport=transport
+        )
+    except ValueError as exc:
+        raise SideChatEffortUnavailable(str(exc)) from exc
+
+
 async def submit_side_turn(
     codex_client: CodexAppServerClient,
     child_thread_id: str,
     text: str,
     *,
     collaboration_mode: _JsonObject | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    reset_effort: bool = False,
+    transport: str | None = None,
 ) -> str | None:
     """
     Submit one user turn to a side-chat thread over the app-server.
@@ -183,14 +230,26 @@ async def submit_side_turn(
     :param child_thread_id: Side-chat Codex thread id.
     :param text: User input for the turn.
     :param collaboration_mode: Optional Codex collaboration mode payload.
+    :param model: Side-thread model override for this and subsequent turns.
+    :param effort: Side-thread reasoning effort for this and subsequent turns.
+    :param reset_effort: Resolve the selected model's default instead of inheriting effort.
+    :param transport: Parent app-server address used to share its effort-catalog cache.
     :returns: The started turn id, or ``None`` when absent.
     """
+    if reset_effort or effort is not None:
+        effort = await _resolve_side_effort(
+            codex_client, child_thread_id, None if reset_effort else effort, model, transport
+        )
     params: _JsonObject = {
         "threadId": child_thread_id,
         "input": [{"type": "text", "text": text}],
     }
     if collaboration_mode is not None:
         params["collaborationMode"] = collaboration_mode
+    if model is not None:
+        params["model"] = model
+    if effort is not None:
+        params["effort"] = effort
     response = await codex_client.request("turn/start", params)
     result = response.get("result")
     turn = result.get("turn") if isinstance(result, dict) else None
@@ -198,29 +257,86 @@ async def submit_side_turn(
     return turn_id if isinstance(turn_id, str) and turn_id else None
 
 
+async def parent_side_chat_settings(
+    codex_client: CodexAppServerClient, bridge_dir: Path
+) -> dict[str, str]:
+    """
+    Return the parent thread's current model and effort for a new side fork.
+
+    A fork takes the app-server's launch ``-c model`` but its effort from
+    ``config.toml``, so after a settings switch it would pair the old model with
+    the new effort. This resolves them like a parent turn does: settings whose
+    ``config.toml`` mirror failed, then ``config.toml``, with the effort clamped
+    to the model's supported levels.
+
+    :param codex_client: Connected Codex app-server client, for the model catalog.
+    :param bridge_dir: Native Codex bridge directory of the parent session.
+    :returns: The known settings, e.g. ``{"model": "gpt-6-sol", "effort": "max"}``;
+        empty when neither is known.
+    """
+    from omnigent.harnesses.codex_native.app_server import resolve_codex_effort_for_model
+    from omnigent.harnesses.codex_native.bridge import (
+        read_bridge_state,
+        read_codex_config_effort,
+        read_codex_config_model,
+        read_unmirrored_codex_settings,
+    )
+
+    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+    unmirrored = await asyncio.to_thread(read_unmirrored_codex_settings, bridge_dir)
+    model = unmirrored.get("model") or await asyncio.to_thread(read_codex_config_model, bridge_dir)
+    effort = unmirrored.get("effort") or await asyncio.to_thread(
+        read_codex_config_effort, bridge_dir
+    )
+    settings: dict[str, str] = {}
+    if model:
+        settings["model"] = model
+    if effort:
+        settings["effort"] = await resolve_codex_effort_for_model(
+            codex_client,
+            effort,
+            model,
+            transport=state.socket_path if state is not None else None,
+        )
+    return settings
+
+
 async def open_side_chat_on_client(
     codex_client: CodexAppServerClient,
     *,
     parent_thread_id: str,
     question: str,
+    bridge_dir: Path | None = None,
     developer_instructions: str | None = SIDE_REFERENCE_ONLY_INSTRUCTIONS,
 ) -> str | None:
     """
     Open a side chat on an already-connected app-server client (executor path).
 
-    Forks an ephemeral child of ``parent_thread_id`` and submits ``question`` as
-    its first turn. Registration/surfacing is the forwarder's job (it observes
-    the fork's ``thread/started`` on the shared event stream), so this does not
-    touch the Omnigent server.
+    Forks an ephemeral child of ``parent_thread_id`` on the parent's current
+    model and effort, and submits ``question`` as its first turn.
+    Registration/surfacing is the forwarder's job (it observes the fork's
+    ``thread/started`` on the shared event stream), so this does not touch the
+    Omnigent server.
 
     :param codex_client: Connected Codex app-server client (built from bridge state).
     :param parent_thread_id: The active (main) Codex thread id to fork from.
     :param question: The ``/side`` question, submitted as the first turn.
+    :param bridge_dir: Parent session's bridge directory, read for its current
+        settings (:func:`parent_side_chat_settings`); ``None`` keeps the
+        fork's own settings.
     :param developer_instructions: Reference-only boundary instructions.
     :returns: The child Codex thread id, or ``None`` if the fork failed.
     """
+    settings = (
+        await parent_side_chat_settings(codex_client, bridge_dir)
+        if bridge_dir is not None
+        else None
+    )
     child_thread_id = await fork_ephemeral_side_thread(
-        codex_client, parent_thread_id, developer_instructions=developer_instructions
+        codex_client,
+        parent_thread_id,
+        developer_instructions=developer_instructions,
+        settings=settings,
     )
     if child_thread_id is None:
         return None

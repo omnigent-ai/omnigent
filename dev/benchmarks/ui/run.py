@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import datetime
 import json
@@ -238,7 +239,9 @@ async def measure_scenario(
         return sample
     except Exception:
         with contextlib.suppress(Exception):
-            await page.screenshot(path=str(evidence.with_suffix(".failed.png")))
+            # Failed assets can leave font readiness pending; capture the rendered frame.
+            capture = await (await context.new_cdp_session(page)).send("Page.captureScreenshot")
+            evidence.with_suffix(".failed.png").write_bytes(base64.b64decode(capture["data"]))
         raise
     finally:
         await context.close()
@@ -274,7 +277,7 @@ def make_report(
             }
     report = build_report(
         journeys,
-        generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        generated_at=datetime.datetime.now(datetime.UTC).isoformat(),
         config={
             "iterations": args.iterations,
             "runs": args.runs,

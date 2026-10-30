@@ -24,6 +24,7 @@ import {
   relativizeToWorkspace,
   useWorkspaceChangedFiles,
   useWorkspaceAllFiles,
+  useWorkspaceAsleep,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
@@ -41,9 +42,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
+import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
+  conversationId?: string;
   onFileSelect: (path: string) => void;
   /**
    * Which scope this panel renders: false = full folder tree, true =
@@ -217,14 +220,18 @@ function SearchFilterInput({
 
 /**
  * Browse location per conversation, surviving unmount/remount within a JS
- * session. Opening a file swaps this panel for the FileViewer (see
- * WorkspacePanel's content slot), which unmounts it — with plain state,
- * closing the viewer snapped the tree back to the workspace root instead of
- * the directory the file was opened from. Same pattern as FolderTree's
- * expandedPathsCache. Keyed by conversation, so a session switch still lands
- * on that session's own last location (or its root), never another's.
+ * session (e.g. a session switch, or the mobile drawer closing). Same pattern
+ * as FolderTree's expandedPathsCache. Keyed by conversation, so a session
+ * switch still lands on that session's own last location (or its root).
  */
 const browseLocationCache = new Map<string, string>();
+const folderRevealListeners = new Set<(conversationId: string, absolutePath: string) => void>();
+
+/** Point a session's Files tree at a folder: live if mounted, else on its next mount. */
+export function revealFolderInFilesPanel(conversationId: string, absolutePath: string): void {
+  browseLocationCache.set(conversationId, absolutePath);
+  folderRevealListeners.forEach((listener) => listener(conversationId, absolutePath));
+}
 
 /**
  * Right-side Files card. Always visible on desktop.
@@ -236,6 +243,7 @@ const browseLocationCache = new Map<string, string>();
  * intentionally not listed here.
  */
 export function FilesPanel({
+  conversationId: sessionId,
   onFileSelect,
   flatView,
   showHidden,
@@ -245,7 +253,8 @@ export function FilesPanel({
   onClose,
   frameless,
 }: FilesPanelProps) {
-  const { conversationId } = useParams<{ conversationId: string }>();
+  const { conversationId: routeId } = useParams<{ conversationId: string }>();
+  const conversationId = sessionId ?? routeId;
   // The runner went offline (e.g. its host restarted): `sessionStatus`
   // is "failed", set by `_on_runner_disconnect` server-side when the
   // runner's tunnel drops (and also client-side in chatStore when the
@@ -258,6 +267,7 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
   // The runner is offline but the host still holds the workspace on disk,
   // so the server serves the panel by reading the workspace over the host
   // tunnel. Show a passive "served from host" badge — the panel keeps
@@ -295,8 +305,7 @@ export function FilesPanel({
   // workspace chip uses.
   const { session } = useSession(conversationId);
   // Absolute path currently browsed. Null tracks the workspace root. Seeded
-  // from the per-conversation cache so the location survives the panel
-  // unmounting while a file is open in the viewer.
+  // from the per-conversation cache so the location survives a remount.
   const [browseLocation, setBrowseLocation] = useState<string | null>(
     () => (conversationId && browseLocationCache.get(conversationId)) || null,
   );
@@ -407,6 +416,18 @@ export function FilesPanel({
     setDebouncedTreeSearch("");
   }, []);
 
+  useEffect(() => {
+    const listener = (revealedId: string, absolutePath: string) => {
+      if (revealedId !== conversationId) return;
+      exitTreeSearch();
+      navigateTo(absolutePath);
+    };
+    folderRevealListeners.add(listener);
+    return () => {
+      folderRevealListeners.delete(listener);
+    };
+  }, [conversationId, navigateTo, exitTreeSearch]);
+
   // Only fire search queries on the Explore tab. The include/exclude globs
   // narrow an active text query; globs alone do not search.
   const treeSearchQuery = useWorkspaceFileSearch(
@@ -458,6 +479,11 @@ export function FilesPanel({
     : null;
   const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
   const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
+  // An idle-stopped managed sandbox is asleep, not failed: its status stays
+  // idle, and with neither a runner nor a host to read the workspace from, the
+  // lists can't load. Say so rather than "No files in workspace"; a list
+  // cached before it slept still renders.
+  const showAsleepHint = sandboxAsleep && !dataReady;
 
   return (
     <div
@@ -537,7 +563,7 @@ export function FilesPanel({
         </div>
       </div>
       {/* Content */}
-      <div className="shrink-0 border-t border-border" />
+      <div className="workspace-panel-header-divider shrink-0 border-t border-border" />
       {/* Search toolbar — the Changed | All scope switch leads, then the
               search field, then the per-view trailing control (Sort for the
               changed list, glob filters for the tree). Lives outside the
@@ -554,7 +580,7 @@ export function FilesPanel({
                 aria-label="Search changed files"
                 className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                 onChange={(event) => setChangedSearch(event.target.value)}
-                placeholder="Search"
+                placeholder="Find changed files by name"
                 type="search"
                 value={changedSearch}
               />
@@ -578,7 +604,7 @@ export function FilesPanel({
                   aria-label="Search all files"
                   className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                   onChange={(event) => setTreeSearch(event.target.value)}
-                  placeholder="Search"
+                  placeholder="Find files by name"
                   type="search"
                   value={treeSearch}
                 />
@@ -647,7 +673,8 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {flatView ? (
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline />}
+        {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
             isLoading={changedQuery.isLoading}
@@ -661,7 +688,8 @@ export function FilesPanel({
             conversationId={conversationId}
             runnerWentOffline={runnerWentOffline}
           />
-        ) : (
+        )}
+        {!showAsleepHint && !flatView && (
           <FolderTree
             files={allFilesQuery.data?.data}
             isLoading={allFilesQuery.isLoading}

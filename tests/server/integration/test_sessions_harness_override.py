@@ -65,6 +65,26 @@ def _stub_runner_client(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return captured
 
 
+def _stub_late_runner_bind(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Accept any ``PATCH {runner_id}`` bind and capture the runner POSTs.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: The :func:`_stub_runner_client` capture dict.
+    """
+    from omnigent.server.routes import sessions as sessions_mod
+
+    async def _skip_relay_readiness(*_: Any, **__: Any) -> None:
+        return None
+
+    def _accept_runner_id(_router: Any, raw: str, *, user_id: Any = None) -> str:
+        del user_id
+        return raw.strip()
+
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _skip_relay_readiness)
+    monkeypatch.setattr(sessions_mod, "_registered_runner_id", _accept_runner_id)
+    return _stub_runner_client(monkeypatch)
+
+
 @pytest.mark.parametrize("override", ["pi", "acp:goose"])
 async def test_create_with_harness_override_persists_and_snapshot_reflects(
     client: httpx.AsyncClient,
@@ -97,10 +117,13 @@ async def test_create_with_harness_override_persists_and_snapshot_reflects(
         "GET snapshot lost the harness override — the column did not "
         "persist or _resolve_harness stopped preferring it."
     )
+    listed = (await client.get("/v1/sessions")).json()["data"]
+    assert next(item for item in listed if item["id"] == body["id"])["harness"] == override
 
 
 async def test_create_without_harness_override_reports_spec_default(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No override → the snapshot reports the spec's declared harness.
 
@@ -115,6 +138,32 @@ async def test_create_without_harness_override_reports_spec_default(
     assert resp.status_code == 201, resp.text
     # The test bundle declares claude-sdk (see build_agent_bundle).
     assert resp.json().get("harness") == "claude-sdk"
+    override = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "initial_items": [], "harness_override": "pi"},
+    )
+    assert override.status_code == 201, override.text
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    def reject_single_agent_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("The session list must batch its agent metadata reads")
+
+    monkeypatch.setattr(SqlAlchemyAgentStore, "get", reject_single_agent_read)
+    listed = (await client.get("/v1/sessions")).json()["data"]
+    assert next(item for item in listed if item["id"] == resp.json()["id"])["harness"] == (
+        "claude-sdk"
+    )
+
+    def unavailable_bundle(*args: object, **kwargs: object) -> None:
+        raise httpx.ConnectError("Artifact service unavailable")
+
+    monkeypatch.setattr(AgentCache, "load", unavailable_bundle)
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200
+    listed_by_id = {item["id"]: item for item in response.json()["data"]}
+    assert "harness" not in listed_by_id[resp.json()["id"]]
+    assert listed_by_id[override.json()["id"]]["harness"] == "pi"
 
 
 async def test_create_harness_override_alias_canonicalizes(
@@ -303,19 +352,7 @@ async def test_patch_rebind_init_carries_harness_override(
     ``initial_items`` resolves its harness from session init. A bare legacy
     body loses the override, so the kickoff runs on the spec's harness.
     """
-    from omnigent.server.routes import sessions as sessions_mod
-
-    captured = _stub_runner_client(monkeypatch)
-
-    async def _skip_relay_readiness(*_: Any, **__: Any) -> None:
-        return None
-
-    def _accept_runner_id(_router: Any, raw: str, *, user_id: Any = None) -> str:
-        del user_id
-        return raw.strip()
-
-    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _skip_relay_readiness)
-    monkeypatch.setattr(sessions_mod, "_registered_runner_id", _accept_runner_id)
+    captured = _stub_late_runner_bind(monkeypatch)
 
     agent = await create_test_agent(client)
     resp = await client.post(
@@ -343,6 +380,53 @@ async def test_patch_rebind_init_carries_harness_override(
     assert not init_posts[-1].get("session_init", {}).get("suppress_recovery_turn"), (
         f"The rebind init must keep recovery enabled — on rebind the recovery "
         f"turn is what runs the pending seeded kickoff; got {init_posts[-1]!r}."
+    )
+
+
+async def test_patch_bind_side_chat_init_suppresses_recovery_turn(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copied sub-agent completion must not start a side-chat recovery turn."""
+    captured = _stub_late_runner_bind(monkeypatch)
+
+    agent = await create_test_agent(client)
+    source = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert source.status_code == 201, source.text
+    notice = "[System: sub-agent worker finished. Summarize its result.]"
+    seeded = await client.post(
+        f"/v1/sessions/{source.json()['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": notice}],
+                },
+            },
+        },
+    )
+    assert seeded.status_code in (200, 202), seeded.text
+    fork = await client.post(
+        f"/v1/sessions/{source.json()['id']}/fork",
+        json={"title": "Side chat", "side_chat": True},
+    )
+    assert fork.status_code == 201, fork.text
+    items = await client.get(f"/v1/sessions/{fork.json()['id']}/items")
+    assert items.status_code == 200, items.text
+    assert notice in items.text
+    captured.pop("posts", None)
+
+    patch = await client.patch(
+        f"/v1/sessions/{fork.json()['id']}", json={"runner_id": "runner_bound_late"}
+    )
+    assert patch.status_code == 200, patch.text
+
+    init_posts = [body for path, body in captured.get("posts", []) if path == "/v1/sessions"]
+    assert init_posts, "The side-chat bind never notified the runner about the session."
+    assert init_posts[-1].get("session_init", {}).get("suppress_recovery_turn") is True, (
+        f"The side-chat bind init must suppress the recovery turn; got {init_posts[-1]!r}."
     )
 
 

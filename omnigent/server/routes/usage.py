@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -31,12 +31,12 @@ def _utc_today() -> str:
     """Return the current UTC calendar day as ``"YYYY-MM-DD"``."""
     from omnigent.db.utils import now_epoch
 
-    return datetime.fromtimestamp(now_epoch(), tz=timezone.utc).date().isoformat()
+    return datetime.fromtimestamp(now_epoch(), tz=UTC).date().isoformat()
 
 
 def _day_offset(day_utc: str, *, days: int) -> str:
     """Return the UTC day *days* before *day_utc*, as ``"YYYY-MM-DD"``."""
-    base = datetime.strptime(day_utc, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    base = datetime.strptime(day_utc, "%Y-%m-%d").replace(tzinfo=UTC)
     return (base - timedelta(days=days)).date().isoformat()
 
 

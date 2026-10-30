@@ -9,6 +9,8 @@ import {
   SESSION_ACTIONS_LOADING,
   SESSION_ACTIONS_UNAVAILABLE,
 } from "@/lib/sessionCapabilities";
+import type { SandboxLaunchStage } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -340,6 +342,30 @@ describe("HostBadge", () => {
     },
   );
 
+  it("names an Arclet in the composer tooltip by its own host name", async () => {
+    useHostsMock.mockReturnValue({
+      data: [host({ name: "omnigent-arclet-1234567890", sandbox_provider: "arclet" })],
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.focus(screen.getByTestId("composer-host-select"));
+    const tooltip = await screen.findByTestId("composer-host-tooltip");
+    expect(tooltip).toHaveTextContent("Host: Arclet Sandbox");
+    expect(tooltip).toHaveTextContent("Name: omnigent-arclet-1234567890");
+    expect(tooltip).toHaveTextContent("Status: Connected");
+  });
+
+  it("keeps another sandbox's managed-* name out of the composer tooltip", async () => {
+    useHostsMock.mockReturnValue({
+      data: [host({ name: "managed-abc123", sandbox_provider: "lakebox" })],
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.focus(screen.getByTestId("composer-host-select"));
+    const tooltip = await screen.findByTestId("composer-host-tooltip");
+    expect(tooltip).toHaveTextContent("Host: Databricks Sandbox");
+    expect(tooltip).not.toHaveTextContent("Name:");
+    expect(tooltip).not.toHaveTextContent("managed-abc123");
+  });
+
   it("names no host in the composer tooltip for an unbound session", async () => {
     useSessionMock.mockReturnValue({ session: { hostId: null }, isLoading: false, error: null });
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
@@ -505,9 +531,9 @@ describe("HostBadge", () => {
     expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
   });
 
-  it("stays passive for a dormant resumable managed host", () => {
-    // A resumable sandbox host reads offline while idle-stopped, but the next
-    // message wakes it — offering `omnigent host` there would be wrong.
+  it("offers reconnect for a dormant resumable managed host", () => {
+    // A resumable sandbox host reads offline while idle-stopped; reconnecting
+    // asks the server to wake it, as the next message would.
     useSessionMock.mockReturnValue({
       session: { hostId: "host_a1b2", hostResumable: true },
       isLoading: false,
@@ -517,11 +543,27 @@ describe("HostBadge", () => {
     const onReconnect = vi.fn();
     render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
     const badge = screen.getByTestId("host-badge");
-    expect(badge.textContent).toBe("mac-laptop, offline");
-    // `omnigent host` is the wrong instruction here, so the click must not
-    // reach reconnect — it opens the switch dialog like any non-reconnect host.
+    expect(badge.textContent).toBe("mac-laptop, offline — click to reconnect");
     fireEvent.click(badge);
-    expect(onReconnect).not.toHaveBeenCalled();
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("switch-host-dialog")).toBeNull();
+  });
+
+  it.each([
+    ["a disconnected", false],
+    ["an asleep", true],
+  ])("offers Reconnect host in the composer menu for %s host", (_state, hostResumable) => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_a1b2", hostResumable },
+      isLoading: false,
+      error: null,
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={onReconnect} />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
+    expect(onReconnect).toHaveBeenCalledTimes(1);
   });
 
   it("renders nothing when onReconnect is set but the session isn't host-bound", () => {
@@ -641,5 +683,73 @@ describe("HostBadge", () => {
     useSessionHostOnlineMock.mockReturnValue(false);
     rerender(<HostBadge sessionId="conv_1" />);
     expect(screen.getByTestId("host-badge").textContent).toBe("new-box, offline");
+  });
+});
+
+describe("HostBadge during a sandbox launch", () => {
+  afterEach(() => useChatStore.setState({ conversationId: null, sandboxStatus: null }));
+
+  function launch(stage: SandboxLaunchStage, hostId: string | null, provider?: string): void {
+    useChatStore.setState({
+      conversationId: "conv_1",
+      sandboxStatus: { stage, error: null, provider },
+    });
+    useSessionMock.mockReturnValue({ session: { hostId } });
+  }
+
+  it.each([
+    ["provisioning", "Provisioning sandbox"],
+    ["connecting", "Starting agent"],
+    ["failed", "Sandbox launch failed"],
+  ] as const)("shows a %s sandbox instead of a missing host", (stage, status) => {
+    launch(stage, null);
+    useHostsMock.mockReturnValue({ data: [] });
+    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger).toHaveAccessibleName(`Host Sandbox, ${status}`);
+    expect(screen.getByTestId("composer-host-icon")).toHaveClass("lucide-monitor-cloud");
+    expect(screen.queryByTestId("composer-host-status")).not.toBeInTheDocument();
+    fireEvent.pointerDown(trigger, { button: 0 });
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveTextContent("Cloud");
+    expect(within(menu).getByRole("menuitem", { name: "Sandbox" })).toBeInTheDocument();
+    expect(menu).toHaveTextContent(status);
+    expect(menu).not.toHaveTextContent("No host bound");
+    expect(menu).not.toHaveTextContent("no host binding");
+    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
+  });
+
+  it("names the launching provider until the bound sandbox's host record loads", () => {
+    launch("connecting", "host_sb", "modal");
+    useHostsMock.mockReturnValue({ data: [] });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const { rerender } = render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger).toHaveAccessibleName("Host Modal Sandbox, Starting agent");
+
+    useHostsMock.mockReturnValue({
+      data: [host({ host_id: "host_sb", name: "managed-sb", sandbox_provider: "modal" })],
+    });
+    useSessionHostOnlineMock.mockReturnValue(true);
+    rerender(<HostBadge sessionId="conv_1" appearance="composer" />);
+    expect(trigger).toHaveAccessibleName("Host Modal Sandbox, online");
+    expect(screen.getByTestId("composer-host-icon")).toHaveClass("lucide-monitor-cloud");
+    expect(screen.getByTestId("composer-host-status")).toBeInTheDocument();
+  });
+
+  it("shows a resolved host rather than an earlier failed launch", () => {
+    launch("failed", "host_a1b2");
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName(
+      "Host mac-laptop, online",
+    );
+    expect(screen.getByTestId("composer-host-icon")).not.toHaveClass("lucide-monitor-cloud");
+  });
+
+  it("ignores another open session's launch", () => {
+    launch("provisioning", null);
+    useChatStore.setState({ conversationId: "conv_other" });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName("No host bound");
   });
 });

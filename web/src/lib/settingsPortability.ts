@@ -8,6 +8,20 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "./pickerEntryVisibility";
+import {
+  resetSessionWorkspaceTabSelections,
+  unpinSessionWorkspaceTabs,
+} from "./sessionWorkspaceState";
+import {
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
+  readDefaultWorkspaceTab,
+  readPinnedWorkspaceTabs,
+} from "./workspaceTabPreferences";
 
 /** localStorage keys that constitute exportable user preferences. */
 const EXPORTABLE_KEYS = [
@@ -20,8 +34,12 @@ const EXPORTABLE_KEYS = [
   "omnigent:ui-theme-palette",
   "omnigent:custom-theme",
   "omnigent:default-workspace-panel",
+  "omnigent:default-workspace-tab",
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
@@ -119,6 +137,8 @@ export function readSettingsFile(file: File): Promise<ExportedSettings> {
 export function applyImportedSettings(imported: ExportedSettings): number {
   if (typeof window === "undefined") return 0;
   const allowedKeys = new Set<string>(EXPORTABLE_KEYS);
+  const previousPins = readPinnedWorkspaceTabs();
+  const previousDefault = readDefaultWorkspaceTab();
 
   // Clear all exportable keys first to honor the "overwrite" contract.
   for (const key of EXPORTABLE_KEYS) {
@@ -139,6 +159,15 @@ export function applyImportedSettings(imported: ExportedSettings): number {
     } catch {
       // Swallow individual write failures.
     }
+  }
+  // Same-tab writes fire no storage event, so the subscribable preferences
+  // have to be told; otherwise an open picker keeps the pre-import set.
+  notifyHiddenPickerAgentsChanged();
+  const nextPins = readPinnedWorkspaceTabs();
+  const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
+  unpinSessionWorkspaceTabs(removedPins);
+  if (previousDefault !== readDefaultWorkspaceTab()) {
+    resetSessionWorkspaceTabSelections();
   }
   return count;
 }

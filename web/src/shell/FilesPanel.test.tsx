@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useState } from "react";
+import { type ComponentProps, useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +8,7 @@ import {
   type WorkspaceFile,
   PathUnreachableError,
   useWorkspaceAllFiles,
+  useWorkspaceAsleep,
   useWorkspaceChangedFiles,
   useWorkspaceDirectories,
   useWorkspaceDirectory,
@@ -21,7 +22,7 @@ const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.r
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { useSession } from "@/hooks/useSession";
-import { FilesPanel } from "./FilesPanel";
+import { FilesPanel, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
@@ -32,6 +33,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   // panel makes, so stubbing it would test a fiction.
   ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceAllFiles: vi.fn(),
+  useWorkspaceAsleep: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
   // The tree fetches expanded lazy dirs centrally via the plural hook; default
@@ -71,6 +73,7 @@ vi.mock("@/hooks/useSession", () => ({
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
+const useAsleepMock = vi.mocked(useWorkspaceAsleep);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useDirectoriesMock = vi.mocked(useWorkspaceDirectories);
@@ -137,6 +140,10 @@ function changedFilesResult(files: WorkspaceChangedFile[] = []) {
   } as unknown as ReturnType<typeof useWorkspaceChangedFiles>;
 }
 
+function unloadedResult() {
+  return { data: undefined, error: null, isError: false, isLoading: false } as unknown;
+}
+
 function directoryResult(files: WorkspaceFile[] = []) {
   return {
     data: files,
@@ -192,6 +199,7 @@ function renderPanel({
   isSearchTruncated = false,
   reachable = null,
   onFileSelect = vi.fn(),
+  listsLoaded = true,
 }: {
   conversationId: string;
   flatView?: boolean;
@@ -209,16 +217,31 @@ function renderPanel({
     roots: { path: string; access: string; origin: string }[];
   } | null;
   onFileSelect?: (path: string) => void;
+  /** False: both list queries are disabled and hold no data (nothing could serve them). */
+  listsLoaded?: boolean;
 }) {
-  useAllFilesMock.mockReturnValue(allFilesResult(files));
-  useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
+  useAllFilesMock.mockReturnValue(
+    listsLoaded
+      ? allFilesResult(files)
+      : (unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>),
+  );
+  useChangedFilesMock.mockReturnValue(
+    listsLoaded
+      ? changedFilesResult(changedFiles)
+      : (unloadedResult() as ReturnType<typeof useWorkspaceChangedFiles>),
+  );
   useDirectoryMock.mockReturnValue(directoryResult());
   useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
   useSearchMock.mockReturnValue(
     searchResult(treeSearchResults, isSearching, isSearchPlaceholder, isSearchTruncated),
   );
 
-  return render(
+  return render(panelAt(conversationId, { flatView, onFileSelect, showHidden, onClose }));
+}
+
+/** A fresh routed FilesPanel element, so rerenders re-read the hook mocks. */
+function panelAt(conversationId: string, props: Partial<ComponentProps<typeof FilesPanel>> = {}) {
+  return (
     <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
       <Routes>
         <Route
@@ -227,21 +250,22 @@ function renderPanel({
             <FilesPanel
               sort="recent"
               onSortChange={vi.fn()}
-              flatView={flatView}
-              onFileSelect={onFileSelect}
-              showHidden={showHidden}
+              flatView={false}
+              onFileSelect={vi.fn()}
+              showHidden={false}
               onShowHiddenChange={vi.fn()}
-              onClose={onClose}
+              {...props}
             />
           }
         />
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
 }
 
 beforeEach(() => {
   useAllFilesMock.mockReset();
+  useAsleepMock.mockReturnValue(false);
   useChangedFilesMock.mockReset();
   useDirectoryMock.mockReset();
   useDirectoriesMock.mockClear();
@@ -305,6 +329,8 @@ describe("FilesPanel header role", () => {
     // Content is always shown — the tree search box is part of it.
     const search = screen.getByRole("searchbox", { name: "Search all files" });
     expect(search).toBeInTheDocument();
+    expect(search).toHaveAttribute("placeholder", "Find files by name");
+    expect(screen.queryByRole("group", { name: "Search mode" })).not.toBeInTheDocument();
     expect(search.parentElement).toHaveClass("rounded-lg");
     expect(search.parentElement).not.toHaveClass("rounded-full");
   });
@@ -382,6 +408,28 @@ describe("FilesPanel hidden-files toggle icon", () => {
     const toggle = screen.getByRole("button", { name: "Show hidden files" });
     expect(toggle.querySelector(".lucide-eye")).not.toBeNull();
     expect(toggle.querySelector(".lucide-eye-off")).toBeNull();
+  });
+});
+
+describe("FilesPanel on an asleep sandbox", () => {
+  it.each([true, false])(
+    "says the sandbox is offline instead of an empty workspace (flatView=%s)",
+    (flatView) => {
+      useAsleepMock.mockReturnValue(true);
+      renderPanel({ conversationId: "conv_asleep", flatView, files: [], listsLoaded: false });
+
+      expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
+      expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
+      expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps showing a list cached before the sandbox went offline", () => {
+    useAsleepMock.mockReturnValue(true);
+    renderPanel({ conversationId: "conv_asleep", files: [file("README.md")] });
+
+    expect(screen.getByText("README.md")).toBeInTheDocument();
+    expect(screen.queryByText("Sandbox is offline")).not.toBeInTheDocument();
   });
 });
 
@@ -1431,28 +1479,7 @@ describe("FilesPanel scroll position persistence", () => {
     useDirectoryMock.mockReturnValue(directoryResult());
     useEnvironmentMock.mockReturnValue(environmentResult(null));
     useSearchMock.mockReturnValue(searchResult());
-    // Fresh JSX per render — reusing the same element would let React bail
-    // out of the re-render without re-reading the updated hook mocks.
-    const panel = () => (
-      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={false}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>
-    );
-    const view = render(panel());
+    const view = render(panelAt(conversationId));
     const section = view.container.querySelector("section");
     if (!section) throw new Error("scroll section not found");
     section.scrollTop = 0;
@@ -1461,7 +1488,7 @@ describe("FilesPanel scroll position persistence", () => {
     // Files arrive: the saved position survives the clamp and is restored.
     useAllFilesMock.mockReturnValue(allFilesResult(files));
     useChangedFilesMock.mockReturnValue(changedFilesResult([]));
-    view.rerender(panel());
+    view.rerender(panelAt(conversationId));
     expect(section.scrollTop).toBe(120);
 
     // Let the restore's animation-frame loop settle (jsdom has no layout, so
@@ -1705,6 +1732,59 @@ describe("FilesPanel browse location", () => {
     });
 
     expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_loc_other", expect.anything(), "");
+  });
+
+  it("browses a folder revealed from chat, live and on its next mount", () => {
+    vi.useFakeTimers();
+    const first = renderPanel({
+      conversationId: "conv_reveal",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: CONFINED,
+    });
+    const search = screen.getByRole("searchbox", { name: "Search all files" });
+    fireEvent.change(search, { target: { value: "touch" } });
+    act(() => vi.advanceTimersByTime(300));
+    expect(useSearchMock).toHaveBeenLastCalledWith(
+      "conv_reveal",
+      "touch",
+      "",
+      "",
+      { enabled: true },
+      "",
+    );
+
+    act(() => revealFolderInFilesPanel("conv_reveal", "/home/user/proj/experimental/data"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_reveal",
+      expect.anything(),
+      "experimental/data",
+    );
+    expect(search).toHaveValue("");
+    expect(useSearchMock).toHaveBeenLastCalledWith(
+      "conv_reveal",
+      "",
+      "",
+      "",
+      { enabled: false },
+      "experimental/data",
+    );
+    act(() => revealFolderInFilesPanel("conv_reveal_other", "/home/user/proj/docs"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_reveal",
+      expect.anything(),
+      "experimental/data",
+    );
+
+    first.unmount();
+    revealFolderInFilesPanel("conv_reveal", "/home/user/proj/docs");
+    renderPanel({
+      conversationId: "conv_reveal",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: CONFINED,
+    });
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_reveal", expect.anything(), "docs");
   });
 
   it("surfaces a refused location instead of an empty tree", () => {

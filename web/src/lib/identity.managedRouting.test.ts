@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OmnigentHostConfig } from "./host";
 
 const fetchMock = vi.fn();
+const getHostConfig = vi.fn<() => OmnigentHostConfig>();
 const isWorkspace = vi.fn(() => true);
 const SLICE_KEY = "X-Databricks-Omnigent-Slice-Key";
 const SESSION_ID = "managed-session";
@@ -17,10 +19,11 @@ function requestHeaders(index: number): Headers {
 beforeEach(() => {
   vi.resetModules();
   fetchMock.mockReset();
+  getHostConfig.mockReset().mockReturnValue({ fetcher: fetchMock });
   isWorkspace.mockReturnValue(true);
   vi.doUnmock("./sessionHost");
   vi.doMock("./host", () => ({
-    getOmnigentHostConfig: () => ({ fetcher: fetchMock }),
+    getOmnigentHostConfig: getHostConfig,
     hostFetch: fetchMock,
     isDatabricksWorkspace: isWorkspace,
     isHostRoutingEnabled: isWorkspace,
@@ -92,12 +95,7 @@ describe("managed first-message routing", () => {
   });
 
   it("recovers workspace dev requests without an embedded fetcher", async () => {
-    vi.doMock("./host", () => ({
-      getOmnigentHostConfig: () => ({}),
-      hostFetch: fetchMock,
-      isDatabricksWorkspace: isWorkspace,
-      isHostRoutingEnabled: isWorkspace,
-    }));
+    getHostConfig.mockReturnValue({});
     const { authenticatedFetch, resolve } = await setup();
     fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(Response.json({}));
 
@@ -252,4 +250,35 @@ describe("managed first-message routing", () => {
       expect(resolve.mock.calls.every((call) => call[1]?.force !== true)).toBe(true);
     },
   );
+});
+
+describe("managed create routing by a chosen host id", () => {
+  it.each([
+    [
+      { host_type: "managed", host_id: "0123456789abcdef0123456789abcdef" },
+      "0123456789abcdef0123456789abcdef",
+    ],
+    [{ host_type: "managed" }, null],
+  ])("keys a managed POST /v1/sessions by the body's host_id (%o)", async (body, key) => {
+    const { authenticatedFetch } = await setup();
+    fetchMock.mockResolvedValueOnce(Response.json({ id: "conv_new" }, { status: 201 }));
+
+    await authenticatedFetch("/v1/sessions", { method: "POST", body: JSON.stringify(body) });
+
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe(key);
+  });
+
+  it("routes a session by its chosen host id until the host binds", async () => {
+    const { authenticatedFetch, sessionRoutingHostId, setSessionHost } = await setup();
+    const labels = { "omnigent.sandbox.requested_host_id": "0123456789abcdef0123456789abcdef" };
+    setSessionHost(SESSION_ID, sessionRoutingHostId(null, labels));
+    fetchMock.mockResolvedValue(Response.json({ queued: true }));
+
+    await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
+    setSessionHost(SESSION_ID, sessionRoutingHostId("bound-host", labels));
+    await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
+
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe("0123456789abcdef0123456789abcdef");
+    expect(requestHeaders(1).get(SLICE_KEY)).toBe("bound-host");
+  });
 });

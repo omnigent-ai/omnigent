@@ -8,7 +8,7 @@ and deletes owned agents.
 
 - `list`: server cards, owned rows, search of loaded results, and pagination.
 - `create`: name, description, harness, model, instructions, and MCP servers.
-- `review`: read-only summary, including version, dates, MCP servers, and skills.
+- `review`: configuration preview, including version, dates, MCP servers, and skills.
 - `edit`: partial configuration updates, explicit credential replacement/removal,
   dirty-draft confirmation, error retention, and stale-revision reload.
 - `delete`: confirmation, in-use warning, explicit forced removal, and errors.
@@ -20,12 +20,13 @@ and deletes owned agents.
 
 - Desktop: open Settings, then Customize → Custom agents in the sidebar.
 - Mobile: open Settings, then Customize → Custom agents in the settings navigation.
-- From the list: Create opens the form; an agent name opens its summary.
+- From the list: Create opens the form; an owned row opens its configuration form,
+  and a server card opens its read-only summary.
 - Direct links: `/settings/custom-agents`, `/settings/custom-agents/new`, and
   `/settings/custom-agents/<agent-id>` open those same pages.
 - Creation and review pages: Custom agents returns to the list; Cancel also
-  returns from creation. Edit and Delete are available in an owned agent's summary
-  when the server supports them. Edit opens a dialog on the same URL.
+  returns from creation and configuration review. Owned agents open directly in
+  an editable form with Save changes and Delete when the server supports them.
 
 ## Driving it with the repro environment
 
@@ -48,18 +49,20 @@ requires `user_owned: true` and `agent_config_edit: true`.
   action. Each cold bookmark requests one agent directly without fetching list
   pages. An unknown ID shows a missing-agent message; a failed request offers
   Retry. Test Create and Back from direct links too.
-- Edit: from an owned summary, choose Edit, change Description, and Save changes.
-  Reopen and verify the saved description, unchanged instructions, and configured
-  credential names. Changing a URL must preserve hidden credentials; replacing or
+- Edit: open an owned agent, change Description in the page form, and Save changes.
+  Confirm the same form shows the saved description, unchanged instructions, and
+  configured credential names. Changing a URL must preserve hidden credentials; replacing or
   removing a credential requires an explicit action. Existing server names and
   transports cannot be changed; managed servers are read-only.
-  Cancel a dirty draft and choose Keep editing, then cancel/discard it.
-  Change the same agent in another tab before saving: the first draft remains
-  visible with Reload latest. Confirm reload, then verify the newer value.
+  Cancel a dirty draft and choose Keep editing, then cancel/discard it. Confirm
+  Custom agents also asks before leaving a dirty draft, and no edit modal opens.
+  With revision headers available, change the same agent in another tab before
+  saving: the first draft remains visible with Reload latest. Confirm reload, then verify the newer value.
   `tests/e2e_ui/sessions/test_custom_agent_edit.py` covers desktop and mobile
-  persistence and conflict recovery against the real API; it enables only the UI
-  release flag in the info response. Cold desktop bookmarks and mobile list entry
-  are covered. Manually check desktop list entry and normal Settings navigation.
+  persistence with and without revision headers, and conflict recovery against the
+  real API. It enables the UI release flag and independently strips response
+  `ETag`, request `If-Match`, or both.
+  Cold desktop bookmarks and mobile list entry are covered. Manually check desktop list entry and normal Settings navigation.
 - Delete: cancel once and verify the agent remains, then delete and verify the
   list and API omit it. For an agent used by a session, verify the initial
   deletion reports the count and waits for Remove anyway. Only that action
@@ -72,7 +75,8 @@ requires `user_owned: true` and `agent_config_edit: true`.
   agents URL must show an update notice with no agent requests or management
   controls. An older detail response missing `user_owned` must hide Delete and
   explain that a server update is required. With `agent_config_edit` absent/false,
-  retain create/review/delete but hide Edit and show an editing update notice.
+  retain create/review/delete but show a read-only summary and an editing update
+  notice.
 - Component checks for duplicate names, failed save/delete, direct lookup,
   request errors, and capability gating:
   `pnpm --filter web test src/pages/settings/SettingsCustomAgentsSection.test.tsx src/shell/settingsNav.test.tsx src/lib/capabilities.test.ts`.
@@ -82,15 +86,17 @@ requires `user_owned: true` and `agent_config_edit: true`.
 
 ## Gotchas
 
-- On mobile, opening a Settings URL afresh shows the existing full-screen
-  settings navigation first. Select Custom agents, then Create or an agent row;
-  links within the section keep the content visible.
+- On mobile, Custom agents links open the content directly. The header Back
+  button opens the settings navigation; the form's Custom agents button returns
+  to the agent list and confirms unsaved changes.
 - Saving an existing owned name replaces its entire configuration and affects
   sessions using it. Use a unique name when creating a separate agent.
-- Editing loads the configuration endpoint and ETag; summaries never prefill it.
-  Missing revision headers prevent saving. Unchanged fields are omitted from PATCH.
-- Global browser history navigation can discard a draft; modal dismissal confirms
-  first and refresh/close warns. Model/harness incompatibilities are reported on save.
+- Owned previews load the configuration endpoint and ETag; summaries never prefill it.
+  Missing revision headers allow saving without a stale-draft check; the last
+  successful save of a field wins. Unchanged fields are omitted from PATCH.
+- Global browser history and settings navigation can discard a draft; Cancel and
+  the form's Custom agents button confirm first, and refresh/close warns.
+  Model/harness incompatibilities are reported on save.
 - Search covers loaded results. Load more to include older agents.
 - A detail bookmark uses the single-agent endpoint, independently of list
   pagination. Duplicate names are separate rows identified by ID.

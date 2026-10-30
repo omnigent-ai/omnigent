@@ -1,4 +1,4 @@
-// Monaco-based viewer/editor for non-markdown files in the file viewer.
+// Monaco-based source viewer/editor, including large Markdown files.
 //
 // One component serves both modes, switched by permission:
 //   • read-only (no edit permission) → Monaco with readOnly:true; selection,
@@ -33,7 +33,7 @@ import { TruncatedBanner } from "./TruncatedBanner";
 import { useMonacoFilePosition } from "./useMonacoFilePosition";
 // Reused as-is — the hook is editor-agnostic (drives any editor through
 // setContentRef). Named for markdown only because that was its first caller.
-import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
+import { type FinishServerCheck, useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import {
   ensureLanguage,
@@ -87,6 +87,9 @@ interface MonacoCodeEditorProps extends CommentProps {
    * on the visible prefix stay available.
    */
   truncated?: boolean;
+  largeMarkdown?: boolean;
+  /** Soft-wrap long lines at the pane edge instead of scrolling horizontally. */
+  wrapLines?: boolean;
   /** Reports unsaved-edit state up to FileViewer (navigation guard, etc.). */
   onDirtyChange?: (isDirty: boolean) => void;
   /** Reports the auto-save lifecycle up to FileViewer's toolbar status chip. */
@@ -116,7 +119,7 @@ interface MonacoCodeEditorProps extends CommentProps {
  * and feeds same-file external updates in through `setContentRef`.
  *
  * @param props See {@link MonacoCodeEditorProps}.
- * @returns The Monaco code editor for non-markdown files.
+ * @returns The Monaco source editor.
  */
 export function MonacoCodeEditor({
   position,
@@ -125,6 +128,8 @@ export function MonacoCodeEditor({
   path,
   isSettled,
   truncated = false,
+  largeMarkdown = false,
+  wrapLines = false,
   onDirtyChange,
   onSaveStatusChange,
   searchOpen,
@@ -150,7 +155,7 @@ export function MonacoCodeEditor({
     discardAndApplyExternal,
     dismissExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
   } = useMarkdownEditorSync({ content, path, isSettled, onDirtyChange, setContentRef });
 
   return (
@@ -162,13 +167,15 @@ export function MonacoCodeEditor({
       path={path}
       canEdit={canEdit}
       truncated={truncated}
+      largeMarkdown={largeMarkdown}
+      wrapLines={wrapLines}
       isDirty={isDirty}
       setDirty={setDirty}
       hasExternalUpdate={hasExternalUpdate}
       discardAndApplyExternal={discardAndApplyExternal}
       dismissExternalUpdate={dismissExternalUpdate}
       markSaved={markSaved}
-      reconcileServerContent={reconcileServerContent}
+      beginServerCheck={beginServerCheck}
       setContentRef={setContentRef}
       onSaveStatusChange={onSaveStatusChange}
       searchOpen={searchOpen}
@@ -189,13 +196,15 @@ interface InnerProps extends CommentProps {
   path: string;
   canEdit: boolean;
   truncated: boolean;
+  largeMarkdown: boolean;
+  wrapLines: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
   hasExternalUpdate: boolean;
   discardAndApplyExternal: () => void;
   dismissExternalUpdate: () => void;
   markSaved: (content: string) => void;
-  reconcileServerContent: (serverContent: string) => boolean;
+  beginServerCheck: () => FinishServerCheck;
   setContentRef: React.RefObject<((content: string) => void) | null>;
   onSaveStatusChange?: (status: SaveStatus) => void;
   searchOpen?: boolean;
@@ -218,13 +227,15 @@ function MonacoCodeEditorInner({
   path,
   canEdit,
   truncated,
+  largeMarkdown,
+  wrapLines,
   isDirty,
   setDirty,
   hasExternalUpdate,
   discardAndApplyExternal,
   dismissExternalUpdate,
   markSaved,
-  reconcileServerContent,
+  beginServerCheck,
   setContentRef,
   onSaveStatusChange,
   searchOpen,
@@ -287,7 +298,7 @@ function MonacoCodeEditorInner({
   // instance (the child <Editor> unmounts first).
   const isEditorDirty = useCallback(() => latestContentRef.current !== baselineRef.current, []);
 
-  // All save orchestration — write mutation, mid-turn conflict check, teardown
+  // All save orchestration — write mutation, pre-write conflict check, teardown
   // guard, and debounce/flush wiring — lives in the shared hook, identical to
   // the markdown editor. This surface only supplies its own content access.
   const { autoSave, saveDisabled, writeFile } = useEditorAutoSave({
@@ -298,7 +309,7 @@ function MonacoCodeEditorInner({
     setDirty,
     hasExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
     dismissExternalUpdate,
     baselineRef,
     getContent: () => latestContentRef.current,
@@ -488,8 +499,10 @@ function MonacoCodeEditorInner({
       renderLineHighlight: canEdit ? "line" : "none",
       // Read-only buffers still allow selection + copy; just hide the caret.
       cursorStyle: canEdit ? "line" : "underline-thin",
+      // Toggling only updates options on the live editor, so edits and cursor survive.
+      wordWrap: wrapLines ? "on" : "off",
     };
-  }, [canEdit]);
+  }, [canEdit, wrapLines]);
 
   // Apply live code-font changes to the mounted editor. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new
@@ -507,6 +520,11 @@ function MonacoCodeEditorInner({
 
   return (
     <div className="flex h-full flex-col">
+      {largeMarkdown && (
+        <div className="shrink-0 border-b border-border bg-muted/50 px-4 py-2 text-sm text-muted-foreground">
+          Large Markdown file opened as source to keep the viewer responsive.
+        </div>
+      )}
       {truncated && <TruncatedBanner />}
       {canEdit &&
         isDirty &&

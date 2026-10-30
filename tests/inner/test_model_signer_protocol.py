@@ -34,7 +34,12 @@ class _Writer:
 
 
 class _BlockingWriter(_Writer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.drain_started = asyncio.Event()
+
     async def drain(self) -> None:
+        self.drain_started.set()
         await asyncio.Future()
 
 
@@ -366,18 +371,42 @@ async def test_total_response_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch
 async def test_total_response_timeout_bounds_client_backpressure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    total_timeout = 60.0
     monkeypatch.setattr(
         "omnigent.inner.model_signer_service._RESPONSE_TOTAL_TIMEOUT_SECONDS",
-        0.001,
+        total_timeout,
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.model_signer_service._RESPONSE_IDLE_TIMEOUT_SECONDS",
+        total_timeout * 2,
     )
     relay = object.__new__(_SignerRelay)
     relay._credential_source = Mock()
+    client = _BlockingWriter()
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    clock_offset = 0.0
+    monkeypatch.setattr(loop, "time", lambda: real_time() + clock_offset)
 
-    with pytest.raises(asyncio.TimeoutError):
-        await relay._relay_response_observing_status(
+    task = asyncio.create_task(
+        relay._relay_response_observing_status(
             _reader(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
-            _BlockingWriter(),
+            client,
         )
+    )
+    try:
+        await asyncio.wait_for(client.drain_started.wait(), timeout=5.0)
+        assert not task.done()
+        # Expire the total deadline only after parsing has reached backpressure.
+        clock_offset = total_timeout + 1.0
+        done, _ = await asyncio.wait({task}, timeout=5.0)
+        assert task in done, "total response deadline did not cancel the blocked drain"
+        with pytest.raises(asyncio.TimeoutError):
+            task.result()
+    finally:
+        clock_offset = 0.0
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_unframed_infinite_response_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:

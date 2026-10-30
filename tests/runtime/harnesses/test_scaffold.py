@@ -33,6 +33,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -43,7 +44,11 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
-from omnigent.server.schemas import CreateResponseRequest
+from omnigent.server.schemas import (
+    CreateResponseRequest,
+    ElicitationRequestParams,
+    ElicitationResult,
+)
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -247,6 +252,33 @@ async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
     assert terminal.type == "response.cancelled"
     assert terminal.sequence_number == 3
     assert terminal.response.status == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_elicit_emits_resolved_on_every_exit(cancel: bool) -> None:
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_elicit", queue, asyncio.Event())
+    task = asyncio.create_task(
+        ctx.elicit("elicit_test", ElicitationRequestParams(mode="form", message="approve?"))
+    )
+    request = await queue.get()
+    assert request.type == "response.elicitation_request"
+    assert request.elicitation_id == "elicit_test"
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        ctx._pending_elicitations["elicit_test"].set_result(ElicitationResult(action="accept"))
+        assert (await task).action == "accept"
+    resolved = await queue.get()
+    assert resolved.type == "response.elicitation_resolved"
+    assert resolved.elicitation_id == "elicit_test"
+    assert resolved.action == (None if cancel else "accept")
+    assert resolved.reason == ("unanswered" if cancel else None)
+    assert ctx._pending_elicitations == {}
+    assert queue.empty()
 
 
 @pytest.mark.asyncio
@@ -552,7 +584,7 @@ async def test_heartbeat_carries_server_time_and_last_event_seq(
     import datetime
 
     parsed = datetime.datetime.strptime(server_time, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=datetime.timezone.utc
+        tzinfo=datetime.UTC
     )
     assert parsed.year >= 2026
 
@@ -1647,6 +1679,96 @@ async def test_interrupt_then_message_without_prev_id_starts_fresh_turn(
         await followup_client.aclose()
 
 
+async def test_steer_after_interrupt_does_not_start_a_stray_turn(
+    use_cancellable: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A steer landing after its turn was interrupted must not start a turn.
+
+    The runner forwards a mid-turn message (stamped ``injection_id``) while it
+    still sees the turn as live, and also buffers it for a continuation turn.
+    If the harness turn was already interrupted, starting a turn for the steer
+    makes the runner's continuation turn-start get a 204 injection instead —
+    the user's next message fails with "turn failed (status 204)".
+    """
+    conv_id = "conv_steer_after_interrupt"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    steer_client = _make_side_client(str(manager.socket_path(conv_id)))
+    next_client = _make_side_client(str(manager.socket_path(conv_id)))
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    followup = [{"type": "input_text", "text": "say hi"}]
+    steer_body = {**start_body, "content": followup, "injection_id": "inj_after_interrupt"}
+    next_body = {**start_body, "content": followup}
+    steer_status: int | None = None
+    next_status: int | None = None
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            async for event in _stream_iter(response):
+                if event.event != "response.in_progress":
+                    continue
+                cancel_resp = await side_client.post(
+                    f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"}
+                )
+                assert cancel_resp.status_code == 204
+                # Hold the steer's response open so a stray turn it starts stays
+                # live while the runner's continuation turn-start arrives.
+                async with steer_client.stream(
+                    "POST", f"/v1/sessions/{conv_id}/events", json=steer_body
+                ) as steer:
+                    steer_status = steer.status_code
+                    async with next_client.stream(
+                        "POST", f"/v1/sessions/{conv_id}/events", json=next_body
+                    ) as nxt:
+                        next_status = nxt.status_code
+                break
+        assert next_status == 200, (
+            f"the continuation turn must start a fresh turn (200), got {next_status}"
+        )
+        assert steer_status == 409, (
+            f"a steer with no live turn must be refused, got {steer_status}"
+        )
+    finally:
+        await side_client.aclose()
+        await steer_client.aclose()
+        await next_client.aclose()
+
+
+async def test_steer_with_injection_id_injects_live_turn(
+    use_injection: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A runner steer (``injection_id`` set) still injects into a live turn."""
+    conv_id = "conv_steer_live_turn"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    steer_body = {
+        **start_body,
+        "content": [{"type": "input_text", "text": "x"}],
+        "injection_id": "inj_live",
+    }
+    deltas: list[str] = []
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            async for event in _stream_iter(response):
+                if event.event != "response.output_text.delta":
+                    continue
+                deltas.append(event.data["delta"])
+                if event.data["delta"] == "ready:":
+                    steer = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json=steer_body
+                    )
+                    assert steer.status_code == 204
+        assert deltas == ["ready:", "got_1"]
+    finally:
+        await side_client.aclose()
+
+
 async def test_interrupt_then_message_with_prev_id_starts_fresh_turn(
     use_cancellable: None,
     manager: HarnessProcessManager,
@@ -1915,14 +2037,19 @@ async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
             await asyncio.Event().wait()
 
     # Short idle window so the watchdog trips quickly; absolute kept high so the
-    # idle ceiling (not the absolute one) is what fails the turn. The reader's
-    # recency window is 2x the idle timeout, comfortably covering the record
-    # made just before run_turn started plus scheduling overhead.
-    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    # idle ceiling (not the absolute one) is what fails the turn.
+    idle_timeout = 0.2
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", idle_timeout)
     monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 3600.0)
+    # Age the failure by exactly the wedged attempts' idle windows (plus a
+    # margin) on a fake clock, so a stalled runner can't push it out of range.
+    health_clock = {"now": 1000.0}
+    monkeypatch.setattr(health, "time", SimpleNamespace(monotonic=lambda: health_clock["now"]))
 
     health.clear()
     health.record_post_failure("external_session_status", httpx.ConnectError("No route to host"))
+    attempts = 1 + _scaffold._WEDGED_TURN_RECOVERY_RETRIES
+    health_clock["now"] += idle_timeout * attempts + 0.05
 
     app = _WedgedApp()
     ctx = TurnContext(

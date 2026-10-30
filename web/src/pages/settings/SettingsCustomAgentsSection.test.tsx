@@ -106,6 +106,13 @@ beforeEach(() => {
       users = users.filter((a) => a.id !== url.pathname.split("/").at(-1));
       return response({ deleted: true });
     }
+    if (url.pathname.endsWith("/config")) {
+      const id = decodeURIComponent(url.pathname.split("/").at(-2)!);
+      const found = users.find((item) => item.id === id)!;
+      return new Response(JSON.stringify({ ...editableConfig, ...found, mcp_servers: {} }), {
+        headers: { ETag: '"original"' },
+      });
+    }
     if (url.pathname.startsWith("/v1/agents/")) {
       const id = decodeURIComponent(url.pathname.slice("/v1/agents/".length));
       const owned = users.find((a) => a.id === id);
@@ -140,12 +147,15 @@ describe("Custom agents settings", () => {
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   });
 
-  it("opens a bookmark with one detail request and no list scans", async () => {
+  it("opens a bookmark with direct detail and configuration requests and no list scans", async () => {
     mount("/settings/custom-agents/a1");
     expect(await screen.findByRole("heading", { name: "research" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Delete agent" })).toBeVisible();
-    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
-    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/agents/a1", expect.anything());
+    await screen.findByLabelText("Instructions");
+    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
+      "/v1/agents/a1",
+      "/v1/agents/a1/config",
+    ]);
   });
 
   it("keeps an operator-added server agent read-only on a cold link", async () => {
@@ -165,7 +175,7 @@ describe("Custom agents settings", () => {
 
   it("shows loading while the detail request is pending", async () => {
     let resolve!: (value: Response) => void;
-    vi.mocked(authenticatedFetch).mockReturnValue(
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
       new Promise((done) => {
         resolve = done;
       }),
@@ -174,6 +184,7 @@ describe("Custom agents settings", () => {
     expect(screen.getByText("Loading agent…")).toBeVisible();
     resolve(response({ ...agent("a1"), user_owned: true }));
     expect(await screen.findByRole("heading", { name: "a1" })).toBeVisible();
+    expect(await screen.findByLabelText("Instructions")).toHaveValue(" literal\n");
   });
 
   it("reports a missing bookmark without fetching lists or retrying 404", async () => {
@@ -198,6 +209,7 @@ describe("Custom agents settings", () => {
     expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
       "/v1/agents/a1",
       "/v1/agents/a1",
+      "/v1/agents/a1/config",
     ]);
   });
 
@@ -337,7 +349,11 @@ const editableConfig: AgentConfig = {
   mcp_servers: {},
 };
 
-function configResponses({ fail = 0, etag = true }: { fail?: number; etag?: boolean } = {}) {
+function configResponses({
+  fail = 0,
+  etag = true,
+  patchEtag = etag,
+}: { fail?: number; etag?: boolean; patchEtag?: boolean } = {}) {
   const previous = vi.mocked(authenticatedFetch).getMockImplementation()!;
   let current = { ...editableConfig };
   let patchStatus = fail;
@@ -351,7 +367,7 @@ function configResponses({ fail = 0, etag = true }: { fail?: number; etag?: bool
       const patch = JSON.parse(init.body as string);
       current = { ...current, ...patch, version: current.version + 1 };
       users[0] = { ...users[0], description: current.description, version: current.version };
-      return new Response(JSON.stringify(current), { headers: { ETag: '"new"' } });
+      return new Response(JSON.stringify(current), { headers: patchEtag ? { ETag: '"new"' } : {} });
     }
     if (String(url).endsWith("/config"))
       return new Response(JSON.stringify(current), { headers: etag ? { ETag: '"original"' } : {} });
@@ -367,8 +383,9 @@ function configResponses({ fail = 0, etag = true }: { fail?: number; etag?: bool
 
 async function openEditor() {
   mount("/settings/custom-agents/a1");
-  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
   await screen.findByDisplayValue("Original");
+  expect(screen.getByLabelText("Name")).toHaveAttribute("readonly");
+  expect(screen.queryByRole("dialog")).toBeNull();
 }
 
 describe("editing custom agents", () => {
@@ -385,29 +402,92 @@ describe("editing custom agents", () => {
     flags.edit = edit;
     mount("/settings/custom-agents/a1");
     await screen.findByRole("button", { name: "Delete agent" });
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("form", { name: "Agent configuration" })).toBeNull();
     expect(authenticatedFetch).not.toHaveBeenCalledWith(
       expect.stringContaining("/config"),
       expect.anything(),
     );
   });
-  it("saves only changed fields, updates the summary, and never builds a replacement bundle", async () => {
-    configResponses();
+  it.each([
+    [true, true],
+    [false, false],
+    [true, false],
+  ])("saves only changed fields twice with GET ETag=%s, PATCH ETag=%s", async (etag, patchEtag) => {
+    configResponses({ etag, patchEtag });
     await openEditor();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const description = screen.getByLabelText("Description");
+    expect(description).not.toHaveAttribute("readonly");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Updated" } });
+    fireEvent.change(description, { target: { value: "Updated" } });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(await screen.findByText("Updated")).toBeVisible();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    expect(screen.getByLabelText("Description")).toBe(description);
+    expect(description).toHaveValue("Updated");
+    fireEvent.change(description, { target: { value: "Updated again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    expect(description).toHaveValue("Updated again");
     expect(authenticatedFetch).toHaveBeenCalledWith(
       "/v1/agents/a1",
       expect.objectContaining({
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "If-Match": '"original"' },
+        headers: {
+          "Content-Type": "application/json",
+          ...(patchEtag ? { "If-Match": '"new"' } : {}),
+        },
+        body: '{"description":"Updated again"}',
+      }),
+    );
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/agents/a1",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          ...(etag ? { "If-Match": '"original"' } : {}),
+        },
         body: '{"description":"Updated"}',
       }),
     );
     expect(buildAgentBundle).not.toHaveBeenCalled();
+  });
+  it("preserves new edits when the detail refresh after saving fails and is retried", async () => {
+    configResponses();
+    await openEditor();
+    const previous = vi.mocked(authenticatedFetch).getMockImplementation()!;
+    let finishRefresh!: (value: Response) => void;
+    const pendingDetail = new Promise<Response>((resolve) => {
+      finishRefresh = resolve;
+    });
+    vi.mocked(authenticatedFetch).mockImplementation((url, init) =>
+      String(url) === "/v1/agents/a1" && init?.method !== "PATCH"
+        ? pendingDetail
+        : previous(url, init),
+    );
+    const description = screen.getByLabelText("Description");
+    fireEvent.change(description, { target: { value: "Saved change" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    fireEvent.change(description, { target: { value: "Unsaved second draft" } });
+
+    vi.mocked(authenticatedFetch).mockImplementation(previous);
+    finishRefresh(response({ error: { message: "Unavailable" } }, 500));
+    const warning = await screen.findByRole("alert");
+    expect(screen.getByLabelText("Description")).toBe(description);
+    expect(description).toHaveValue("Unsaved second draft");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Custom agents" })).toBeVisible();
+    expect(warning).toHaveTextContent("Could not refresh this agent");
+
+    fireEvent.click(within(warning).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(screen.getByLabelText("Description")).toBe(description);
+    expect(description).toHaveValue("Unsaved second draft");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
   });
   it("retains a failed draft and confirms cancellation", async () => {
     configResponses({ fail: 500 });
@@ -422,6 +502,24 @@ describe("editing custom agents", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await screen.findByRole("heading", { name: "Custom agents" })).toBeVisible();
+    fireEvent.click((await screen.findAllByRole("link", { name: "research" }))[0]);
+    expect(await screen.findByLabelText("Instructions")).toHaveValue(" literal\n");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+  it("confirms a dirty draft before returning to the list", async () => {
+    configResponses();
+    await openEditor();
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Unsaved" } });
+    fireEvent.click(screen.getByRole("button", { name: "Custom agents" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep editing" }));
+    expect(screen.getByLabelText("Description")).toHaveValue("Unsaved");
+    fireEvent.click(screen.getByRole("button", { name: "Custom agents" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    expect(await screen.findByRole("heading", { name: "Custom agents" })).toBeVisible();
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([, init]) => init?.method === "PATCH"),
+    ).toBe(false);
   });
   it("keeps a conflicted draft until explicit reload, then allows editing the latest revision", async () => {
     const server = configResponses({ fail: 412 });
@@ -437,11 +535,21 @@ describe("editing custom agents", () => {
     expect(await screen.findByDisplayValue("Concurrent winner")).toBeVisible();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
   });
-  it("never saves without a revision", async () => {
-    configResponses({ etag: false });
+  it("preserves the draft on 428 and allows retrying after the server updates", async () => {
+    const server = configResponses({ etag: false, fail: 428 });
     await openEditor();
     fireEvent.change(screen.getByLabelText("Description"), { target: { value: "New" } });
-    expect(screen.getByRole("alert")).toHaveTextContent("did not provide");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("This server needs an update");
+    expect(screen.getByRole("alert")).toHaveTextContent("Your draft is still here");
+    expect(screen.getByLabelText("Description")).toHaveValue("New");
+    expect(screen.queryByRole("button", { name: "Reload latest" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    server.recover();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByLabelText("Description")).toHaveValue("New");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
   });
 });

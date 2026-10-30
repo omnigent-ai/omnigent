@@ -100,6 +100,7 @@ from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
 )
@@ -1481,6 +1482,34 @@ async def test_runner_post_reports_a_removed_agent_with_fork_guidance() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("exc", "cause"),
+    [
+        (httpx.ConnectError("connect failed to internal-host:6767"), "ConnectError"),
+        (
+            RuntimeError(
+                "spec_resolver: GET /v1/sessions/conv_x/agent/contents failed with HTTP 503"
+            ),
+            "RuntimeError HTTP 503",
+        ),
+    ],
+    ids=["connection-error", "server-status"],
+)
+def test_spec_resolve_error_detail_names_structured_cause(
+    exc: BaseException, cause: str, pinned_runner_log: Path
+) -> None:
+    """The client detail names the cause type and status, never the raw text."""
+    from omnigent.runner.app import _spec_resolve_error_detail
+
+    detail = _spec_resolve_error_detail(exc)
+
+    assert detail == (
+        f"Could not load the agent spec ({cause}). "
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert "internal-host" not in detail and "conv_x" not in detail
+
+
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
@@ -1532,6 +1561,7 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
     # not leak into the HTTP body (it is logged on the runner instead).
     assert body["error"] == "spec_resolver_failed"
     assert body["detail"] == (
+        "Could not load the agent spec (RuntimeError). "
         f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
     )
     assert "spec resolver unavailable" not in body["detail"]
@@ -2081,13 +2111,31 @@ def test_build_spawn_env_applies_model_override(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
     )
 
-    base = _build_spawn_env_from_spec(spec, "claude-sdk")
-    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", model_override="claude-sonnet-4-6")
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = SessionResourceRegistry()
+    registry.set_client_surface("desktop-session", "desktop")
+    base = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="desktop-session", resource_registry=registry
+    )
+    overridden = _build_spawn_env_from_spec(
+        spec,
+        "claude-sdk",
+        model_override="claude-sonnet-4-6",
+        session_id="desktop-session",
+        resource_registry=registry,
+    )
     assert base is not None and overridden is not None
     # Baseline uses the provider/catalog default (not the override) …
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+    assert base["OMNIGENT_CLIENT_SURFACE"] == overridden["OMNIGENT_CLIENT_SURFACE"] == "desktop"
+    unknown = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="legacy-session", resource_registry=registry
+    )
+    assert unknown is not None
+    assert unknown["OMNIGENT_CLIENT_SURFACE"] == "unknown"
 
 
 def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4529,10 +4577,8 @@ def _isolate_model_providers(
     :param tmp_path: Per-test temp dir holding ``config.yaml``.
     :param yaml_text: The config contents, e.g. a ``providers:`` block.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
     (tmp_path / "config.yaml").write_text(yaml_text)
 
 
@@ -4620,17 +4666,15 @@ async def _dispatch_model_send(
         pytest.param(
             "claude-native",
             "claude-sonnet-4-6",
-            "databricks-claude-sonnet-4-6",
+            "system.ai.claude-sonnet-4-6",
             id="canonical-claude-localized",
         ),
-        pytest.param(
-            "codex-native", "gpt-5-4", "databricks-gpt-5-4", id="canonical-gpt-localized"
-        ),
+        pytest.param("codex-native", "gpt-5-4", "system.ai.gpt-5-4", id="canonical-gpt-localized"),
         pytest.param(
             "claude-native",
             "databricks-claude-sonnet-4-6",
-            "databricks-claude-sonnet-4-6",
-            id="already-local-unchanged",
+            "system.ai.claude-sonnet-4-6",
+            id="legacy-local-canonicalized",
         ),
         pytest.param(
             "claude-native",
@@ -4652,9 +4696,9 @@ async def test_sys_session_send_localizes_canonical_model_for_gateway_child(
 
     With a Databricks default provider, a bare canonical vendor id
     (``claude-sonnet-4-6``) would die at the gateway ("model not
-    found"); the gate must persist the ``databricks-``-prefixed
-    spelling as ``model_override`` — and ONLY for mechanical ids:
-    already-local and vendor-prefixed shapes pass through verbatim.
+    found"); the gate must persist the Unity Catalog ``system.ai.`` spelling
+    as ``model_override`` — and ONLY for mechanical ids: legacy-local ids
+    canonicalize and vendor-prefixed shapes pass through.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir for the isolated provider config.
@@ -7858,6 +7902,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
                             "status": "running",
                             "runner_id": "r1",
                             "parent_session_id": None,
+                            "labels": {"omnigent.created_by_session_id": "conv_x"},
                         },
                         {
                             "id": "s2",
@@ -7899,6 +7944,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "created_by_session_id": "conv_x",
         },
         {
             "session_id": "s2",
@@ -7908,6 +7954,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "created_by_session_id": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
@@ -13162,11 +13209,16 @@ _SIGNED_IN_SCREENS = {
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
+@pytest.mark.parametrize(
+    ("harness", "rotated"),
+    [("codex-native", False), ("codex-native", True), ("claude-native", False)],
+    ids=["codex-native", "codex-native-rotated", "claude-native"],
+)
 async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     harness: str,
+    rotated: bool,
 ) -> None:
     """
     A turn that failed on a pending Databricks sign-in is followed by one "signed in" notice.
@@ -13175,15 +13227,21 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     prompt is on screen nothing is posted. Once the prompt is gone and the
     agent can take a message (Codex has published its bridge state, Claude Code
     shows its composer), one neutral notice lands in the transcript so the
-    person knows the sign-in worked and can resend.
+    person knows the sign-in worked and can resend. A rotated Codex session's
+    launch publishes its state in its bridge-id label's directory.
     """
     from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import orchestration as native_orchestration
     from omnigent.terminals import TerminalRegistry
     from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
     conv = f"conv_signin_{harness.replace('-', '_')}"
     monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = codex_bridge.bridge_dir_for_bridge_id(conv)
+    if rotated:
+        bridge_dir = codex_bridge.bridge_dir_for_bridge_id("conv_signin_rotated_from")
+        monkeypatch.setitem(native_orchestration._AUTO_CODEX_BRIDGE_DIRS, conv, bridge_dir)
 
     class _RecordingServerClient(NullServerClient):
         def __init__(self) -> None:
@@ -13204,7 +13262,7 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
         if harness == "codex-native":
             # Thread discovery publishes the bridge state as the TUI starts a thread.
             codex_bridge.write_bridge_state(
-                codex_bridge.bridge_dir_for_bridge_id(conv),
+                bridge_dir,
                 codex_bridge.CodexNativeBridgeState(
                     session_id=conv,
                     socket_path="ws://127.0.0.1:1",
@@ -13337,9 +13395,15 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
+@pytest.mark.parametrize("with_client_id", [False, True])
+async def test_turn_lifecycle_events_name_the_web_message_they_settle(
+    with_client_id: bool,
+) -> None:
     conv = "conv_stable_id_on_lifecycle"
     stable_id = "8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e"
+    identity = {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32}
+    if with_client_id:
+        identity["input_stable_id"] = stable_id
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -13372,7 +13436,7 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
                 "agent_id": "ag_stable",
                 "model": "x",
                 "content": [{"role": "user", "content": "hi"}],
-                "stable_id": stable_id,
+                **identity,
             },
         )
         assert response.status_code == 200
@@ -13381,12 +13445,12 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
             "event: response.in_progress",
             "event: response.completed",
         ]
-        assert [
-            json.loads(next(line[5:] for line in frame.splitlines() if line.startswith("data:")))[
-                "input_stable_id"
-            ]
-            for frame in direct_frames
-        ] == [stable_id, stable_id]
+        for frame in direct_frames:
+            event = json.loads(
+                next(line[5:] for line in frame.splitlines() if line.startswith("data:"))
+            )
+            assert {key: event.get(key) for key in identity} == identity
+            assert ("input_stable_id" in event) is with_client_id
         events = await _drain_turn_events(
             app.state.session_event_queues,
             conv,
@@ -13399,7 +13463,10 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
         for event in events
         if event.get("type") in {"response.in_progress", "response.completed"}
     ]
-    assert [event["input_stable_id"] for event in lifecycle] == [stable_id, stable_id]
+    assert len(lifecycle) == 2
+    for event in lifecycle:
+        assert {key: event.get(key) for key in identity} == identity
+        assert ("input_stable_id" in event) is with_client_id
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ What each test claims to prove (and what failure indicates):
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Iterable
 from typing import Any, Literal
@@ -43,6 +44,7 @@ from omnigent_client._sessions import (
     SessionsNamespace,
 )
 
+from omnigent.server.routes._host_launch import _MAX_LAUNCH_TIMEOUT_S
 from omnigent.server.schemas import (
     CompletedEvent,
     OutputTextDeltaEvent,
@@ -1468,3 +1470,261 @@ async def test_list_preserves_host_id_on_rows() -> None:
     assert by_id["conv_unbound"].parent_session_id is None
     assert by_id["conv_child"].host_id is None
     assert by_id["conv_child"].parent_session_id == "conv_host_bound"
+
+
+# ── create_from_agent_id() / list_launch_hosts() ──────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_id", [None, "host_1"])
+@pytest.mark.parametrize("read_timeout", [0.05, 7200.0, None])
+async def test_create_from_agent_id_preserves_request_timeouts(
+    host_id: str | None, read_timeout: float | None
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        captured["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200, json=_session_response_body(status="idle"))
+
+    ns, client = _make_namespace(handler)
+    client.timeout = httpx.Timeout(connect=2, read=read_timeout, write=3, pool=4)
+    try:
+        await ns.create_from_agent_id("ag_abc", workspace="/w", host_id=host_id)
+    finally:
+        await client.aclose()
+
+    expected_body: dict[str, object] = {"agent_id": "ag_abc", "workspace": "/w"}
+    if host_id is not None:
+        expected_body["host_id"] = host_id
+    assert captured["body"] == expected_body
+    timeout = captured["timeout"]
+    assert {key: timeout[key] for key in ("connect", "write", "pool")} == {
+        "connect": 2,
+        "write": 3,
+        "pool": 4,
+    }
+    if host_id is not None and read_timeout is not None:
+        assert timeout["read"] > _MAX_LAUNCH_TIMEOUT_S
+        assert timeout["read"] >= read_timeout
+    else:
+        assert timeout["read"] == read_timeout
+    assert client.timeout.read == read_timeout
+
+
+@pytest.mark.asyncio
+async def test_host_launch_waits_past_the_ordinary_http_read_timeout() -> None:
+    """A real HTTP read waits for a delayed launch without extending ordinary requests."""
+    pending: set[asyncio.Task[None]] = set()
+
+    async def respond(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            await asyncio.sleep(0.2)
+            body = json.dumps(_session_response_body(status="idle")).encode()
+            writer.write(
+                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    def connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.create_task(respond(reader, writer))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    server = await asyncio.start_server(connected, "127.0.0.1", 0)
+    base_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    try:
+        async with server, httpx.AsyncClient(timeout=0.05, trust_env=False) as http:
+            sessions = SessionsNamespace(http, base_url)
+            launched = await sessions.create_from_agent_id("ag_abc", host_id="host_1")
+            assert launched.id == "conv_abc"
+            with pytest.raises(httpx.ReadTimeout):
+                await sessions.create_from_agent_id("ag_abc")
+    finally:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _host(
+    host_id: str,
+    *,
+    status: str = "online",
+    sandbox_provider: str | None = None,
+    harnesses: dict[str, object] | None = None,
+    name: str | None = "",
+) -> dict[str, object]:
+    """Build one ``GET /v1/hosts`` row; ``name=""`` means ``<host_id>.local``."""
+    return {
+        "host_id": host_id,
+        "name": f"{host_id}.local" if name == "" else name,
+        "status": status,
+        "sandbox_provider": sandbox_provider,
+        "configured_harnesses": harnesses,
+    }
+
+
+async def _launch_hosts(
+    body: object,
+    *,
+    status_code: int = 200,
+    **kwargs: Any,
+) -> list[tuple[str, str, bool, str | None]]:
+    """Run ``list_launch_hosts`` on a mocked listing; return (id, name, launchable, reason)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/hosts"
+        return httpx.Response(status_code, json=body)
+
+    ns, client = _make_namespace(handler)
+    try:
+        hosts = await ns.list_launch_hosts(**kwargs)
+    finally:
+        await client.aclose()
+    return [(h.host_id, h.name, h.launchable, h.unavailable_reason) for h in hosts]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_flags_hosts_that_cannot_launch() -> None:
+    """Readiness follows the server's launch check; auth is advisory."""
+    hosts = [
+        _host("offline", status="offline", harnesses={"claude-sdk": True}),
+        _host("sandbox", sandbox_provider="modal", harnesses={"claude-sdk": True}),
+        _host("missing", harnesses={"claude-sdk": "binary-missing"}),
+        _host("old", harnesses={"claude-sdk": "version-too-low"}),
+        _host("disabled", harnesses={"claude-sdk": False}),
+        _host("absent", harnesses={"codex": True}),
+        _host("needs_auth", harnesses={"claude-sdk": "needs-auth"}),
+        _host("ready", harnesses={"claude-sdk": True}),
+        _host("unknown", harnesses=None),
+        _host("future", harnesses={"claude-sdk": {"state": "future"}}),
+    ]
+
+    listed = await _launch_hosts({"hosts": hosts}, harness="claude-sdk")
+
+    assert [(h, ok, why) for h, _, ok, why in listed] == [
+        ("missing", False, "binary-missing"),
+        ("old", False, "version-too-low"),
+        ("disabled", False, "unconfigured"),
+        ("absent", False, "unconfigured"),
+        ("needs_auth", True, None),
+        ("ready", True, None),
+        ("unknown", True, None),
+        ("future", True, None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("reported", "launchable"), [("claude-sdk", True), ("claude", False)])
+async def test_list_launch_hosts_matches_server_canonical_key(
+    reported: str, launchable: bool
+) -> None:
+    hosts = [_host("h1", harnesses={reported: True})]
+
+    listed = await _launch_hosts(
+        {"hosts": hosts},
+        harness="claude",
+    )
+
+    assert [(h, ok) for h, _, ok, _ in listed] == [("h1", launchable)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", [None, "auto", ""])
+async def test_list_launch_hosts_without_harness_marks_every_host_launchable(
+    harness: str | None,
+) -> None:
+    hosts = [_host("h1", harnesses={"claude-sdk": False})]
+
+    assert [ok for _, _, ok, _ in await _launch_hosts({"hosts": hosts}, harness=harness)] == [True]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_skips_malformed_rows_and_names_by_id() -> None:
+    hosts: list[object] = [
+        "not-a-row",
+        {"status": "online"},
+        _host(""),
+        _host("unnamed", name=None),
+        _host("ok"),
+    ]
+
+    assert [(h, n) for h, n, _, _ in await _launch_hosts({"hosts": hosts})] == [
+        ("unnamed", "unnamed"),
+        ("ok", "ok.local"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"hosts": None}, {"hosts": {"oops": True}}])
+async def test_list_launch_hosts_rejects_a_non_list_listing(body: dict[str, object]) -> None:
+    with pytest.raises(OmnigentError, match=r"GET /v1/hosts.*unexpected hosts listing"):
+        await _launch_hosts(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 500])
+async def test_list_launch_hosts_http_failure_raises(status: int) -> None:
+    """Like other SDK calls, a 404 raises; callers decide what an older server means."""
+    with pytest.raises(OmnigentError):
+        await _launch_hosts({}, status_code=status)
+
+
+# ── resolve_agent() user-agent fallback ───────────────────────────────
+
+
+def _agents_handler(
+    server: list[str], user: list[str]
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/agents"
+        if request.url.params.get("scope") == "user":
+            rows = [{"id": f"uid_{n}", "name": n, "harness": "codex"} for n in user]
+        else:
+            rows = [{"id": f"id_{n}", "name": n, "harness": "claude-sdk"} for n in server]
+        return httpx.Response(200, json={"data": rows, "has_more": False})
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_falls_back_to_the_callers_user_agents() -> None:
+    ns, client = _make_namespace(_agents_handler(["scribe"], ["mine"]))
+    try:
+        agent = await ns.resolve_agent("mine")
+    finally:
+        await client.aclose()
+
+    assert (agent.id, agent.harness) == ("uid_mine", "codex")
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_miss_lists_both_kinds_of_agent() -> None:
+    ns, client = _make_namespace(_agents_handler(["scribe"], ["mine"]))
+    try:
+        with pytest.raises(LookupError) as excinfo:
+            await ns.resolve_agent("ghost")
+    finally:
+        await client.aclose()
+
+    assert "scribe" in str(excinfo.value) and "mine" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_validates_the_whole_matching_page() -> None:
+    """A matching first row cannot hide malformed registrations later in that page."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "ag_good", "name": "good"}, {}]})
+
+    namespace, client = _make_namespace(handler)
+    async with client:
+        with pytest.raises(OmnigentError, match="malformed agent row"):
+            await namespace.resolve_agent("good")
