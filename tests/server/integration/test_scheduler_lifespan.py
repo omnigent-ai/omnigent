@@ -280,6 +280,36 @@ async def test_lifespan_database_switch_dispatches_claim_and_drains(
     assert store.list_runs(task.id)[0][0].status == "starting"
 
 
+async def test_dispatch_hooks_pass_the_live_switch_and_interval_to_the_scheduler(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+
+    def dispatch_enabled() -> bool:
+        return False
+
+    def poll_interval() -> float:
+        return 5
+
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=store,
+        dispatch=ScheduledTaskDispatchHooks(
+            dispatch_enabled=dispatch_enabled, poll_interval=poll_interval
+        ),
+    )
+    async with app.router.lifespan_context(app):
+        scheduler = app.state.scheduled_task_scheduler
+        assert isinstance(scheduler, PersistentTaskScheduler)
+        assert scheduler._dispatch_enabled is dispatch_enabled
+        assert scheduler._poll_interval is poll_interval
+
+
 @pytest.mark.parametrize("features", [None, "-automations_v2", "automations_v2,-automations_v2"])
 async def test_automations_v2_flag_off_keeps_timers_even_with_hooks(
     runtime_init: None,

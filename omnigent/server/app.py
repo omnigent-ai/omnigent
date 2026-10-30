@@ -2022,6 +2022,8 @@ def create_app(
                     on_fire=dispatch_hooks.on_fire or executor.fire,
                     on_expired=dispatch_hooks.on_expired or executor.recover,
                     owned_hosts=dispatch_hooks.owned_hosts,
+                    dispatch_enabled=dispatch_hooks.dispatch_enabled,
+                    poll_interval=dispatch_hooks.poll_interval,
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
