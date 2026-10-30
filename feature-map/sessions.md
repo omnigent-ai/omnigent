@@ -181,6 +181,11 @@ the header menu), and each place is a separate entry point.
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
   a flat Display filter and the tooltip keeps its plain layout.
+- `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
+  drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
+  a third of its width, or after a quick flick, closes it; a shorter drag springs
+  back. List scrolling, row taps, long-press reordering and horizontal scrollers
+  keep their own touch handling.
 
 ## How to get to it (user POV)
 
@@ -555,6 +560,10 @@ plain `uv run pytest`, which starts a private server for the test.
   The iOS drawer rename under the soft keyboard:
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
+- **`mobile-drawer-swipe`:**
+  `tests/e2e_ui/mobile/test_sidebar_swipe_to_close.py::test_swipe_left_closes_open_drawer`,
+  `tests/e2e_ui/mobile/test_sidebar_swipe_to_close.py::test_drawer_stays_open_for_scroll_and_short_drag`.
+  These touch-drive desktop Chromium at a phone viewport with a stubbed iOS bridge.
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,

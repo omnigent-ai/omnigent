@@ -236,3 +236,83 @@ describe("mobile sidebar drawer keyboard inset", () => {
     );
   });
 });
+
+/** Dispatch a single-finger touch event on `target` at `time` ms. */
+function touch(target: Element, type: string, x: number, time: number): void {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "touches", {
+    value: type === "touchend" ? [] : [{ clientX: x, clientY: 300 }],
+  });
+  Object.defineProperty(event, "timeStamp", { value: time });
+  act(() => {
+    target.dispatchEvent(event);
+  });
+}
+
+function stubMobileLayout(mobile: boolean): void {
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: mobile && query.includes("max-width"),
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }));
+}
+
+// A leftward swipe on the open drawer slides it shut under the finger, the
+// reverse of the iOS shell's left-edge swipe that opens it.
+describe("mobile sidebar drawer swipe to close", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function renderDrawer() {
+    const onClose = vi.fn();
+    renderSidebar({ onClose });
+    const drawer = screen.getByRole("complementary", { name: "Conversations" });
+    drawer.getBoundingClientRect = () => ({ width: 400 }) as DOMRect;
+    return { onClose, drawer };
+  }
+
+  it("follows the finger and closes once released past a third of its width", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 60);
+    touch(drawer, "touchmove", 100, 120);
+
+    expect(drawer.style.transform).toBe("translateX(-50%)");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("0.5");
+    expect(onClose).not.toHaveBeenCalled();
+
+    touch(drawer, "touchend", 0, 400);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(drawer.style.transform).toBe("");
+  });
+
+  it("springs back open without closing after a short drag", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 270, 80);
+    touch(drawer, "touchmove", 250, 160);
+    touch(drawer, "touchend", 0, 400);
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(drawer.style.transform).toBe("");
+  });
+
+  it("ignores the swipe in the desktop layout", () => {
+    stubMobileLayout(false);
+    const { onClose, drawer } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 100, 60);
+    touch(drawer, "touchend", 0, 120);
+
+    expect(drawer.style.transform).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});

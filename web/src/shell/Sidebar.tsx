@@ -214,6 +214,7 @@ import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
+import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
@@ -928,12 +929,30 @@ function SidebarImpl({
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, handleProps: resizeHandleProps } = useResizableSidebar();
 
+  // On the open mobile drawer, a leftward swipe slides it shut under the
+  // finger, reusing the open swipe's progress rendering below.
+  const drawerRef = useRef<HTMLElement>(null);
+  const scrimRef = useRef<HTMLButtonElement>(null);
+  const [closeSwipeProgress, setCloseSwipeProgress] = useState<number | null>(null);
+  const mobileLayout = useIsMobileViewport();
+  useSidebarSwipeToClose({
+    enabled: open && mobileLayout && !inSettings && dragProgress == null,
+    drawerRef,
+    scrimRef,
+    holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
+    onDragProgress: setCloseSwipeProgress,
+    onSettle: (close) => {
+      if (close) onClose();
+    },
+  });
+  const liveDragProgress = dragProgress ?? closeSwipeProgress;
+
   // While the iOS edge-swipe is dragging, the overlay is on-screen and
   // interactive even though `open` hasn't flipped yet — treat a live drag as
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
-  const dragging = dragProgress != null;
+  const dragging = liveDragProgress != null;
   const effectiveOpen = open || dragging || peek;
-  const sidebarInertRef = useInertRef<HTMLElement>(!effectiveOpen);
+  const sidebarInertRef = useInertRef<HTMLElement>(!effectiveOpen, drawerRef);
   const nativeSidebarSurface = isIOSShell() || isAndroidShell();
 
   // The mobile drawer is a `fixed inset-0` overlay, so the iOS shell-lock
@@ -1013,6 +1032,7 @@ function SidebarImpl({
       {!inSettings && (
         <button
           type="button"
+          ref={scrimRef}
           data-testid="sidebar-scrim"
           aria-label="Close sidebar"
           onClick={onClose}
@@ -1022,7 +1042,7 @@ function SidebarImpl({
             "fixed inset-0 z-[45] bg-black/25 transition-opacity duration-200 ease-out md:hidden",
             effectiveOpen ? "opacity-100" : "pointer-events-none opacity-0",
           )}
-          style={dragging ? { opacity: dragProgress, transition: "none" } : undefined}
+          style={dragging ? { opacity: liveDragProgress, transition: "none" } : undefined}
         />
       )}
       <aside
@@ -1106,7 +1126,7 @@ function SidebarImpl({
             // Track the finger: map the 0→1 open fraction to translateX
             // -100%→0% and kill the transition so it follows the drag exactly.
             ...(dragging
-              ? { transform: `translateX(${(dragProgress - 1) * 100}%)`, transition: "none" }
+              ? { transform: `translateX(${(liveDragProgress - 1) * 100}%)`, transition: "none" }
               : null),
           } as CSSProperties
         }
