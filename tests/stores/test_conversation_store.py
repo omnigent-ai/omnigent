@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import string
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -3114,23 +3115,35 @@ def test_list_conversations_sort_by_title(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    ``sort_by="title"`` orders case-insensitively by code point, lists
-    untitled conversations last when ascending, and pages without gaps.
+    ``sort_by="title"`` folds ASCII case only, compares by code point, lists
+    untitled conversations last when ascending, breaks ties by id, and pages
+    without gaps. The web client reproduces this exact order.
     """
-    for title in ["beta", "", "Alpha", "ab", "a-c", "alpha", "Gamma", ""]:
+    titles = ["beta", "", "Alpha", "ab", "a-c", "alpha", "Gamma", ""]
+    titles += ["\u00e9clair", "\u00c9clair", "\uff21 wide", "\U0001f600 smile"]
+    for title in titles:
         conversation_store.create_conversation(title=title)
 
     full = conversation_store.list_conversations(sort_by="title", order="asc", kind=None)
-    listed = [(c.title or "").lower() for c in full.data]
-    # "-" sorts before letters by code point, unlike most locale collations.
-    # The two "alpha" spellings tie on the key, so only their pair is fixed.
-    assert listed == [
+    ascii_fold = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+    expected = sorted(
+        full.data,
+        key=lambda c: ("0" + c.title.translate(ascii_fold) if c.title else "1", c.id),
+    )
+    assert [c.id for c in full.data] == [c.id for c in expected]
+    # "-" sorts before letters, accented capitals stay unfolded, and the
+    # emoji follows U+FF21 by code point (a UTF-16 comparison would invert it).
+    listed = [c.title or "" for c in full.data]
+    assert sorted(listed[2:4]) == ["Alpha", "alpha"], listed
+    assert listed[:2] + listed[4:] == [
         "a-c",
         "ab",
-        "alpha",
-        "alpha",
         "beta",
-        "gamma",
+        "Gamma",
+        "\u00c9clair",
+        "\u00e9clair",
+        "\uff21 wide",
+        "\U0001f600 smile",
         "",
         "",
     ], listed

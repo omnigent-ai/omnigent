@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import string
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import PureWindowsPath
@@ -3082,7 +3083,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
-        sort_col = self._resolve_sort_column(sort_by)
+        sort_col, tiebreaker_col = self._resolve_sort_columns(sort_by)
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
 
@@ -3401,7 +3402,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     after,
                     sort_col,
                     is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
+                    tiebreaker_col=tiebreaker_col,
                     forward=True,
                 )
             if before:
@@ -3411,12 +3412,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     before,
                     sort_col,
                     is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
+                    tiebreaker_col=tiebreaker_col,
                     forward=False,
                 )
             stmt = stmt.order_by(
                 sort_fn(sort_col),
-                sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
+                sort_fn(tiebreaker_col),
             ).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
@@ -3470,36 +3471,47 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more=has_more,
         )
 
-    def _resolve_sort_column(self, sort_by: str) -> ColumnElement[Any]:
+    def _resolve_sort_columns(self, sort_by: str) -> tuple[ColumnElement[Any], ColumnElement[Any]]:
         """
-        Map a ``sort_by`` string to the expression the listing orders on.
+        Map a ``sort_by`` string to the expressions the listing orders on.
 
-        ``"title"`` sorts case-insensitively by code point, with untitled
-        conversations after every titled one in ascending order. The web
-        client reproduces this key to merge pages, so the comparison uses a
-        binary collation rather than the database's locale order.
+        ``"title"`` folds ASCII case only and compares by code point, with
+        untitled conversations after every titled one in ascending order, and
+        breaks ties by id. The web client reproduces this exact order to merge
+        pages, so the key avoids locale collations and Unicode case mapping,
+        which differ between dialects.
 
         :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"title"``.
-        :returns: The column or expression to order and page on.
+        :returns: The primary sort expression and its tiebreaker column.
         :raises ValueError: If ``sort_by`` is not a valid sort key.
         """
         if sort_by == "created_at":
-            return cast(ColumnElement[Any], SqlConversation.created_at)
+            return cast(ColumnElement[Any], SqlConversation.created_at), self._tiebreaker_col
         if sort_by == "updated_at":
-            return cast(ColumnElement[Any], SqlConversation.updated_at)
+            return cast(ColumnElement[Any], SqlConversation.updated_at), self._tiebreaker_col
         if sort_by != "title":
             raise ValueError(f"invalid sort_by: {sort_by!r}")
-        # One string key keeps the keyset cursor a two-column row comparison.
-        title_key = (
-            case((SqlConversation.title == "", "1"), else_="0") + func.lower(SqlConversation.title)
-        ).self_group()
         dialect = self._conv_engine.dialect.name
+        title = cast(ColumnElement[Any], SqlConversation.title)
+        if dialect == "sqlite":
+            # SQLite's built-in lower() folds ASCII only.
+            folded: ColumnElement[Any] = func.lower(title)
+        elif dialect in ("postgresql", "cockroachdb"):
+            folded = func.translate(title, string.ascii_uppercase, string.ascii_lowercase)
+        else:
+            folded = title
+            for upper, lower in zip(string.ascii_uppercase, string.ascii_lowercase, strict=True):
+                folded = func.replace(folded, upper, lower)
+        # One string key keeps the keyset cursor a two-column row comparison.
+        title_key = (case((title == "", "1"), else_="0") + folded).self_group()
+        # Ids are raw uuid bytes, so they order like their lowercase hex form.
+        tiebreaker = cast(ColumnElement[Any], SqlConversation.id)
         if dialect == "postgresql":
-            return title_key.collate("C")
+            return title_key.collate("C"), tiebreaker
         if dialect == "mysql":
-            return title_key.collate("utf8mb4_bin")
-        # SQLite compares with BINARY by default.
-        return title_key
+            return title_key.collate("utf8mb4_bin"), tiebreaker
+        # SQLite (BINARY) and CockroachDB compare strings bytewise by default.
+        return title_key, tiebreaker
 
     @staticmethod
     def _apply_cursor(
@@ -3530,11 +3542,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param stmt: The current SELECT statement to augment.
         :param cursor_id: The conversation ID acting as the page cursor,
             e.g. ``"conv_abc123"``.
-        :param sort_col: Primary sort expression from :meth:`_resolve_sort_column`.
+        :param sort_col: Primary sort expression from :meth:`_resolve_sort_columns`.
         :param is_desc: ``True`` for descending, ``False`` for ascending.
         :param tiebreaker_col: Secondary sort column; must match the
-            secondary ORDER BY column. See ``_tiebreaker_col`` in
-            ``__init__`` for the SQLite/non-SQLite choice.
+            secondary ORDER BY column. See :meth:`_resolve_sort_columns`.
         :param forward: ``True`` for ``after`` cursors, ``False`` for
             ``before`` cursors.
         :returns: The statement with the cursor WHERE clause applied.

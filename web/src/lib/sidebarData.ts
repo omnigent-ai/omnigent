@@ -72,15 +72,22 @@ export function dedupeSessionRows(rows: Conversation[]): Conversation[] {
 }
 
 /**
- * The server's ``sort_by=title`` key: case-insensitive, untitled last, compared
- * by code point so merged pages agree with the server's page boundaries.
+ * The server's ``sort_by=title`` key: ASCII case folded, untitled last. The
+ * server folds only ASCII on every database, so this must not use toLowerCase.
  */
 export function titleSortKey(title: string | null | undefined): string {
-  return title ? `0${title.toLowerCase()}` : "1";
+  return title ? `0${title.replace(/[A-Z]/g, (letter) => letter.toLowerCase())}` : "1";
 }
 
-function compareCodePoints(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+/** Orders like the server's binary collations: by code point, not UTF-16 unit. */
+export function compareCodePoints(a: string, b: string): number {
+  const length = Math.min(a.length, b.length);
+  for (let index = 0; index < length; index++) {
+    if (a.charCodeAt(index) !== b.charCodeAt(index)) {
+      return (a.codePointAt(index) ?? 0) - (b.codePointAt(index) ?? 0);
+    }
+  }
+  return a.length - b.length;
 }
 
 export function compareSessionRows(
@@ -90,7 +97,8 @@ export function compareSessionRows(
 ): number {
   if (sortBy === "title") {
     return (
-      compareCodePoints(titleSortKey(a.title), titleSortKey(b.title)) || a.id.localeCompare(b.id)
+      compareCodePoints(titleSortKey(a.title), titleSortKey(b.title)) ||
+      compareCodePoints(a.id, b.id)
     );
   }
   return b[sortBy] - a[sortBy] || b.id.localeCompare(a.id);

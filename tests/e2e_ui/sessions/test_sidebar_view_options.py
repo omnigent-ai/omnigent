@@ -7,6 +7,7 @@ grouping is deterministic; everything else comes from the live server.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -417,23 +418,35 @@ def _seed_session(base_url: str, title: str, project: str | None) -> str:
     return session_id
 
 
+_UNFILED_TITLES = ["!mango plan", "!Zebra notes", "!lemon tasks"]
+_UNFILED_A_TO_Z = ["!lemon tasks", "!mango plan", "!Zebra notes"]
+
+
 @pytest.fixture
 def named_sessions(request: pytest.FixtureRequest) -> Iterator[_NamedSessions]:
     """Seed live sessions with mixed-case titles in a folder and unfiled, newest last."""
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
     project = f"Sorting {uuid.uuid4().hex[:4]}"
-    # Created in this order, so Updated lists each group roughly reversed.
-    folder = {
-        title: _seed_session(base_url, title, project)
-        for title in ["date list", "Banana bread", "", "kiwi trip", "apple pie", "Cherry jam"]
-    }
-    unfiled = {
-        title: _seed_session(base_url, title, None)
-        for title in ["mango plan", "Zebra notes", "lemon tasks"]
-    }
-    yield _NamedSessions(base_url, project, folder, unfiled)
-    for session_id in [*folder.values(), *unfiled.values()]:
-        httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    folder: dict[str, str] = {}
+    unfiled: dict[str, str] = {}
+    try:
+        # Created in this order, so Updated lists each group roughly reversed.
+        for title in ["date list", "Banana bread", "", "kiwi trip", "apple pie", "Cherry jam"]:
+            folder[title] = _seed_session(base_url, title, project)
+        # Unfiled rows share the server with other tests; "!" keeps them on
+        # the first A to Z page while "Z" vs "l" still checks case folding.
+        for title in _UNFILED_TITLES:
+            unfiled[title] = _seed_session(base_url, title, None)
+        yield _NamedSessions(base_url, project, folder, unfiled)
+    finally:
+        for session_id in [*folder.values(), *unfiled.values()]:
+            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+
+
+def _pause_for_recording(page: Page, milliseconds: int) -> None:
+    """Hold a step on screen long enough to read, only while recording a demo."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(milliseconds)
 
 
 def _listed_ids(page: Page, ids: dict[str, str]) -> list[str]:
@@ -478,10 +491,10 @@ def test_name_ordering_lists_live_sessions_a_to_z_and_persists(
     folder_header.click()
     expect(page.get_by_test_id("project-show-more")).to_be_visible()
     poll_until(lambda: len(_listed_ids(page, named_sessions.unfiled)) == 3, timeout_s=15)
-    page.wait_for_timeout(1_000)
+    _pause_for_recording(page, 1_000)
 
     _open_view_submenu(page, "session-ordering-menu")
-    page.wait_for_timeout(700)
+    _pause_for_recording(page, 700)
     page.get_by_role("menuitemradio", name="Name (A to Z)", exact=True).click()
     page.keyboard.press("Escape")
     _wait_for_order(
@@ -489,13 +502,13 @@ def test_name_ordering_lists_live_sessions_a_to_z_and_persists(
         named_sessions.folder,
         ["apple pie", "Banana bread", "Cherry jam", "date list", "kiwi trip"],
     )
-    _wait_for_order(page, named_sessions.unfiled, ["lemon tasks", "mango plan", "Zebra notes"])
+    _wait_for_order(page, named_sessions.unfiled, _UNFILED_A_TO_Z)
     assert any(
         parse_qs(urlparse(url).query).get("sort_by") == ["title"]
         and parse_qs(urlparse(url).query).get("order") == ["asc"]
         for url in requests
     )
-    page.wait_for_timeout(1_500)
+    _pause_for_recording(page, 1_500)
     page.get_by_test_id("project-show-more").click()
     _wait_for_order(
         page,
@@ -504,11 +517,11 @@ def test_name_ordering_lists_live_sessions_a_to_z_and_persists(
     )
     untitled = page.locator(f'aside a[href="/c/{named_sessions.folder[""]}"]')
     expect(untitled).to_have_text("New session")
-    page.wait_for_timeout(1_500)
+    _pause_for_recording(page, 1_500)
 
     page.reload()
     expect(folder_header).to_be_visible(timeout=30_000)
-    _wait_for_order(page, named_sessions.unfiled, ["lemon tasks", "mango plan", "Zebra notes"])
+    _wait_for_order(page, named_sessions.unfiled, _UNFILED_A_TO_Z)
     _wait_for_order(
         page,
         named_sessions.folder,
@@ -516,4 +529,4 @@ def test_name_ordering_lists_live_sessions_a_to_z_and_persists(
     )
     _open_view_submenu(page, "session-ordering-menu")
     expect(page.get_by_role("menuitemradio", name="Name (A to Z)", exact=True)).to_be_checked()
-    page.wait_for_timeout(2_000)
+    _pause_for_recording(page, 2_000)

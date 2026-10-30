@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import {
+  compareSessionRows,
   dedupeSessionRows,
   mergeScopeRows,
   refreshScopeWindow,
@@ -178,5 +179,30 @@ it("orders by name like the server: folded case, code points, untitled last", ()
     "bravo",
     "charlie",
     "untitled",
+  ]);
+});
+
+it("orders names like every server dialect: ASCII-only folding, code points, id ties", () => {
+  const titled = (id: string, title: string) => ({ ...row(id, 0), title });
+  const rows = [
+    titled("b2", "\u{1F600} smile"),
+    titled("b1", "\uFF21 wide"),
+    titled("a8", "\u00E9clair"),
+    titled("a9", "\u00C9clair"),
+    titled("a7", "zeta"),
+    titled("a6", "Zeta"),
+    titled("c1", ""),
+    titled("a1", ""),
+  ];
+  // Accented capitals stay unfolded, and the emoji sorts after U+FF21 by code point.
+  expect(rows.sort((x, y) => compareSessionRows(x, y, "title")).map((r) => r.id)).toEqual([
+    "a6",
+    "a7",
+    "a9",
+    "a8",
+    "b1",
+    "b2",
+    "a1",
+    "c1",
   ]);
 });

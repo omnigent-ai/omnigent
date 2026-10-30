@@ -14218,7 +14218,7 @@
             }
           },
           {
-            "description": "Sort key, `\"created_at\"`, `\"updated_at\"`, or `\"title\"`. `\"title\"` is case-insensitive and lists untitled sessions last with `order=asc` (A to Z).",
+            "description": "Sort key, `\"created_at\"`, `\"updated_at\"`, or `\"title\"`. `\"title\"` ignores ASCII letter case and lists untitled sessions last with `order=asc` (A to Z).",
             "in": "query",
             "name": "sort_by",
             "required": false,
