@@ -10,6 +10,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useContext } from "react";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -69,6 +70,7 @@ vi.mock("./PullRequestPanel", () => ({
 }));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
+  revealFolderInFilesPanel: vi.fn(),
 }));
 vi.mock("./FileViewer", () => ({
   FileViewer: () => <div data-testid="file-viewer" />,
@@ -77,14 +79,21 @@ vi.mock("./InlineTerminalsSection", () => ({
   InlineTerminalsSection: () => <div data-testid="inline-terminals-section" />,
 }));
 vi.mock("./FilesPanelDrawer", () => ({
-  FilesPanelDrawer: () => <div data-testid="files-panel-drawer" />,
+  FilesPanelDrawer: ({ open, flatView }: { open: boolean; flatView: boolean }) => (
+    <div
+      data-testid="files-panel-drawer"
+      data-state={open ? "open" : "closed"}
+      data-flat-view={String(flatView)}
+    />
+  ),
 }));
 vi.mock("./TerminalsPanel", () => ({
   TerminalsPanel: () => <div data-testid="terminals-panel" />,
 }));
 
 import { AppShell } from "./AppShell";
-import { useOpenGithubTab } from "./FileViewerContext";
+import { FileViewerContext, useFolderOpener, useOpenGithubTab } from "./FileViewerContext";
+import { revealFolderInFilesPanel } from "./FilesPanel";
 import { isMobileViewport } from "./Sidebar";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
@@ -132,12 +141,22 @@ beforeEach(() => {
   } as never);
 });
 
-function GithubLinkProbe() {
+const LINKED_FOLDER = "/home/u/ws/experimental/data";
+
+function ChatLinkProbe() {
   const openGithubTab = useOpenGithubTab();
+  const openFolder = useFolderOpener();
+  const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   return (
     <>
+      <button type="button" onClick={() => registerNavigationGuard?.(() => {})}>
+        Hold navigation
+      </button>
       <button type="button" onClick={() => openGithubTab?.()}>
         Open PR
+      </button>
+      <button type="button" onClick={() => openFolder?.(LINKED_FOLDER)}>
+        Open folder
       </button>
       <Link to="/c/conv_other">Another session</Link>
     </>
@@ -153,7 +172,7 @@ function renderShell() {
           <MemoryRouter initialEntries={["/c/conv_ws"]}>
             <Routes>
               <Route element={<AppShell />}>
-                <Route path="c/:conversationId" element={<GithubLinkProbe />} />
+                <Route path="c/:conversationId" element={<ChatLinkProbe />} />
               </Route>
             </Routes>
           </MemoryRouter>
@@ -274,5 +293,57 @@ describe("opening Pull Requests from the composer", () => {
     fireEvent.click(screen.getByRole("link", { name: "Another session" }));
 
     expect(screen.getByTestId("github-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+});
+
+describe("opening a folder from a chat link", () => {
+  beforeEach(() => {
+    vi.mocked(revealFolderInFilesPanel).mockClear();
+    writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "github" });
+  });
+
+  it("opens the desktop rail on the Files tab browsing that folder", () => {
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
+
+    expect(revealFolderInFilesPanel).toHaveBeenCalledWith("conv_ws", LINKED_FOLDER);
+    const workspace = screen.getByRole("complementary", { name: "Workspace" });
+    expect(within(workspace).getByRole("tab", { name: /^Files$/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(workspace).getByTestId("files-panel")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+      open: true,
+      rightRailTab: "files",
+    });
+    expect(screen.getByTestId("files-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+
+  it("leaves the rail alone while an unsaved-edit guard holds navigation", () => {
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Hold navigation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
+
+    expect(revealFolderInFilesPanel).not.toHaveBeenCalled();
+    expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+      open: false,
+      rightRailTab: "github",
+    });
+  });
+
+  it("opens the mobile Files drawer in tree view without opening the hidden rail", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
+
+    expect(revealFolderInFilesPanel).toHaveBeenCalledWith("conv_ws", LINKED_FOLDER);
+    const drawer = screen.getByTestId("files-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(drawer).toHaveAttribute("data-flat-view", "false");
+    expect(readSessionWorkspaceState("conv_ws").open).toBe(false);
   });
 });
