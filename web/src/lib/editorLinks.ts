@@ -19,16 +19,18 @@ interface EditorHost {
   sandbox_provider?: string | null;
 }
 
+const ARCA_HOST_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*'s arca$/;
 const ARCLET_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ARCLET_RESERVED_PREFIX_PATTERN = /^arclet[_-]/i;
 
 /** Infer only the standard SSH aliases provisioned for Databricks hosts. */
 export function inferHostSshTarget(host: EditorHost | null | undefined): string | null {
   if (host?.sandbox_provider === "databricks-arca") return "arca.ssh";
+  if (typeof host?.name !== "string" || host.name !== host.name.trim()) return null;
+  // Isaac names user-connected Arcas "<user>'s arca" without a sandbox provider.
+  if (host.sandbox_provider == null && ARCA_HOST_NAME_PATTERN.test(host.name)) return "arca.ssh";
   if (
-    host?.sandbox_provider !== "arclet" ||
-    typeof host.name !== "string" ||
-    host.name !== host.name.trim() ||
+    host.sandbox_provider !== "arclet" ||
     !ARCLET_NAME_PATTERN.test(host.name) ||
     ARCLET_RESERVED_PREFIX_PATTERN.test(host.name)
   )

@@ -116,6 +116,8 @@ it.each([
   ["browser", "arclet", "conversant-crane", "arclet_conversant-crane.ssh"],
   ["desktop", "databricks-arca", "my-arca", "arca.ssh"],
   ["browser", "databricks-arca", "my-arca", "arca.ssh"],
+  ["desktop", null, "alex.dev's arca", "arca.ssh"],
+  ["browser", null, "alex.dev's arca", "arca.ssh"],
 ] as const)(
   "opens remote folders/files from %s for %s",
   async (platform, provider, name, sshTarget) => {

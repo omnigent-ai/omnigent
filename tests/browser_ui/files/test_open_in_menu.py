@@ -24,6 +24,7 @@ seeded_session = seeded_session_fixture
         (360, "local", "laptop", None, None, True, True),
         (950, "local", "laptop", None, None, True, True),
         (950, "arca", "my-arca", "databricks-arca", "arca.ssh", True, True),
+        (950, "personal-arca", "alex.dev's arca", None, "arca.ssh", False, True),
         (
             360,
             "arclet",

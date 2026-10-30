@@ -42,6 +42,8 @@ it("keeps remote folder links distinct from file links", () => {
 
 it.each([
   [{ name: "my-arca", sandbox_provider: "databricks-arca" }, "arca.ssh"],
+  [{ name: "alex.dev's arca", sandbox_provider: null }, "arca.ssh"],
+  [{ name: "alex-dev_2's arca" }, "arca.ssh"],
   [{ name: "conversant-crane", sandbox_provider: "arclet" }, "arclet_conversant-crane.ssh"],
   [
     { name: "omnigent-arclet-session", sandbox_provider: "arclet" },
@@ -56,6 +58,15 @@ it.each([
   undefined,
   null,
   { name: "remote", sandbox_provider: null },
+  { name: "alex.dev's laptop", sandbox_provider: null },
+  { name: "'s arca", sandbox_provider: null },
+  { name: " alex.dev's arca", sandbox_provider: null },
+  { name: "alex.dev's arca\n", sandbox_provider: null },
+  { name: "alex.dev's arca backup", sandbox_provider: null },
+  { name: "alex/dev's arca", sandbox_provider: null },
+  { name: "alex.dev's arca", sandbox_provider: "" },
+  { name: "alex.dev's arca", sandbox_provider: "arclet" },
+  { name: "alex.dev's arca", sandbox_provider: "databricks-lakebox" },
   { name: "lakebox", sandbox_provider: "databricks-lakebox" },
   { name: "", sandbox_provider: "arclet" },
   { name: "bad name", sandbox_provider: "arclet" },

@@ -16,6 +16,11 @@ The UI infers standard SSH aliases from the existing host list: provider
 1–64 ASCII letters, digits, underscores, or hyphens; a letter or digit first;
 and no `arclet_` or `arclet-` prefix. The alias must exist in your local SSH
 configuration; Arca Companion creates these aliases for Arclets.
+User-connected hosts with no sandbox provider also use `arca.ssh` when their
+name matches Isaac's standard `<username>'s arca` format, such as
+`alex.dev's arca`. The username must start with an ASCII letter or digit and
+contain only ASCII letters, digits, dots, underscores, or hyphens. Explicit
+sandbox providers take precedence over this naming fallback.
 Remote links currently support POSIX paths, including Arca and Arclet workspaces.
 
 Other remote providers, custom aliases, missing host rows, and invalid Arclet
