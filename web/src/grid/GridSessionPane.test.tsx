@@ -1,5 +1,6 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import type * as FilesPanelModule from "@/shell/FilesPanel";
 import { type ComponentProps, useContext, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
@@ -13,6 +14,7 @@ import { splitGrid } from "./gridLayout";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { retrySession } from "@/lib/sessionsApi";
+import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 
 const fixture = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
@@ -20,6 +22,7 @@ const fixture = vi.hoisted(() => ({
   terminals: [] as TerminalsModule.TerminalInfo[],
   terminalPending: false,
   composerDisabled: false,
+  hostOnline: undefined as boolean | undefined,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -32,6 +35,10 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+vi.mock("@/shell/FilesPanel", async (original) => ({
+  ...(await original<typeof FilesPanelModule>()),
+  revealFolderInFilesPanel: vi.fn(),
+}));
 vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
 
 vi.mock("@/hooks/useSession", () => ({
@@ -52,6 +59,7 @@ vi.mock("@/hooks/useConversationEntryState", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => {},
   useSessionRunnerOnline: () => true,
+  useSessionHostOnline: () => fixture.hostOnline,
 }));
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
 vi.mock("@/hooks/useSessionLiveness", () => ({
@@ -91,6 +99,9 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
           Block navigation
         </button>
+        <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
+          Open folder
+        </button>
       </>
     );
   },
@@ -106,6 +117,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-maximized={String(props.maximized)}
         data-width={props.width}
         data-terminal={props.selectedTerminalKey ?? ""}
+        data-tab={props.rightRailTab ?? ""}
         data-end-line={props.filePosition?.endLine}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
@@ -140,6 +152,7 @@ afterEach(() => {
   fixture.terminals = [];
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
+  fixture.hostOnline = undefined;
   vi.restoreAllMocks();
 });
 
@@ -163,6 +176,34 @@ it("opens agent-requested files only in the active workspace and respects naviga
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
+});
+
+it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {
+  writeSessionWorkspaceState("first", { rightRailTab: "subagents" });
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "folder-link", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Block navigation"));
+  fireEvent.click(first.getByText("Open folder"));
+  expect(revealFolderInFilesPanel).not.toHaveBeenCalledWith("first", expect.anything());
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-tab", "subagents");
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("aria-hidden", "true");
+
+  fireEvent.click(within(screen.getByRole("region", { name: "second" })).getByText("Open folder"));
+
+  expect(revealFolderInFilesPanel).toHaveBeenCalledWith("second", "/workspace/experimental");
+  const workspace = screen.getByRole("complementary", { name: "Workspace" });
+  expect(workspace).toHaveAttribute("data-testid", "workspace-second");
+  expect(workspace).toHaveAttribute("data-tab", "files");
+  expect(workspace).toHaveTextContent("No file");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {
@@ -305,6 +346,31 @@ it("uses the terminal default and changes startup into a scoped resume action", 
   rendered.rerender(tree());
   fireEvent.click(within(first).getByRole("button", { name: "Resume session" }));
   await waitFor(() => expect(retrySession).toHaveBeenCalledWith("first"));
+});
+
+it("keeps failed automatic recovery across grid view switches", async () => {
+  fixture.labels = { "omnigent.ui": "terminal" };
+  fixture.hostOnline = true;
+  vi.mocked(retrySession).mockClear().mockRejectedValueOnce(new Error("Recovery unavailable"));
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "recovery", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = screen.getByRole("region", { name: "first (active)" });
+  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  const failure = await within(first).findByRole("alert");
+  expect(failure).toHaveTextContent("Couldn't reconnect the terminal automatically.");
+  fireEvent.click(within(first).getByRole("button", { name: "Chat view" }));
+  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  await act(async () => {});
+  expect(within(first).getByRole("alert")).toBe(failure);
+  expect(within(first).getByRole("button", { name: "Resume session" })).toBeEnabled();
+  expect(retrySession).toHaveBeenCalledTimes(1);
 });
 
 it("shares one workspace, preserves per-session files and drafts, and persists grid width", () => {

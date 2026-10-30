@@ -68,6 +68,7 @@ import {
   ChevronsUpDownIcon,
   GitBranchIcon,
   LockIcon,
+  FileTextIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
@@ -203,6 +204,7 @@ import {
   writeLastHarness,
 } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
+import { useHiddenPickerAgents } from "@/hooks/useHiddenPickerAgents";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
@@ -244,8 +246,8 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
-  isAcpHarnessAgent,
   partitionAgentsByKind,
+  partitionPickerEntries,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
@@ -276,6 +278,7 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
+import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   previewIsUnsupported,
@@ -1766,9 +1769,17 @@ export function AgentHarnessPicker({
   // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
   // nothing is hidden in those cases, and unrecognized harnesses stay visible.
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
+  // Per-entry hides from Settings › Appearance; the selected entry is never
+  // hidden, so a stored pick can't vanish from its own picker.
+  const hiddenAgents = useHiddenPickerAgents();
+  const isHiddenEntry = useCallback(
+    (agent: AvailableAgent) => agent.id !== effectiveAgentId && hiddenAgents.has(agent.name),
+    [hiddenAgents, effectiveAgentId],
+  );
+  const { readyHarnessEntries, moreHarnessEntries, hidOfferedHarness } = useMemo(() => {
     const ready: AvailableAgent[] = [];
     let more: AvailableAgent[] = [];
+    let hidOffered = false;
     // Recorded during the split so the backfill below asks the same question
     // rather than restating it inverted.
     const unavailableIds = new Set<string>();
@@ -1777,6 +1788,11 @@ export function AgentHarnessPicker({
       const readiness = harnessReadinessOnHost(agent.harness, host);
       const unavailable = !readiness.selectable && readiness.fallbackRelevant;
       if (!selected && hideUnconfigured && unavailable) continue;
+      // Readiness runs first, so this records only hides that removed an offered row.
+      if (isHiddenEntry(agent)) {
+        hidOffered = true;
+        continue;
+      }
       if (unavailable) unavailableIds.add(agent.id);
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
       const primary = PRIMARY_HARNESS_ORDER.includes(key) || agent.id === promotedHarnessId;
@@ -1808,8 +1824,8 @@ export function AgentHarnessPicker({
         more = more.filter((agent) => !promotedIds.has(agent.id));
       }
     }
-    return { readyHarnessEntries: ready, moreHarnessEntries: more };
-  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
+    return { readyHarnessEntries: ready, moreHarnessEntries: more, hidOfferedHarness: hidOffered };
+  }, [harnessEntries, host, hideUnconfigured, isHiddenEntry, effectiveAgentId, promotedHarnessId]);
   // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
   const prefetchedOpenNonce = useRef(0);
   useEffect(() => {
@@ -1827,8 +1843,8 @@ export function AgentHarnessPicker({
   // in the main list; user-registered custom agents fold into an "Other..."
   // submenu so a long roster doesn't crowd out the recommended picks.
   const { builtins: bundleEntries, customs: customEntries } = useMemo(
-    () => partitionAgentsByKind(agentEntries),
-    [agentEntries],
+    () => partitionAgentsByKind(agentEntries.filter((agent) => !isHiddenEntry(agent))),
+    [agentEntries, isHiddenEntry],
   );
 
   // Existing custom / pending agents fold into an "Other..." submenu so a
@@ -1880,6 +1896,16 @@ export function AgentHarnessPicker({
       )}
     </>
   );
+  // Nothing is left to pick and the per-entry hides removed at least one row,
+  // so point at Settings ("Create custom agent" may still render).
+  const allEntriesHidden =
+    (hidOfferedHarness || agentEntries.some(isHiddenEntry)) &&
+    !autoHarnessAvailable &&
+    readyHarnessEntries.length === 0 &&
+    moreHarnessEntries.length === 0 &&
+    bundleEntries.length === 0 &&
+    customEntries.length === 0 &&
+    pendingAgent == null;
   const showMore = isMobile && menuPage === "more" && moreHarnessEntries.length > 0;
   const showCustom = isMobile && menuPage === "custom" && hasCustomGroup;
   const showConfig = isMobile && menuPage === "config" && selectedConfigContent != null;
@@ -2032,6 +2058,20 @@ export function AgentHarnessPicker({
           <DropdownMenuSeparator />
           {customAgentsBody}
         </div>
+      ) : allEntriesHidden ? (
+        <>
+          <div
+            data-testid="new-chat-landing-all-hidden"
+            role="status"
+            className="px-2 py-3 text-ui whitespace-normal text-muted-foreground"
+          >
+            Every entry is hidden.
+            <div className="text-xs leading-4">
+              Turn some back on in Settings, under Appearance.
+            </div>
+          </div>
+          {createAgentItem}
+        </>
       ) : (
         <>
           {/* Smart Routing sits in its own unlabeled group above the
@@ -2196,6 +2236,7 @@ interface LandingDraft {
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
+  codexPlanMode: boolean;
   cursorExecMode: string;
   agySkipMode: string;
   devinPermissionMode: string;
@@ -2383,12 +2424,8 @@ export function NewChatLandingScreen() {
   // under "Agents". ACP agents aren't native, so they fold into "More". The
   // user's own agents stay under "Agents" even on a native harness, so one never
   // passes for a harness row (or for the Claude Code wrapper Smart Routing binds).
-  const harnessEntries = useMemo(
-    () => agentList.filter((a) => !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a))),
-    [agentList],
-  );
-  const agentEntries = useMemo(
-    () => agentList.filter((a) => a.mine || (!isNativeCodingAgent(a) && !isAcpHarnessAgent(a))),
+  const { harnesses: harnessEntries, agents: agentEntries } = useMemo(
+    () => partitionPickerEntries(agentList),
     [agentList],
   );
 
@@ -2731,6 +2768,11 @@ export function NewChatLandingScreen() {
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => restoredDraft?.bypassSandbox ?? false,
   );
+  // Codex Plan mode armed before the first prompt; sent as the session's
+  // collaboration-mode label, which the in-session Plan toggle also drives.
+  const [codexPlanMode, setCodexPlanMode] = useState<boolean>(
+    () => restoredDraft?.codexPlanMode ?? false,
+  );
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(
@@ -2858,6 +2900,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    codexPlanMode,
     cursorExecMode,
     agySkipMode,
     devinPermissionMode,
@@ -4289,6 +4332,18 @@ export function NewChatLandingScreen() {
             : supportsDevinPermission
               ? DEVIN_NATIVE_PERMISSION_MODES
               : [];
+  // Unsaved custom agents launch through the host runners route, which cannot
+  // refuse a host too old to start Codex in Plan mode.
+  const codexPlanLaunchEnabled = isFeatureEnabled(info, "codex_plan_at_launch");
+  const codexPlanModeSelectable =
+    codexPlanLaunchEnabled &&
+    !smartRoutingHarnessSelected &&
+    selectedNativeHarness === "codex-native" &&
+    effectiveAgentId !== PENDING_AGENT_ID;
+  const toggleCodexPlanMode = codexPlanModeSelectable
+    ? () => setCodexPlanMode((armed) => !armed)
+    : undefined;
+  const codexPlanToggleLabel = codexPlanMode ? "Exit Plan mode" : "Enter Plan mode";
   const selectDirectMode = (mode: string) => {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
@@ -4327,6 +4382,7 @@ export function NewChatLandingScreen() {
     userPickedModelRef.current = false;
     userPickedEffortRef.current = false;
     setBypassSandbox(false);
+    setCodexPlanMode(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
   // A project-configured default model (Project settings) outranks the user's
@@ -5860,10 +5916,15 @@ export function NewChatLandingScreen() {
       // when the toggle is armed for a codex-native agent) so the runner
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
       // survives reload.
-      const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
-          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-          : nativeLabels;
+      const baseLabels = {
+        ...(nativeLabels ?? {}),
+        ...(agentSupportsApprovalMode && bypassSandbox
+          ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : {}),
+        ...(codexPlanModeSelectable && codexPlanMode
+          ? { [CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY]: "plan" }
+          : {}),
+      };
       // First-class project filing: a project-driven visit whose `?project=`
       // name resolved to a real project id sends `project_id` so the server
       // files the session atomically at create (born filed, no follow-up
@@ -7129,11 +7190,22 @@ export function NewChatLandingScreen() {
                         onPlan={
                           directModeOptions.some((mode) => mode.value === "plan")
                             ? () => selectDirectMode("plan")
-                            : undefined
+                            : toggleCodexPlanMode
                         }
                         planActive={
                           (supportsPermissionMode && permissionMode === "plan") ||
-                          (supportsCursorMode && cursorExecMode === "plan")
+                          (supportsCursorMode && cursorExecMode === "plan") ||
+                          (codexPlanModeSelectable && codexPlanMode)
+                        }
+                        planLabel={codexPlanModeSelectable ? codexPlanToggleLabel : undefined}
+                        planUnavailableReason={
+                          selectedNativeHarness === "codex-native"
+                            ? !codexPlanLaunchEnabled
+                              ? "This server does not support starting Codex in Plan mode"
+                              : effectiveAgentId === PENDING_AGENT_ID
+                                ? "Turn Plan mode on after this custom agent's session starts"
+                                : undefined
+                            : undefined
                         }
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
@@ -7423,6 +7495,15 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                       />
                     ) : null}
+                    {codexPlanModeSelectable && codexPlanMode && (
+                      <span
+                        data-testid="new-chat-landing-plan-mode"
+                        className="inline-flex shrink-0 items-center gap-1 px-1 text-sm font-medium text-foreground"
+                      >
+                        <FileTextIcon className="ui-icon" />
+                        <span>Plan mode</span>
+                      </span>
+                    )}
 
                     {/* The session's project membership (from a `?project=` landing)
                 is shown in the hero heading instead of a tray chip; filing on
