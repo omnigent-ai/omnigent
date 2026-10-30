@@ -16,6 +16,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import set_fallback_mock_llm
 from tests.e2e_ui.messages.test_message_render_parity import (
     _ASSISTANT,
@@ -122,7 +123,7 @@ def test_native_clear_keeps_project_and_title(
         expect(_section(page, project_name).locator(f'a[href="/c/{session_id}"]')).to_be_visible(
             timeout=15_000
         )
-        page.wait_for_timeout(1_500)
+        poll_until(lambda: _session(base_url, session_id).get("title") == title, timeout_s=15.0)
 
         composer = page.get_by_label("Message the agent")
         composer.click()
