@@ -3713,6 +3713,33 @@ def _undelivered_native_input_items(
     ]
 
 
+def _native_input_discarded_by_stop_notice(display_name: str, *, stop_landed: bool) -> ErrorData:
+    """
+    Build the notice saved after a web message a Stop session discarded.
+
+    :param display_name: Harness name shown to the person, e.g. ``"Claude"``.
+    :param stop_landed: ``False`` when the runner reported the stop failed,
+        so the notice does not claim the session was stopped.
+    :returns: An info-level ``native_input_discarded_by_stop`` notice.
+    """
+    if stop_landed:
+        title = "Message not sent because the session was stopped"
+        explanation = f"The session was stopped while this message was waiting for {display_name}"
+    else:
+        title = "Message discarded by Stop session"
+        explanation = (
+            f"Stop session discarded this message while it was waiting for {display_name}, "
+            "although the session could not be stopped"
+        )
+    return ErrorData(
+        source="execution",
+        code="native_input_discarded_by_stop",
+        level="info",
+        title=title,
+        message=f"{explanation}, so it was never delivered. Send it again if you still need it.",
+    )
+
+
 async def _settle_native_inputs_discarded_by_stop(
     conversation_store: ConversationStore,
     session_id: str,
@@ -3728,8 +3755,9 @@ async def _settle_native_inputs_discarded_by_stop(
     prompt or a running turn) when the session is stopped, even if stopping
     then fails. No transcript mirror will ever settle them, so a later mirror
     would otherwise skip them and blame the harness for never recording them.
-    A failed append returns the entries to the queue unsaved without changing
-    the stop's outcome; after a failed stop they may still be reported as never recorded.
+    A failed harness lookup or append returns the entries to the queue unsaved
+    without changing the stop's outcome; after a failed stop they may still be
+    reported as never recorded.
 
     :param conversation_store: Store to append the messages and notices to.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
@@ -3746,32 +3774,19 @@ async def _settle_native_inputs_discarded_by_stop(
     ]
     if not discarded:
         return
-    native_agent = _native_coding_agent_for_session(conv)
-    display_name = native_agent.display_name if native_agent is not None else "the agent"
-    if stop_landed:
-        title = "Message not sent because the session was stopped"
-        explanation = f"The session was stopped while this message was waiting for {display_name}"
-    else:
-        title = "Message discarded by Stop session"
-        explanation = (
-            f"Stop session discarded this message while it was waiting for {display_name}, "
-            "although the session could not be stopped"
-        )
-    notice = ErrorData(
-        source="execution",
-        code="native_input_discarded_by_stop",
-        level="info",
-        title=title,
-        message=f"{explanation}, so it was never delivered. Send it again if you still need it.",
-    )
-    items = [
-        item
-        for entry in discarded
-        for item in _undelivered_native_input_items(
-            session_id, entry, stable_id_prefix="omnigent-stopped-native", error=notice
-        )
-    ]
     try:
+        native_agent = await asyncio.to_thread(_native_coding_agent_for_session, conv)
+        notice = _native_input_discarded_by_stop_notice(
+            native_agent.display_name if native_agent is not None else "the agent",
+            stop_landed=stop_landed,
+        )
+        items = [
+            item
+            for entry in discarded
+            for item in _undelivered_native_input_items(
+                session_id, entry, stable_id_prefix="omnigent-stopped-native", error=notice
+            )
+        ]
         persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
     except Exception:  # noqa: BLE001 — an unsaved notice must not change the stop's outcome
         _logger.exception(

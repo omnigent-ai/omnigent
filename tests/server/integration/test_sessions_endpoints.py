@@ -11118,10 +11118,12 @@ def _queue_web_message(session_id: str, text: str) -> str:
     return pending_inputs.record(session_id, [{"type": "input_text", "text": text}])
 
 
-async def _press_stop(client: httpx.AsyncClient, session_id: str) -> None:
-    """POST an interrupt, as the web client's Stop button does."""
+async def _press_stop(
+    client: httpx.AsyncClient, session_id: str, event_type: str = "interrupt"
+) -> None:
+    """POST an interrupt, as the web client's Stop button does, or a ``stop_session``."""
     response = await client.post(
-        f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+        f"/v1/sessions/{session_id}/events", json={"type": event_type, "data": {}}
     )
     assert response.status_code == 202, response.text
 
@@ -11177,28 +11179,39 @@ def _consumed_pending_ids(published: list[tuple[str, dict[str, Any]]]) -> list[s
     ]
 
 
-@pytest.mark.parametrize("delivered", [True, False])
+@pytest.mark.parametrize(
+    ("event_type", "wrapper", "runner_status", "delivered"),
+    [
+        pytest.param("interrupt", "codex-native-ui", 202, True, id="interrupt"),
+        pytest.param("interrupt", "codex-native-ui", 503, False, id="interrupt-not-delivered"),
+        pytest.param("stop_session", "claude-code-native-ui", 204, True, id="stop-session"),
+    ],
+)
 async def test_interrupted_native_message_is_not_reported_undelivered_by_a_later_mirror(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    wrapper: str,
+    runner_status: int,
     delivered: bool,
 ) -> None:
     """
     A message cancelled with Stop before the agent recorded it is not an error later.
 
-    The person sends a message and presses Stop before Codex records it, then
-    sends another. Without the interrupt landing, the next mirror jumps over
+    The person sends a message and presses Stop before the agent records it,
+    then sends another. Without the interrupt landing, the next mirror jumps over
     the first entry and persists it with a ``native_prompt_not_recorded`` error
-    (the ``delivered=False`` control). With it landed, the first entry is
-    settled quietly and only the message the agent did record is persisted.
+    (the ``delivered=False`` control). With it landed, or with a Stop session
+    whose runner names no discarded messages, the first entry is settled quietly
+    and only the message the agent did record is persisted.
     """
     from omnigent.runtime import pending_inputs
 
     async with _codex_native_session(
-        client, monkeypatch, interrupt_status=202 if delivered else 503
+        client, monkeypatch, interrupt_status=runner_status, wrapper=wrapper
     ) as (session_id, published):
         cancelled = _queue_web_message(session_id, "cancel me")
-        await _press_stop(client, session_id)
+        await _press_stop(client, session_id, event_type)
         # The person's next message, sent after Stop, which the agent records.
         kept = _queue_web_message(session_id, "go on")
         await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
@@ -11218,26 +11231,6 @@ async def test_interrupted_native_message_is_not_reported_undelivered_by_a_later
             assert _consumed_pending_ids(published) == [cancelled, kept]
 
 
-async def test_message_held_when_the_session_is_stopped_is_not_reported_never_recorded(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A message held when Stop session ends Claude is not reported as never recorded."""
-    async with _codex_native_session(
-        client, monkeypatch, interrupt_status=204, wrapper="claude-code-native-ui"
-    ) as (session_id, _published):
-        _queue_web_message(session_id, "held message one")
-        response = await client.post(
-            f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}}
-        )
-        assert response.status_code < 300, response.text
-        _queue_web_message(session_id, "held message two")
-        await _mirror_user_message(client, session_id, "held message two", "claude:held-two:0")
-
-        _user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
-        assert "native_prompt_not_recorded" not in error_codes
-
-
 async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -11248,7 +11241,7 @@ async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
     The runner names what it dropped from behind Claude's open prompt: each
     message is saved with a neutral notice and its bubble is cleared. A queued
     message it does not name may have reached Claude and drains quietly, and
-    one sent after Stop is still delivered normally.
+    one sent while Stop is in progress stays queued and is delivered normally.
     """
     from omnigent.runtime import pending_inputs
 
@@ -11261,10 +11254,14 @@ async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
             _queue_web_message(session_id, "held message two"),
         ]
         _queue_web_message(session_id, "message that reached Claude")
-        stop_reply = {"discarded_pending_ids": [*held, "not-a-pending-id"]}
+        sent_during_stop: list[str] = []
+
+        def stop_runner(_request: httpx.Request) -> httpx.Response:
+            sent_during_stop.append(_queue_web_message(session_id, "sent during stop"))
+            return httpx.Response(200, json={"discarded_pending_ids": [*held, "not-a-pending-id"]})
+
         async with httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=stop_reply)),
-            base_url="http://runner",
+            transport=httpx.MockTransport(stop_runner), base_url="http://runner"
         ) as runner:
             _route_to_runner(monkeypatch, runner)
             response = await client.post(
@@ -11296,14 +11293,16 @@ async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
             item["id"] for item in items if item["type"] == "message" and item["role"] == "user"
         ]
         assert consumed == list(zip(user_item_ids, held, strict=True))
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == (
+            sent_during_stop
+        )
 
-        after_stop = _queue_web_message(session_id, "sent after stop")
-        await _mirror_user_message(client, session_id, "sent after stop", "claude:after-stop:0")
+        await _mirror_user_message(client, session_id, "sent during stop", "claude:during-stop:0")
 
         user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
-        assert user_texts == ["held message one", "held message two", "sent after stop"]
+        assert user_texts == ["held message one", "held message two", "sent during stop"]
         assert error_codes == ["native_input_discarded_by_stop"] * 2
-        assert _consumed_pending_ids(published) == [*held, after_stop]
+        assert _consumed_pending_ids(published) == [*held, *sent_during_stop]
         assert pending_inputs.pending_ids(session_id) == []
 
 
@@ -11343,16 +11342,27 @@ async def test_failed_stop_still_keeps_the_message_the_runner_discarded(
         ]
 
 
-async def test_unsaved_stop_notice_returns_the_discarded_message_to_the_queue() -> None:
-    """A failed append keeps the discarded message queued, still marked interrupted."""
+@pytest.mark.parametrize("failing_step", ["harness_lookup", "append"])
+async def test_unsaved_stop_notice_returns_the_discarded_messages_to_the_queue(
+    monkeypatch: pytest.MonkeyPatch, failing_step: str
+) -> None:
+    """A failed lookup or append keeps the discarded messages queued in order, unannounced."""
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
     from omnigent.runtime import pending_inputs
-    from omnigent.server.routes._sessions.orchestration import (
-        _settle_native_inputs_discarded_by_stop,
-    )
+    from omnigent.server.routes._sessions import orchestration
 
     class _UnavailableStore:
         def append(self, *_args: Any, **_kwargs: Any) -> None:
             raise OSError("database is locked")
+
+    def _pool_exhausted(_conv: Conversation) -> None:
+        raise PoolTimeoutError("QueuePool limit reached")
+
+    if failing_step == "harness_lookup":
+        monkeypatch.setattr(orchestration, "_native_coding_agent_for_session", _pool_exhausted)
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
 
     session_id = "conv_stop_notice_unsaved"
     conv = Conversation(
@@ -11364,17 +11374,22 @@ async def test_unsaved_stop_notice_returns_the_discarded_message_to_the_queue() 
     )
     pending_inputs.reset_for_tests()
     try:
-        held = _queue_web_message(session_id, "held message")
-        pending_inputs.mark_interrupted(session_id, [held])
-        await _settle_native_inputs_discarded_by_stop(
+        held = [
+            _queue_web_message(session_id, "held message one"),
+            _queue_web_message(session_id, "held message two"),
+        ]
+        still_queued = _queue_web_message(session_id, "still queued")
+        pending_inputs.mark_interrupted(session_id, held)
+        await orchestration._settle_native_inputs_discarded_by_stop(
             _UnavailableStore(),  # type: ignore[arg-type]
             session_id,
             conv,
-            [held],
+            held,
         )
-        assert pending_inputs.pending_ids(session_id) == [held]
-        restored = pending_inputs.resolve(session_id, held)
-        assert restored is not None and restored.interrupted
+        assert pending_inputs.pending_ids(session_id) == [*held, still_queued]
+        restored = [pending_inputs.resolve(session_id, pending_id) for pending_id in held]
+        assert [entry is not None and entry.interrupted for entry in restored] == [True, True]
+        assert published == []
     finally:
         pending_inputs.reset_for_tests()
 
