@@ -1646,7 +1646,9 @@ async def _send_to_in_flight_child(
     :param child_display_title: Display title for the fan-out registration.
     :param wrapper_label: Optional child ``omnigent.wrapper`` label.
     :param created_by: Human actor that sent the nudge, if known.
-    :returns: A JSON handle on success; a descriptive error string otherwise.
+    :returns: A JSON handle on success, with ``status`` ``"held"`` when the
+        server reports the child's terminal is holding the message behind an
+        open prompt; a descriptive error string otherwise.
     """
     from omnigent.runner import subagent_work as _subagent_work
 
@@ -1669,6 +1671,11 @@ async def _send_to_in_flight_child(
             f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
+    try:
+        msg_reply = msg_resp.json()
+    except ValueError:
+        msg_reply = None
+    held_for_prompt = isinstance(msg_reply, dict) and msg_reply.get("held_for_prompt") is True
 
     async with _subagent_work.in_flight_send_lock(child_session_id):
         entry = _subagent_work.get_subagent_work(child_session_id)
@@ -1717,6 +1724,24 @@ async def _send_to_in_flight_child(
                     stamp_error,
                 )
 
+    if held_for_prompt:
+        status = "held"
+        status_message = (
+            f"Held the message for sub-agent {agent!r} title {title!r}: its terminal is "
+            "waiting on a prompt or dialog (e.g. a permission approval), so the message "
+            "has not been delivered yet. It is delivered once that prompt is resolved; "
+            "resending queues another copy. sys_session_get_info lists it under "
+            "pending_inputs until then, and the turn's result still arrives via "
+            "sys_read_inbox."
+        )
+    else:
+        status = "running"
+        status_message = (
+            f"Steered the in-flight turn of sub-agent {agent!r} title {title!r}: the "
+            "message was injected into the running turn, which picks it up as it yields. "
+            "The turn's single result still arrives via sys_read_inbox — don't resend to "
+            "await it."
+        )
     return json.dumps(
         {
             "task_id": child_session_id,
@@ -1725,13 +1750,8 @@ async def _send_to_in_flight_child(
             "kind": "sub_agent",
             "agent": agent,
             "title": title,
-            "status": "running",
-            "message": (
-                f"Steered the in-flight turn of sub-agent {agent!r} title {title!r}: the "
-                "message was injected into the running turn, which picks it up as it yields. "
-                "The turn's single result still arrives via sys_read_inbox — don't resend to "
-                "await it."
-            ),
+            "status": status,
+            "message": status_message,
         }
     )
 
@@ -5268,8 +5288,9 @@ async def _session_get_info_via_rest(
     binding, runner binding, host and its reported harness readiness,
     reasoning effort, effective model,
     parent linkage, workspace / git branch, persisted last-activity time,
-    and the outstanding approval prompts (the prompts themselves plus a
-    count). Runner connectivity
+    the outstanding approval prompts (the prompts themselves plus a
+    count), and accepted messages the session has not consumed yet (their
+    text plus a count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound); host readiness is likewise
@@ -5308,6 +5329,15 @@ async def _session_get_info_via_rest(
     snap: _JsonObject = resp.json()
     pending_value = snap.get("pending_elicitations")
     pending = pending_value if isinstance(pending_value, list) else []
+    pending_inputs_value = snap.get("pending_inputs")
+    pending_inputs = [
+        {
+            "pending_id": entry.get("pending_id"),
+            "text": _truncate_activity(_text_from_api_content(entry.get("content"))),
+        }
+        for entry in (pending_inputs_value if isinstance(pending_inputs_value, list) else [])
+        if isinstance(entry, dict)
+    ]
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
     snap_host_id = _optional_string(snap.get("host_id"))
@@ -5353,6 +5383,10 @@ async def _session_get_info_via_rest(
             # waiting on.
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
+            # Messages accepted but not yet consumed, e.g. held by a native
+            # terminal until its open prompt is resolved.
+            "pending_inputs": pending_inputs,
+            "pending_input_count": len(pending_inputs),
         }
     )
 

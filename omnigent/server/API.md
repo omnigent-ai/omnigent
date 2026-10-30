@@ -1145,6 +1145,11 @@ dedupe; the first-party web client deliberately does NOT (it keeps a
 client temp id for React-key stability and relies on a stable key +
 FIFO matching), so adoption is optional, not required.
 
+The response adds `"held_for_prompt": true` when the runner held the message
+because the terminal is waiting on a prompt, such as a Claude permission
+approval. The message stays in `pending_inputs` and is delivered once the
+prompt is resolved. The field is omitted otherwise.
+
 A failed transcript append restores pending inputs with their prior delivery
 uncertainty, including entries that expired while persistence was in flight.
 A later mirror cannot report a possibly recorded input as definitely undelivered.

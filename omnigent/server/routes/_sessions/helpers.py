@@ -8331,10 +8331,13 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param held_for_prompt: Whether the native runner held the message
+        until a pending terminal prompt is resolved instead of delivering it.
     """
 
     item_id: str | None
     pending_id: str | None
+    held_for_prompt: bool = False
 
 
 def _extract_persistent_item_from_sse(

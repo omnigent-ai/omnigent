@@ -69,6 +69,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.harnesses.claude_native import PENDING_PROMPT_HOLD_REASON
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.input_diagnostics import input_attributes
@@ -6857,6 +6858,7 @@ def create_runner_app(
                             status_code=202,
                             content={
                                 "status": "buffered",
+                                "reason": PENDING_PROMPT_HOLD_REASON,
                                 "detail": "Message buffered until the pending prompt is resolved.",
                             },
                         )

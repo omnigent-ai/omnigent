@@ -3546,6 +3546,8 @@ def register_events_routes(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
+        if dispatch.held_for_prompt:
+            response["held_for_prompt"] = True
         return response
 
     if register_startup_dispatch is not None:

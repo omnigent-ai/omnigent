@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.claude_native import PENDING_PROMPT_HOLD_REASON
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
@@ -838,6 +839,55 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
     assert "private-invalid-id" not in json.dumps(attrs)
     lifecycle = [getattr(record, "event_name", None) for record in caplog.records]
     assert lifecycle.index("native_input_received") < lifecycle.index("native_input_enqueued")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_reply", "held_for_prompt"),
+    [
+        pytest.param(
+            {
+                "status": "buffered",
+                "reason": PENDING_PROMPT_HOLD_REASON,
+                "detail": "Message buffered until the pending prompt is resolved.",
+            },
+            True,
+            id="held-for-prompt",
+        ),
+        pytest.param(
+            {"status": "buffered", "detail": "Message buffered; active turn will process it."},
+            False,
+            id="active-turn",
+        ),
+        pytest.param({"status": "accepted", "detail": "Turn started."}, False, id="accepted"),
+    ],
+)
+async def test_claude_native_message_reports_runner_prompt_hold(
+    client: httpx.AsyncClient,
+    runner_reply: dict[str, str],
+    held_for_prompt: bool,
+) -> None:
+    """The message response says when the runner held the message behind an open prompt."""
+    events_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"
+    fake_runner = _FakeRunnerClient(payload={}, responses={events_path: (202, runner_reply)})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+
+    resp = await client.post(
+        events_path,
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "resume"}]},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["pending_id"].startswith("pending_")
+    if held_for_prompt:
+        assert body["held_for_prompt"] is True
+    else:
+        assert "held_for_prompt" not in body
 
 
 @pytest.mark.asyncio

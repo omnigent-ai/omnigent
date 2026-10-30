@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 
+from omnigent.harnesses.claude_native import PENDING_PROMPT_HOLD_REASON
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
@@ -116,6 +117,7 @@ async def test_question_buffers_messages_and_resumes_fifo(
         second = await client.post(f"/v1/sessions/{sid}/events", json=_message("second"))
         assert first.status_code == second.status_code == 202
         assert first.json()["status"] == second.json()["status"] == "buffered"
+        assert first.json()["reason"] == second.json()["reason"] == PENDING_PROMPT_HOLD_REASON
         assert app.state.claude_prompt_waiters[sid] is waiter
         assert sid not in app.state.active_turns
         assert app.state.has_active_work()
