@@ -1,8 +1,10 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import { SubagentPanelOpenerContext } from "@/shell/subagentPanelOpener";
 import { SubagentTaskIndicator } from "./SubagentTaskIndicator";
 
 const useChildSessionsMock = vi.fn();
@@ -43,6 +45,7 @@ beforeEach(() => setChildren([]));
 afterEach(() => {
   cleanup();
   useChildSessionsMock.mockReset();
+  localStorage.clear();
 });
 
 describe("SubagentTaskIndicator", () => {
@@ -153,5 +156,43 @@ describe("SubagentTaskIndicator", () => {
     expect(pill).toHaveAttribute("data-state", "parked");
     expect(pill).toHaveClass("text-warning");
     expect(pill).toHaveAccessibleName("1 sub-agent: 1 awaiting input");
+  });
+
+  describe("with sub-agents opening in the Workspace panel", () => {
+    function CurrentPath() {
+      return <output data-testid="current-path">{useLocation().pathname}</output>;
+    }
+
+    function renderWithOpener(opener: (id: string) => boolean) {
+      setChildren([child({ id: "working", busy: true, task_summary: "Investigate auth" })]);
+      render(
+        <MemoryRouter initialEntries={["/c/conv-1"]}>
+          <SubagentPanelOpenerContext.Provider value={opener}>
+            <SubagentTaskIndicator conversationId="conv-1" />
+          </SubagentPanelOpenerContext.Provider>
+          <CurrentPath />
+        </MemoryRouter>,
+      );
+      fireEvent.click(screen.getByTestId("subagent-task-pill"));
+      return screen.getByRole("link", { name: /Investigate auth/ });
+    }
+
+    it("opens a picked sub-agent beside the chat and closes the popover", () => {
+      writeOpenSubagentsInPanel(true);
+      const opener = vi.fn(() => true);
+      fireEvent.click(renderWithOpener(opener));
+
+      expect(opener).toHaveBeenCalledWith("working");
+      expect(screen.getByTestId("current-path")).toHaveTextContent("/c/conv-1");
+      expect(screen.queryByRole("link", { name: /Investigate auth/ })).toBeNull();
+    });
+
+    it("navigates as before when the setting is off", () => {
+      const opener = vi.fn(() => true);
+      fireEvent.click(renderWithOpener(opener));
+
+      expect(opener).not.toHaveBeenCalled();
+      expect(screen.getByTestId("current-path")).toHaveTextContent("/c/working");
+    });
   });
 });

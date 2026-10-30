@@ -115,6 +115,17 @@ async def _drive_claude_pane(
         return await asyncio.to_thread(function, *args, **kwargs)
 
 
+def _claude_waits_on_person(exc: BaseException) -> bool:
+    """Whether the switch was refused only because the pane awaits the person's answer."""
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeSignInPending,
+        ClaudeTerminalDialog,
+        ClaudeUserPromptPending,
+    )
+
+    return isinstance(exc, ClaudeSignInPending | ClaudeTerminalDialog | ClaudeUserPromptPending)
+
+
 def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
     """
     Return a model-switch next step when the terminal is waiting on the person, else ``None``.
@@ -791,30 +802,8 @@ def build_native_controls(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
-        from omnigent.harnesses.codex_native.bridge import (
-            DeveloperInstructionsReadState,
-            read_codex_config_developer_instructions_state_from_home,
-        )
-
-        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
-        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
-            _logger.warning(
-                "Codex-native plan-mode update skipped for %s: developer_instructions "
-                "config unreadable — refusing to guess and risk wiping live state.",
-                conv_id,
-                extra={"session_id": conv_id},
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "codex_native_settings_update_failed",
-                    "detail": (
-                        "Codex-native plan-mode update requires reading the current "
-                        "developer_instructions config; it could not be read."
-                    ),
-                },
-            )
-        developer_instructions = _di_read.value
+        # A non-null developer_instructions here replaces the mode's built-in
+        # prompt; the agent's instructions already ride the additive config key.
         return await _handle_codex_native_settings_update(
             conv_id,
             {
@@ -823,7 +812,7 @@ def build_native_controls(
                     "settings": {
                         "model": model,
                         "reasoning_effort": effort,
-                        "developer_instructions": developer_instructions,
+                        "developer_instructions": None,
                     },
                 },
             },
@@ -1037,14 +1026,17 @@ def build_native_controls(
             bridge_dir_for_session_id,
             enqueue_model_change,
         )
+        from omnigent.util.reasoning_effort import to_pi_thinking_level
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        effort = _session_reasoning_effort.get(conv_id)
         try:
             await asyncio.to_thread(
                 enqueue_model_change,
                 bridge_dir_for_session_id(conv_id),
                 model.strip(),
+                thinking_level=to_pi_thinking_level(effort) if effort else None,
             )
         except OSError as exc:
             _logger.warning(
@@ -1349,6 +1341,8 @@ def build_native_controls(
             resolve_bound_model,
         )
         from omnigent.models.claude_model_vocabulary import (
+            alias_pins,
+            canonical_claude_id,
             claude_model_command_arg,
             picker_command_values,
         )
@@ -1388,7 +1382,8 @@ def build_native_controls(
                     picker_values = stored_claude_picker_values(claude_config, stored_rows)
         model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         inference_config = load_runtime_inference_config()
-        if binding_for_harness(inference_config, "claude-native") is not None:
+        bound_model = binding_for_harness(inference_config, "claude-native") is not None
+        if bound_model:
             resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
             model_arg = resolved_model
         if model_arg is None:
@@ -1421,6 +1416,7 @@ def build_native_controls(
                 content={
                     "error": "claude_native_model_failed",
                     "detail": _claude_model_change_blocked_detail(exc) or safe_detail,
+                    **({"waiting_on_person": True} if _claude_waits_on_person(exc) else {}),
                 },
             )
 
@@ -1475,9 +1471,34 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
+        if not bound_model:
+            # A repeated alias pick keeps the same model; its launch pin proves
+            # the exact generation even when the options cache is cold.
+            long_context_requested = any(
+                value.lower().endswith("[1m]")
+                for value in (selected_model, resolved_model or "", model_arg)
+            )
+            pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
+            if pinned:
+                if long_context_requested and not pinned.lower().endswith("[1m]"):
+                    pinned += "[1m]"
+                expected.add(pinned)
+            if long_context_requested:
+                expected = {value for value in expected if value.lower().endswith("[1m]")}
+            expected.update(
+                canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
+            )
 
         def _switched(current: str | None) -> bool:
-            return bool(current and (current in expected or (baseline and current != baseline)))
+            comparable = current if bound_model or not current else canonical_claude_id(current)
+            return bool(
+                current
+                and (
+                    current in expected
+                    or comparable in expected
+                    or (baseline and current != baseline)
+                )
+            )
 
         try:
             # Accepted trade-off: ``/model <id>`` also saves the pick as the

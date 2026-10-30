@@ -35,7 +35,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 
 import {
   composeSandboxWorkspace,
@@ -62,6 +62,34 @@ import {
   useSandboxUnsupportedAgents,
   type SandboxModelOptions,
 } from "@/hooks/useSandboxModelOptions";
+import type { HarnessFixDialogProps } from "@/pages/settings/HarnessFixDialog";
+
+let fixDialogProps: HarnessFixDialogProps | null = null;
+vi.mock("@/pages/settings/HarnessFixDialog", () => ({
+  HarnessFixDialog: (props: HarnessFixDialogProps) => {
+    fixDialogProps = props;
+    return (
+      <div data-testid="new-chat-fix-dialog">
+        <button
+          type="button"
+          onClick={() => {
+            props.onFixed({
+              configuredHarnesses: { "codex-native": true },
+              harnessAccounts: { codex: { kind: "chatgpt", email: "demo@example.test" } },
+              gatewayInference: { codex: false },
+            });
+            props.onOpenChange(false);
+          }}
+        >
+          Finish harness setup
+        </button>
+        <button type="button" onClick={() => props.onOpenChange(false)}>
+          Cancel
+        </button>
+      </div>
+    );
+  },
+}));
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -153,6 +181,7 @@ describe("ComposerAddMenu", () => {
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitem", { name: /Work in a project/ }));
+    expect(screen.getByTestId("composer-add-menu")).toHaveClass("menu-surface");
     expect(screen.getByText("Choose a project")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "docs" }));
     expect(onProjectSelect).toHaveBeenCalledWith("docs");
@@ -1192,6 +1221,7 @@ function mockModelQueries(
 // directory-session / runner-health / filesystem stubs, and a persisted
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
+  fixDialogProps = null;
   authenticatedFetchMock.mockReset();
   getCurrentUserIdMock.mockReset();
   getCurrentUserIdMock.mockReturnValue(null);
@@ -1229,6 +1259,7 @@ function setupLandingMocks() {
           useAvailableAgentsMock().data?.find(
             (agent: AvailableAgent) => agent.id === target?.agentId,
           )?.skills ?? [],
+        skillsWarnings: [],
         skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
         refetch: vi.fn(),
       }) as ReturnType<typeof useSkills>,
@@ -1350,7 +1381,10 @@ function renderLanding(
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
     smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
-    features: { harness_install: infoOverrides.harness_install_enabled === true },
+    features: {
+      harness_install: infoOverrides.harness_install_enabled === true,
+      codex_plan_at_launch: true,
+    },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -1463,6 +1497,79 @@ function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
 describe("model picker hotkey", () => {
   beforeEach(setupLandingMocks);
 
+  it("cycles the full Pi catalog after searching the model menu", () => {
+    mockAgents([testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" })]);
+    // Long enough for the menu to offer search.
+    mockModelQueries(() => ({
+      ...SUCCESS_QUERY_STATE,
+      data: [..."abcdefghij"].map((letter) => ({
+        id: `model-${letter}`,
+        model: `model-${letter}`,
+        displayName: `Model ${letter.toUpperCase()}`,
+        isDefault: letter === "a",
+      })),
+    }));
+    renderLanding();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search models" }), {
+      target: { value: "model-a" },
+    });
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Model B" })).toBeNull();
+    closeMenu();
+    const input = screen.getByTestId("new-chat-landing-input");
+    act(() => input.focus());
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("menuitemcheckbox", { name: "Model B" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("menuitemcheckbox", { name: "Model C" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  it("previews the cycled launch model and its effort ladder with the draft focused", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "unfinished task" } });
+    act(() => input.focus());
+
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("GPT-5.6");
+    expect(
+      await screen.findByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"),
+    ).toHaveAttribute("aria-checked", "true");
+    for (const effort of ["Medium", "High", "xHigh"]) {
+      fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent(effort);
+    }
+    fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
+    fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("Medium");
+    expect(await screen.findByTestId("new-chat-landing-agent-effort-medium")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("unfinished task");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    await act(async () => fireEvent.submit(screen.getByTestId("new-chat-landing-composer")));
+    expect((await readCreateBody()).body).toMatchObject({
+      agent_id: "a2",
+      model_override: "databricks-gpt-5-6",
+      reasoning_effort: "medium",
+    });
+  });
+
   it("drills into the selected harness's model submenu on Ctrl+Shift+M and focuses its model", async () => {
     const user = userEvent.setup();
     mockAgents(DEFAULT_LANDING_AGENTS);
@@ -1568,11 +1675,17 @@ function selectUnconfiguredAgent(agentId: string): void {
   closeMenu();
 }
 
-function breakSelectedHarness(agentId: string, harness: string, readiness: boolean | string): void {
+function breakSelectedHarness(
+  agentId: string,
+  harness: string,
+  readiness: boolean | string,
+  hostOverrides: Partial<Host> = {},
+): void {
   selectAgent(agentId);
   mockHosts([
     {
       ...host("online"),
+      ...hostOverrides,
       configured_harnesses: {
         "claude-native": true,
         "codex-native": true,
@@ -4109,7 +4222,7 @@ describe("NewChatLandingScreen", () => {
       "rounded-t-2xl",
       "border",
       "border-b-0",
-      "composer-workspace-surface",
+      "composer-context-bar",
       "px-2",
       "py-0.5",
       "md:px-3",
@@ -6422,6 +6535,29 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  const sshDesktop = { kind: "electron", connectSshHost: vi.fn() };
+  it.each([
+    ["the browser", undefined, null, false],
+    ["a desktop app without SSH connect", { kind: "electron" }, null, false],
+    ["a window that offers Run on Arca", sshDesktop, { databricksInternalFeatures: true }, false],
+    ["a desktop app with SSH connect", sshDesktop, null, true],
+  ])("offers SSH connect in %s only when it can", async (_name, desktop, features, shown) => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
+    vi.mocked(getDesktopFeatures).mockResolvedValue(features);
+    try {
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+      // Let the shell's feature answer land before judging.
+      await act(async () => {});
+
+      expect(screen.queryByTestId("ssh-connect-form") !== null).toBe(shown);
+    } finally {
+      vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    }
+  });
+
   it("offers connect-host even when no hosts are online (no dead end)", () => {
     mockHosts([]);
     renderLanding();
@@ -6806,6 +6942,43 @@ describe("NewChatLandingScreen", () => {
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
+  it.each([true, false])("requires server support for Codex Plan (%s)", async (supported) => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const togglePlan = () => {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+      const plan = screen.getByTestId("composer-plan-action");
+      expect(plan).not.toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(plan);
+    };
+    togglePlan();
+    cleanup();
+    renderLanding({ features: supported ? { codex_plan_at_launch: true } : {} });
+    if (supported) {
+      expect(screen.getByTestId("new-chat-landing-plan-mode")).toHaveTextContent("Plan mode");
+      togglePlan();
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      togglePlan();
+      selectAgent("a1");
+      selectAgent("a2");
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      togglePlan();
+    } else {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+      expect(screen.getByTestId("composer-plan-action")).toHaveAttribute("aria-disabled", "true");
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      closeMenu();
+    }
+    const { body } = await submitAndReadBody();
+    const labels = body.labels as Record<string, string>;
+    expect(labels["omnigent.codex_native.collaboration_mode"]).toBe(supported ? "plan" : undefined);
+    expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
+  });
+
   it.each([
     ["default", "Default", undefined],
     [
@@ -6893,7 +7066,114 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();
   });
 
-  it("opens the setup dialog and installs an installable harness from it", () => {
+  it.each([
+    ["binary-missing", "install"],
+    [false, "install"],
+    ["needs-auth", "reconfigure"],
+    ["version-too-low", "update"],
+    ["future-error", "reconfigure"],
+  ] as const)("opens repair over the composer for %s", (readiness, mode) => {
+    renderLanding({ harness_install_enabled: true });
+    breakSelectedHarness("a2", "codex-native", readiness);
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.getByTestId("new-chat-fix-dialog")).toBeVisible();
+    expect(fixDialogProps).toMatchObject({
+      mode,
+      harness: "codex-native",
+      harnessLabel: "Codex",
+      host: { host_id: "host_1" },
+    });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Harness readiness changed");
+    expect(screen.queryByTestId("harness-setup-install")).toBeNull();
+  });
+
+  it("normalizes Codex aliases before opening repair", () => {
+    mockAgents([
+      testAgent("alias", "codex-native-ui", { display_name: "Codex", harness: "codex" }),
+    ]);
+    renderLanding({ harness_install_enabled: true });
+    breakSelectedHarness("alias", "codex-native", "binary-missing");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(fixDialogProps).toMatchObject({ harness: "codex-native", mode: "install" });
+  });
+
+  it("uses the native display name for a custom agent's repair", () => {
+    mockAgents([
+      testAgent("custom", "my-bot", { display_name: "My Bot", harness: "codex-native" }),
+    ]);
+    renderLanding({ harness_install_enabled: true });
+    breakSelectedHarness("custom", "codex-native", "needs-auth");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(fixDialogProps?.harnessLabel).toBe("Codex");
+  });
+
+  it("keeps the setup checklist for an SDK Claude agent needing authentication", () => {
+    mockAgents([testAgent("sdk", "claude", { display_name: "Claude SDK", harness: "claude" })]);
+    renderLanding({ harness_install_enabled: true });
+    mockHosts([{ ...host("online"), configured_harnesses: { claude: "needs-auth" } } as Host]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "SDK setup" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.queryByTestId("new-chat-fix-dialog")).toBeNull();
+    expect(screen.getByTestId("harness-setup-dialog")).toBeVisible();
+  });
+
+  it("keeps the setup checklist when an older host reports no readiness for the harness", () => {
+    renderLanding({ harness_install_enabled: true });
+    selectAgent("a2");
+    mockHosts([{ ...host("online"), configured_harnesses: { "claude-native": true } } as Host]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Unknown readiness" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.queryByTestId("new-chat-fix-dialog")).toBeNull();
+    expect(screen.getByTestId("harness-setup-dialog")).toBeVisible();
+  });
+
+  it("keeps the notice after Cancel and reopens repair from Set up", () => {
+    renderLanding({ harness_install_enabled: true });
+    breakSelectedHarness("a2", "codex-native", "needs-auth");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByTestId("new-chat-fix-dialog")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-harness-warning")).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.getByTestId("new-chat-fix-dialog")).toBeVisible();
+  });
+
+  it("refreshes readiness and preserves the draft after repair succeeds", async () => {
+    const unreadyHost = {
+      ...host("online"),
+      configured_harnesses: { "codex-native": "needs-auth" },
+    };
+    useHostsMock.mockImplementation(
+      () =>
+        useQuery({
+          queryKey: ["hosts"],
+          queryFn: async () => [unreadyHost],
+          initialData: [unreadyHost],
+          staleTime: Infinity,
+        }) as ReturnType<typeof useHosts>,
+    );
+    mockAgents([
+      testAgent("a2", "codex-native-ui", { display_name: "Codex", harness: "codex-native" }),
+    ]);
+    renderLanding({ harness_install_enabled: true });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep my draft" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish harness setup" }));
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull(),
+    );
+    expect(screen.queryByTestId("new-chat-fix-dialog")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep my draft");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
+  it("managed host: opens the setup dialog and installs an installable harness from it", () => {
     // host_1 reports codex-native (agent a2) as not set up; the server accepts
     // that harness, so the composer notice offers a "Set up Codex" action that
     // opens the dialog, and the dialog's Install button fires the install.
@@ -6906,7 +7186,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     // The composer action is labelled with the agent, not "the harness".
     const setup = screen.getByTestId("new-chat-landing-harness-setup");
@@ -7088,7 +7368,7 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("gates Set up auth until the harness is installed (no auth-before-install)", () => {
+  it("managed host: gates Set up auth until the harness is installed (no auth-before-install)", () => {
     // codex-native not installed: the credential form must NOT be available
     // yet — the auth row shows a DISABLED "Set up auth" (install first).
     // Clicking it does nothing / the form doesn't expand, so an auth-first write
@@ -7097,7 +7377,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
 
     // Install is offered; the auth row's control is present but disabled.
@@ -7109,14 +7389,14 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("harness-credential-form")).toBeNull();
   });
 
-  it("enables Set up auth once the harness is installed (needs-auth)", () => {
+  it("managed host: enables Set up auth once the harness is installed (needs-auth)", () => {
     // Installed but no credential → the auth row's "Set up auth" is enabled and
     // expands the credential form.
     renderLanding({
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", "needs-auth");
+    breakSelectedHarness("a2", "codex-native", "needs-auth", { sandbox_provider: "modal" });
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
 
     const setUpAuth = screen.getByTestId("harness-setup-add-credential") as HTMLButtonElement;
@@ -7126,7 +7406,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("harness-credential-form")).toBeTruthy();
   });
 
-  it("marks its Install button loading while THIS harness's install is pending", () => {
+  it("managed host: marks its Install button loading while THIS harness's install is pending", () => {
     // The dialog derives the in-flight indicator from React Query's mutation
     // state via useInstallingHarnesses (observer-independent, so a concurrent
     // install can't strand it). When that reports codex-native pending, the
@@ -7136,7 +7416,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect((screen.getByTestId("harness-setup-install") as HTMLButtonElement).disabled).toBe(true);
@@ -7147,7 +7427,7 @@ describe("NewChatLandingScreen", () => {
     expect(installStep.contains(installingCaption)).toBe(true);
   });
 
-  it("offers the inline credential form (not an install) for codex needs-auth", async () => {
+  it("managed host: offers the inline credential form (not an install) for codex needs-auth", async () => {
     // Binary present, just not authed → the auth step offers "Set up auth",
     // which expands the inline credential form. Never an Install button (a
     // reinstall wouldn't add the credential). The subscription `codex login` is
@@ -7157,7 +7437,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", "needs-auth");
+    breakSelectedHarness("a2", "codex-native", "needs-auth", { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
@@ -7172,7 +7452,7 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(copyTextMock).toHaveBeenCalledWith("codex login"));
   });
 
-  it("hides the Install button when the server doesn't list the harness as installable", () => {
+  it("managed host: hides the Install button when the server doesn't list the harness as installable", () => {
     // Defence in depth: the server published an install step for codex-native,
     // but the harness is NOT in installable_harnesses (a catalog/allowlist
     // drift). The Install button must not render — offering it would drive a
@@ -7182,13 +7462,13 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: [], // step catalog says install; allowlist disagrees
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
   });
 
-  it("toast says 'ready' only when the install returns a launchable harness", () => {
+  it("managed host: toast says 'ready' only when the install returns a launchable harness", () => {
     // The install POST returns the refreshed readiness. codex-native comes back
     // true (ready) → the success toast says ready.
     showToastMock.mockClear();
@@ -7205,14 +7485,14 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     fireEvent.click(screen.getByTestId("harness-setup-install"));
     expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("is ready on"));
   });
 
-  it("toast says 'one more step' when the install leaves the harness needing auth", () => {
+  it("managed host: toast says 'one more step' when the install leaves the harness needing auth", () => {
     // codex installs but still needs a login → readiness comes back
     // "needs-auth", not true. The toast must not claim "ready" (which would
     // contradict the sign-in row the checklist still shows).
@@ -7230,7 +7510,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     fireEvent.click(screen.getByTestId("harness-setup-install"));
@@ -7238,7 +7518,7 @@ describe("NewChatLandingScreen", () => {
     expect(showToastMock).not.toHaveBeenCalledWith(expect.stringContaining("is ready"));
   });
 
-  it("shows a fallback message when the server published no steps for the spelling", () => {
+  it("managed host: shows a fallback message when the server published no steps for the spelling", () => {
     // Feature on, harness unconfigured, but no setup_steps for this spelling
     // (a1 = claude-native, which the stubbed useHarnessSetupSteps doesn't
     // cover). The dialog must not be an empty dead-end — it points at the CLI.
@@ -7246,7 +7526,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["claude", "claude-native"],
     });
-    breakSelectedHarness("a1", "claude-native", false);
+    breakSelectedHarness("a1", "claude-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect(screen.getByTestId("harness-setup-empty").textContent).toContain("omni setup");
@@ -8455,6 +8735,7 @@ describe("NewChatLandingScreen skills menu", () => {
       ({ target, enabled = true, starting = false }) =>
         ({
           skills: [],
+          skillsWarnings: [],
           skillsStatus: "ready",
           refetch: vi.fn(),
           ...state,
@@ -8464,6 +8745,144 @@ describe("NewChatLandingScreen skills menu", () => {
         }) as ReturnType<typeof useSkills>,
     );
   }
+
+  it.each([
+    { agentId: "a1", harness: "claude-native", prefix: "/" },
+    { agentId: "a2", harness: "codex-native", prefix: "$" },
+  ])(
+    "discovers Arca skills before provisioning and delivers the first $harness prompt",
+    async ({ agentId, harness, prefix }) => {
+      const { useSkills: realHook } =
+        await vi.importActual<typeof UseSkillsModule>("@/hooks/useSkills");
+      vi.mocked(useSkills).mockImplementation(realHook);
+      mockHosts([host("online"), { ...host("online"), host_id: "arca", name: "corey's arca" }]);
+      localStorage.setItem(LAST_AGENT_KEY, agentId);
+      authenticatedFetchMock.mockImplementation(async (url) =>
+        String(url).startsWith("/v1/skills?")
+          ? ({
+              ok: true,
+              json: async () => ({
+                skills: [{ name: "arca-review", description: "Review on Arca" }],
+              }),
+            } as Response)
+          : ({ ok: true, json: async () => ({ id: "conv_new" }) } as Response),
+      );
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "arclet",
+        durable_initial_input: true,
+      });
+      typeMessage(`${prefix}arca`);
+      fireEvent.click(await screen.findByTestId("slash-menu-item-arca-review"));
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(`${prefix}arca-review `);
+      expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+      const discoveryUrl = new URL(String(authenticatedFetchMock.mock.calls[0]![0]), "http://test");
+      expect(Object.fromEntries(discoveryUrl.searchParams)).toEqual({
+        host_id: "arca",
+        harness,
+        path: "~",
+        agent_id: agentId,
+      });
+      typeMessage(`${prefix}arca-review check these changes`);
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(
+          true,
+        ),
+      );
+      const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+      const body = JSON.parse(init!.body as string);
+      expect(body).toMatchObject({
+        host_type: "managed",
+        sandbox_provider: "arclet",
+        initial_input: {
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: `${prefix}arca-review check these changes` }],
+          },
+        },
+      });
+      expect(body.host_id).toBeUndefined();
+    },
+  );
+
+  it("loads Arclet skills when hosts arrive and hides them when the Arca disconnects", () => {
+    const arca: Host = { ...host("online"), host_id: "arca", name: "corey's arca" };
+    mockHosts(undefined);
+    mockSkills({ skills: [{ name: "arca-review", description: "Review on Arca" }] });
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "arclet" });
+    typeMessage("/");
+    expect(screen.getByText("Loading skills…")).toBeInTheDocument();
+    mockHosts([arca]);
+    typeMessage("/arca");
+    expect(screen.getByTestId("slash-menu-item-arca-review")).toBeInTheDocument();
+    mockHosts([host("online"), { ...arca, status: "offline" }]);
+    typeMessage("/arc");
+    expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Connect your Arca to discover skills before the sandbox starts."),
+    ).toBeInTheDocument();
+    expect(useSkills).toHaveBeenLastCalledWith({ target: null, enabled: false, starting: false });
+  });
+
+  it.each([
+    { prompt: "/arca-review check these changes", bundled: false },
+    { prompt: "/review-pr check these changes", bundled: true },
+  ])(
+    "keeps SDK Arclet skill invocation scoped to its bundle: $prompt",
+    async ({ prompt, bundled }) => {
+      mockAgents([skilledAgent()]);
+      mockHosts([{ ...host("online"), name: "corey's arca" }]);
+      mockSkills({ skills: [{ name: "arca-review", description: "Only available on Arca" }] });
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "arclet",
+        durable_initial_input: true,
+      });
+      typeMessage("/");
+      expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
+      expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
+      expect(useSkills).toHaveBeenLastCalledWith({ target: null, enabled: false, starting: false });
+      typeMessage(prompt);
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(
+          true,
+        ),
+      );
+      const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+      const body = JSON.parse(init!.body as string);
+      expect(body.host_type).toBe("managed");
+      expect(body.initial_input).toEqual(
+        bundled
+          ? {
+              type: "slash_command",
+              data: { kind: "skill", name: "review-pr", arguments: "check these changes" },
+            }
+          : {
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: prompt }] },
+            },
+      );
+    },
+  );
+
+  it("keeps other sandbox providers from previewing connected Arca skills", () => {
+    mockHosts([{ ...host("online"), name: "corey's arca" }]);
+    mockSkills({ skills: [{ name: "arca-review", description: "Review on Arca" }] });
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "modal" });
+    typeMessage("/");
+    expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Host skills will be available after the sandbox starts."),
+    ).toBeInTheDocument();
+    expect(useSkills).toHaveBeenLastCalledWith({ target: null, enabled: false, starting: false });
+  });
 
   it("updates and selects arriving skills under StrictMode without retyping", async () => {
     const { useSkills: realHook } =
@@ -8539,6 +8958,23 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByText("No matching skills")).toBeInTheDocument();
     typeMessage("/");
     expect(screen.getByText("No skills available")).toBeInTheDocument();
+  });
+
+  it("explains an incomplete catalog with Retry while listing the skills it read", () => {
+    const retry = vi.fn();
+    const warning = "Codex plugin skills unavailable: `codex plugin list` exited 1";
+    mockSkills({
+      skills: [{ name: "host-review", description: "Host-only skill" }],
+      skillsWarnings: [warning],
+      refetch: retry,
+    });
+    renderLanding();
+    typeMessage("/");
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-host-review")).toBeInTheDocument();
+    expect(screen.queryByText("No skills available")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledOnce();
   });
 
   it("dismisses a loading-only menu with Escape", () => {
@@ -9791,7 +10227,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 
   // Switch the target to the connected host, then create + submit a pending
   // custom agent from the dialog so it becomes the selected agent.
-  async function createAndSelectPendingAgentOnHost(): Promise<void> {
+  async function createAndSelectPendingAgentOnHost(harnessLabel: string): Promise<void> {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
         "Sandbox",
@@ -9812,15 +10248,29 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.change(screen.getByTestId("create-agent-model"), {
       target: { value: "claude-sonnet-4-20250514" },
     });
+    fireEvent.click(screen.getByTestId("create-agent-harness"));
+    fireEvent.click(screen.getByRole("option", { name: harnessLabel }));
     fireEvent.click(screen.getByTestId("create-agent-submit"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent"),
-    );
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
   }
 
-  it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
+  it("disables Plan for pending custom Codex agents and drops them on a sandbox switch", async () => {
+    const agentLabels = await import("@/lib/agentLabels");
+    const catalog = vi.spyOn(agentLabels, "useBrainHarnessLabels").mockReturnValue({
+      ...agentLabels.BRAIN_HARNESS_LABELS,
+      "codex-native": "Codex CLI",
+    });
+    onTestFinished(() => catalog.mockRestore());
     renderLanding({ managed_sandboxes_enabled: true });
-    await createAndSelectPendingAgentOnHost();
+    await createAndSelectPendingAgentOnHost("Codex CLI");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+    const plan = screen.getByTestId("composer-plan-action");
+    expect(plan).toHaveAttribute("aria-disabled", "true");
+    expect(plan).toHaveAttribute(
+      "title",
+      "Turn Plan mode on after this custom agent's session starts",
+    );
+    closeMenu();
     // Switch back to the sandbox: the pending pick can't run there, so the
     // selection falls back to a real agent and the pending row disappears.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
@@ -10150,18 +10600,79 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(selectedPickerModel()).toBeTruthy();
   });
 
-  it("disables effort choices while Smart Routing owns effort", () => {
+  // A managed sandbox has no pre-launch catalog, so Codex's Model section lists
+  // no models there; unchecking Smart Routing must still turn it off, as the
+  // Default row does for Claude Code.
+  it("lets a Codex sandbox session switch back from Smart Routing to the default model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sandbox_unrouted" }),
+    } as unknown as Response);
+    renderLanding({
+      smart_routing_enabled: true,
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "lakebox",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "Sandbox",
+      ),
+    );
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Smart Routing");
+    const smartRouting = () => screen.getByRole("menuitemcheckbox", { name: "Smart Routing" });
+    expect(smartRouting()).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("new-chat-landing-agent-select").getAttribute("aria-label")).toBe(
+      "Codex, Model Smart Routing, Effort —",
+    );
+    // The checkbox is the only way out: no model or Default row is offered.
+    const models = screen.getByTestId("new-chat-landing-agent-models");
+    expect(within(models).getByText("Models unavailable")).toBeVisible();
+    expect(within(models).queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+
+    fireEvent.click(smartRouting());
+
+    expect(smartRouting()).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("new-chat-landing-agent-select").getAttribute("aria-label")).toBe(
+      "Codex, Model Default",
+    );
+    closePrimaryPicker();
+
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({ agent_id: "a2", host_type: "managed" });
+    expect(body.cost_control_mode_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("disables effort choices while Smart Routing owns effort and hands them back once it is unchecked", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentModels("a1");
     pickPrimaryOption("effort", "High");
     expect(selectedPickerEffort()).toHaveTextContent("High");
     pickPrimaryOption("model", "Smart Routing");
-    for (const option of within(screen.getByTestId("new-chat-landing-agent-efforts")).getAllByRole(
-      "menuitemcheckbox",
-    )) {
+    const effortChoices = () =>
+      within(screen.getByTestId("new-chat-landing-agent-efforts")).getAllByRole("menuitemcheckbox");
+    for (const option of effortChoices()) {
       expect(option).toHaveAttribute("data-disabled");
       expect(option).toHaveAttribute("aria-checked", "false");
     }
+
+    // Unchecking lands on the harness default with the effort row usable again.
+    pickPrimaryOption("model", "Smart Routing");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(selectedPickerModel().textContent).toContain("Default");
+    expect(selectedPickerEffort()).toHaveTextContent("Default");
+    for (const option of effortChoices()) {
+      expect(option).not.toHaveAttribute("data-disabled");
+    }
+    expect(
+      JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["claude-native"],
+    ).toMatchObject({ routing: "off", model: "", effort: "" });
   });
 
   it("sends cost_control_mode_override 'on' and no model/effort override when routing is picked", async () => {
@@ -11850,6 +12361,39 @@ describe("managed sandbox gateway preview", () => {
       sandbox_provider_capabilities: { arclet: { default_models: true } },
     });
   }
+
+  it.each([
+    ["high", "high"],
+    ["xhigh", undefined],
+  ])(
+    "seeds project effort %s against the gateway model's ladder",
+    async (projectEffort, sentEffort) => {
+      preview();
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      useProjectsMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: [{ id: "proj_alpha", name: "Alpha" }],
+      });
+      useProjectConfigMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { agent_id: "a2", model: astra.id, effort: projectEffort },
+      });
+      renderLanding(
+        {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "arclet",
+          sandbox_provider_capabilities: { arclet: { default_models: true } },
+        },
+        "/?project=Alpha",
+      );
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBe(astra.id);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
 
   it("offers gateway models without a host and carries Codex model and effort into create", async () => {
     preview();

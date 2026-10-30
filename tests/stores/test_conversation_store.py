@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     CompactionData,
+    Conversation,
     ErrorData,
     FunctionCallData,
     FunctionCallOutputData,
@@ -318,6 +319,27 @@ def test_get_conversations_empty_input_skips_query(
     assert conversation_store.get_conversations([]) == {}
 
 
+def test_get_session_activity(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Each known id maps to its update time and live status; unknown ids are omitted."""
+    a = conversation_store.create_conversation(title="alpha")
+    b = conversation_store.create_conversation(title="beta")
+    conversation_store.set_session_live_status(a.id, "waiting")
+    conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
+
+    result = conversation_store.get_session_activity(
+        [a.id, b.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+    )
+
+    assert set(result) == {a.id, b.id}
+    assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
+    assert result[a.id].live_status == "waiting"
+    # A session that never reported a status has none recorded.
+    assert result[b.id].live_status is None
+    assert conversation_store.get_session_activity([]) == {}
+
+
 def test_list_latest_message_items_for_conversations(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -586,7 +608,7 @@ def test_update_conversation_with_changes_missing_conversation(
 def test_update_conversation_with_changes_retries_commit(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    conv = conversation_store.create_conversation()
+    conv = conversation_store.create_conversation(labels={"existing": "kept"})
     retrying_maker = _RetryOnceMaker(conversation_store._conv_session_immediate)
     conversation_store._conv_session_immediate = retrying_maker
 
@@ -594,6 +616,7 @@ def test_update_conversation_with_changes_retries_commit(
         conv.id,
         reasoning_effort="high",
         model_override="model-a",
+        label_updates={"effort_reset": "false"},
     )
 
     assert retrying_maker.attempts == 2
@@ -602,11 +625,13 @@ def test_update_conversation_with_changes_retries_commit(
     assert result.model_override_changed is True
     assert result.conversation.reasoning_effort == "high"
     assert result.conversation.model_override == "model-a"
+    assert result.conversation.labels == {"existing": "kept", "effort_reset": "false"}
 
     committed = conversation_store.get_conversation(conv.id)
     assert committed is not None
     assert committed.reasoning_effort == "high"
     assert committed.model_override == "model-a"
+    assert committed.labels == result.conversation.labels
 
 
 def test_reported_model_round_trips_beside_the_request(
@@ -1834,6 +1859,129 @@ def test_list_conversations_search_query_matches_content(
     assert conv_title.id in matched_ids, "title match should be included"
     assert conv_content.id in matched_ids, "content match should be included"
     assert conv_neither.id not in matched_ids, "non-matching conversation excluded"
+
+
+def test_list_conversations_search_scope_splits_title_and_content_matches(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``search_scope`` returns disjoint title and content groups of one search.
+
+    A session matching in both its title and content is a title match only,
+    and each group pages with the ordinary cursor.
+
+    :param conversation_store: The conversation store fixture.
+    """
+
+    def add_message(conversation_id: str, text: str) -> None:
+        conversation_store.append(
+            conversation_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{conversation_id}",
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                ),
+            ],
+        )
+
+    title_only = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_only.id, title="Kestrel plan")
+    title_and_content = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_and_content.id, title="kestrel notes")
+    add_message(title_and_content.id, "more kestrel detail")
+    content_ids = []
+    for index in range(3):
+        content_only = conversation_store.create_conversation()
+        conversation_store.update_conversation(content_only.id, title=f"Sync {index}")
+        add_message(content_only.id, "the kestrel checklist")
+        content_ids.append(content_only.id)
+    unrelated = conversation_store.create_conversation()
+    conversation_store.update_conversation(unrelated.id, title="Unrelated")
+
+    def page_through(scope: str) -> list[Conversation]:
+        """Read every match of ``scope`` two rows at a time."""
+        rows: list[Conversation] = []
+        after: str | None = None
+        while True:
+            page = conversation_store.list_conversations(
+                search_query="kestrel", search_scope=scope, limit=2, after=after
+            )
+            rows.extend(page.data)
+            if not page.has_more:
+                return rows
+            after = page.last_id
+
+    title_rows = page_through("title")
+    assert sorted(c.id for c in title_rows) == sorted([title_only.id, title_and_content.id])
+    # The title already shows the hit, so the title group skips snippets.
+    assert all(c.search_snippet is None for c in title_rows)
+
+    content_rows = page_through("content")
+    # Paging walks the same order as one unpaged read, with no repeats or gaps.
+    unpaged = conversation_store.list_conversations(search_query="kestrel", search_scope="content")
+    assert [c.id for c in content_rows] == [c.id for c in unpaged.data]
+    assert sorted(c.id for c in content_rows) == sorted(content_ids)
+    assert all(c.search_snippet for c in content_rows)
+
+    all_ids = {c.id for c in conversation_store.list_conversations(search_query="kestrel").data}
+    assert all_ids == {title_only.id, title_and_content.id, *content_ids}
+
+    with pytest.raises(ValueError, match="search_scope"):
+        conversation_store.list_conversations(search_query="kestrel", search_scope="body")
+
+
+@pytest.mark.parametrize("query", ["50%", "a_b", "x/y"])
+def test_list_conversations_search_matches_like_wildcards_literally(
+    conversation_store: SqlAlchemyConversationStore,
+    query: str,
+) -> None:
+    """
+    ``%``, ``_`` and the escape character in a search match only themselves,
+    in titles, content and the content snippet.
+
+    :param conversation_store: The conversation store fixture.
+    :param query: A search containing a LIKE wildcard or the escape character.
+    """
+    title_hit = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_hit.id, title=f"Plan {query} rollout")
+    content_hit = conversation_store.create_conversation()
+    conversation_store.update_conversation(content_hit.id, title="Notes")
+    conversation_store.append(
+        content_hit.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_wildcard_hit",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": f"ship {query} today"}]
+                ),
+            ),
+        ],
+    )
+    # Each would match if the query's wildcard or escape character were active.
+    near_miss = query.replace("%", "0").replace("_", "-").replace("/", "")
+    decoy = conversation_store.create_conversation()
+    conversation_store.update_conversation(decoy.id, title=f"Plan {near_miss} rollout")
+    conversation_store.append(
+        decoy.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_wildcard_decoy",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"ship {near_miss} today"}],
+                ),
+            ),
+        ],
+    )
+
+    by_id = {c.id: c for c in conversation_store.list_conversations(search_query=query).data}
+    assert set(by_id) == {title_hit.id, content_hit.id}
+    snippet = by_id[content_hit.id].search_snippet
+    assert snippet is not None
+    assert query in snippet
 
 
 def test_list_conversations_search_query_content_only(
@@ -4729,6 +4877,70 @@ def test_fork_preserves_compaction_boundary_at_workspace_error(
     assert conversation_store.list_items(source.id).data == original_items
 
 
+def test_fork_remaps_attachments_in_compaction_snapshot(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork's replay snapshot must use its own file rows, like ordinary messages."""
+    source = conversation_store.create_conversation()
+    boundary = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="response-example",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "Read"}]),
+            )
+        ],
+    )[0]
+    snapshot = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_image", "file_id": "source-image", "filename": "image.png"},
+                {"type": "input_file", "file_id": "source-file", "filename": "notes.txt"},
+                {"type": "input_file", "file_id": "missing-file"},
+                {"type": "input_text", "text": "source-image"},
+            ],
+        }
+    ]
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="response-example",
+                data=CompactionData(
+                    summary="Read the attachments",
+                    last_item_id=boundary.id,
+                    token_count=10,
+                    compacted_messages=snapshot,
+                ),
+            )
+        ],
+    )
+
+    fork = conversation_store.fork_conversation(
+        source.id,
+        file_id_map={"source-image": "fork-image", "source-file": "fork-file"},
+    )
+
+    fork_items = conversation_store.list_items(fork.id, order="asc").data
+    compaction = fork_items[1].data
+    assert isinstance(compaction, CompactionData)
+    assert compaction.last_item_id == fork_items[0].id
+    assert compaction.compacted_messages is not None
+    assert compaction.compacted_messages[0]["content"] == [
+        {"type": "input_image", "file_id": "fork-image", "filename": "image.png"},
+        {"type": "input_file", "file_id": "fork-file", "filename": "notes.txt"},
+        {"type": "input_file", "file_id": "missing-file"},
+        {"type": "input_text", "text": "source-image"},
+    ]
+    source_compaction = conversation_store.list_items(source.id, type="compaction").data[0].data
+    assert isinstance(source_compaction, CompactionData)
+    assert source_compaction.compacted_messages == snapshot
+
+
 def test_fork_conversation_remaps_file_references(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -5471,6 +5683,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.last_context_window": "1000000",
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
+            # Creation origin belongs to the source, not the fork.
+            "omnigent.created_by_session_id": "original-manager",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },
@@ -8233,6 +8447,47 @@ def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
     assert after is not None
     assert after.updated_at == 1000
     assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_append_probes_stable_ids_in_bounded_batches(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The idempotency probe binds at most one batch of stable ids per statement.
+
+    An import can carry more stable ids than one statement may bind, and a
+    re-post spanning several batches must still dedupe every persisted id.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "_APPEND_STABLE_ID_PROBE_BATCH", 2)
+    conv = conversation_store.create_conversation()
+
+    def item(n: int) -> NewConversationItem:
+        return NewConversationItem(
+            type="message",
+            response_id="resp_x",
+            data=MessageData(role="user", content=[{"type": "input_text", "text": f"m{n}"}]),
+            stable_id=f"{n:02x}" * 16,
+        )
+
+    conversation_store.append(conv.id, [item(n) for n in range(5)])
+    probe_params: list[int] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if "FROM conversation_items" in statement and " IN (" in statement:
+            probe_params.append(len(parameters))
+
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", capture)
+    try:
+        appended = conversation_store.append(conv.id, [item(n) for n in range(7)])
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", capture)
+
+    assert [i.deduplicated for i in appended] == [True] * 5 + [False] * 2
+    # Each probe binds the workspace and conversation ids plus at most two stable ids.
+    assert sorted(probe_params) == [3, 4, 4, 4]
+    assert len(conversation_store.list_items(conv.id).data) == 7
 
 
 # ── Connection-checkout budget ─────────────────────────

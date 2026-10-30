@@ -1,10 +1,11 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import type * as FilesPanelModule from "@/shell/FilesPanel";
 import { type ComponentProps, useContext, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -13,12 +14,15 @@ import { splitGrid } from "./gridLayout";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { retrySession } from "@/lib/sessionsApi";
+import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 
 const fixture = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
   permissionLevel: null as number | null,
   terminals: [] as TerminalsModule.TerminalInfo[],
   terminalPending: false,
+  composerDisabled: false,
+  hostOnline: undefined as boolean | undefined,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -31,6 +35,10 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+vi.mock("@/shell/FilesPanel", async (original) => ({
+  ...(await original<typeof FilesPanelModule>()),
+  revealFolderInFilesPanel: vi.fn(),
+}));
 vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
 
 vi.mock("@/hooks/useSession", () => ({
@@ -51,6 +59,7 @@ vi.mock("@/hooks/useConversationEntryState", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => {},
   useSessionRunnerOnline: () => true,
+  useSessionHostOnline: () => fixture.hostOnline,
 }));
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
 vi.mock("@/hooks/useSessionLiveness", () => ({
@@ -80,7 +89,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     const terminal = useTerminalFirst();
     return (
       <>
-        <input aria-label="Message" />
+        <textarea aria-label="Message" disabled={fixture.composerDisabled} />
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
@@ -89,6 +98,9 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         </button>
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
           Block navigation
+        </button>
+        <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
+          Open folder
         </button>
       </>
     );
@@ -105,6 +117,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-maximized={String(props.maximized)}
         data-width={props.width}
         data-terminal={props.selectedTerminalKey ?? ""}
+        data-tab={props.rightRailTab ?? ""}
         data-end-line={props.filePosition?.endLine}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
@@ -138,6 +151,8 @@ afterEach(() => {
   fixture.permissionLevel = null;
   fixture.terminals = [];
   fixture.terminalPending = false;
+  fixture.composerDisabled = false;
+  fixture.hostOnline = undefined;
   vi.restoreAllMocks();
 });
 
@@ -161,6 +176,34 @@ it("opens agent-requested files only in the active workspace and respects naviga
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
+});
+
+it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {
+  writeSessionWorkspaceState("first", { rightRailTab: "subagents" });
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "folder-link", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Block navigation"));
+  fireEvent.click(first.getByText("Open folder"));
+  expect(revealFolderInFilesPanel).not.toHaveBeenCalledWith("first", expect.anything());
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-tab", "subagents");
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("aria-hidden", "true");
+
+  fireEvent.click(within(screen.getByRole("region", { name: "second" })).getByText("Open folder"));
+
+  expect(revealFolderInFilesPanel).toHaveBeenCalledWith("second", "/workspace/experimental");
+  const workspace = screen.getByRole("complementary", { name: "Workspace" });
+  expect(workspace).toHaveAttribute("data-testid", "workspace-second");
+  expect(workspace).toHaveAttribute("data-tab", "files");
+  expect(workspace).toHaveTextContent("No file");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {
@@ -212,6 +255,76 @@ it("keeps cell views, input, permissions and shortcut targets independent", asyn
   ).toBeVisible();
 });
 
+it("cycles keyboard focus through cells and toggles the grid workspace from the keyboard", () => {
+  fixture.labels = { "omnigent.ui": "terminal" };
+  fixture.terminals = [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }];
+  const layout = splitGrid(
+    splitGrid("first", "first", "second", "right")!,
+    "second",
+    "third",
+    "bottom",
+  )!;
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid grid={{ id: "cycle", layout }} />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const cell = (name: string) => screen.getByRole("region", { name: new RegExp(`^${name}`) });
+  // Clicking the switch also selects the third cell, so cycling starts there.
+  fireEvent.click(within(cell("third")).getByRole("button", { name: "Terminal view" }));
+  const next = () =>
+    fireEvent.keyDown(window, {
+      code: "BracketRight",
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: true,
+    });
+
+  next();
+  expect(cell("first")).toHaveAttribute("data-active", "true");
+  expect(within(cell("first")).getByRole("textbox", { name: "Message" })).toHaveFocus();
+  next();
+  expect(within(cell("second")).getByRole("textbox", { name: "Message" })).toHaveFocus();
+  // A connected terminal claims focus itself; until then the cell holds it.
+  next();
+  expect(cell("third")).toHaveAttribute("data-active", "true");
+  expect(within(cell("third")).getByLabelText("Terminal input")).toHaveAttribute(
+    "data-active",
+    "true",
+  );
+  expect(cell("third")).toHaveFocus();
+  fireEvent.keyDown(window, { code: "BracketLeft", ctrlKey: true, altKey: true, shiftKey: true });
+  expect(cell("second")).toHaveAttribute("data-active", "true");
+  // A handled request must not pull focus back when the cell's view changes later.
+  const outside = document.body.appendChild(document.createElement("button"));
+  onTestFinished(() => outside.remove());
+  outside.focus();
+  fireEvent.keyDown(window, { code: "Backslash", ctrlKey: true, altKey: true });
+  expect(outside).toHaveFocus();
+
+  const toggle = screen.getByRole("button", { name: /grid workspace$/ });
+  const label = toggle.getAttribute("aria-label");
+  fireEvent.keyDown(window, { code: "BracketRight", ctrlKey: true, altKey: true });
+  expect(toggle).not.toHaveAttribute("aria-label", label);
+  fireEvent.keyDown(window, { code: "BracketRight", ctrlKey: true, altKey: true });
+  expect(toggle).toHaveAttribute("aria-label", label);
+});
+
+it("focuses the cell itself when its composer is not ready", () => {
+  fixture.composerDisabled = true;
+  render(
+    <MemoryRouter>
+      <RearrangeableGrid
+        grid={{ id: "not-ready", layout: splitGrid("first", "first", "second", "right")! }}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.keyDown(window, { code: "BracketRight", ctrlKey: true, altKey: true, shiftKey: true });
+  expect(screen.getByRole("region", { name: "second (active)" })).toHaveFocus();
+});
+
 it("uses the terminal default and changes startup into a scoped resume action", async () => {
   localStorage.setItem("omnigent:default-transcript-view", "terminal");
   fixture.labels = { "omnigent.ui": "terminal" };
@@ -233,6 +346,31 @@ it("uses the terminal default and changes startup into a scoped resume action", 
   rendered.rerender(tree());
   fireEvent.click(within(first).getByRole("button", { name: "Resume session" }));
   await waitFor(() => expect(retrySession).toHaveBeenCalledWith("first"));
+});
+
+it("keeps failed automatic recovery across grid view switches", async () => {
+  fixture.labels = { "omnigent.ui": "terminal" };
+  fixture.hostOnline = true;
+  vi.mocked(retrySession).mockClear().mockRejectedValueOnce(new Error("Recovery unavailable"));
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "recovery", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = screen.getByRole("region", { name: "first (active)" });
+  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  const failure = await within(first).findByRole("alert");
+  expect(failure).toHaveTextContent("Couldn't reconnect the terminal automatically.");
+  fireEvent.click(within(first).getByRole("button", { name: "Chat view" }));
+  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  await act(async () => {});
+  expect(within(first).getByRole("alert")).toBe(failure);
+  expect(within(first).getByRole("button", { name: "Resume session" })).toBeEnabled();
+  expect(retrySession).toHaveBeenCalledTimes(1);
 });
 
 it("shares one workspace, preserves per-session files and drafts, and persists grid width", () => {
