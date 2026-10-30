@@ -1511,24 +1511,20 @@ html[data-electron-mac] .breadcrumb-folder {
   );
 }
 
-/* Start native transcripts below the header and top fade, and keep snapped
- * "Worked for" rows out of the faded band. */
-:is([data-ios-native], [data-android-native]) .chat-conversation-content {
+/* Start unpinned native transcripts below the header and top fade (a pinned
+ * plan or banner already clears them), and keep snapped "Worked for" rows out
+ * of the faded band. */
+:is([data-ios-native], [data-android-native]) .chat-scroll-fade .chat-conversation-content {
   padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
-}
-
-:is([data-ios-native], [data-android-native])
-  .chat-conversation-content.chat-content-under-arca-banner {
-  padding-top: 1rem;
 }
 
 [data-ios-native] .turn-fold-row {
   scroll-margin-top: calc(88px + var(--omnigent-inset-top));
 }
 
-/* Wide settings pages scroll under the status bar; hide that band. Phone
- * widths skip the mask because it would trap the fixed title beneath the
- * header, and extend the header backdrop instead. */
+/* Wide settings pages scroll under the status bar; hide that band. The mask
+ * makes the scroller a stacking context, which would trap the fixed phone
+ * title beneath the header, so phones extend the header backdrop instead. */
 @media (width >= 48rem) {
   :is([data-ios-native], [data-android-native]) .settings-page-scroll {
     mask-image: linear-gradient(

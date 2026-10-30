@@ -422,6 +422,19 @@ describe("index.css native status-bar scroll fades", () => {
   );
 });
 
+describe("index.css native transcript top padding", () => {
+  it("pads only unpinned transcripts so a pinned plan gets no extra gap", () => {
+    const padded = cssBlocks.filter(([block]) =>
+      block.includes(
+        "padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top))",
+      ),
+    );
+    expect(padded.map(([block]) => selectorOf(block).replace(/\s+/g, " "))).toEqual([
+      ":is([data-ios-native], [data-android-native]) .chat-scroll-fade .chat-conversation-content",
+    ]);
+  });
+});
+
 describe("index.css native Settings status bar", () => {
   const ruleFor = (selector: string) =>
     cssBlocks.find(([block]) => selectorOf(block).replace(/\s+/g, " ") === selector);
