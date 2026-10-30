@@ -3787,15 +3787,13 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 // the registry attribute each request to its view.
 const guardedAgentSessions = new WeakSet();
 
-/** Enforce the agent navigation policy on document requests at the network layer. */
+/** Enforce the agent network policy on documents, subresources, and workers. */
 function guardAgentPartitionRequests(partition, registry) {
   const ses = session.fromPartition(partition);
   if (guardedAgentSessions.has(ses)) return;
   guardedAgentSessions.add(ses);
-  // Documents only: frames plus <object>/<embed> content, which also renders.
   const filter = {
-    urls: ["http://*/*", "https://*/*"],
-    types: ["mainFrame", "subFrame", "object"],
+    urls: ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"],
   };
   const answer = (decision, callback) =>
     decision.then(
@@ -3803,13 +3801,13 @@ function guardAgentPartitionRequests(partition, registry) {
       () => callback({ cancel: true }),
     );
   ses.webRequest.onBeforeRequest(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentRequest(details), callback),
+    answer(registry.shouldCancelAgentRequest(details, partition), callback),
   );
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
-    callback(registry.agentRequestHeaders(details)),
+    callback(registry.agentRequestHeaders(details, partition)),
   );
   ses.webRequest.onHeadersReceived(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentResponse(details), callback),
+    answer(registry.shouldCancelAgentResponse(details, partition), callback),
   );
 }
 

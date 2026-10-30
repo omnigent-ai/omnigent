@@ -16,7 +16,7 @@ const {
 const deps = desktopDepsAvailable();
 
 it(
-  "attributes repeated document responses and cancels internal responses",
+  "guards documents, subresources, WebSockets, and worker network requests",
   {
     skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`,
     timeout: 180_000,
@@ -28,6 +28,13 @@ it(
       fs.mkdtempSync(path.join(os.tmpdir(), "omni-navigation-recordings-"));
     const evidence = {};
     const fixture = http.createServer((req, res) => {
+      if (req.url === "/policy-worker.js") {
+        res.setHeader("Content-Type", "application/javascript");
+        res.end(
+          "self.onmessage = (event) => { fetch(event.data).catch(() => {}); }; self.skipWaiting();",
+        );
+        return;
+      }
       if (req.url === "/redirect") {
         res.writeHead(302, {
           Location: `http://lvh.me:${fixture.address().port}/embedded?kind=redirect`,
@@ -67,16 +74,16 @@ it(
         allowsLocalhost: (context) => context?.trustedPreviewFixture === true,
       });
       const response = registry.shouldCancelAgentResponse.bind(registry);
-      registry.shouldCancelAgentResponse = async (details) => {
-        const cancel = await response(details);
+      registry.shouldCancelAgentResponse = async (details, partition) => {
+        const cancel = await response(details, partition);
         global.navigationResponses.push({ url: details.url, ip: details.ip,
           webContentsId: details.webContentsId, statusCode: details.statusCode, cancel });
         return cancel;
       };
       const request = registry.shouldCancelAgentRequest.bind(registry);
-      registry.shouldCancelAgentRequest = async (details) => {
+      registry.shouldCancelAgentRequest = async (details, partition) => {
         const cancel = registry.get("response-fixture")?.view.webContents.id === details.webContentsId
-          && details.url === ${JSON.stringify(localUrl)} ? false : await request(details);
+          && details.url === ${JSON.stringify(localUrl)} ? false : await request(details, partition);
         global.navigationRequests.push({ url: details.url, resourceType: details.resourceType,
           webContentsId: details.webContentsId, cancel });
         return cancel;
@@ -270,6 +277,95 @@ it(
           JSON.stringify(evidence.embedded),
         );
       }
+
+      await phase("Subresources and workers: private requests cancel without closing the view.");
+      assert.equal((await navigate("preview-fixture", localUrl, true)).ok, true);
+      evidence.subresources = await electronApp.evaluate(
+        async (_electron, { port }) => {
+          const entry = global.omnigentTestBrowserRegistries[0].get("preview-fixture");
+          // Install a same-origin service worker while this preview has loopback access.
+          await entry.view.webContents.executeJavaScript(`
+          (async () => {
+            const registration = await navigator.serviceWorker.register("/policy-worker.js");
+            await navigator.serviceWorker.ready;
+            window.policyServiceWorker = registration.active;
+          })()
+        `);
+          entry.agentContext = {};
+          const privateUrl = "http://127.0.0.1:" + port + "/private";
+          await entry.view.webContents.executeJavaScript(`
+          void fetch(${JSON.stringify(privateUrl + "?kind=fetch")}).catch(() => {});
+          const xhr = new XMLHttpRequest();
+          xhr.open("GET", ${JSON.stringify(privateUrl + "?kind=xhr")}); xhr.send();
+          const image = new Image();
+          image.src = "http://169.254.169.254/?kind=image";
+          document.body.appendChild(image);
+          const socket = new WebSocket("ws://localhost:" + ${port} + "/?kind=websocket");
+          socket.onerror = () => {};
+          const workerCode = "fetch(" + ${JSON.stringify(JSON.stringify(privateUrl + "?kind=dedicated-worker"))} + ").catch(() => {});";
+          window.policyDedicatedWorker = new Worker(URL.createObjectURL(new Blob([workerCode], { type: "application/javascript" })));
+          const sharedCode = "onconnect = () => { fetch(" + ${JSON.stringify(JSON.stringify(privateUrl + "?kind=shared-worker"))} + ").catch(() => {}); };";
+          window.policySharedWorker = new SharedWorker(URL.createObjectURL(new Blob([sharedCode], { type: "application/javascript" })));
+          window.policyServiceWorker.postMessage(${JSON.stringify(privateUrl + "?kind=service-worker")});
+          void fetch("https://example.com/?kind=public-subresource", { mode: "no-cors" }).catch(() => {});
+          void 0;
+        `);
+          const kinds = [
+            "fetch",
+            "xhr",
+            "image",
+            "websocket",
+            "dedicated-worker",
+            "shared-worker",
+            "service-worker",
+            "public-subresource",
+          ];
+          const deadline = Date.now() + 10000;
+          await new Promise((resolve) => {
+            const check = () => {
+              const observed = kinds.every((kind) =>
+                global.navigationRequests.some((request) => request.url.endsWith("?kind=" + kind)),
+              );
+              if (observed || Date.now() >= deadline) resolve();
+              else setTimeout(check, 50);
+            };
+            check();
+          });
+          const requests = global.navigationRequests.filter((request) =>
+            kinds.some((kind) => request.url.endsWith("?kind=" + kind)),
+          );
+          const alive = !entry.view.webContents.isDestroyed();
+          entry.agentContext = { trustedPreviewFixture: true };
+          await entry.view.webContents.executeJavaScript(
+            "navigator.serviceWorker.getRegistrations().then((registrations) => Promise.all(registrations.map((registration) => registration.unregister())))",
+          );
+          return { requests, alive };
+        },
+        { port: fixture.address().port },
+      );
+      for (const kind of [
+        "fetch",
+        "xhr",
+        "image",
+        "websocket",
+        "dedicated-worker",
+        "shared-worker",
+        "service-worker",
+      ]) {
+        assert.ok(
+          evidence.subresources.requests.some(
+            (request) => request.url.endsWith("?kind=" + kind) && request.cancel,
+          ),
+          JSON.stringify(evidence.subresources),
+        );
+      }
+      assert.ok(
+        evidence.subresources.requests.some(
+          (request) => request.url.endsWith("?kind=public-subresource") && !request.cancel,
+        ),
+        JSON.stringify(evidence.subresources),
+      );
+      assert.equal(evidence.subresources.alive, true);
 
       const cancellation = await electronApp.evaluate(async (_electron, url) => {
         const registry = global.omnigentTestBrowserRegistries[0];

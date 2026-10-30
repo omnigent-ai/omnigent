@@ -629,11 +629,15 @@ against its local Chromium, and the result is posted back.
   any literal form, except exact loopback hosts for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
-  policy to every document request (frames, `<object>`/`<embed>`) of an
-  agent-locked view through `webRequest`, covering redirects and in-place
-  window opens. Scripts, images, fetch/XHR, and WebSockets are outside this
-  guard and can still reach internal addresses; Electron 42 does not enforce
-  Chromium's Local Network Access checks here.
+  policy to every HTTP(S) and WebSocket request of an agent-locked view through
+  `webRequest`, including frames, `<object>`/`<embed>`, scripts, styles, images,
+  media, and fetch/XHR. Worker network requests use the owning view's policy;
+  requests without a view ID use the most restrictive owner in the partition,
+  or public-only access if no owners remain. Only documents resolve DNS before
+  sending; subresources use URL rules followed by the connected-address check.
+  The existing exact-loopback exception also applies to these requests; LAN
+  and metadata addresses stay blocked. Enforcement cancels requests and keeps
+  the view open.
   Those requests skip HTTP-cache reads so every response reports
   the address Chromium connected to, and a response whose address is missing
   or non-public (a DNS answer that changed after the check) is cancelled,
@@ -648,7 +652,7 @@ against its local Chromium, and the result is posted back.
   agent browsing through such proxies. For a proxied request, the reported IP
   belongs to the proxy, not the destination it fetched; destination enforcement
   therefore also depends on the proxy's own policy. Preflight still requires
-  successful local destination DNS, so proxy-only DNS configurations are not
+  successful local destination DNS for documents, so proxy-only DNS configurations are not
   supported. Classification conservatively excludes all of `2001::/23`,
   including the global exceptions recognized by the Python policy.
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to

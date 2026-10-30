@@ -2564,7 +2564,7 @@ describe("browser permission wiring", () => {
     }
   });
 
-  it("guards each agent partition's document requests through its own Chromium session", async () => {
+  it("guards each agent partition's network requests through its own Chromium session", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
       const sessions = new Map();
@@ -2614,13 +2614,13 @@ describe("browser permission wiring", () => {
       const ses = sessions.get(partitions[0]);
       assert.deepEqual(
         // main.js runs in its own vm realm, so copy its arrays before deepEqual.
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
         [
-          ["request", ["mainFrame", "subFrame", "object"]],
-          ["sendHeaders", ["mainFrame", "subFrame", "object"]],
-          ["headers", ["mainFrame", "subFrame", "object"]],
+          ["request", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
+          ["sendHeaders", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
+          ["headers", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
         ],
-        "installed once per partition, for document requests only",
+        "installed once per partition, for all network request types",
       );
       // Round-trip through JSON so objects from main.js's vm realm compare.
       const decide = (kind, details, session = ses, view = agent) =>
@@ -2639,6 +2639,27 @@ describe("browser permission wiring", () => {
         requestHeaders: { "Cache-Control": "no-cache" },
       });
       assert.deepEqual(await decide("headers", { url: next, ip: "127.0.0.1" }), { cancel: true });
+      ses.lookups.length = 0;
+      const worker = { webContentsId: 0, resourceType: "script" };
+      assert.deepEqual(
+        await decide("request", { ...worker, url: "http://169.254.169.254/worker.js" }),
+        { cancel: true },
+        "a worker without a view ID is guarded using its partition",
+      );
+      assert.deepEqual(await decide("sendHeaders", { ...worker, url: next, requestHeaders: {} }), {
+        requestHeaders: { "Cache-Control": "no-cache" },
+      });
+      assert.deepEqual(await decide("headers", { ...worker, url: next, ip: "127.0.0.1" }), {
+        cancel: true,
+      });
+      assert.deepEqual(
+        await decide("request", { url: "ws://localhost/live", resourceType: "webSocket" }),
+        { cancel: true },
+      );
+      assert.deepEqual(await decide("request", { url: next, resourceType: "xhr" }), {
+        cancel: false,
+      });
+      assert.deepEqual(ses.lookups, [], "subresource hooks do not resolve DNS");
       ses.resolveProxy = async () => {
         throw new Error("proxy lookup failed");
       };
@@ -2656,9 +2677,9 @@ describe("browser permission wiring", () => {
       const otherSession = sessions.get(partitions[2]);
       assert.notEqual(otherSession, ses);
       assert.deepEqual(
-        otherSession.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        "each independent session receives all document hooks",
+        otherSession.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
+        "each independent session receives all network hooks",
       );
       otherSession.dns["example.com"] = "127.0.0.1";
       ses.lookups.length = 0;

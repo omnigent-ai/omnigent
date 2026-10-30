@@ -26,6 +26,12 @@ const {
 } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
+const DOCUMENT_RESOURCE_TYPES = new Set(["mainFrame", "subFrame", "object"]);
+
+// WebSocket handshakes use the same host and connected-address rules as HTTP.
+function agentRequestPolicyUrl(url) {
+  return url.replace(/^ws(s?):/, "http$1:");
+}
 
 /**
  * Storage partition shared by one conversation's browser views. Without an
@@ -417,15 +423,19 @@ function createBrowserViewRegistry({
   // DNS-aware check for an agent's first hop. openOrNavigate stays synchronous
   // (literal checks only), so browserIpc awaits this before it: a name that
   // resolves internally fails with an error instead of creating a blank view.
-  function checkAgentNavigationFor(conversationId, url, agentContext) {
-    const partition = agentPartition(partitionScope, conversationId);
+  function checkAgentNavigationFor(
+    conversationId,
+    url,
+    agentContext,
+    partition = agentPartition(partitionScope, conversationId),
+  ) {
     return checkAgentNavigation(url, {
       allowLocalhost: allowsLocalhost(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
     });
   }
 
-  function agentLockedEntryFor(webContentsId) {
+  function agentLockedEntryFor(webContentsId, partition) {
     for (const entry of entries.values()) {
       let id;
       try {
@@ -435,18 +445,40 @@ function createBrowserViewRegistry({
       }
       if (id === webContentsId) return entry.agentNavLocked ? entry : null;
     }
-    return null;
+    if (!partition) return null;
+    // Workers may lack a view ID. Shared partitions use their strictest owner;
+    // orphaned workers retain public-only access after the last view closes.
+    const owners = [...entries.values()].filter(
+      (entry) => agentPartition(partitionScope, entry.conversationId) === partition,
+    );
+    const publicOnly = { conversationId: "", agentContext: null };
+    const restrictive = owners.find(
+      (entry) => !entry.agentNavLocked || !allowsLocalhost(entry.agentContext),
+    );
+    if (restrictive) return restrictive.agentNavLocked ? restrictive : publicOnly;
+    return owners[0] ?? publicOnly;
   }
 
-  // SECURITY (SSRF): network-layer half of the agent guard, wired by main.js
-  // to webRequest.onBeforeRequest for document requests on these views'
-  // partitions. Resolves true to cancel. Unlike the will-* guards it sees every
-  // hop — redirects, window-open loads, history navigations — and can wait on
-  // DNS, so a public name pointing at an internal address is refused too.
-  async function shouldCancelAgentRequest({ webContentsId, url }) {
-    const entry = agentLockedEntryFor(webContentsId);
-    if (!entry) return false; // user-driven or unattributed: permissive
-    const verdict = await checkAgentNavigationFor(entry.conversationId, url, entry.agentContext);
+  // SECURITY (SSRF): enforce URL rules on every network request. Documents
+  // also resolve DNS before sending; subresources use the connected IP below
+  // to avoid a separate DNS lookup on every script, image, or fetch.
+  async function shouldCancelAgentRequest(
+    { webContentsId, url, resourceType = "mainFrame" },
+    partition,
+  ) {
+    const entry = agentLockedEntryFor(webContentsId, partition);
+    if (!entry) return false;
+    const policyUrl = agentRequestPolicyUrl(url);
+    const verdict = DOCUMENT_RESOURCE_TYPES.has(resourceType)
+      ? await checkAgentNavigationFor(
+          entry.conversationId,
+          policyUrl,
+          entry.agentContext,
+          partition,
+        )
+      : isAgentNavigationAllowed(policyUrl, {
+          allowLocalhost: allowsLocalhost(entry.agentContext),
+        });
     if (verdict.ok) return false;
     sendToRenderer("browser-nav-blocked", {
       conversationId: entry.conversationId,
@@ -458,10 +490,10 @@ function createBrowserViewRegistry({
 
   // Wired to webRequest.onBeforeSendHeaders. A pure HTTP-cache hit reports no
   // connected address (Chromium's HttpCache::Transaction::GetRemoteEndpoint),
-  // so agent documents skip cache reads (`no-cache`, per http_cache_util's
+  // so agent requests skip cache reads (`no-cache`, per http_cache_util's
   // GetLoadFlagsForExtraHeaders) and every response checked below carries one.
-  function agentRequestHeaders({ webContentsId, requestHeaders }) {
-    if (!agentLockedEntryFor(webContentsId)) return {};
+  function agentRequestHeaders({ webContentsId, requestHeaders }, partition) {
+    if (!agentLockedEntryFor(webContentsId, partition)) return {};
     const headers = {};
     const directives = new Map(); // lowercased → as sent, keeping e.g. no-store
     for (const [name, value] of Object.entries(requestHeaders ?? {})) {
@@ -482,20 +514,21 @@ function createBrowserViewRegistry({
 
   // Check Chromium's connected endpoint to catch DNS rebinding.
   // Electron 42 supplies details.ip despite stale typings.
-  async function shouldCancelAgentResponse({ webContentsId, url, ip }) {
-    const entry = agentLockedEntryFor(webContentsId);
+  async function shouldCancelAgentResponse({ webContentsId, url, ip }, partition) {
+    const entry = agentLockedEntryFor(webContentsId, partition);
     if (!entry) return false;
-    const verdict = isAgentConnectionAllowed(url, ip, {
+    const policyUrl = agentRequestPolicyUrl(url);
+    const verdict = isAgentConnectionAllowed(policyUrl, ip, {
       allowLocalhost: allowsLocalhost(entry.agentContext),
     });
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress).
-    const partition = agentPartition(partitionScope, entry.conversationId);
+    const requestPartition = partition ?? agentPartition(partitionScope, entry.conversationId);
     const proxied =
       !!ip &&
-      (await isProxyAddress(ip, await resolveProxy(url, partition), (hostname) =>
-        resolveHost(hostname, partition),
+      (await isProxyAddress(ip, await resolveProxy(policyUrl, requestPartition), (hostname) =>
+        resolveHost(hostname, requestPartition),
       ));
     if (proxied) return false;
     sendToRenderer("browser-nav-blocked", {
