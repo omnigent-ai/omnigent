@@ -2029,7 +2029,7 @@ async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
 
 async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
     task = _task(store)
-    clock = FakeClock(task.created_at + 60)
+    clock = FakeClock(task.created_at)
     owned = False
 
     async def owned_hosts(keys):
@@ -2057,7 +2057,7 @@ async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
 
 async def test_run_now_keeps_a_recorded_request_when_starting_it_here_fails(store) -> None:
     task = _task(store)
-    clock = FakeClock(task.created_at + 60)
+    clock = FakeClock(task.created_at)
     calls = 0
 
     async def owned_hosts(keys):
@@ -2180,7 +2180,7 @@ async def test_a_continue_task_runs_where_its_session_host_is_not_the_workspace_
         == "adopted"
     )
     task = store.get(task.id)
-    clock = FakeClock(task.created_at + 60)
+    clock = FakeClock(task.created_at)
     fired = {"a": AsyncMock(), "b": AsyncMock()}
 
     def replica(name, owns):
