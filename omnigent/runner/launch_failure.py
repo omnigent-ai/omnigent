@@ -112,6 +112,18 @@ _AUTH_MARKERS = (
     "not authenticated",
 )
 
+# --- Claude Code install failed or left broken -------------------------------
+# A launcher that installs Claude Code before starting it reports npm's
+# ENOENT text, which also reads like a missing binary.
+_BROKEN_CLAUDE_INSTALL_MARKERS = (
+    "failedtoinstallclaudecode",
+    "claudenativebinarynotinstalled",
+)
+# The launcher's exec of a half-written binary, e.g. "Exec format error: '~/.local/bin/claude'".
+_EXEC_FORMAT_ERROR = re.compile(r"execformaterror\W+\S*?claude")
+# Pane captures wrap long lines and draw borders, which can split a marker.
+_PANE_WRAP = re.compile(r"[\s│┃]+")
+
 # --- binary missing -----------------------------------------------------------
 _MISSING_MARKERS = (
     "command not found",
@@ -134,7 +146,8 @@ _REJECTED_ARGUMENT_MARKERS = (
 
 
 # Ordered most-specific first: the root case also reads like a permission /
-# auth problem, so it must win over the broader rules below it.
+# auth problem, and a broken install like a missing binary, so they must win
+# over the broader rules below them.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     _TerminalMatcher(
         "root_permission",
@@ -146,6 +159,21 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    _TerminalMatcher(
+        "claude_install_broken",
+        lambda s: _claude_install_is_broken(s.output),
+        FailureDiagnosis(
+            title="Claude Code's install is broken",
+            cause=(
+                "Claude Code could not start because its install failed or is incomplete. "
+                "Launches that update Claude Code at the same time can leave it this way."
+            ),
+            remediation=(
+                "Send your message again. If it fails again, reinstall Claude Code on the "
+                "host with the installer you used, then retry."
+            ),
         ),
     ),
     _TerminalMatcher(
@@ -208,6 +236,13 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
         ),
     ),
 )
+
+
+def _claude_install_is_broken(output: str) -> bool:
+    compact = _PANE_WRAP.sub("", output)
+    return any(m in compact for m in _BROKEN_CLAUDE_INSTALL_MARKERS) or bool(
+        _EXEC_FORMAT_ERROR.search(compact)
+    )
 
 
 def classify_terminal_failure(
