@@ -241,7 +241,13 @@ header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
 budgets, MCP servers, sandbox provider lifecycle beyond profile configuration,
-and smart routing.
+and smart routing. Smart routing's per-worker model lists, which `sys_list_models`
+also returns, are covered by component tests only: `tests/test_model_catalog.py`
+for the worker rows and `tests/host/test_connect.py` for the host's
+`GET /v1/hosts/{id}/harnesses/claude-sdk/model-options` answer. A Claude Code or
+Codex SDK worker on a CLI login lists the host's cached native probe of that
+login; behind a gateway, `apiKeyHelper` or cloud transport, or with Codex logged
+out, it lists nothing.
 
 ## Keeping the map current
 

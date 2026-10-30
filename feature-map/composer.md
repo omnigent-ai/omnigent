@@ -807,6 +807,9 @@ Other connection providers alone do not enable the managed MCP picker.
   creators, so Claude and Codex catalogs normally stay flat. A model whose IDs
   don't name a known creator (a router alias such as Pi's `radius/balanced`)
   lands in Other models; that is expected, not a missing catalog.
+- The Claude and Codex pickers here list the native harnesses' catalogs. A
+  `claude-sdk` or `codex` SDK worker has no picker of its own, so don't verify
+  its models here: see the smart routing note in the [index](./README.md#not-yet-mapped).
 - The managed MCP picker uses only the administrator's registry; it does not
   add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
   connections. Bearer-token accounts must be connected in settings first.
