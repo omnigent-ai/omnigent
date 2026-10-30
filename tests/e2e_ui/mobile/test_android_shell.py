@@ -278,11 +278,12 @@ def test_android_scrolled_settings_page_keeps_status_bar_blank(
     assert marker_rows == [], f"scrolled Settings paints in the status bar at rows {marker_rows}"
 
     if viewport is _MOBILE_VIEWPORT:
-        # The phone title is fixed in the header row; its glyphs must still paint.
+        # The fixed phone title must paint: hiding it has to change its pixels.
         box = title.bounding_box()
         assert box is not None
-        title_pixels = Image.open(io.BytesIO(page.screenshot(clip=box))).convert("L")
-        assert title_pixels.getextrema()[0] < 100, "the Settings title is hidden"
+        shown_title = page.screenshot(clip=box)
+        title.evaluate("element => { element.style.visibility = 'hidden'; }")
+        assert page.screenshot(clip=box) != shown_title, "the Settings title is hidden"
 
 
 # Bridge stub that also CAPTURES the notification-activation callback the SPA
