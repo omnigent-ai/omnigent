@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -19,7 +21,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms have no flock
 import click
 
 from omnigent.onboarding.databricks_config import normalize_workspace_url
-from omnigent.onboarding.ucode_state import read_ucode_state
+from omnigent.onboarding.ucode_state import read_ucode_config_scope, read_ucode_state
 
 _logger = logging.getLogger(__name__)
 
@@ -32,9 +34,14 @@ _UCODE_AGENT_NAMES: tuple[str, ...] = ("claude", "codex", "pi")
 # ucode's ``main`` HEAD (a mutable ref that can move under us between runs and
 # break setup unexpectedly). A full SHA is immutable, so uvx caches the built
 # wheel by ref and reuses it across runs — no ``--refresh-package`` needed to
-# defeat a mutable branch's stale cache.
-_UCODE_GIT_REF = "304e4a29c5ca73b3bfaaf1911e38d0080833fda4"
+# defeat a mutable branch's stale cache. This is ucode v0.2.1, the first
+# release whose ``configure --user`` writes settings without sudo.
+_UCODE_GIT_REF = "5f72236eea3ab01db2cc4ff5fd4f15ede7626c33"
 _UCODE_UVX_SOURCE = f"git+https://github.com/databricks/ucode@{_UCODE_GIT_REF}"
+
+# ucode refuses ``configure --user`` while Codex's machine-wide config exists.
+_CODEX_MANAGED_CONFIG_PATH = Path("/etc/codex/managed_config.toml")
+_MACOS_ADMIN_GROUP = "admin"
 
 
 def model_gateway_workspace_urls() -> list[str]:
@@ -61,32 +68,127 @@ def model_gateway_workspace_urls() -> list[str]:
 def build_ucode_configure_command(
     ucode_command: Sequence[str],
     *,
-    workspace_urls: Sequence[str],
+    workspace_url: str,
     agents: Sequence[str] = _UCODE_AGENT_NAMES,
+    user_scope: bool = False,
 ) -> list[str]:
     """Build the ``ucode configure`` command Omnigent runs.
 
     :param ucode_command: Command prefix that invokes ucode, e.g.
         ``("/usr/bin/ucode",)`` or ``("uvx", "--from",
         "git+https://github.com/databricks/ucode@<sha>", "ucode")``.
-    :param workspace_urls: Workspace URLs to configure. Must be non-empty.
+    :param workspace_url: The one workspace URL to configure; ucode
+        configures a single workspace per run.
     :param agents: ucode agent names to configure non-interactively,
         e.g. ``("claude", "codex", "pi")``.
-    :returns: Command argv using ucode's comma-separated ``--workspaces``
-        and ``--agents`` options.
-    :raises ValueError: If *workspace_urls* is empty.
+    :param user_scope: Pass ``--user`` so ucode writes per-user settings
+        only, never the machine-wide managed settings that need sudo.
+    :returns: Command argv using ucode's ``--workspaces`` and
+        comma-separated ``--agents`` options.
     """
-    if not workspace_urls:
-        raise ValueError("workspace_urls must not be empty")
-    return [
+    argv = [
         *ucode_command,
         "configure",
         "--workspaces",
-        ",".join(normalize_workspace_url(url) for url in workspace_urls),
+        normalize_workspace_url(workspace_url),
         "--agents",
         ",".join(agents),
-        "--enable-fable",
     ]
+    if user_scope:
+        argv.append("--user")
+    return argv
+
+
+def _lacks_macos_admin_rights() -> bool:
+    """Return whether this is a macOS account that cannot approve a sudo prompt.
+
+    :returns: ``True`` on macOS when the user is neither root nor a member
+        of the ``admin`` group; ``False`` on every other platform.
+    """
+    if sys.platform != "darwin" or os.geteuid() == 0:
+        return False
+    import grp
+    import pwd
+
+    try:
+        admin_gid = grp.getgrnam(_MACOS_ADMIN_GROUP).gr_gid
+        user_name = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return False
+    else:
+        return admin_gid not in os.getgrouplist(user_name, os.getgid())
+
+
+def _machine_managed_settings_exist(agents: Sequence[str]) -> bool:
+    """Return whether a selected harness already has machine-wide managed settings.
+
+    :param agents: ucode agent names being configured, e.g. ``("claude",)``.
+    :returns: ``True`` when Claude Code's managed-settings file or Codex's
+        managed config exists for a selected agent.
+    """
+    from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+    paths: list[Path] = []
+    if "claude" in agents:
+        paths.extend(CLAUDE_CODE_MANAGED_SETTINGS_PATHS)
+    if "codex" in agents:
+        paths.append(_CODEX_MANAGED_CONFIG_PATH)
+    return any(path.exists() for path in paths)
+
+
+def _ucode_user_scope_preferred(agents: Sequence[str] = _UCODE_AGENT_NAMES) -> bool:
+    """Return whether ``ucode configure`` should run with ``--user``.
+
+    Keeps a ``--user`` scope already recorded in ucode's state, since a run
+    without it resets ucode to machine-wide settings. A macOS account without
+    admin rights also gets ``--user``, because ucode's default writes managed
+    settings through sudo. Existing managed files rule that out: ucode refuses
+    ``--user`` over them.
+
+    :param agents: ucode agent names being configured, e.g.
+        ``("claude", "codex", "pi")``.
+    :returns: ``True`` when Omnigent should pass ``--user``.
+    """
+    if read_ucode_config_scope() == "user":
+        return True
+    return _lacks_macos_admin_rights() and not _machine_managed_settings_exist(agents)
+
+
+def run_ucode_configure(
+    ucode_command: Sequence[str],
+    workspace_url: str,
+    *,
+    agents: Sequence[str] = _UCODE_AGENT_NAMES,
+) -> None:
+    """Run ``ucode configure`` for one workspace in the user's terminal.
+
+    :param ucode_command: Command prefix from :func:`find_ucode_command`.
+    :param workspace_url: The workspace to configure, e.g.
+        ``"https://example.databricks.com"``.
+    :param agents: ucode agent names to configure non-interactively.
+    :returns: None.
+    :raises click.ClickException: If ``ucode configure`` exits non-zero.
+    """
+    user_scope = _ucode_user_scope_preferred(agents)
+    scope_flag = " --user" if user_scope else ""
+    click.echo(f"Running `ucode configure --workspaces {workspace_url}{scope_flag}`...")
+    argv = build_ucode_configure_command(
+        ucode_command, workspace_url=workspace_url, agents=agents, user_scope=user_scope
+    )
+    result = subprocess.run(argv, check=False)
+    if result.returncode == 0:
+        return
+    message = (
+        f"`ucode configure` exited with code {result.returncode}; "
+        "see the command output above for details."
+    )
+    if not user_scope:
+        message += (
+            " If it could not update machine-wide managed settings (that needs "
+            "administrator rights), configure your user only, then rerun setup:\n"
+            f"  {shlex.join([*argv, '--user'])}"
+        )
+    raise click.ClickException(message)
 
 
 def configure_ucode_for_workspace(
@@ -114,19 +216,7 @@ def configure_ucode_for_workspace(
     :raises click.ClickException: If ucode cannot be resolved (see
         :func:`find_ucode_command`) or ``ucode configure`` exits non-zero.
     """
-    ucode_command = find_ucode_command()
-    click.echo(f"Running `ucode configure --workspaces {workspace_url}`...")
-    result = subprocess.run(
-        build_ucode_configure_command(
-            ucode_command, workspace_urls=[workspace_url], agents=agents
-        ),
-        check=False,
-    )
-    if result.returncode != 0:
-        raise click.ClickException(
-            f"`ucode configure` exited with code {result.returncode}; "
-            "see the command output above for details."
-        )
+    run_ucode_configure(find_ucode_command(), workspace_url, agents=agents)
     click.echo("ucode configuration complete. Omnigent will use state.json for harness setup.")
 
 

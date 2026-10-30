@@ -10,6 +10,7 @@ from unittest.mock import patch
 from omnigent.onboarding.ucode_state import (
     UcodeWorkspaceState,
     read_current_ucode_state,
+    read_ucode_config_scope,
     read_ucode_state,
 )
 
@@ -261,3 +262,17 @@ def test_workspace_host_does_not_depend_on_claude_url() -> None:
         available_tools=[],
     )
     assert state.workspace_host == "https://example.cloud.databricks.com"
+
+
+def test_read_ucode_config_scope_reads_saved_scope(tmp_path: Path) -> None:
+    """Returns the scope ucode recorded, and ``None`` when it recorded none."""
+    scoped = _write_state(tmp_path, {**_VALID_STATE, "config_scope": "user"})
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", scoped):
+        assert read_ucode_config_scope() == "user"
+
+    unscoped = _write_state(tmp_path, _VALID_STATE)
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", unscoped):
+        assert read_ucode_config_scope() is None
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", tmp_path / "missing.json"):
+        assert read_ucode_config_scope() is None
