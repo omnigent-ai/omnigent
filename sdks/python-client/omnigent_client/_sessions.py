@@ -184,9 +184,6 @@ class Session:
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
     :param host_id: Host owning this session's runner, or ``None`` when unbound.
-    :param pending_elicitations: Outstanding prompts as raw
-        ``response.elicitation_request`` events. The live stream doesn't
-        replay them, so a client that subscribes late reads them from here.
     """
 
     id: str
@@ -209,7 +206,6 @@ class Session:
     external_session_id: str | None = None
     archived: bool = False
     host_id: str | None = None
-    pending_elicitations: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -247,9 +243,6 @@ class Session:
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
             host_id=raw.get("host_id"),
-            pending_elicitations=[
-                event for event in raw.get("pending_elicitations") or [] if isinstance(event, dict)
-            ],
         )
 
 

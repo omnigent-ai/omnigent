@@ -340,6 +340,6 @@ def test_settle_resolved_elsewhere_releases_an_open_field_prompt() -> None:
         return unrelated, mine
 
     assert _run(_run_case()) == (None, "approved elsewhere")
-    # Every resolution is recorded, even one with no prompt open here.
+    # The adapter hears every resolution: the request may still be queued there.
     assert recorded == ["elicit_x", "elicit_q"]
     assert not state.pending

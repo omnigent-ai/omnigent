@@ -1008,7 +1008,7 @@ class _FieldInputState:
         # the next field after the turn is already gone.
         self._aborted: bool = False
         # Elicitation the open prompt answers, so another client's verdict
-        # for it can release the prompt; set when the abort came from there.
+        # for it can release the prompt.
         self._elicitation_id: str | None = None
 
     @property
@@ -1062,6 +1062,22 @@ class _FieldInputState:
         self._future = None
         self._field_name = None
         self._elicitation_id = None
+
+
+@dataclass
+class _PromptTicket:
+    """One elicitation request waiting for, or holding, the terminal prompt.
+
+    :param elicitation_id: Id of the elicitation, e.g. ``"elicit_abc"``. The
+        server may reuse an id for a later request, which gets a new ticket.
+    :param event: The translated :class:`ElicitationRequest`.
+    :param settled: Set once a verdict from here is no longer wanted: another
+        client answered the request, or the server re-asked under its id.
+    """
+
+    elicitation_id: str
+    event: object
+    settled: bool = False
 
 
 def _settle_resolved_elsewhere(
@@ -1319,16 +1335,6 @@ def _elicitation_resolve_session_id(sdk_event: object, fallback_session_id: str)
     return getattr(sdk_event, "target_session_id", None) or fallback_session_id
 
 
-def _log_replay_failure(task: asyncio.Task[None]) -> None:
-    """Log a pending-prompt replay that raised; it runs detached from the pump."""
-    if task.cancelled() or task.exception() is None:
-        return
-    # One line, details behind DEBUG: a WARNING with exc_info paints a
-    # traceback over the TUI (no log handlers are configured).
-    _log.warning("Could not replay pending prompts")
-    _log.debug("pending prompt replay failed", exc_info=task.exception())
-
-
 def _dict_or_none(value: object) -> dict[str, object] | None:
     """Return *value* when it is a dict, else ``None``."""
     return value if isinstance(value, dict) else None
@@ -1544,19 +1550,14 @@ class _SessionsChatReplAdapter:
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
         self._field_input_state = field_input_state
-        # Prompts already handed to the terminal. A prompt can arrive twice:
-        # live on the stream and from the snapshot replayed on subscribe.
-        self._seen_elicitation_ids: set[str] = set()
-        # Ids another client settled, so a stale snapshot replay can't reopen them.
-        self._resolved_elicitation_ids: set[str] = set()
+        # Prompts queued or open, by elicitation id: a repeat request for one
+        # is dropped, and another client's verdict settles it.
+        self._prompt_tickets: dict[str, _PromptTicket] = {}
         # One terminal prompt at a time: they share the input line, and a
         # second prompt would otherwise take it from the first.
         self._prompt_lock = asyncio.Lock()
-        # Elicitation whose prompt holds ``_prompt_lock`` (shown to the user),
-        # and the session whose stream (and snapshot) it arrived on.
-        self._open_elicitation_id: str | None = None
-        self._open_elicitation_stream: str | None = None
-        self._replay_task: asyncio.Task[None] | None = None
+        # The prompt holding ``_prompt_lock`` (shown to the user).
+        self._open_ticket: _PromptTicket | None = None
         self._host = host
         self._fmt = fmt
         self._session_id: str | None = session_id
@@ -2454,13 +2455,6 @@ class _SessionsChatReplAdapter:
             ready.cancel()
 
     async def _stream_pump(self) -> None:
-        """Run the stream pump; a replay never outlives it (switch, clear, exit)."""
-        try:
-            await self._stream_pump_forever()
-        finally:
-            self._cancel_replay()
-
-    async def _stream_pump_forever(self) -> None:
         """Subscribe to ``/v1/sessions/{id}/stream`` indefinitely.
 
         Subscribes to the session's SSE stream and pushes every
@@ -2491,14 +2485,8 @@ class _SessionsChatReplAdapter:
                         file=sys.stderr,
                         flush=True,
                     )
-                replay_scheduled = False
                 async for event in self._client.sessions.stream(self._session_id):
                     self._stream_ready.set()
-                    if not replay_scheduled:
-                        # The stream doesn't replay prompts raised before it
-                        # opened (REPL startup, reconnects); read them once.
-                        replay_scheduled = True
-                        self._start_replay(self._session_id)
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2847,59 +2835,67 @@ class _SessionsChatReplAdapter:
 
         task.add_done_callback(_discard_task)
 
+    def queue_elicitation(self, session_id: str, event: object) -> asyncio.Task[None] | None:
+        """Queue the terminal prompt for an elicitation; its task POSTs the verdict.
+
+        The request is registered before this returns, so a resolved event
+        handled right after it settles the prompt instead of missing it.
+
+        :param session_id: Session to post the verdict to.
+        :param event: The translated :class:`ElicitationRequest`.
+        :returns: The task collecting the verdict, or ``None`` when *event*
+            repeats a request that is still queued or open.
+        """
+        elicitation_id = getattr(event, "elicitation_id", "")
+        current = self._prompt_tickets.get(elicitation_id)
+        if current is not None:
+            if current.event == event:
+                return None
+            # Re-asked under the same id: the old request's verdict must not answer it.
+            self.note_elicitation_resolved(elicitation_id)
+        ticket = _PromptTicket(elicitation_id, event)
+        if elicitation_id:
+            self._prompt_tickets[elicitation_id] = ticket
+        return asyncio.create_task(self._answer_prompt(session_id, ticket))
+
     async def _handle_elicitation(
         self,
         session_id: str,
         event: object,
-        stream_session_id: str | None = None,
     ) -> None:
         """
         Route an elicitation through the hook and POST the verdict.
 
         :param session_id: Session to post the approval to.
-        :param stream_session_id: Session whose stream delivered the event;
-            defaults to the session current when this starts.
         :param event: The translated :class:`ElicitationRequest`.
         """
-        elicitation_id = getattr(event, "elicitation_id", "")
-        stream = stream_session_id if stream_session_id is not None else self._session_id
-        if elicitation_id:
-            if (
-                elicitation_id in self._seen_elicitation_ids
-                or elicitation_id in self._resolved_elicitation_ids
-            ):
-                return
-            self._seen_elicitation_ids.add(elicitation_id)
-        async with self._prompt_lock:
-            # Another client may have settled it while this waited its turn.
-            if elicitation_id in self._resolved_elicitation_ids:
-                return
-            self._open_elicitation_id = elicitation_id
-            # Not ``session_id``: a mirrored child prompt resolves against the
-            # child but is listed in the parent stream's snapshot.
-            self._open_elicitation_stream = stream
-            try:
-                resolve_payload = await self._collect_verdict(event, elicitation_id)
-            finally:
-                self._open_elicitation_id = None
-                self._open_elicitation_stream = None
-        if resolve_payload is None:
-            return  # another client answered it
-        delivered = False
-        try:
-            delivered = await self._post_elicitation_verdict(
-                session_id, elicitation_id, resolve_payload
-            )
-        finally:
-            if not delivered:
-                # Still parked server-side: let a later snapshot replay offer it again.
-                self._seen_elicitation_ids.discard(elicitation_id)
+        task = self.queue_elicitation(session_id, event)
+        if task is not None:
+            await task
 
-    async def _collect_verdict(
-        self, event: object, elicitation_id: str
-    ) -> dict[str, object] | None:
-        """Prompt for *event* and build its resolve payload (``None``: post nothing)."""
-        ask_user_question = getattr(event, "ask_user_question", None)
+    async def _answer_prompt(self, session_id: str, ticket: _PromptTicket) -> None:
+        """Prompt for *ticket* when its turn comes and POST the verdict."""
+        try:
+            async with self._prompt_lock:
+                if ticket.settled:
+                    return  # its verdict is no longer wanted from here
+                self._open_ticket = ticket
+                try:
+                    resolve_payload = await self._collect_verdict(ticket)
+                finally:
+                    self._open_ticket = None
+            if resolve_payload is not None:
+                await self._post_elicitation_verdict(
+                    session_id, ticket.elicitation_id, resolve_payload
+                )
+        finally:
+            # Finished with this request, so a later one may reuse its id.
+            if self._prompt_tickets.get(ticket.elicitation_id) is ticket:
+                del self._prompt_tickets[ticket.elicitation_id]
+
+    async def _collect_verdict(self, ticket: _PromptTicket) -> dict[str, object] | None:
+        """Prompt for *ticket*'s request and build its resolve payload (``None``: post nothing)."""
+        ask_user_question = getattr(ticket.event, "ask_user_question", None)
         questions = _question_prompts(ask_user_question)
         if isinstance(ask_user_question, dict) and not questions:
             # Nothing usable to ask; an approval would accept with no answers.
@@ -2907,131 +2903,32 @@ class _SessionsChatReplAdapter:
         if questions and self._host is not None:
             # Questions get the selector: a y/a/n accept would carry no answers.
             return await self._question_payload(
-                elicitation_id, questions, secret=_asks_for_secret(ask_user_question)
+                ticket, questions, secret=_asks_for_secret(ask_user_question)
             )
-        return await self._approval_payload(event, elicitation_id)
+        return await self._approval_payload(ticket)
 
     def note_elicitation_resolved(self, elicitation_id: str) -> None:
-        """Record that a client settled *elicitation_id* so it is never prompted again."""
-        if not elicitation_id:
+        """Settle the queued or open request for *elicitation_id* so no verdict is posted."""
+        ticket = self._prompt_tickets.pop(elicitation_id, None)
+        if ticket is None:
             return
-        self._resolved_elicitation_ids.add(elicitation_id)
-        if elicitation_id == self._open_elicitation_id and self._host is not None:
+        ticket.settled = True
+        if ticket is self._open_ticket and self._host is not None:
             self._host.dismiss_questions()
 
-    async def _post_elicitation_verdict(
-        self,
-        session_id: str,
-        elicitation_id: str,
-        resolve_payload: dict[str, object],
-    ) -> bool:
-        """POST the verdict, retrying transport errors.
-
-        :returns: ``True`` once the server has the verdict (or reports it
-            already resolved); ``False`` when every attempt failed.
-        """
-
-        # Retrying is safe: the server accepts a retry or reports it already
-        # resolved (``not_found``), even if a dropped response hid a success.
-        for attempt in range(3):
-            try:
-                await self._client.sessions.resolve_elicitation(
-                    session_id,
-                    elicitation_id,
-                    resolve_payload,
-                )
-                return True
-            except OmnigentError as exc:
-                if exc.code == "not_found":
-                    # Another client may have resolved it while the terminal
-                    # prompt was open, or the first POST reached the server.
-                    return True
-                raise
-            except Exception as exc:
-                if not _is_recoverable_sse_transport_error(exc):
-                    raise
-                if attempt == 2:
-                    _log.warning("Could not resolve elicitation after transport retries")
-                    _log.debug("elicitation resolve failed", exc_info=exc)
-                    # The elicitation is still parked server-side, so the
-                    # turn waits on a verdict that will never arrive. Say so
-                    # instead of leaving an apparently live prompt.
-                    self._emit_elicitation_resolve_error(exc)
-                    return False
-                await asyncio.sleep(0.1 * (2**attempt))
-        return False
-
-    def _start_replay(self, session_id: str | None) -> None:
-        """Replay *session_id*'s pending prompts, replacing any earlier replay."""
-        self._cancel_replay()
-        if session_id is None:
-            return
-        self._replay_task = asyncio.create_task(self._replay_pending_elicitations(session_id))
-        self._replay_task.add_done_callback(_log_replay_failure)
-
-    def _cancel_replay(self) -> None:
-        if self._replay_task is not None and not self._replay_task.done():
-            self._replay_task.cancel()
-        self._replay_task = None
-
-    async def _replay_pending_elicitations(self, session_id: str) -> None:
-        """Feed prompts raised before this subscription opened through the live path.
-
-        :param session_id: Session the subscription belongs to; results are
-            dropped if the REPL switched sessions while the snapshot loaded.
-        """
-        from omnigent_client._sessions import _SERVER_STREAM_EVENT_ADAPTER
-
-        from omnigent.server.schemas import ElicitationResolvedEvent
-
-        if self._on_event is None:
-            return
-        open_before = self._open_elicitation_id
-        # Only the snapshot of the stream the prompt arrived on lists it (with
-        # its descendants'); a child's snapshot never lists the parent's.
-        open_here = self._open_elicitation_stream == session_id
-        try:
-            snapshot = await self._client.sessions.get(session_id)
-        except Exception:  # noqa: BLE001
-            _log.debug("could not read pending prompts", exc_info=True)
-            return
-        if self._session_id != session_id:
-            return
-        pending_ids = {raw.get("elicitation_id") for raw in snapshot.pending_elicitations}
-        if (
-            open_before is not None
-            and open_here
-            and open_before == self._open_elicitation_id
-            and open_before not in pending_ids
-        ):
-            # Settled while the stream was down, so its resolved event never
-            # arrived; release it the same way, or it holds the prompt lock.
-            self._on_event(
-                ElicitationResolvedEvent(
-                    type="response.elicitation_resolved", elicitation_id=open_before
-                )
-            )
-        for raw in snapshot.pending_elicitations:
-            try:
-                event = _SERVER_STREAM_EVENT_ADAPTER.validate_python(raw)
-            except ValueError:
-                continue
-            self._on_event(event)
-
-    async def _approval_payload(
-        self, event: object, elicitation_id: str
-    ) -> dict[str, object] | None:
+    async def _approval_payload(self, ticket: _PromptTicket) -> dict[str, object] | None:
         """Run the y/a/n approval hook and build the resolve payload.
 
-        :param event: The translated :class:`ElicitationRequest`.
-        :param elicitation_id: Id of the elicitation being answered.
+        :param ticket: The request being answered.
         :returns: ``{"action": ..., "content"?: ...}`` for the resolve POST, or
-            ``None`` when another client answered its form mid-prompt.
+            ``None`` when another client answered it mid-prompt.
         """
         import inspect
 
         from omnigent_client._tool_handler import ElicitationRequestCtx
 
+        event = ticket.event
+        elicitation_id = ticket.elicitation_id
         hook = self._hooks.on_elicitation_request
         if hook is None:
             action = "decline"
@@ -3054,7 +2951,7 @@ class _SessionsChatReplAdapter:
                 action = "accept" if result else "decline"
             except Exception:  # noqa: BLE001
                 action = "decline"
-        if elicitation_id in self._resolved_elicitation_ids:
+        if ticket.settled:
             return None  # settled elsewhere while the y/a/n card was open
         # Build the resolve payload. For accept with a requestedSchema,
         # populate ``content`` from the schema so the MCP server receives
@@ -3073,10 +2970,10 @@ class _SessionsChatReplAdapter:
                 # agent turn doesn't hang waiting on a verdict that the
                 # background task would otherwise never POST.
                 try:
-                    prompted = await self._prompt_schema_fields(schema, elicitation_id)
+                    prompted = await self._prompt_schema_fields(schema, ticket)
                 except Exception:  # noqa: BLE001
                     prompted = None
-                if elicitation_id in self._resolved_elicitation_ids:
+                if ticket.settled:
                     return None  # settled elsewhere mid-form
                 if prompted is not None:
                     resolve_payload["content"] = prompted
@@ -3085,16 +2982,60 @@ class _SessionsChatReplAdapter:
 
         return resolve_payload
 
+    async def _post_elicitation_verdict(
+        self,
+        session_id: str,
+        elicitation_id: str,
+        resolve_payload: dict[str, object],
+    ) -> None:
+        """POST the verdict, retrying transport errors."""
+        # URL-based elicitation: deliver the verdict to the elicitation's
+        # dedicated resolve URL rather than as an in-band ``approval`` event.
+        # A transport error can happen after the server accepted the POST but
+        # before the client received its response, so retrying is safe: the
+        # server either accepts the retry or reports the elicitation resolved.
+        for attempt in range(3):
+            try:
+                await self._client.sessions.resolve_elicitation(
+                    session_id,
+                    elicitation_id,
+                    resolve_payload,
+                )
+                return
+            except OmnigentError as exc:
+                if exc.code == "not_found":
+                    # Another client may have resolved it while the terminal
+                    # prompt was open, or the first POST reached the server.
+                    return
+                raise
+            except Exception as exc:
+                if not _is_recoverable_sse_transport_error(exc):
+                    raise
+                if attempt == 2:
+                    # One line here, postmortem behind DEBUG: the REPL
+                    # configures no log handlers, so a WARNING carrying
+                    # exc_info falls through to ``logging.lastResort`` and
+                    # paints a traceback over the TUI frame. Same split
+                    # ``_stream_pump`` makes for the same reason.
+                    _log.warning("Could not resolve elicitation after transport retries")
+                    _log.debug("elicitation resolve failed", exc_info=exc)
+                    # The elicitation is still parked server-side, so the
+                    # turn waits on a verdict that will never arrive. Say so
+                    # instead of leaving an apparently live prompt.
+                    self._emit_elicitation_resolve_error(exc)
+                    return
+                await asyncio.sleep(0.1 * (2**attempt))
+
     async def _question_payload(
         self,
-        elicitation_id: str,
+        ticket: _PromptTicket,
         questions: list[QuestionSpec],
         *,
         secret: bool,
     ) -> dict[str, object] | None:
         """Ask the questions in the terminal's selector and build the resolve payload.
 
-        :param elicitation_id: Id of the elicitation being answered.
+        :param ticket: The request being answered.
         :param questions: Parsed questions from the ``ask_user_question`` extra.
         :param secret: Whether a question is marked secret.
         :returns: An accept carrying the web form's answer shape, a decline
@@ -3121,7 +3062,7 @@ class _SessionsChatReplAdapter:
         except Exception:  # noqa: BLE001
             # Never leave the elicitation unresolved: a failed prompt declines.
             answers = None
-        if elicitation_id in self._resolved_elicitation_ids:
+        if ticket.settled:
             return None  # answered in another client while the selector was open
         if answers is None:
             return {"action": "decline"}
@@ -3130,12 +3071,14 @@ class _SessionsChatReplAdapter:
     async def _prompt_schema_fields(
         self,
         schema: dict[str, object],
-        elicitation_id: str | None = None,
+        ticket: _PromptTicket | None = None,
     ) -> dict[str, str | int | float | bool | list[str] | None] | None:
         """Prompt the user for each schema property via the main input loop.
 
         Returns the filled content dict, or ``None`` if the interactive
         state is unavailable (e.g. no ``_field_input_state`` wired up).
+        *ticket* is the request being answered; collection stops once
+        another client settles it.
         """
         from rich.text import Text
 
@@ -3156,7 +3099,7 @@ class _SessionsChatReplAdapter:
         for key, prop in properties.items():
             if not isinstance(prop, dict):
                 return None
-            if elicitation_id is not None and elicitation_id in self._resolved_elicitation_ids:
+            if ticket is not None and ticket.settled:
                 return None  # settled elsewhere between fields: ask nothing more
 
             prop_type = prop.get("type", "string")
@@ -3201,7 +3144,7 @@ class _SessionsChatReplAdapter:
             # everything: a single typo on field N shouldn't decline the
             # whole form. The user aborts the turn with Esc (→ ``aborted``).
             while True:
-                raw = await fis.begin(key, elicitation_id)
+                raw = await fis.begin(key, ticket.elicitation_id if ticket is not None else None)
                 if fis.aborted:
                     return None
 
@@ -4448,13 +4391,10 @@ async def run_repl(
             sid = _elicitation_resolve_session_id(
                 sdk_ev, getattr(session, "session_id", None) or ""
             )
-            # Capture the delivering stream now: a session switch may happen
-            # while this prompt waits for the prompt lock.
-            elicit_task = asyncio.create_task(
-                session._handle_elicitation(sid, sdk_ev, stream_session_id=session.session_id),
-            )
-            _background_event_tasks.add(elicit_task)
-            elicit_task.add_done_callback(_background_event_tasks.discard)
+            elicit_task = session.queue_elicitation(sid, sdk_ev)
+            if elicit_task is not None:
+                _background_event_tasks.add(elicit_task)
+                elicit_task.add_done_callback(_background_event_tasks.discard)
             if tape_entry is not None:
                 _maybe_log_tape_entry(tape_entry)
             return

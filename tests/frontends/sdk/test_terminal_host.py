@@ -1854,7 +1854,8 @@ async def test_question_picker_scrolls_long_lists_and_truncates_wide_lines() -> 
 
 
 @pytest.mark.asyncio
-async def test_ask_questions_sets_the_draft_aside_and_restores_it() -> None:
+@pytest.mark.parametrize("dismissed", [False, True], ids=["answered", "dismissed"])
+async def test_ask_questions_sets_the_draft_aside_and_restores_it(dismissed: bool) -> None:
     host = TerminalHost(model_name="test")
     buffer = host._prompt.default_buffer
     buffer.text = "half-typed chat message"
@@ -1863,24 +1864,14 @@ async def test_ask_questions_sets_the_draft_aside_and_restores_it() -> None:
     await asyncio.sleep(0)
     assert host._question_picker is not None
     assert buffer.text == "", "the selector starts with an empty input line"
-    host._move_question_highlight(1)
-    host._answer_question(buffer)
+    if dismissed:
+        buffer.text = "typed into the selector"
+        host.dismiss_questions()
+    else:
+        host._move_question_highlight(1)
+        host._answer_question(buffer)
 
-    assert await asking == {"Env?": "staging"}
-    assert host._question_picker is None
-    assert buffer.text == "half-typed chat message"
-
-
-@pytest.mark.asyncio
-async def test_dismiss_questions_returns_none_and_restores_the_draft() -> None:
-    host = TerminalHost(model_name="test")
-    buffer = host._prompt.default_buffer
-    buffer.text = "half-typed chat message"
-    asking = asyncio.create_task(host.ask_questions([_env_question()]))
-    await asyncio.sleep(0)
-    buffer.text = "typed into the selector"
-    host.dismiss_questions()
-    assert await asking is None
+    assert await asking == (None if dismissed else {"Env?": "staging"})
     assert host._question_picker is None
     assert buffer.text == "half-typed chat message"
 
