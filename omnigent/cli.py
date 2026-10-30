@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     import httpx
 
     from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
     from omnigent.server.smart_routing import LLMRoutingClient
@@ -4036,7 +4037,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         pinned_databricks_org_id,
         store_databricks_auth,
     )
-    from omnigent.inner.databricks_executor import _forget_remembered_profile, _remember_profile
+    from omnigent.inner.databricks_executor import _forget_remembered_profile
 
     org_id = load_databricks_org_id(server)
     headers = _remote_headers(server_url=server, host_id=None)
@@ -4080,8 +4081,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         if refreshed_probe.status_code == 200:
             org_id = _verified_databricks_org_id(refreshed_probe, org_id)
             store_databricks_auth(server, workspace_host, org_id=org_id)
-            if auth_info.profile_name:
-                _remember_profile(workspace_host, auth_info.profile_name)
+            _keep_verified_workspace_auth(server, workspace_host, auth_info)
             return
     # User-facing: show the display form (the workspace /omnigent URL, with
     # ?o= when known), not the internal API mount; it round-trips through
@@ -13532,7 +13532,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         )
 
     from omnigent.cli_auth import is_workspace_hosted_url
-    from omnigent.inner.databricks_executor import _forget_remembered_profile, _remember_profile
+    from omnigent.inner.databricks_executor import _forget_remembered_profile
 
     auth_info = _databricks_workspace_auth_info(workspace_host)
     if org_id is None and auth_info is not None:
@@ -13605,8 +13605,8 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"(HTTP {verify.status_code}). Check that your user has access to this app."
         )
     org_id = _verified_databricks_org_id(verify, org_id)
-    if auth_info is not None and auth_info.profile_name:
-        _remember_profile(workspace_host, auth_info.profile_name)
+    if auth_info is not None:
+        _keep_verified_workspace_auth(server, workspace_host, auth_info)
     user_id: str | None = None
     with contextlib.suppress(ValueError):
         raw_user = verify.json().get("user_id")
@@ -13741,6 +13741,9 @@ def _verify_databricks_server_token(
 class _DatabricksWorkspaceAuthInfo:
     token: str
     profile_name: str | None
+    # The auth that minted *token*, kept so later clients can reuse it once the
+    # server accepts the token.
+    auth: _DatabricksBearerAuth | None = None
 
 
 def _databricks_workspace_auth_info(workspace_host: str) -> _DatabricksWorkspaceAuthInfo | None:
@@ -13757,7 +13760,29 @@ def _databricks_workspace_auth_info(workspace_host: str) -> _DatabricksWorkspace
         return None
     if not token:
         return None
-    return _DatabricksWorkspaceAuthInfo(token=token, profile_name=auth.profile_name)
+    return _DatabricksWorkspaceAuthInfo(token=token, profile_name=auth.profile_name, auth=auth)
+
+
+def _keep_verified_workspace_auth(
+    server: str, workspace_host: str, auth_info: _DatabricksWorkspaceAuthInfo
+) -> None:
+    """Reuse the credential *server* just accepted, in this process and the next.
+
+    Later clients in this process take it from the shared token source instead
+    of resolving again, and later processes try its profile first.
+
+    :param server: The server that accepted ``auth_info.token``.
+    :param workspace_host: The workspace the token was minted for, e.g.
+        ``"https://example.databricks.com"``.
+    :param auth_info: The accepted credential.
+    """
+    from omnigent.chat import _adopt_verified_credential
+    from omnigent.inner.databricks_executor import _remember_profile
+
+    if auth_info.profile_name:
+        _remember_profile(workspace_host, auth_info.profile_name)
+    if auth_info.auth is not None:
+        _adopt_verified_credential(server, auth_info.auth)
 
 
 def _databricks_workspace_token(workspace_host: str) -> str | None:

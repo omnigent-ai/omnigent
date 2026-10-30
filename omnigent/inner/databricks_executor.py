@@ -843,7 +843,7 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
         if config is not None
         and config[name].get("auth_type", "").strip().lower() == "databricks-cli"
     }
-    remembered = _remembered_profiles().get(host.rstrip("/"))
+    remembered = _remembered_profiles().get(_host_match_key(host))
     # User profiles that matched the host but failed to authenticate (e.g. an
     # expired OAuth grant). Tracked so we can warn if a lower-priority service
     # principal is then selected — otherwise the host would silently register
@@ -965,6 +965,15 @@ class _ReusedDatabricksTokenSource:
         except DatabricksAuthError:
             return None
 
+    def adopt(self, auth: _DatabricksBearerAuth) -> None:
+        """Serve tokens from *auth*, which the server has already accepted.
+
+        :param auth: Auth resolved outside this source, e.g. by a recovery
+            after the server refused this source's token.
+        """
+        self._auth = auth
+        self._failure_logged = False
+
 
 _REMEMBERED_PROFILES_FILE = "databricks_profiles.json"
 
@@ -972,9 +981,9 @@ _REMEMBERED_PROFILES_FILE = "databricks_profiles.json"
 def _remembered_profiles() -> dict[str, str]:
     """Return the user profile the server last accepted for each workspace host.
 
-    :returns: Map of workspace host to profile name, e.g.
-        ``{"https://example.databricks.com": "my-ws"}``; empty when nothing
-        is stored or the file is unreadable.
+    :returns: Map of :func:`_host_match_key` to profile name, e.g.
+        ``{"example.databricks.com": "my-ws"}``; empty when nothing is stored
+        or the file is unreadable.
     """
     from omnigent.process_logging import data_dir
 
@@ -1012,7 +1021,7 @@ def _remember_profile(host: str, profile: str) -> None:
     :param profile: The verified profile, e.g. ``"my-ws"``.
     """
     remembered = _remembered_profiles()
-    key = host.rstrip("/")
+    key = _host_match_key(host)
     if remembered.get(key) == profile:
         return
     if profile in _databrickscfg_host_matches_and_sp_sections(host)[1]:
@@ -1027,7 +1036,7 @@ def _forget_remembered_profile(host: str) -> None:
     :param host: Workspace host, e.g. ``"https://example.databricks.com"``.
     """
     remembered = _remembered_profiles()
-    if remembered.pop(host.rstrip("/"), None) is not None:
+    if remembered.pop(_host_match_key(host), None) is not None:
         _store_remembered_profiles(remembered)
 
 
@@ -1121,6 +1130,19 @@ def _section_is_service_principal(options: configparser.SectionProxy) -> bool:
     return auth_type in machine_auth_types or has_client_secret_pair
 
 
+def _host_match_key(host: str) -> str:
+    """The form in which two workspace hosts compare equal.
+
+    Scheme, case and a trailing ``/`` are ignored, so
+    ``"https://Example.databricks.com/"`` and ``"example.databricks.com"``
+    name the same workspace.
+
+    :param host: Workspace host, e.g. ``"https://example.databricks.com"``.
+    :returns: The comparison key, e.g. ``"example.databricks.com"``.
+    """
+    return host.strip().rstrip("/").split("://", 1)[-1].lower()
+
+
 def _databrickscfg_host_matches_and_sp_sections(
     host: str, config: configparser.ConfigParser | None = None
 ) -> tuple[list[str], set[str]]:
@@ -1142,16 +1164,11 @@ def _databrickscfg_host_matches_and_sp_sections(
         the subset of *all* section names that are service principals.
         ``([], set())`` when the file is missing or unparseable.
     """
-
-    def _norm(value: str) -> str:
-        value = value.strip().rstrip("/")
-        return value.split("://", 1)[-1].lower()
-
     if config is None:
         config = _read_databrickscfg_no_inheritance()
     if config is None:
         return [], set()
-    wanted = _norm(host)
+    wanted = _host_match_key(host)
     # With the sentinel default_section, the file's [DEFAULT] is a plain
     # section named "DEFAULT"; its host is what named sections inherit.
     default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
@@ -1170,9 +1187,9 @@ def _databrickscfg_host_matches_and_sp_sections(
         # overrides inheritance to no host, matching ConfigParser semantics —
         # so an empty host does not fall back and does not match.
         section_host = options.get("host", default_host)
-        if _norm(section_host) == wanted:
+        if _host_match_key(section_host) == wanted:
             matches.append(section)
-    if default_host and _norm(default_host) == wanted:
+    if default_host and _host_match_key(default_host) == wanted:
         matches.append("DEFAULT")
     return matches, sp_sections
 

@@ -89,6 +89,7 @@ from omnigent.util.server_url import display_server_url
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
 
 console = Console()
 
@@ -814,6 +815,18 @@ def _forget_refused_credential(server_url: str) -> None:
     workspace_host = load_databricks_workspace_host(server_url)
     if workspace_host is not None:
         _forget_remembered_profile(workspace_host)
+
+
+def _adopt_verified_credential(server_url: str, auth: _DatabricksBearerAuth) -> None:
+    """Serve later clients of *server_url* from *auth*, whose token the server accepted.
+
+    A recovery resolves credentials outside the shared source; without this the
+    next client would walk ``~/.databrickscfg`` and mint again.
+
+    :param server_url: The remote server URL that accepted the token.
+    :param auth: The resolved auth that minted the accepted token.
+    """
+    _shared_token_source(server_url).adopt(auth)
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:

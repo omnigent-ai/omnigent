@@ -1978,6 +1978,33 @@ def test_resolve_auth_for_host_tries_the_remembered_profile_first(
     assert attempts[0] == ("cli", "stale")
 
 
+def test_remembered_profile_matches_any_spelling_of_the_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host spellings that match the same profiles share one remembered entry."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[stale]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+        "[live]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    attempts = _fake_profile_sources(monkeypatch, stale={"stale"}, sdk_tokens={})
+
+    databricks_executor._remember_profile("https://Example.databricks.com/", "live")
+    databricks_executor._remember_profile("example.databricks.com", "live")
+    assert databricks_executor._remembered_profiles() == {"example.databricks.com": "live"}
+
+    databricks_executor._resolve_databricks_auth(host="HTTPS://EXAMPLE.databricks.com")
+    assert attempts == [("cli", "live")]
+
+    databricks_executor._forget_remembered_profile("example.databricks.com/")
+    assert databricks_executor._remembered_profiles() == {}
+
+
 def test_remembered_profile_keeps_the_identity_preference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

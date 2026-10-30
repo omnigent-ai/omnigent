@@ -3391,7 +3391,7 @@ def test_databricks_preflight_remembers_the_profile_the_server_accepted(
 
     cli._ensure_databricks_server_auth(_TWO_PROFILE_SERVER, non_interactive=True)
     assert minted == ["stale", "live"]
-    assert _remembered_profiles() == {_TWO_PROFILE_WORKSPACE: "live"}
+    assert _remembered_profiles() == {"example.databricks.com": "live"}
 
     chat._databricks_auth_cache.clear()  # the next launch is a new process
     minted.clear()
@@ -3402,11 +3402,11 @@ def test_databricks_preflight_remembers_the_profile_the_server_accepted(
 def test_databricks_login_recovery_ignores_a_remembered_profile_the_server_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After a refusal, the browser login's fresh profile is the one verified and remembered."""
+    """After a refusal, the browser login's fresh profile is verified, remembered and reused."""
     from omnigent import chat
     from omnigent.inner.databricks_executor import _remember_profile, _remembered_profiles
 
-    _two_profile_databricks_login(
+    minted = _two_profile_databricks_login(
         tmp_path, monkeypatch, profiles=["acme", "other"], signed_in={"other"}, accepted="acme"
     )
     _remember_profile(_TWO_PROFILE_WORKSPACE, "other")  # accepted before, refused now
@@ -3414,8 +3414,12 @@ def test_databricks_login_recovery_ignores_a_remembered_profile_the_server_refus
 
     cli._ensure_databricks_server_auth(_TWO_PROFILE_SERVER)
 
-    assert _remembered_profiles() == {_TWO_PROFILE_WORKSPACE: "acme"}
-    assert chat._shared_token_source(_TWO_PROFILE_SERVER) is not refused
+    assert _remembered_profiles() == {"example.databricks.com": "acme"}
+    shared = chat._shared_token_source(_TWO_PROFILE_SERVER)
+    assert shared is not refused
+    minted.clear()
+    assert shared.current_token() == "acme-token"
+    assert minted == [], "the next client minted again instead of reusing the verified login"
 
 
 def test_databricks_preflight_keeps_explicit_selector_for_inline_login(
@@ -3857,10 +3861,13 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         lambda server: "https://example.databricks.com",
     )
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    fresh_auth = SimpleNamespace(current_token=lambda: "fresh-token", profile_name=None)
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
-        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh-token", profile_name=None),
+        lambda workspace: cli._DatabricksWorkspaceAuthInfo(
+            token="fresh-token", profile_name=None, auth=fresh_auth
+        ),
     )
     monkeypatch.setattr(
         cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
@@ -3876,9 +3883,15 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
     assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com")]
-    assert chat._shared_token_source(_HOST_DATABRICKS_SERVER) is not refused, (
+    shared = chat._shared_token_source(_HOST_DATABRICKS_SERVER)
+    assert shared is not refused, (
         "clients built after the refused probe would reuse the refused credential"
     )
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda *args, **kwargs: pytest.fail("the next client resolved credentials again"),
+    )
+    assert shared.current_token() == "fresh-token"
 
 
 def _patch_foreground_host(
