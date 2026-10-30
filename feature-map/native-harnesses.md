@@ -10,6 +10,21 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
+- `picker-curation`: server config `restrict_to_agent_names` limits and orders
+  what New Chat offers, and `default_agent_name` pre-selects one for a user
+  with no remembered pick. Curated, the menu is one flat list with no Harnesses
+  heading, no "Other..." submenus, no "Create custom agent" entry and no Smart
+  Routing entry; a name matching nothing shows an empty state and logs at
+  startup, while a failed agent fetch says so rather than blaming the
+  deployment. A returning user's cached picker stays closed while `/v1/info` is
+  pending, including behind the embedded app's offline stand-in, so the full
+  roster never shows ahead of the curation (a failed probe falls back to the
+  uncurated picker); "Hide unconfigured harnesses" and the per-entry hides in
+  Settings > Appearance apply to the curated list too. A remembered pick the curation drops falls back to the
+  configured default carrying that agent's own brain harness, never the
+  rejected agent's, and a project's configured agent outside the curation is
+  reported unavailable until the user picks an offered one. Display only,
+  and New Chat only: the scheduled-task and project-settings pickers are untouched.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
@@ -46,12 +61,18 @@ implements them separately, so a fix for one harness does not reach the others.
 - `isaac-credential-detection`: harness setup offers Isaac when host-side
   Databricks detection finds a matching credential, and fails open for older
   hosts or servers that cannot report detection results.
+- `picker-entry-visibility`: the user hides individual harnesses and agents from
+  every agent picker (new chat, automation, project default) in Settings →
+  Appearance, per device. Independent of the readiness filter above, which only
+  drops rows that cannot launch.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
   composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
   the answer reaches the harness.
+- `devin-questions`: Devin's native question picker appears in Chat and Inbox;
+  selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
@@ -75,6 +96,8 @@ implements them separately, so a fix for one harness does not reach the others.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
+- `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
+  composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `idle-reap`: a finished native pane left alone past the idle window closes
@@ -149,6 +172,14 @@ Real-provider history compatibility requires a separate live check.
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
 
+**Picker visibility:** open Settings → Appearance → **Show in agent pickers**.
+The row summarizes what is shown ("Showing 15 of 17. Hidden: …"). Press
+**Edit**, filter the checklist and uncheck an entry, or press **Show all** to
+restore them. The entry drops from the New Chat, New automation and
+project-default pickers. This is the user's own per-device choice, unlike "Hide
+unconfigured harnesses" next to it, which only drops rows that cannot launch on
+the selected host.
+
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
 the linked session's Agents panel and check the child under its parent. Ask a
@@ -164,6 +195,11 @@ before entering the harness menu. Then start a new CLI or web session.
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices.
+
+**Devin questions:** start Devin from the CLI or the new-session picker and ask
+it to use `ask_user_question` with selectable options. Answer in Chat or open Inbox
+to answer there. Reload while a choice is pending, submit it, and confirm Devin
+continues with the answer and the session no longer needs a response.
 
 **Approval links:** open a pending permission's standalone approval link.
 Claude directory requests show the exact directories in Chat, Inbox, and the
@@ -419,6 +455,14 @@ Cross-harness journeys:
   response contract is covered by
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
+- **`picker-curation`:** `tests/server/test_server_config.py` (parsing),
+  `tests/server/test_app.py` (the `/v1/info` block and the startup warning),
+  `web/src/lib/capabilities.test.ts` (probe parsing),
+  the "curated New Chat picker" cases in `web/src/shell/AgentHarnessPicker.test.tsx`
+  (menu shape) and the
+  "picker curation" cases in `web/src/shell/NewChatDialog.test.tsx` (default
+  pre-selection, remembered picks and the empty state in the real landing
+  flow). Set the two keys in the server config, restart, and open New Chat.
 - **`needs-auth`:**
   `web/src/pages/settings/SettingsHarnessesSection.test.tsx` covers the
   flag-gated credential warning card, its Reconfigure affordance, and full-card click.
@@ -448,6 +492,16 @@ Cross-harness journeys:
   a newer same-value model write and its effort while the applied model stays
   unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
   These cases do not cover live providers or a post-refusal retry.
+- **`picker-entry-visibility`:**
+  `web/src/shell/AgentHarnessPicker.test.tsx` covers the picker rows a hidden
+  entry drops and when the picker points at Settings,
+  `web/src/pages/settings/PickerVisibilitySetting.test.tsx` the Settings
+  summary, checklist, **Show all** and a failed catalog load,
+  `web/src/lib/pickerEntryVisibility.test.ts`
+  the stored set, `web/src/lib/settingsPortability.test.ts` export and import,
+  `web/src/hooks/useAvailableAgents.test.tsx` (`useAgentCatalog`) the Settings
+  list's agents, and `web/src/lib/agentGrouping.test.ts` that Settings and the
+  picker group an entry the same way.
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal
@@ -715,6 +769,17 @@ Cross-harness journeys:
   pnpm --filter web test src/components/blocks/ApprovalCard.test.tsx
   ```
 
+- **`devin-questions`:**
+  `tests/e2e_ui/approvals/test_ask_user_question.py::test_devin_question_hook_round_trip_survives_reload`
+  runs the real native hook subprocess with a recorded question shape through
+  the server and browser. Chat and Inbox each restore a pending question after
+  reload, submit the answer in Devin's native input shape, and clear the pending
+  count and sidebar badge. This uses no Devin CLI or live model; a live native
+  session must additionally confirm that the tool consumes the answer and
+  continues. Custom and multiple selections belong in the hook's component
+  coverage. Standalone approval links do not expose the question form; mobile
+  and Managed question journeys remain unverified.
+
 - **`resume`, Claude and Pi provider selection after a runner restart:**
   `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
   (own environment, real server, runner, native CLI and tmux with local model
@@ -776,6 +841,33 @@ Cross-harness journeys:
   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
   prompt must remain a separate user turn outside the assistant's folded work,
   including after reload. This browser contract does not launch the Claude CLI.
+- **`chat-render`, `steer`, Codex shell commands from the web composer:**
+  A standalone `!command` runs in the session's shell. Its pending bubble settles
+  and its output appears below it; attachments, multiple content blocks and `!!`
+  text remain model input. On shared servers, direct Codex shell messages require
+  owner access (`LEVEL_OWNER`), including API and automated messages. Codex runs
+  these commands as the host process user, outside its thread sandbox and
+  model-tool approval path. Collaborators with edit access can still send model
+  prompts. Each shell delivery carries trusted owner authorization from the
+  server, bound to the exact command at runner ingress. An older server cannot
+  authorize direct shell execution: the runner reports an undelivered upgrade
+  error and preserves the native session.
+  `tests/e2e_ui/messages/test_native_codex_shell_input.py::test_web_shell_input_runs_in_codex_shell_not_as_prompt`
+  covers both a first message and an existing session, including rendered output.
+  Run it through the repro environment with `--ui-skip-build --video=on` after
+  building the SPA. It requires real Codex and tmux with the mock model provider.
+  `tests/e2e/test_codex_native_shell_followup_e2e.py::test_web_prompt_during_standalone_shell_gets_model_reply`
+  (own environment; real server, runner, Codex and tmux, local mock model) checks
+  that a prompt sent during the command receives an answer after it finishes,
+  and that an unresolved submission with no running command allows the next
+  question through without resubmitting the shell command.
+  `tests/e2e/test_codex_native_shell_followup_e2e.py::test_editor_bang_input_cannot_execute_through_an_older_server`
+  covers editor rejection and ordinary-prompt recovery with current peers or an
+  older server selected by `OMNIGENT_COMPAT_SERVER_PYTHON`.
+  Manually, send `!echo hi`, expand its output and check for `hi`. Then send
+  `!sleep 5` followed immediately by a question; the question must receive an
+  answer. Upload a text file containing `!echo file-content` with an empty
+  composer and verify that it reaches the model without running a shell command.
 - **`codex-plugin-skills`:** use the
   [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
   real CLI catalog regression and recorded browser journey across both

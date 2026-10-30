@@ -379,6 +379,12 @@ def create_scheduled_tasks_router(
                     "managed sandboxes are not configured on this server",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            if sandbox_config.default.manages_profiles:
+                raise OmnigentError(
+                    "Scheduled fresh sandboxes cannot select a profile yet; "
+                    "use a connected host or a default provider without profiles",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             return agent, None, validated_model, validated_effort
         if host_id is not None:
             host_store = getattr(request.app.state, "host_store", None)

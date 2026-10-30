@@ -4,6 +4,7 @@ import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
 import { useInertRef } from "@/hooks/useInertRef";
@@ -49,6 +50,7 @@ import {
 import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
 import { WorkspacePanel } from "@/shell/WorkspacePanel";
+import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
 
@@ -157,6 +159,10 @@ export function GridSessionPane({
     [sessionId],
   );
   const showTerminal = terminalFirst && view === "terminal";
+  const [terminalOpened, setTerminalOpened] = useState(showTerminal);
+  useEffect(() => {
+    if (showTerminal) setTerminalOpened(true);
+  }, [showTerminal]);
   const setChatRef = useInertRef(showTerminal, chatRef);
   const terminalInertRef = useInertRef<HTMLDivElement>(!showTerminal);
   // A connected terminal focuses itself as the cell activates; otherwise focus
@@ -252,22 +258,23 @@ export function GridSessionPane({
     [navigateWorkspace, onOpenWorkspace],
   );
   useUiOpenFile(sessionId, selected && canBrowse, openFile);
+  const showTab = useCallback((rightRailTab: RightRailTab | null) => {
+    setWorkspace((previous) => ({
+      ...previous,
+      rightRailTab,
+      selectedFilePath: null,
+      selectedTerminalKey: null,
+      openPanels:
+        isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
+          ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
+          : previous.openPanels,
+    }));
+  }, []);
   const selectTab = useCallback(
     (rightRailTab: RightRailTab | null) => {
-      navigateWorkspace("", undefined, () =>
-        setWorkspace((previous) => ({
-          ...previous,
-          rightRailTab,
-          selectedFilePath: null,
-          selectedTerminalKey: null,
-          openPanels:
-            isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
-              ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
-              : previous.openPanels,
-        })),
-      );
+      navigateWorkspace("", undefined, () => showTab(rightRailTab));
     },
-    [navigateWorkspace],
+    [navigateWorkspace, showTab],
   );
   const closeFile = useCallback(
     (path: string) => {
@@ -298,6 +305,14 @@ export function GridSessionPane({
         selectTab("github");
         onOpenWorkspace();
       },
+      openFolder: showFiles
+        ? (absolutePath: string) =>
+            navigateWorkspace(absolutePath, undefined, () => {
+              revealFolderInFilesPanel(sessionId, absolutePath);
+              showTab("files");
+              onOpenWorkspace();
+            })
+        : undefined,
       conversationId: sessionId,
       workspaceRoot: environment.data?.root ?? null,
       workspaceHome: environment.data?.home ?? null,
@@ -308,7 +323,10 @@ export function GridSessionPane({
       openFile,
       registerNavigationGuard,
       selectTab,
+      navigateWorkspace,
+      showTab,
       onOpenWorkspace,
+      showFiles,
       sessionId,
       environment.data,
       session?.hostId,
@@ -390,9 +408,11 @@ export function GridSessionPane({
           </header>
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
             <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
-              <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+              <RenderErrorBoundary name="chat" resetKey={sessionId}>
+                <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+              </RenderErrorBoundary>
             </div>
-            {terminalFirst && (agentTerminal !== null || showTerminal) && (
+            {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
               <div
                 className={cn(
                   "absolute inset-0 flex flex-col",
@@ -401,16 +421,18 @@ export function GridSessionPane({
                 ref={terminalInertRef}
                 aria-hidden={!showTerminal}
               >
-                <MainTerminalView
-                  conversationId={sessionId}
-                  visible={showTerminal}
-                  active={selected && !workspacePanel.maximized}
-                  className="pt-0"
-                  readOnly={!session || !isOwnerLevel(permissionLevel)}
-                  runnerOnline={runnerOnline}
-                  onResume={canEdit ? resume : undefined}
-                  sandboxOffline={liveness.kind === "host_asleep"}
-                />
+                <RenderErrorBoundary name="terminal" resetKey={sessionId}>
+                  <MainTerminalView
+                    conversationId={sessionId}
+                    visible={showTerminal}
+                    active={selected && !workspacePanel.maximized}
+                    className="pt-0"
+                    readOnly={!session || !isOwnerLevel(permissionLevel)}
+                    runnerOnline={runnerOnline}
+                    onResume={canEdit ? resume : undefined}
+                    sandboxOffline={liveness.kind === "host_asleep"}
+                  />
+                </RenderErrorBoundary>
               </div>
             )}
           </div>

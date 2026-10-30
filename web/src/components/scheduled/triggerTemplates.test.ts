@@ -210,7 +210,7 @@ describe("renderTriggerPrompt", () => {
     expect(prompt).toContain(
       "Replace CONVERSATION_ID with the conversation_id that sys_session_create returned",
     );
-    expect(prompt.endsWith("Instructions for each session:\nInvestigate the ticket.")).toBe(true);
+    expect(prompt).toContain("Instructions for each session:\nInvestigate the ticket.\n");
 
     // A raw JQL row's own ORDER BY gives way to creation order.
     const sorted = renderTriggerPrompt(
@@ -226,6 +226,36 @@ describe("renderTriggerPrompt", () => {
       'search for (project = "ES" AND (type = Bug)) AND created >= <that time> ORDER BY created ASC.',
     );
     expect(sorted).not.toContain("ORDER BY created DESC");
+  });
+
+  it("signs what it posts and stops when it can't reach the service", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), CTX);
+
+    // Link-backs and worker posts go out under the owner's account, so both are signed.
+    expect(prompt).toContain(
+      'on each ticket you started a session for. End each one with a line "Sent with Omnigent", since it posts with the owner\'s account.',
+    );
+    expect(
+      prompt.endsWith(
+        'Investigate the ticket.\nAnything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "Sent with Omnigent", since it posts with the owner\'s account.',
+      ),
+    ).toBe(true);
+    expect(prompt).toContain(
+      "If you have no way to use Jira here, or signing in to it fails, skip to your reply and say that this automation needs a Jira MCP server where it runs.",
+    );
+    expect(
+      renderTriggerPrompt("slack", fields({ event: "posted", scope: "#eng-support" }), CTX),
+    ).toContain("say that this automation needs a Slack MCP server where it runs.");
+    expect(
+      renderTriggerPrompt("github", fields({ event: "issue", scope: "acme/app" }), CTX),
+    ).toContain(
+      "say that this automation needs the GitHub CLI or a GitHub MCP server where it runs.",
+    );
+
+    // Workers still sign their posts when the manager doesn't post a link.
+    const noLink = renderTriggerPrompt("jira", fields({ linkBack: false }), CTX);
+    expect(noLink).not.toContain("End each one with a line");
+    expect(noLink).toContain('ends with a line "Sent with Omnigent"');
   });
 
   it("walks newly created matches oldest first and only checkpoints what it fully read", () => {
