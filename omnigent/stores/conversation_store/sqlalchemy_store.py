@@ -15,6 +15,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    case,
     delete,
     desc,
     func,
@@ -3032,8 +3033,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"``
-            or ``"updated_at"``.
+        :param sort_by: Sort key: ``"created_at"``, ``"updated_at"``,
+            or ``"title"`` (case-insensitive, untitled last when
+            ascending).
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
@@ -3468,32 +3470,43 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more=has_more,
         )
 
-    @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+    def _resolve_sort_column(self, sort_by: str) -> ColumnElement[Any]:
         """
-        Map a ``sort_by`` string to the corresponding
-        :class:`SqlConversation` column.
+        Map a ``sort_by`` string to the expression the listing orders on.
 
-        :param sort_by: ``"created_at"`` or ``"updated_at"``.
-        :returns: The mapped column attribute.
-        :raises ValueError: If ``sort_by`` is not a valid column
-            name.
+        ``"title"`` sorts case-insensitively by code point, with untitled
+        conversations after every titled one in ascending order. The web
+        client reproduces this key to merge pages, so the comparison uses a
+        binary collation rather than the database's locale order.
+
+        :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"title"``.
+        :returns: The column or expression to order and page on.
+        :raises ValueError: If ``sort_by`` is not a valid sort key.
         """
-        allowed = {
-            "created_at": SqlConversation.created_at,
-            "updated_at": SqlConversation.updated_at,
-        }
-        col = allowed.get(sort_by)
-        if col is None:
+        if sort_by == "created_at":
+            return cast(ColumnElement[Any], SqlConversation.created_at)
+        if sort_by == "updated_at":
+            return cast(ColumnElement[Any], SqlConversation.updated_at)
+        if sort_by != "title":
             raise ValueError(f"invalid sort_by: {sort_by!r}")
-        return col
+        # One string key keeps the keyset cursor a two-column row comparison.
+        title_key = (
+            case((SqlConversation.title == "", "1"), else_="0") + func.lower(SqlConversation.title)
+        ).self_group()
+        dialect = self._conv_engine.dialect.name
+        if dialect == "postgresql":
+            return title_key.collate("C")
+        if dialect == "mysql":
+            return title_key.collate("utf8mb4_bin")
+        # SQLite compares with BINARY by default.
+        return title_key
 
     @staticmethod
     def _apply_cursor(
         session: Session,
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
-        sort_col: QueryableAttribute[int],
+        sort_col: ColumnElement[Any],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,
@@ -3517,7 +3530,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param stmt: The current SELECT statement to augment.
         :param cursor_id: The conversation ID acting as the page cursor,
             e.g. ``"conv_abc123"``.
-        :param sort_col: Primary sort column (``created_at`` or ``updated_at``).
+        :param sort_col: Primary sort expression from :meth:`_resolve_sort_column`.
         :param is_desc: ``True`` for descending, ``False`` for ascending.
         :param tiebreaker_col: Secondary sort column; must match the
             secondary ORDER BY column. See ``_tiebreaker_col`` in

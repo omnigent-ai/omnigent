@@ -259,7 +259,7 @@ describe("useConversations project filter", () => {
   });
 });
 
-describe.each([undefined, "updated_at", "created_at"] as const)(
+describe.each([undefined, "updated_at", "created_at", "title"] as const)(
   "fetchConversationsPage sorting %s",
   (sortBy) => {
     it.each([undefined, "mine", "shared", "archived"] as const)(
@@ -281,7 +281,8 @@ describe.each([undefined, "updated_at", "created_at"] as const)(
         const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
         expect(params.get("visibility")).toBe(visibility ?? "all");
         expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
-        expect(params.get("order")).toBe("desc");
+        // Names list A to Z; timestamps list newest first.
+        expect(params.get("order")).toBe(sortBy === "title" ? "asc" : "desc");
         queryClient.clear();
       },
     );
@@ -2510,6 +2511,8 @@ describe("useProjectSessions", () => {
     ["created_at", false, ["project-sessions", "Sprint 42", "created_at", false]],
     ["updated_at", true, ["project-sessions", "Sprint 42", "updated_at", true]],
     ["created_at", true, ["project-sessions", "Sprint 42", "created_at", true]],
+    ["title", false, ["project-sessions", "Sprint 42", "title", false]],
+    ["title", true, ["project-sessions", "Sprint 42", "title", true]],
   ] as const)(
     "fetches project sessions by %s (archived: %s)",
     async (sortBy, archived, expectedKey) => {
@@ -2541,7 +2544,7 @@ describe("useProjectSessions", () => {
       const url = fetchMock.mock.calls[0][0] as string;
       expect(url).toContain("/v1/sessions?");
       expect(url).toContain("project=Sprint+42");
-      expect(url).toContain("order=desc");
+      expect(url).toContain(sortBy === "title" ? "order=asc" : "order=desc");
       expect(url).toContain(`sort_by=${sortBy}`);
       expect(url).toContain("limit=20");
       expect(url).toContain(`visibility=${archived ? "all" : "mine"}`);

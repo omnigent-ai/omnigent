@@ -14218,13 +14218,13 @@
             }
           },
           {
-            "description": "Column to sort on, `\"created_at\"` or `\"updated_at\"`.",
+            "description": "Sort key, `\"created_at\"`, `\"updated_at\"`, or `\"title\"`. `\"title\"` is case-insensitive and lists untitled sessions last with `order=asc` (A to Z).",
             "in": "query",
             "name": "sort_by",
             "required": false,
             "schema": {
               "default": "created_at",
-              "pattern": "^(created_at|updated_at)$",
+              "pattern": "^(created_at|updated_at|title)$",
               "title": "Sort By",
               "type": "string"
             }

@@ -703,8 +703,9 @@ class SessionsNamespace:
             has this name, including distinct session-scoped agents
             that share the name. ``None`` returns all names.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Sort key, ``"created_at"``, ``"updated_at"``, or
+            ``"title"`` (case-insensitive; pair with ``order="asc"`` for
+            A to Z, untitled last).
         :param include_archived: With ``visibility="all"``, include
             archived sessions alongside active ones when ``True``.
             Defaults to ``False``. Other visibility modes determine

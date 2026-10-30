@@ -14,6 +14,7 @@ import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
   writeSidebarViewPreferences,
+  type SidebarOrdering,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey } from "@/lib/sessionListCache";
@@ -43,6 +44,12 @@ export type SidebarListQuery = Pick<
   "data" | "error" | "isError" | "isLoading" | "isFetching" | "isFetchingNextPage" | "hasNextPage"
 > & { fetchNextPage: () => unknown; refetch?: () => unknown };
 
+const SESSION_SORT_BY_ORDERING: Record<SidebarOrdering, SessionSortBy> = {
+  updated: "updated_at",
+  created: "created_at",
+  name: "title",
+};
+
 function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
   const serverInfo = useServerInfo();
@@ -50,7 +57,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
     ? storedView
     : DEFAULT_SIDEBAR_VIEW;
-  const sortBy: SessionSortBy = view.ordering === "created" ? "created_at" : "updated_at";
+  const sortBy = SESSION_SORT_BY_ORDERING[view.ordering];
   const updateView = useCallback(
     (patch: Partial<SidebarViewPreferences>) => {
       const next = { ...storedView, ...patch };
@@ -65,7 +72,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
               (key[0] === "conversations"
                 ? (key[5] ?? "updated_at")
                 : parseProjectSessionsQueryKey(key).sortBy) ===
-              (next.ordering === "created" ? "created_at" : "updated_at"),
+              SESSION_SORT_BY_ORDERING[next.ordering],
           });
         }
         void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });

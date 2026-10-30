@@ -7,11 +7,19 @@ grouping is deterministic; everything else comes from the live server.
 from __future__ import annotations
 
 import json
+import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass
 from time import time
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
+
+from tests._helpers.polling import poll_until
+from tests._helpers.session import post_session_bundle
+from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
@@ -382,3 +390,130 @@ def test_created_ordering_persists_and_flag_off_uses_updated(
     expect(page.get_by_role("tooltip")).to_have_text("Filter sessions")
     filter_button.click()
     expect(page.get_by_test_id("session-ordering-menu")).to_have_count(0)
+
+
+@dataclass(frozen=True)
+class _NamedSessions:
+    base_url: str
+    project: str
+    # Session ids keyed by title; the untitled session is keyed by "".
+    folder: dict[str, str]
+    unfiled: dict[str, str]
+
+
+def _seed_session(base_url: str, title: str, project: str | None) -> str:
+    response = post_session_bundle(
+        httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
+    )
+    response.raise_for_status()
+    session_id = response.json()["session_id"]
+    patch: dict[str, object] = {"title": title} if title else {}
+    if project:
+        patch["labels"] = {"omni_project": project}
+    if patch:
+        httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}", json=patch, timeout=10.0
+        ).raise_for_status()
+    return session_id
+
+
+@pytest.fixture
+def named_sessions(request: pytest.FixtureRequest) -> Iterator[_NamedSessions]:
+    """Seed live sessions with mixed-case titles in a folder and unfiled, newest last."""
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    project = f"Sorting {uuid.uuid4().hex[:4]}"
+    # Created in this order, so Updated lists each group roughly reversed.
+    folder = {
+        title: _seed_session(base_url, title, project)
+        for title in ["date list", "Banana bread", "", "kiwi trip", "apple pie", "Cherry jam"]
+    }
+    unfiled = {
+        title: _seed_session(base_url, title, None)
+        for title in ["mango plan", "Zebra notes", "lemon tasks"]
+    }
+    yield _NamedSessions(base_url, project, folder, unfiled)
+    for session_id in [*folder.values(), *unfiled.values()]:
+        httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+
+
+def _listed_ids(page: Page, ids: dict[str, str]) -> list[str]:
+    """Titles of the seeded sessions in their on-screen order."""
+    titles = {session_id: title for title, session_id in ids.items()}
+    hrefs = page.locator('aside a[href^="/c/"]').evaluate_all(
+        "links => links.map((link) => link.getAttribute('href').slice(3))"
+    )
+    return [titles[href] for href in hrefs if href in titles]
+
+
+def _wait_for_order(page: Page, ids: dict[str, str], expected: list[str]) -> None:
+    """Wait until the seeded sessions in *ids* are listed as *expected*, leading."""
+    try:
+        poll_until(lambda: _listed_ids(page, ids)[: len(expected)] == expected, timeout_s=15)
+    except AssertionError:
+        assert _listed_ids(page, ids) == expected
+        raise
+
+
+_NAME_ORDER_VIEWPORT = {"width": 1280, "height": 800}
+
+
+@pytest.mark.browser_context_args(
+    viewport=_NAME_ORDER_VIEWPORT, record_video_size=_NAME_ORDER_VIEWPORT
+)
+def test_name_ordering_lists_live_sessions_a_to_z_and_persists(
+    request: pytest.FixtureRequest, named_sessions: _NamedSessions
+) -> None:
+    """Name orders the server's sessions and folders A to Z, untitled last, across reloads."""
+    # Request the page after seeding so a recording starts at the user's first view.
+    page: Page = request.getfixturevalue("page")
+    requests: list[str] = []
+    page.on(
+        "request",
+        lambda req: requests.append(req.url) if "/v1/sessions?" in req.url else None,
+    )
+    _enable_grouping_ui(page)
+    page.goto(named_sessions.base_url)
+    folder_header = page.locator(f'button[data-project-order-name="{named_sessions.project}"]')
+    expect(folder_header).to_be_visible(timeout=30_000)
+    folder_header.click()
+    expect(page.get_by_test_id("project-show-more")).to_be_visible()
+    poll_until(lambda: len(_listed_ids(page, named_sessions.unfiled)) == 3, timeout_s=15)
+    page.wait_for_timeout(1_000)
+
+    _open_view_submenu(page, "session-ordering-menu")
+    page.wait_for_timeout(700)
+    page.get_by_role("menuitemradio", name="Name (A to Z)", exact=True).click()
+    page.keyboard.press("Escape")
+    _wait_for_order(
+        page,
+        named_sessions.folder,
+        ["apple pie", "Banana bread", "Cherry jam", "date list", "kiwi trip"],
+    )
+    _wait_for_order(page, named_sessions.unfiled, ["lemon tasks", "mango plan", "Zebra notes"])
+    assert any(
+        parse_qs(urlparse(url).query).get("sort_by") == ["title"]
+        and parse_qs(urlparse(url).query).get("order") == ["asc"]
+        for url in requests
+    )
+    page.wait_for_timeout(1_500)
+    page.get_by_test_id("project-show-more").click()
+    _wait_for_order(
+        page,
+        named_sessions.folder,
+        ["apple pie", "Banana bread", "Cherry jam", "date list", "kiwi trip", ""],
+    )
+    untitled = page.locator(f'aside a[href="/c/{named_sessions.folder[""]}"]')
+    expect(untitled).to_have_text("New session")
+    page.wait_for_timeout(1_500)
+
+    page.reload()
+    expect(folder_header).to_be_visible(timeout=30_000)
+    _wait_for_order(page, named_sessions.unfiled, ["lemon tasks", "mango plan", "Zebra notes"])
+    _wait_for_order(
+        page,
+        named_sessions.folder,
+        ["apple pie", "Banana bread", "Cherry jam", "date list", "kiwi trip"],
+    )
+    _open_view_submenu(page, "session-ordering-menu")
+    expect(page.get_by_role("menuitemradio", name="Name (A to Z)", exact=True)).to_be_checked()
+    page.wait_for_timeout(2_000)

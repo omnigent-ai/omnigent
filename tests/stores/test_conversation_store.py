@@ -3110,6 +3110,47 @@ def test_list_conversations_sort_by_updated_at_with_pagination(
     assert page2.data[0].id == ids[1]
 
 
+def test_list_conversations_sort_by_title(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``sort_by="title"`` orders case-insensitively by code point, lists
+    untitled conversations last when ascending, and pages without gaps.
+    """
+    for title in ["beta", "", "Alpha", "ab", "a-c", "alpha", "Gamma", ""]:
+        conversation_store.create_conversation(title=title)
+
+    full = conversation_store.list_conversations(sort_by="title", order="asc", kind=None)
+    listed = [(c.title or "").lower() for c in full.data]
+    # "-" sorts before letters by code point, unlike most locale collations.
+    # The two "alpha" spellings tie on the key, so only their pair is fixed.
+    assert listed == [
+        "a-c",
+        "ab",
+        "alpha",
+        "alpha",
+        "beta",
+        "gamma",
+        "",
+        "",
+    ], listed
+
+    descending = conversation_store.list_conversations(sort_by="title", order="desc", kind=None)
+    assert [c.id for c in descending.data] == [c.id for c in reversed(full.data)]
+
+    walked: list[str] = []
+    after: str | None = None
+    while True:
+        page = conversation_store.list_conversations(
+            limit=3, after=after, sort_by="title", order="asc", kind=None
+        )
+        walked.extend(c.id for c in page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+    assert walked == [c.id for c in full.data]
+
+
 # ─── Phase 4: parent_conversation_id + name uniqueness ──────
 
 
@@ -8580,7 +8621,7 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
 
 
 @pytest.mark.parametrize("order", ["desc", "asc"])
-@pytest.mark.parametrize("sort_by", ["created_at", "updated_at"])
+@pytest.mark.parametrize("sort_by", ["created_at", "updated_at", "title"])
 def test_cursor_pages_forward_and_backward_in_both_orders(
     conversation_store: SqlAlchemyConversationStore, db_uri: str, sort_by: str, order: str
 ) -> None:

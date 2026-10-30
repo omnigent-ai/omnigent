@@ -29,7 +29,7 @@ export function useScopeCache(
       false,
       null,
       visibility,
-      ...(sortBy === "created_at" ? [sortBy] : []),
+      ...(sortBy !== "updated_at" ? [sortBy] : []),
     ],
     [visibility, sortBy],
   );

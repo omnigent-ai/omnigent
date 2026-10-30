@@ -3811,6 +3811,35 @@ describe("Sidebar view options", () => {
     },
   );
 
+  it("orders sessions and project folders by Name through the menu, untitled last", () => {
+    projectsMock.push("Customer X");
+    const project = { omni_project: "Customer X" };
+    mockConversations([
+      conv("conv_untitled", "Codex", { title: null, updated_at: 600 }),
+      conv("conv_z", "Codex", { title: "conv_zeta", updated_at: 500 }),
+      conv("conv_b", "Codex", { title: "conv_beta", updated_at: 400 }),
+      conv("conv_a", "Codex", { title: "Conv_Alpha", updated_at: 100 }),
+      conv("conv_pm", "Codex", { title: "conv_mango", updated_at: 300, labels: project }),
+      conv("conv_pk", "Codex", { title: "Conv_Kiwi", updated_at: 200, labels: project }),
+    ]);
+    renderGroupingSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const sessionTitles = () =>
+      within(groupSection("Sessions"))
+        .getAllByRole("link")
+        .map((link) => link.textContent)
+        .filter(Boolean);
+    expect(sessionTitles()).toEqual(["New session", "conv_zeta", "conv_beta", "Conv_Alpha"]);
+
+    openViewSubmenu("session-ordering-menu");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Name (A to Z)" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("name");
+    expect(
+      screen.getAllByRole("link", { name: /^conv_/i }).map((link) => link.textContent),
+    ).toEqual(["Conv_Kiwi", "conv_mango", "Conv_Alpha", "conv_beta", "conv_zeta"]);
+    expect(sessionTitles()).toEqual(["Conv_Alpha", "conv_beta", "conv_zeta", "New session"]);
+  });
+
   it("shows the toggled metadata under the title and the updated time in the trailing slot", () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_mac", name: "Build Mac", sandbox_provider: null }],

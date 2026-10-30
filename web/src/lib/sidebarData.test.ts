@@ -6,6 +6,7 @@ import {
   refreshScopeWindow,
   appendScopePage,
   sessionRowsPage,
+  titleSortKey,
 } from "./sidebarData";
 
 const row = (id: string, updated_at: number): Conversation => ({
@@ -144,4 +145,38 @@ it("uses creation time for scope boundaries, appended pages, and capped refreshe
   );
   expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
   expect(refreshed.pages[0].last_id).toBe("old");
+});
+
+it("orders by name like the server: folded case, code points, untitled last", () => {
+  expect(["beta", null, "Alpha", "ab", "a-c", ""].map(titleSortKey).sort()).toEqual([
+    "0a-c",
+    "0ab",
+    "0alpha",
+    "0beta",
+    "1",
+    "1",
+  ]);
+  const titled = (id: string, title: string | null) => ({ ...row(id, 0), title });
+  const alpha = titled("alpha", "Alpha");
+  const bravo = titled("bravo", "bravo");
+  const charlie = titled("charlie", "Charlie");
+  const untitled = titled("untitled", null);
+  // Shared has more rows after "bravo", so mine's "Charlie" waits for it.
+  expect(
+    mergeScopeRows([alpha, charlie], [bravo], false, true, null, "bravo", "title").rows.map(
+      (r) => r.id,
+    ),
+  ).toEqual(["alpha", "bravo"]);
+  const current = {
+    pages: [sessionRowsPage([charlie, alpha], true)],
+    pageParams: [undefined],
+    windowSize: 2,
+  };
+  const appended = appendScopePage(current, sessionRowsPage([untitled, bravo]), 2, "title");
+  expect(appended.pages[0].data.map((r) => r.id)).toEqual([
+    "alpha",
+    "bravo",
+    "charlie",
+    "untitled",
+  ]);
 });

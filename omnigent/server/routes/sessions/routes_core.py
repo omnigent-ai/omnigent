@@ -1801,7 +1801,7 @@ def register_core_routes(
         agent_id: str | None = Query(default=None),
         agent_name: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-        sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
+        sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at|title)$"),
         search_query: str | None = Query(default=None),
         search_scope: str = Query(default="all", pattern="^(all|title|content)$"),
         include_archived: bool = Query(default=False),
@@ -1832,8 +1832,9 @@ def register_core_routes(
             have distinct bundles. ``None`` disables the filter.
         :param order: Sort direction, ``"desc"`` (newest-first)
             or ``"asc"`` (oldest-first).
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Sort key, ``"created_at"``, ``"updated_at"``,
+            or ``"title"``. ``"title"`` is case-insensitive and lists
+            untitled sessions last with ``order=asc`` (A to Z).
         :param search_query: Case-insensitive substring filter on
             the session title or conversation content. ``None``
             or empty string disables the filter. A session

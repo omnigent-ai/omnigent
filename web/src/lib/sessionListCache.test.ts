@@ -380,11 +380,19 @@ describe("filtersFromConversationQueryKey", () => {
     });
   });
 
-  it("accepts creation-order caches for live updates and optimistic mutations", () => {
-    expect(
-      filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
-    ).toEqual({ searchQuery: "", includeArchived: false, project: undefined, visibility: "mine" });
-  });
+  it.each(["created_at", "title"])(
+    "accepts %s-order caches for live updates and optimistic mutations",
+    (sortBy) => {
+      expect(
+        filtersFromConversationQueryKey(["conversations", "", false, null, "mine", sortBy]),
+      ).toEqual({
+        searchQuery: "",
+        includeArchived: false,
+        project: undefined,
+        visibility: "mine",
+      });
+    },
+  );
 
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
@@ -469,7 +477,7 @@ describe("collectConversationIds", () => {
 });
 
 describe("parseProjectSessionsQueryKey", () => {
-  it.each(["updated_at", "created_at"])(
+  it.each(["updated_at", "created_at", "title"])(
     "keeps sort and archive scope separate for %s",
     (sortBy) => {
       for (const archived of [false, true]) {
@@ -490,6 +498,7 @@ describe("project-folder cache membership", () => {
   it.each([
     ["project-sessions", "proj", "updated_at", true],
     ["project-sessions", "proj", "created_at", true],
+    ["project-sessions", "proj", "title", true],
   ])("retains a renamed archive in %j and evicts it from live folders", (...archivedKey) => {
     const qc = new QueryClient();
     const row = conv("a", { archived: true });

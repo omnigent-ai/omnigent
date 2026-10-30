@@ -2,6 +2,7 @@ import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { compareSessionRows } from "@/lib/sidebarData";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -211,22 +212,31 @@ export function filterConversations(
   });
 }
 
-// Newest first; equal timestamps fall back to id, so arrival order never shows.
-// Freeze update timestamps for the active chat and hovered list; creation
-// timestamps stay immutable, including when the selected order changes.
+/** The mutable sort fields captured while the list is held still. */
+export interface FrozenSortKey {
+  updatedAt: number;
+  title: string | null;
+}
+
+// Timestamps sort newest first and titles A to Z; ties fall back to id, so
+// arrival order never shows. Freeze update timestamps and titles for the
+// hovered list so a background change cannot move a row under the cursor.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
-  frozenKeys?: Map<string, number> | null,
+  frozenKeys?: Map<string, FrozenSortKey> | null,
   sortBy: SessionSortBy = "updated_at",
 ): Conversation[] {
-  const effective = (c: Conversation): number => {
-    const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
-    const updatedAt = frozenKeys?.get(c.id) ?? live;
-    frozenKeys?.set(c.id, updatedAt);
-    return sortBy === "created_at" ? c.created_at : updatedAt;
+  const effective = (c: Conversation): Conversation => {
+    const updatedAt = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const frozen = frozenKeys?.get(c.id) ?? { updatedAt, title: c.title };
+    frozenKeys?.set(c.id, frozen);
+    return { ...c, updated_at: frozen.updatedAt, title: frozen.title };
   };
-  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
+  return conversations
+    .map((row) => ({ row, key: effective(row) }))
+    .sort((a, b) => compareSessionRows(a.key, b.key, sortBy))
+    .map(({ row }) => row);
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */

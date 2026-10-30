@@ -139,7 +139,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
  * - 4 elements: `[..., project]` — the Archived settings picker's project filter.
  * - 5 elements: `[..., project|null, visibility]` — the sidebar's mine/shared
  *   tab-scoped query (project is `null` here since it's always unset for those
- *   tabs). A sixth `created_at` element selects creation-time ordering.
+ *   tabs). A sixth `created_at` or `title` element selects that ordering.
  *   These variants are accepted so the rename overlay and push-delta merge
  *   — which iterate *every* cached `["conversations", ...]` query — never throw
  *   on unknown variants. Query membership decisions depend on these dimensions,
@@ -153,7 +153,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
   if (key.length < 3 || key.length > 6 || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
-  if (key.length === 6 && key[5] !== "created_at") {
+  if (key.length === 6 && key[5] !== "created_at" && key[5] !== "title") {
     throw new Error("Invalid conversations query key");
   }
   const [, searchQuery, includeArchived, project] = key;
@@ -469,7 +469,7 @@ export function parseProjectSessionsQueryKey(key: readonly unknown[]): {
     key.length !== 4 ||
     prefix !== "project-sessions" ||
     typeof project !== "string" ||
-    (sortBy !== "updated_at" && sortBy !== "created_at") ||
+    (sortBy !== "updated_at" && sortBy !== "created_at" && sortBy !== "title") ||
     typeof archived !== "boolean"
   )
     throw new Error("Invalid project sessions query key");

@@ -114,7 +114,12 @@ function isAbortTimeout(error: unknown): boolean {
  */
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
-export type SessionSortBy = "updated_at" | "created_at";
+export type SessionSortBy = "updated_at" | "created_at" | "title";
+
+/** Timestamps list newest first; titles list A to Z. */
+export function sessionSortOrder(sortBy: SessionSortBy): "asc" | "desc" {
+  return sortBy === "title" ? "asc" : "desc";
+}
 /** `?search_scope=`: `title` and `content` are disjoint groups of one search. */
 export type SessionSearchScope = "all" | "title" | "content";
 
@@ -549,7 +554,7 @@ export async function fetchConversationsPage({
 }): Promise<ConversationsPage> {
   // Match the visible order so pagination selects the same session window.
   const params = new URLSearchParams({
-    order: "desc",
+    order: sessionSortOrder(sortBy),
     sort_by: sortBy,
     limit: String(limit),
     visibility: visibility ?? "all",
@@ -675,7 +680,7 @@ export function useConversations(
   // disturbing the existing all-sessions key used by every other caller.
   const sortBy = options.sortBy ?? "updated_at";
   const queryKey =
-    sortBy === "created_at"
+    sortBy !== "updated_at"
       ? ["conversations", searchQuery, includeArchived, project ?? null, visibility, sortBy]
       : visibility
         ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
@@ -2401,7 +2406,7 @@ export function useMoveToProject() {
       );
       if (found.has(id) && next?.pages.some((page) => page.data.some((c) => c.id === id))) {
         windowScopes.add(
-          `${key[5] === "created_at" ? "created_at" : "updated_at"}:${row.archived === true}`,
+          `${typeof key[5] === "string" ? key[5] : "updated_at"}:${row.archived === true}`,
         );
       }
       if (next !== data) queryClient.setQueryData(key, next);
@@ -2590,7 +2595,7 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
   return page.data.map((conv) => conv.id);
 }
 
-/** One page of the viewer's sessions in a project, newest-first. */
+/** One page of the viewer's sessions in a project, in the selected order. */
 async function fetchProjectSessionsPage(
   project: string,
   after?: string,
@@ -2599,7 +2604,7 @@ async function fetchProjectSessionsPage(
   archived = false,
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
-    order: "desc",
+    order: sessionSortOrder(sortBy),
     sort_by: sortBy,
     limit: String(limit),
     visibility: archived ? "all" : "mine",

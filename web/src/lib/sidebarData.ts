@@ -71,11 +71,28 @@ export function dedupeSessionRows(rows: Conversation[]): Conversation[] {
   return [...byId.values()];
 }
 
+/**
+ * The server's ``sort_by=title`` key: case-insensitive, untitled last, compared
+ * by code point so merged pages agree with the server's page boundaries.
+ */
+export function titleSortKey(title: string | null | undefined): string {
+  return title ? `0${title.toLowerCase()}` : "1";
+}
+
+function compareCodePoints(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function compareSessionRows(
   a: Conversation,
   b: Conversation,
   sortBy: SessionSortBy = "updated_at",
 ): number {
+  if (sortBy === "title") {
+    return (
+      compareCodePoints(titleSortKey(a.title), titleSortKey(b.title)) || a.id.localeCompare(b.id)
+    );
+  }
   return b[sortBy] - a[sortBy] || b.id.localeCompare(a.id);
 }
 

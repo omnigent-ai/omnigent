@@ -257,6 +257,7 @@ import {
   resolveSidebarDrop,
   type SidebarDropTarget,
   sortConversations,
+  type FrozenSortKey,
   STATUS_BUCKETS,
   type StatusBucket,
   statusBucket,
@@ -1492,7 +1493,7 @@ function ProjectFolder({
   activeOverride: ActiveChatOverride | null;
   /** Pointer-inside sort-key freeze shared with the flat list (see
       ConversationList); null while the pointer is outside the list. */
-  frozenSortKeys: Map<string, number> | null;
+  frozenSortKeys: Map<string, FrozenSortKey> | null;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -2030,7 +2031,7 @@ function ConversationList({
   // map accumulates keys lazily inside sortConversations (a render-time ref
   // write) and is cleared once neither hold is active, when the order snaps
   // back to reality.
-  const frozenKeysRef = useRef<Map<string, number>>(new Map());
+  const frozenKeysRef = useRef<Map<string, FrozenSortKey>>(new Map());
   // Status buckets freeze the same way, so a turn finishing under the cursor
   // doesn't move its row to another group.
   const frozenStatusRef = useRef<Map<string, StatusBucket>>(new Map());
@@ -2161,7 +2162,7 @@ function ConversationList({
             : `${GROUPING_LABELS[view.grouping]} ${dateBucket(
                 view.grouping === "created"
                   ? c.created_at
-                  : (frozenKeys?.get(c.id) ??
+                  : (frozenKeys?.get(c.id)?.updatedAt ??
                       (activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at)),
                 now,
               )}`,
@@ -3454,7 +3455,11 @@ const GROUPING_LABELS: Record<SidebarGrouping, string> = {
   created: "Created",
   updated: "Updated",
 };
-const ORDERING_LABELS: Record<SidebarOrdering, string> = { updated: "Updated", created: "Created" };
+const ORDERING_LABELS: Record<SidebarOrdering, string> = {
+  updated: "Updated",
+  created: "Created",
+  name: "Name (A to Z)",
+};
 const SHOW_LABELS: Record<SidebarShowField, string> = {
   updated: "Updated",
   environment: "Environment",
