@@ -1112,6 +1112,35 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
     assert pending_inputs.pending_ids("conv_a") == []
 
 
+def test_declared_missing_text_is_recognized_once_and_not_kept_as_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    pending = pending_inputs.record("conv_late", [{"type": "input_text", "text": "lost  text"}])
+    drained = pending_inputs.resolve("conv_late", pending)
+    assert drained is not None
+
+    pending_inputs.remember_declared_missing("conv_late", drained)
+    clock["t"] += 2.5
+    assert pending_inputs.take_declared_missing("conv_late", "lost text") == (pending, 2500)
+    assert pending_inputs.take_declared_missing("conv_late", "lost text") is None
+
+
+def test_declared_missing_entries_expire_after_the_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    pending = pending_inputs.record("conv_old", [{"type": "input_text", "text": "old"}])
+    pending_inputs.remember_declared_missing(
+        "conv_old", pending_inputs.resolve("conv_old", pending)
+    )
+    clock["t"] += pending_inputs._TTL_S + 1
+    pending_inputs.remember_declared_missing(
+        "conv_old", pending_inputs.DrainedInput(pending_id="pending_new", content=[])
+    )
+    assert pending_inputs.take_declared_missing("conv_old", "old") is None
+
+
 def test_queued_slash_prompt_recorded_after_a_plain_follow_up_is_not_lost() -> None:
     """
     A "/"-led prompt queued before a plain one can be recorded after it.

@@ -104,6 +104,7 @@ same conversation.
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import re
 import threading
@@ -331,6 +332,9 @@ class _Entry:
 # relies on to drain the oldest matching message first. Empty inner
 # dicts are popped eagerly so the index doesn't accrete stale keys.
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
+# Conversation -> text digest -> (monotonic time reported missing, pending id). Lets a
+# transcript record that arrives after its message was reported missing be recognized.
+_declared_missing: WorkspaceScopedCache[str, dict[str, tuple[float, str]]] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
@@ -614,6 +618,42 @@ def classify_missing_native_record(entry: DrainedInput) -> DrainedInput:
     else:
         reason_code = "missing_delivery_evidence"
     return replace(entry, cause_class="unknown", reason_code=reason_code)
+
+
+def text_digest(text: str) -> str:
+    """Return a short identity for a message's whitespace-collapsed text.
+
+    Logs carry this digest, never the text itself.
+    """
+    return hashlib.sha256(_collapse_whitespace(text).encode()).hexdigest()[:16]
+
+
+def remember_declared_missing(conversation_id: str, entry: DrainedInput) -> None:
+    """Keep a digest of a message just reported missing, for a later late-record check."""
+    with _lock:
+        now = _now()
+        declared = {
+            digest: value
+            for digest, value in _declared_missing.get(conversation_id, {}).items()
+            if now - value[0] <= _TTL_S
+        }
+        declared[text_digest(_content_text(entry.content))] = (now, entry.pending_id)
+        _declared_missing[conversation_id] = declared
+
+
+def take_declared_missing(conversation_id: str, text: str) -> tuple[str, int] | None:
+    """Pop the pending id and age in ms of a message reported missing with this text, if any."""
+    with _lock:
+        declared = _declared_missing.get(conversation_id, {})
+        found = declared.pop(text_digest(text), None)
+        if found is None:
+            return None
+        if declared:
+            _declared_missing[conversation_id] = declared
+        else:
+            del _declared_missing[conversation_id]
+    declared_at, pending_id = found
+    return pending_id, max(0, int((_now() - declared_at) * 1000))
 
 
 def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
@@ -1138,3 +1178,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _declared_missing.clear()
