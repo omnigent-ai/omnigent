@@ -584,6 +584,13 @@ export interface SkillSummary {
   display_name?: string | null;
 }
 
+/** A host's discovered catalog plus the sources it could not read. */
+export interface SkillsCatalog {
+  skills: SkillSummary[];
+  /** User-facing notes, e.g. a failed `codex plugin list`; empty when complete. */
+  warnings: string[];
+}
+
 export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";
 
 /** Reasoning-effort metadata advertised for a native model. */

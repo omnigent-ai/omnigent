@@ -505,7 +505,8 @@ def test_mixed_structures_accumulated_comments_after_autosave(
     response = httpx.get(file_url, timeout=10)
     response.raise_for_status()
     serialized = response.json()["content"]
-    assert serialized.endswith("saved edit")
+    # The fixture ends with a newline, and saves keep it.
+    assert serialized.endswith("saved edit\n")
     assert serialized != content
     raw_positions = [match.start() for match in re.finditer("word", serialized)]
     pm_positions = editor.evaluate(
