@@ -192,9 +192,11 @@ the header menu), and each place is a separate entry point.
 
 With `related_sessions` enabled, open **Agents → New session** in the right
 Workspace panel, or **Add agent** in a sidebar row's overflow/right-click menu.
-Select a peer to center its conversation; use its side-panel button to chat beside
-the current conversation. Each full session has its own collapsible Subagents
-section. At mobile width, open **Conversation actions → Agents**. The original
+Select a peer to center its conversation; use **Open in side panel** in its row
+menu to chat beside the current conversation. Drag peers to reorder and hover a
+row to rename it. The peer's composer identifies it and offers **Back to Main**.
+The chevron beside each full session's harness icon opens its subagent tray
+directly below the row. At mobile width, open **Conversation actions → Agents**. The original
 sidebar row's **Archive All** and **Delete All** act on the group; peer controls
 act only on that peer and its helpers.
 
@@ -532,10 +534,14 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`related-sessions` (opt-in draft):** Enable `related_sessions` on the isolated
   server only. In an owned session with an attached runner, open **Agents → New
-  session**, choose an agent/model, enter a name and optional draft, then create.
+  session** to open the normal new-session composer in a popup. Check the source
+  defaults, choose a harness/model, enter the first message and send. Canceling
+  must preserve an unrelated landing-page draft and saved preferences.
   Repeat from that peer: both peers should appear beside Main under the original
   sidebar row. Independently collapse Main's and each peer's Subagents, rename
-  and reorder peers, and reload. Open a peer in a side panel, send a message, then
+  through hover actions and drag peers to reorder, then reload. Check the identity
+  tray above a peer's composer and **Back to Main**. Use the row menu to open a
+  peer in a side panel, send a message, then
   switch the center conversation: its tab, transcript and composer remain scoped
   to the peer. Repeat creation from the sidebar **Add agent** menu and check the
   Agents drawer at mobile width. Archive one peer, then **Archive All → Undo**:
@@ -546,6 +552,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/server/integration/test_sessions_archive.py` and
   `tests/server/test_host_runner_ownership.py`. Component coverage is in
   `web/src/shell/SubagentsPanel.test.tsx`, `web/src/shell/AddAgentDialog.test.tsx`,
+  `web/src/shell/NewChatDialog.test.tsx`, `web/src/pages/ChatPage.composer.test.tsx`,
   `web/src/shell/Sidebar.archive.test.tsx`,
   `web/src/hooks/useRelatedSessionLifecycle.test.tsx`,
   `web/src/hooks/useSideChats.test.tsx` and

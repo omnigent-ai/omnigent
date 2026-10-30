@@ -140,6 +140,8 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 const { composerSessionSnapshot } = vi.hoisted(() => ({
   composerSessionSnapshot: {
     hostId: null as string | null,
+    parentSessionId: null as string | null,
+    title: null as string | null,
     workspace: null as string | null,
     labels: {} as Record<string, string>,
     gitBranch: null as string | null,
@@ -6043,6 +6045,7 @@ describe("Composer sub-agent tray", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    Object.assign(composerSessionSnapshot, { parentSessionId: null, title: null, labels: {} });
   });
 
   /** The sub-agent tray element, or null when not rendered. */
@@ -6070,6 +6073,28 @@ describe("Composer sub-agent tray", () => {
     expect(screen.getByText("check-account-eligibility")).toBeTruthy();
     expect(screen.getByText(/Chatting with sub-agent/)).toBeTruthy();
     expect(screen.getByTestId("composer-workspace-controls")).not.toHaveClass("rounded-t-none");
+  });
+
+  it("identifies a full peer by its exact title and links back to Main", () => {
+    Object.assign(composerSessionSnapshot, {
+      parentSessionId: "conv_main",
+      title: "Review: API changes",
+      labels: { "omnigent.session_role": "peer" },
+    });
+    render(
+      <MemoryRouter initialEntries={["/c/conv_test"]}>
+        <Composer {...composerProps()} />
+      </MemoryRouter>,
+    );
+
+    const peerTray = screen.getByTestId("composer-related-session-tray");
+    expect(peerTray).toHaveTextContent("Chatting in Review: API changes");
+    expect(screen.getByRole("link", { name: "Back to Main" })).toHaveAttribute(
+      "href",
+      "/c/conv_main",
+    );
+    expect(peerTray.nextElementSibling).toBe(screen.getByTestId("composer-workspace-controls"));
+    expect(tray()).toBeNull();
   });
 
   // The sub-agent tray sits directly above the workspace bar, sharing its

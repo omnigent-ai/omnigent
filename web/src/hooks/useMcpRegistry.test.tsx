@@ -1,7 +1,8 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authorizeRegistryService, type RegistryService } from "@/lib/mcpRegistry";
-import { useRegistrySignIn } from "./useMcpRegistry";
+import { readLastMcpServices, writeLastMcpServices } from "@/lib/mcpPreferences";
+import { useMcpRegistrySelection, useRegistrySignIn } from "./useMcpRegistry";
 
 vi.mock("@/lib/mcpRegistry", () => ({
   registryRequest: vi.fn(),
@@ -23,6 +24,16 @@ const wiki: RegistryService = {
   title: "Wiki",
   connect_provider: "mcp-wiki",
 };
+
+it.each([true, false])("keeps popup selections local when persistence is %s", (persist) => {
+  writeLastMcpServices(["wiki"]);
+  const { result, unmount } = renderHook(() => useMcpRegistrySelection(undefined, false, persist));
+  act(() => result.current.toggle("tracker", true));
+  expect(result.current.selected).toEqual(["wiki", "tracker"]);
+  expect(readLastMcpServices()).toEqual(persist ? ["wiki", "tracker"] : ["wiki"]);
+  unmount();
+  writeLastMcpServices([]);
+});
 
 /** A popup that resolves when the test says so and, like the real one, rejects on abort. */
 function pendingPopup() {

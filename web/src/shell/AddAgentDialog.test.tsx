@@ -9,8 +9,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AddAgentDialog } from "./AddAgentDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useSession } from "@/hooks/useSession";
-import { useHostModelOptions } from "@/hooks/useHosts";
-import { getSessionDraft } from "@/lib/sessionDrafts";
 import { createSession } from "@/lib/sessionsApi";
 
 const navigateMock = vi.fn();
@@ -23,7 +21,13 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   prefetchAvailableAgentDetails: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHostModelOptions: vi.fn() }));
+const composerProps = vi.hoisted(() => ({ current: null as unknown }));
+vi.mock("./NewChatDialog", () => ({
+  NewChatLandingScreen: (props: unknown) => {
+    composerProps.current = props;
+    return <div data-testid="shared-new-session-composer" />;
+  },
+}));
 vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn() }));
 
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
@@ -204,56 +208,27 @@ describe("AddAgentDialog", () => {
 });
 
 describe("related session creation", () => {
-  it("uses the acted-on peer as source and stages its first message without running it", async () => {
-    vi.mocked(useSession).mockReturnValue({ session: { hostId: "host_peer" } } as ReturnType<
-      typeof useSession
-    >);
-    vi.mocked(useHostModelOptions).mockReturnValue({
-      data: [{ id: "model-1", displayName: "Model One" }],
-    } as ReturnType<typeof useHostModelOptions>);
-    createSessionMock.mockResolvedValue({ id: "conv_new_peer" } as Awaited<
-      ReturnType<typeof createSession>
-    >);
-    const { invalidateSpy } = renderDialog("conv_peer", true);
-    fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
-    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "model-1" } });
-    fireEvent.change(screen.getByLabelText("First message (optional draft)"), {
-      target: { value: "Review the API" },
+  it("opens the shared new-session composer with the acted-on peer and group root", () => {
+    const source = { id: "conv_peer", hostId: "host_peer", agentId: "ag_codex", harness: "codex" };
+    vi.mocked(useSession).mockReturnValue({ session: source } as ReturnType<typeof useSession>);
+    renderDialog("conv_peer", true);
+    expect(screen.getByTestId("shared-new-session-composer")).toBeInTheDocument();
+    expect(composerProps.current).toMatchObject({
+      relatedSession: { source, rootSessionId: "conv_root" },
     });
-    expect(screen.getByRole("option", { name: "Fork context — coming soon" })).toBeDisabled();
-    expect(screen.getByRole("option", { name: "New sandbox — coming soon" })).toBeDisabled();
-    fireEvent.click(screen.getByTestId("add-agent-submit"));
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new_peer"));
-    expect(createSessionMock).toHaveBeenCalledWith("ag_codex", [], {
-      relatedToSessionId: "conv_peer",
-      title: "codex",
-      modelOverride: "model-1",
-    });
-    expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: ["conversation", "conv_root", "child_sessions"],
-    });
-    expect(useHostModelOptions).toHaveBeenCalledWith("host_peer", "codex", true, {
-      poll: false,
-    });
-    expect(getSessionDraft("conv_new_peer")?.text).toBe("Review the API");
+    expect(screen.queryByTestId("add-agent-name-input")).not.toBeInTheDocument();
+    expect(createSessionMock).not.toHaveBeenCalled();
   });
 
-  it("uses the harness default when older hosts have no model catalog", async () => {
+  it("shows the source-loading error without creating an independent session", () => {
     vi.mocked(useSession).mockReturnValue({
-      session: { hostId: null, agentId: "ag_codex", harness: "codex" },
-    } as ReturnType<typeof useSession>);
-    vi.mocked(useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
-      typeof useHostModelOptions
-    >);
-    createSessionMock.mockResolvedValue({ id: "conv_default" } as Awaited<
-      ReturnType<typeof createSession>
-    >);
-    renderDialog("conv_peer", true);
-    fireEvent.click(screen.getByTestId("add-agent-submit"));
-    await waitFor(() => expect(createSessionMock).toHaveBeenCalled());
-    expect(createSessionMock).toHaveBeenCalledWith("ag_codex", [], {
-      relatedToSessionId: "conv_peer",
-      title: "codex",
+      session: null,
+      isLoading: false,
+      error: new Error("Session unavailable"),
     });
+    renderDialog("conv_peer", true);
+    expect(screen.getByText("Session unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("shared-new-session-composer")).not.toBeInTheDocument();
+    expect(createSessionMock).not.toHaveBeenCalled();
   });
 });

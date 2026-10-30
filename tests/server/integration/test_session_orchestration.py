@@ -131,10 +131,10 @@ async def test_related_creation_rejects_before_persisting(
         payload["parent_session_id"] = source["id"]
     elif condition == "named":
         payload["sub_agent_name"] = "worker"
-    before = {row.id for row in store.list_conversations().data}
+    before = {row.id for row in store.list_conversations(kind=None, limit=1000).data}
     response = await auth_client.post("/v1/sessions", json=payload, headers=headers)
     assert response.status_code in {400, 403}, response.text
-    assert {row.id for row in store.list_conversations().data} == before
+    assert {row.id for row in store.list_conversations(kind=None, limit=1000).data} == before
 
 
 async def test_peer_role_cannot_be_forged_or_copied_to_top_level_fork(

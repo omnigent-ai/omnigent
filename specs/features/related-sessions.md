@@ -22,11 +22,14 @@ to recognize a new feature or advertise new protocol fields.
 
 - **R1:** Show Main and full peers as equal rows in Agents, under one left-sidebar
   root. Independently collapse the helpers belonging to each full session and
-  remember the selection across navigation and reload.
+  remember the selection across navigation and reload. Place the collapse chevron
+  beside the harness icon on the session row; its tray opens directly below it.
 - **R2:** Offer New session in Agents and Add agent in the sidebar action menu.
-  Reuse the agent catalog and available model choices. Create fresh context in the
+  Open the existing new-session composer in a popup, prefilled from the source.
+  Reuse its harness, model, permissions and attachment controls. Create fresh context in the
   source session's environment; a create from peer B attaches under root A but uses
-  B's execution environment. An optional first task remains a draft until sent.
+  B's execution environment. Sending the first message creates the session.
+  Canceling leaves the ordinary new-session draft and preferences untouched.
 - **R3:** Open peers in the main conversation or as persistent group-scoped side
   tabs. Side tabs have their own transcript, attachments, drafts, queue and model
   controls where supported. Full screen opens the existing complete workspace.
@@ -38,6 +41,9 @@ to recognize a new feature or advertise new protocol fields.
 - **R6:** Group actions clearly describe their scope. Archive All and Delete All
   include the group; individual peer actions stay scoped. Undo restores only rows
   changed by its archive operation. Archived peers remain discoverable.
+- **R7:** Reuse sidebar rows: drag peers to reorder, rename on hover, and put
+  Open in side panel and lifecycle actions in the row menu. In a peer's main
+  conversation, reuse the above-composer identity tray and offer Back to Main.
 
 ## Clarifications
 
@@ -57,6 +63,10 @@ to recognize a new feature or advertise new protocol fields.
   also retains worktrees and tells the user instead of offering cleanup.
 - Forking continues through existing flows. Related-session fork and new sandbox
   choices remain unavailable in this draft instead of silently changing context.
+- The popup shows the source environment and fixes its destination. Other hosts
+  need a trusted placement capability before they can be offered; a host name or
+  provider label cannot establish permission to control it. New custom-agent
+  bundle creation remains available through the ordinary new-session flow.
 
 ## Acceptance Criteria
 
@@ -77,6 +87,9 @@ to recognize a new feature or advertise new protocol fields.
 - **AC6 (R5):** GIVEN a source on a sandbox, WHEN a request supplies a different
   external host or requests managed provisioning, THEN creation is rejected;
   existing standalone managed provisioning is unchanged.
+- **AC7 (R7):** GIVEN a peer centered in the main conversation, THEN its exact
+  name appears above the composer with Back to Main. Dragging its Agents row
+  reorders peers without changing their parent; hover reveals rename and menu.
 
 ## Constraints
 

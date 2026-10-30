@@ -32,6 +32,9 @@ vi.mock("@/hooks/useSkills", () => ({
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type { Session } from "@/lib/types";
+import { getSessionHost, getSessionParent, setSessionHost } from "@/lib/sessionHost";
+import type { RelatedSessionComposer } from "./NewChatDialog";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -266,7 +269,8 @@ function setAgents(agents: AvailableAgent[]): void {
 function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
-): void {
+  relatedSession?: RelatedSessionComposer,
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -315,7 +319,10 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return {
+    ...render(<NewChatLandingScreen relatedSession={relatedSession} />, { wrapper: Wrapper }),
+    client,
+  };
 }
 
 /**
@@ -439,6 +446,154 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+});
+
+describe("related session composer", () => {
+  function sourceSession(hostId: string | null = "host_1"): Session {
+    return {
+      id: "conv_source_peer",
+      permissionLevel: 3,
+      parentSessionId: "conv_root",
+      subAgentName: null,
+      kind: "sub_agent",
+      agentId: "ag_native",
+      agentName: "Claude Code",
+      hostId,
+      runnerId: "runner_current",
+      workspace: "/workspace/source",
+      harness: "claude-native",
+      modelOverride: "sonnet",
+      reasoningEffort: "high",
+      title: "API work",
+      status: "idle",
+      createdAt: 1,
+      items: [],
+    };
+  }
+
+  it.each([
+    { hostId: "host_1", catalog: true },
+    { hostId: null, catalog: true },
+    { hostId: null, catalog: false },
+  ])(
+    "prefills the source and sends a peer (host=$hostId, catalog=$catalog)",
+    async ({ hostId, catalog }) => {
+      if (!catalog)
+        vi.mocked(useHostModelOptions).mockReturnValue({
+          data: undefined,
+          isLoading: false,
+        } as unknown as ReturnType<typeof useHostModelOptions>);
+      setAgents([
+        agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" }),
+      ]);
+      setHosts([host(), host({ host_id: "other_laptop", name: "Other laptop" })]);
+      writeLastHostChoice("other_laptop");
+      searchParams = new URLSearchParams("project=Other&prompt=Unrelated+task");
+      setSessionHost("conv_root", "different_root_host");
+      const onCreated = vi.fn();
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          id: "conv_new_peer",
+          host_id: hostId,
+          parent_session_id: "conv_root",
+          labels: { "omnigent.session_role": "peer" },
+        }),
+      } as Response);
+      const { client } = renderLanding(
+        [],
+        { managed_sandboxes_enabled: true },
+        {
+          source: sourceSession(hostId),
+          rootSessionId: "conv_root",
+          onCreated,
+        },
+      );
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveTextContent("source");
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeDisabled();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(/sonnet/i),
+      );
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      expect(screen.getByTestId("new-chat-landing-host-menu")).toHaveTextContent(
+        "share this session’s environment",
+      );
+      expect(screen.queryByText("Other laptop")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("new-chat-landing-sandbox-option")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("new-chat-landing-connect-host")).not.toBeInTheDocument();
+      fireEvent.keyDown(document, { key: "Escape" });
+      pickPermissionOption("plan");
+      const file = new File(["Context"], "context.txt", { type: "text/plain" });
+      fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+        target: { files: [file] },
+      });
+      typeMessage("Review this API");
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new_peer"));
+      const body = JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0]![1]!.body as string);
+      expect(body).toMatchObject({
+        related_to_session_id: "conv_source_peer",
+        agent_id: "ag_native",
+        model_override: "sonnet",
+        reasoning_effort: "high",
+        terminal_launch_args: ["--permission-mode", "plan"],
+      });
+      expect(body).not.toHaveProperty("harness_override");
+      for (const field of [
+        "host_id",
+        "host_type",
+        "workspace",
+        "workspaces",
+        "git",
+        "project_id",
+        "sandbox_provider",
+      ])
+        expect(body).not.toHaveProperty(field);
+      expect(beginLocalConversationMock).not.toHaveBeenCalled();
+      expect(pushMatchers).toHaveLength(0);
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new_peer", {
+        text: "Review this API",
+        skill: null,
+        files: [file],
+      });
+      expect(getSessionHost("conv_new_peer")).toBe(hostId);
+      expect(getSessionParent("conv_new_peer")).toBeNull();
+      expect(onCreated).toHaveBeenCalledWith("conv_new_peer");
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["conversation", "conv_root", "child_sessions"],
+      });
+    },
+  );
+
+  it("keeps an unrelated landing draft and preferences when the popup is cancelled", async () => {
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    const landing = renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("Keep this independent task");
+    landing.unmount();
+    const remembered = localStorage.getItem("omnigent:last-mode-by-harness");
+    const popup = renderLanding(
+      [],
+      {},
+      { source: sourceSession(), rootSessionId: "conv_root", onCreated: vi.fn() },
+    );
+    typeMessage("A different peer task");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Sonnet"),
+    );
+    pickPermissionOption("plan");
+    expect(localStorage.getItem("omnigent:last-mode-by-harness")).toBe(remembered);
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByText("Create custom agent")).not.toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    popup.unmount();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this independent task");
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
 });
 
 describe("NewChatLandingScreen create flow", () => {

@@ -31,7 +31,7 @@ import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
-import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
@@ -2253,22 +2253,26 @@ function ComposerStatusLine() {
   );
 }
 
-/**
- * Sub-agent shelf tucked behind the workspace bar's rounded top.
- * Bottom padding keeps the label above the overlap; opaque surfaces prevent
- * the pink tint from bleeding through the bar.
- */
-function SubagentComposerTray({ label }: { label: string }) {
+/** Session identity tucked behind the workspace bar's rounded top. */
+function SessionComposerTray({ label, mainSessionId }: { label: string; mainSessionId?: string }) {
   return (
     <div
-      data-testid="composer-subagent-tray"
+      data-testid={mainSessionId ? "composer-related-session-tray" : "composer-subagent-tray"}
       className="composer-subagent-surface mx-3 -mb-4 flex items-center gap-1.5 rounded-t-2xl px-4 pb-5.5 pt-1.5 text-sm text-brand-accent"
     >
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
-      {/* truncate so a long sub-agent name never wraps the tray to two rows */}
       <span className="min-w-0 truncate">
-        Chatting with sub-agent <strong className="font-semibold">{label}</strong>
+        {mainSessionId ? "Chatting in" : "Chatting with sub-agent"}{" "}
+        <strong className="font-semibold">{label}</strong>
       </span>
+      {mainSessionId && (
+        <Link
+          to={`/c/${mainSessionId}`}
+          className="ml-auto shrink-0 rounded-sm text-xs underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+        >
+          Back to Main
+        </Link>
+      )}
     </div>
   );
 }
@@ -2526,6 +2530,10 @@ function ComposerImpl(
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
+  const peerMainSessionId =
+    composerSession?.labels?.["omnigent.session_role"] === "peer"
+      ? composerSession.parentSessionId
+      : null;
   const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
   const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
   const hostMcpHarness =
@@ -3913,11 +3921,14 @@ function ComposerImpl(
           onReorder={reorderQueuedMessage}
           widthClassName="mx-3 w-auto"
         />
-        {/* Sub-agent context tray — peeks above the workspace bar; reserves
-            its own layout slot so the bar sits below it (see
-            SubagentComposerTray). Truthy (not just non-null) so an empty
-            label never peeks a nameless tray. */}
-        {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+        {peerMainSessionId ? (
+          <SessionComposerTray
+            label={composerSession?.title || "Session"}
+            mainSessionId={peerMainSessionId}
+          />
+        ) : subAgentLabel ? (
+          <SessionComposerTray label={subAgentLabel} />
+        ) : null}
         <ComposerWorkspaceBar
           data-testid="composer-workspace-controls"
           className={cn(

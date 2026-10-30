@@ -22,10 +22,9 @@ import {
   NetworkIcon,
   PauseIcon,
   PanelRightOpenIcon,
-  ArrowUpIcon,
-  ArrowDownIcon,
   PencilIcon,
   ArchiveIcon,
+  ArchiveRestoreIcon,
   Trash2Icon,
   PlusIcon,
   ScanSearchIcon,
@@ -43,6 +42,39 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  MouseSensor,
+  TouchSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { SessionStateBadge } from "@/components/SessionStateBadge";
+import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { SidebarEditRow } from "./SidebarEditRow";
+import { SIDEBAR_ROW, SIDEBAR_ACTIVE_HIGHLIGHT, SIDEBAR_HOVER_HIGHLIGHT } from "./sidebarStyles";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import {
@@ -74,7 +106,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { childPrimaryLabel } from "./subagentLabel";
-import { childStatus, sessionStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
+import { childStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
 const CODEX_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.codex_native.agent_role";
@@ -177,33 +209,29 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         >
           <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
         </Suspense>
+      ) : relatedSessions ? (
+        <RelatedSessionsList
+          rootSessionId={rootSessionId}
+          conversationId={conversationId}
+          sessions={children}
+          collapsedRows={collapsedRows}
+          onToggleCollapsed={toggleCollapsedRow}
+          canEdit={canCreate}
+        />
       ) : (
         <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
-          {relatedSessions ? (
-            <RelatedSessionsList
-              rootSessionId={rootSessionId}
+          <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
+          {children.map((child, index) => (
+            <SubagentRow
+              key={child.id}
+              child={child}
+              depth={1}
+              rootGuideContinues={index < children.length - 1}
               conversationId={conversationId}
-              sessions={children}
               collapsedRows={collapsedRows}
               onToggleCollapsed={toggleCollapsedRow}
-              canEdit={canCreate}
             />
-          ) : (
-            <>
-              <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-              {children.map((child, index) => (
-                <SubagentRow
-                  key={child.id}
-                  child={child}
-                  depth={1}
-                  rootGuideContinues={index < children.length - 1}
-                  conversationId={conversationId}
-                  collapsedRows={collapsedRows}
-                  onToggleCollapsed={toggleCollapsedRow}
-                />
-              ))}
-            </>
-          )}
+          ))}
         </ul>
       )}
       {/* Mounted only while open so a closed rail issues no /v1/agents
@@ -220,6 +248,13 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
     </div>
   );
 }
+
+const KEYBOARD_REORDER_OPTIONS = {
+  coordinateGetter: sortableKeyboardCoordinates,
+  keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
+};
+const MOUSE_REORDER_OPTIONS = { activationConstraint: { distance: 5 } };
+const TOUCH_REORDER_OPTIONS = { activationConstraint: { delay: 250, tolerance: 8 } };
 
 function RelatedSessionsList({
   rootSessionId,
@@ -243,65 +278,78 @@ function RelatedSessionsList({
     () => setOrder(readSessionWorkspaceState(rootSessionId).relatedSessionOrder ?? []),
     [rootSessionId],
   );
+  const sensors = useSensors(
+    useSensor(KeyboardSensor, KEYBOARD_REORDER_OPTIONS),
+    useSensor(MouseSensor, MOUSE_REORDER_OPTIONS),
+    useSensor(TouchSensor, TOUCH_REORDER_OPTIONS),
+  );
   const peers = sessions.filter((child) => child.labels?.["omnigent.session_role"] === "peer");
   const rank = (id: string) => (order.includes(id) ? order.indexOf(id) : order.length);
   peers.sort((a, b) => rank(a.id) - rank(b.id));
   const active = peers.filter((child) => !child.archived);
   const archived = peers.filter((child) => child.archived);
-  function move(id: string, direction: number) {
-    const ids = active.map((child) => child.id);
-    const index = ids.indexOf(id);
-    const target = index + direction;
-    if (index < 0 || target < 0 || target >= ids.length) return;
-    [ids[index], ids[target]] = [ids[target], ids[index]];
-    setOrder(ids);
-    writeSessionWorkspaceState(rootSessionId, { relatedSessionOrder: ids });
-  }
+  const ids = active.map((peer) => peer.id);
   return (
-    <>
-      <MainRow
-        rootSessionId={rootSessionId}
-        isActive={conversationId === rootSessionId}
-        fullSession
-      />
-      <HelperSection
-        sessionId={rootSessionId}
-        label="Main"
-        sessions={sessions.filter(
-          (child) => child.labels?.["omnigent.session_role"] !== "peer" && !child.archived,
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={({ active: dragged, over }) => {
+        if (!canEdit || !over || dragged.id === over.id) return;
+        const from = ids.indexOf(String(dragged.id));
+        const to = ids.indexOf(String(over.id));
+        if (from < 0 || to < 0) return;
+        const next = arrayMove(ids, from, to);
+        setOrder(next);
+        writeSessionWorkspaceState(rootSessionId, { relatedSessionOrder: next });
+      }}
+    >
+      <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
+        <MainRow
+          rootSessionId={rootSessionId}
+          isActive={conversationId === rootSessionId}
+          fullSession
+          collapsed={collapsedRows[rootSessionId] ?? false}
+          onToggleCollapsed={() => onToggleCollapsed(rootSessionId)}
+        />
+        <HelperSection
+          sessionId={rootSessionId}
+          label="Main"
+          sessions={sessions.filter(
+            (child) => child.labels?.["omnigent.session_role"] !== "peer" && !child.archived,
+          )}
+          conversationId={conversationId}
+          collapsedRows={collapsedRows}
+          onToggleCollapsed={onToggleCollapsed}
+        />
+        <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+          {active.map((peer) => (
+            <PeerSessionSection
+              key={peer.id}
+              peer={peer}
+              rootSessionId={rootSessionId}
+              conversationId={conversationId}
+              collapsedRows={collapsedRows}
+              onToggleCollapsed={onToggleCollapsed}
+              canEdit={canEdit}
+            />
+          ))}
+        </SortableContext>
+        {archived.length > 0 && (
+          <li className="mt-3 px-2 text-xs font-medium text-muted-foreground">Archived sessions</li>
         )}
-        conversationId={conversationId}
-        collapsedRows={collapsedRows}
-        onToggleCollapsed={onToggleCollapsed}
-      />
-      {active.map((peer, index) => (
-        <PeerSessionSection
-          key={peer.id}
-          peer={peer}
-          rootSessionId={rootSessionId}
-          conversationId={conversationId}
-          collapsedRows={collapsedRows}
-          onToggleCollapsed={onToggleCollapsed}
-          canEdit={canEdit}
-          onMoveUp={index > 0 ? () => move(peer.id, -1) : undefined}
-          onMoveDown={index < active.length - 1 ? () => move(peer.id, 1) : undefined}
-        />
-      ))}
-      {archived.length > 0 && (
-        <li className="mt-3 px-2 text-xs font-medium text-muted-foreground">Archived sessions</li>
-      )}
-      {archived.map((peer) => (
-        <PeerSessionSection
-          key={peer.id}
-          peer={peer}
-          rootSessionId={rootSessionId}
-          conversationId={conversationId}
-          collapsedRows={collapsedRows}
-          onToggleCollapsed={onToggleCollapsed}
-          canEdit={canEdit}
-        />
-      ))}
-    </>
+        {archived.map((peer) => (
+          <PeerSessionSection
+            key={peer.id}
+            peer={peer}
+            rootSessionId={rootSessionId}
+            conversationId={conversationId}
+            collapsedRows={collapsedRows}
+            onToggleCollapsed={onToggleCollapsed}
+            canEdit={canEdit}
+          />
+        ))}
+      </ul>
+    </DndContext>
   );
 }
 
@@ -312,8 +360,6 @@ function PeerSessionSection({
   collapsedRows,
   onToggleCollapsed,
   canEdit,
-  onMoveUp,
-  onMoveDown,
 }: {
   peer: ChildSessionInfo;
   rootSessionId: string;
@@ -321,23 +367,23 @@ function PeerSessionSection({
   collapsedRows: Record<string, boolean>;
   onToggleCollapsed: (id: string) => void;
   canEdit: boolean;
-  onMoveUp?: () => void;
-  onMoveDown?: () => void;
 }) {
   const { children } = useChildSessions(peer.archived ? null : peer.id);
   const archive = useArchiveRelatedSessions();
   const removeSession = useStopAndDeleteConversation();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const navigate = useNavigate();
-  const openInPanel = useContext(SubagentPanelOpenerContext);
   const queryClient = useQueryClient();
-  const search = sessionNavigationSearch(useLocation().search);
   const [renaming, setRenaming] = useState(false);
-  const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const label = peer.title || peer.session_name || "Session";
   const harness = harnessAgentForChild(peer);
+  const sortable = useSortable({
+    id: peer.id,
+    data: { label },
+    disabled: !canEdit || peer.archived || renaming,
+  });
   async function save(action: () => Promise<unknown>) {
     setSaving(true);
     setError(null);
@@ -353,145 +399,72 @@ function PeerSessionSection({
     }
   }
   return (
-    <>
-      <li
-        className="group/peer mt-2 rounded-md border border-border/60"
-        data-peer-session-id={peer.id}
-      >
-        <div className="flex items-start">
-          <Link
-            to={{ pathname: `/c/${peer.id}`, search }}
-            data-testid="peer-session-row"
-            className={cn(
-              "min-w-0 flex-1 rounded-md px-2.5 py-2 hover:bg-muted",
-              conversationId === peer.id && "bg-accent",
-            )}
-          >
-            <div className="flex items-center gap-2">
-              <StatusAvatar {...childStatus(peer)} />
-              {harness && <ComposerAgentIcon agent={harness} className="size-4 shrink-0" />}
-              <span className="truncate text-sm font-semibold">{label}</span>
-            </div>
-            {peer.last_message_preview && (
-              <p className="mt-1 truncate text-xs text-muted-foreground">
-                {peer.last_message_preview}
-              </p>
-            )}
-          </Link>
-          {openInPanel && (
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className="mr-1 mt-2 shrink-0"
-              aria-label={`Open ${label} in side panel`}
-              title="Open in side panel"
-              onClick={() => openInPanel(peer.id)}
-            >
-              <PanelRightOpenIcon className="size-3.5" />
-            </Button>
-          )}
-        </div>
-        {canEdit && (
-          <div className="flex items-center gap-0.5 border-t border-border/50 px-2 py-1">
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={`Rename ${label}`}
-              title="Rename session"
-              onClick={() => {
-                setName(label);
-                setRenaming(true);
-              }}
-            >
-              <PencilIcon className="size-3" />
-            </Button>
-            {!peer.archived && (
-              <>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={`Move ${label} up`}
-                  title="Move up"
-                  disabled={!onMoveUp}
-                  onClick={onMoveUp}
-                >
-                  <ArrowUpIcon className="size-3" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={`Move ${label} down`}
-                  title="Move down"
-                  disabled={!onMoveDown}
-                  onClick={onMoveDown}
-                >
-                  <ArrowDownIcon className="size-3" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={`Archive ${label}`}
-                  title="Archive session and its subagents"
-                  disabled={archive.isPending}
-                  onClick={() => {
-                    if (conversationId === peer.id) navigate(`/c/${rootSessionId}`);
-                    archive.mutate({ conversation: { id: peer.id }, archived: true });
-                  }}
-                >
-                  <ArchiveIcon className="size-3" />
-                </Button>
-              </>
-            )}
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={`Delete ${label}`}
-              title="Delete session and its subagents"
-              onClick={() => setDeleteOpen(true)}
-            >
-              <Trash2Icon className="size-3" />
-            </Button>
-            {peer.archived && (
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={archive.isPending}
-                onClick={() => archive.mutate({ conversation: { id: peer.id }, archived: false })}
-              >
-                Unarchive
-              </Button>
-            )}
-          </div>
-        )}
-        {renaming && (
-          <form
-            className="flex gap-1 p-2"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void save(() => renameConversation(peer.id, name.trim()));
-            }}
-          >
-            <input
-              aria-label="Session name"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              className="min-w-0 flex-1 rounded border bg-background px-2 text-sm"
-              autoFocus
-            />
-            <Button size="sm" type="submit" disabled={saving || !name.trim()}>
-              Save
-            </Button>
-            <Button size="sm" variant="ghost" type="button" onClick={() => setRenaming(false)}>
-              Cancel
-            </Button>
-          </form>
-        )}
-        {error && (
-          <p role="alert" className="px-2 pb-2 text-xs text-destructive">
-            {error}
-          </p>
-        )}
-      </li>
+    <li
+      ref={sortable.setNodeRef}
+      data-peer-session-id={peer.id}
+      data-dragging={sortable.isDragging || undefined}
+      className={cn("relative", sortable.isDragging && "z-10 opacity-60")}
+      style={{
+        transform: sortable.transform
+          ? `translate3d(${sortable.transform.x}px, ${sortable.transform.y}px, 0)`
+          : undefined,
+        transition: sortable.transition,
+      }}
+    >
+      {renaming ? (
+        <SidebarEditRow
+          initialTitle={label}
+          onCommit={(title) => {
+            setRenaming(false);
+            const trimmed = title.trim();
+            if (trimmed && trimmed !== label) void save(() => renameConversation(peer.id, trimmed));
+          }}
+          onCancel={() => setRenaming(false)}
+        />
+      ) : (
+        <RelatedSessionRow
+          sessionId={peer.id}
+          label={label}
+          harness={harness}
+          preview={peer.last_message_preview}
+          state={
+            peer.current_task_status === "launching"
+              ? { kind: "starting" }
+              : getSessionState(
+                  {
+                    status: peer.busy
+                      ? "running"
+                      : peer.current_task_status === "failed"
+                        ? "failed"
+                        : "idle",
+                    pending_elicitations_count: peer.pending_elicitations_count,
+                  },
+                  childStatus(peer).activity === "disconnected" ? "disconnected" : null,
+                )
+          }
+          isActive={conversationId === peer.id}
+          collapsed={collapsedRows[peer.id] ?? false}
+          onToggleCollapsed={peer.archived ? undefined : () => onToggleCollapsed(peer.id)}
+          sortable={canEdit && !peer.archived ? sortable : undefined}
+          onRename={canEdit && !saving ? () => setRenaming(true) : undefined}
+          archived={peer.archived}
+          archivePending={archive.isPending}
+          onArchive={
+            canEdit
+              ? () => {
+                  if (!peer.archived && conversationId === peer.id) navigate(`/c/${rootSessionId}`);
+                  archive.mutate({ conversation: { id: peer.id }, archived: !peer.archived });
+                }
+              : undefined
+          }
+          onDelete={canEdit ? () => setDeleteOpen(true) : undefined}
+        />
+      )}
+      {error && (
+        <p role="alert" className="px-2 pb-2 text-xs text-destructive">
+          {error}
+        </p>
+      )}
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent>
           <DialogHeader>
@@ -531,16 +504,195 @@ function PeerSessionSection({
         </DialogContent>
       </Dialog>
       {!peer.archived && (
-        <HelperSection
-          sessionId={peer.id}
-          label={label}
-          sessions={children.filter((child) => !child.archived)}
-          conversationId={conversationId}
-          collapsedRows={collapsedRows}
-          onToggleCollapsed={onToggleCollapsed}
-        />
+        <ul>
+          <HelperSection
+            sessionId={peer.id}
+            label={label}
+            sessions={children.filter((child) => !child.archived)}
+            conversationId={conversationId}
+            collapsedRows={collapsedRows}
+            onToggleCollapsed={onToggleCollapsed}
+          />
+        </ul>
       )}
-    </>
+    </li>
+  );
+}
+
+function RelatedSessionRow({
+  sessionId,
+  label,
+  harness,
+  state,
+  preview,
+  isActive,
+  isMain = false,
+  collapsed = false,
+  onToggleCollapsed,
+  sortable,
+  onRename,
+  onArchive,
+  onDelete,
+  archived,
+  archivePending,
+}: {
+  sessionId: string;
+  label: string;
+  harness: { name: string; harness: string | null } | null;
+  state: SessionState | null;
+  preview?: string | null;
+  isActive: boolean;
+  isMain?: boolean;
+  collapsed?: boolean;
+  onToggleCollapsed?: () => void;
+  sortable?: ReturnType<typeof useSortable>;
+  onRename?: () => void;
+  onArchive?: () => void;
+  onDelete?: () => void;
+  archived?: boolean;
+  archivePending?: boolean;
+}) {
+  const openInPanel = useContext(SubagentPanelOpenerContext);
+  const search = sessionNavigationSearch(useLocation().search);
+  const hasActions = openInPanel || onRename || onArchive || onDelete;
+  function menuItems(Item: typeof DropdownMenuItem | typeof ContextMenuItem) {
+    return (
+      <>
+        {openInPanel && (
+          <SessionActionMenuItem Item={Item} onSelect={() => openInPanel(sessionId)}>
+            <PanelRightOpenIcon className="size-3.5" />
+            Open in side panel
+          </SessionActionMenuItem>
+        )}
+        {onRename && (
+          <SessionActionMenuItem Item={Item} onSelect={onRename}>
+            <PencilIcon className="size-3.5" />
+            Rename
+          </SessionActionMenuItem>
+        )}
+        {onArchive && (
+          <SessionActionMenuItem
+            Item={Item}
+            onSelect={onArchive}
+            disabledReason={archivePending ? "Updating session…" : undefined}
+          >
+            {archived ? (
+              <ArchiveRestoreIcon className="size-3.5" />
+            ) : (
+              <ArchiveIcon className="size-3.5" />
+            )}
+            {archived ? "Unarchive" : "Archive"}
+          </SessionActionMenuItem>
+        )}
+        {onDelete && (
+          <SessionActionMenuItem Item={Item} onSelect={onDelete} className="text-destructive">
+            <Trash2Icon className="size-3.5" />
+            Delete
+          </SessionActionMenuItem>
+        )}
+      </>
+    );
+  }
+  return (
+    <div className="group relative">
+      <ContextMenu>
+        <ContextMenuTrigger asChild disabled={!hasActions}>
+          <Link
+            to={{ pathname: `/c/${sessionId}`, search }}
+            data-testid={isMain ? "subagent-main-row" : "peer-session-row"}
+            data-root-session-id={isMain ? sessionId : undefined}
+            title={preview ? `${label}\n${preview}` : label}
+            draggable={false}
+            ref={sortable?.setActivatorNodeRef}
+            aria-describedby={sortable?.attributes["aria-describedby"]}
+            aria-roledescription={sortable ? "sortable session" : undefined}
+            onMouseDown={(event) => sortable?.listeners?.onMouseDown?.(event)}
+            onTouchStart={(event) => sortable?.listeners?.onTouchStart?.(event)}
+            onKeyDown={(event) => sortable?.listeners?.onKeyDown?.(event)}
+            className={cn(
+              SIDEBAR_ROW,
+              SIDEBAR_HOVER_HIGHLIGHT,
+              "relative flex w-full items-center text-left text-foreground",
+              onToggleCollapsed && "pl-8",
+              isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+              hasActions &&
+                "pr-8 md:pr-2 md:group-hover:pr-14 md:group-has-[:focus-visible]:pr-14 md:group-has-[[data-state=open]]:pr-14",
+            )}
+            onDoubleClick={
+              onRename
+                ? (event) => {
+                    event.preventDefault();
+                    onRename();
+                  }
+                : undefined
+            }
+          >
+            <span className="flex size-4 shrink-0 items-center justify-center">
+              {harness ? (
+                <ComposerAgentIcon agent={harness} className="size-3.5" />
+              ) : (
+                <BotIcon className="size-3.5 text-muted-foreground" />
+              )}
+            </span>
+            <span className="min-w-0 flex-1 truncate">{label}</span>
+            {state && (
+              <span className="shrink-0 md:group-hover:hidden md:group-has-[:focus-visible]:hidden md:group-has-[[data-state=open]]:hidden">
+                <SessionStateBadge state={state} />
+              </span>
+            )}
+          </Link>
+        </ContextMenuTrigger>
+        <ContextMenuContent className="min-w-44">{menuItems(ContextMenuItem)}</ContextMenuContent>
+      </ContextMenu>
+      {onToggleCollapsed && (
+        <button
+          type="button"
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${label} subagents`}
+          aria-expanded={!collapsed}
+          aria-controls={`subagents-${sessionId}`}
+          onClick={onToggleCollapsed}
+          className="absolute left-1 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {collapsed ? (
+            <ChevronRightIcon className="size-3.5" />
+          ) : (
+            <ChevronDownIcon className="size-3.5" />
+          )}
+        </button>
+      )}
+      {hasActions && (
+        <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
+          {onRename && (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`Rename ${label}`}
+              title="Rename"
+              onClick={onRename}
+              className="hidden text-muted-foreground transition-opacity md:inline-flex md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100"
+            >
+              <PencilIcon className="size-3.5" />
+            </Button>
+          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`${label} actions`}
+                title="Session actions"
+                className="text-muted-foreground transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100 md:aria-expanded:opacity-100"
+              >
+                <EllipsisIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-44">
+              {menuItems(DropdownMenuItem)}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -560,30 +712,14 @@ function HelperSection({
   onToggleCollapsed: (id: string) => void;
 }) {
   const collapsed = collapsedRows[sessionId] ?? false;
-  const working = sessions.filter((child) => childStatus(child).activity === "working").length;
-  const awaiting = sessions.filter((child) => childStatus(child).activity === "awaiting").length;
+  if (collapsed) return null;
   return (
-    <>
-      <li>
-        <button
-          type="button"
-          className="flex w-full items-center gap-1 px-3 py-2 text-xs text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label={`${collapsed ? "Expand" : "Collapse"} ${label} subagents`}
-          aria-expanded={!collapsed}
-          onClick={() => onToggleCollapsed(sessionId)}
-        >
-          {collapsed ? (
-            <ChevronRightIcon className="size-3" />
-          ) : (
-            <ChevronDownIcon className="size-3" />
-          )}
-          <span>Subagents ({sessions.length})</span>
-          {working > 0 && <span className="ml-auto">{working} working</span>}
-          {awaiting > 0 && <span className="text-warning">{awaiting} needs input</span>}
-        </button>
-      </li>
-      {!collapsed &&
-        sessions.map((child, index) => (
+    <li id={`subagents-${sessionId}`}>
+      <ul aria-label={`${label} subagents`}>
+        {sessions.length === 0 && (
+          <li className="py-1 pl-8 text-xs text-muted-foreground">No subagents yet</li>
+        )}
+        {sessions.map((child, index) => (
           <SubagentRow
             key={child.id}
             child={child}
@@ -594,7 +730,8 @@ function HelperSection({
             onToggleCollapsed={onToggleCollapsed}
           />
         ))}
-    </>
+      </ul>
+    </li>
   );
 }
 
@@ -831,12 +968,15 @@ function MainRow({
   rootSessionId,
   isActive,
   fullSession = false,
+  collapsed,
+  onToggleCollapsed,
 }: {
   rootSessionId: string;
   isActive: boolean;
   fullSession?: boolean;
+  collapsed?: boolean;
+  onToggleCollapsed?: () => void;
 }) {
-  const openInPanel = useContext(SubagentPanelOpenerContext);
   const { session } = useSession(rootSessionId);
   const search = sessionNavigationSearch(useLocation().search);
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
@@ -850,27 +990,38 @@ function MainRow({
   // carries no name.
   const label = nativeAgent?.displayName ?? session?.agentName ?? "main";
   const preview = mainMessagePreview(session?.items);
+  if (fullSession)
+    return (
+      <li>
+        <RelatedSessionRow
+          sessionId={rootSessionId}
+          label="Main"
+          harness={{
+            name: session?.agentName ?? nativeAgent?.agentName ?? "",
+            harness: session?.harness ?? nativeAgent?.harness ?? null,
+          }}
+          state={getSessionState({
+            status:
+              session?.status === "running" || session?.status === "failed"
+                ? session.status
+                : "idle",
+            pending_elicitations_count: session?.pendingElicitations?.length ?? 0,
+          })}
+          preview={preview}
+          isActive={isActive}
+          isMain
+          collapsed={collapsed}
+          onToggleCollapsed={onToggleCollapsed}
+        />
+      </li>
+    );
   return (
     <li className="relative">
-      {!fullSession && (
-        <span
-          aria-hidden="true"
-          style={{ left: ROOT_GUIDE_CENTER_PX }}
-          className="pointer-events-none absolute bottom-0 top-10 z-10 border-l border-dashed border-border/70"
-        />
-      )}
-      {fullSession && openInPanel && (
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          className="absolute right-1 top-2 z-10"
-          aria-label="Open Main in side panel"
-          title="Open in side panel"
-          onClick={() => openInPanel(rootSessionId)}
-        >
-          <PanelRightOpenIcon className="size-3.5" />
-        </Button>
-      )}
+      <span
+        aria-hidden="true"
+        style={{ left: ROOT_GUIDE_CENTER_PX }}
+        className="pointer-events-none absolute bottom-0 top-10 z-10 border-l border-dashed border-border/70"
+      />
       <Link
         // Drop session-scoped params (``file``, ``diff``, ``comment``,
         // ``view``, ``message``) when navigating in the rail — those are tied to
@@ -891,13 +1042,6 @@ function MainRow({
         <div className="flex w-full items-start gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-[2px]">
-              {fullSession && session && (
-                <StatusAvatar
-                  {...((session.pendingElicitations?.length ?? 0) > 0
-                    ? { activity: "awaiting", label: "Needs input" }
-                    : sessionStatus(session.status, session.lastTaskError))}
-                />
-              )}
               <span
                 data-testid="subagent-main-harness-icon"
                 className="flex size-8 shrink-0 items-center justify-center rounded-xl border border-border bg-background"
@@ -910,12 +1054,7 @@ function MainRow({
                   className="size-5"
                 />
               </span>
-              <span className="min-w-0 truncate text-base font-semibold">
-                {fullSession ? "Main" : label}
-              </span>
-              {fullSession && (
-                <span className="ml-1 truncate text-xs text-muted-foreground">{label}</span>
-              )}
+              <span className="min-w-0 truncate text-base font-semibold">{label}</span>
             </div>
             {preview && (
               <p
