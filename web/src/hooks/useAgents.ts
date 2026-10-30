@@ -46,6 +46,10 @@ export interface Agent {
   harness?: string | null;
   /** MCP server declarations from the agent spec. Empty when none configured. */
   mcp_servers?: McpServerSummary[];
+  /** Whether a claude-sdk session loads the user's Claude settings and user-scope MCP
+   * servers; false when the spec's `skills: none` runs the CLI with no setting sources.
+   * Absent on older servers, which the web reads as true. */
+  loads_user_settings?: boolean;
   /** Whether the active session's agent bundle can be edited through the UI. */
   mcp_servers_editable?: boolean;
   /** Whether managed MCP services can be selected for the active session. */
