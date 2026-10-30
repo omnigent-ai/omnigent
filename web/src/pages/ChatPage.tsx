@@ -2528,8 +2528,18 @@ function ComposerImpl(
   const { session: composerSession } = useSession(composerSessionId);
   const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
   const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
-  const hostMcpHarness =
-    nativeMcpHarness !== undefined && isBrandHarness(nativeMcpHarness) ? nativeMcpHarness : null;
+  // claude-sdk runs the Claude Code CLI, so its /mcp lists the host's Claude servers too.
+  const hostMcpKey = sessionHarness === "claude-sdk" ? "claude" : nativeMcpHarness;
+  const hostMcpHarness = hostMcpKey !== undefined && isBrandHarness(hostMcpKey) ? hostMcpKey : null;
+  const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
+  // A claude-sdk session run without setting sources (`skills: none`) loads only managed servers.
+  const hostUserServersLoaded =
+    sessionHarness !== "claude-sdk" || selectedAgent?.loads_user_settings !== false;
+  const isSessionHostServer = useCallback(
+    (server: HostMcpServer) =>
+      server.harness === hostMcpHarness && (server.managed === true || hostUserServersLoaded),
+    [hostMcpHarness, hostUserServersLoaded],
+  );
   const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
     composerSessionId === null ? null : getSessionHost(composerSessionId),
   );
@@ -2542,12 +2552,11 @@ function ComposerImpl(
     useCallback(
       (servers: HostMcpServer[] | undefined) =>
         servers?.some(
-          (server) =>
-            server.harness === hostMcpHarness && server.auth_status === "sign_in_required",
+          (server) => isSessionHostServer(server) && server.auth_status === "sign_in_required",
         )
           ? HOST_MCP_SIGN_IN_POLL_MS
           : false,
-      [hostMcpHarness],
+      [isSessionHostServer],
     ),
   );
   const hostMcpStatus =
@@ -3317,7 +3326,6 @@ function ComposerImpl(
     [skills, skillPrefix],
   );
   const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
-  const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
   const registryEnabled =
     composerServerInfo !== "loading" && !!composerServerInfo.enabled_connections?.includes("mcp");
   const hasRegistryServers =
@@ -3346,30 +3354,28 @@ function ComposerImpl(
       .join(" ") || undefined;
   const mcpServers = useMemo(() => {
     const byName = new Map<string, McpServerRow>(
-      (hostMcpQuery.data ?? [])
-        .filter((server) => server.harness === hostMcpHarness)
-        .map((server) => [
-          server.name,
-          {
-            name: server.name,
-            description:
-              [server.plugin && `${server.plugin} plugin`, server.url_host]
-                .filter(Boolean)
-                .join(" · ") || undefined,
-            connection:
-              server.auth_status === "connected"
-                ? "connected"
-                : server.auth_status === "sign_in_required"
-                  ? "sign-in-required"
-                  : undefined,
-            // No URL means the state is still worth showing, with nothing to click.
-            // The scheme is enforced host-side and again at the frame decoder; this
-            // is the last gate before it becomes an href.
-            signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
-              ? { kind: "url", url: server.sign_in_url! }
-              : undefined,
-          },
-        ]),
+      (hostMcpQuery.data ?? []).filter(isSessionHostServer).map((server) => [
+        server.name,
+        {
+          name: server.name,
+          description:
+            [server.plugin && `${server.plugin} plugin`, server.url_host]
+              .filter(Boolean)
+              .join(" · ") || undefined,
+          connection:
+            server.auth_status === "connected"
+              ? "connected"
+              : server.auth_status === "sign_in_required"
+                ? "sign-in-required"
+                : undefined,
+          // No URL means the state is still worth showing, with nothing to click.
+          // The scheme is enforced host-side and again at the frame decoder; this
+          // is the last gate before it becomes an href.
+          signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
+            ? { kind: "url", url: server.sign_in_url! }
+            : undefined,
+        },
+      ]),
     );
     const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
     for (const server of selectedAgent?.mcp_servers ?? []) {
@@ -3401,7 +3407,7 @@ function ComposerImpl(
     return [...byName.values()];
   }, [
     hasRegistryServers,
-    hostMcpHarness,
+    isSessionHostServer,
     hostMcpQuery.data,
     registryCatalog.error,
     registryCatalog.loading,
