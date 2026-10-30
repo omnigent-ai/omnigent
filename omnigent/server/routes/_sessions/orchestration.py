@@ -800,7 +800,8 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
 # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
-# Watchers for queued web inputs that may never be mirrored back (see _watch_unrecorded_native_input).
+# Watchers for queued web inputs that may never be mirrored (see _watch_unrecorded_native_input).
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_expiry_tasks: set[asyncio.Task[None]] = set()
 # How often an expiry watcher re-checks a stale input while its session is busy.
 _UNRECORDED_INPUT_RECHECK_S = 30.0
@@ -3659,7 +3660,9 @@ async def _expire_unrecorded_native_input(
         if _session_status_from_cache(session_id) != "running":
             drained = pending_inputs.expire_pending_input(session_id, pending_id)
             if drained is not None:
-                await _record_unrecorded_native_input(conversation_store, conv, session_id, drained)
+                await _record_unrecorded_native_input(
+                    conversation_store, conv, session_id, drained
+                )
                 return
         await asyncio.sleep(_UNRECORDED_INPUT_RECHECK_S)
 

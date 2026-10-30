@@ -743,9 +743,10 @@ def expire_pending_input(conversation_id: str, pending_id: str) -> DrainedInput 
     Remove a watched entry that outlived the TTL and return it for undelivered recording.
 
     Returns ``None`` (and removes the entry quietly) when the entry was
-    interrupted or may have been settled by a positional drain: those were
-    never a message the agent failed to record. Also ``None`` while the entry is
-    still fresh or held by a persist in progress.
+    interrupted, may have been settled by a positional drain, or is a slash
+    command Claude runs itself: none of those is a message the agent failed to
+    record. Also ``None`` while the entry is still fresh or held by a persist
+    in progress.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param pending_id: The id returned by :func:`record`.
@@ -754,12 +755,12 @@ def expire_pending_input(conversation_id: str, pending_id: str) -> DrainedInput 
     with _lock:
         entries = _pending.get(conversation_id)
         entry = entries.get(pending_id) if entries is not None else None
-        if entry is None or entry.held or _now() - entry.created_at <= _TTL_S:
+        if entries is None or entry is None or entry.held or _now() - entry.created_at <= _TTL_S:
             return None
         entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
-        if entry.interrupted or entry.uncertain:
+        if entry.interrupted or entry.uncertain or _is_slash_led(entry):
             return None
         return _drained_input(entry)
 
@@ -1137,6 +1138,11 @@ def _prefer_live(candidates: list[int], interrupted: list[bool]) -> int | None:
 def _collapse_whitespace(text: str) -> str:
     """Collapse whitespace runs so paste and mirror spacing differences cancel out."""
     return " ".join(text.split())
+
+
+def _is_slash_led(entry: _Entry) -> bool:
+    """Whether the entry is a slash command Claude runs itself, not a recorded message."""
+    return _collapse_whitespace(_content_text(entry.content)).startswith("/")
 
 
 def _attachment_count(content: list[dict[str, Any]]) -> int:

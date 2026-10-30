@@ -221,7 +221,9 @@ def test_expire_pending_input_returns_a_stale_watched_entry_once(
     clock = [1000.0]
     monkeypatch.setattr(pending_inputs, "_now", lambda: clock[0])
     pending_id = pending_inputs.record(
-        conversation, [{"type": "input_text", "text": "never mirrored"}], created_by="a@example.com"
+        conversation,
+        [{"type": "input_text", "text": "never mirrored"}],
+        created_by="a@example.com",
     )
     pending_inputs.watch_expiry(conversation, pending_id)
 
@@ -253,6 +255,22 @@ def test_expire_pending_input_drops_quietly_when_the_entry_was_settled_otherwise
         pending_inputs.mark_interrupted(conversation, [pending_id])
     else:
         pending_inputs.mark_uncertain(conversation)
+
+    clock[0] += pending_inputs._TTL_S + 1
+
+    assert pending_inputs.expire_pending_input(conversation, pending_id) is None
+    assert not pending_inputs.is_queued(conversation, pending_id)
+
+
+def test_expire_pending_input_drops_a_slash_command_quietly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slash command Claude runs itself is never recorded as an undelivered message."""
+    conversation = "conv_slash"
+    clock = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock[0])
+    pending_id = pending_inputs.record(conversation, [{"type": "input_text", "text": "/model"}])
+    pending_inputs.watch_expiry(conversation, pending_id)
 
     clock[0] += pending_inputs._TTL_S + 1
 
