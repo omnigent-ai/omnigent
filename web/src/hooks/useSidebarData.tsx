@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
+import { isFeatureEnabled, sessionTitleSortSupported } from "@/lib/capabilities";
 import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
@@ -54,9 +54,17 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
   const serverInfo = useServerInfo();
   const [storedView, setView] = useState(readSidebarViewPreferences);
-  const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
-    ? storedView
-    : DEFAULT_SIDEBAR_VIEW;
+  const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  const titleSort = sessionTitleSortSupported(serverInfo);
+  const view = useMemo(() => {
+    if (!groupingUi) return DEFAULT_SIDEBAR_VIEW;
+    // A server that rejects sort_by=title lists by Updated; the stored choice
+    // is kept so Name returns once the server supports it.
+    if (storedView.ordering === "name" && !titleSort) {
+      return { ...storedView, ordering: DEFAULT_SIDEBAR_VIEW.ordering };
+    }
+    return storedView;
+  }, [groupingUi, titleSort, storedView]);
   const sortBy = SESSION_SORT_BY_ORDERING[view.ordering];
   const updateView = useCallback(
     (patch: Partial<SidebarViewPreferences>) => {

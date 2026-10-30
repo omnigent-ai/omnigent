@@ -403,19 +403,18 @@ class _NamedSessions:
 
 
 def _seed_session(base_url: str, title: str, project: str | None) -> str:
+    metadata: dict[str, object] = {"title": title} if title else {}
+    if project:
+        metadata["labels"] = {"omni_project": project}
     response = post_session_bundle(
-        httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
+        httpx.post,
+        f"{base_url}/v1/sessions",
+        _build_hello_world_bundle(),
+        metadata=metadata,
+        timeout=30.0,
     )
     response.raise_for_status()
-    session_id = response.json()["session_id"]
-    patch: dict[str, object] = {"title": title} if title else {}
-    if project:
-        patch["labels"] = {"omni_project": project}
-    if patch:
-        httpx.patch(
-            f"{base_url}/v1/sessions/{session_id}", json=patch, timeout=10.0
-        ).raise_for_status()
-    return session_id
+    return response.json()["session_id"]
 
 
 _UNFILED_TITLES = ["!mango plan", "!Zebra notes", "!lemon tasks"]
@@ -449,7 +448,7 @@ def _pause_for_recording(page: Page, milliseconds: int) -> None:
         page.wait_for_timeout(milliseconds)
 
 
-def _listed_ids(page: Page, ids: dict[str, str]) -> list[str]:
+def _listed_titles(page: Page, ids: dict[str, str]) -> list[str]:
     """Titles of the seeded sessions in their on-screen order."""
     titles = {session_id: title for title, session_id in ids.items()}
     hrefs = page.locator('aside a[href^="/c/"]').evaluate_all(
@@ -461,9 +460,9 @@ def _listed_ids(page: Page, ids: dict[str, str]) -> list[str]:
 def _wait_for_order(page: Page, ids: dict[str, str], expected: list[str]) -> None:
     """Wait until the seeded sessions in *ids* are listed as *expected*, leading."""
     try:
-        poll_until(lambda: _listed_ids(page, ids)[: len(expected)] == expected, timeout_s=15)
+        poll_until(lambda: _listed_titles(page, ids)[: len(expected)] == expected, timeout_s=15)
     except AssertionError:
-        assert _listed_ids(page, ids) == expected
+        assert _listed_titles(page, ids) == expected
         raise
 
 
@@ -490,7 +489,7 @@ def test_name_ordering_lists_live_sessions_a_to_z_and_persists(
     expect(folder_header).to_be_visible(timeout=30_000)
     folder_header.click()
     expect(page.get_by_test_id("project-show-more")).to_be_visible()
-    poll_until(lambda: len(_listed_ids(page, named_sessions.unfiled)) == 3, timeout_s=15)
+    poll_until(lambda: len(_listed_titles(page, named_sessions.unfiled)) == 3, timeout_s=15)
     _pause_for_recording(page, 1_000)
 
     _open_view_submenu(page, "session-ordering-menu")

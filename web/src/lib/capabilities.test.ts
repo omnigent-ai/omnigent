@@ -192,15 +192,18 @@ describe("resolveServerInfo release features", () => {
   });
 });
 
-describe("resolveServerInfo session_search_scope", () => {
-  it("reads the advertised capability", async () => {
-    expect((await probe({ session_search_scope: true })).session_search_scope).toBe(true);
-  });
+describe.each(["session_search_scope", "session_title_sort"] as const)(
+  "resolveServerInfo %s",
+  (capability) => {
+    it("reads the advertised capability", async () => {
+      expect((await probe({ [capability]: true }))[capability]).toBe(true);
+    });
 
-  it("is off for an older server that omits it", async () => {
-    expect((await probe({})).session_search_scope).toBe(false);
-  });
-});
+    it("is off for an older server that omits it", async () => {
+      expect((await probe({}))[capability]).toBe(false);
+    });
+  },
+);
 
 describe("resolveServerInfo scheduled_task_projects", () => {
   it.each([

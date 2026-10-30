@@ -178,7 +178,12 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  isSingleUserMode,
+  sandboxOptionLabel,
+  sessionTitleSortSupported,
+} from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
@@ -226,6 +231,7 @@ import {
 } from "@/lib/sessionFilterPreferences";
 import {
   SIDEBAR_GROUPINGS,
+  SIDEBAR_ORDERINGS,
   SIDEBAR_SHOW_FIELDS,
   type SidebarGrouping,
   type SidebarOrdering,
@@ -2755,6 +2761,11 @@ function ConversationList({
       onChange={onActiveTabChange}
       multiUser={multiUser}
       view={groupingUi ? view : null}
+      orderings={
+        sessionTitleSortSupported(serverInfo)
+          ? SIDEBAR_ORDERINGS
+          : SIDEBAR_ORDERINGS.filter((ordering) => ordering !== "name")
+      }
       onViewChange={updateView}
     />
   );
@@ -3499,6 +3510,7 @@ function SessionFilterMenu({
   onChange,
   multiUser,
   view,
+  orderings,
   onViewChange,
 }: {
   value: SidebarTab;
@@ -3506,6 +3518,8 @@ function SessionFilterMenu({
   multiUser: boolean;
   /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
   view: SidebarViewPreferences | null;
+  /** Orderings the server can list by; older servers can't sort by name. */
+  orderings: readonly SidebarOrdering[];
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
@@ -3596,13 +3610,13 @@ function SessionFilterMenu({
               value={view.ordering}
               onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
             >
-              {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
+              {orderings.map((ordering) => (
                 <DropdownMenuRadioItem
                   key={ordering}
                   value={ordering}
                   data-testid={`session-ordering-${ordering}`}
                 >
-                  {label}
+                  {ORDERING_LABELS[ordering]}
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>

@@ -218,9 +218,9 @@ export interface FrozenSortKey {
   title: string | null;
 }
 
-// Timestamps sort newest first and titles A to Z; ties fall back to id, so
-// arrival order never shows. Freeze update timestamps and titles for the
-// hovered list so a background change cannot move a row under the cursor.
+// Timestamps sort newest first and titles A to Z; ties fall back to id. While
+// the list is hovered or a rename is open, each row's updated time (including
+// the active-chat override) and title stay frozen, so it doesn't move.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,

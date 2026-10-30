@@ -6207,6 +6207,11 @@
             "title": "Session Search Scope",
             "type": "boolean"
           },
+          "session_title_sort": {
+            "default": true,
+            "title": "Session Title Sort",
+            "type": "boolean"
+          },
           "sharing_mode": {
             "enum": [
               "on",

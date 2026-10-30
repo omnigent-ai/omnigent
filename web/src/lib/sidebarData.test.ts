@@ -191,11 +191,16 @@ it("orders names like every server dialect: ASCII-only folding, code points, id 
     titled("a9", "\u00C9clair"),
     titled("a7", "zeta"),
     titled("a6", "Zeta"),
+    titled("a2", "y "),
+    titled("a3", "y"),
     titled("c1", ""),
     titled("a1", ""),
   ];
-  // Accented capitals stay unfolded, and the emoji sorts after U+FF21 by code point.
+  // Trailing spaces count, accented capitals stay unfolded, and the emoji
+  // sorts after U+FF21 by code point.
   expect(rows.sort((x, y) => compareSessionRows(x, y, "title")).map((r) => r.id)).toEqual([
+    "a3",
+    "a2",
     "a6",
     "a7",
     "a9",

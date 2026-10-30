@@ -3369,10 +3369,11 @@ it("caps Shared display independently of Mine while revealing cached rows", asyn
 });
 
 /** Render the sidebar with the sidebar_grouping_ui release flag on. */
-function renderGroupingSidebar() {
+function renderGroupingSidebar(sessionTitleSort = true) {
   return renderSidebar(true, "/", undefined, {
     ...FALLBACK_SERVER_INFO,
     features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true },
+    session_title_sort: sessionTitleSort,
   });
 }
 
@@ -3838,6 +3839,28 @@ describe("Sidebar view options", () => {
       screen.getAllByRole("link", { name: /^conv_/i }).map((link) => link.textContent),
     ).toEqual(["Conv_Kiwi", "conv_mango", "Conv_Alpha", "conv_beta", "conv_zeta"]);
     expect(sessionTitles()).toEqual(["Conv_Alpha", "conv_beta", "conv_zeta", "New session"]);
+  });
+
+  it("hides Name and lists by Updated on a server that can't sort by title", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+    mockConversations([
+      conv("conv_z", "Codex", { title: "conv_zeta", updated_at: 500 }),
+      conv("conv_a", "Codex", { title: "conv_alpha", updated_at: 100 }),
+    ]);
+    renderGroupingSidebar(false);
+    expect(
+      within(groupSection("Sessions"))
+        .getAllByRole("link")
+        .map((link) => link.textContent)
+        .filter(Boolean),
+    ).toEqual(["conv_zeta", "conv_alpha"]);
+    openViewSubmenu("session-ordering-menu");
+    expect(screen.queryByRole("menuitemradio", { name: "Name (A to Z)" })).toBeNull();
+    expect(screen.getByRole("menuitemradio", { name: "Updated" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("name");
   });
 
   it("shows the toggled metadata under the title and the updated time in the trailing slot", () => {

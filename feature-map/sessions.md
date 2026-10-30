@@ -63,8 +63,8 @@ the header menu), and each place is a separate entry point.
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
-- `project-show-more`: an expanded project folder lists its five newest
-  sessions; each Show more slides five more in until none remain. Re-expanding
+- `project-show-more`: an expanded project folder lists its first five
+  sessions in the selected ordering; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has
   loaded it, and Show more carries the badge of a hidden session that needs
   attention or is unread. Filing a session into the folder leaves its listed

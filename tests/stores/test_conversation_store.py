@@ -3119,10 +3119,14 @@ def test_list_conversations_sort_by_title(
     untitled conversations last when ascending, breaks ties by id, and pages
     without gaps. The web client reproduces this exact order.
     """
-    titles = ["beta", "", "Alpha", "ab", "a-c", "alpha", "Gamma", ""]
+    titles = ["beta", "", "Alpha", "ab", "a-c", "alpha", "Gamma", "", "  "]
     titles += ["\u00e9clair", "\u00c9clair", "\uff21 wide", "\U0001f600 smile"]
     for title in titles:
         conversation_store.create_conversation(title=title)
+    # "b " gets the smaller id, so a padded comparison that ties it with "b"
+    # would list it first.
+    conversation_store.create_conversation(title="b ", conversation_id="0" * 32)
+    conversation_store.create_conversation(title="b", conversation_id="f" * 32)
 
     full = conversation_store.list_conversations(sort_by="title", order="asc", kind=None)
     ascii_fold = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
@@ -3131,13 +3135,17 @@ def test_list_conversations_sort_by_title(
         key=lambda c: ("0" + c.title.translate(ascii_fold) if c.title else "1", c.id),
     )
     assert [c.id for c in full.data] == [c.id for c in expected]
-    # "-" sorts before letters, accented capitals stay unfolded, and the
-    # emoji follows U+FF21 by code point (a UTF-16 comparison would invert it).
+    # Spaces and "-" sort before letters, trailing spaces count, accented
+    # capitals stay unfolded, and the emoji follows U+FF21 by code point (a
+    # UTF-16 comparison would invert it).
     listed = [c.title or "" for c in full.data]
-    assert sorted(listed[2:4]) == ["Alpha", "alpha"], listed
-    assert listed[:2] + listed[4:] == [
+    assert sorted(listed[3:5]) == ["Alpha", "alpha"], listed
+    assert listed[:3] + listed[5:] == [
+        "  ",
         "a-c",
         "ab",
+        "b",
+        "b ",
         "beta",
         "Gamma",
         "\u00c9clair",

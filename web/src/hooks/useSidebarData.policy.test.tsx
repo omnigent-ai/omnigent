@@ -52,6 +52,7 @@ let config: SidebarConfig;
 let view: SessionFilter;
 let mounted: boolean;
 let groupingUi = false;
+let titleSort = true;
 function View() {
   useSidebarView(view);
   return null;
@@ -60,7 +61,11 @@ function wrapper({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={client}>
       <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, features: { sidebar_grouping_ui: groupingUi } }}
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          features: { sidebar_grouping_ui: groupingUi },
+          session_title_sort: titleSort,
+        }}
       >
         <SidebarDataProvider config={config}>
           {mounted && <View />}
@@ -81,6 +86,7 @@ const response = (rows: Conversation[], more = false) => ({
 });
 beforeEach(() => {
   groupingUi = false;
+  titleSort = true;
   localStorage.clear();
   identity.viewerId = null;
   identity.resolution = Promise.resolve(null);
@@ -524,6 +530,27 @@ it.each([
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("updated");
   },
 );
+
+it("keeps a stored Name ordering but lists by Updated until the server can sort by title", async () => {
+  localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+  groupingUi = true;
+  titleSort = false;
+  view = "all";
+  const { result, rerender } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+  expect(result.current.sortBy).toBe("updated_at");
+  expect(result.current.view.ordering).toBe("updated");
+  const listed = () => [...listCalls("mine"), ...listCalls("shared")];
+  expect(listed().every(([url]) => params(url).get("sort_by") === "updated_at")).toBe(true);
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("name");
+  titleSort = true;
+  fetchMock.mockClear();
+  rerender();
+  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+  expect(result.current.sortBy).toBe("title");
+  expect(listCalls("mine")).toHaveLength(1);
+  expect(listed().every(([url]) => params(url).get("sort_by") === "title")).toBe(true);
+});
 
 it.each([false, true])(
   "clears destination sort snapshots while folders, pins and Archived reload (archived folder: %s)",

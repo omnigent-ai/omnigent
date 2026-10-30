@@ -3503,13 +3503,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             for upper, lower in zip(string.ascii_uppercase, string.ascii_lowercase, strict=True):
                 folded = func.replace(folded, upper, lower)
         # One string key keeps the keyset cursor a two-column row comparison.
-        title_key = (case((title == "", "1"), else_="0") + folded).self_group()
+        # length() rather than = '' so MySQL's PAD SPACE equality can't treat
+        # a whitespace-only title as untitled.
+        title_key = (case((func.length(title) == 0, "1"), else_="0") + folded).self_group()
         # Ids are raw uuid bytes, so they order like their lowercase hex form.
         tiebreaker = cast(ColumnElement[Any], SqlConversation.id)
         if dialect == "postgresql":
             return title_key.collate("C"), tiebreaker
-        if dialect == "mysql":
-            return title_key.collate("utf8mb4_bin"), tiebreaker
+        if dialect in ("mysql", "mariadb"):
+            # Binary strings compare UTF-8 bytes without PAD SPACE, so trailing
+            # spaces still order titles.
+            return title_key.cast(LargeBinary), tiebreaker
         # SQLite (BINARY) and CockroachDB compare strings bytewise by default.
         return title_key, tiebreaker
 
