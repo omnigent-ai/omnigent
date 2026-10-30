@@ -198,8 +198,8 @@ map an area, remove it here in the same change.
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity,
-  Claude shell-command settlement, refused-delivery persistence, and tool-run
-  folding are mapped)
+  Claude and Codex shell-command settlement, refused-delivery persistence, and
+  tool-run folding are mapped)
 - Mobile layout: `tests/e2e_ui/mobile/` (only composer labels, the composer
   after an unacknowledged send, sidebar rename under the keyboard, and
   terminal touch scroll are mapped)

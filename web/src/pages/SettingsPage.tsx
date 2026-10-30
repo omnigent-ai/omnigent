@@ -236,6 +236,10 @@ import {
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "@/lib/pickerEntryVisibility";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -279,6 +283,7 @@ import {
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
+import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -1008,12 +1013,15 @@ function AppearanceSection() {
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
       } catch {
         // localStorage access errors are non-fatal.
       }
+      // As with import: a same-tab write fires no storage event.
+      notifyHiddenPickerAgentsChanged();
     }
     applyStoredUiFontSize();
 
@@ -1114,6 +1122,7 @@ function AppearanceSection() {
             <TranscriptViewDefaultControl />
             <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
+              <PickerVisibilitySetting />
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <FoldAssistantNarrationControl />

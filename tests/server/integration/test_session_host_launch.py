@@ -2199,7 +2199,7 @@ async def test_message_relaunch_waits_longer_for_a_runner_the_host_spawned(
         launch = await _serve_one_launch(comm, launch_status="launched")
         runner_id = token_bound_runner_id(launch.binding_token)
         relaunched.append(runner_id)
-        await _wait_for_runner_connect_waiter(app, runner_id, timeout_s=budget(5.0))
+        await _wait_for_runner_connect_waiter(app, runner_id)
         # Connect after the base budget but well inside the doubled one.
         await asyncio.sleep(base_timeout_s * 1.4)
         assert not post.done(), "the send gave up at the base connect budget"
