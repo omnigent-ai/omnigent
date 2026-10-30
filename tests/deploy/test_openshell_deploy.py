@@ -28,6 +28,11 @@ def _server_pod() -> dict:
     return patch["spec"]["template"]["spec"]
 
 
+def _openshell_config() -> dict:
+    server_config = yaml.safe_load((_OVERLAY / "server-config.yaml").read_text())["data"]
+    return yaml.safe_load(server_config["config.yaml"])["sandbox"]["openshell"]
+
+
 def test_host_image_venv_is_writable_by_openshell_sandbox_user() -> None:
     """OpenShell execs run as ``sandbox`` and pip-install Omnigent wheels into /opt/venv."""
     instructions = _stage_instructions("host")
@@ -83,10 +88,8 @@ def test_openshell_overlay_mounts_gateway_config_where_server_sdk_reads_it() -> 
 
 def test_openshell_overlay_gateway_secret_projects_gateway_metadata() -> None:
     """Secret keys cannot contain ``/``, so items place them under the configured gateway."""
-    server_config = yaml.safe_load((_OVERLAY / "server-config.yaml").read_text())["data"]
-    openshell_config = yaml.safe_load(server_config["config.yaml"])["sandbox"]["openshell"]
     # Without a cluster name the SDK falls back to an active_gateway file.
-    cluster = openshell_config.get("cluster")
+    cluster = _openshell_config().get("cluster")
     assert cluster, "sandbox.openshell.cluster must name the mounted gateway"
     (secret,) = [
         volume["secret"]
@@ -101,3 +104,28 @@ def test_openshell_overlay_gateway_secret_projects_gateway_metadata() -> None:
     }
     # Plaintext gateways have no mTLS keys; optional lets the pod start without them.
     assert secret["optional"] is True
+
+
+def test_openshell_overlay_allows_server_egress_to_in_cluster_gateway() -> None:
+    """Egress is checked against the gateway pod's port after Service translation."""
+    base = yaml.safe_load((_ROOT / "deploy/kubernetes/base/deployment.yaml").read_text())
+    policy = yaml.safe_load((_OVERLAY / "gateway-networkpolicy.yaml").read_text())["spec"]
+    gateway_namespace = {"kubernetes.io/metadata.name": "openshell"}
+
+    assert policy["podSelector"]["matchLabels"].items() <= (
+        base["spec"]["template"]["metadata"]["labels"].items()
+    )
+    assert any(
+        {"protocol": "TCP", "port": 8080} in rule.get("ports", [])
+        and {"namespaceSelector": {"matchLabels": gateway_namespace}} in rule.get("to", [])
+        for rule in policy["egress"]
+    )
+
+
+def test_openshell_overlay_forwards_runner_proxy_passthrough_into_sandboxes() -> None:
+    """Runners only inherit the sandbox proxy when the host receives the passthrough list."""
+    server_env = yaml.safe_load((_OVERLAY / "configmap-patch.yaml").read_text())["data"]
+    passthrough = set(server_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"].split(","))
+
+    assert "OMNIGENT_RUNNER_ENV_PASSTHROUGH" in _openshell_config()["env"]
+    assert {"HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"} <= passthrough

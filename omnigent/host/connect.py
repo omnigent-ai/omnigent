@@ -5206,9 +5206,8 @@ class HostProcess:
             )
             ws = await ws_cm.__aenter__()
         except BaseException as exc:
-            # The event loop owns the proxied socket once create_connection is
-            # reached; close it for failures before that hand-off (a second
-            # close of an already-closed socket is harmless).
+            # Close the proxied socket on any connect failure; closing it again
+            # after the event loop has adopted it is harmless.
             if proxy_sock is not None:
                 with contextlib.suppress(OSError):
                     proxy_sock.close()

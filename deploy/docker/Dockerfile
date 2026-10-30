@@ -394,8 +394,8 @@ RUN set -eu; \
 # /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
 # policy. Re-install without -e so the package bytes land in the venv's
 # site-packages and imports no longer require /build at runtime.
-# OpenShell's sandbox user must own the venv to ship wheels into it. Chown at
-# COPY and only re-own pip's new files so the venv layer is not duplicated.
+
+# OpenShell's sandbox user installs wheels here; chowning at COPY avoids a second venv layer.
 COPY --from=builder --chown=sandbox:sandbox /opt/venv /opt/venv
 COPY --from=builder /build /build
 RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \

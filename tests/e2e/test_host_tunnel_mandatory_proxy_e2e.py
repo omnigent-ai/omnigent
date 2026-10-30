@@ -7,23 +7,20 @@ import os
 import select
 import socket
 import socketserver
-import subprocess
-import sys
 import threading
 import time
-import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-import yaml
+import pytest
 
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from tests._helpers.compat import runner_executable
+from tests._helpers.host import isolated_host
 from tests.e2e.conftest import lookup_agent_id, upload_agent
 from tests.e2e.test_host_e2e import _write_smoke_agent_yaml
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVER_HOST = "omnigent-server.openshell.invalid"
 
 _SITECUSTOMIZE = f"""\
@@ -116,39 +113,34 @@ def _mandatory_proxy(server_port: int) -> Iterator[tuple[str, list[tuple[str, st
             thread.join(timeout=5)
 
 
+# Older host builds dial the tunnel directly instead of through the proxy.
+@pytest.mark.min_runner_version("0.21.0")
 def test_host_comes_online_through_mandatory_proxy(
     live_server: str, http_client: httpx.Client, tmp_path: Path
 ) -> None:
     server_port = urlsplit(live_server).port
     assert server_port is not None
     server_url = f"http://{_SERVER_HOST}:{server_port}"
-    host_id = uuid.uuid4().hex
-    omni_dir = tmp_path / ".omnigent"
-    omni_dir.mkdir()
-    (omni_dir / "config.yaml").write_text(
-        yaml.safe_dump({"host": {"host_id": host_id, "name": f"proxy-test-{host_id}"}})
-    )
-    databricks_config = tmp_path / ".databrickscfg"
-    databricks_config.touch()
     # Only the proxy may resolve the server; the real host imports this DNS shim.
-    (tmp_path / "sitecustomize.py").write_text(_SITECUSTOMIZE)
-    host_log = tmp_path / "host-daemon.log"
-    host_log.touch()
-    console_log = tmp_path / "host-console.log"
+    dns_shim = tmp_path / "dns-shim"
+    dns_shim.mkdir()
+    (dns_shim / "sitecustomize.py").write_text(_SITECUSTOMIZE)
+    python = runner_executable()
+    # Exclude ambient credentials and optional native harness binaries.
+    base_env = {
+        "PATH": os.pathsep.join([str(Path(python).parent), os.defpath]),
+        "PYTHONPATH": str(dns_shim),
+        **{
+            name: os.environ[name]
+            for name in ("OMNIGENT_HARNESS_TMP_PARENT", "LANG", "LC_ALL", "TMPDIR")
+            if name in os.environ
+        },
+    }
 
     with _mandatory_proxy(server_port) as (proxy_url, relayed):
         assert httpx.get(f"{server_url}/health", proxy=proxy_url, timeout=10).status_code == 200
         env = {
-            # Exclude ambient credentials and optional native harness binaries.
-            "PATH": os.pathsep.join([str(Path(sys.executable).parent), os.defpath]),
-            "DATABRICKS_CONFIG_FILE": str(databricks_config),
-            "OMNIGENT_CONFIG_HOME": str(omni_dir),
-            "OMNIGENT_DATA_DIR": str(omni_dir),
-            "OMNIGENT_AUTH_PROVIDER": "header",
             "OMNIGENT_DISABLE_KEYRING": "1",
-            "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
-            PROCESS_LOG_FILE_ENV_VAR: str(host_log),
-            "PYTHONPATH": os.pathsep.join([str(tmp_path), str(_REPO_ROOT)]),
             "HTTP_PROXY": proxy_url,
             "HTTPS_PROXY": proxy_url,
             "ALL_PROXY": proxy_url,
@@ -163,86 +155,51 @@ def test_host_comes_online_through_mandatory_proxy(
                 "http_proxy,https_proxy,all_proxy,no_proxy"
             ),
         }
-        with console_log.open("w") as console:
-            proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "omnigent",
-                    "host",
-                    "--server",
-                    server_url,
-                    "--non-interactive",
-                    "--no-open",
-                ],
-                env=env,
-                cwd=_REPO_ROOT,
-                stdout=console,
-                stderr=subprocess.STDOUT,
-            )
-            try:
-                online = False
-                deadline = time.monotonic() + 90
-                while proc.poll() is None and time.monotonic() < deadline:
-                    hosts: list[dict[str, object]] = []
-                    with contextlib.suppress(httpx.HTTPError):
-                        response = http_client.get("/v1/hosts", timeout=5)
-                        response.raise_for_status()
-                        hosts = response.json().get("hosts", [])
-                    online = any(
-                        host.get("host_id") == host_id and host.get("status") == "online"
-                        for host in hosts
-                    )
-                    if (
-                        online
-                        or host_log.read_text(errors="replace").count(
-                            "Temporary failure in name resolution"
-                        )
-                        >= 5
-                    ):
-                        break
-                    time.sleep(0.5)
-                assert online, (
-                    f"Host never came online: exit={proc.poll()}, relayed requests={relayed}\n"
-                    f"{host_log.read_text(errors='replace')[-3000:]}\n"
-                    f"{console_log.read_text(errors='replace')[-3000:]}"
-                )
-                assert ("CONNECT", f"{_SERVER_HOST}:{server_port}") in relayed
+        with isolated_host(
+            tmp_path / "host",
+            server_url,
+            env=env,
+            base_env=base_env,
+            command=[
+                python,
+                "-m",
+                "omnigent",
+                "host",
+                "--server",
+                server_url,
+                "--non-interactive",
+                "--no-open",
+            ],
+        ) as host:
+            host.wait_online(http_client, timeout=90)
+            assert ("CONNECT", f"{_SERVER_HOST}:{server_port}") in relayed
 
-                agent_name = upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
-                workspace = tmp_path / "project"
-                workspace.mkdir()
-                response = http_client.post(
-                    "/v1/sessions",
-                    json={
-                        "agent_id": lookup_agent_id(http_client, agent_name),
-                        "host_id": host_id,
-                        "workspace": str(workspace),
-                    },
-                    timeout=90,
-                )
-                response.raise_for_status()
-                runner_id = response.json()["runner_id"]
-                assert runner_id, response.json()
-                runner_online = False
-                deadline = time.monotonic() + 60
-                while proc.poll() is None and time.monotonic() < deadline:
-                    status = http_client.get(f"/v1/runners/{runner_id}/status", timeout=5)
-                    status.raise_for_status()
-                    if status.json().get("online"):
-                        runner_online = True
-                        break
-                    time.sleep(0.5)
-                assert runner_online, (
-                    f"Runner {runner_id} never came online; relayed requests={relayed}\n"
-                    f"{host_log.read_text(errors='replace')[-3000:]}"
-                )
-                assert relayed.count(("CONNECT", f"{_SERVER_HOST}:{server_port}")) >= 2
-            finally:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=5)
+            agent_name = upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
+            workspace = tmp_path / "project"
+            workspace.mkdir()
+            response = http_client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": lookup_agent_id(http_client, agent_name),
+                    "host_id": host.host_id,
+                    "workspace": str(workspace),
+                },
+                timeout=90,
+            )
+            response.raise_for_status()
+            runner_id = response.json()["runner_id"]
+            assert runner_id, response.json()
+            runner_online = False
+            deadline = time.monotonic() + 60
+            while host.proc.poll() is None and time.monotonic() < deadline:
+                status = http_client.get(f"/v1/runners/{runner_id}/status", timeout=5)
+                status.raise_for_status()
+                if status.json().get("online"):
+                    runner_online = True
+                    break
+                time.sleep(0.5)
+            assert runner_online, (
+                f"Runner {runner_id} never came online; relayed requests={relayed}\n"
+                f"{host.log_path.read_text(errors='replace')[-3000:]}"
+            )
+            assert relayed.count(("CONNECT", f"{_SERVER_HOST}:{server_port}")) >= 2

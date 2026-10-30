@@ -1199,9 +1199,8 @@ async def _serve_tunnel_once(
                 )
             )
         except BaseException:
-            # The event loop owns the proxied socket once create_connection is
-            # reached; close it for failures before that hand-off (including
-            # websockets versions that parse the URI in the constructor).
+            # Close the proxied socket on any connect failure; closing it again
+            # after the event loop has adopted it is harmless.
             if proxy_sock is not None:
                 with contextlib.suppress(OSError):
                     proxy_sock.close()
