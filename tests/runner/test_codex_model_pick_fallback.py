@@ -313,7 +313,10 @@ async def test_profile_workspace_listing_decides_a_pick_codex_omits(
     harness.workspace_models.assert_called_once_with(
         "https://workspace.example.com", "workspace-token"
     )
-    assert read_cached_state.called is isinstance(live_listing, Exception)
+    if isinstance(live_listing, Exception):
+        read_cached_state.assert_called_once_with("https://workspace.example.com")
+    else:
+        read_cached_state.assert_not_called()
 
 
 @pytest.mark.asyncio
