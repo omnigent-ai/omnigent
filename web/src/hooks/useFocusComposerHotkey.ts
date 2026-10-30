@@ -1,3 +1,4 @@
+import { chatOwnsHotkey } from "@/lib/hotkeys";
 // Ctrl+Shift+L (every platform, including macOS) focuses the composer's chat
 // input, so the user can start typing from anywhere in the session view without
 // reaching for the mouse.
@@ -39,7 +40,12 @@ function focusOwnsHotkey(): boolean {
  * @param enabled Pass `false` to leave the chord untouched (e.g. no composer on
  *   screen). Defaults on.
  */
-export function useFocusComposerHotkey(onFocus: () => void, enabled = true): void {
+export function useFocusComposerHotkey(
+  onFocus: () => void,
+  enabled = true,
+  sessionId?: string | null,
+  secondary = false,
+): void {
   // Held in a ref so the bound handler always calls the latest closure without
   // re-registering on every render.
   const latest = useRef(onFocus);
@@ -49,7 +55,7 @@ export function useFocusComposerHotkey(onFocus: () => void, enabled = true): voi
     if (!enabled) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
       // Ignore auto-repeat: holding the chord would re-fire focus pointlessly.
-      if (e.repeat) return;
+      if (e.repeat || !chatOwnsHotkey(sessionId, secondary)) return;
       if (!isFocusComposerHotkey(e)) return;
       if (focusOwnsHotkey()) return;
       e.preventDefault();
@@ -58,5 +64,5 @@ export function useFocusComposerHotkey(onFocus: () => void, enabled = true): voi
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [enabled]);
+  }, [enabled, sessionId, secondary]);
 }

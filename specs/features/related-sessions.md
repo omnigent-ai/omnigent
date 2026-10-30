@@ -25,12 +25,14 @@ to recognize a new feature or advertise new protocol fields.
   remember the selection across navigation and reload. Place the collapse chevron
   beside the harness icon on the session row; its tray opens directly below it.
 - **R2:** Offer New session in Agents and Add agent in the sidebar action menu.
-  Open the existing new-session composer in a popup, prefilled from the source.
-  Reuse its harness, model, permissions and attachment controls. Create fresh context in the
-  source session's environment; a create from peer B attaches under root A but uses
-  B's execution environment. Sending the first message creates the session.
-  Its opening task supplies the initial title; users can rename it from the row.
-  Canceling leaves the ordinary new-session draft and preferences untouched.
+  Replace the Agents list with the existing new-session composer, prefilled from
+  the source, and offer Back to agents. Reuse its harness, model, permissions and
+  attachment controls. Sending creates a fresh session and opens it in a side-panel
+  chat tab, leaving the main chat unchanged. Its opening task supplies its title.
+  Fork beside Rename opens the existing fork dialog with its harness picker and
+  copies context using the existing compatibility rules. Both paths reuse the
+  source environment; creating from peer B attaches under root A using B's runner.
+  Leaving the composer preserves ordinary new-session drafts and preferences.
 - **R3:** Open peers in the main conversation or as persistent group-scoped side
   tabs. Side tabs have their own transcript, attachments, drafts, queue and model
   controls where supported. Full screen opens the existing complete workspace.
@@ -42,8 +44,9 @@ to recognize a new feature or advertise new protocol fields.
 - **R6:** Group actions clearly describe their scope. Archive All and Delete All
   include the group; individual peer actions stay scoped. Undo restores only rows
   changed by its archive operation. Archived peers remain discoverable.
-- **R7:** Reuse sidebar rows: drag peers to reorder, rename on hover, and put
-  Open in side panel and lifecycle actions in the row menu. In a peer's main
+- **R7:** Keep the taller Agents rows and harness avatars; reuse sidebar interactions: drag peers to reorder, rename on hover, and put
+  Open in side panel and lifecycle actions in the row menu. Hover actions are
+  ordered Rename, Fork, More; Main has Fork and More. In a peer's main
   conversation, reuse the above-composer identity tray and offer Back to Main.
 
 ## Clarifications
@@ -58,13 +61,14 @@ to recognize a new feature or advertise new protocol fields.
   scopes.
 - Full-session side tabs are group-scoped. Real forked side chats, files, browser
   tabs, terminal selection and session drafts remain scoped to their own session.
-- Side tabs reuse existing side-chat controls; goal/plan controls and complete
-  main-composer menu parity remain available through Open full screen.
+- Full-session side tabs render the main ChatPage, transcript and composer with
+  session-scoped state/actions. Model, permissions, goals, plans, attachments,
+  commands, queue/steer, stop and drafts use the tab's own session.
 - Group archive retains shared worktrees. With this draft enabled, bulk archive
   also retains worktrees and tells the user instead of offering cleanup.
-- Forking continues through existing flows. Related-session fork and new sandbox
-  choices remain unavailable in this draft instead of silently changing context.
-- The popup shows the source environment and fixes its destination. Other hosts
+- Related forks use the existing history and cross-harness compatibility rules.
+  New sandbox placement remains unavailable in this draft.
+- The inline composer shows the source environment and fixes its destination. Other hosts
   need a trusted placement capability before they can be offered; a host name or
   provider label cannot establish permission to control it. New custom-agent
   bundle creation remains available through the ordinary new-session flow.
@@ -74,7 +78,9 @@ to recognize a new feature or advertise new protocol fields.
 - **AC1 (R1):** GIVEN a root, two full peers and helpers, WHEN Main's Subagents is
   collapsed, THEN both peers remain visible and the collapse survives reload.
 - **AC2 (R2, R4):** GIVEN an owned peer B, WHEN New session is submitted, THEN the
-  new session is attached to B's root using B's runner and a fresh transcript;
+  new session is attached to B's root using B's runner and a fresh transcript,
+  opens in a side tab, and leaves the center chat unchanged. Fork on B's row
+  copies its transcript using the existing fork rules;
   a reader's equivalent request is denied without persisting a session.
 - **AC3 (R3):** GIVEN a full peer opened in a side tab, WHEN navigating to another
   peer in the same group, THEN the tab remains available and its messages/settings
@@ -110,7 +116,7 @@ capability picker alone does not provide that isolation.
 ## Plan
 
 1. Add the release gate, owner-checked related create and protected peer role.
-2. Reuse the Agents panel and creation dialog for flat peers and grouped helpers.
+2. Reuse the Agents panel and inline composer for flat peers and grouped helpers.
 3. Scope full-session tabs to the root and reuse the existing rich chat composer.
 4. Add explicit group lifecycle handling with operation-specific Undo.
 5. Run targeted server/component checks and record an isolated browser demo.
@@ -118,7 +124,7 @@ capability picker alone does not provide that isolation.
 ## Tasks
 
 - [x] Server create contract, authorization and legacy regression checks.
-- [x] Agents grouping, creation dialog and sidebar entry point.
+- [x] Agents grouping, inline composer and sidebar entry point.
 - [x] Group side tabs and scoped composer behavior.
 - [x] Group lifecycle and archived-peer discovery.
 - [x] Isolated browser evidence and compatibility checks.

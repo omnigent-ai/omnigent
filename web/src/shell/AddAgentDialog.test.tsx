@@ -8,7 +8,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { AddAgentDialog } from "./AddAgentDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
-import { useSession } from "@/hooks/useSession";
 import { createSession } from "@/lib/sessionsApi";
 
 const navigateMock = vi.fn();
@@ -19,14 +18,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
-}));
-vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
-const composerProps = vi.hoisted(() => ({ current: null as unknown }));
-vi.mock("./NewChatDialog", () => ({
-  NewChatLandingScreen: (props: unknown) => {
-    composerProps.current = props;
-    return <div data-testid="shared-new-session-composer" />;
-  },
 }));
 vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn() }));
 
@@ -48,19 +39,13 @@ function mockAgents(agents: AvailableAgent[]) {
   } as unknown as ReturnType<typeof useAvailableAgents>);
 }
 
-function renderDialog(parentSessionId = "conv_parent", relatedSession = false) {
+function renderDialog(parentSessionId = "conv_parent") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
   const utils = render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <AddAgentDialog
-          parentSessionId={parentSessionId}
-          rootSessionId={relatedSession ? "conv_root" : parentSessionId}
-          relatedSession={relatedSession}
-          open
-          onOpenChange={vi.fn()}
-        />
+        <AddAgentDialog parentSessionId={parentSessionId} open onOpenChange={vi.fn()} />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -68,7 +53,6 @@ function renderDialog(parentSessionId = "conv_parent", relatedSession = false) {
 }
 
 beforeEach(() => {
-  vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
   useAvailableAgentsMock.mockReset();
   createSessionMock.mockReset();
   navigateMock.mockReset();
@@ -204,31 +188,5 @@ describe("AddAgentDialog", () => {
     );
     // A failed create must not navigate the user away from the parent.
     expect(navigateMock).not.toHaveBeenCalled();
-  });
-});
-
-describe("related session creation", () => {
-  it("opens the shared new-session composer with the acted-on peer and group root", () => {
-    const source = { id: "conv_peer", hostId: "host_peer", agentId: "ag_codex", harness: "codex" };
-    vi.mocked(useSession).mockReturnValue({ session: source } as ReturnType<typeof useSession>);
-    renderDialog("conv_peer", true);
-    expect(screen.getByTestId("shared-new-session-composer")).toBeInTheDocument();
-    expect(composerProps.current).toMatchObject({
-      relatedSession: { source, rootSessionId: "conv_root" },
-    });
-    expect(screen.queryByTestId("add-agent-name-input")).not.toBeInTheDocument();
-    expect(createSessionMock).not.toHaveBeenCalled();
-  });
-
-  it("shows the source-loading error without creating an independent session", () => {
-    vi.mocked(useSession).mockReturnValue({
-      session: null,
-      isLoading: false,
-      error: new Error("Session unavailable"),
-    });
-    renderDialog("conv_peer", true);
-    expect(screen.getByText("Session unavailable")).toBeInTheDocument();
-    expect(screen.queryByTestId("shared-new-session-composer")).not.toBeInTheDocument();
-    expect(createSessionMock).not.toHaveBeenCalled();
   });
 });

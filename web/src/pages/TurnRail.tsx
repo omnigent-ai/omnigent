@@ -1,3 +1,4 @@
+import { useChatStoreApi, useChatStore } from "@/store/chatStore";
 // A vertical minimap of the conversation: one tick per turn (a user message
 // and a preview of the reply that followed). Hovering a tick reveals a preview
 // box; clicking scrolls the transcript to that user message. The rail scrolls
@@ -7,7 +8,6 @@
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { scrollToUserMessage } from "@/hooks/useUserMessageNav";
-import { useChatStore } from "@/store/chatStore";
 
 /** One rail tick: a user turn plus a preview of the reply it drew. */
 export interface Turn {
@@ -47,6 +47,7 @@ export function TurnRail({
   // longer scans anchor rects itself — that broke for windowed-out turns.
   activeTurnId?: string | null;
 }) {
+  const chatStore = useChatStoreApi();
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const railRef = useRef<HTMLDivElement | null>(null);
   const tickRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -127,7 +128,7 @@ export function TurnRail({
     if (!rail) return;
     const fetchOlder = () => {
       if (rail.scrollTop < FETCH_TOP_PX && hasMoreHistory && !loadingMoreHistory) {
-        void useChatStore.getState().loadMoreHistory();
+        void chatStore.getState().loadMoreHistory();
       }
     };
     const onWheel = (e: WheelEvent) => {
@@ -147,7 +148,7 @@ export function TurnRail({
       rail.removeEventListener("scroll", onScroll);
       rail.removeEventListener("wheel", onWheel);
     };
-  }, [hasMoreHistory, loadingMoreHistory]);
+  }, [chatStore, hasMoreHistory, loadingMoreHistory]);
 
   // Stable ref callback so React doesn't detach/re-attach every tick on every
   // render (an inline arrow changes identity each render, thrashing the Map).
@@ -297,7 +298,14 @@ export function TurnRail({
               // Keyboard focus shows the preview via onFocus; clear it on blur
               // so tabbing away doesn't leave the preview stranded on-screen.
               onBlur={() => setHoveredId((cur) => (cur === turn.itemId ? null : cur))}
-              onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage, ensureItemVisible)}
+              onClick={() =>
+                scrollToUserMessage(
+                  turn.itemId,
+                  flashUserMessage,
+                  ensureItemVisible,
+                  chatStore.getState().conversationId,
+                )
+              }
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
               // Full-pitch hit area (h-2, no gap between ticks) so clicking
               // anywhere in a tick's band — not just the 2px dash — registers.

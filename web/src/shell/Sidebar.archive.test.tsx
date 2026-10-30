@@ -22,7 +22,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
@@ -53,19 +53,6 @@ vi.mock("@/hooks/useRelatedSessionLifecycle", async (importOriginal) => ({
   ...(await importOriginal<typeof RelatedSessionLifecycle>()),
   useArchiveRelatedSessions: () => mocks.archiveGroup,
 }));
-vi.mock("./AddAgentDialog", () => ({
-  AddAgentDialog: ({
-    parentSessionId,
-    relatedSession,
-  }: {
-    parentSessionId: string;
-    relatedSession?: boolean;
-  }) => (
-    <div data-testid="add-agent-dialog">
-      {parentSessionId}:{String(relatedSession)}
-    </div>
-  ),
-}));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
@@ -92,6 +79,16 @@ function mockConversations(conversations: Conversation[]) {
 
 const CLEANUP_SERVER: ServerInfo = { ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true };
 
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <output data-testid="location">
+      {location.pathname}
+      {location.search}
+    </output>
+  );
+}
+
 function renderSidebar(serverInfo: ServerInfo = CLEANUP_SERVER) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -102,6 +99,7 @@ function renderSidebar(serverInfo: ServerInfo = CLEANUP_SERVER) {
             <MemoryRouter initialEntries={["/"]}>
               <Sidebar open={true} onClose={vi.fn()} />
               <Toaster />
+              <LocationProbe />
             </MemoryRouter>
           </TooltipProvider>
         </SidebarDataProvider>
@@ -155,7 +153,7 @@ it("offers Add agent and All lifecycle actions for a group containing an archive
   expect(mocks.archive.mutate).not.toHaveBeenCalled();
   fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
   fireEvent.click(screen.getByTestId("add-agent-conversation"));
-  expect(screen.getByTestId("add-agent-dialog")).toHaveTextContent("conv_1:true");
+  expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_1?panel=agents&newSession=1");
 });
 
 it("keeps helpers on the legacy archive path and hides new actions on older servers", async () => {

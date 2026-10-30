@@ -79,6 +79,7 @@ import {
   ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
   ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
   beginLocalConversation,
+  createSessionChatStore,
   committedItemProvesDelivery,
   takeFailedSendDraft,
   restoredSendDraftUnchanged,
@@ -1121,6 +1122,42 @@ describe("chatStore — lazy subtree usage", () => {
 });
 
 describe("chatStore — switchTo", () => {
+  it("uses the main chat actions in a secondary session without activating or mutating the center chat", async () => {
+    seedSession("conv_center", [userMessage("center_history", "Center history")]);
+    seedSession("conv_panel", [userMessage("panel_history", "Panel history")]);
+    await useChatStore.getState().switchTo("conv_center");
+    const panel = createSessionChatStore("conv_panel");
+    await panel.getState().switchTo("conv_panel");
+    const centerBlocks = useChatStore.getState().blocks;
+    const notifications = vi.fn();
+    const unsubscribe = panel.subscribe(notifications);
+    const modelChange = panel.getState().setModel("panel-model");
+    expect(panel.getState().sessionModelOverride).toBe("panel-model");
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    await modelChange;
+    await panel.getState().setSubagentRouting("on");
+    expect(panel.getState().subagentRoutingOverride).toBe("on");
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+    await panel.getState().send("Panel message", "agent_xyz");
+    panel.setState({ sessionStatus: "running", status: "streaming" });
+    panel.getState().enqueueMessage("Queued for panel");
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ conversationId: "conv_panel", text: "Queued for panel" }),
+    ]);
+    panel.getState().clearQueuedMessages("conv_panel");
+    panel.getState().stop();
+    expect(panel.getState().status).toBe("idle");
+    expect(notifications).toHaveBeenCalled();
+    expect(useChatStore.getState().conversationId).toBe("conv_center");
+    expect(useChatStore.getState().blocks).toBe(centerBlocks);
+    const writes = fetchMock.mock.calls.filter(([, init]) =>
+      ["POST", "PATCH"].includes(init?.method ?? ""),
+    );
+    expect(writes.length).toBeGreaterThanOrEqual(3);
+    for (const [url] of writes) expect(String(url)).toContain("/sessions/conv_panel");
+    unsubscribe();
+  });
+
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
     const items: ConversationItem[] = [
       userMessage("resp_1", "hello"),

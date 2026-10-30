@@ -1,3 +1,4 @@
+import { chatOwnsHotkey } from "@/lib/hotkeys";
 // Ctrl+Shift+M (every platform, including macOS) opens the composer's model
 // picker: the keyboard equivalent of typing bare "/model", reachable without
 // leaving the keyboard.
@@ -42,7 +43,12 @@ function focusOwnsHotkey(): boolean {
  *   gear is not disabled: not read-only, unreachable, or busy); pass `false` to
  *   leave the chord untouched when there's nothing to open. Defaults on.
  */
-export function useModelPickerHotkey(onOpen: () => void, enabled = true): void {
+export function useModelPickerHotkey(
+  onOpen: () => void,
+  enabled = true,
+  sessionId?: string | null,
+  secondary = false,
+): void {
   // Held in a ref so the bound handler always calls the latest closure without
   // re-registering on every render.
   const latest = useRef(onOpen);
@@ -52,7 +58,7 @@ export function useModelPickerHotkey(onOpen: () => void, enabled = true): void {
     if (!enabled) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
       // Ignore auto-repeat: holding the chord would reopen the picker.
-      if (e.repeat) return;
+      if (e.repeat || !chatOwnsHotkey(sessionId, secondary)) return;
       if (!isModelPickerHotkey(e)) return;
       if (focusOwnsHotkey()) return;
       e.preventDefault();
@@ -61,5 +67,5 @@ export function useModelPickerHotkey(onOpen: () => void, enabled = true): void {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [enabled]);
+  }, [enabled, sessionId, secondary]);
 }

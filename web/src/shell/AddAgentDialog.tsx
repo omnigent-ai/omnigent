@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -13,62 +13,6 @@ import { AgentCard } from "@/components/AgentCard";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { createSession } from "@/lib/sessionsApi";
-import { useSession } from "@/hooks/useSession";
-import { Spinner } from "@/components/ui/spinner";
-import { NewChatLandingScreen } from "./NewChatDialog";
-
-interface AddAgentDialogProps {
-  parentSessionId: string;
-  rootSessionId?: string;
-  relatedSession?: boolean;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}
-
-export function AddAgentDialog(props: AddAgentDialogProps) {
-  return props.relatedSession ? (
-    <RelatedSessionDialog {...props} />
-  ) : (
-    <LegacyAddAgentDialog {...props} />
-  );
-}
-
-function RelatedSessionDialog({
-  parentSessionId,
-  rootSessionId = parentSessionId,
-  open,
-  onOpenChange,
-}: AddAgentDialogProps) {
-  const { session, error } = useSession(open ? parentSessionId : null);
-  const relatedSession = useMemo(
-    () =>
-      session
-        ? { source: session, rootSessionId, onCreated: () => onOpenChange(false) }
-        : undefined,
-    [session, rootSessionId, onOpenChange],
-  );
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        data-testid="add-agent-dialog"
-        className="flex max-h-[85vh] flex-col gap-4 overflow-y-auto sm:max-w-[800px]"
-      >
-        <DialogHeader>
-          <DialogTitle>New session</DialogTitle>
-        </DialogHeader>
-        {open && relatedSession ? (
-          <NewChatLandingScreen key={parentSessionId} relatedSession={relatedSession} />
-        ) : error ? (
-          <p className="text-sm text-destructive">{error.message}</p>
-        ) : (
-          <div className="flex justify-center p-8">
-            <Spinner />
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
-  );
-}
 
 // Title sentinel marking a user-added agent. Mirrors the server's
 // ``_UI_ADDED_AGENT_TITLE_PREFIX`` in omnigent/server/routes/sessions.py:
@@ -92,7 +36,7 @@ const UI_ADDED_TITLE_PREFIX = "ui";
  * @param open - Whether the dialog is visible.
  * @param onOpenChange - Visibility setter (Radix-controlled).
  */
-function LegacyAddAgentDialog({
+export function AddAgentDialog({
   parentSessionId,
   open,
   onOpenChange,

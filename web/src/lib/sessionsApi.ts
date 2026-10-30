@@ -853,6 +853,7 @@ export async function forkSession(
     );
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
+    relatedSession?: boolean;
   } = {},
 ): Promise<Session> {
   const { title, agentId, upToResponseId, config, sandbox, sideChat } = options;
@@ -872,7 +873,9 @@ export async function forkSession(
     workspace?: string | null;
     workspaces?: string[] | null;
     side_chat?: boolean;
+    related_session?: boolean;
   } = {};
+  if (options.relatedSession) body.related_session = true;
   if (sideChat) {
     body.side_chat = true;
   }

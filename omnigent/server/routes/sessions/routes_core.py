@@ -228,9 +228,11 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
 )
 from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SESSION_ROLE_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -3977,6 +3979,26 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        related_source = None
+        if body.related_session:
+            from dataclasses import replace
+
+            from omnigent.server.routes._session_create_validation import (
+                resolve_related_session_create,
+            )
+
+            placement, related_source = await resolve_related_session_create(
+                SessionCreateRequest(agent_id=source.agent_id, related_to_session_id=source_id),
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
+            assert related_source is not None
+            related_source = replace(
+                related_source, host_id=placement.host_id, workspace=placement.workspace
+            )
+
         sandbox_profile = await prepare_profile(
             request, body, user_id=user_id, inherited_session_id=source_id
         )
@@ -4195,6 +4217,10 @@ def register_core_routes(
         extra_labels: dict[str, str] = {
             CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(request.headers)
         }
+        if related_source is not None:
+            extra_labels[SESSION_ROLE_LABEL_KEY] = "peer"
+            extra_labels[CREATED_BY_SESSION_LABEL_KEY] = source_id
+
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":
@@ -4415,6 +4441,7 @@ def register_core_routes(
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
+                **({"related_source": related_source} if related_source is not None else {}),
             )
         except LookupError as exc:
             await drop_unused_copy()
@@ -4528,12 +4555,12 @@ def register_core_routes(
             # row, so announcing it would leak it into every open sidebar (the
             # real-time path bypasses the list-endpoint's side-chat filter).
             # Pushed once its managed labels are written, as on a create.
-            if not body.side_chat:
+            if not body.side_chat and related_source is None:
                 _announce_session_added(user_id, new_conv.id)
         # Default-public grant only after the managed launch was accepted (see
         # the create paths). A side chat is a private scratch fork of the
         # caller's own view.
-        if user_id is not None and not body.side_chat:
+        if user_id is not None and not body.side_chat and related_source is None:
             await _grant_default_public(
                 request.app.state,
                 permission_store,

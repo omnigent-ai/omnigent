@@ -1,3 +1,4 @@
+import * as clipboard from "@/lib/clipboard";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
@@ -755,4 +756,25 @@ describe("AssistantBubble copy", () => {
       "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
     );
   });
+});
+
+it("copies a side conversation's message link rather than the main route", async () => {
+  const copy = vi.spyOn(clipboard, "copyText").mockResolvedValue(undefined);
+  render(
+    <ConversationScopeContext.Provider value="peer-session">
+      <BubbleView
+        bubble={{
+          kind: "user",
+          itemId: "forked-message",
+          content: [{ type: "input_text", text: "Context" }],
+        }}
+      />
+    </ConversationScopeContext.Provider>,
+  );
+  fireEvent.click(screen.getByTestId("copy-message-link"));
+  await waitFor(() =>
+    expect(copy).toHaveBeenCalledWith(
+      expect.stringContaining("/c/peer-session?message=forked-message"),
+    ),
+  );
 });

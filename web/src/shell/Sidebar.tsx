@@ -1,3 +1,4 @@
+import { usePreventDragClick } from "@/hooks/usePreventDragClick";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { GridSidebar } from "@/grid/GridWorkspace";
@@ -185,7 +186,6 @@ import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
-import { AddAgentDialog } from "./AddAgentDialog";
 import {
   useArchiveRelatedSessions,
   useRelatedSessionGroup,
@@ -4881,7 +4881,6 @@ function ConversationRowImpl({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
-  const [addAgentOpen, setAddAgentOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
@@ -5047,22 +5046,7 @@ function ConversationRowImpl({
     disabled:
       (!isOwner && !gridsEnabled) || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
-  // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
-  // on the same anchor still fires a click); swallow that one click so a drag
-  // doesn't also navigate into the session. Flagged when a drag finishes,
-  // cleared on the next tick (after the click that follows pointer-up).
-  const justDraggedRef = useRef(false);
-  const wasDraggingRef = useRef(false);
-  useEffect(() => {
-    const was = wasDraggingRef.current;
-    wasDraggingRef.current = isDragging;
-    if (!was || isDragging) return undefined;
-    justDraggedRef.current = true;
-    const timer = setTimeout(() => {
-      justDraggedRef.current = false;
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [isDragging]);
+  usePreventDragClick(isDragging);
   // In the Pinned section each row is also a reorder target for other pins.
   const pinOrder = useContext(PinOrderContext);
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
@@ -5225,7 +5209,9 @@ function ConversationRowImpl({
     moveToProject,
     setShareOpen,
     setForkOpen,
-    setAddAgentOpen: relatedGroup.enabled ? setAddAgentOpen : undefined,
+    setAddAgentOpen: relatedGroup.enabled
+      ? () => navigate(`/c/${conversation.id}?panel=agents&newSession=1`)
+      : undefined,
     hasRelatedSessions: relatedGroup.hasPeers,
     relatedSessionsPending:
       relatedGroup.loading || !!relatedGroup.error || archiveRelated.isPending,
@@ -5283,11 +5269,7 @@ function ConversationRowImpl({
       )}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        // Swallow the click that trails a drag so it doesn't navigate.
-        if (justDraggedRef.current) {
-          e.preventDefault();
-          return;
-        }
+        if (e.defaultPrevented) return;
         if (selectionMode) {
           e.preventDefault();
           e.stopPropagation();
@@ -5718,15 +5700,6 @@ function ConversationRowImpl({
           sourceGitBranch={conversation.git_branch}
           open
           onOpenChange={setForkOpen}
-        />
-      )}
-      {addAgentOpen && (
-        <AddAgentDialog
-          parentSessionId={conversation.id}
-          rootSessionId={conversation.id}
-          relatedSession
-          open
-          onOpenChange={setAddAgentOpen}
         />
       )}
       <Dialog

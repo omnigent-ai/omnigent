@@ -35,3 +35,11 @@ export function hasCommandModifier(
 export function isFocusInDialogOrMenu(): boolean {
   return !!document.activeElement?.closest('[role="dialog"], [role="alertdialog"], [role="menu"]');
 }
+
+/** Only the focused chat handles composer shortcuts when two chats are visible. */
+export function chatOwnsHotkey(sessionId: string | null | undefined, secondary: boolean): boolean {
+  const focused = document.activeElement
+    ?.closest("[data-chat-session-id]")
+    ?.getAttribute("data-chat-session-id");
+  return focused && sessionId !== undefined ? focused === sessionId : !secondary;
+}

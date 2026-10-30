@@ -532,7 +532,8 @@ describe("related session composer", () => {
       typeMessage("Review this API");
       await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new_peer"));
+      await waitFor(() => expect(onCreated).toHaveBeenCalledWith("conv_new_peer"));
+      expect(navigateMock).not.toHaveBeenCalled();
       const body = JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0]![1]!.body as string);
       expect(body).toMatchObject({
         related_to_session_id: "conv_source_peer",
@@ -569,14 +570,14 @@ describe("related session composer", () => {
     },
   );
 
-  it("keeps an unrelated landing draft and preferences when the popup is cancelled", async () => {
+  it("keeps an unrelated landing draft and preferences when the panel is dismissed", async () => {
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     const landing = renderLanding();
     await waitForWorkspaceSeed();
     typeMessage("Keep this independent task");
     landing.unmount();
     const remembered = localStorage.getItem("omnigent:last-mode-by-harness");
-    const popup = renderLanding(
+    const panel = renderLanding(
       [],
       {},
       { source: sourceSession(), rootSessionId: "conv_root", onCreated: vi.fn() },
@@ -590,7 +591,7 @@ describe("related session composer", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.queryByText("Create custom agent")).not.toBeInTheDocument();
     fireEvent.keyDown(document, { key: "Escape" });
-    popup.unmount();
+    panel.unmount();
     renderLanding();
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this independent task");
     expect(authenticatedFetch).not.toHaveBeenCalled();

@@ -2104,11 +2104,13 @@ class ConversationStore(ABC):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        related_source: Conversation | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
 
-        Creates a new top-level conversation
+        Unless ``related_source`` supplies a group and execution binding,
+        creates a new top-level conversation
         (``kind="default"``, ``parent_conversation_id=None``)
         with the source's ``reasoning_effort``, then copies every
         item (with fresh IDs) preserving position order,

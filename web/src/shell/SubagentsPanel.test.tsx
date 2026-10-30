@@ -25,6 +25,31 @@ import { conversation } from "@/test/sidebarMockHelpers";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
+vi.mock("./NewChatDialog", () => ({
+  NewChatLandingScreen: ({
+    relatedSession,
+  }: {
+    relatedSession: { source: { id: string }; onCreated: (id: string) => void };
+  }) => (
+    <button type="button" onClick={() => relatedSession.onCreated("new_peer")}>
+      Create from {relatedSession.source.id}
+    </button>
+  ),
+}));
+vi.mock("./ForkSessionDialog", () => ({
+  ForkSessionDialog: ({
+    sourceSessionId,
+    relatedSession,
+  }: {
+    sourceSessionId: string;
+    relatedSession?: boolean;
+  }) => (
+    <div role="dialog">
+      Fork {sourceSessionId} {relatedSession ? "in group" : "standalone"}
+    </div>
+  ),
+}));
+
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
   // hook itself is replaced.
@@ -1799,7 +1824,47 @@ describe("related sessions", () => {
     ).toBeInTheDocument();
   });
 
-  it("uses sidebar rows and inline rename with Enter to save and Escape to cancel", async () => {
+  it("creates inside Agents, supports Back, and opens the new chat in a tab without navigating", () => {
+    enable();
+    mockChildTree(tree);
+    const opener = vi.fn(() => true);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/c/conv_parent?panel=agents&newSession=1"]}>
+          <SubagentPanelOpenerContext.Provider value={opener}>
+            <TooltipProvider>
+              <SubagentsPanel conversationId="conv_parent" rootSessionId="conv_parent" />
+            </TooltipProvider>
+          </SubagentPanelOpenerContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("related-session-composer")).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Back to agents" }));
+    expect(screen.queryByTestId("related-session-composer")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New session" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create from conv_root" }));
+    expect(opener).toHaveBeenCalledWith("new_peer");
+    expect(screen.queryByTestId("related-session-composer")).not.toBeInTheDocument();
+    expect(screen.getByTestId("subagent-main-row")).toHaveAttribute("aria-current", "page");
+  });
+
+  it("orders hover actions Rename, Fork, More and opens the existing fork dialog for the source", () => {
+    enable();
+    mockChildTree(tree);
+    renderPanel();
+    const rename = screen.getByRole("button", { name: "Rename Review" });
+    expect(
+      within(rename.parentElement!)
+        .getAllByRole("button")
+        .map((button) => button.getAttribute("aria-label")),
+    ).toEqual(["Rename Review", "Fork Review", "Review actions"]);
+    fireEvent.click(screen.getByRole("button", { name: "Fork Review" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Fork review in group");
+  });
+
+  it("keeps taller harness rows and inline rename with Enter to save and Escape to cancel", async () => {
     enable();
     mockChildTree(tree);
     const rename = vi
@@ -1810,7 +1875,7 @@ describe("related sessions", () => {
       screen.getByTestId("subagent-main-row"),
       ...screen.getAllByTestId("peer-session-row"),
     ]) {
-      expect(row).toHaveClass("sidebar-row", "sidebar-compact-text");
+      expect(row).toHaveClass("py-2", "text-base");
     }
     const renameButton = screen.getByRole("button", { name: "Rename Review" });
     expect(renameButton).toHaveClass("md:opacity-0", "md:group-hover:opacity-100");

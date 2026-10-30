@@ -192,6 +192,8 @@ the header menu), and each place is a separate entry point.
 
 With `related_sessions` enabled, open **Agents → New session** in the right
 Workspace panel, or **Add agent** in a sidebar row's overflow/right-click menu.
+New session replaces the Agents list with a composer and Back button; sending
+opens the new chat in a side tab while the main conversation stays in place.
 Select a peer to center its conversation; use **Open in side panel** in its row
 menu to chat beside the current conversation. Drag peers to reorder and hover a
 row to rename it. The peer's composer identifies it and offers **Back to Main**.
@@ -534,29 +536,35 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`related-sessions` (opt-in draft):** Enable `related_sessions` on the isolated
   server only. In an owned session with an attached runner, open **Agents → New
-  session** to open the normal new-session composer in a popup. Check the source
-  defaults, choose a harness/model, enter the first message and send. Canceling
+  session** to replace the Agents list with the normal new-session composer.
+  Check **Back to agents**, reopen, choose a harness/model, enter the first message
+  and send. The new session opens in a side chat tab; the center stays unchanged. Leaving
   must preserve an unrelated landing-page draft and saved preferences.
   Repeat from that peer: both peers should appear beside Main under the original
   sidebar row. Independently collapse Main's and each peer's Subagents, rename
   through hover actions and drag peers to reorder, then reload. Check the identity
   tray above a peer's composer and **Back to Main**. Use the row menu to open a
-  peer in a side panel, send a message, then
+  peer in a side panel with the full main-chat composer, send a message, then
   switch the center conversation: its tab, transcript and composer remain scoped
   to the peer. Repeat creation from the sidebar **Add agent** menu and check the
   Agents drawer at mobile width. Archive one peer, then **Archive All → Undo**:
   the previously archived peer must stay archived. **Delete All** removes the
-  group. Fresh context/current environment are the only enabled create choices.
+  group. Hover a peer and check the action order **Rename → Fork → More**.
+  Fork opens the existing dialog; choose a compatible harness and submit. The copied
+  transcript is visible and its next turn uses that context. Both creation modes stay in the
+  source environment. In the full side chat, open the normal configuration and
+  attachment menus, draft in both chats, then switch tabs and check drafts,
+  sends, queue/steer, stop and settings target the correct session.
   Creation, ownership, routing and legacy requests have coverage in
   `tests/server/integration/test_session_orchestration.py`; group lifecycle in
   `tests/server/integration/test_sessions_archive.py` and
   `tests/server/test_host_runner_ownership.py`. Component coverage is in
-  `web/src/shell/SubagentsPanel.test.tsx`, `web/src/shell/AddAgentDialog.test.tsx`,
-  `web/src/shell/NewChatDialog.test.tsx`, `web/src/pages/ChatPage.composer.test.tsx`,
+  `web/src/shell/SubagentsPanel.test.tsx`, `web/src/shell/ForkSessionDialog.test.tsx`,
+  `web/src/shell/NewChatDialog.flow.test.tsx`, `web/src/pages/ChatPage.composer.test.tsx`,
   `web/src/shell/Sidebar.archive.test.tsx`,
   `web/src/hooks/useRelatedSessionLifecycle.test.tsx`,
   `web/src/hooks/useSideChats.test.tsx` and
-  `web/src/components/chat/SideChatPane.test.tsx`. The flag defaults off; legacy
+  `web/src/store/chatStore.test.ts`. The flag defaults off; legacy
   hosts/runners/providers require no new fields or upgrade.
 
 - **`session-grid` (browser contract):**

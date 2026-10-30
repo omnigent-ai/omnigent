@@ -5149,6 +5149,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        related_source: Conversation | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -5308,6 +5309,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             project_id=project_id,
             file_id_map=file_id_map,
             created_by=created_by,
+            related_source=related_source,
         )
 
     def _fork_conversation_with_id(
@@ -5337,6 +5339,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        related_source: Conversation | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -5405,10 +5408,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "created_at": now,
                 "updated_at": now,
                 "title": fork_title or "",  # None → empty string at DB layer
-                # A fork is a fresh top-level conversation, so its
-                # root mirrors its own id (matches the
-                # ``_new_session_conversation_row`` invariant).
-                "root_conversation_id": new_conv_id,
+                # Related forks join the source group; ordinary forks own a new root.
+                "root_conversation_id": related_source.root_conversation_id
+                if related_source
+                else new_conv_id,
+                "parent_conversation_id": related_source.root_conversation_id
+                if related_source
+                else None,
                 # An explicit agent_id (clone or existing) beats inheriting the
                 # source's binding.
                 "agent_id": agent_id if agent_id is not None else source.agent_id,
@@ -5769,6 +5775,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork_meta = SqlConversationMetadata(
                 id=new_conv_id,
                 kind=encoded_default_kind,
+                runner_id=related_source.runner_id if related_source else None,
+                host_id=related_source.host_id if related_source else None,
+                workspace=related_source.workspace if related_source else None,
                 terminal_launch_args=source_terminal_args,
                 inference_snapshot=(
                     source_meta_ref.inference_snapshot if source_meta_ref else None

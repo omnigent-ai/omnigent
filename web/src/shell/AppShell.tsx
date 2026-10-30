@@ -2847,7 +2847,9 @@ function AppShellImpl() {
                   onClose={() => setSubagentsPanelOpen(false)}
                   testId="subagents-panel-drawer"
                 >
-                  <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                  <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
+                    <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                  </SubagentPanelOpenerContext.Provider>
                 </MobilePanelDrawer>
               )}
               {conversationId && (

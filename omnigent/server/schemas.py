@@ -2882,6 +2882,8 @@ class SessionForkRequest(_SandboxProfileSelection):
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
     # side-chat tab). It may share its parent's runner.
     side_chat: bool = False
+    # Full peer fork in the source group and execution environment. Owner-only and opt-in.
+    related_session: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2908,6 +2910,16 @@ class SessionForkRequest(_SandboxProfileSelection):
         # Lazy import: schemas is imported by nearly every module, so
         # pulling the (FastAPI/click-importing) managed-hosts module in
         # at module scope would risk import cycles.
+        if self.related_session and (
+            self.side_chat
+            or self.host_type != "external"
+            or self.host_id is not None
+            or self.workspace is not None
+            or self.workspaces is not None
+            or self.sandbox_provider is not None
+            or self.sandbox_profile_id is not None
+        ):
+            raise ValueError("Related forks use the source environment and cannot be side chats")
         from omnigent.server.managed_hosts import parse_repo_workspace
 
         if self.host_type == "managed":

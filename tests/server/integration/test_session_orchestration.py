@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 
+from omnigent.entities import NewConversationItem
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
@@ -31,24 +32,44 @@ from tests.server.integration.test_sessions_subagent_context import (
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("fork", [False, True])
 async def test_related_sessions_inherit_source_placement_and_root_access(
-    auth_client, auth_app, peers, db_uri, monkeypatch
+    auth_client, auth_app, peers, db_uri, monkeypatch, fork
 ):
     source, _, _ = peers
     auth_app.state.feature_flags = FeatureFlags(frozenset({Feature.RELATED_SESSIONS}))
     store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
+    store.append(
+        source["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="context",
+                data={
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Use optional fields."}],
+                },
+            )
+        ],
+    )
     permissions.ensure_user("__public__")
     permissions.grant("__public__", source["id"], LEVEL_READ)
     first = await auth_client.post(
-        "/v1/sessions",
-        json={"agent_id": source["agent_id"], "related_to_session_id": source["id"]},
+        f"/v1/sessions/{source['id']}/fork" if fork else "/v1/sessions",
+        json={"related_session": True}
+        if fork
+        else {"agent_id": source["agent_id"], "related_to_session_id": source["id"]},
     )
     assert first.status_code == 201, first.text
     peer = first.json()
     assert peer["parent_session_id"] == source["id"]
     assert peer["labels"][SESSION_ROLE_LABEL_KEY] == "peer"
     assert peer["runner_id"] == store.get_conversation(source["id"]).runner_id
+    history = store.list_items(peer["id"]).data
+    assert len(history) == (1 if fork else 0)
+    if fork:
+        assert "Use optional fields." in history[0].data.model_dump_json()
     # A source on another proven environment must not silently use the root's runner.
     store.replace_runner_id(peer["id"], "peer-runner")
     store.set_host_id(peer["id"], "a" * 32, workspace="/peer/workspace")
@@ -63,8 +84,10 @@ async def test_related_sessions_inherit_source_placement_and_root_access(
         validate_workspace,
     )
     second = await auth_client.post(
-        "/v1/sessions",
-        json={"agent_id": source["agent_id"], "related_to_session_id": peer["id"]},
+        f"/v1/sessions/{peer['id']}/fork" if fork else "/v1/sessions",
+        json={"related_session": True}
+        if fork
+        else {"agent_id": source["agent_id"], "related_to_session_id": peer["id"]},
     )
     assert second.status_code == 201, second.text
     sibling = second.json()
@@ -102,8 +125,9 @@ async def test_related_sessions_inherit_source_placement_and_root_access(
         "named",
     ],
 )
+@pytest.mark.parametrize("fork", [False, True])
 async def test_related_creation_rejects_before_persisting(
-    auth_client, auth_app, peers, db_uri, condition
+    auth_client, auth_app, peers, db_uri, condition, fork
 ):
     source, _, _ = peers
     auth_app.state.feature_flags = FeatureFlags(
@@ -132,8 +156,13 @@ async def test_related_creation_rejects_before_persisting(
     elif condition == "named":
         payload["sub_agent_name"] = "worker"
     before = {row.id for row in store.list_conversations(kind=None, limit=1000).data}
-    response = await auth_client.post("/v1/sessions", json=payload, headers=headers)
-    assert response.status_code in {400, 403}, response.text
+    path = "/v1/sessions"
+    if fork:
+        source_id = payload.pop("related_to_session_id")
+        path = f"/v1/sessions/{source_id}/fork"
+        payload["related_session"] = True
+    response = await auth_client.post(path, json=payload, headers=headers)
+    assert response.status_code in {400, 403, 422}, response.text
     assert {row.id for row in store.list_conversations(kind=None, limit=1000).data} == before
 
 

@@ -1,18 +1,19 @@
+import { ChatStoreContext, useChatStoreApi, useChatStore } from "@/store/chatStore";
 // Apply ``?message=<id>`` deep links: after the session loads, page in
 // older history if needed, then scroll + flash the target message.
 // Reuses the same scroll/flash path as the activity rail.
 
-import { useEffect, useRef } from "react";
+import { useContext, useEffect, useRef } from "react";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM, findMessageElement } from "@/lib/messageDeepLink";
 import { scrollToMessage } from "@/hooks/useUserMessageNav";
-import { useChatStore } from "@/store/chatStore";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 
 /** Select Chat from the surface that stays mounted while Terminal is visible. */
 export function useMessageDeepLinkChatView(conversationId: string | null): void {
   const [searchParams] = useSearchParams();
-  const messageId = searchParams.get(MESSAGE_QUERY_PARAM);
+  const secondary = useContext(ChatStoreContext) !== null;
+  const messageId = secondary ? null : searchParams.get(MESSAGE_QUERY_PARAM);
   const terminalFirst = useTerminalFirst();
   const showTerminal = terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal";
   const setView = terminalFirst?.setView;
@@ -43,8 +44,10 @@ export function useMessageDeepLink(
   conversationId: string | null,
   { ensureMessageVisible, ready = true, rangeNonce = 0 }: MessageDeepLinkOptions = {},
 ): void {
+  const chatStore = useChatStoreApi();
   const [searchParams] = useSearchParams();
-  const messageId = searchParams.get(MESSAGE_QUERY_PARAM);
+  const secondary = useContext(ChatStoreContext) !== null;
+  const messageId = secondary ? null : searchParams.get(MESSAGE_QUERY_PARAM);
   const terminalFirst = useTerminalFirst();
   const showTerminal = terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal";
   const loadingConversation = useChatStore((s) => s.loadingConversation);
@@ -63,19 +66,20 @@ export function useMessageDeepLink(
     if (appliedKeyRef.current === key) return;
     if (!ready || showTerminal || loadingConversation || loadingMoreHistory) return;
 
-    if (findMessageElement(messageId)) {
+    if (findMessageElement(messageId, conversationId)) {
       appliedKeyRef.current = key;
-      scrollToMessage(messageId, flashUserMessage);
+      scrollToMessage(messageId, flashUserMessage, undefined, conversationId);
       return;
     }
     // Geometry publishes a new range after this scroll mounts the target.
     if (ensureMessageVisible?.(messageId)) return;
     if (hasMoreHistory) {
-      void useChatStore.getState().loadMoreHistory();
+      void chatStore.getState().loadMoreHistory();
       return;
     }
     appliedKeyRef.current = key;
   }, [
+    chatStore,
     conversationId,
     messageId,
     ready,

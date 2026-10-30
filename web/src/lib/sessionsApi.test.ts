@@ -434,6 +434,15 @@ describe("createBundledSession", () => {
 });
 
 describe("forkSession", () => {
+  it("sends the related fork opt-in without any placement override", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ id: "conv_peer", created_at: 1, items: [] })),
+    );
+    await forkSession("conv_src", { relatedSession: true, agentId: "ag_other" });
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+    expect(body).toEqual({ related_session: true, agent_id: "ag_other" });
+  });
+
   it("POSTs the fork endpoint with the (url-encoded) source id and parses the fork", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

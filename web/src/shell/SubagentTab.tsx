@@ -1,5 +1,6 @@
 import { useQueries } from "@tanstack/react-query";
 import { BotIcon, Maximize2Icon } from "lucide-react";
+import { SessionChatPane } from "@/components/chat/SessionChatPane";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { sessionQueryOptions, useSession } from "@/hooks/useSession";
@@ -71,14 +72,12 @@ export function SubagentTabPane({ sessionId, label }: { sessionId: string; label
           Open full screen
         </Link>
       </div>
-      <div className="min-h-0 flex-1">
-        <SideChatPane
-          key={sessionId}
-          childId={sessionId}
-          fullSession
-          interactiveSession={interactiveSession}
-          readOnly={readOnly}
-        />
+      <div className="flex min-h-0 flex-1 flex-col">
+        {interactiveSession ? (
+          <SessionChatPane sessionId={sessionId} />
+        ) : (
+          <SideChatPane key={sessionId} childId={sessionId} fullSession readOnly={readOnly} />
+        )}
       </div>
       {readOnlyReason !== null && (
         <p

@@ -6332,8 +6332,8 @@ export function NewChatLandingScreen({
           });
         }
         if (onScreenRef.current && window.location.href === createLocation) {
-          relatedSession?.onCreated(data.id);
-          navigate(sessionLocation(data.id));
+          if (relatedSession) relatedSession.onCreated(data.id);
+          else navigate(sessionLocation(data.id));
         }
       }
     } catch {

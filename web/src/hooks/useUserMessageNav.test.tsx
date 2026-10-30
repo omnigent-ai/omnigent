@@ -8,7 +8,7 @@ import type * as ConversationModule from "@/components/ai-elements/conversation"
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
-import { useUserMessageNav } from "./useUserMessageNav";
+import { useUserMessageNav, scrollToMessage } from "./useUserMessageNav";
 
 const releaseScrollLock = vi.hoisted(() => vi.fn());
 vi.mock("@/components/ai-elements/conversation", async (importOriginal) => {
@@ -56,6 +56,15 @@ afterEach(() => {
 });
 
 describe("useUserMessageNav", () => {
+  it("scrolls the correct transcript when a fork shares response ids with main", () => {
+    document.body.innerHTML =
+      '<section data-chat-session-id="main"><div data-message-id="shared">main</div></section><section data-chat-session-id="peer"><div data-message-id="shared">peer</div></section>';
+    scrollToMessage("shared", undefined, undefined, "peer");
+    const target = scrollSpy.mock.contexts[0] as Element;
+    expect(target.textContent).toBe("peer");
+    expect(releaseScrollLock).toHaveBeenCalledWith(target);
+  });
+
   it("goPrev from null anchor jumps to the LAST user message", () => {
     const ids = ["a", "b", "c"];
     setupDom(ids);

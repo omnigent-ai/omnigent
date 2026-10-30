@@ -70,6 +70,23 @@ describe("isFocusComposerHotkey", () => {
 });
 
 describe("useFocusComposerHotkey", () => {
+  it("only focuses the chat that owns the current input", () => {
+    document.body.innerHTML =
+      '<section data-chat-session-id="main"><textarea id="main"></textarea></section><section data-chat-session-id="peer"><textarea id="peer"></textarea></section>';
+    const main = vi.fn();
+    const peer = vi.fn();
+    renderHook(() => useFocusComposerHotkey(main, true, "main"));
+    renderHook(() => useFocusComposerHotkey(peer, true, "peer", true));
+    document.getElementById("peer")!.focus();
+    press({ code: "KeyL", ctrlKey: true, shiftKey: true });
+    expect(peer).toHaveBeenCalledOnce();
+    expect(main).not.toHaveBeenCalled();
+    document.getElementById("main")!.focus();
+    press({ code: "KeyL", ctrlKey: true, shiftKey: true });
+    expect(main).toHaveBeenCalledOnce();
+    expect(peer).toHaveBeenCalledOnce();
+  });
+
   it("focuses on Ctrl+Shift+L and prevents the browser default", () => {
     const onFocus = vi.fn();
     renderHook(() => useFocusComposerHotkey(onFocus));
