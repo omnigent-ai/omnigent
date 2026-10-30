@@ -483,6 +483,8 @@ _OPENAI_MODEL_NOT_FOUND = re.compile(
 
 
 def _is_model_unavailable(message: str) -> bool:
+    if "is no longer available. use unity catalog model services" in message.lower():
+        return True
     if _MODEL_UNAVAILABLE_MARKER in message.lower():
         return True
     if _CLAUDE_STOP_MODEL_NOT_FOUND.search(message):
