@@ -3661,34 +3661,133 @@ def _build_skipped_native_items(
             "accepting a later one, so it was not delivered. The native terminal may "
             "have shown the underlying error."
         )
-    items: list[NewConversationItem] = []
-    for skipped in skipped_entries:
-        turn_id = generate_task_id()
-        items.append(
-            NewConversationItem(
-                type="message",
-                response_id=turn_id,
-                data=MessageData(role="user", content=skipped.content, user_authored=True),
-                created_by=skipped.created_by,
-                stable_id=uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-skipped-{harness_key}-user:{session_id}:{skipped.pending_id}",
-                ).hex,
-                replaces_pending_id=skipped.stable_id,
-            )
+    error = ErrorData(source="execution", code=code, message=message)
+    return [
+        item
+        for skipped in skipped_entries
+        for item in _undelivered_native_input_items(
+            session_id, skipped, stable_id_prefix=f"omnigent-skipped-{harness_key}", error=error
         )
-        items.append(
-            NewConversationItem(
-                type="error",
-                response_id=turn_id,
-                data=ErrorData(source="execution", code=code, message=message),
-                stable_id=uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-skipped-{harness_key}-error:{session_id}:{skipped.pending_id}",
-                ).hex,
-            )
+    ]
+
+
+def _undelivered_native_input_items(
+    session_id: str,
+    entry: pending_inputs.DrainedInput,
+    *,
+    stable_id_prefix: str,
+    error: ErrorData,
+) -> list[NewConversationItem]:
+    """
+    Build the ``[user_message, error_item]`` pair that keeps an undelivered web input.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param entry: The drained queue entry whose message was not delivered.
+    :param stable_id_prefix: Namespace for the pair's ``pending_id``-derived
+        stable ids, e.g. ``"omnigent-skipped-native"``.
+    :param error: The notice persisted after the message.
+    :returns: The user message followed by its notice, sharing one response id.
+    """
+    turn_id = generate_task_id()
+    return [
+        NewConversationItem(
+            type="message",
+            response_id=turn_id,
+            data=MessageData(role="user", content=entry.content, user_authored=True),
+            created_by=entry.created_by,
+            stable_id=uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{stable_id_prefix}-user:{session_id}:{entry.pending_id}",
+            ).hex,
+            replaces_pending_id=entry.stable_id,
+        ),
+        NewConversationItem(
+            type="error",
+            response_id=turn_id,
+            data=error,
+            stable_id=uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{stable_id_prefix}-error:{session_id}:{entry.pending_id}",
+            ).hex,
+        ),
+    ]
+
+
+async def _settle_native_inputs_discarded_by_stop(
+    conversation_store: ConversationStore,
+    session_id: str,
+    conv: Conversation,
+    pending_ids: Sequence[str],
+) -> None:
+    """
+    Keep the queued web messages a stopped runner discarded, each with a notice.
+
+    The runner drops messages it was still holding (behind an open native
+    prompt or a running turn) when the session is stopped. No transcript
+    mirror will ever settle them, so a later mirror would otherwise skip them
+    and blame the harness for never recording them. A failed append returns
+    the entries to the queue; the stop itself stands.
+
+    :param conversation_store: Store to append the messages and notices to.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row, used to name the harness in the notice.
+    :param pending_ids: Pending ids the runner reported discarding, oldest
+        first, e.g. ``["pending_a1b2..."]``.
+    """
+    discarded = [
+        entry
+        for pending_id in pending_ids
+        if (entry := pending_inputs.resolve(session_id, pending_id)) is not None
+    ]
+    if not discarded:
+        return
+    native_agent = _native_coding_agent_for_session(conv)
+    display_name = native_agent.display_name if native_agent is not None else "the agent"
+    notice = ErrorData(
+        source="execution",
+        code="native_input_discarded_by_stop",
+        level="info",
+        title="Message not sent because the session was stopped",
+        message=(
+            f"The session was stopped while this message was waiting for {display_name}, "
+            "so it was never delivered. Send it again if you still need it."
+        ),
+    )
+    items = [
+        item
+        for entry in discarded
+        for item in _undelivered_native_input_items(
+            session_id, entry, stable_id_prefix="omnigent-stopped-native", error=notice
         )
-    return items
+    ]
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
+    except Exception:  # noqa: BLE001 — the stop landed; an unsaved notice must not undo it
+        _logger.exception(
+            "Could not persist the messages discarded by stopping session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        for entry in reversed(discarded):
+            pending_inputs.restore(session_id, entry)
+        return
+    for index, entry in enumerate(discarded):
+        persisted_user = persisted[index * 2]
+        persisted_notice = persisted[index * 2 + 1]
+        if persisted_user.deduplicated:
+            continue
+        log_input_event(
+            _logger,
+            "native_input_settled",
+            session_id=session_id,
+            attributes=pending_inputs.delivery_attributes(entry),
+            outcome="discarded_by_stop",
+            item_id=persisted_user.id,
+            error_item_id=persisted_notice.id,
+            response_id=persisted_notice.response_id,
+        )
+        _publish_input_consumed(session_id, persisted_user, cleared_pending_id=entry.pending_id)
+        _publish_external_conversation_item(session_id, persisted_notice)
 
 
 async def _enrich_terminal_status_with_subagent_output(

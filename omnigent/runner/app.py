@@ -347,6 +347,20 @@ def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
     )
 
 
+def _stop_acknowledgement(response: Response, discarded_pending_ids: list[str]) -> Response:
+    """
+    Name the queued web messages a successful ``stop_session`` discarded.
+
+    :param response: The stop's own reply, e.g. a bare ``204``.
+    :param discarded_pending_ids: Pending ids dropped undelivered, oldest first.
+    :returns: *response* unchanged when nothing was discarded or the stop
+        failed, else a ``200`` listing the ids for the server to settle.
+    """
+    if not discarded_pending_ids or response.status_code >= 300:
+        return response
+    return JSONResponse(status_code=200, content={"discarded_pending_ids": discarded_pending_ids})
+
+
 def _invalid_effort_response(effort: object) -> JSONResponse | None:
     """Return the 400 for a non-string, non-null session-event effort, else ``None``."""
     if effort is None or isinstance(effort, str):
@@ -4442,15 +4456,26 @@ def create_runner_app(
             return bridge_dir
         return None
 
-    def _cancel_claude_prompt_waiter(session_id: str) -> None:
-        """Discard waiting input before explicit terminal interruption or teardown."""
+    def _cancel_claude_prompt_waiter(session_id: str) -> list[str]:
+        """
+        Discard waiting input before explicit terminal interruption or teardown.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: Pending ids of the discarded web messages, oldest first.
+        """
         waiter = _claude_prompt_waiters.pop(session_id, None)
+        discarded: list[dict[str, Any]] = []
         if waiter is not None or _session_harness_name(session_id) == "claude-native":
             # Cancel queued work even if the terminal control fails; restoring it
             # could restart work the user explicitly asked to stop.
-            _session_message_buffers.pop(session_id, None)
+            discarded = _session_message_buffers.pop(session_id, None) or []
         if waiter is not None:
             waiter.cancel()
+        return [
+            pending_id
+            for message_body in discarded
+            if isinstance(pending_id := message_body.get("pending_id"), str)
+        ]
 
     def _start_claude_prompt_waiter(session_id: str, bridge_dir: Path | None = None) -> None:
         """Resume the native FIFO after its prompt is answered, without a turn timeout."""
@@ -7074,7 +7099,7 @@ def create_runner_app(
 
         if body_type == "stop_session":
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
-            _cancel_claude_prompt_waiter(conversation_id)
+            _discarded_pending_ids = _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             # Killing Claude's pane fails a turn still waiting to deliver into it;
             # mark that turn interrupted first so it ends cancelled, not failed.
@@ -7090,9 +7115,9 @@ def create_runner_app(
                         await _cancel_inprocess_turn(conversation_id)
                     else:
                         _interrupted_sessions.discard(conversation_id)
-                return _stop_resp
+                return _stop_acknowledgement(_stop_resp, _discarded_pending_ids)
             await _cancel_inprocess_turn(conversation_id)
-            return Response(status_code=204)
+            return _stop_acknowledgement(Response(status_code=204), _discarded_pending_ids)
 
         if body_type == "effort_change":
             harness = _session_harness_name(conversation_id)

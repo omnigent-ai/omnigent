@@ -31,6 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
+    Conversation,
     MessageData,
     NewConversationItem,
 )
@@ -11074,9 +11075,10 @@ async def _codex_native_session(
     monkeypatch: pytest.MonkeyPatch,
     *,
     interrupt_status: int = 202,
+    wrapper: str = "codex-native-ui",
 ) -> AsyncIterator[tuple[str, list[tuple[str, dict[str, Any]]]]]:
     """
-    Scope a codex-native session whose runner answers every interrupt with one status.
+    Scope a native session whose runner answers every interrupt with one status.
 
     Captures the published events, and clears the pending-input index and the
     stop fence on exit.
@@ -11085,6 +11087,7 @@ async def _codex_native_session(
     :param monkeypatch: Used to capture published events and route to the runner.
     :param interrupt_status: The runner's reply; a 2xx lands the interrupt, a
         4xx/5xx is one that did not.
+    :param wrapper: The native wrapper label, e.g. ``"claude-code-native-ui"``.
     :yields: The session id and the list the published events are captured into.
     """
     from omnigent.runtime import pending_inputs
@@ -11094,9 +11097,7 @@ async def _codex_native_session(
     _capture_published(monkeypatch, published)
     pending_inputs.reset_for_tests()
     agent = await create_test_agent(client)
-    session = await _create_session(
-        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
-    )
+    session = await _create_session(client, agent["id"], labels={"omnigent.wrapper": wrapper})
     session_id = session["id"]
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _request: httpx.Response(interrupt_status)),
@@ -11215,6 +11216,112 @@ async def test_interrupted_native_message_is_not_reported_undelivered_by_a_later
             assert error_codes == ["native_prompt_not_recorded"]
             assert user_texts == ["cancel me", "go on"]
             assert _consumed_pending_ids(published) == [cancelled, kept]
+
+
+async def test_message_held_when_the_session_is_stopped_is_not_reported_never_recorded(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message held when Stop session ends Claude is not reported as never recorded."""
+    async with _codex_native_session(
+        client, monkeypatch, interrupt_status=204, wrapper="claude-code-native-ui"
+    ) as (session_id, _published):
+        _queue_web_message(session_id, "held message one")
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}}
+        )
+        assert response.status_code < 300, response.text
+        _queue_web_message(session_id, "held message two")
+        await _mirror_user_message(client, session_id, "held message two", "claude:held-two:0")
+
+        _user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert "native_prompt_not_recorded" not in error_codes
+
+
+async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Stop session keeps the held messages Claude never received, each with a notice.
+
+    The runner names what it dropped from behind Claude's open prompt: that
+    message is saved with a neutral notice and its bubble is cleared. A queued
+    message it does not name may have reached Claude and drains quietly, and
+    one sent after Stop is still delivered normally.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch, wrapper="claude-code-native-ui") as (
+        session_id,
+        published,
+    ):
+        held = _queue_web_message(session_id, "held message")
+        _queue_web_message(session_id, "message that reached Claude")
+        stop_reply = {"discarded_pending_ids": [held, "not-a-pending-id"]}
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=stop_reply)),
+            base_url="http://runner",
+        ) as runner:
+            _route_to_runner(monkeypatch, runner)
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}}
+            )
+        assert response.status_code < 300, response.text
+
+        items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        notices = [item for item in items if item["type"] == "error"]
+        assert [item["code"] for item in notices] == ["native_input_discarded_by_stop"]
+        notice = notices[0]
+        assert notice["level"] == "info"
+        assert notice["title"] == "Message not sent because the session was stopped"
+        assert "waiting for Claude," in notice["message"]
+        assert _consumed_pending_ids(published) == [held]
+
+        after_stop = _queue_web_message(session_id, "sent after stop")
+        await _mirror_user_message(client, session_id, "sent after stop", "claude:after-stop:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert user_texts == ["held message", "sent after stop"]
+        assert error_codes == ["native_input_discarded_by_stop"]
+        assert _consumed_pending_ids(published) == [held, after_stop]
+        assert pending_inputs.pending_ids(session_id) == []
+
+
+async def test_unsaved_stop_notice_returns_the_discarded_message_to_the_queue() -> None:
+    """A failed append keeps the discarded message queued, still marked interrupted."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _settle_native_inputs_discarded_by_stop,
+    )
+
+    class _UnavailableStore:
+        def append(self, *_args: Any, **_kwargs: Any) -> None:
+            raise OSError("database is locked")
+
+    session_id = "conv_stop_notice_unsaved"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    pending_inputs.reset_for_tests()
+    try:
+        held = _queue_web_message(session_id, "held message")
+        pending_inputs.mark_interrupted(session_id, [held])
+        await _settle_native_inputs_discarded_by_stop(
+            _UnavailableStore(),  # type: ignore[arg-type]
+            session_id,
+            conv,
+            [held],
+        )
+        assert pending_inputs.pending_ids(session_id) == [held]
+        restored = pending_inputs.resolve(session_id, held)
+        assert restored is not None and restored.interrupted
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 async def test_message_resent_after_stop_takes_the_mirror_of_the_same_text(
