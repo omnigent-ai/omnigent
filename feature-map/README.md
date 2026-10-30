@@ -246,8 +246,9 @@ also returns, are covered by component tests only: `tests/test_model_catalog.py`
 for the worker rows and `tests/host/test_connect.py` for the host's
 `GET /v1/hosts/{id}/harnesses/claude-sdk/model-options` answer. A Claude Code or
 Codex SDK worker on a CLI login lists the host's cached native probe of that
-login; behind a gateway, `apiKeyHelper` or cloud transport, or with Codex logged
-out, it lists nothing.
+login; behind a gateway, `apiKeyHelper` or cloud transport, with Codex logged
+out, or when the child launches a different CLI or arguments than the host
+probed, it lists nothing.
 
 ## Keeping the map current
 
