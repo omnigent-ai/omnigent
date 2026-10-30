@@ -678,6 +678,9 @@ async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store
     try:
         await scheduler.poll_once()
         await asyncio.wait_for(started.wait(), 10)
+        # Finish the pre-expiry sweep before asking the next poll to recover it.
+        assert scheduler._recovery is not None
+        await scheduler._recovery
         clock.advance(120)
         await scheduler.poll_once()
         await _drain(scheduler)
@@ -2029,7 +2032,7 @@ async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
 
 async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
     task = _task(store)
-    clock = FakeClock(task.created_at + 60)
+    clock = FakeClock(task.created_at)
     owned = False
 
     async def owned_hosts(keys):
@@ -2057,7 +2060,7 @@ async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
 
 async def test_run_now_keeps_a_recorded_request_when_starting_it_here_fails(store) -> None:
     task = _task(store)
-    clock = FakeClock(task.created_at + 60)
+    clock = FakeClock(task.created_at)
     calls = 0
 
     async def owned_hosts(keys):

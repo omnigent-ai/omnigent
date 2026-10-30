@@ -21,7 +21,10 @@ from click.testing import CliRunner
 from omnigent import cli as cli_module
 from omnigent.cli import _add_daemon_host_status, _ensure_host_daemon, _host_daemon_alive, cli
 from omnigent.cli_diagnostics import suppresses_recovery_hint
+from omnigent.host.connect import RUNNER_ENV_PASSTHROUGH_ENV_VAR
+from omnigent.host.daemon_lifecycle import DaemonLifecycleLock, read_runner_env
 from omnigent.host.local_server import LocalServerStartup
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR, RUNNER_PARENT_PID_ENV_VAR
 
 
 @dataclass(frozen=True)
@@ -1672,6 +1675,7 @@ def test_host_background_reuses_same_workspace_daemon_only_when_online(
 def test_host_background_reuses_daemon_on_another_url_for_the_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """
     A second URL for the same workspace reuses the running daemon.
@@ -1684,6 +1688,15 @@ def test_host_background_reuses_daemon_on_another_url_for_the_workspace(
         "omnigent.cli._pid_alive", lambda checked: checked in {4242, _SAME_WORKSPACE_PID}
     )
     _seed_same_workspace_daemon(monkeypatch, tmp_path)
+    owner = DaemonLifecycleLock.for_target(
+        _WORKSPACE_API, base_dir=tmp_path, pid=_SAME_WORKSPACE_PID
+    )
+    assert owner.try_acquire() is True
+    request.addfinalizer(owner.release)
+    monkeypatch.delenv(RUNNER_PARENT_PID_ENV_VAR, raising=False)
+    monkeypatch.delenv(OMNIGENT_SESSION_ENV_VAR, raising=False)
+    monkeypatch.setenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "ISAAC_LAUNCH_MODE")
+    monkeypatch.setenv("ISAAC_LAUNCH_MODE", "omni")
 
     result = CliRunner().invoke(cli, ["host", "--background", "--server", _VANITY_API])
 
@@ -1691,6 +1704,9 @@ def test_host_background_reuses_daemon_on_another_url_for_the_workspace(
     assert spawned_args == [], "the workspace's daemon must not get a second one"
     assert f"already running (pid {_SAME_WORKSPACE_PID})" in result.output
     assert "same workspace through another URL" in result.output
+    published = read_runner_env(_WORKSPACE_API, pid=_SAME_WORKSPACE_PID, base_dir=tmp_path)
+    assert published is not None
+    assert published["ISAAC_LAUNCH_MODE"] == "omni"
     # Reported under the daemon's own URL, not the one requested.
     server_lines = [line.split() for line in result.output.splitlines() if "server:" in line]
     assert server_lines == [["server:", "https://dbc-1.cloud.databricks.com/omnigent?o=1"]]
@@ -2067,6 +2083,7 @@ def _seed_yielding_spawn(
 def test_ensure_host_daemon_reuses_the_daemon_a_spawned_daemon_yielded_to(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
     registered_late: bool,
     requested_login: bool,
     failed_probes: int,
@@ -2076,7 +2093,8 @@ def test_ensure_host_daemon_reuses_the_daemon_a_spawned_daemon_yielded_to(
 
     The daemon itself makes the final check, so a launch on another URL that
     raced the first daemon's start still ends with one daemon. Only a
-    successful probe of the requested URL is remembered.
+    successful probe of the requested URL is remembered. The kept daemon
+    receives this invocation's runner values.
     """
     probed = _seed_yielding_spawn(
         monkeypatch,
@@ -2085,12 +2103,24 @@ def test_ensure_host_daemon_reuses_the_daemon_a_spawned_daemon_yielded_to(
         requested_login=requested_login,
         failed_probes=failed_probes,
     )
+    owner = DaemonLifecycleLock.for_target(
+        _WORKSPACE_API, base_dir=tmp_path, pid=_SAME_WORKSPACE_PID
+    )
+    assert owner.try_acquire() is True
+    request.addfinalizer(owner.release)
+    monkeypatch.delenv(RUNNER_PARENT_PID_ENV_VAR, raising=False)
+    monkeypatch.delenv(OMNIGENT_SESSION_ENV_VAR, raising=False)
+    monkeypatch.setenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "ISAAC_LAUNCH_MODE")
+    monkeypatch.setenv("ISAAC_LAUNCH_MODE", "omni")
 
     assert _ensure_host_daemon(_VANITY_API) is False
     assert cli_module._find_daemon_record(_VANITY_API) is None
     kept = cli_module._find_daemon_record(_WORKSPACE_API)
     assert kept is not None and kept.pid == _SAME_WORKSPACE_PID
     assert probed.count(_VANITY_API) == failed_probes + 1
+    published = read_runner_env(_WORKSPACE_API, pid=_SAME_WORKSPACE_PID, base_dir=tmp_path)
+    assert published is not None
+    assert published["ISAAC_LAUNCH_MODE"] == "omni"
 
 
 def test_ensure_host_daemon_refuses_an_offline_daemon_a_spawned_daemon_yielded_to(
@@ -2198,14 +2228,28 @@ def test_wait_for_daemon_claim_paces_failed_probes_within_its_deadline(
     assert max(probe_ends) <= 2.0
 
 
+@pytest.mark.parametrize(
+    "winner_target",
+    [_VANITY_API, "https://VANITY.databricks.com:443/api/2.0/omnigent"],
+    ids=["same-url", "old-url-spelling"],
+)
 def test_ensure_host_daemon_treats_an_old_spelling_of_its_url_as_its_own_daemon(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    winner_target: str,
 ) -> None:
-    """A record under an old spelling of the requested URL is not another URL's daemon."""
-    _seed_yielding_spawn(
-        monkeypatch, tmp_path, winner_target="https://VANITY.databricks.com:443/api/2.0/omnigent"
+    """A concurrent winner for the same URL keeps its identity and takes runner values."""
+    _seed_yielding_spawn(monkeypatch, tmp_path, winner_target=winner_target)
+    owner = DaemonLifecycleLock.for_target(
+        winner_target, base_dir=tmp_path, pid=_SAME_WORKSPACE_PID
     )
+    assert owner.try_acquire() is True
+    request.addfinalizer(owner.release)
+    monkeypatch.delenv(RUNNER_PARENT_PID_ENV_VAR, raising=False)
+    monkeypatch.delenv(OMNIGENT_SESSION_ENV_VAR, raising=False)
+    monkeypatch.setenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "ISAAC_LAUNCH_MODE")
+    monkeypatch.setenv("ISAAC_LAUNCH_MODE", "omni")
     actions: list[str] = []
 
     def _record(event: str, *, details: dict[str, object], **_kwargs: object) -> None:
@@ -2216,6 +2260,9 @@ def test_ensure_host_daemon_treats_an_old_spelling_of_its_url_as_its_own_daemon(
 
     assert _ensure_host_daemon(_VANITY_API) is False
     assert actions[-1] == "started_concurrently_during_launch"
+    published = read_runner_env(winner_target, pid=_SAME_WORKSPACE_PID, base_dir=tmp_path)
+    assert published is not None
+    assert published["ISAAC_LAUNCH_MODE"] == "omni"
 
 
 @pytest.mark.parametrize(

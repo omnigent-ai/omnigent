@@ -75,6 +75,7 @@ def main() -> None:
         DaemonLifecycleLock,
         HostDaemonRecord,
         daemon_target_server_url,
+        delete_runner_env,
         normalize_daemon_target,
         write_daemon_record,
     )
@@ -96,6 +97,8 @@ def main() -> None:
             "Another host daemon already claimed target %s; exiting", daemon_target
         )
         return
+    # Values left by a crashed owner would otherwise reach this daemon if it reuses that pid.
+    delete_runner_env(daemon_target, pid=None)
 
     workspace_lock: DaemonLifecycleLock | None = None
     try:
@@ -143,6 +146,8 @@ def main() -> None:
         if workspace_lock is not None:
             workspace_lock.release()
         lifecycle_lock.release()
+        # After the release, publishers see this daemon as gone and stop writing for it.
+        delete_runner_env(daemon_target, pid=os.getpid())
 
 
 def _claim_workspace(

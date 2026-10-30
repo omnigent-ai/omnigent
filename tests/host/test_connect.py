@@ -28,6 +28,7 @@ from websockets.http11 import Response
 from omnigent import debug_logging
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
+    RUNNER_ENV_PASSTHROUGH_ENV_VAR,
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
@@ -35,8 +36,11 @@ from omnigent.host.connect import (
     _build_runner_env,
     _runner_exit_error,
     _RunnerHandle,
+    overlay_runner_env,
+    refreshable_runner_env_names,
     run_host_process,
 )
+from omnigent.host.daemon_lifecycle import DaemonLifecycleLock, write_runner_env
 from omnigent.host.frames import (
     CAP_WORKTREE_CREATE_BUDGET,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -100,6 +104,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.onboarding.harness_login import CodexDeviceLogin
+from omnigent.process_logging import DATA_DIR_ENV_VAR, LOG_TTY_FD_ENV_VAR
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -916,6 +921,19 @@ def _make_host_process() -> HostProcess:
     )
 
 
+def _make_background_host_process() -> HostProcess:
+    """Create a CLI-launched background HostProcess that owns the ``local`` target.
+
+    :returns: A :class:`HostProcess` that applies published runner env values.
+    """
+    return HostProcess(
+        identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        server_url="http://localhost:8000",
+        lifecycle_lock=DaemonLifecycleLock.for_target("local"),
+        apply_published_runner_env=True,
+    )
+
+
 def _cleanup_host(host: HostProcess) -> None:
     """Terminate a test host's spawned runners and exit watchers.
 
@@ -1018,6 +1036,197 @@ async def test_handle_launch_spawns_subprocess(
 
     # Clean up the spawned sleep process (and its exit watcher).
     _cleanup_host(host)
+
+
+async def test_handle_launch_uses_runner_env_published_after_daemon_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reused daemon's next runner gets credentials a later invocation published.
+
+    Covers a passthrough variable missing when the daemon started and a harness
+    credential whose value changed after it started.
+    """
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path / "data"))
+    monkeypatch.setenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "ISAAC_LAUNCH_MODE")
+    monkeypatch.delenv("ISAAC_LAUNCH_MODE", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-start-value")
+    host = _make_background_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    launched_envs: list[dict[str, str]] = []
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        launched_envs.append(dict(env))
+        return original_popen(
+            ["sleep", "10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    async def _launch(binding_token: str) -> HostLaunchRunnerResultFrame:
+        return await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id=f"req_{binding_token}",
+                binding_token=binding_token,
+                workspace=str(workspace),
+            )
+        )
+
+    caplog.set_level(logging.DEBUG)
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first = await _launch("token_first")
+        write_runner_env(
+            "local",
+            pid=os.getpid(),
+            env={
+                RUNNER_ENV_PASSTHROUGH_ENV_VAR: "ISAAC_LAUNCH_MODE",
+                "ISAAC_LAUNCH_MODE": "omni",
+                "ANTHROPIC_API_KEY": "sk-published-value",
+            },
+        )
+        second = await _launch("token_second")
+
+    assert (first.status, second.status) == ("launched", "launched")
+    assert launched_envs[0]["ANTHROPIC_API_KEY"] == "sk-start-value"
+    assert "ISAAC_LAUNCH_MODE" not in launched_envs[0]
+    assert launched_envs[1]["ANTHROPIC_API_KEY"] == "sk-published-value"
+    assert launched_envs[1]["ISAAC_LAUNCH_MODE"] == "omni"
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-start-value"
+    assert "sk-published-value" not in caplog.text
+    _cleanup_host(host)
+
+
+def test_runner_launch_base_env_refreshes_only_this_daemons_runner_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Published values cannot change host settings, add unlisted names, or reach other hosts."""
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setenv("PATH", "/daemon/bin")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-daemon")
+    monkeypatch.delenv(LOG_TTY_FD_ENV_VAR, raising=False)
+    monkeypatch.delenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.onboarding.provider_config._load_config", dict)
+    host = _make_background_host_process()
+    published = {
+        "ANTHROPIC_API_KEY": "sk-published",
+        "PATH": "/published/bin",
+        LOG_TTY_FD_ENV_VAR: "9",
+        "UNLISTED_SECRET": "must-not-forward",
+    }
+
+    write_runner_env("local", pid=os.getpid() + 1, env=published)
+    assert host._runner_launch_base_env() is os.environ
+
+    write_runner_env("local", pid=os.getpid(), env=published)
+    base_env = host._runner_launch_base_env()
+
+    assert base_env["ANTHROPIC_API_KEY"] == "sk-published"
+    assert base_env["PATH"] == "/daemon/bin"
+    assert LOG_TTY_FD_ENV_VAR not in base_env
+    assert "UNLISTED_SECRET" not in base_env
+    foreground = HostProcess(
+        identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        server_url="http://localhost:8000",
+        lifecycle_lock=DaemonLifecycleLock.for_target("local"),
+    )
+    assert foreground._runner_launch_base_env() is os.environ
+
+
+def test_runner_launch_base_env_keeps_names_the_daemon_started_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "STARTUP_TOKEN")
+    monkeypatch.setenv("STARTUP_TOKEN", "from-start")
+    monkeypatch.setattr("omnigent.onboarding.provider_config._load_config", dict)
+    host = _make_background_host_process()
+    write_runner_env(
+        "local",
+        pid=os.getpid(),
+        env={RUNNER_ENV_PASSTHROUGH_ENV_VAR: "LATER_TOKEN", "LATER_TOKEN": "from-later"},
+    )
+
+    env = _build_runner_env(
+        host._runner_launch_base_env(),
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert env["STARTUP_TOKEN"] == "from-start"
+    assert env["LATER_TOKEN"] == "from-later"
+
+
+def test_refreshable_runner_env_names_cover_credentials_but_not_host_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config._load_config",
+        lambda: {
+            "providers": {
+                "saved": {
+                    "kind": "gateway",
+                    "openai": {
+                        "api_key_ref": "env:SAVED_PROVIDER_KEY",
+                        "base_url": "https://gateway.example.com/v1",
+                        "models": {"default": "m"},
+                    },
+                }
+            }
+        },
+    )
+
+    names = refreshable_runner_env_names(
+        {RUNNER_ENV_PASSTHROUGH_ENV_VAR: "DAEMON_TOKEN,PATH"},
+        {RUNNER_ENV_PASSTHROUGH_ENV_VAR: "LATER_TOKEN,MLFLOW_TRACKING_URI"},
+    )
+
+    assert {
+        "ANTHROPIC_API_KEY",
+        "SAVED_PROVIDER_KEY",
+        "DAEMON_TOKEN",
+        "LATER_TOKEN",
+        RUNNER_ENV_PASSTHROUGH_ENV_VAR,
+    } <= names
+    assert not names & {"PATH", "MLFLOW_TRACKING_URI"}
+
+
+def test_overlay_runner_env_adds_or_replaces_only_non_empty_refreshable_values() -> None:
+    merged = overlay_runner_env(
+        {
+            RUNNER_ENV_PASSTHROUGH_ENV_VAR: "DAEMON_TOKEN",
+            "ANTHROPIC_API_KEY": "sk-old",
+            "SAVED_PROVIDER_KEY": "kept",
+            "PATH": "/daemon/bin",
+        },
+        {
+            RUNNER_ENV_PASSTHROUGH_ENV_VAR: "LATER_TOKEN",
+            "ANTHROPIC_API_KEY": "sk-new",
+            "LATER_TOKEN": "added",
+            "SAVED_PROVIDER_KEY": "",
+            "PATH": "/published/bin",
+            "UNLISTED_SECRET": "dropped",
+        },
+        frozenset(
+            {
+                RUNNER_ENV_PASSTHROUGH_ENV_VAR,
+                "ANTHROPIC_API_KEY",
+                "LATER_TOKEN",
+                "SAVED_PROVIDER_KEY",
+            }
+        ),
+    )
+
+    assert merged == {
+        RUNNER_ENV_PASSTHROUGH_ENV_VAR: "DAEMON_TOKEN,LATER_TOKEN",
+        "ANTHROPIC_API_KEY": "sk-new",
+        "LATER_TOKEN": "added",
+        "SAVED_PROVIDER_KEY": "kept",
+        "PATH": "/daemon/bin",
+    }
 
 
 async def test_handle_launch_recreates_missing_workspace(

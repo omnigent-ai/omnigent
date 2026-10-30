@@ -214,14 +214,15 @@ async def test_schedule_validation_keeps_requests_responsive(
         method = "PATCH"
         body = {"rrule": "FREQ=WEEKLY"}
 
-    entered = threading.Event()
+    entered = asyncio.Event()
     release = threading.Event()
+    loop = asyncio.get_running_loop()
 
     def recurrence_clock() -> float:
         # Hold the clock boundary to check concurrent HTTP service, then expire
         # the real iterator's deadline without an expensive recurrence.
         if not entered.is_set():
-            entered.set()
+            loop.call_soon_threadsafe(entered.set)
             assert release.wait(5), "recurrence validation blocked the event loop"
             return 0
         return 1
@@ -229,7 +230,7 @@ async def test_schedule_validation_keeps_requests_responsive(
     monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", recurrence_clock)
     pending = asyncio.create_task(auth_client.request(method, url, json=body, headers=_headers()))
     try:
-        assert await asyncio.to_thread(entered.wait, 2)
+        await asyncio.wait_for(entered.wait(), timeout=2)
         response = await asyncio.wait_for(
             auth_client.get("/v1/scheduled-tasks", headers=_headers()), timeout=2
         )

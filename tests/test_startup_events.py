@@ -93,7 +93,7 @@ def test_host_state_event_carries_deterministic_process_classification(
     from omnigent import cli
 
     caplog.set_level(logging.INFO, logger="omnigent.startup")
-    record = SimpleNamespace(pid=1234)
+    record = SimpleNamespace(pid=1234, log_path=None)
     monkeypatch.setattr(cli, "_find_daemon_record", lambda _target: record)
     monkeypatch.setattr(cli, "_daemon_owner_is_live", lambda _record: True)
     monkeypatch.setattr(
