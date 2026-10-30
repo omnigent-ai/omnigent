@@ -1963,7 +1963,7 @@ describe("ForkSessionDialog", () => {
     it.each([true, false, undefined])(
       "inherits ALL repositories with workspace-list capability %s",
       async (acceptsWorkspaces) => {
-        // Every source repository and its branch must be preserved when untouched.
+        // Legacy inheritance must remain usable even if branch discovery is available.
         useSessionMock.mockReturnValue({
           session: {
             labels: {
@@ -1974,6 +1974,12 @@ describe("ForkSessionDialog", () => {
           isLoading: false,
           error: null,
         } as unknown as ReturnType<typeof useSession>);
+        fetchSessionRepositoryBranchesMock.mockResolvedValue({
+          repositories: [
+            { url: "https://github.com/org/api", branch: "feature/api", pushed: true },
+            { url: "https://github.com/org/web", branch: "feature/web", pushed: true },
+          ],
+        });
         forkSessionMock.mockResolvedValue({
           id: "conv_fork",
         } as unknown as Awaited<ReturnType<typeof forkSession>>);
@@ -1993,8 +1999,12 @@ describe("ForkSessionDialog", () => {
         await act(async () => {});
         expect(screen.queryByTestId("fork-session-advanced-content")).not.toBeInTheDocument();
         expect(screen.getAllByTestId("fork-session-sandbox-repo-row")).toHaveLength(2);
-        expect(screen.getByRole("textbox", { name: "Branch for api" })).toHaveValue("main");
-        expect(screen.getByRole("textbox", { name: "Branch for web" })).toHaveValue("");
+        expect(screen.getByRole("textbox", { name: "Branch for api" })).toHaveValue(
+          acceptsWorkspaces ? "feature/api" : "main",
+        );
+        expect(screen.getByRole("textbox", { name: "Branch for web" })).toHaveValue(
+          acceptsWorkspaces ? "feature/web" : "",
+        );
 
         // The space-joined label no longer greys the button on a multi-repo dest.
         const submit = screen.getByTestId("fork-session-submit") as HTMLButtonElement;
@@ -2006,10 +2016,11 @@ describe("ForkSessionDialog", () => {
         expect(call?.sandbox?.provider).toBe("agent_sandbox");
         if (acceptsWorkspaces) {
           expect(call?.sandbox?.workspaces).toEqual([
-            "https://github.com/org/api#main",
-            "https://github.com/org/web",
+            "https://github.com/org/api#feature/api",
+            "https://github.com/org/web#feature/web",
           ]);
         } else {
+          expect(fetchSessionRepositoryBranchesMock).not.toHaveBeenCalled();
           expect(call?.sandbox).toEqual({ provider: "agent_sandbox" });
         }
       },

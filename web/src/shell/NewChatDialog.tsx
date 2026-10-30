@@ -5031,52 +5031,71 @@ export function NewChatLandingScreen() {
     }
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
-  const canSubmit =
-    (message.trim().length > 0 || files.length > 0) &&
-    !mcpAuthorizing &&
-    mcpSelectionError === null &&
-    !pickerLoading &&
-    !workspaceStartLoading &&
-    !worktreeRequestPending &&
-    !pendingSkillCompletion &&
-    pickerSelectionError === null &&
-    sandboxCatalogError === null &&
-    selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
-    !creating;
-
-  // Name the next missing input in the submit tooltip.
-  const submitDisabledReason = canSubmit
-    ? null
-    : mcpAuthorizing || mcpSelectionError
-      ? (mcpSelectionError ?? "Finish signing in to the MCP service…")
-      : pendingSkillCompletion
-        ? "Loading skills…"
-        : pickerLoading || workspaceStartLoading || worktreeRequestPending
-          ? "Loading session configuration…"
-          : pickerSelectionError || sandboxCatalogError
-            ? (pickerSelectionError ?? sandboxCatalogError)
-            : sandboxSelected && sandboxRepoOverCap
-              ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-                  maxSandboxRepos === 1 ? "repository" : "repositories"
-                } — remove the extras`
-              : sandboxSelected && sandboxRepoPending
-                ? "Finish or clear the repository URL before starting"
-                : sandboxSelected && !sandboxWorkspaceLengthsValid
-                  ? SANDBOX_WORKSPACE_LENGTH_MESSAGE
-                  : sandboxSelected && !sandboxBranchesValid
-                    ? "Please enter a valid repository branch"
-                    : sandboxSelected && !sandboxRepoValid
-                      ? "Please enter a valid repository URL"
-                      : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                        ? "Selected host is unavailable. Reconnect it or choose another host."
-                        : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                          ? "Please choose a host and working directory"
-                          : configuredAgentUnavailable && selectedAgent == null
-                            ? "This project's configured agent is unavailable — pick an agent to continue"
-                            : message.trim().length === 0 && files.length === 0
-                              ? "Enter a message to get started"
-                              : null;
+  // Keep the disabled reason and its recovery target in the same priority order.
+  const submitBlocker = ((): {
+    field: "sandboxRepo" | "other";
+    message: string | null;
+  } | null => {
+    if (mcpAuthorizing || mcpSelectionError !== null) {
+      return {
+        field: "other",
+        message: mcpSelectionError ?? "Finish signing in to the MCP service…",
+      };
+    }
+    if (pendingSkillCompletion) return { field: "other", message: "Loading skills…" };
+    if (pickerLoading || workspaceStartLoading || worktreeRequestPending) {
+      return { field: "other", message: "Loading session configuration…" };
+    }
+    if (pickerSelectionError !== null || sandboxCatalogError !== null) {
+      return { field: "other", message: pickerSelectionError ?? sandboxCatalogError };
+    }
+    if (sandboxSelected) {
+      if (sandboxRepoOverCap) {
+        return {
+          field: "sandboxRepo",
+          message: `This sandbox provider clones at most ${maxSandboxRepos} ${maxSandboxRepos === 1 ? "repository" : "repositories"} — remove the extras`,
+        };
+      }
+      if (sandboxRepoPending) {
+        return {
+          field: "sandboxRepo",
+          message: "Finish or clear the repository URL before starting",
+        };
+      }
+      if (!sandboxWorkspaceLengthsValid) {
+        return { field: "sandboxRepo", message: SANDBOX_WORKSPACE_LENGTH_MESSAGE };
+      }
+      if (!sandboxBranchesValid) {
+        return { field: "sandboxRepo", message: "Please enter a valid repository branch" };
+      }
+      if (!sandboxRepoValid) {
+        return { field: "sandboxRepo", message: "Please enter a valid repository URL" };
+      }
+    } else {
+      if (selectedHostId && selectedHost?.status !== "online") {
+        return {
+          field: "other",
+          message: "Selected host is unavailable. Reconnect it or choose another host.",
+        };
+      }
+      if (!selectedHostId || !workspaceValid) {
+        return { field: "other", message: "Please choose a host and working directory" };
+      }
+    }
+    if (configuredAgentUnavailable && selectedAgent == null) {
+      return {
+        field: "other",
+        message: "This project's configured agent is unavailable — pick an agent to continue",
+      };
+    }
+    if (message.trim().length === 0 && files.length === 0) {
+      return { field: "other", message: "Enter a message to get started" };
+    }
+    if (selectedAgent == null || creating) return { field: "other", message: null };
+    return null;
+  })();
+  const canSubmit = submitBlocker === null;
+  const submitDisabledReason = submitBlocker?.message ?? null;
   useLayoutEffect(() => {
     if (submitDisabledReason !== null) return;
     setSubmitTooltipState("closed");
@@ -5096,7 +5115,7 @@ export function NewChatLandingScreen() {
   }
 
   function handleBlockedSubmit(): void {
-    if (sandboxSelected && !sandboxRepoValid) {
+    if (submitBlocker?.field === "sandboxRepo") {
       setSubmitTooltipState("closed");
       setSandboxRepoPopoverOpen(true);
       focusSandboxRepositoryIssue();

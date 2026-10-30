@@ -1118,21 +1118,34 @@ function SupportedForkSessionForm({
   // Repository the SOURCE ran in, when it was itself a sandbox session.
   // Recorded by the server on the managed create and copied onto the fork.
   const sourceSandboxRepo = sourceSession?.labels?.[SANDBOX_REPO_LABEL_KEY] ?? null;
+  const originalSandboxWorkspaces = useMemo(
+    () => (sourceSandboxRepo ?? "").split(/\s+/).filter(Boolean),
+    [sourceSandboxRepo],
+  );
+  const originalSandboxRepos = useMemo(
+    () => originalSandboxWorkspaces.map(splitSandboxWorkspace),
+    [originalSandboxWorkspaces],
+  );
+  const sandboxWorkspacesSupported = info !== "loading" && info.session_fork_workspaces === true;
+  // Older servers can only preserve multiple repositories through unchanged inheritance.
+  const canDiscoverSandboxBranches =
+    originalSandboxRepos.length > 0 &&
+    (sandboxWorkspacesSupported || originalSandboxRepos.length === 1);
   const sandboxBranchesPending =
-    sandboxSelected && Boolean(sourceSandboxRepo) && !sandboxBranchesChecked;
+    sandboxSelected && canDiscoverSandboxBranches && !sandboxBranchesChecked;
   // Seed once so removing all inherited repositories stays an explicit choice.
   useEffect(() => {
     if (!sandboxSelected || sandboxRepoSeededRef.current || sourceSandboxRepo === null) return;
     sandboxRepoSeededRef.current = true;
-    setSandboxRepos(sourceSandboxRepo.split(/\s+/).filter(Boolean).map(splitSandboxWorkspace));
-  }, [sandboxSelected, sourceSandboxRepo]);
+    setSandboxRepos(originalSandboxRepos);
+  }, [sandboxSelected, sourceSandboxRepo, originalSandboxRepos]);
 
   useEffect(() => {
     if (
       !visible ||
       !sandboxSelected ||
       busy ||
-      sourceSandboxRepo === null ||
+      !canDiscoverSandboxBranches ||
       sandboxBranchesChecked
     )
       return;
@@ -1141,12 +1154,11 @@ function SupportedForkSessionForm({
       controller.abort();
       setSandboxBranchesChecked(true);
     }, 8_000);
-    const originals = sourceSandboxRepo.split(/\s+/).filter(Boolean).map(splitSandboxWorkspace);
     void fetchSessionRepositoryBranches(sourceSessionId, controller.signal)
       .then(({ repositories }) => {
         if (controller.signal.aborted) return;
         const ambiguousUrls = new Set<string>();
-        for (const entries of [originals, repositories]) {
+        for (const entries of [originalSandboxRepos, repositories]) {
           const seen = new Set<string>();
           for (const repo of entries) {
             if (seen.has(repo.url)) ambiguousUrls.add(repo.url);
@@ -1172,7 +1184,7 @@ function SupportedForkSessionForm({
         );
         setSandboxBranchNotes(
           Object.fromEntries(
-            originals.flatMap((repo) => {
+            originalSandboxRepos.flatMap((repo) => {
               const live = currentBranches.get(repo.url);
               if (
                 editedSandboxReposRef.current.has(repo.url) ||
@@ -1201,7 +1213,15 @@ function SupportedForkSessionForm({
       controller.abort();
       clearTimeout(timeout);
     };
-  }, [visible, sandboxSelected, busy, sourceSandboxRepo, sourceSessionId, sandboxBranchesChecked]);
+  }, [
+    visible,
+    sandboxSelected,
+    busy,
+    canDiscoverSandboxBranches,
+    originalSandboxRepos,
+    sourceSessionId,
+    sandboxBranchesChecked,
+  ]);
 
   // Resolve a typed "~/…" path to its absolute form against the host's home,
   // so it's directly submittable without opening the tree browser (the server
@@ -1241,8 +1261,6 @@ function SupportedForkSessionForm({
     info.sandbox_provider_capabilities?.[forkEffectiveProvider]?.multi_repo === true;
   const maxSandboxRepos = forkProviderMultiRepo ? MAX_SANDBOX_REPOS : 1;
   const sandboxWorkspaces = composeSandboxWorkspaces(sandboxRepos);
-  const originalSandboxWorkspaces = (sourceSandboxRepo ?? "").split(/\s+/).filter(Boolean);
-  const sandboxWorkspacesSupported = info !== "loading" && info.session_fork_workspaces === true;
   const originalSandboxReposUnchanged =
     sandboxWorkspaces.length === originalSandboxWorkspaces.length &&
     sandboxWorkspaces.every((entry, index) => entry === originalSandboxWorkspaces[index]);
