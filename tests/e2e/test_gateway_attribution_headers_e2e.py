@@ -221,6 +221,16 @@ def test_gateway_headers_reach_real_cli_requests(
             assert "base_url" not in inherited
             assert "auth" not in inherited
             assert set(inherited["http_headers"]) == {_AGENT_HEADER, _SURFACES_HEADER}
+            # Native hook-trust writes validate the private file without launcher overrides.
+            validated = subprocess.run(
+                [executable, "features", "list"],
+                cwd=tmp_path,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert validated.returncode == 0, validated.stderr[-2000:]
             policy["base_url"] = destination
             policy_path.write_text(policy.as_string())
             executable = command[0]

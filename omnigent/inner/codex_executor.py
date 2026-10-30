@@ -1371,11 +1371,16 @@ def materialize_codex_provider_config(
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
 
-    for provider_name in gateway_providers:
+    for provider_name, provider in gateway_providers.items():
         if provider_name in providers or provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
-        # A partial table adds metadata; Codex still owns routing and auth.
-        providers[provider_name] = tomlkit.inline_table()
+        # Codex validates the private file independently when writing hook trust.
+        inherited_provider = tomlkit.inline_table()
+        name = provider.get("name")
+        inherited_provider["name"] = (
+            name if isinstance(name, str) and name.strip() else provider_name
+        )
+        providers[provider_name] = inherited_provider
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):

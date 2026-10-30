@@ -4638,6 +4638,7 @@ def test_materialize_attributes_effective_gateway_without_copying_credentials(
     if include_effective_providers:
         written = config_path.read_text()
         provider = tomllib.loads(written)["model_providers"]["Managed"]
+        assert provider["name"] == "Managed Gateway"
         assert provider["http_headers"] == {
             "Databricks-Custom-Coding-Agent": "codex",
             "Databricks-Custom-Client-Surfaces": "omnigent, ug, inner",
