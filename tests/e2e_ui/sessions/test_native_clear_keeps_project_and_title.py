@@ -91,6 +91,7 @@ def test_native_clear_keeps_project_and_title(
 
     page = request.getfixturevalue("page")
     project_id: str | None = None
+    new_session_id: str | None = None
     try:
         page.goto(f"{base_url}/c/{session_id}")
         _open_terminal_view(page)
@@ -154,6 +155,9 @@ def test_native_clear_keeps_project_and_title(
             f"project_id={original.get('project_id')!r} title={original.get('title')!r}"
         )
     finally:
+        if new_session_id is not None:
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(f"{base_url}/v1/sessions/{new_session_id}", timeout=10.0)
         if project_id is not None:
             with contextlib.suppress(httpx.HTTPError):
                 httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
