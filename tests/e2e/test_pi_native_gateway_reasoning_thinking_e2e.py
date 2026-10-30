@@ -64,7 +64,6 @@ pytestmark = [
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LAUNCH_TIMEOUT = 180
 _SCREEN_COLS, _SCREEN_ROWS = 140, 40
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[>=]")
 
 CLAUDE_MODEL = "system.ai.claude-fable-5-1"
 GPT_MODEL = "system.ai.gpt-6-luna"
@@ -258,22 +257,19 @@ class PiTui:
     def __init__(self, process: Any) -> None:
         self.process = process
         self.screen = pyte.Screen(_SCREEN_COLS, _SCREEN_ROWS)
+        # tmux sends private status queries unsupported by pyte; only render output.
+        self.screen.report_device_status = lambda *_args, **_kwargs: None
         self.stream = pyte.Stream(self.screen)
-        self.raw: list[str] = []
 
     def _pump(self) -> None:
         try:
             chunk = self.process.read_nonblocking(65536, timeout=0.2)
         except pexpect.TIMEOUT:
             return
-        self.raw.append(chunk)
         self.stream.feed(chunk)
 
     def text(self) -> str:
         return "\n".join(self.screen.display)
-
-    def raw_text(self) -> str:
-        return _ANSI_RE.sub("", "".join(self.raw))
 
     def wait_for(self, predicate: Callable[[str], bool], *, timeout: float, what: str) -> str:
         deadline = time.monotonic() + timeout
@@ -286,20 +282,6 @@ class PiTui:
             if predicate(rendered):
                 return rendered
         pytest.fail(f"Pi did not show {what} within {timeout:.0f}s:\n{self.text()}")
-
-    def wait_raw(self, pattern: str, *, timeout: float, what: str) -> re.Match[str]:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                self._pump()
-            except pexpect.EOF:
-                pytest.fail(f"omnigent pi exited before {what}:\n{self.raw_text()[-4000:]}")
-            match = re.search(pattern, self.raw_text())
-            if match:
-                return match
-        pytest.fail(
-            f"omnigent pi did not print {what} within {timeout:.0f}s:\n{self.raw_text()[-4000:]}"
-        )
 
     def send(self, text: str) -> None:
         self.process.send(text)
@@ -326,7 +308,7 @@ def footer_thinking_level(text: str, model: str) -> str | None:
 def select_model(tui: PiTui, model: str) -> None:
     """``/model`` -> filter to *model* -> Enter; wait for the footer to switch."""
     tui.send("/model\r")
-    tui.wait_for(lambda text: model in text, timeout=30, what="the model picker")
+    tui.wait_for(lambda text: "Enter to select" in text, timeout=30, what="the model picker")
     tui.send(model.removeprefix("system.ai."))
     tui.wait_for(
         lambda text: model in text and DEEPSEEK_MODEL not in text,
@@ -393,7 +375,6 @@ def test_pi_native_gateway_reasoning_models_offer_thinking_levels(pi_home: Path)
     tui = PiTui(child)
     thinking: dict[str, str | None] = {}
     try:
-        tui.wait_raw(r"Web UI:\s*(\S+)", timeout=_LAUNCH_TIMEOUT, what="its 'Web UI:' line")
         # Pi boots with the workspace's Claude model selected.
         tui.wait_for(_footer_shows(CLAUDE_MODEL), timeout=_LAUNCH_TIMEOUT, what="the Pi TUI")
         time.sleep(5)  # let the tmux attach settle before reading the footer

@@ -35,12 +35,10 @@ import stat
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Buffer, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
-
-from typing_extensions import Buffer
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (

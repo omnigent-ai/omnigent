@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal, overload
 
 import httpx
@@ -78,15 +78,15 @@ class OmnigentClient:
 
         async with OmnigentClient(base_url="http://localhost:8080") as client:
             result = await client.query(model="archer", input="hello")
-            print(result.text)        # the assistant's reply
-            print(result.files)       # any files the agent produced
+            print(result.text)  # the assistant's reply
+            print(result.files)  # any files the agent produced
 
     Streaming::
 
         stream = await client.query(model="archer", input="hi", stream=True)
         async for chunk in stream:
             print(chunk, end="", flush=True)
-        print(stream.files)            # populated after the stream ends
+        print(stream.files)  # populated after the stream ends
 
     Multi-turn conversation::
 
@@ -104,9 +104,12 @@ class OmnigentClient:
         authentication. When set, the auth handler runs on every
         request, allowing transparent token refresh for OAuth
         flows. ``None`` (default) relies on static ``headers``.
+    :param request_hooks: Async HTTP request hooks, run after authentication.
     :param timeout: Default timeout for non-streaming HTTP requests in
         seconds. SSE streams use a 600-second read timeout so server-side
-        tool execution can pause the stream for several minutes.
+        tool execution can pause the stream for several minutes. Session
+        creation with ``host_id`` allows at least 3660 seconds for the
+        server's host-launch acknowledgement.
 
     The client follows 3xx redirects on the configured origin (including
     http→https upgrades on the same host) and refuses cross-origin hops
@@ -121,6 +124,7 @@ class OmnigentClient:
         headers: dict[str, str] | None = None,
         auth: httpx.Auth | None = None,
         timeout: float = 30.0,
+        request_hooks: list[Callable[[httpx.Request], Awaitable[None]]] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         # Announce this as a first-party non-browser client via the sentinel
@@ -142,7 +146,10 @@ class OmnigentClient:
             # the host the caller configured. httpx raises TooManyRedirects
             # on loops.
             follow_redirects=True,
-            event_hooks={"response": [_refuse_cross_origin_redirects]},
+            event_hooks={
+                "request": request_hooks or [],
+                "response": [_refuse_cross_origin_redirects],
+            },
             # A proxy cannot reach our loopback server, so bypass the
             # environment for local targets. Loopback is plain HTTP with
             # explicit headers, so losing netrc/CA env with it costs nothing.
@@ -240,13 +247,17 @@ class OmnigentClient:
 
             from omnigent_client import tool
 
+
             @tool
             def get_time() -> str:
                 '''Return the current time.'''
                 return datetime.now().isoformat()
 
+
             result = await client.query(
-                model="archer", input="what time?", tools=[get_time],
+                model="archer",
+                input="what time?",
+                tools=[get_time],
             )
 
         Creates a single-turn session internally. For multi-turn

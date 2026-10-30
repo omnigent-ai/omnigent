@@ -10,7 +10,7 @@ The `antigravity-native` harness wraps the **real Antigravity `agy` TUI** (the
 antigravity` ensures a host daemon, the daemon-spawned **runner** launches `agy`
 in a runner-owned **tmux** terminal, and your TTY attaches to it. This is **not**
 the in-process `antigravity` Gemini-SDK harness — that one runs `google-antigravity`
-with a Gemini *API key*; this one drives the OAuth-only `agy` CLI and mirrors it
+with separate SDK settings; this one drives the `agy` CLI and mirrors it
 over **connect-RPC**. This skill is the proven recipe for running it **for real
 against a live local server + runner** — not just the unit tests.
 
@@ -62,10 +62,15 @@ Three transports, easy to confuse:
    #   curl -fsSL https://antigravity.google/cli/install.sh | bash   # then restart shell
    .venv/bin/python -c "from omnigent.onboarding.harness_readiness import harness_is_configured; print('antigravity-native ready:', harness_is_configured('antigravity-native'))"
    ```
-3. **`agy` is signed in (OAuth).** agy is **OAuth-only** — it has no `agy login`;
-   you authenticate by running bare `agy` once and completing the browser sign-in.
-   It **ignores `GEMINI_API_KEY`** (API-key auth belongs to the separate
-   `antigravity` SDK harness). Verify (no secrets printed):
+3. **Configure the connection being tested.** Native agy supports OAuth or a
+   Gemini API key/gateway. Use `omni setup` for a saved key, native Gemini
+   gateway, or Databricks profile; follow the
+   [gateway guide](../../../docs/native-agy-gateways.md) and use a fresh isolated
+   daemon. `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL` are also supported,
+   subject to the documented saved-credential precedence.
+
+   For the OAuth path, run bare `agy` once and complete browser sign-in.
+   Verify OAuth separately (no secrets printed):
    ```bash
    .venv/bin/python -c "from omnigent.onboarding.gemini_auth import gemini_login_detected; print('agy oauth token present:', gemini_login_detected())"
    agy models   # exits 0 and lists models only when signed in; else 'Please sign in'
@@ -78,11 +83,11 @@ Three transports, easy to confuse:
 4. **`tmux` is on PATH.** The agy terminal is a runner-owned tmux pane; the CLI
    attaches to it and the executor drives it via `tmux send-keys`
    (`_preflight_local_tools` hard-fails without tmux).
-5. **Network egress to Google's Antigravity backend.** A turn that hangs / fails
+5. **Network egress to the selected backend or gateway.** A turn that hangs / fails
    to connect on a locked-down host is usually egress, not a harness bug.
 
-> No `node` and no provider/gateway config are needed here (unlike pi/cursor
-> native): agy is a self-hosted binary and auth is the inherited Google OAuth.
+> agy is a standalone binary. OAuth needs no gateway configuration; gateway
+> tests must verify the selected endpoint receives the main and auxiliary requests.
 
 ## Step 1 — start a local server (real server + runner)
 
@@ -209,8 +214,9 @@ Key facts:
    `--server "$SERVER"` (or `--server ""` for local). If a *local* server rejects
    `antigravity-native`, it's stale — restart it from your checkout
    (allowlist: `omnigent/spec/_omnigent_compat.py`).
-3. **OAuth-only.** agy ignores `GEMINI_API_KEY`; if `agy models` says "sign in",
-   no web turn will get a real answer. Run bare `agy` once first.
+3. **Check the selected credential path.** A saved Gemini default outranks
+   ambient keys and OAuth. OpenAI Responses endpoints are incompatible with
+   native Gemini, even if they serve a Gemini model. Use the gateway guide above.
 4. **tmux must be reachable from the CLI process** for the direct attach; the
    executor's send-keys run on the runner side against the advertised socket.
 5. **Isolated HOME.** Don't expect your real `~/.gemini` to change — agy runs

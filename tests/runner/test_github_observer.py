@@ -15,7 +15,7 @@ def _segment(*tokens: str, env: tuple[str, ...] = ()) -> ShellSegment:
     return ShellSegment(raw_tokens=(*env, *tokens), invocation_tokens=tokens)
 
 
-def test_each_pr_or_api_segment_is_one_op_in_order() -> None:
+def test_pr_and_api_ops_stay_in_order_before_deferred_push() -> None:
     target = PullRequestRef.from_url(A)
     segments = [
         _segment("gh", "auth", "status"),
@@ -26,12 +26,15 @@ def test_each_pr_or_api_segment_is_one_op_in_order() -> None:
         _segment("gh", "pr", "diff", "42", "-R", "example/one"),
     ]
 
-    assert PULL_REQUESTS.shell_pr_operations(segments) == [
+    ops = PULL_REQUESTS.shell_pr_operations(segments)
+
+    assert ops[:-1] == [
         ShellPrOp(tracks=False, creates=False, target=target, content_only=False),
         ShellPrOp(tracks=True, creates=True, target=None, content_only=False),
         ShellPrOp(tracks=True, creates=False, target=target, content_only=False),
         ShellPrOp(tracks=False, creates=False, target=target, content_only=True),
     ]
+    assert ops[-1].resolve_result is not None
 
 
 @pytest.mark.parametrize(

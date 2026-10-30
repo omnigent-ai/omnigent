@@ -7,4 +7,4 @@
 from typing import TypeAlias
 
 JsonObject: TypeAlias = dict[str, object]
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+JsonValue: TypeAlias = bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"] | None

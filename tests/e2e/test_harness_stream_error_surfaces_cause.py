@@ -14,8 +14,11 @@ The runner's proxy exception handler (``omnigent/runner/app.py``, the
 ``except (httpx.HTTPError, RuntimeError)`` arm of ``proxy_stream``) logs the real
 exception via ``_logger.exception()`` but builds a *fixed* user-visible payload::
 
-    {"code": "connection_error", "message": "Harness stream connection error.",
-     "type": "<exception class>"}
+    {
+        "code": "connection_error",
+        "message": "Harness stream connection error.",
+        "type": "<exception class>",
+    }
 
 so ``str(exc)`` never reaches the user, and no ``Last captured terminal output``
 block is attached even for a session with a live native terminal.

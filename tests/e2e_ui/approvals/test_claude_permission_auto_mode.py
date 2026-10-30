@@ -29,6 +29,7 @@ import contextlib
 import secrets
 import threading
 from functools import partial
+from pathlib import Path
 
 import httpx
 import pytest
@@ -39,6 +40,7 @@ from tests._helpers.polling import poll_until
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _INBOX_ITEM = '[data-testid="inbox-item"]'
 _AUTO_MODE_LABEL = "Approve & switch to auto mode"
+_DIRECTORY_LABEL = "Approve & allow directories for this session"
 _CARD_TIMEOUT_MS = 30_000
 # The action row renders with the card itself, so once the pending card is
 # visible a short window is enough for the button to appear; this keeps the
@@ -92,6 +94,7 @@ def _park_permission_hook(
     session_id: str,
     elicitation_id: str,
     sink: dict,
+    payload: dict | None = None,
 ) -> None:
     """Long-poll the permission hook in a worker thread; stash the verdict.
 
@@ -109,14 +112,19 @@ def _park_permission_hook(
     try:
         sink["resp"] = httpx.post(
             f"{base_url}/v1/sessions/{session_id}/hooks/permission-request",
-            json=_permission_hook_payload(elicitation_id),
+            json=payload if payload is not None else _permission_hook_payload(elicitation_id),
             timeout=120.0,
         )
     except Exception as exc:  # surfaced by the test thread via the sink
         sink["error"] = exc
 
 
-def _park_in_thread(base_url: str, session_id: str, elicitation_id: str) -> dict:
+def _park_in_thread(
+    base_url: str,
+    session_id: str,
+    elicitation_id: str,
+    payload: dict | None = None,
+) -> dict:
     """Start a hook long-poll for *elicitation_id* and wait until it parks.
 
     :returns: The sink dict the worker writes into; it also carries the worker
@@ -125,7 +133,7 @@ def _park_in_thread(base_url: str, session_id: str, elicitation_id: str) -> dict
     sink: dict = {}
     worker = threading.Thread(
         target=_park_permission_hook,
-        args=(base_url, session_id, elicitation_id, sink),
+        args=(base_url, session_id, elicitation_id, sink, payload),
         daemon=True,
     )
     sink["thread"] = worker
@@ -154,20 +162,15 @@ def _drain_pending(base_url: str, session_id: str) -> None:
                 )
 
 
-def _assert_auto_mode_decision(sink: dict) -> None:
-    """Join the parked long-poll and assert the auto-mode allow decision.
-
-    The accepted verdict must come back as ``behavior=allow`` carrying the
-    session-scoped ``setMode(auto)`` permission update -- the signal Claude
-    Code needs to actually switch the session into auto mode.
-    """
+def _assert_permission_decision(sink: dict, expected_permissions: list[dict]) -> None:
+    """Check the exact permission grant returned to the native hook process."""
     sink["thread"].join(timeout=60)
     assert not sink["thread"].is_alive(), "permission hook long-poll never resolved"
     assert "error" not in sink, f"permission hook POST failed: {sink.get('error')!r}"
     assert sink["resp"].status_code == 200, sink["resp"].text
     decision = sink["resp"].json()["hookSpecificOutput"]["decision"]
     assert decision["behavior"] == "allow", decision
-    assert decision.get("updatedPermissions") == _EXPECTED_AUTO_MODE_PERMISSIONS, decision
+    assert decision.get("updatedPermissions") == expected_permissions, decision
 
 
 def _assert_gating_message_bold(card, tool_name: str) -> None:
@@ -218,7 +221,7 @@ def test_permission_card_offers_approve_and_switch_to_auto(
         expect(responded).to_be_visible(timeout=_CARD_TIMEOUT_MS)
         expect(responded).to_contain_text("Approved · auto mode")
         _assert_gating_message_bold(responded, "Write")
-        _assert_auto_mode_decision(sink)
+        _assert_permission_decision(sink, _EXPECTED_AUTO_MODE_PERMISSIONS)
     finally:
         _drain_pending(base_url, session_id)
         sink["thread"].join(timeout=10)
@@ -258,7 +261,73 @@ def test_inbox_permission_card_offers_approve_and_switch_to_auto(
         # the prompt drains and the hook gets the setMode(auto) decision.
         auto_button.click()
         poll_until(lambda: not _pending_elicitations(base_url, session_id))
-        _assert_auto_mode_decision(sink)
+        _assert_permission_decision(sink, _EXPECTED_AUTO_MODE_PERMISSIONS)
+    finally:
+        _drain_pending(base_url, session_id)
+        sink["thread"].join(timeout=10)
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize("surface", ["chat", "inbox", "standalone"])
+def test_permission_card_grants_directories_without_changing_auto_mode(
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    surface: str,
+) -> None:
+    """Each approval route preserves native directory grants and Auto mode."""
+    base_url, session_id = seeded_session
+    elicitation_id = f"elicit_claude_{secrets.token_hex(16)}"
+    directories = ["/home/developer/worktrees/canary", "/mnt/quicktree/canary"]
+    expected_permissions = [
+        {"type": "addDirectories", "directories": directories, "destination": "session"}
+    ]
+    payload = _permission_hook_payload(elicitation_id) | {
+        "permission_mode": "auto",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": f"{directories[0]}/directory-permission-check.txt",
+            "old_string": "before",
+            "new_string": "after",
+        },
+        "permission_suggestions": expected_permissions,
+    }
+    sink = _park_in_thread(base_url, session_id, elicitation_id, payload)
+    try:
+        if surface == "chat":
+            page.goto(f"{base_url}/c/{session_id}")
+            card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
+            expect(card).to_be_visible(timeout=_CARD_TIMEOUT_MS)
+            page.reload()
+        elif surface == "inbox":
+            page.goto(f"{base_url}/inbox")
+            item = page.locator(_INBOX_ITEM).filter(has_text="Edit").first
+            card = item.locator(_APPROVAL_CARD)
+        else:
+            page.goto(f"{base_url}/approve/{session_id}/{elicitation_id}")
+            card = page.locator(_APPROVAL_CARD)
+
+        expect(card).to_be_visible(timeout=_CARD_TIMEOUT_MS)
+        for directory in directories:
+            expect(card.get_by_text(directory, exact=True)).to_be_visible()
+        expect(card.get_by_role("button", name="Approve", exact=True)).to_be_visible()
+        expect(card.get_by_role("button", name=_AUTO_MODE_LABEL)).to_have_count(0)
+        expect(card.get_by_role("button", name="Accept & allow all edits")).to_have_count(0)
+        directory_button = card.get_by_role("button", name=_DIRECTORY_LABEL, exact=True)
+        expect(directory_button).to_be_visible()
+        page.screenshot(path=str(tmp_path / f"{surface}-directory-permission.png"))
+        directory_button.click()
+
+        _assert_permission_decision(sink, expected_permissions)
+        poll_until(lambda: not _pending_elicitations(base_url, session_id))
+        if surface == "chat":
+            responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
+            expect(responded).to_contain_text("Approved · directory access for this session")
+        elif surface == "inbox":
+            expect(item).to_have_count(0)
+        else:
+            expect(page.get_by_text("Approved", exact=True)).to_be_visible()
+            expect(page.get_by_text("You can close this page.")).to_be_visible()
     finally:
         _drain_pending(base_url, session_id)
         sink["thread"].join(timeout=10)

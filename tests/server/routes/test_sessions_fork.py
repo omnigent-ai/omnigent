@@ -301,6 +301,7 @@ class _ConversationStore:
             key: value
             for key, value in src.labels.items()
             if key not in (_FORK_ONLY_DROPPED_LABEL_KEYS | dropped_label_keys)
+            and not key.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
         }
         fork_labels.update(extra_labels or {})
         fork = Conversation(
@@ -892,7 +893,8 @@ async def test_fork_copies_all_file_rows_without_probing_blobs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fork_session_run_config_overrides_pass_through() -> None:
+@pytest.mark.parametrize("side_chat", [False, True])
+async def test_fork_session_run_config_overrides_pass_through(side_chat: bool) -> None:
     """The dialog's model / effort / launch-args picks reach the store as
     explicit overrides with their set-flags on.
 
@@ -908,6 +910,7 @@ async def test_fork_session_run_config_overrides_pass_through() -> None:
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
         json={
+            "side_chat": side_chat,
             "model_override": "opus",
             "reasoning_effort": "high",
             "terminal_launch_args": ["--permission-mode", "auto"],
@@ -1458,9 +1461,10 @@ async def test_fork_codex_bypass_stamps_label_on_codex_target(
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
     extra = conv_store.fork_calls[0]["extra_labels"]
-    assert extra == {"omnigent.codex_native.bypass_sandbox": "1"}, (
-        f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
-    )
+    assert extra == {
+        "omnigent.codex_native.bypass_sandbox": "1",
+        "omnigent.client_surface": "web",
+    }, f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
 
 
 @pytest.mark.asyncio
@@ -1978,7 +1982,10 @@ async def test_fork_managed_launches_its_requested_host_id(
     assert body["labels"][REQUESTED_HOST_ID_LABEL_KEY] == host_id
     # Born with the row (not patched onto the response): a list read racing the
     # fork can't return the row without the id the caller routes it by.
-    assert conv_store.fork_calls[0]["extra_labels"] == {REQUESTED_HOST_ID_LABEL_KEY: host_id}
+    assert conv_store.fork_calls[0]["extra_labels"] == {
+        REQUESTED_HOST_ID_LABEL_KEY: host_id,
+        "omnigent.client_surface": "web",
+    }
     assert conv_store.label_writes == [(body["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})]
 
 
@@ -2157,6 +2164,78 @@ async def test_fork_managed_inherits_all_source_repositories(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selected_count", [1, 2])
+async def test_fork_managed_explicit_workspaces_replace_source_repositories(
+    monkeypatch: pytest.MonkeyPatch, selected_count: int
+) -> None:
+    """The fork launches every chosen ref and records that selection for relaunch."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/old-web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={conv.id: conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(
+        app, monkeypatch, provider="modal" if selected_count == 1 else "kubernetes"
+    )
+    client = TestClient(app)
+    selected = [
+        "https://github.com/org/api#fix-auth",
+        "https://github.com/org/web#update-login",
+    ][:selected_count]
+
+    resp = client.post(
+        f"/v1/sessions/{conv.id}/fork",
+        json={"host_type": "managed", "workspaces": selected},
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(launches) == 1
+    assert [(r.url, r.branch) for r in launches[0]["repos"]] == [
+        ("https://github.com/org/api", "fix-auth"),
+        ("https://github.com/org/web", "update-login"),
+    ][:selected_count]
+    fork = conv_store.get_conversation(resp.json()["id"])
+    assert fork is not None
+    assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.0"] == selected[0]
+    if selected_count == 2:
+        assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.1"] == selected[1]
+    else:
+        assert f"{MANAGED_REPO_LABEL_KEY}.1" not in fork.labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspaces", [[], None])
+async def test_fork_managed_explicit_empty_workspaces_clear_source_repositories(
+    monkeypatch: pytest.MonkeyPatch, workspaces: list[str] | None
+) -> None:
+    """Removing every repo produces an empty sandbox instead of inheriting the source."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={conv.id: conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        f"/v1/sessions/{conv.id}/fork", json={"host_type": "managed", "workspaces": workspaces}
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert launches[0]["repos"] == []
+    assert conv_store.label_writes == []
+    fork = conv_store.get_conversation(resp.json()["id"])
+    assert fork is not None
+    assert not any(key.startswith(MANAGED_REPO_LABEL_KEY) for key in fork.labels)
+
+
+@pytest.mark.asyncio
 async def test_fork_managed_explicit_workspace_overrides_inherited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2316,8 +2395,9 @@ async def test_fork_managed_rejects_unoffered_provider(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_selection", [False, True])
 async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, explicit_selection: bool
 ) -> None:
     """A multi-repo source forked onto a single-repo provider fails the POST with
     a clear 400 (modal is exec-model → single-repo), rather than a background
@@ -2335,7 +2415,14 @@ async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed"},
+        json={
+            "host_type": "managed",
+            **(
+                {"workspaces": ["https://github.com/org/other-api", "https://github.com/org/web"]}
+                if explicit_selection
+                else {}
+            ),
+        },
     )
 
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
@@ -2762,3 +2849,40 @@ def test_fork_enforces_current_policy_before_creating_destination(
         assert not conv_store.fork_calls
         assert len(conv_store._convs) == 1
         assert file_store.files == original_files
+
+
+@pytest.mark.parametrize(
+    "policy,expected_status",
+    [
+        ({"filesystem_attachment_max_files": 1}, 413),
+        ({"filesystem_attachment_max_total_bytes": 7}, 413),
+        ({"filesystem_attachment_max_files": 2, "filesystem_attachment_max_total_bytes": 8}, 201),
+    ],
+    ids=["file-count", "total-bytes", "within-limits"],
+)
+def test_fork_counts_files_recorded_for_filesystem_delivery(
+    monkeypatch: pytest.MonkeyPatch, policy: dict[str, Any], expected_status: int
+) -> None:
+    """A type outside the default extensions counts when its upload was recorded for disk."""
+    client, conv_store, file_store = _attachment_fork_client(
+        monkeypatch, "sample.zip", "codex-native"
+    )
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    recorded = {"delivery": "filesystem"}
+    file_store.create(
+        "trace.gz", bytes=4, session_id=source_id, file_id="0" * 32, source_metadata=recorded
+    )
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: policy)
+
+    response = client.post(
+        f"/v1/sessions/{source_id}/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
+    )
+
+    assert response.status_code == expected_status, response.text
+    if expected_status == 201:
+        fork_id = response.json()["id"]
+        copied = [f for f in file_store.files.values() if f.session_id == fork_id]
+        assert [f.source_metadata for f in copied if f.filename == "trace.gz"] == [recorded]
+    else:
+        assert not conv_store.fork_calls

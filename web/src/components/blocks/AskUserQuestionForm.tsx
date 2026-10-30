@@ -1,38 +1,19 @@
-// Interactive form for Claude Code's built-in ``AskUserQuestion``
-// tool. Rendered inside the existing ``ApprovalCard`` when the
-// PermissionRequest carries a structured ``ask_user_question``
-// payload — see :file:`@/lib/askUserQuestion`.
+// Question carousel for structured elicitation, with single- or multi-select answers.
+// isOther controls custom input; submit requires an answer to every question.
 //
-// **Carousel** layout: only one question is visible at a time with
-// Prev / Next / Submit navigation. ``Question N of M`` indicator
-// keeps progress legible without stacking N fieldsets vertically.
-//
-// Each question section renders:
-//   - the question text in primary foreground color + an optional
-//     ``header`` badge in muted text
-//   - radio inputs (single-select) or checkboxes (multi-select)
-//     for the predefined options, with each option's description
-//     under the label in muted text
-//   - a "Type something" custom-input row at the bottom of the
-//     option list — same radio/checkbox prefix as the real
-//     options, so visually it's "one more option" whose value the
-//     user types. The radio/checkbox is part of the same group
-//     as the predefined options (single-select mutex; multi-select
-//     independent toggle).
-//   - <pre> blocks showing the ``preview`` of any currently-selected
-//     option that has one (single-select: 0 or 1; multi-select:
-//     one per selected option with a preview).
-//
-// Submit is gated on EVERY question having an answer (a predefined
-// option selected, or the custom row selected with non-empty text).
-// Selections are gathered into a flat ``{[question id or text]:
-// answer}`` map matching MCP's ``ElicitResult.content`` shape and
-// passed to ``onSubmit``.
+// Unsent answers are restored on remount (see ``@/lib/askUserQuestionDrafts``).
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import { type ChangeEvent, useState } from "react";
+import { type ChangeEvent, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import {
+  type AskUserQuestionDraft,
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 
 /**
  * Map from question id/text → either a single selected label
@@ -41,6 +22,8 @@ import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 export type AskUserQuestionAnswers = Record<string, string | string[]>;
 
 interface AskUserQuestionFormProps {
+  /** Pending elicitation the questions belong to; keys the unsent draft. */
+  elicitationId: string;
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
@@ -52,7 +35,7 @@ interface AskUserQuestionFormProps {
  *
  * Single-select: when the custom row is selected, the custom text
  * is the answer (and must be non-empty). Otherwise the selected
- * option label is the answer.
+ * option label is the answer. Text editors preserve whitespace and allow empty text.
  *
  * Multi-select: the answer is the union of selected option labels
  * and (the custom text, when the custom row is selected and the
@@ -73,6 +56,7 @@ function answerForQuestion(
     return all.length > 0 ? all : null;
   }
   if (customSelected) {
+    if (question.textInput) return customText;
     return customValue || null;
   }
   return typeof selection === "string" && selection ? selection : null;
@@ -82,34 +66,80 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
+/** Answers on a freshly opened card, before the user touches it. */
+function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft, "currentIndex"> {
+  const answers: Omit<AskUserQuestionDraft, "currentIndex"> = {
+    selections: {},
+    customSelected: {},
+    customInputs: {},
+  };
+  for (const q of questions) {
+    const key = questionKey(q);
+    answers.selections[key] = q.multiSelect ? [] : (q.options[0]?.label ?? "");
+    answers.customSelected[key] = q.textInput !== undefined;
+    answers.customInputs[key] = q.textInput?.default ?? "";
+  }
+  return answers;
+}
+
+export function AskUserQuestionForm({
+  elicitationId,
+  questions,
+  onSubmit,
+  onReject,
+}: AskUserQuestionFormProps) {
+  // Form state belongs to the first questions; ApprovalCard remounts the form for new ones.
+  const [draftQuestions] = useState(questions);
+  const [signature] = useState(() => askUserQuestionSignature(questions));
+  const [draft] = useState(() => getAskUserQuestionDraft(elicitationId, signature));
+  const [initial] = useState(() => initialAnswers(questions));
+
   // Currently-visible question (carousel index).
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(draft?.currentIndex ?? 0);
 
   // Per-question option selection. Single-select stores a string;
   // multi-select stores a deduped array.
-  const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
-    const initial: Record<string, string | string[]> = {};
-    for (const q of questions) {
-      initial[questionKey(q)] = q.multiSelect ? [] : "";
-    }
-    return initial;
-  });
+  const [selections, setSelections] = useState(draft?.selections ?? initial.selections);
 
-  // Per-question custom-input state. ``text`` is what the user
-  // typed; ``selected`` is whether the custom row's radio/checkbox
+  // Per-question custom-input state. ``customInputs`` is what the user
+  // typed; ``customSelected`` is whether the custom row's radio/checkbox
   // is checked (which determines whether the typed text is part of
   // the answer).
-  const [customSelected, setCustomSelected] = useState<Record<string, boolean>>(() => {
-    const initial: Record<string, boolean> = {};
-    for (const q of questions) initial[questionKey(q)] = false;
-    return initial;
-  });
-  const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
-    for (const q of questions) initial[questionKey(q)] = "";
-    return initial;
-  });
+  const [customSelected, setCustomSelected] = useState(
+    draft?.customSelected ?? initial.customSelected,
+  );
+  const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
+
+  useEffect(() => {
+    const answers = {
+      selections: { ...selections },
+      customSelected: { ...customSelected },
+      customInputs: { ...customInputs },
+    };
+    // Answers to a secret question are never kept past this mount.
+    for (const q of draftQuestions) {
+      if (!q.isSecret) continue;
+      const key = questionKey(q);
+      answers.selections[key] = initial.selections[key]!;
+      answers.customSelected[key] = initial.customSelected[key]!;
+      answers.customInputs[key] = initial.customInputs[key]!;
+    }
+    // Untouched cards keep no draft, so they cannot evict real ones.
+    if (currentIndex === 0 && JSON.stringify(answers) === JSON.stringify(initial)) {
+      clearAskUserQuestionDraft(elicitationId, signature);
+      return;
+    }
+    saveAskUserQuestionDraft(elicitationId, signature, { currentIndex, ...answers });
+  }, [
+    elicitationId,
+    draftQuestions,
+    signature,
+    initial,
+    currentIndex,
+    selections,
+    customSelected,
+    customInputs,
+  ]);
 
   const handleSingleSelect = (key: string, label: string) => {
     // Single-select mutex: clicking a real option clears the
@@ -214,6 +244,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
     (opt) => selectedLabels.includes(opt.label) && opt.preview,
   );
 
+  const allowCustomInput = current.isOther !== false;
   const customRowId = `${currentKey}__custom`;
   const customRowChecked = customSelected[currentKey] ?? false;
   const customRowValue = customInputs[currentKey] ?? "";
@@ -292,40 +323,42 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
               </label>
             );
           })}
-          {/* Custom-input row — visually "one more option" with a
-              matching radio/checkbox prefix, so the user picks
-              between predefined options and free-form input the
-              same way. */}
-          <label
-            htmlFor={customRowId}
-            className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
-          >
-            <input
-              type={current.multiSelect ? "checkbox" : "radio"}
-              id={customRowId}
-              name={current.multiSelect ? undefined : currentKey}
-              checked={customRowChecked}
-              onChange={() =>
-                current.multiSelect
-                  ? handleCustomToggleMulti(currentKey)
-                  : handleCustomToggleSingle(currentKey)
-              }
-              className="mt-1"
-              data-testid="ask-user-question-custom-toggle"
-            />
-            {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
-                the textarea to fit its content, so typing past the
-                first line wraps and expands downward instead of
-                scrolling within a fixed single row. */}
-            <textarea
-              rows={1}
-              placeholder="Type something"
-              value={customRowValue}
-              onChange={(e) => handleCustomInput(currentKey, e)}
-              data-testid="ask-user-question-custom-input"
-              className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
-            />
-          </label>
+          {allowCustomInput && (
+            /* Custom-input row — visually "one more option" with a
+               matching radio/checkbox prefix, so the user picks
+               between predefined options and free-form input the
+               same way. */
+            <label
+              htmlFor={customRowId}
+              className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
+            >
+              <input
+                type={current.multiSelect ? "checkbox" : "radio"}
+                id={customRowId}
+                name={current.multiSelect ? undefined : currentKey}
+                checked={customRowChecked}
+                onChange={() =>
+                  current.multiSelect
+                    ? handleCustomToggleMulti(currentKey)
+                    : handleCustomToggleSingle(currentKey)
+                }
+                className="mt-1"
+                data-testid="ask-user-question-custom-toggle"
+              />
+              {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
+                  the textarea to fit its content, so typing past the
+                  first line wraps and expands downward instead of
+                  scrolling within a fixed single row. */}
+              <textarea
+                rows={1}
+                placeholder="Type something"
+                value={customRowValue}
+                onChange={(e) => handleCustomInput(currentKey, e)}
+                data-testid="ask-user-question-custom-input"
+                className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+              />
+            </label>
+          )}
         </div>
         {previewsToShow.length > 0 && (
           <div className="flex flex-col gap-1" data-testid="ask-user-question-previews">

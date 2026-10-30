@@ -362,6 +362,7 @@ def configure_mock_llm(
     *,
     key: str = "default",
     match: str | None = None,
+    required_tools: list[str] | None = None,
 ) -> None:
     """
     Configure a keyed response queue on the mock LLM server.
@@ -375,11 +376,9 @@ def configure_mock_llm(
     Use different keys to give each agent its own response stream::
 
         # Parent agent uses "mock-parent" model
-        configure_mock_llm(url, [{"text": "spawning reviewer..."}],
-                           key="mock-parent")
+        configure_mock_llm(url, [{"text": "spawning reviewer..."}], key="mock-parent")
         # Sub-agent uses "mock-reviewer" model
-        configure_mock_llm(url, [{"text": "LGTM"}],
-                           key="mock-reviewer")
+        configure_mock_llm(url, [{"text": "LGTM"}], key="mock-reviewer")
 
     Pass *match* to route by request CONTENT instead of model: the queue
     serves any request whose ``role="user"`` input contains the token.
@@ -399,6 +398,8 @@ def configure_mock_llm(
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
+    :param required_tools: Advertised tools required to consume this queue,
+        isolating agent turns from background generation and review.
     :param match: Optional content-routing token. When set, the queue is
         selected if this token appears in the request's user input,
         regardless of ``model``. Use a deliberately-unique token (the
@@ -413,6 +414,8 @@ def configure_mock_llm(
     }
     if match is not None:
         payload["match"] = match
+    if required_tools is not None:
+        payload["required_tools"] = required_tools
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/configure",
         json=payload,
@@ -517,6 +520,20 @@ def get_mock_requests(
         params=params,
         timeout=5.0,
     )
+    resp.raise_for_status()
+    return resp.json()["requests"]
+
+
+def get_mock_message_requests(mock_llm_server_url: str, *, key: str | None = None) -> list[dict]:
+    """
+    Retrieve captured Anthropic Messages requests with their beta flags.
+
+    :param mock_llm_server_url: Mock server URL.
+    :param key: When set, only return requests whose ``model`` field matches this key.
+    :returns: Entries shaped ``{"body": <request body>, "betas": [<flag>, ...]}``.
+    """
+    params = {"key": key} if key is not None else {}
+    resp = httpx.get(f"{mock_llm_server_url}/mock/message_requests", params=params, timeout=5.0)
     resp.raise_for_status()
     return resp.json()["requests"]
 

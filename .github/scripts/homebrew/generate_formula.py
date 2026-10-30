@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -58,8 +59,8 @@ DEFAULT_INDEX_URL = "https://pypi.org/simple"
 PYPI_JSON_API = "https://pypi.org/pypi"
 
 # The three packages that release together at one version. At release time they
-# are minutes old, so they are the only ones that legitimately need to be exempt
-# from the supply-chain cooldown re-applied below.
+# are minutes old, so they are always exempt from the supply-chain cooldown
+# re-applied below (uv.toml's own exemptions are honored too).
 LOCKSTEP_PACKAGES = ("omnigent", "omnigent-client", "omnigent-ui-sdk")
 # Fallback when `exclude-newer` can't be read out of uv.toml.
 DEFAULT_COOLDOWN_DAYS = 7
@@ -179,6 +180,24 @@ def cooldown_days(repo_root: Path | None = None) -> int:
         file=sys.stderr,
     )
     return DEFAULT_COOLDOWN_DAYS
+
+
+def cooldown_exemptions(repo_root: Path | None = None) -> dict[str, str]:
+    """The repo's `exclude-newer-package` exemptions from uv.toml, by package.
+
+    The lockfile build lets these packages in up to their dated cutoff, so the
+    formula must too, or a release that needs one (e.g. a fresh security fix)
+    cannot resolve. Missing or unreadable uv.toml means no extra exemptions.
+
+    :returns: Normalized package name to cutoff, e.g.
+        ``{"certifi": "2026-10-21T00:00:00Z"}``.
+    """
+    root = repo_root or Path(__file__).resolve().parents[3]
+    try:
+        table = tomllib.loads((root / "uv.toml").read_text()).get("exclude-newer-package", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return {normalize_name(name): str(cutoff) for name, cutoff in table.items()}
 
 
 def _http_get_json(url: str, retries: int = 5, timeout: int = 30) -> dict:
@@ -339,6 +358,8 @@ def resolve_closure(
     index_url: str,
     uv: str,
     cooldown: int,
+    *,
+    exemptions: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Union of `uv pip compile` resolutions per platform -> {name: version}.
 
@@ -353,21 +374,26 @@ def resolve_closure(
     The cooldown cannot simply be left on: at release time `omnigent` and its two
     lockstep SDKs are minutes old, and uv would filter out the very version being
     packaged ("no version of omnigent==X.Y.Z"). So the window applies to everything
-    except those three, via `--exclude-newer-package`.
+    except those three and uv.toml's dated `exclude-newer-package` entries
+    (*exemptions*, read from uv.toml when omitted), via `--exclude-newer-package`.
 
     If a package resolves to different versions across platforms, the highest
     PEP 440 version wins and a warning is printed (rare for sdists).
     """
     extras_spec = f"[{','.join(extras)}]" if extras else ""
     requirement = f"omnigent{extras_spec}=={version}"
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cutoff = (now - datetime.timedelta(days=cooldown)).strftime("%Y-%m-%dT%H:%M:%SZ")
     # The lockstep packages are exempted up to "now" rather than skipped, so a
     # typo'd name still gets a cooldown rather than silently getting none.
     exempt_until = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    package_cutoffs = cooldown_exemptions() if exemptions is None else dict(exemptions)
+    package_cutoffs.update(dict.fromkeys(LOCKSTEP_PACKAGES, exempt_until))
     print(
         f"Cooldown: ignoring distributions uploaded after {cutoff} "
-        f"({cooldown}d), except {', '.join(LOCKSTEP_PACKAGES)}.",
+        f"({cooldown}d), except "
+        + ", ".join(f"{pkg} (until {until})" for pkg, until in package_cutoffs.items())
+        + ".",
         file=sys.stderr,
     )
     closure: dict[str, str] = {}
@@ -386,8 +412,8 @@ def resolve_closure(
                 cutoff,
                 *[
                     arg
-                    for pkg in LOCKSTEP_PACKAGES
-                    for arg in ("--exclude-newer-package", f"{pkg}={exempt_until}")
+                    for pkg, until in package_cutoffs.items()
+                    for arg in ("--exclude-newer-package", f"{pkg}={until}")
                 ],
                 "--no-header",
                 "--no-annotate",
