@@ -422,6 +422,22 @@ describe("index.css native status-bar scroll fades", () => {
   );
 });
 
+describe("index.css native header glass", () => {
+  it("reaches the glass up over the status bar at every width", () => {
+    const glass = cssBlocks.find(
+      ([block]) =>
+        selectorOf(block).replace(/\s+/g, " ") ===
+        ":is([data-ios-native], [data-android-native]) .session-header-glass::before",
+    );
+    expect(glass).toBeDefined();
+    expect(glass![0]).toContain(
+      "top: calc(-1 * max(0px, calc(var(--omnigent-safe-top) - 0.5rem)))",
+    );
+    const before = cssSource.slice(0, glass!.index!);
+    expect((before.match(/\{/g) ?? []).length - (before.match(/\}/g) ?? []).length).toBe(0);
+  });
+});
+
 describe("index.css native transcript top padding", () => {
   it("pads only unpinned transcripts so a pinned plan gets no extra gap", () => {
     const padded = cssBlocks.filter(([block]) =>
