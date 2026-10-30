@@ -167,6 +167,7 @@ function loadNavigationHarness({
   oidc = {},
   acceptedSessions = new Set(),
   deepLinks = null,
+  localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -643,6 +644,10 @@ function loadNavigationHarness({
       decideWindowOpen: () => ({ kind: "ignore" }),
       stripCrossOriginOpenerHeaders: () => {},
       WEB_SCHEMES: new Set(),
+    },
+    "./hostIdentity": {
+      isHostThisMachine: (context) =>
+        require("../src/hostIdentity").isHostThisMachine(context, localHostCli),
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
@@ -4338,8 +4343,10 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     h.api.registerIpc();
     const registry = h.api.createBrowserRegistryForWindow(h.win);
     h.api.windows.get(h.win).browserRegistry = registry;
-    const context = h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId);
-    const eligible = h.browserRegistryDeps().isArcaAgentContext;
+    const context = h
+      .browserIpcDeps()
+      .getAgentContextForEvent({ sender: h.webContents }, { sourceHostId: hostId });
+    const eligible = h.browserRegistryDeps().allowsLocalhost;
     const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
     assert.equal(eligible(context), false);
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
@@ -4352,7 +4359,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.deepEqual(h.browserRegistryCalls.closeAll, ["server-changed"]);
     assert.equal(eligible(context), false);
     assert.equal(
-      eligible(h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId)),
+      eligible(
+        h
+          .browserIpcDeps()
+          .getAgentContextForEvent({ sender: h.webContents }, { sourceHostId: hostId }),
+      ),
       false,
     );
   });
@@ -5465,6 +5476,52 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(
       [...h.ipc.keys()].filter((channel) => /ssh/i.test(channel)),
       ["omnigent:ssh-connect"],
+    );
+  });
+});
+
+describe("main-owned local host eligibility", () => {
+  it("ignores page-supplied eligibility and requires enrollment plus the protocol marker", (t) => {
+    let live = true;
+    const serverUrl = "https://server.example";
+    const h = loadNavigationHarness({
+      serverUrl,
+      localHostCli: {
+        readLocalHostId: () => "local",
+        liveDaemonRecordFor: (target) => {
+          assert.equal(target, serverUrl);
+          return live ? { host_id: "local" } : null;
+        },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const context = (opts) =>
+      h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, opts);
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: false })
+        .hostIsThisMachine,
+      true,
+    );
+    assert.equal(
+      context({ sourceHostId: "remote", sessionHostProtocol: 1, hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
+    );
+    assert.equal(
+      context({ sourceHostId: "local", hostIsThisMachine: true }).hostIsThisMachine,
+      false,
+    );
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: "1", hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
+    );
+    live = false;
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
     );
   });
 });

@@ -81,7 +81,7 @@ function createBrowserViewRegistry({
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
-  isArcaAgentContext = () => false,
+  allowsLocalhost = () => false,
   // (hostname, partition) => Promise<string[]> for the agent DNS check, and
   // (url, partition) => Promise<string> ("DIRECT" or a PAC-style proxy list).
   resolveHost = lookupHostAddresses,
@@ -218,7 +218,7 @@ function createBrowserViewRegistry({
       }
       if (entry.agentNavLocked) {
         const verdict = isAgentNavigationAllowed(url, {
-          allowLocalhost: isArcaAgentContext(entry.agentContext),
+          allowLocalhost: allowsLocalhost(entry.agentContext),
         });
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
@@ -285,7 +285,7 @@ function createBrowserViewRegistry({
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
       const verdict = isAgentNavigationAllowed(targetUrl, {
-        allowLocalhost: isArcaAgentContext(entry.agentContext),
+        allowLocalhost: allowsLocalhost(entry.agentContext),
       });
       if (!verdict.ok) {
         try {
@@ -391,7 +391,7 @@ function createBrowserViewRegistry({
   function checkAgentNavigationFor(conversationId, url, agentContext) {
     const partition = agentPartition(partitionScope, conversationId);
     return checkAgentNavigation(url, {
-      allowLocalhost: isArcaAgentContext(agentContext),
+      allowLocalhost: allowsLocalhost(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
     });
   }
@@ -457,7 +457,7 @@ function createBrowserViewRegistry({
     const entry = agentLockedEntryFor(webContentsId);
     if (!entry) return false;
     const verdict = isAgentConnectionAllowed(url, ip, {
-      allowLocalhost: isArcaAgentContext(entry.agentContext),
+      allowLocalhost: allowsLocalhost(entry.agentContext),
     });
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
@@ -486,7 +486,7 @@ function createBrowserViewRegistry({
     // rejected nav creates no blank view.
     if (opts && opts.agent && url) {
       const verdict = isAgentNavigationAllowed(url, {
-        allowLocalhost: isArcaAgentContext(opts.agentContext),
+        allowLocalhost: allowsLocalhost(opts.agentContext),
       });
       if (!verdict.ok) {
         return { ok: false, error: verdict.error };

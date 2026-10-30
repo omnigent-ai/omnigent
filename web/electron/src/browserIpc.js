@@ -401,9 +401,8 @@ function registerBrowserIpc({
     const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
     const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
     const navigate = async (registry) => {
-      // The first-party renderer supplies the source-session host; main owns
-      // the target and eligibility. Caller exception flags never establish identity.
-      const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+      // Main derives navigation eligibility from the window and routing options.
+      const agentContext = getAgentContextForEvent(event, opts);
       if (url) {
         const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
         if (!isCurrent()) return cancelled;
@@ -464,6 +463,7 @@ function registerBrowserIpc({
     return {
       ok: r.ok,
       created: r.created ?? false,
+      ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
       error: hint ? `${r.error} ${hint}` : r.error,
     };
   });

@@ -319,8 +319,8 @@ describe("browser IPC Arca context", () => {
           return { ok: true };
         },
       }),
-      getAgentContextForEvent: (_event, host) => {
-        assert.equal(host, "actual-host");
+      getAgentContextForEvent: (_event, opts) => {
+        assert.equal(opts.sourceHostId, "actual-host");
         return context;
       },
     });
@@ -1460,5 +1460,90 @@ it("applies navigation policy even when renderer options claim user intent", asy
     assert.equal(result.ok, false);
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0][3], { force: false, agent: true, agentContext: context });
+  }
+});
+
+describe("browser IPC sessions on this machine", () => {
+  function localNavigation({ hostId = "local", live = true, protocol = 1 } = {}) {
+    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+    const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
+    const { isHostThisMachine } = require("../src/hostIdentity");
+    const webContents = makeWebContents();
+    webContents.loadURL = () => {};
+    webContents.capturePage = async () => ({ toPNG: () => Buffer.from("fixture") });
+    const registry = createBrowserViewRegistry({
+      WebContentsViewCtor: () => ({ webContents, setBounds() {} }),
+      createBoundsController: createBrowserViewBoundsController,
+      sendToRenderer: () => {},
+      attachToHost: () => {},
+      detachFromHost: () => {},
+      allowsLocalhost: (context) => context?.hostIsThisMachine === true,
+      resolveHost: async (hostname) =>
+        hostname === "alias.example" ? ["127.0.0.1"] : ["93.184.215.14"],
+    });
+    const ipcMain = makeIpcMain();
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => registry,
+      getAgentContextForEvent: (_event, opts) => ({
+        sourceHostId: opts?.sourceHostId,
+        hostIsThisMachine:
+          opts?.sessionHostProtocol === 1 &&
+          isHostThisMachine(
+            { hostId: opts?.sourceHostId, serverUrl: "https://server.example" },
+            {
+              readLocalHostId: () => "local",
+              liveDaemonRecordFor: () => (live ? { host_id: "local" } : null),
+            },
+          ),
+      }),
+    });
+    const navigate = (url, opts = { sourceHostId: hostId, sessionHostProtocol: protocol }) =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        { conversationId: "conv", url, opts },
+      );
+    return { ipcMain, registry, navigate };
+  }
+
+  for (const url of ["http://localhost:5173", "http://127.0.0.1:5173", "http://[::1]:5173"]) {
+    it(`allows an enrolled local session to open ${url}`, async () => {
+      const { navigate } = localNavigation();
+      const result = await navigate(url);
+      assert.equal(result.ok, true);
+      assert.equal(result.hostIsThisMachine, true);
+    });
+  }
+  for (const url of [
+    "http://192.168.1.1",
+    "http://169.254.169.254",
+    "http://app.localhost",
+    "http://alias.example",
+    "http://0.0.0.0",
+  ]) {
+    it(`keeps ${url} blocked for a local session`, async () => {
+      const { navigate, registry } = localNavigation();
+      assert.equal((await navigate(url)).ok, false);
+      assert.equal(registry.get("conv"), null);
+    });
+  }
+  for (const scenario of [
+    { name: "remote host", hostId: "remote" },
+    { name: "matching host without a live daemon", live: false },
+    { name: "old bundle without a protocol marker", protocol: null },
+  ]) {
+    it(`denies ${scenario.name} while retaining an existing public view`, async () => {
+      const { navigate, registry, ipcMain } = localNavigation(scenario);
+      assert.equal((await navigate("https://example.com")).ok, true);
+      const entry = registry.get("conv");
+      assert.equal((await navigate("http://localhost:5173")).ok, false);
+      assert.equal(registry.get("conv"), entry);
+      assert.equal(
+        (await ipcMain.invoke("omnigent:browser-screenshot", {}, { conversationId: "conv" })).ok,
+        true,
+      );
+    });
   }
 });
