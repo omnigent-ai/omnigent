@@ -21005,24 +21005,39 @@ describe("a send cut off by a reload", () => {
     });
   });
 
-  it("joins an unanswered send and the queue behind it into one new message", async () => {
+  it("joins an unanswered send and the queue behind it into one new message, keeping reply cards", async () => {
     seedSession("conv_reload", []);
     rememberUnsentSend("conv_reload", {
       stableId: "stable_reload",
       text: "rerun the failing test",
       authorId: "user_a",
     });
+    const reply: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "the lint step" }],
+      text: "run the linter next",
+    };
     rememberQueuedSends("conv_reload", [
-      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+      {
+        stableId: "stable_queued",
+        text: serializeReplyDraft(reply),
+        replyDraft: reply,
+        authorId: "user_a",
+      },
     ]);
 
     await useChatStore.getState().switchTo("conv_reload");
 
-    const restored = "rerun the failing test\n\nrun the linter next";
+    const restored = "rerun the failing test\n\n> the lint step\n\nrun the linter next";
     expect(useChatStore.getState().failedSendDraft).toEqual({
       conversationId: "conv_reload",
       text: restored,
       files: [],
+      replyDraft: {
+        version: 1,
+        quotes: [{ before: "rerun the failing test", text: "the lint step" }],
+        text: "run the linter next",
+      },
       serverRefused: false,
       recovered: true,
     });

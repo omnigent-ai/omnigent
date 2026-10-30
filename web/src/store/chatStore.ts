@@ -177,7 +177,14 @@ import {
   isNativeTerminalSession as isNativeTerminalSessionFn,
   nativeCodingAgentForHarness,
 } from "@/lib/nativeCodingAgents";
-import type { ReplyQuote, StoredReplyDraft } from "@/lib/replyDraft";
+import {
+  appendReplyDraft,
+  restoreReplyDraft,
+  serializeReplyDraft,
+  snapshotReplyDraft,
+  type ReplyQuote,
+  type StoredReplyDraft,
+} from "@/lib/replyDraft";
 import { toast } from "sonner";
 
 export interface SendOptions {
@@ -7502,14 +7509,18 @@ function unsentSendToRestore(
   );
   const [first] = sends;
   if (first === undefined) return null;
+  // Joined as drafts, not text, so each message keeps its reply cards.
+  const joined = sends
+    .map((send) => restoreReplyDraft(send.text, send.replyDraft))
+    .reduce(appendReplyDraft);
+  const replyDraft = snapshotReplyDraft(joined);
   return {
     conversationId,
-    text: sends.map((send) => send.text).join("\n\n"),
+    text: serializeReplyDraft(joined),
     files: [],
     // A resend of one message reuses its id, which the server dedupes; joined text is a new message.
-    ...(sends.length === 1
-      ? { stableId: first.stableId, ...(first.replyDraft ? { replyDraft: first.replyDraft } : {}) }
-      : {}),
+    ...(sends.length === 1 ? { stableId: first.stableId } : {}),
+    ...(replyDraft ? { replyDraft } : {}),
     serverRefused: false,
     recovered: true,
   };
