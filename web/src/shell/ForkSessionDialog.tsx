@@ -1,4 +1,12 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -87,6 +95,17 @@ import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferen
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
+import {
+  attachClone,
+  beginClone,
+  cloneKey,
+  detachClone,
+  finishClone,
+  pendingClone,
+  subscribeClones,
+  type CloneListener,
+  type CloneRequest,
+} from "./cloneRequests";
 import {
   ConnectHostInstructions,
   SANDBOX_REPO_LABEL_KEY,
@@ -704,6 +723,8 @@ function ForkRunConfig({
  * @param upToResponseId - Truncation point for a "fork from here": the
  *   fork copies history only up to and including this response. `null` /
  *   omitted forks the full history.
+ * @param visible - Whether the user can see this form. While hidden, a
+ *   running clone continues and a toast reports it (see `cloneRequests`).
  * @param onClose - Closes the host dialog (Cancel, and after a
  *   successful fork).
  */
@@ -759,6 +780,7 @@ function SupportedForkSessionForm({
   upToResponseId,
   workspaceRecovery = false,
   sandboxOnlyProvider,
+  visible,
   onClose,
 }: {
   sourceSessionId: string;
@@ -770,6 +792,7 @@ function SupportedForkSessionForm({
   workspaceRecovery?: boolean;
   /** The only target offered: a fresh sandbox from this provider. */
   sandboxOnlyProvider?: string;
+  visible: boolean;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
@@ -789,6 +812,33 @@ function SupportedForkSessionForm({
   const [agentChoice, setAgentChoice] = useState<string>(SAME_AS_SOURCE);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // `submitting` covers the directory pre-flight; `request` the clone after it.
+  const requestKey = cloneKey(sourceSessionId, upToResponseId, workspaceRecovery);
+  const request = useSyncExternalStore(subscribeClones, () => pendingClone(requestKey));
+  const busy = submitting || request !== undefined;
+  // Read through a ref so a clone that settles later closes with the latest host callback.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const [listener] = useState<CloneListener>(() => ({
+    onSuccess: (forkId) => {
+      onCloseRef.current();
+      navigate(`/c/${forkId}`);
+    },
+    onError: setError,
+  }));
+  useLayoutEffect(() => {
+    if (!visible || request === undefined) return;
+    attachClone(request, listener);
+    return () => detachClone(request);
+  }, [visible, request, listener]);
+  // Hiding the form cancels a pre-flight for good, even if it's shown again.
+  const preflight = useRef({ cancelled: false });
+  useLayoutEffect(
+    () => () => {
+      preflight.current.cancelled = true;
+    },
+    [visible],
+  );
   // Ready-to-send model/effort/permission overrides from the run-config
   // section. Empty until that section (rendered only for a native target)
   // reports its seeded value.
@@ -1283,6 +1333,9 @@ function SupportedForkSessionForm({
     }
     setSubmitting(true);
     setError(null);
+    const token = { cancelled: false };
+    preflight.current = token;
+    let clone: CloneRequest | undefined;
     try {
       // Pre-flight the directory BEFORE creating anything: the runner
       // launch below is detached and its failure is swallowed, so a
@@ -1307,16 +1360,19 @@ function SupportedForkSessionForm({
             // detached launch below swallows its failure.
             const repoProblem = await checkHostDirectory(selectedHostId, workspaceTrimmed);
             if (repoProblem !== null) {
-              setError(repoProblem);
+              if (!token.cancelled) setError(repoProblem);
               return;
             }
             recreateSourceWorktree = true;
           } else {
-            setError(problem);
+            if (!token.cancelled) setError(problem);
             return;
           }
         }
       }
+      if (token.cancelled) return;
+      clone = beginClone(requestKey, listener, (forkId) => navigate(`/c/${forkId}`));
+      setSubmitting(false);
       const trimmed = title.trim();
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
@@ -1397,11 +1453,12 @@ function SupportedForkSessionForm({
       // it either: it skips the active session, and the navigate below makes
       // the fork active.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      onClose();
-      navigate(`/c/${fork.id}`);
+      finishClone(clone, { forkId: fork.id });
     } catch (e) {
       // forkSession failed — nothing created, so inputs stay editable for a resubmit.
-      setError(e instanceof Error ? e.message : "Couldn't clone the session. Try again.");
+      const message = e instanceof Error ? e.message : "Couldn't clone the session. Try again.";
+      if (clone) finishClone(clone, { error: message });
+      else setError(message);
     } finally {
       setSubmitting(false);
     }
@@ -1524,6 +1581,7 @@ function SupportedForkSessionForm({
                     ? "No hosts connected yet. Connect one from your terminal:"
                     : "No hosts online. Reconnect from your terminal to start the clone:"
                 }
+                onSshConnected={selectHost}
               />
             ) : (
               <>
@@ -1626,7 +1684,15 @@ function SupportedForkSessionForm({
                         ? "Connect a host from your terminal"
                         : "Connect another host from your terminal"}
                     </button>
-                    {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
+                    {showConnect && (
+                      <ConnectHostInstructions
+                        serverUrl={serverUrl}
+                        onSshConnected={(hostId) => {
+                          setShowConnect(false);
+                          selectHost(hostId);
+                        }}
+                      />
+                    )}
                   </>
                 )}
               </>
@@ -1825,7 +1891,7 @@ function SupportedForkSessionForm({
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && !submitting) handleFork();
+                    if (e.key === "Enter" && !busy) handleFork();
                   }}
                   placeholder={namePlaceholder}
                   className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
@@ -1937,14 +2003,20 @@ function SupportedForkSessionForm({
         </p>
       )}
 
+      {request && (
+        <p className="text-sm text-muted-foreground">
+          Large sessions can take a minute. You can close this, and it continues in the background.
+        </p>
+      )}
+
       <DialogFooter>
         <Button variant="ghost" onClick={onClose} disabled={submitting}>
-          Cancel
+          {request ? "Close" : "Cancel"}
         </Button>
         <Button
           data-testid="fork-session-submit"
           onClick={handleFork}
-          loading={submitting}
+          loading={busy}
           // Greyed but clickable: a blocked click points at the missing field.
           aria-disabled={!canSubmit || undefined}
           className="aria-disabled:opacity-50"
@@ -2054,6 +2126,7 @@ export function ForkSessionDialog({
           sourceGitBranch={sourceGitBranch}
           upToResponseId={upToResponseId}
           workspaceRecovery={workspaceRecovery}
+          visible={open}
           onClose={() => onOpenChange(false)}
         />
       </DialogContent>

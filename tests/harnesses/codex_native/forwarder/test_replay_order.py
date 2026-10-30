@@ -21,6 +21,170 @@ from tests.harnesses.codex_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+async def test_shell_reconnect_preserves_a_newer_unresolved_submission(tmp_path: Path) -> None:
+    """Old shell history is mirrored without resolving an uncorrelated newer submission."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            pending_shell_command_id="new_submission",
+        ),
+    )
+    native_client = MagicMock()
+    native_client.is_subscribed_to_thread.return_value = False
+    native_client.request = AsyncMock(
+        return_value={
+            "result": {
+                "thread": {
+                    "id": "thread_1",
+                    "turns": [
+                        {
+                            "id": "turn_shell",
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "id": "shell_1",
+                                    "type": "commandExecution",
+                                    "source": "userShell",
+                                    "command": "echo recovered",
+                                    "status": "completed",
+                                    "aggregatedOutput": "recovered\n",
+                                    "exitCode": 0,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        }
+    )
+    client = _RecordingClient()
+    tracker = fwd._CodexElicitationTaskTracker()
+    try:
+        await fwd._subscribe_until_ready(
+            native_client,
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=tracker,
+        )
+    finally:
+        await tracker.close()
+
+    native_client.request.assert_awaited_once_with("thread/resume", {"threadId": "thread_1"})
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None
+    assert bridge.pending_shell_command_id == "new_submission"
+    assert bridge.active_turn_id is None
+    assert bridge.active_shell_turn_id is None
+    assert any(
+        body["data"].get("item_data", {}).get("stdout") == "recovered\n"
+        for _, body in client.posts
+    )
+
+
+@pytest.mark.parametrize("parent_turn_id", [None, "turn_1"], ids=["standalone", "auxiliary"])
+@pytest.mark.asyncio
+async def test_running_shell_replay_waits_for_actual_output(
+    tmp_path: Path, parent_turn_id: str | None
+) -> None:
+    """A resume snapshot is still running and must not consume its completion ID."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=parent_turn_id,
+            pending_shell_command_id="submission_1",
+            pending_shell_parent_turn_id=parent_turn_id,
+        ),
+    )
+    item = {
+        "type": "commandExecution",
+        "id": "shell_1",
+        "source": "userShell",
+        "command": "/bin/zsh -lc 'printf shell-output'",
+        "status": "inProgress",
+        "aggregatedOutput": None,
+        "exitCode": None,
+    }
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    try:
+        await fwd._replay_resume_response(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            response={
+                "result": {
+                    "thread": {
+                        "id": "thread_1",
+                        "turns": [{"id": "turn_1", "status": "inProgress", "items": [item]}],
+                    }
+                }
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            forwarder_state=state,
+        )
+        terminal_items = [
+            body["data"]["item_data"]
+            for _, body in client.posts
+            if body["type"] == "external_conversation_item"
+        ]
+        assert terminal_items == [{"kind": "input", "input": "printf shell-output"}]
+        bridge = read_bridge_state(tmp_path)
+        assert bridge is not None
+        assert bridge.pending_shell_command_id == "submission_1"
+        assert bridge.active_shell_turn_id is None
+
+        completion = {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "item": {
+                    **item,
+                    "status": "completed",
+                    "aggregatedOutput": "shell-output",
+                    "exitCode": 0,
+                },
+            },
+        }
+        for _ in range(2):
+            await fwd._handle_event(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                event=completion,
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+                forwarder_state=state,
+            )
+    finally:
+        await tracker.close()
+
+    terminal_items = [
+        body["data"]["item_data"]
+        for _, body in client.posts
+        if body["type"] == "external_conversation_item"
+    ]
+    assert terminal_items == [
+        {"kind": "input", "input": "printf shell-output"},
+        {"kind": "output", "stdout": "shell-output", "stderr": None},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_resume_replay_keeps_tool_pair_ahead_of_live_completion() -> None:
     """Replay holds one delivery scope so live items cannot split a tool pair."""
 

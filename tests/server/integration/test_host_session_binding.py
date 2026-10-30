@@ -51,6 +51,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -2241,9 +2242,7 @@ async def test_runner_exited_logs_one_event_per_bound_session(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_crashed")
-    async with asyncio.timeout(5.0):
-        while len(_runner_exited_events(caplog)) < 2:
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: len(_runner_exited_events(caplog)) >= 2)
 
     events = _runner_exited_events(caplog)
     assert sorted(getattr(r, "session_id", None) for r in events) == sorted([parent.id, child.id])
@@ -2263,9 +2262,7 @@ async def test_runner_exited_without_bound_sessions_logs_sessionless_event(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_orphan")
-    async with asyncio.timeout(5.0):
-        while not _runner_exited_events(caplog):
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: _runner_exited_events(caplog))
     # Let any (incorrect) extra rows from the same frame land before counting.
     await asyncio.sleep(0.05)
 
@@ -2301,9 +2298,7 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     def _callback_failures() -> list[logging.LogRecord]:
         return [r for r in caplog.records if "on_runner_exited callback failed" in r.getMessage()]
 
-    async with asyncio.timeout(5.0):
-        while not _callback_failures():
-            await asyncio.sleep(0.01)
+    await poll_until_async(_callback_failures)
 
     events = _runner_exited_events(caplog)
     assert len(events) == 1

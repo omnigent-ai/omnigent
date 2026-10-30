@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 from threading import Barrier
@@ -17,7 +19,9 @@ from filelock import Timeout as FileLockTimeout
 from omnigent.runner import create_runner_app, pr_resource
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from omnigent.runner.slow_io import run_slow_io
 from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
@@ -635,6 +639,51 @@ async def test_runner_serves_a_pr_the_server_vouches_for(
     assert served.json()["pr"]["number"] == 42
     assert default.json()["selected_pr_url"] == A
     assert SessionPrRegistry("fresh").list() == []
+
+
+async def test_pr_panel_reads_answer_while_changed_file_listings_hold_the_slow_pool(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provider CLI reads have their own threads, so stuck ``git status`` can't delay them."""
+    gh_threads: list[str] = []
+
+    def fake_gh(*_args: object, **_kwargs: object) -> tuple[int, str, str]:
+        gh_threads.append(threading.current_thread().name)
+        return 0, '{"number": 42}', ""
+
+    monkeypatch.setattr(github, "_gh", fake_gh)
+    release_git = threading.Event()
+    listings_started = [threading.Event() for _ in range(4)]
+
+    def stuck_listing(started: threading.Event) -> None:
+        started.set()
+        release_git.wait(budget(30))
+
+    listings = [asyncio.create_task(run_slow_io(stuck_listing, e)) for e in listings_started]
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        await poll_until_async(
+            lambda: all(e.is_set() for e in listings_started), timeout_s=budget(5)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            response = await asyncio.wait_for(
+                client.get(
+                    "/v1/sessions/fresh/resources/github",
+                    params={"pr_url": A, "server_tracked": "1"},
+                ),
+                timeout=budget(5),
+            )
+    finally:
+        release_git.set()
+        await asyncio.gather(*listings)
+
+    assert response.status_code == 200, response.text
+    assert gh_threads and all(name.startswith("runner-provider-cli_") for name in gh_threads)
 
 
 @pytest.mark.parametrize("operation", ["github_changes", "github_pr_diff", "github_file_diff"])

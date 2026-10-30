@@ -15,9 +15,12 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by
   another session". `sys_session_list` and `sys_session_get_info` expose
-  `created_by_session_id` so managers can identify their workers across restarts.
+  `created_by_session_id` so managers can identify their workers across restarts;
+  `sys_session_list` with `include_archived` also lists archived workers, each
+  marked `archived`.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
-  creates, even if an enable is also listed. Restart every server replica to
+  creates, even if an enable is also listed, and hides the Automations page's
+  trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
@@ -28,7 +31,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   the sender private restores eligibility.
 - `scheduled`: scheduled runs, their forks and children use the new sends and
   independent creates like any private session their owner owns, so an
-  automation can message the owner's other sessions or start workers.
+  automation can message the owner's other sessions or start workers. The
+  Automations page's Jira/Slack/GitHub trigger templates rely on this: their
+  kept session starts one worker per match (`docs/AUTOMATIONS.md`).
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
@@ -47,6 +52,10 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
+- On Automations, pick the *Jira tickets*, *Slack messages*, or *GitHub issues*
+  chip, fill in the trigger builder, and save: the hourly automation's kept
+  session starts one worker per new match with `sys_session_create`. Covered by
+  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`.
 
 ## Driving it with the repro environment
 
