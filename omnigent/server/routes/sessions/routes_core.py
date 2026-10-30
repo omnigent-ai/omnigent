@@ -4309,17 +4309,18 @@ def register_core_routes(
         # Managed host: schedule the fork's own BACKGROUND sandbox provision
         # and return immediately, exactly like a managed create. The host is
         # registered to the forking caller, so the sandbox resolves THEIR
-        # credentials, never the source owner's. An omitted workspace inherits
+        # credentials, never the source owner's. Omitted workspace fields inherit
         # ALL of the repositories the source recorded (read off the SOURCE,
         # since a fork never inherits the labels itself), so cloning a
         # multi-repo sandbox session lands the fork with every repo.
         try:
             if body.host_type == "managed":
-                fork_workspaces = (
-                    ([body.workspace] if body.workspace is not None else [])
-                    if workspace_set
-                    else read_managed_repo_workspaces(source.labels)
-                )
+                if "workspaces" in fields_set:
+                    fork_workspaces = list(body.workspaces or [])
+                elif workspace_set:
+                    fork_workspaces = [body.workspace] if body.workspace is not None else []
+                else:
+                    fork_workspaces = read_managed_repo_workspaces(source.labels)
                 await _schedule_managed_launch(
                     request,
                     session_id=new_conv.id,

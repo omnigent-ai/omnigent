@@ -2823,11 +2823,17 @@ class SessionForkRequest(BaseModel):
     :param workspace: Git repository URL (optionally ``#<branch>``) the
         server clones into the fork's sandbox as its working directory,
         e.g. ``"https://github.com/org/repo#release-1.2"``. **Omitting**
-        the field inherits the repository the source session recorded, so
-        cloning a sandbox session lands the fork in the same checkout; an
+        both workspace fields inherits all repositories the source session
+        recorded, so cloning a sandbox session preserves its checkouts; an
         explicit value overrides it and an explicit ``null`` gives the
         fork an empty sandbox. Only valid with ``host_type: "managed"`` —
         an external fork's directory is chosen when it binds a host.
+    :param workspaces: Repository URLs (each optionally ``#<branch>``) to
+        clone into the fork's sandbox, replacing the source's repositories.
+        Several repositories require a provider with ``multi_repo`` support.
+        Mutually exclusive with ``workspace``; explicitly sending ``[]`` or
+        ``null`` gives the fork an empty sandbox. Only valid with
+        ``host_type: "managed"``.
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -2841,6 +2847,7 @@ class SessionForkRequest(BaseModel):
     sandbox_provider: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    workspaces: list[str] | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
     # side-chat tab). It may share its parent's runner.
@@ -2854,8 +2861,8 @@ class SessionForkRequest(BaseModel):
         Enforce the per-``host_type`` contract for a fork.
 
         Mirrors :meth:`_SessionCreateRequestBase._check_managed_host_fields`:
-        a managed fork's ``workspace``, when given, must be a git repository
-        URL (optionally ``#<branch>``) the server clones into the sandbox —
+        a managed fork's workspace(s), when given, must be git repository
+        URLs (optionally ``#<branch>``) the server clones into the sandbox —
         a filesystem path points at nothing in a sandbox that doesn't exist
         yet. Both ``sandbox_provider`` and ``workspace`` are meaningless on
         an external fork, which picks its host and directory afterwards.
@@ -2865,8 +2872,8 @@ class SessionForkRequest(BaseModel):
         :returns: The validated instance.
         :raises ValueError: On a managed workspace that isn't a valid
             repository URL, a malformed managed ``host_id``, or
-            ``host_id`` / ``sandbox_provider`` / ``workspace`` without
-            ``host_type: "managed"``.
+            conflicting or oversized workspace selections, or ``host_id`` /
+            ``sandbox_provider`` / workspace(s) without ``host_type: "managed"``.
         """
         # Lazy import: schemas is imported by nearly every module, so
         # pulling the (FastAPI/click-importing) managed-hosts module in
@@ -2878,13 +2885,26 @@ class SessionForkRequest(BaseModel):
                 raise ValueError(
                     "host_type 'managed' takes a host_id of 32 lowercase hex characters"
                 )
-            if self.workspace is not None:
+            if {"workspace", "workspaces"} <= self.model_fields_set:
+                raise ValueError(
+                    "set either 'workspace' (one repository) or 'workspaces' "
+                    "(several) for host_type 'managed', not both"
+                )
+            if self.workspaces is not None and len(self.workspaces) > _MAX_MANAGED_WORKSPACES:
+                raise ValueError(
+                    f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
+                    f"repositories in 'workspaces' (got {len(self.workspaces)})"
+                )
+            workspaces = self.workspaces or (
+                [self.workspace] if self.workspace is not None else []
+            )
+            for workspace in workspaces:
                 try:
-                    parse_repo_workspace(self.workspace)
+                    parse_repo_workspace(workspace)
                 except ValueError as exc:
                     raise ValueError(
                         "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') as workspace: {exc}"
+                        f"(optionally '#<branch>') for each workspace: {exc}"
                     ) from exc
             return self
         if self.host_id is not None:
@@ -2900,6 +2920,11 @@ class SessionForkRequest(BaseModel):
         if self.workspace is not None:
             raise ValueError(
                 "workspace only applies to host_type 'managed' — an external "
+                "fork picks its directory when it binds a host"
+            )
+        if "workspaces" in self.model_fields_set:
+            raise ValueError(
+                "workspaces only applies to host_type 'managed' — an external "
                 "fork picks its directory when it binds a host"
             )
         return self

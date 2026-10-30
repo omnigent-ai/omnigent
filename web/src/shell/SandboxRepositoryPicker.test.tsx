@@ -1,0 +1,172 @@
+import { useState } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
+import type { LastSandboxRepo } from "@/lib/repoPreferences";
+import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
+
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn() }));
+vi.mock("@/lib/githubIntegration", () => ({
+  fetchGithubBranches: vi.fn(),
+  fetchGithubRepos: vi.fn(),
+}));
+
+const REPOSITORIES: GithubRepo[] = ["api", "web"].map((name) => ({
+  full_name: `org/${name}`,
+  clone_url: `https://github.com/org/${name}.git`,
+  default_branch: "main",
+  private: true,
+  pushed_at: null,
+}));
+
+function renderPicker(initialSelections: LastSandboxRepo[] = [], maxRepos = 10) {
+  const onChange = vi.fn();
+  const onPendingUrlChange = vi.fn();
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  function Harness({ limit }: { limit: number }) {
+    const [selections, setSelections] = useState(initialSelections);
+    const [pendingUrl, setPendingUrl] = useState("");
+    return (
+      <QueryClientProvider client={client}>
+        <SandboxRepositoryPicker
+          selections={selections}
+          onChange={(next) => {
+            setSelections(next);
+            onChange(next);
+          }}
+          maxRepos={limit}
+          pendingUrl={pendingUrl}
+          onPendingUrlChange={(url) => {
+            setPendingUrl(url);
+            onPendingUrlChange(url);
+          }}
+          testIdPrefix="sandbox-repo"
+        />
+      </QueryClientProvider>
+    );
+  }
+  const result = render(<Harness limit={maxRepos} />);
+  return {
+    ...result,
+    onChange,
+    onPendingUrlChange,
+    setLimit: (limit: number) => result.rerender(<Harness limit={limit} />),
+  };
+}
+
+describe("SandboxRepositoryPicker", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useServerInfo).mockReturnValue({
+      ...FALLBACK_SERVER_INFO,
+      enabled_connections: ["github"],
+    });
+    vi.mocked(fetchGithubRepos).mockResolvedValue({ connected: true, repos: REPOSITORIES });
+    vi.mocked(fetchGithubBranches).mockResolvedValue({
+      connected: true,
+      branches: ["main", "dev"],
+    });
+  });
+  afterEach(cleanup);
+
+  it("matches pasted clone URLs to GitHub repositories and excludes selected repositories", async () => {
+    const { onChange } = renderPicker([
+      { url: "git@github.com:org/api", branch: "feature/orders" },
+    ]);
+    await screen.findByRole("combobox", { name: "Branch for org/api" });
+    fireEvent.click(screen.getByRole("combobox", { name: "GitHub repository" }));
+    expect(screen.queryByRole("option", { name: /org\/api/ })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: /org\/web/ }));
+    expect(onChange).toHaveBeenLastCalledWith([
+      { url: "git@github.com:org/api", branch: "feature/orders" },
+      { url: "https://github.com/org/web.git", branch: "" },
+    ]);
+    fireEvent.change(screen.getByRole("textbox", { name: "Repository URL" }), {
+      target: { value: "https://github.com/org/api.git/" },
+    });
+    expect(
+      screen.getByText("This repository is already selected. Change its branch above."),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
+  });
+
+  it("allows a custom branch when GitHub cannot list branches and can restore the default", async () => {
+    vi.mocked(fetchGithubBranches).mockRejectedValue(new Error("unavailable"));
+    const { onChange } = renderPicker([{ url: REPOSITORIES[0].clone_url!, branch: "" }]);
+    fireEvent.click(await screen.findByRole("combobox", { name: "Branch for org/api" }));
+    await screen.findByText("Couldn't load branches. Enter a branch name to use it.");
+    fireEvent.change(screen.getByTestId("sandbox-repo-branch-search"), {
+      target: { value: "release/next" },
+    });
+    fireEvent.click(screen.getByRole("option", { name: "Use “release/next”" }));
+    expect(onChange).toHaveBeenLastCalledWith([
+      { url: REPOSITORIES[0].clone_url, branch: "release/next" },
+    ]);
+    fireEvent.click(screen.getByRole("combobox", { name: "Branch for org/api" }));
+    fireEvent.click(screen.getByRole("option", { name: "Default (main)" }));
+    expect(onChange).toHaveBeenLastCalledWith([{ url: REPOSITORIES[0].clone_url, branch: "" }]);
+  });
+
+  it("retains repository branches when switching to a provider with a smaller limit", async () => {
+    const { setLimit, onChange } = renderPicker([
+      { url: "https://git.example.com/org/api", branch: "release" },
+      { url: "https://git.example.com/org/web", branch: "feature/ui" },
+    ]);
+    setLimit(1);
+    expect(screen.getAllByTestId("sandbox-repo-row")).toHaveLength(2);
+    expect(screen.getByRole("alert")).toHaveTextContent("at most 1 repository");
+    expect(screen.getByRole("textbox", { name: "Branch for web" })).toHaveValue("feature/ui");
+    expect(screen.queryByRole("textbox", { name: "Repository URL" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Remove api" }));
+    expect(onChange).toHaveBeenLastCalledWith([
+      { url: "https://git.example.com/org/web", branch: "feature/ui" },
+    ]);
+    expect(screen.queryByRole("alert")).toBeNull();
+    await waitFor(() => expect(fetchGithubRepos).toHaveBeenCalledOnce());
+  });
+
+  it("retains an unfinished URL when the provider limit hides the repository menu", async () => {
+    const { setLimit, onPendingUrlChange } = renderPicker([
+      { url: REPOSITORIES[0].clone_url!, branch: "" },
+    ]);
+    fireEvent.change(screen.getByRole("textbox", { name: "Repository URL" }), {
+      target: { value: "https://git.example.com/org/another" },
+    });
+    setLimit(1);
+    expect(screen.getByRole("textbox", { name: "Repository URL" })).toHaveValue(
+      "https://git.example.com/org/another",
+    );
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
+    fireEvent.change(screen.getByRole("textbox", { name: "Repository URL" }), {
+      target: { value: "" },
+    });
+    expect(onPendingUrlChange).toHaveBeenLastCalledWith("");
+    expect(screen.queryByRole("textbox", { name: "Repository URL" })).toBeNull();
+    await waitFor(() => expect(fetchGithubRepos).toHaveBeenCalledOnce());
+  });
+
+  it("falls back to validated URL entry when GitHub repositories fail to load", async () => {
+    vi.mocked(fetchGithubRepos).mockRejectedValue(new Error("unavailable"));
+    const { onChange, onPendingUrlChange } = renderPicker();
+    await screen.findByText(
+      "Couldn't load your GitHub repositories. Paste a repository URL below.",
+    );
+    const input = screen.getByRole("textbox", { name: "Repository URL" });
+    fireEvent.change(input, { target: { value: "https://user:token@github.com/org/repo" } });
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "https://git.example.com/org/repo" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onPendingUrlChange).toHaveBeenLastCalledWith("");
+    fireEvent.change(within(screen.getByTestId("sandbox-repo-row")).getByRole("textbox"), {
+      target: { value: "release" },
+    });
+    expect(onChange).toHaveBeenLastCalledWith([
+      { url: "https://git.example.com/org/repo", branch: "release" },
+    ]);
+  });
+});

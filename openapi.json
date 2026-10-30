@@ -6840,8 +6840,23 @@
                 "type": "null"
               }
             ],
-            "description": "Git repository URL (optionally `#<branch>`) the server clones into the fork's sandbox as its working directory, e.g. `\"https://github.com/org/repo#release-1.2\"`. **Omitting** the field inherits the repository the source session recorded, so cloning a sandbox session lands the fork in the same checkout; an explicit value overrides it and an explicit `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"` \u2014 an external fork's directory is chosen when it binds a host.",
+            "description": "Git repository URL (optionally `#<branch>`) the server clones into the fork's sandbox as its working directory, e.g. `\"https://github.com/org/repo#release-1.2\"`. **Omitting** both workspace fields inherits all repositories the source session recorded, so cloning a sandbox session preserves its checkouts; an explicit value overrides it and an explicit `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"` \u2014 an external fork's directory is chosen when it binds a host.",
             "title": "Workspace"
+          },
+          "workspaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Repository URLs (each optionally `#<branch>`) to clone into the fork's sandbox, replacing the source's repositories. Several repositories require a provider with `multi_repo` support. Mutually exclusive with `workspace`; explicitly sending `[]` or `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"`.",
+            "title": "Workspaces"
           }
         },
         "title": "SessionForkRequest",
