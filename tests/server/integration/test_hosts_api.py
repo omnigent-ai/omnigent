@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -21,8 +22,11 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
+    HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostProbeAccountsFrame,
+    HostStopRunnerFrame,
+    HostStopRunnerResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -1632,3 +1636,590 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
     assert received == [(_HOST_ID, "runner_x", "exited with code 1")]
     # The callback owns the event; the tunnel must not log a session-less duplicate.
     assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
+
+
+_OLD_HOST_ID = "11111111111111111111111111111111"
+_OLD_RUNNER_ID = "runner_token_oldpane"
+
+
+@dataclass
+class _FrameLog:
+    """Stop and launch frames the fake hosts received, in arrival order."""
+
+    frames: list[tuple[str, HostStopRunnerFrame | HostLaunchRunnerFrame]] = field(
+        default_factory=list
+    )
+
+    @property
+    def events(self) -> list[tuple[str, str]]:
+        """``(host label, "stop" | "launch")`` per frame."""
+        return [
+            (label, "stop" if isinstance(frame, HostStopRunnerFrame) else "launch")
+            for label, frame in self.frames
+        ]
+
+    def launch_frame(self) -> HostLaunchRunnerFrame:
+        """The one launch frame received."""
+        launches = [f for _label, f in self.frames if isinstance(f, HostLaunchRunnerFrame)]
+        assert len(launches) == 1, self.events
+        return launches[0]
+
+
+@dataclass
+class _Switch:
+    """What a ``setup`` hook of :func:`_switch_to_new_host` may adjust."""
+
+    store: SqlAlchemyConversationStore
+    registry: HostRegistry
+    session_id: str
+
+
+async def _serve_frames(
+    comm: ApplicationCommunicator,
+    log: _FrameLog,
+    label: str,
+    *,
+    stop_status: str | None = "stopped",
+    launch_status: str = "launched",
+) -> None:
+    """Answer one fake host's stop and launch frames and log them.
+
+    Assertions on the frames belong in the test body: a failure here would be
+    swallowed when the serving task is cancelled.
+
+    :param comm: The host's connected ASGI communicator.
+    :param log: Shared log of the frames every fake host received.
+    :param label: Name of the host this task serves, e.g. ``"old"``.
+    :param stop_status: Result status for a stop frame; ``None`` leaves it unanswered.
+    :param launch_status: Result status for a launch frame, ``"launched"`` or ``"failed"``.
+    """
+    while True:
+        output = await comm.receive_output(timeout=budget(30.0))
+        if output["type"] != "websocket.send":
+            continue
+        try:
+            frame = decode_host_frame(output["text"])
+        except ValueError:
+            # Keepalive pings interleave with the frames under test.
+            continue
+        reply: object
+        if isinstance(frame, HostStopRunnerFrame):
+            log.frames.append((label, frame))
+            if stop_status is None:
+                continue
+            reply = HostStopRunnerResultFrame(request_id=frame.request_id, status=stop_status)
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            log.frames.append((label, frame))
+            reply = HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status=launch_status,
+                runner_id="runner_token_new" if launch_status == "launched" else None,
+                error=None if launch_status == "launched" else "spawn failed",
+            )
+        else:
+            continue
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(reply)})
+
+
+async def _switch_to_new_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    *,
+    old_host_online: bool,
+    unbound_on_host: str = _OLD_HOST_ID,
+    stop_status: str | None = "stopped",
+    launch_status: str = "launched",
+    session_runner_id: str | None = None,
+    setup: Callable[[_Switch], None] | None = None,
+    launch_extra: dict[str, object] | None = None,
+    expected_status: int = 200,
+) -> tuple[_FrameLog, str, SqlAlchemyConversationStore]:
+    """Unbind a session from the old host, then launch it on the new host.
+
+    Mirrors the web UI's "Switch host": the unbind is replaced by its observable
+    effect (a remembered runner and a session row that keeps its old host), then
+    the launch request runs.
+
+    :param old_host_online: Whether the old host has a live tunnel.
+    :param unbound_on_host: Host id recorded for the remembered runner.
+    :param stop_status: Result the old host sends for the stop frame.
+    :param launch_status: Result the new host sends for the launch frame.
+    :param session_runner_id: Runner the session row is bound to, if any.
+    :param setup: Hook run once the session and record exist.
+    :param launch_extra: Extra launch request fields, e.g. ``{"git": {...}}``.
+    :param expected_status: HTTP status the launch must return.
+    :returns: ``(frame log, session id, conversation store)``.
+    """
+    from omnigent.server.routes._host_launch import remember_unbound_host_runner
+
+    app, registry, _hs, conv_store = host_api_app
+    comms = {"new": await _connect_host(app, registry, _HOST_ID, name="new")}
+    if old_host_online:
+        comms["old"] = await _connect_host(app, registry, _OLD_HOST_ID, name="old")
+    conv = conv_store.create_conversation(agent_id=None, runner_id=session_runner_id)
+    conv_store.set_host_id(conv.id, _OLD_HOST_ID, workspace="/work/repo")
+    remember_unbound_host_runner(conv.id, unbound_on_host, _OLD_RUNNER_ID)
+    if setup is not None:
+        setup(_Switch(conv_store, registry, conv.id))
+
+    log = _FrameLog()
+    servers = [
+        asyncio.create_task(
+            _serve_frames(c, log, label, stop_status=stop_status, launch_status=launch_status)
+        )
+        for label, c in comms.items()
+    ]
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/v1/hosts/{_HOST_ID}/runners",
+                json={"session_id": conv.id, "workspace": "/work/repo", **(launch_extra or {})},
+            )
+        assert resp.status_code == expected_status, resp.text
+    finally:
+        for task in servers:
+            task.cancel()
+        await asyncio.gather(*servers, return_exceptions=True)
+    return log, conv.id, conv_store
+
+
+def _count_admissions(switch: _Switch, calls: list[str]) -> None:
+    """Wrap the launch authorizer so each admission appends to *calls*."""
+    authorize = switch.registry.launch_authorizer
+    assert authorize is not None
+
+    def _recording(*args: object) -> None:
+        calls.append("admit")
+        authorize(*args)
+
+    switch.registry.launch_authorizer = _recording  # type: ignore[assignment]
+
+
+def _fail_admission_from(switch: _Switch, call_number: int) -> None:
+    """Make the launch authorizer refuse from its *call_number*-th call on."""
+    authorize = switch.registry.launch_authorizer
+    assert authorize is not None
+    seen = 0
+
+    def _refusing(*args: object) -> None:
+        nonlocal seen
+        seen += 1
+        if seen >= call_number:
+            raise OmnigentError("host is no longer available", code=ErrorCode.UNAUTHORIZED)
+        authorize(*args)
+
+    switch.registry.launch_authorizer = _refusing  # type: ignore[assignment]
+
+
+async def test_launch_on_other_host_stops_previous_runner_first(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    A cross-host launch stops the session's runner on the previous host, and
+    only then sends the launch frame to the new host.
+
+    If the order flips, two panes resume the same transcript at once. The stop
+    can take seconds, so admission is checked again before the binding.
+    """
+    from omnigent.server.routes._host_launch import get_unbound_host_runner
+
+    admissions: list[str] = []
+    log, session_id, conv_store = await _switch_to_new_host(
+        host_api_app,
+        old_host_online=True,
+        setup=lambda switch: _count_admissions(switch, admissions),
+    )
+
+    assert log.events == [("old", "stop"), ("new", "launch")]
+    stop = log.frames[0][1]
+    assert isinstance(stop, HostStopRunnerFrame)
+    assert stop.runner_id == _OLD_RUNNER_ID
+    assert log.launch_frame().superseded_runner_ids == ()
+    assert len(admissions) == 2, "admission before and after the stop"
+    bound = conv_store.get_conversation(session_id)
+    assert bound is not None
+    assert bound.host_id == _HOST_ID
+    assert get_unbound_host_runner(session_id) is None, "dropped once the stop was sent"
+
+
+async def test_launch_on_other_host_proceeds_when_previous_host_offline(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A previous host with no tunnel cannot be told to stop; the launch still succeeds."""
+    with caplog.at_level("WARNING"):
+        log, _session_id, _store = await _switch_to_new_host(host_api_app, old_host_online=False)
+
+    assert log.events == [("new", "launch")]
+    assert any(
+        "previous host" in r.getMessage() and "not connected" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_launch_on_other_host_proceeds_when_previous_stop_never_acks(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A silent previous host delays the launch by the bounded wait, then the launch goes on."""
+    from omnigent.server.routes import hosts as hosts_routes
+
+    monkeypatch.setattr(hosts_routes, "_PREVIOUS_RUNNER_STOP_WAIT_S", 0.2)
+    with caplog.at_level("WARNING"):
+        log, session_id, store = await _switch_to_new_host(
+            host_api_app, old_host_online=True, stop_status=None
+        )
+
+    assert sorted(log.events) == [("new", "launch"), ("old", "stop")]
+    assert any("did not acknowledge stop" in r.getMessage() for r in caplog.records)
+    bound = store.get_conversation(session_id)
+    assert bound is not None
+    assert bound.host_id == _HOST_ID
+
+
+@pytest.mark.parametrize(
+    "unbound_on_host",
+    [_HOST_ID, f"host_{_HOST_ID}"],
+    ids=["canonical", "legacy-spelling"],
+)
+async def test_launch_on_same_host_supersedes_previous_runner_instead_of_stopping_it(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    unbound_on_host: str,
+) -> None:
+    """
+    A launch on the host the session was on sends no stop frame; it names the old
+    runner in the launch frame so the host stops it once the new one is alive.
+    """
+    from omnigent.server.routes._host_launch import get_unbound_host_runner
+
+    log, session_id, _store = await _switch_to_new_host(
+        host_api_app, old_host_online=False, unbound_on_host=unbound_on_host
+    )
+
+    assert log.events == [("new", "launch")]
+    assert log.launch_frame().superseded_runner_ids == (_OLD_RUNNER_ID,)
+    assert get_unbound_host_runner(session_id) is None, "dropped once the launch succeeded"
+
+
+async def test_same_host_launch_failing_at_the_host_keeps_the_record(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A same-host launch that fails at the host keeps the record for a retry."""
+    from omnigent.server.routes._host_launch import get_unbound_host_runner
+
+    log, session_id, store = await _switch_to_new_host(
+        host_api_app,
+        old_host_online=False,
+        unbound_on_host=_HOST_ID,
+        launch_status="failed",
+        expected_status=502,
+    )
+
+    assert log.launch_frame().superseded_runner_ids == (_OLD_RUNNER_ID,)
+    assert get_unbound_host_runner(session_id) == (_HOST_ID, _OLD_RUNNER_ID)
+    after = store.get_conversation(session_id)
+    assert after is not None
+    assert after.runner_id is None
+
+
+@pytest.mark.parametrize("same_host", [False, True], ids=["cross-host", "same-host"])
+async def test_launch_does_not_stop_runner_now_serving_another_session(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    same_host: bool,
+) -> None:
+    """A runner that /clear moved to a new session is neither stopped nor superseded."""
+
+    def _hand_runner_to_new_session(switch: _Switch) -> None:
+        switch.store.create_conversation(agent_id=None, runner_id=_OLD_RUNNER_ID)
+
+    log, _session_id, _store = await _switch_to_new_host(
+        host_api_app,
+        old_host_online=not same_host,
+        unbound_on_host=_HOST_ID if same_host else _OLD_HOST_ID,
+        setup=_hand_runner_to_new_session,
+    )
+
+    assert log.events == [("new", "launch")]
+    assert log.launch_frame().superseded_runner_ids == ()
+
+
+async def test_launch_never_stops_a_runner_bound_back_to_the_session(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A remembered runner that is bound to the session again is live; keep it."""
+    log, session_id, store = await _switch_to_new_host(
+        host_api_app,
+        old_host_online=True,
+        session_runner_id=_OLD_RUNNER_ID,
+        expected_status=400,
+    )
+
+    assert log.frames == []
+    bound = store.get_conversation(session_id)
+    assert bound is not None
+    assert bound.runner_id == _OLD_RUNNER_ID
+
+
+def _share_runner_with_sub_agent(
+    parent_of_child: str | None,
+) -> Callable[[_Switch], None]:
+    """Hook adding a sub-agent bound to the old runner.
+
+    :param parent_of_child: ``None`` for a child of the switching session, ``"other"``
+        for a child of an unrelated top-level session.
+    """
+
+    def _setup(switch: _Switch) -> None:
+        parent_id = switch.session_id
+        if parent_of_child == "other":
+            parent_id = switch.store.create_conversation(agent_id=None).id
+        switch.store.create_conversation(
+            agent_id=None,
+            runner_id=_OLD_RUNNER_ID,
+            kind="sub_agent",
+            parent_conversation_id=parent_id,
+        )
+
+    return _setup
+
+
+async def test_launch_on_other_host_stops_runner_shared_with_own_sub_agent(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A sub-agent of the session shares its runner and never signals a move."""
+    log, _session_id, _store = await _switch_to_new_host(
+        host_api_app, old_host_online=True, setup=_share_runner_with_sub_agent(None)
+    )
+
+    assert log.events == [("old", "stop"), ("new", "launch")]
+
+
+async def test_launch_keeps_runner_shared_with_another_trees_sub_agent(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A sub-agent of an unrelated session on that runner means the runner is not ours."""
+    log, _session_id, _store = await _switch_to_new_host(
+        host_api_app, old_host_online=True, setup=_share_runner_with_sub_agent("other")
+    )
+
+    assert log.events == [("new", "launch")]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_events"),
+    [
+        ("this-session", [("old", "stop"), ("new", "launch")]),
+        ("another-session", [("new", "launch")]),
+    ],
+)
+async def test_launch_stops_runner_shared_only_with_its_own_side_chats(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    source: str,
+    expected_events: list[tuple[str, str]],
+) -> None:
+    """
+    A side chat is a top-level row that shares its source's runner. One forked
+    from the switching session moves with it; one forked from another session
+    keeps the runner in use.
+    """
+    from omnigent.stores.conversation_store import (
+        SIDE_CHAT_LABEL_KEY,
+        SIDE_CHAT_SOURCE_LABEL_KEY,
+    )
+
+    def _add_side_chat(switch: _Switch) -> None:
+        source_id = (
+            switch.session_id
+            if source == "this-session"
+            else switch.store.create_conversation(agent_id=None).id
+        )
+        switch.store.create_conversation(
+            agent_id=None,
+            runner_id=_OLD_RUNNER_ID,
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source_id},
+        )
+
+    log, _session_id, _store = await _switch_to_new_host(
+        host_api_app, old_host_online=True, setup=_add_side_chat
+    )
+
+    assert log.events == expected_events
+
+
+async def test_launch_proceeds_when_previous_host_reports_stop_failed(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """An old host answering "failed" (unknown runner: already gone) does not block the launch."""
+    log, session_id, store = await _switch_to_new_host(
+        host_api_app, old_host_online=True, stop_status="failed"
+    )
+
+    assert log.events == [("old", "stop"), ("new", "launch")]
+    bound = store.get_conversation(session_id)
+    assert bound is not None
+    assert bound.host_id == _HOST_ID
+
+
+async def test_launch_proceeds_when_previous_runner_lookup_fails(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A store error while checking the old runner is logged and never blocks the launch."""
+
+    def _break_lookup(switch: _Switch) -> None:
+        def _boom(runner_id: str) -> list[object]:
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(switch.store, "list_conversations_by_runner_id", _boom)
+
+    with caplog.at_level("WARNING"):
+        log, _session_id, _store = await _switch_to_new_host(
+            host_api_app, old_host_online=True, setup=_break_lookup
+        )
+
+    assert log.events == [("new", "launch")]
+    assert any("launching anyway" in r.getMessage() for r in caplog.records)
+
+
+async def test_refused_admission_sends_no_stop_and_keeps_the_record(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Admission is checked before the stop: a refused launch leaves the old pane alone."""
+    from omnigent.server.routes._host_launch import get_unbound_host_runner
+
+    log, session_id, _store = await _switch_to_new_host(
+        host_api_app,
+        old_host_online=True,
+        setup=lambda switch: _fail_admission_from(switch, 1),
+        expected_status=401,
+    )
+
+    assert log.frames == []
+    assert get_unbound_host_runner(session_id) == (_OLD_HOST_ID, _OLD_RUNNER_ID)
+
+
+async def test_refused_request_check_sends_no_stop_and_keeps_the_record(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A launch rejected for its request (invalid branch name) leaves the old pane alone."""
+    from omnigent.server.routes._host_launch import get_unbound_host_runner
+
+    log, session_id, _store = await _switch_to_new_host(
+        host_api_app,
+        old_host_online=True,
+        launch_extra={"git": {"branch_name": "not..valid"}},
+        expected_status=400,
+    )
+
+    assert log.frames == []
+    assert get_unbound_host_runner(session_id) == (_OLD_HOST_ID, _OLD_RUNNER_ID)
+
+
+async def test_admission_refused_after_the_stop_leaves_session_unbound(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """If the second admission refuses, the old runner is already stopped and nothing is bound."""
+    from omnigent.server.routes._host_launch import get_unbound_host_runner
+
+    log, session_id, store = await _switch_to_new_host(
+        host_api_app,
+        old_host_online=True,
+        setup=lambda switch: _fail_admission_from(switch, 2),
+        expected_status=401,
+    )
+
+    assert log.events == [("old", "stop")]
+    after = store.get_conversation(session_id)
+    assert after is not None
+    assert after.runner_id is None
+    assert get_unbound_host_runner(session_id) is None, "the stop was sent"
+
+
+async def test_cancelled_launch_during_previous_stop_leaves_session_unbound(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Cancelling the request while it waits for the old host's ack must not leave
+    a binding to a runner whose launch frame was never sent.
+    """
+    from omnigent.server.routes._host_launch import remember_unbound_host_runner
+
+    app, registry, _hs, conv_store = host_api_app
+    new_comm = await _connect_host(app, registry, _HOST_ID, name="new")
+    old_comm = await _connect_host(app, registry, _OLD_HOST_ID, name="old")
+    conv = conv_store.create_conversation(agent_id=None)
+    conv_store.set_host_id(conv.id, _OLD_HOST_ID, workspace="/work/repo")
+    remember_unbound_host_runner(conv.id, _OLD_HOST_ID, _OLD_RUNNER_ID)
+
+    log = _FrameLog()
+    servers = [
+        asyncio.create_task(_serve_frames(new_comm, log, "new")),
+        asyncio.create_task(_serve_frames(old_comm, log, "old", stop_status=None)),
+    ]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        request = asyncio.create_task(
+            client.post(
+                f"/v1/hosts/{_HOST_ID}/runners",
+                json={"session_id": conv.id, "workspace": "/work/repo"},
+            )
+        )
+        async with asyncio.timeout(budget(5.0)):
+            while ("old", "stop") not in log.events:
+                await asyncio.sleep(0.01)
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+    for task in servers:
+        task.cancel()
+    await asyncio.gather(*servers, return_exceptions=True)
+
+    after = conv_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.runner_id is None
+    assert after.host_id == _OLD_HOST_ID
+    assert ("new", "launch") not in log.events
+
+
+async def test_expired_previous_runner_record_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A record older than the TTL belongs to an abandoned switch and is dropped."""
+    import cachetools
+
+    from omnigent.db.workspace_cache import WorkspaceScopedCache
+    from omnigent.server.routes import _host_launch
+
+    now = [0.0]
+    monkeypatch.setattr(
+        _host_launch,
+        "_unbound_host_runners",
+        WorkspaceScopedCache(
+            lambda: cachetools.TTLCache(
+                maxsize=8, ttl=_host_launch._UNBOUND_HOST_RUNNER_TTL_S, timer=lambda: now[0]
+            )
+        ),
+    )
+
+    _host_launch.remember_unbound_host_runner("conv_fresh", _OLD_HOST_ID, _OLD_RUNNER_ID)
+    _host_launch.remember_unbound_host_runner("conv_stale", _OLD_HOST_ID, _OLD_RUNNER_ID)
+    now[0] = _host_launch._UNBOUND_HOST_RUNNER_TTL_S - 1
+    assert _host_launch.get_unbound_host_runner("conv_fresh") == (_OLD_HOST_ID, _OLD_RUNNER_ID)
+    assert _host_launch.get_unbound_host_runner("conv_fresh") is not None, "reading keeps it"
+    _host_launch.forget_unbound_host_runner("conv_fresh", (_OLD_HOST_ID, _OLD_RUNNER_ID))
+    assert _host_launch.get_unbound_host_runner("conv_fresh") is None
+    now[0] = _host_launch._UNBOUND_HOST_RUNNER_TTL_S + 1
+    assert _host_launch.get_unbound_host_runner("conv_stale") is None
+
+
+async def test_forgetting_a_handled_record_keeps_a_newer_one() -> None:
+    """A launch that finishes late must not drop the record of a newer switch."""
+    from omnigent.server.routes import _host_launch
+
+    handled = (_OLD_HOST_ID, _OLD_RUNNER_ID)
+    newer = (_HOST_ID, "runner_token_newer")
+    _host_launch.remember_unbound_host_runner("conv_newer", *newer)
+    try:
+        _host_launch.forget_unbound_host_runner("conv_newer", handled)
+        assert _host_launch.get_unbound_host_runner("conv_newer") == newer
+    finally:
+        _host_launch.forget_unbound_host_runner("conv_newer", newer)

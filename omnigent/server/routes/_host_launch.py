@@ -23,8 +23,10 @@ import logging
 import os
 from dataclasses import dataclass
 
+import cachetools
 from fastapi import HTTPException
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
@@ -54,6 +56,56 @@ _MIN_LAUNCH_TIMEOUT_S = 1.0
 # Ceiling for the override: a launch that never answers must still fail, or
 # the create request and its pending launch hang for the process lifetime.
 _MAX_LAUNCH_TIMEOUT_S = 3600.0
+
+# Host runner a ``PATCH runner_id=""`` just unbound, by session, as
+# ``(host_id, runner_id)``. Per replica and best-effort; entries expire so an
+# abandoned switch leaves nothing behind.
+_UNBOUND_HOST_RUNNER_TTL_S = 300.0
+_UNBOUND_HOST_RUNNERS_MAX = 512
+_unbound_host_runners: WorkspaceScopedCache[str, tuple[str, str]] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=_UNBOUND_HOST_RUNNERS_MAX, ttl=_UNBOUND_HOST_RUNNER_TTL_S)
+)
+
+
+def remember_unbound_host_runner(session_id: str, host_id: str, runner_id: str) -> None:
+    """
+    Remember the host runner a session was just unbound from.
+
+    :param session_id: Session that was unbound, e.g. ``"conv_abc123"``.
+    :param host_id: Host the session was on, e.g. ``"host_a1b2c3d4..."``.
+    :param runner_id: Runner the session was bound to, e.g. ``"runner_token_..."``.
+    """
+    _unbound_host_runners[session_id] = (host_id, runner_id)
+
+
+def get_unbound_host_runner(session_id: str) -> tuple[str, str] | None:
+    """
+    Return the runner stored by :func:`remember_unbound_host_runner`, if any.
+
+    The unbind clears the session row's only record of its host runner, so a
+    launch on a "Switch host" target reads it from here. Reading does not
+    consume it: the caller calls :func:`forget_unbound_host_runner` once the
+    runner is stopped or superseded.
+
+    :param session_id: Session being launched, e.g. ``"conv_abc123"``.
+    :returns: ``(host_id, runner_id)`` of the runner the session was last
+        unbound from, or ``None`` when none was remembered or it expired.
+    """
+    return _unbound_host_runners.get(session_id)
+
+
+def forget_unbound_host_runner(session_id: str, record: tuple[str, str]) -> None:
+    """
+    Drop the runner stored for *session_id*, once it has been handled.
+
+    Only the record the caller read is dropped: a newer one stored since (a new
+    switch of the same session) stays.
+
+    :param session_id: Session whose record to drop, e.g. ``"conv_abc123"``.
+    :param record: The ``(host_id, runner_id)`` pair that was read and handled.
+    """
+    if _unbound_host_runners.get(session_id) == record:
+        del _unbound_host_runners[session_id]
 
 
 @functools.cache

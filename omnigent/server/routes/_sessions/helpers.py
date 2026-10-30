@@ -7561,6 +7561,7 @@ async def _stop_session_host_runner(
     *,
     expect_already_stopped: bool = False,
     attempt: _HostRunnerStopAttempt | None = None,
+    ack_timeout_s: float | None = None,
 ) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
@@ -7603,6 +7604,10 @@ async def _stop_session_host_runner(
         runner (the relaunch belt: see
         :func:`_spawn_superseded_runner_stop`). Delivery failures still warn.
     :param attempt: Optional caller-owned progress record that survives cancellation.
+    :param ack_timeout_s: How long to wait for the host's acknowledgement;
+        ``None`` uses ``_STOP_RUNNER_RESULT_TIMEOUT_S``. The host acks after
+        terminating the runner (SIGTERM, then SIGKILL), so a caller that must see
+        the runner gone can allow longer.
     :returns: ``True`` after a successful acknowledgement; ``False`` for an
         unavailable host, rejected send, timeout, or host-reported failure.
         A dispatched stop can still finish after a timeout or cancellation;
@@ -7647,7 +7652,7 @@ async def _stop_session_host_runner(
         try:
             result = await asyncio.wait_for(
                 future,
-                timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
+                timeout=_STOP_RUNNER_RESULT_TIMEOUT_S if ack_timeout_s is None else ack_timeout_s,
             )
         except TimeoutError:
             _logger.warning(
