@@ -5364,10 +5364,8 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
 def test_run_turn_cli_config_passes_no_model_to_thread_create(
     model: str | None, model_provider_override: str
 ):
-    """A pinned provider passes model=None to thread/start when the model is
-    the codex config's to choose: a cli-config provider never receives an alias it
-    cannot resolve (e.g. gpt-5.6), and a subscription without a selected model keeps
-    the config.toml default."""
+    """A pinned provider sends no model when config.toml should choose: a cli-config
+    alias it cannot resolve (e.g. gpt-5.6), or a subscription with no selected model."""
 
     async def _t():
         fake_session = _FakeAppSession([[TurnComplete(response="done")]])
