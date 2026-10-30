@@ -13183,13 +13183,14 @@ def _resolve_server_url(server: str) -> ServerUrl:
 
         if org_id is not None:
             resolved = ServerUrl(api_base=api_base, org_id=org_id)
-            if resolved.is_workspace_hosted:
-                from omnigent.cli_auth import pin_databricks_org_id
-
-                # Route this command and its children without saving an unverified selector.
-                pin_databricks_org_id(resolved.api_base, org_id)
         else:
             resolved = ServerUrl.from_api_base(api_base)
+        if resolved.is_workspace_hosted and resolved.org_id is not None:
+            from omnigent.cli_auth import pin_databricks_org_id
+
+            # Freeze explicit and saved selectors before concurrent startup can
+            # observe another CLI's login, without saving unverified routing.
+            pin_databricks_org_id(resolved.api_base, resolved.org_id)
         # Every remote CLI command resolves its server here, so this attributes
         # the CLI's own debug-log rows.
         publish_origin_identity(resolved.api_base)

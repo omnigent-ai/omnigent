@@ -4371,6 +4371,11 @@ def test_workspace_startup_orders_discovery_and_preserves_host_binding(
         return httpx.Response(200, headers=headers)
 
     def start_host(server_url: str) -> bool:
+        if selector_source in {"stored", "explicit"}:
+            assert probe_started.wait(10)
+            # Another CLI can change the shared login while this launch's
+            # authentication is still verifying the original workspace.
+            cli_auth.store_databricks_org_id(_ACCOUNT_SERVER, "222")
         host_env.update(cli._build_host_daemon_env(server_url=server_url))
         host_started.set()
         return False
@@ -4395,5 +4400,7 @@ def test_workspace_startup_orders_discovery_and_preserves_host_binding(
     pin = host_env[cli_auth.PINNED_DATABRICKS_ORG_ENV_VAR]
     assert pin == cli_auth.databricks_org_pin(_ACCOUNT_SERVER, selected_org)
     cli_auth.store_databricks_org_id(_ACCOUNT_SERVER, "222")
+    if selector_source in {"stored", "explicit"}:
+        assert cli_auth.load_databricks_org_id(_ACCOUNT_SERVER) == selected_org
     monkeypatch.setenv(cli_auth.PINNED_DATABRICKS_ORG_ENV_VAR, pin)
     assert cli_auth.load_databricks_org_id(_ACCOUNT_SERVER) == selected_org
