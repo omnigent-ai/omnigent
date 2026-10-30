@@ -114,7 +114,7 @@ export function HarnessMenuRowContent({
           data-harness-edit=""
           onPointerDown={onEditPointerDown}
           className={cn(
-            "composer-agent-edit flex h-8 shrink-0 cursor-pointer items-center rounded-none px-0 py-0 text-xs leading-4 text-muted-foreground underline-offset-2 hover:underline focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
+            "composer-agent-edit mobile-touch-target mobile-app:justify-center flex h-8 shrink-0 cursor-pointer items-center rounded-none px-0 py-0 text-xs leading-4 text-muted-foreground underline-offset-2 hover:underline focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
             summaryVisibility,
             isMobile && "opacity-100",
           )}

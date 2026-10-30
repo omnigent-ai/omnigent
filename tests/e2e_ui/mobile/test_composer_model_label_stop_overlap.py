@@ -48,6 +48,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import pytest
 from playwright.async_api import Page as AsyncPage
 from playwright.async_api import async_playwright
 from playwright.async_api import expect as async_expect
@@ -416,13 +417,17 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         reset_mock_llm(mock_llm_server_url)
 
 
+@pytest.mark.parametrize("native_kind", [None, "ios", "android"])
 def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
     page: Page,
     seeded_session: tuple[str, str],
+    native_kind: str | None,
 ) -> None:
     """Keep Goal and Plan reachable in the shared Add menu at both widths, with
     no row text cut off and only the side-chat description hidden on a phone."""
     base_url, session_id = seeded_session
+    if native_kind:
+        page.add_init_script(f"window.omnigentNative = {{kind: {json.dumps(native_kind)}}};")
     page.set_viewport_size(_IPHONE_VIEWPORT)
     _patch_session_as_databricks_codex_native(page, session_id)
     try:
@@ -441,9 +446,19 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
                 action = page.get_by_test_id(action_id)
                 expect(action).to_be_visible()
                 expect(action).to_be_enabled()
+                action.scroll_into_view_if_needed()
                 bounds = _box(action)
                 assert bounds["x"] >= 0
                 assert bounds["x"] + bounds["width"] <= viewport["width"]
+                if native_kind:
+                    assert bounds["width"] >= 44
+                    assert bounds["height"] >= 44, f"{action_id} is only {bounds['height']}px tall"
+                    assert action.evaluate("""element => {
+                        const box = element.getBoundingClientRect();
+                        return [box.left + 2, box.left + box.width / 2, box.right - 2]
+                          .every(x => element.contains(
+                            document.elementFromPoint(x, box.top + box.height / 2)));
+                    }""")
             menu = page.get_by_test_id("composer-add-menu")
             shown = _menu_row_texts_shown(menu.evaluate(_MENU_ROW_TEXT_JS))
             assert {

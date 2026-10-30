@@ -486,6 +486,11 @@
   min-height: 28px;
 }
 
+/* Density rules above are unlayered, so opted-in app targets need the same cascade priority. */
+:is(.composer-add-menu, .composer-host-menu, .composer-agent-menu) .mobile-touch-target {
+  @apply mobile-touch-target;
+}
+
 .composer-agent-menu [role="menuitem"] > svg:last-child {
   margin-left: 0;
 }

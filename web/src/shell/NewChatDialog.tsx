@@ -1646,7 +1646,7 @@ export function AgentHarnessPicker({
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
       onSelect={onCreateCustomAgent}
-      className="text-muted-foreground"
+      className="mobile-touch-target text-muted-foreground"
     >
       <PlusIcon className="size-3.5" />
       Create custom agent
@@ -1664,7 +1664,7 @@ export function AgentHarnessPicker({
           data-testid="new-chat-landing-agent-pending"
           data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
           onSelect={onSelectPending}
-          className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+          className="mobile-touch-target items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
         >
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{pendingAgent.name}</span>
@@ -1817,7 +1817,7 @@ export function AgentHarnessPicker({
               e.preventDefault();
               setMenuPage(null);
             }}
-            className="items-center font-medium"
+            className="mobile-touch-target items-center font-medium"
           >
             <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
             <span className="truncate">Other...</span>
@@ -1834,7 +1834,7 @@ export function AgentHarnessPicker({
               e.preventDefault();
               setMenuPage(null);
             }}
-            className="items-center font-medium"
+            className="mobile-touch-target items-center font-medium"
           >
             <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
             <span className="truncate">Other</span>
@@ -1887,7 +1887,7 @@ export function AgentHarnessPicker({
                   onSelectAutoHarness?.();
                   setOpen(false);
                 }}
-                className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+                className="mobile-touch-target group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
                 <WandSparklesIcon className="size-4" aria-hidden="true" />
                 <span
@@ -1919,7 +1919,7 @@ export function AgentHarnessPicker({
                       onPrefetchEntries?.(moreHarnessEntries.map((agent) => agent.id));
                       setMenuPage("more");
                     }}
-                    className="items-center"
+                    className="mobile-touch-target items-center"
                   >
                     <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1933,7 +1933,7 @@ export function AgentHarnessPicker({
                   >
                     <DropdownMenuSubTrigger
                       data-testid="new-chat-landing-harness-more"
-                      className="cursor-pointer items-center"
+                      className="mobile-touch-target cursor-pointer items-center"
                       onPointerLeave={(event) => {
                         const target = event.relatedTarget;
                         if (
@@ -1982,7 +1982,7 @@ export function AgentHarnessPicker({
                   e.preventDefault();
                   setMenuPage("custom");
                 }}
-                className="items-center"
+                className="mobile-touch-target items-center"
               >
                 <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1992,7 +1992,7 @@ export function AgentHarnessPicker({
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger
                   data-testid="new-chat-landing-custom-agents"
-                  className="cursor-pointer items-center"
+                  className="mobile-touch-target cursor-pointer items-center"
                 >
                   <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 </DropdownMenuSubTrigger>
@@ -6303,7 +6303,7 @@ export function NewChatLandingScreen() {
         }
         data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
         title={`${host.name} — ${host.status}`}
-        className={reconnect ? "group" : undefined}
+        className={cn("mobile-touch-target", reconnect ? "group" : undefined)}
       >
         <HostOption
           host={host}
@@ -6429,7 +6429,7 @@ export function NewChatLandingScreen() {
           {sandboxSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
-              className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
+              className="px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
               trailingContent={mcpRegistryPicker}
             >
@@ -6445,7 +6445,7 @@ export function NewChatLandingScreen() {
                     aria-label={`Sandbox repositories: ${
                       sandboxRepoSelections.length > 0 ? sandboxRepoLabel : "None selected"
                     }`}
-                    className="relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:min-w-11"
+                    className="relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:min-w-11"
                     data-testid="new-chat-landing-repo-chip"
                   >
                     <GitBranchIcon className="ui-icon" />
@@ -6464,7 +6464,7 @@ export function NewChatLandingScreen() {
                 <PopoverContent
                   ref={sandboxRepoPopoverRef}
                   align="start"
-                  className="w-96 p-3"
+                  className="w-96 mobile-app:max-w-[calc(100vw-1rem)] p-3"
                   onOpenAutoFocus={(event) => {
                     if (focusSandboxRepositoryIssue()) event.preventDefault();
                   }}
@@ -6524,7 +6524,7 @@ export function NewChatLandingScreen() {
           {!sandboxSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
-              className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
+              className="px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
               trailingContent={mcpRegistryPicker}
             >
@@ -7043,7 +7043,7 @@ export function NewChatLandingScreen() {
                                     ? "true"
                                     : undefined
                                 }
-                                className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                                className="mobile-touch-target text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
                               >
                                 <span className="flex items-center gap-1">
                                   <span className="flex size-4 shrink-0 items-center justify-center">
@@ -7057,7 +7057,7 @@ export function NewChatLandingScreen() {
                             <DropdownMenuItem
                               aria-disabled="true"
                               onSelect={(e) => e.preventDefault()}
-                              className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
+                              className="mobile-touch-target flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
                               data-testid="new-chat-landing-sandbox-option-disabled"
                             >
                               <span className="flex items-center gap-1">
@@ -7089,6 +7089,7 @@ export function NewChatLandingScreen() {
                         {cloudHosts.map(renderHostMenuItem)}
                         {showArcaOption && (
                           <DropdownMenuItem
+                            className="mobile-touch-target"
                             onSelect={() => {
                               pendingArcaConnectRef.current = true;
                             }}
@@ -7122,7 +7123,7 @@ export function NewChatLandingScreen() {
                             }}
                             disabled={connectingThisMachine}
                             data-testid="new-chat-landing-run-on-this-machine"
-                            className="group gap-1 text-sm"
+                            className="mobile-touch-target group gap-1 text-sm"
                           >
                             <span className="flex size-4 shrink-0 items-center justify-center">
                               <span
@@ -7150,7 +7151,7 @@ export function NewChatLandingScreen() {
                                 event.preventDefault();
                                 setOfflineHostLimit((limit) => (limit > 0 ? 0 : 5));
                               }}
-                              className="text-muted-foreground"
+                              className="mobile-touch-target text-muted-foreground"
                             >
                               {offlineHostLimit > 0 ? (
                                 <ChevronDownIcon className="size-4" />
@@ -7176,7 +7177,7 @@ export function NewChatLandingScreen() {
                                       event.preventDefault();
                                       setOfflineHostLimit((limit) => limit + 5);
                                     }}
-                                    className="text-muted-foreground"
+                                    className="mobile-touch-target text-muted-foreground"
                                   >
                                     Show more ({otherOfflineHosts.length - offlineHostLimit}{" "}
                                     remaining)
@@ -7193,7 +7194,7 @@ export function NewChatLandingScreen() {
                         <DropdownMenuItem
                           onSelect={() => setConnectOpen(true)}
                           data-testid="new-chat-landing-connect-host"
-                          className="composer-host-connect text-muted-foreground"
+                          className="mobile-touch-target composer-host-connect text-muted-foreground"
                         >
                           <PlusIcon className="size-4" />
                           Connect new host
@@ -7608,6 +7609,7 @@ export function NewChatLandingScreen() {
           <div className="mt-5 flex flex-col items-center gap-2">
             <Button
               variant="outline"
+              className="mobile-touch-target mobile-app:h-auto"
               onClick={() => navigate("/settings/import")}
               data-testid="landing-import-sessions"
             >

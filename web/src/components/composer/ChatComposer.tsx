@@ -171,9 +171,12 @@ function useCollapsedComposerLabels(
       // Not laid out yet (hidden, or jsdom): keep the current verdict.
       if (!(available > 0)) return;
       delete row.dataset.labels;
+      const previousWrap = leading.style.flexWrap;
+      leading.style.flexWrap = "nowrap";
       const gap = Math.max(parseFloat(style.columnGap) || 0, COMPOSER_LABELS_MIN_GAP_PX);
       if (leading.scrollWidth + trailing.scrollWidth + gap > available)
         row.dataset.labels = "collapsed";
+      leading.style.flexWrap = previousWrap;
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
@@ -412,7 +415,7 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
       <div
         ref={ref}
         className={cn(
-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 pt-1 pb-2",
+          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap mobile-app:flex-wrap items-center justify-between gap-2 pt-1 pb-2",
           COMPOSER_CONTENT_INSET_CLASS,
           className,
         )}
@@ -430,8 +433,10 @@ export const ComposerActionGroup = forwardRef<
     <div
       ref={ref}
       className={cn(
-        "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-none overflow-visible" : "ml-auto max-w-full shrink-0",
+        "flex min-w-0 items-center gap-1 mobile-app:max-w-full",
+        side === "left"
+          ? "flex-none overflow-visible mobile-app:flex-wrap mobile-app:shrink"
+          : "ml-auto max-w-full shrink-0",
         className,
       )}
       {...props}
@@ -457,7 +462,7 @@ export const ComposerSendButton = forwardRef<
       size="icon"
       variant={interrupt ? "destructive" : "default"}
       className={cn(
-        "size-8 shrink-0 rounded-lg transition-opacity md:size-7",
+        "size-8 mobile-touch-target shrink-0 rounded-lg transition-opacity md:size-7",
         !interrupt &&
           "hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
         className,

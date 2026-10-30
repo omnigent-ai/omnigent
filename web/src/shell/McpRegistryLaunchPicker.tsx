@@ -44,7 +44,7 @@ export function McpRegistryLaunchPicker({
           }
           aria-label={`MCP services: ${selectedCount} selected${needsSignInCount ? `, ${needsSignInCount} needs sign-in` : ""}`}
           data-testid="new-chat-landing-mcp-registry-chip"
-          className="relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-0.5 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11 md:px-1"
+          className="relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-0.5 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11 md:px-1"
         >
           <PlugIcon
             className={cn(
