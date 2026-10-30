@@ -87,7 +87,12 @@ async def test_a_sandboxed_shell_runs_a_bundle_skills_script() -> None:
             os_env=OSEnvSpec(
                 type="caller_process",
                 cwd=str(workspace),
-                sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."]),
+                sandbox=OSEnvSandboxSpec(
+                    type="linux_bwrap",
+                    write_paths=["."],
+                    # An editable install keeps omnigent outside the venv; the helper imports it.
+                    read_paths=[str(Path(__file__).resolve().parents[2])],
+                ),
             ),
             skills=[skill],
         )
