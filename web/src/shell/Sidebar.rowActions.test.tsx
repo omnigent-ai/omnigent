@@ -331,12 +331,16 @@ const SWIPE_ACTION_NAMES: Record<SwipeAction, string> = {
 // its menu, then unmount so the sidebar renders against the preference just written.
 async function chooseSwipeActionInSettings(direction: SwipeDirection, action: SwipeAction) {
   const user = userEvent.setup();
+  // Settings' picker-visibility card reads the agent catalog through react-query.
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <TooltipProvider>
-      <MemoryRouter initialEntries={["/settings/appearance"]}>
-        <SettingsPage />
-      </MemoryRouter>
-    </TooltipProvider>,
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={["/settings/appearance"]}>
+          <SettingsPage />
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
   await user.click(screen.getByTestId(`swipe-action-${direction}`));
   await user.click(screen.getByRole("menuitemradio", { name: SWIPE_ACTION_NAMES[action] }));
@@ -503,7 +507,7 @@ describe("quick pin/unpin hover button", () => {
       "fine-hover:md:pointer-events-none",
       "fine-hover:md:group-hover:pointer-events-auto",
       "fine-hover:md:group-has-[:focus-visible]:pointer-events-auto",
-      "fine-hover:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
+      "fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:pointer-events-auto",
     );
     expect(cluster).not.toHaveClass("pointer-events-none", "md:pointer-events-none");
   });
@@ -525,7 +529,7 @@ describe("quick pin/unpin hover button", () => {
     expect(kebab).toHaveClass(
       "fine-hover:md:opacity-0",
       "fine-hover:md:group-hover:opacity-100",
-      "fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100",
+      "fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
     );
     expect(kebab).not.toHaveClass("md:opacity-0");
   });
