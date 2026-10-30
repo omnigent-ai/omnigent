@@ -429,7 +429,7 @@ class EgressProxy:
                 await self._handle_connect(writer, reader, target, headers)
             else:
                 await self._handle_http(writer, reader, method, target, first_line, headers)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.debug("Client connection timed out")
         except (ConnectionResetError, BrokenPipeError):
             pass
@@ -667,7 +667,7 @@ class EgressProxy:
                 )
                 if not keep_alive:
                     return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # WARNING (was DEBUG) so this is visible without raising
             # caplog levels: with the protocol-swap race fixed above,
             # this branch now only fires on a genuine anomaly (TLS
@@ -1224,7 +1224,7 @@ class EgressProxy:
                 client_writer.write(data)
                 await client_writer.drain()
                 bytes_written += len(data)
-        except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError) as e:
+        except (TimeoutError, ConnectionResetError, BrokenPipeError) as e:
             exc = e
         return bytes_written, exc
 

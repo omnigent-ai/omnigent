@@ -2,7 +2,9 @@
 
 Rules use a simple DSL: ``METHODS host/path/pattern``
 
-Examples::
+Examples:
+
+.. code-block:: text
 
     "GET api.github.com/orgs/myorg/**"       # GET only, specific path
     "GET,POST api.github.com/repos/myorg/**"  # Multiple methods

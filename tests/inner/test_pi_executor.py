@@ -1,6 +1,8 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import contextlib
+import itertools
 import json
 import logging
 import os
@@ -9,8 +11,9 @@ import shutil
 import socket
 import tempfile
 import textwrap
+import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,8 +21,10 @@ from urllib.parse import urlparse
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
+    CompactionComplete,
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -45,7 +50,8 @@ from omnigent.inner.pi_executor import (
     _ToolServer,
 )
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
+from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -936,14 +942,15 @@ class TestToolServer(unittest.TestCase):
         finally:
             probe.close()
 
-    async def _run_generated_bridge_tool(
+    async def _run_generated_bridge_tools(
         self,
         *,
         port: int,
         token: str,
+        args: list[dict] | None = None,
         timeout: float = 5.0,
-    ) -> dict:
-        """Run the generated JS extension under Node and execute one tool.
+    ) -> list[dict]:
+        """Run sequential tool calls in one generated Node extension.
 
         This is intentionally cross-runtime: Python starts the real loopback
         server, while Node loads the generated Pi extension, captures the
@@ -966,6 +973,8 @@ class TestToolServer(unittest.TestCase):
             tmp_path = Path(tmp)
             extension_path = tmp_path / "omnigent_tools.js"
             runner_path = tmp_path / "run_bridge.js"
+            args_path = tmp_path / "args.json"
+            args_path.write_text(json.dumps(args if args is not None else [{"input": "hello"}]))
             extension_path.write_text(_generate_extension_js(port, schema, token))
             runner_path.write_text(
                 textwrap.dedent(
@@ -982,14 +991,14 @@ class TestToolServer(unittest.TestCase):
                       if (!registered) {
                         throw new Error("tool was not registered");
                       }
-                      const result = await registered.execute(
-                        "call-1",
-                        { input: "hello" },
-                        undefined,
-                        undefined,
-                        {}
-                      );
-                      process.stdout.write(JSON.stringify(result));
+                      const args = JSON.parse(require("fs").readFileSync(process.argv[3], "utf8"));
+                      const results = [];
+                      for (const [index, params] of args.entries()) {
+                        results.push(await registered.execute(
+                          `call-${index + 1}`, params, undefined, undefined, {}
+                        ));
+                      }
+                      process.stdout.write(JSON.stringify(results));
                     })().catch((err) => {
                       process.stderr.write(err && err.stack ? err.stack : String(err));
                       process.exit(1);
@@ -1002,12 +1011,13 @@ class TestToolServer(unittest.TestCase):
                 node_path,
                 str(runner_path),
                 str(extension_path),
+                str(args_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 stdout, stderr = await proc.communicate()
                 stderr_text = stderr.decode("utf-8", errors="replace")
@@ -1018,6 +1028,147 @@ class TestToolServer(unittest.TestCase):
                 stderr.decode("utf-8", errors="replace"),
             )
             return json.loads(stdout.decode("utf-8"))
+
+    def test_generated_bridge_accepts_request_larger_than_default_stream_limit(self):
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+            payload = "large-tool-input:" + "x" * (128 * 1024)
+            calls = []
+
+            async def executor(name, args, *, call_id=None):
+                calls.append((name, args, call_id))
+                return {"accepted_bytes": len(args["input"].encode())}
+
+            server._tool_executor = executor
+            try:
+                result, next_result = await self._run_generated_bridge_tools(
+                    port=server.port,
+                    token=server.token,
+                    args=[{"input": payload}, {"input": "hello"}],
+                )
+            finally:
+                await server.stop()
+
+            self.assertFalse(result["isError"])
+            self.assertEqual(
+                calls,
+                [
+                    ("exotic", {"input": payload}, "call-1"),
+                    ("exotic", {"input": "hello"}, "call-2"),
+                ],
+            )
+            self.assertEqual(
+                json.loads(result["content"][0]["text"]),
+                {"accepted_bytes": len(payload.encode())},
+            )
+            self.assertFalse(next_result["isError"])
+            self.assertEqual(json.loads(next_result["content"][0]["text"]), {"accepted_bytes": 5})
+
+        _run(_test())
+
+    def test_generated_bridge_rejects_oversized_request_without_dispatch_or_payload_logs(self):
+        async def _test():
+            server = _ToolServer()
+            executor = AsyncMock(return_value={"ok": True})
+            server._tool_executor = executor
+            with patch("omnigent.inner.pi_executor._TOOL_REQUEST_LIMIT", 64 * 1024):
+                await server.start()
+                try:
+                    with self.assertLogs("omnigent.inner.pi_executor", level="WARNING") as logs:
+                        result, next_result = await self._run_generated_bridge_tools(
+                            port=server.port,
+                            token=server.token,
+                            args=[
+                                {"input": "private-tool-value" + "x" * (8 * 1024 * 1024)},
+                                {"input": "hello"},
+                            ],
+                        )
+                finally:
+                    await server.stop()
+
+            executor.assert_awaited_once_with("exotic", {"input": "hello"}, call_id="call-2")
+            self.assertTrue(result["isError"])
+            self.assertEqual(
+                json.loads(result["content"][0]["text"]),
+                {"error": "tool request exceeds 65536-byte limit"},
+            )
+            self.assertFalse(next_result["isError"])
+            self.assertEqual(json.loads(next_result["content"][0]["text"]), {"ok": True})
+            row = record_to_row(logs.records[-1], source="runner")
+            self.assertEqual(row["event_name"], "pi_tool_request_rejected")
+            self.assertEqual(row["attributes"]["request_limit_bytes"], "65536")
+            self.assertNotIn("private-tool-value", json.dumps(row))
+            self.assertNotIn(server.token, json.dumps(row))
+
+        _run(_test())
+
+    def test_oversized_request_preserves_error_while_client_is_sending(self):
+        async def _test():
+            server = _ToolServer()
+            executor = AsyncMock()
+            server._tool_executor = executor
+            with patch("omnigent.inner.pi_executor._TOOL_REQUEST_LIMIT", 64 * 1024):
+                await server.start()
+                reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+                try:
+                    writer.write(
+                        json.dumps(
+                            {
+                                "id": "large-request",
+                                "token": server.token,
+                                "tool": "exotic",
+                                "args": {"input": "x" * (8 * 1024 * 1024)},
+                            }
+                        ).encode()
+                        + b"\n"
+                    )
+                    async with asyncio.timeout(5):
+                        await writer.drain()
+                        result = json.loads(await reader.readline())
+                        self.assertEqual(await reader.read(), b"")
+                finally:
+                    writer.close()
+                    with contextlib.suppress(ConnectionError):
+                        await writer.wait_closed()
+                    await server.stop()
+
+            executor.assert_not_awaited()
+            self.assertEqual(result["error"], "tool request exceeds 65536-byte limit")
+
+        _run(_test())
+
+    def test_oversized_request_with_incomplete_sender_is_bounded(self):
+        async def _test(send_eof):
+            server = _ToolServer()
+            executor = AsyncMock()
+            server._tool_executor = executor
+            with (
+                patch("omnigent.inner.pi_executor._TOOL_REQUEST_LIMIT", 64 * 1024),
+                patch("omnigent.inner.pi_executor._TOOL_REQUEST_DRAIN_TIMEOUT_S", 0.05),
+            ):
+                await server.start()
+                reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+                try:
+                    writer.write(b"x" * (128 * 1024))
+                    await writer.drain()
+                    if send_eof:
+                        writer.write_eof()
+                    async with asyncio.timeout(1):
+                        result = json.loads(await reader.readline())
+                        self.assertEqual(await reader.read(), b"")
+                        while server._clients:
+                            await asyncio.sleep(0.01)
+                    self.assertEqual(result["error"], "tool request exceeds 65536-byte limit")
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+                    await server.stop()
+            executor.assert_not_awaited()
+
+        for send_eof in (True, False):
+            with self.subTest(sender="truncated" if send_eof else "stalled"):
+                _run(_test(send_eof))
 
     def test_start_and_stop(self):
         async def _test():
@@ -1129,7 +1280,7 @@ class TestToolServer(unittest.TestCase):
             async def executor(name, args):
                 # A dict carrying values json.dumps rejects by default.
                 return {
-                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
                     "tags": {1, 2, 3},
                 }
 
@@ -1165,7 +1316,7 @@ class TestToolServer(unittest.TestCase):
         still yield a valid frame rather than re-raising the very crash the
         guard exists to prevent. The id is stringified in that envelope.
         """
-        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc)
+        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC)
         out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
         payload = json.loads(out)
         self.assertEqual(payload["id"], str(bad_id))
@@ -1188,13 +1339,13 @@ class TestToolServer(unittest.TestCase):
             async def executor(name, args, *, call_id=None):
                 self.assertEqual(call_id, "call-1")
                 return {
-                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
                     "tags": {1, 2, 3},
                 }
 
             server._tool_executor = executor
             try:
-                result = await self._run_generated_bridge_tool(
+                [result] = await self._run_generated_bridge_tools(
                     port=server.port,
                     token=server.token,
                 )
@@ -1225,7 +1376,7 @@ class TestToolServer(unittest.TestCase):
             server = await asyncio.start_server(close_without_response, "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             try:
-                result = await self._run_generated_bridge_tool(
+                [result] = await self._run_generated_bridge_tools(
                     port=port,
                     token="close-token",
                 )
@@ -1959,10 +2110,8 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         encoding="utf-8",
     )
     (global_agent / "npm").mkdir()
-    monkeypatch.setattr(
-        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR",
-        global_agent,
-    )
+    (global_agent / "mcp.json").write_text('{"mcpServers": {"custom": {}}}', encoding="utf-8")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_agent))
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
@@ -1973,6 +2122,10 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         executor = PiExecutor(gateway=True)
         _run(executor._get_gateway_token())
 
+    # Use the actual spawn environment, not a later change to the parent process.
+    executor._env["PI_CODING_AGENT_DIR"] = "pi-agent"
+    executor._cwd = str(tmp_path)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "wrong-root"))
     config = executor._build_env_and_dir(
         [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
     )
@@ -1982,6 +2135,7 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         assert settings["extensions"] == ["/ext/demo.ts"]
         assert settings["packages"] == ["npm:@x/y"]
         assert (managed_dir / "npm").is_symlink()
+        assert (managed_dir / "mcp.json").resolve() == (global_agent / "mcp.json").resolve()
     finally:
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
@@ -3744,6 +3898,270 @@ def test_resolve_pi_skill_args_no_bundle() -> None:
     assert _resolve_pi_skill_args(["alpha"], None) == ["--no-skills"]
 
 
+def test_resolve_pi_skill_args_finds_pi_native_skills_layout(tmp_path: Path) -> None:
+    """``skills_filter='all'`` surfaces a skill shipped in Pi's own ``.pi/skills/<name>/``
+    layout via ``--skill``.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    bundle = tmp_path / "bundle"
+    pi_skills_root = bundle / ".pi" / "skills"
+    _make_pi_skill_dir(pi_skills_root, "grilling")
+
+    args = _resolve_pi_skill_args("all", bundle)
+
+    paths = [args[i + 1] for i, tok in enumerate(args) if tok == "--skill"]
+    assert str(pi_skills_root / "grilling") in paths, (
+        f"bundle skill under .pi/skills/ was not exposed via --skill; got args={args}"
+    )
+
+
+def test_resolve_pi_skill_args_named_subset_spans_both_skill_roots(tmp_path: Path) -> None:
+    """A named filter resolves skills from ``skills/`` and ``.pi/skills/``
+    alike, and ``skills/`` wins when both roots ship the same name.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    bundle = tmp_path / "bundle"
+    flat_root = bundle / "skills"
+    pi_root = bundle / ".pi" / "skills"
+    _make_pi_skill_dir(flat_root, "shared")
+    _make_pi_skill_dir(pi_root, "shared")
+    _make_pi_skill_dir(pi_root, "grilling")
+
+    args = _resolve_pi_skill_args(["grilling", "shared", "missing"], bundle)
+
+    assert args[0] == "--no-skills"
+    paths = [args[i + 1] for i, tok in enumerate(args) if tok == "--skill"]
+    assert paths == [str(pi_root / "grilling"), str(flat_root / "shared")], f"got {paths}"
+
+
+def test_resolve_pi_bundle_extension_args_extension_entries(tmp_path: Path) -> None:
+    """Each bundled extension entry point is passed via ``--extension`` so bundled extensions
+    load regardless of Pi's cwd.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_args
+
+    bundle = tmp_path / "bundle"
+    marker_dir = bundle / ".pi" / "extensions" / "marker"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "index.js").write_text("module.exports = function () {};\n")
+
+    assert _resolve_pi_bundle_extension_args(bundle) == [
+        "--extension",
+        str(marker_dir / "index.js"),
+    ]
+    assert _resolve_pi_bundle_extension_args(None) == []
+    assert _resolve_pi_bundle_extension_args(tmp_path / "no-extensions") == []
+
+
+def test_resolve_pi_bundle_extension_entries_discovery_shapes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Entry discovery mirrors Pi's own: top-level ``*.js``/``*.ts``
+    files, subdir ``index.ts`` over ``index.js``, ``package.json``
+    ``pi.extensions`` manifests over index files (file entries inside the
+    extension dir only), dotfiles and ``node_modules`` skipped. A broken
+    manifest falls back to the index file with a warning.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
+
+    ext_root = tmp_path / ".pi" / "extensions"
+    ext_root.mkdir(parents=True)
+    (ext_root / "flat.js").write_text("module.exports = function () {};\n")
+    (ext_root / ".hidden.js").write_text("skip me\n")
+    (ext_root / "node_modules").mkdir()
+    (ext_root / "node_modules" / "index.js").write_text("skip me\n")
+    ts_dir = ext_root / "a-ts-ext"
+    ts_dir.mkdir()
+    (ts_dir / "index.ts").write_text("export default function () {}\n")
+    (ts_dir / "index.js").write_text("compiled; index.ts must win\n")
+    manifest_dir = ext_root / "b-manifest-ext"
+    manifest_dir.mkdir()
+    (manifest_dir / "main.js").write_text("module.exports = function () {};\n")
+    (manifest_dir / "index.js").write_text("manifest entry must win\n")
+    (manifest_dir / "lib").mkdir()
+    broken_dir = ext_root / "c-broken-manifest"
+    broken_dir.mkdir()
+    (broken_dir / "package.json").write_text("{not json")
+    (broken_dir / "index.js").write_text("module.exports = function () {};\n")
+    (tmp_path / "outside.js").write_text("must never be loaded\n")
+    (manifest_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "pi": {
+                    "extensions": [
+                        "lib",
+                        "../../../outside.js",
+                        str(tmp_path / "outside.js"),
+                        "main.js",
+                    ]
+                }
+            }
+        )
+    )
+    (ext_root / "empty-dir").mkdir()
+
+    with caplog.at_level(logging.WARNING):
+        entries = _resolve_pi_bundle_extension_entries(ext_root)
+
+    assert entries == [
+        ts_dir / "index.ts",
+        manifest_dir / "main.js",
+        broken_dir / "index.js",
+        ext_root / "flat.js",
+    ], f"got {entries}"
+    assert "could not read extension manifest" in caplog.text
+    assert caplog.text.count("skipping manifest extension entry") == 3
+
+
+def test_resolve_pi_bundle_extension_entries_root_entry_wins(tmp_path: Path) -> None:
+    """An entry point directly under ``.pi/extensions`` makes that directory
+    the single extension, so child directories are not scanned — as in Pi.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
+
+    ext_root = tmp_path / ".pi" / "extensions"
+    child = ext_root / "child"
+    child.mkdir(parents=True)
+    (child / "index.js").write_text("module.exports = function () {};\n")
+    (ext_root / "index.js").write_text("module.exports = function () {};\n")
+    assert _resolve_pi_bundle_extension_entries(ext_root) == [ext_root / "index.js"]
+
+    (ext_root / "main.js").write_text("module.exports = function () {};\n")
+    (ext_root / "package.json").write_text(json.dumps({"pi": {"extensions": ["main.js"]}}))
+    assert _resolve_pi_bundle_extension_entries(ext_root) == [ext_root / "main.js"]
+
+
+def test_read_pi_bundle_context_follows_pi_candidate_order(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bundle-root context file is read by content in Pi's own precedence order; a missing,
+    blank or undecodable file yields nothing, the last with a warning instead of failing
+    executor construction.
+    """
+    from omnigent.inner.pi_executor import _read_pi_bundle_context
+
+    assert _read_pi_bundle_context(None) is None
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    assert _read_pi_bundle_context(bundle) is None
+    (bundle / "AGENTS.md").write_text("   \n")
+    assert _read_pi_bundle_context(bundle) is None
+
+    (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
+    assert _read_pi_bundle_context(bundle) == "Bundle guidance marker."
+
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    assert _read_pi_bundle_context(bundle) == "Override guidance."
+
+    (bundle / "AGENTS.override.md").write_bytes(b"Caf\xe9 guidance\n")
+    with caplog.at_level(logging.WARNING):
+        assert _read_pi_bundle_context(bundle) == "Bundle guidance marker."
+    assert "could not read bundle context file" in caplog.text
+    (bundle / "AGENTS.md").unlink()
+    assert _read_pi_bundle_context(bundle) is None
+    (bundle / "AGENTS.override.md").unlink()
+    (bundle / "CLAUDE.md").write_text("Claude guidance.\n")
+    assert _read_pi_bundle_context(bundle) == "Claude guidance."
+
+
+def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Path) -> None:
+    """The bundle-root context file is an automatic context file: it is dropped with
+    ``context_files=False`` and not appended twice when the composed instructions
+    already carry it (``instructions: AGENTS.md``).
+    """
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
+
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        enabled = PiExecutor(bundle_dir=bundle)
+        disabled = PiExecutor(bundle_dir=bundle, context_files=False)
+
+    assert enabled._with_bundle_context("Agent prompt.") == (
+        "Agent prompt.\n\nBundle guidance marker."
+    )
+    assert enabled._with_bundle_context("") == "Bundle guidance marker."
+    adopted = "Bundle guidance marker.\n\nFramework notes."
+    assert enabled._with_bundle_context(adopted) == adopted
+    reflowed = "Bundle   guidance\nmarker.\n\nFramework notes."
+    assert enabled._with_bundle_context(reflowed) == reflowed
+    # Quoting the text inside other instructions is not adoption.
+    quoted = 'Agent prompt. Sample wording, not policy: "Bundle guidance marker."'
+    assert enabled._with_bundle_context(quoted) == f"{quoted}\n\nBundle guidance marker."
+    assert disabled._with_bundle_context("Agent prompt.") == "Agent prompt."
+    assert "--no-context-files" in disabled._extra_args
+
+    # Parser-adopted AGENTS.md and Pi's AGENTS.override.md context must both survive.
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        layered = PiExecutor(bundle_dir=bundle)
+    assert layered._with_bundle_context(adopted) == f"{adopted}\n\nOverride guidance."
+
+
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_pi_subprocess_receives_bundle_resources_from_session_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system_prompt_mode: str
+) -> None:
+    """Pi discovers ``.pi/extensions``, ``.pi/skills`` and ``AGENTS.md`` relative
+    to its cwd, so the executor must pass bundle resources explicitly while
+    keeping the session workspace as cwd. The bundle context travels in the one
+    content-bearing prompt flag of the active mode.
+    """
+    from omnigent.inner import pi_executor as pi_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bundle = tmp_path / "bundle"
+    ext_entry = bundle / ".pi" / "extensions" / "ext" / "index.ts"
+    ext_entry.parent.mkdir(parents=True)
+    ext_entry.write_text("export default function (pi) {}\n")
+    skill_dir = _make_pi_skill_dir(bundle / ".pi" / "skills", "grilling")
+    (bundle / "AGENTS.md").write_text("BUNDLE_CONTEXT_MARKER: answer like a pirate.\n")
+
+    captured: dict[str, object] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["argv"] = list(args)
+        captured["cwd"] = kwargs.get("cwd")
+        return _FakeProcess()
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(
+            cwd=str(workspace), bundle_dir=bundle, system_prompt_mode=system_prompt_mode
+        )
+
+    async def _drive() -> None:
+        with patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})):
+            try:
+                await executor._ensure_rpc("session", "You are the bundle agent.", "gpt-4o", [])
+            finally:
+                await executor.close()
+
+    _run(_drive())
+
+    assert captured["cwd"] == str(workspace), "pi must keep the session workspace as its cwd"
+    argv = list(captured["argv"])
+    pairs = list(itertools.pairwise(argv))
+    assert ("--extension", str(ext_entry)) in pairs, f"got argv={argv}"
+    assert ("--skill", str(skill_dir)) in pairs, f"got argv={argv}"
+    composed = "You are the bundle agent.\n\nBUNDLE_CONTEXT_MARKER: answer like a pirate."
+    prompt_values = [
+        argv[i + 1]
+        for i, tok in enumerate(argv)
+        if tok in ("--system-prompt", "--append-system-prompt")
+    ]
+    if system_prompt_mode == "append":
+        assert "--system-prompt" not in argv
+        assert prompt_values == [composed]
+    else:
+        assert argv[argv.index("--system-prompt") + 1] == composed
+        # Replace mode keeps its empty append, which suppresses APPEND_SYSTEM.md.
+        assert prompt_values == [composed, ""]
+
+
 # ---------------------------------------------------------------------------
 # Databricks gateway default-model + models.json parity tests — the pi
 # mirror of the claude-sdk default plumbing. The ucode-cached
@@ -3864,6 +4282,19 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
 
 def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
     """Pi reuses UC availability and enriches aliases with MLflow limits."""
+    lookup_threads = []
+    vendor_model = ModelInfo(
+        name="gpt-next",
+        provider="openai",
+        supports_reasoning=True,
+        max_input_tokens=400_000,
+        max_output_tokens=128_000,
+    )
+
+    def vendor_models(provider):
+        lookup_threads.append(threading.get_ident())
+        return [vendor_model] if provider == "openai" else []
+
     responses = frozenset({ModelWireAPI.OPENAI_RESPONSES})
     entries = (
         ModelEntry(
@@ -3884,27 +4315,24 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
         ) as fetch,
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            return_value=(
-                ModelEntry(
-                    id="databricks-gpt-next",
-                    family="openai",
-                    metadata=ModelMetadata(
-                        context_window=400_000,
-                        max_output_tokens=128_000,
-                    ),
-                ),
-            ),
+            return_value=(),
         ) as enrich,
+        patch(
+            "omnigent.onboarding.providers.get_models",
+            side_effect=vendor_models,
+        ),
     ):
         executor = PiExecutor(gateway=True)
         first = _run(executor._load_gateway_model_wire_apis())
         second = _run(executor._load_gateway_model_wire_apis())
 
+    assert lookup_threads and threading.get_ident() not in lookup_threads
     assert first["databricks-gpt-next"] == responses
     assert second is first
     assert executor._gateway_model_entries is not None
     assert executor._gateway_model_entries[0].metadata.context_window == 400_000
     assert executor._gateway_model_entries[0].metadata.max_output_tokens == 128_000
+    assert executor._gateway_model_entries[0].metadata.supports(ModelCapability.REASONING) is True
     fetch.assert_called_once_with("https://h.example.com", "tok")
     enrich.assert_called_once_with("databricks")
 
@@ -3929,7 +4357,8 @@ def test_gateway_wire_catalog_failure_is_cached() -> None:
     fetch.assert_called_once_with("https://h.example.com", "tok")
 
 
-def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> None:
+@pytest.mark.parametrize("failure_stage", ["catalog", "vendor_fallback"])
+def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails(failure_stage) -> None:
     """MLflow downtime does not erase workspace-discovered picker models."""
     entries = (
         ModelEntry(
@@ -3950,14 +4379,23 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
         ),
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            side_effect=OSError("offline"),
+            return_value=(),
+            side_effect=OSError("offline") if failure_stage == "catalog" else None,
         ),
+        patch(
+            "omnigent.onboarding.providers.find_catalog_models",
+            side_effect=AttributeError("malformed catalog capabilities"),
+        ) as lookup,
     ):
         executor = PiExecutor(gateway=True)
         wire_catalog = _run(executor._load_gateway_model_wire_apis())
+        assert _run(executor._load_gateway_model_wire_apis()) is wire_catalog
 
     assert wire_catalog["system.ai.gpt-live"] == frozenset({ModelWireAPI.OPENAI_RESPONSES})
     assert executor._gateway_model_entries == entries
+
+    if failure_stage == "vendor_fallback":
+        lookup.assert_called_once_with("system.ai.gpt-live")
 
 
 def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
@@ -4088,6 +4526,18 @@ def test_models_json_lists_only_live_gateway_models() -> None:
     assert [m["id"] for m in providers["databricks-mlflow"]["models"]] == [
         "system.ai.llama-catalog"
     ]
+
+
+def test_models_json_attributes_only_unity_gateway_providers() -> None:
+    """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
+    providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
+
+    attributed = {name for name, provider in providers.items() if "headers" in provider}
+    assert attributed == {"databricks-openai", "databricks-mlflow"}
+    assert providers["databricks-openai"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
 
 
 def test_models_json_unknown_gpt_metadata_fails_toward_responses() -> None:
@@ -4804,6 +5254,90 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     assert "FAKE_HOST_SECRET" not in allowlist
 
 
+def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
+    """Only the bundle roots that contributed a ``--skill`` / ``--extension`` path are granted,
+    in a stable order; no bundle or no resources grants nothing.
+    """
+    from omnigent.inner.pi_executor import _pi_bundle_resource_roots
+
+    bundle = tmp_path / "bundle"
+    args = [
+        "--no-tools",
+        "--skill",
+        str(bundle / ".pi" / "skills" / "grilling"),
+        "--extension",
+        str(bundle / ".pi" / "extensions" / "ext" / "index.js"),
+    ]
+
+    assert _pi_bundle_resource_roots(bundle, args) == [
+        bundle / ".pi" / "skills",
+        bundle / ".pi" / "extensions",
+    ]
+    assert _pi_bundle_resource_roots(bundle, ["--no-tools"]) == []
+    assert _pi_bundle_resource_roots(None, args) == []
+
+
+def test_pi_sandbox_grants_bundle_resource_dirs_as_read_roots(monkeypatch, tmp_path) -> None:
+    """A sandboxed Pi is granted the bundle resource directories it is passed."""
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict[str, SandboxPolicy] = {}
+
+    def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+        captured["policy"] = sandbox
+        return "/fake/launcher"
+
+    def _fake_resolve_sandbox(_os_env: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=None,
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=False,
+        )
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bundle = tmp_path / "bundle"
+    flat_skills = bundle / "skills"
+    pi_skills = bundle / ".pi" / "skills"
+    extensions = bundle / ".pi" / "extensions"
+    _make_pi_skill_dir(flat_skills, "alpha")
+    _make_pi_skill_dir(pi_skills, "grilling")
+    (extensions / "ext").mkdir(parents=True)
+    (extensions / "ext" / "index.js").write_text("module.exports = function () {};\n")
+    (bundle / "AGENTS.md").write_text("Bundle guidance.\n")
+
+    def _granted_read_roots(skills_filter: str = "all") -> list[Path]:
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            executor = PiExecutor(
+                cwd=str(workspace),
+                bundle_dir=bundle,
+                os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+                skills_filter=skills_filter,
+            )
+        assert executor._sandboxed is True
+        return [root.resolve(strict=False) for root in captured["policy"].read_roots or []]
+
+    granted = _granted_read_roots()
+    assert flat_skills.resolve() in granted
+    assert pi_skills.resolve() in granted
+    assert extensions.resolve() in granted
+    assert bundle.resolve() not in granted
+
+    # ``skills: none`` passes no --skill flags, so only the extensions root is granted.
+    granted = _granted_read_roots(skills_filter="none")
+    assert extensions.resolve() in granted
+    assert flat_skills.resolve() not in granted
+    assert pi_skills.resolve() not in granted
+
+
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:
     """The generated bridge extension carries the live server's token
     through the full ``run_turn`` → ``_ensure_tool_server`` →
@@ -5200,6 +5734,54 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
     _run(_test())
 
 
+@pytest.mark.parametrize(
+    "method, handler_mode, expected",
+    [
+        ("confirm", "accept", {"confirmed": True}),
+        ("select", "accept", {"value": "Allow"}),
+        ("notify", "missing", None),
+        ("confirm", "missing", {"confirmed": False}),
+        ("confirm", "timeout", {"confirmed": False}),
+    ],
+)
+def test_pi_extension_ui_rpc_round_trip(method: str, handler_mode: str, expected: dict | None):
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request",
+                id="dialog",
+                method=method,
+                title="Continue?",
+                options=["Allow", "Block"],
+                timeout=20,
+            ),
+            _rpc_frame(type="agent_end", messages=[]),
+            _rpc_frame(type="agent_settled"),
+        ]
+    )
+
+    async def answer(elicitation_id: str, params: ElicitationRequestParams) -> ElicitationResult:
+        assert elicitation_id == "elicit_pi_dialog"
+        assert params.mode == "form" and params.message == "Continue?"
+        if handler_mode == "timeout":
+            await asyncio.sleep(1)
+        return ElicitationResult(action="accept", content={"0": "Allow"})
+
+    if handler_mode != "missing":
+        executor._form_elicitation_handler = answer
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert rpc.process is not None and isinstance(rpc.process.stdin, _FakeStreamWriter)
+    commands = [json.loads(line) for line in b"".join(rpc.process.stdin.data).splitlines()]
+    responses = [cmd for cmd in commands if cmd.get("type") == "extension_ui_response"]
+    assert responses == (
+        [] if expected is None else [{"type": "extension_ui_response", "id": "dialog", **expected}]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reasoning effort → pi thinking level
 # ---------------------------------------------------------------------------
@@ -5551,6 +6133,30 @@ def _assert_session_evicted(executor: PiExecutor, rpc: _PiRpcSession) -> None:
     assert rpc.process is None, "the pi process was not closed"
 
 
+def test_extension_answer_write_failure_evicts_waiting_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request", id="dialog", method="confirm", title="Continue?"
+            ),
+        ]
+    )
+    send = rpc.send_command
+
+    async def fail_answer(command: dict) -> None:
+        if command.get("type") == "extension_ui_response":
+            raise BrokenPipeError("test dialog response write failed")
+        await send(command)
+
+    monkeypatch.setattr(rpc, "send_command", fail_answer)
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, ExecutorError) for event in events)
+    _assert_session_evicted(executor, rpc)
+
+
 def _retry_recovery_frames(recovered: str) -> list[str]:
     """pi's frame sequence for a 503 that its automatic retry recovers from."""
     errored = _assistant_message(stop_reason="error", error_message=_RETRYABLE_503)
@@ -5734,43 +6340,252 @@ def test_settled_eof_before_settlement_is_an_error() -> None:
     _run(_test())
 
 
-def test_settled_overflow_compaction_retry_returns_recovered_answer() -> None:
-    """A context-overflow error that pi repairs by compacting and re-running
-    the prompt completes with the recovered answer."""
+def _overflow_compaction_frames(
+    compaction_end: dict, *after_settled: str, retry: list[str] | None = None
+) -> list[str]:
+    """pi's frames for an overflow it compacts and retries, by default into "RECOVERED"."""
+    overflow = _assistant_message(
+        stop_reason="error", error_message="Context overflow: prompt is too long"
+    )
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _rpc_frame(type="message_end", message=overflow),
+        _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
+        _rpc_frame(type="compaction_start", reason="overflow"),
+        _rpc_frame(type="compaction_end", reason="overflow", **compaction_end),
+        *(retry if retry is not None else _plain_answer_frames("RECOVERED")[1:]),
+        *after_settled,
+    ]
+
+
+@pytest.mark.parametrize("exported_context", ["with-tools", "without-tools", None])
+def test_settled_overflow_compaction_retry_reports_compacted_context(
+    exported_context: str | None,
+) -> None:
+    """Export kept text before completion, excluding tools, thinking and the final reply."""
+    pi_context = [
+        {"role": "compactionSummary", "summary": "SUMMARY"},
+        {"role": "user", "content": [{"type": "text", "text": "kept question"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private"},
+                {"type": "toolCall", "id": "c1", "name": "read", "arguments": {}},
+            ],
+        },
+        {"role": "toolResult", "toolCallId": "c1", "content": [{"type": "text", "text": "x"}]},
+        _assistant_message("kept answer"),
+        {"role": "user", "content": "hello"},
+    ]
+    if exported_context == "with-tools":
+        pi_context += [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading notes."},
+                    {"type": "toolCall", "id": "c2", "name": "read", "arguments": {}},
+                ],
+            },
+            {"role": "toolResult", "toolCallId": "c2", "content": [{"type": "text", "text": "y"}]},
+        ]
+    pi_context.append(_assistant_message("RECOVERED"))
+    result: dict = {"summary": "SUMMARY"}
+    if exported_context:
+        result["estimatedTokensAfter"] = 1200
+    executor, rpc = _session_executor(
+        _overflow_compaction_frames(
+            {"result": result, "aborted": False, "willRetry": True},
+            _rpc_frame(
+                type="response",
+                command="get_messages",
+                success=exported_context is not None,
+                **({"data": {"messages": pi_context}} if exported_context else {"error": "busy"}),
+            ),
+        )
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [type(e) for e in events] == [TextChunk, CompactionComplete, TurnComplete]
+    _, compaction, turn_complete = events
+    assert turn_complete.response == "RECOVERED"
+    assert compaction.summary == "SUMMARY"
+    assert compaction.token_count == (1200 if exported_context else 0)
+    expected = [
+        (
+            "user",
+            "input_text",
+            "The conversation history before this point was compacted into "
+            "the following summary:\n\n<summary>\nSUMMARY\n</summary>",
+        ),
+        ("user", "input_text", "kept question"),
+        ("assistant", "output_text", "kept answer"),
+        ("user", "input_text", "hello"),
+    ]
+    if exported_context == "with-tools":
+        expected.append(("assistant", "output_text", "Reading notes."))
+    assert compaction.compacted_messages == (
+        [
+            {"type": "message", "role": role, "content": [{"type": block_type, "text": text}]}
+            for role, block_type, text in expected
+        ]
+        if exported_context
+        else None
+    )
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt", "get_messages"]
+    assert rpc._line_queue.empty()
+    assert _SESSION_KEY in executor._session_states
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "partial_text", "settlement"),
+    [
+        pytest.param("error", "", "settled", id="before-text"),
+        pytest.param("error", "partial", "settled", id="partial-error"),
+        pytest.param("aborted", "partial", "settled", id="partial-abort"),
+        pytest.param("aborted", "", "settled", id="abort-before-text"),
+        pytest.param("error", "partial", "eof", id="exit-before-settlement"),
+        pytest.param("aborted", "partial", "timeout", id="settlement-timeout"),
+        pytest.param("error", "partial", "abort-error", id="abort-write-failure"),
+    ],
+)
+def test_settled_compaction_then_failed_retry_reports_compaction_before_error(
+    stop_reason: str, partial_text: str, settlement: str
+) -> None:
+    """Preserve compaction before the original error, exporting only after settlement."""
 
     async def _test() -> None:
-        overflow = _assistant_message(
-            stop_reason="error", error_message="Context overflow: prompt is too long"
+        failed_retry = _assistant_message(
+            partial_text, stop_reason=stop_reason, error_message="upstream interrupted"
         )
-        executor, rpc = _session_executor(
-            [
-                _rpc_frame(type="response", success=True),
-                _rpc_frame(type="message_start", message={"role": "assistant"}),
-                _rpc_frame(type="message_end", message=overflow),
-                _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
-                _rpc_frame(type="compaction_start", reason="overflow"),
+        settled_frames = []
+        if settlement == "settled":
+            if partial_text:
+                settled_frames.append(_text_delta_frame("DO NOT REPLAY"))
+            settled_frames += [
+                _rpc_frame(type="agent_settled"),
                 _rpc_frame(
-                    type="compaction_end",
-                    reason="overflow",
-                    result={"summary": "..."},
-                    aborted=False,
-                    willRetry=True,
+                    type="response",
+                    command="get_messages",
+                    success=True,
+                    data={
+                        "messages": [
+                            {"role": "compactionSummary", "summary": "SUMMARY"},
+                            {"role": "user", "content": "hello"},
+                            failed_retry,
+                        ]
+                    },
                 ),
-                *_plain_answer_frames("RECOVERED")[1:],
             ]
+        executor, rpc = _session_executor(
+            _overflow_compaction_frames(
+                {"result": {"summary": "SUMMARY"}, "aborted": False, "willRetry": True},
+                retry=[
+                    _rpc_frame(type="agent_start"),
+                    _rpc_frame(type="message_start", message={"role": "assistant"}),
+                    *([_text_delta_frame(partial_text)] if partial_text else []),
+                    _rpc_frame(type="message_end", message=failed_retry),
+                    _rpc_frame(type="agent_end", messages=[failed_retry], willRetry=False),
+                    *settled_frames,
+                ],
+            )
         )
+        if settlement == "eof":
+            rpc._line_queue.put_nowait(None)
+        # An empty queue exercises the real drain deadline in the timeout case.
+        stdin = rpc.process.stdin
+        settled = False
+        read_line, send_command = rpc.read_line, rpc.send_command
 
-        events = await _run_session_turn(executor, "hello")
+        async def read_frame(*args, **kwargs):
+            nonlocal settled
+            line = await read_line(*args, **kwargs)
+            if line is not None and json.loads(line).get("type") == "agent_settled":
+                settled = True
+            return line
 
-        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
-        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
-        assert turn_complete.response == "RECOVERED"
-        assert rpc._line_queue.empty()
+        async def send_checked(command):
+            if command["type"] == "get_messages":
+                assert settled, "context export must wait for agent_settled"
+            if command["type"] == "abort" and settlement == "abort-error":
+                raise BrokenPipeError("Pi exited before abort")
+            await send_command(command)
+
+        with (
+            patch.object(rpc, "read_line", side_effect=read_frame),
+            patch.object(rpc, "send_command", side_effect=send_checked),
+            patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05),
+        ):
+            events = await asyncio.wait_for(_run_session_turn(executor, "hello"), timeout=1)
+
+        assert [type(e) for e in events if not isinstance(e, TextChunk)] == [
+            CompactionComplete,
+            ExecutorError,
+        ]
+        compaction, error = events[-2:]
+        assert error.message == "upstream interrupted"
+        assert compaction.summary == "SUMMARY"
+        assert [e.text for e in events if isinstance(e, TextChunk)] == (
+            [partial_text] if partial_text else []
+        )
+        commands = [json.loads(line)["type"] for line in stdin.data]
+        if settlement == "settled":
+            assert [m["content"][0]["text"] for m in compaction.compacted_messages][1:] == [
+                "hello"
+            ]
+            assert rpc._line_queue.empty()
+        else:
+            assert compaction.compacted_messages is None
+        evicted = bool(partial_text) or stop_reason == "aborted"
+        assert commands == (
+            ["prompt"]
+            + (["abort"] if evicted and settlement != "abort-error" else [])
+            + (["get_messages"] if settlement == "settled" else [])
+        )
+        if evicted:
+            _assert_session_evicted(executor, rpc)
+        else:
+            assert _SESSION_KEY in executor._session_states
 
     _run(_test())
 
 
-def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -> None:
+@pytest.mark.parametrize(
+    "compaction_end",
+    [
+        {"aborted": False, "errorMessage": "Auto-compaction failed: timeout"},
+        {"aborted": True},
+    ],
+    ids=["failed", "aborted"],
+)
+def test_settled_failed_compaction_reports_no_compaction(compaction_end: dict) -> None:
+    """Failed or aborted compaction does not replace history or request an export."""
+    answer_frames = _plain_answer_frames("ANSWER")
+    executor, rpc = _session_executor(
+        [
+            *answer_frames[:-1],
+            _rpc_frame(type="compaction_start", reason="threshold"),
+            _rpc_frame(
+                type="compaction_end", reason="threshold", willRetry=False, **compaction_end
+            ),
+            answer_frames[-1],
+        ]
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert not any(isinstance(e, CompactionComplete) for e in events)
+    (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+    assert turn_complete.response == "ANSWER"
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt"]
+    assert rpc._line_queue.empty()
+
+
+@pytest.mark.parametrize("settled", [True, False], ids=["settled", "exited"])
+def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts(
+    settled: bool,
+) -> None:
     """A truncated answer that already streamed is not followed by the
     regenerated one pi produces after overflow compaction."""
 
@@ -5791,15 +6606,38 @@ def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -
                     aborted=False,
                     willRetry=True,
                 ),
-                *_plain_answer_frames("REGENERATED")[1:],
             ]
         )
+        if settled:
+            for frame in _plain_answer_frames("REGENERATED")[1:]:
+                rpc._line_queue.put_nowait(frame)
+            rpc._line_queue.put_nowait(
+                _rpc_frame(
+                    type="response",
+                    command="get_messages",
+                    success=True,
+                    data={
+                        "messages": [
+                            {"role": "compactionSummary", "summary": "..."},
+                            {"role": "user", "content": "hello"},
+                            _assistant_message("REGENERATED"),
+                        ]
+                    },
+                )
+            )
+        else:
+            rpc._line_queue.put_nowait(None)
 
         events = await _run_session_turn(executor, "hello")
 
         assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial"]
         assert not any(isinstance(e, TurnComplete) for e in events)
         assert len([e for e in events if isinstance(e, ExecutorError)]) == 1
+        compaction, error = events[-2:]
+        assert isinstance(compaction, CompactionComplete)
+        assert compaction.summary == "..."
+        assert bool(compaction.compacted_messages) is settled
+        assert "partial response was already streamed" in error.message
         _assert_session_evicted(executor, rpc)
 
     _run(_test())

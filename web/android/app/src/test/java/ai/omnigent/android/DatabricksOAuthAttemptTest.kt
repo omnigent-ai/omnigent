@@ -15,7 +15,7 @@ class DatabricksOAuthAttemptTest {
     private val configuration =
         DatabricksOAuthConfiguration(
             "public-client",
-            URI("https://login.databricks.com/mobile-redirect"),
+            URI("ai.omnigent.android://mobile-redirect"),
         )
     private val attempt =
         DatabricksOAuthAttempt(
@@ -62,7 +62,7 @@ class DatabricksOAuthAttemptTest {
     fun `callback validates state and falls back to workspace issuer`() {
         val response =
             attempt.authorizationResponse(
-                URI("https://login.databricks.com/mobile-redirect?code=abc&state=state-value"),
+                URI("ai.omnigent.android://mobile-redirect?code=abc&state=state-value"),
             )
 
         assertEquals("abc", response.code)
@@ -97,7 +97,7 @@ class DatabricksOAuthAttemptTest {
         val response =
             attempt.authorizationResponse(
                 URI(
-                    "https://login.databricks.com/mobile-redirect" +
+                    "ai.omnigent.android://mobile-redirect" +
                         "?code=abc&state=state-value&iss=$issuer",
                 ),
             )
@@ -112,11 +112,12 @@ class DatabricksOAuthAttemptTest {
     fun `callback rejects wrong destination state duplicates and provider errors`() {
         val invalidCallbacks =
             listOf(
-                "https://evil.example/mobile-redirect?code=abc&state=state-value",
-                "https://login.databricks.com/mobile-redirect?code=abc&state=wrong",
-                "https://login.databricks.com/mobile-redirect?code=a&code=b&state=state-value",
-                "https://login.databricks.com/mobile-redirect?code=abc&state=state-value&state=again",
-                "https://login.databricks.com/mobile-redirect?state=state-value",
+                "https://login.databricks.com/mobile-redirect?code=abc&state=state-value",
+                "ai.omnigent.android://other?code=abc&state=state-value",
+                "ai.omnigent.android://mobile-redirect?code=abc&state=wrong",
+                "ai.omnigent.android://mobile-redirect?code=a&code=b&state=state-value",
+                "ai.omnigent.android://mobile-redirect?code=abc&state=state-value&state=again",
+                "ai.omnigent.android://mobile-redirect?state=state-value",
             )
         invalidCallbacks.forEach { callback ->
             assertThrows(DatabricksOAuthException.InvalidCallback::class.java) {
@@ -126,7 +127,7 @@ class DatabricksOAuthAttemptTest {
         assertThrows(DatabricksOAuthException.AuthorizationDenied::class.java) {
             attempt.authorizationResponse(
                 URI(
-                    "https://login.databricks.com/mobile-redirect" +
+                    "ai.omnigent.android://mobile-redirect" +
                         "?error=access_denied&state=state-value",
                 ),
             )
@@ -134,7 +135,7 @@ class DatabricksOAuthAttemptTest {
         assertThrows(DatabricksOAuthException.AuthorizationFailed::class.java) {
             attempt.authorizationResponse(
                 URI(
-                    "https://login.databricks.com/mobile-redirect" +
+                    "ai.omnigent.android://mobile-redirect" +
                         "?error=server_error&state=state-value",
                 ),
             )

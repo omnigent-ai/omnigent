@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -79,6 +80,10 @@ elif args == [
     "repos/example/project/pulls/42/files?per_page=100",
 ]:
     print("[[]]")
+elif args == ["api", "--hostname", "github.com", "repos/example/project/pulls/42"]:
+    print(json.dumps({"head": {"sha": pr["headRefOid"]}, "base": {"sha": pr["baseRefOid"]}}))
+elif args[:2] == ["pr", "diff"]:
+    print("")
 elif args[0] == "api":
     unexpected_api()
 else:
@@ -145,7 +150,7 @@ executor:
   harness: openai-agents
 os_env:
   type: caller_process
-  cwd: {json.dumps(str(workspace))}
+  cwd: .
   sandbox:
     type: none
 """
@@ -243,7 +248,9 @@ def test_pr_appears_in_composer_and_workspace(
     expect(rail.get_by_role("tab", name="Pull Requests")).to_have_attribute(
         "aria-selected", "true"
     )
-    expect(rail.get_by_role("combobox", name="Session pull request")).to_contain_text(_TITLE)
+    rail.get_by_role("list", name="Pull requests").get_by_role(
+        "button", name=re.compile(r"^.*#42(?: \(from branch\))? — " + re.escape(_TITLE) + r"$")
+    ).click()
     expect(rail.get_by_role("link", name=f"{_TITLE} #42")).to_have_attribute("href", _URL)
     expect(rail.get_by_text("Created from the active session checkout.")).to_be_visible()
     page.screenshot(path=str(tmp_path / "pr-displayed.png"), animations="disabled")

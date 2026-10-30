@@ -12,6 +12,7 @@ import httpx
 import pytest
 from playwright.sync_api import expect
 
+from omnigent.db.utils import builtin_agent_id
 from tests._helpers.codex_plugins import install_codex_plugin
 from tests._helpers.host import isolated_host
 from tests._helpers.native_session import create_native_session
@@ -91,15 +92,10 @@ def test_plugin_skill_in_both_composers_after_inventory_failure(
             row.click()
             expect(composer).to_have_value("$dev-productivity:xray ")
 
-            agents = client.get("/v1/agents")
-            agents.raise_for_status()
-            codex_agent = next(
-                agent for agent in agents.json()["data"] if agent["harness"] == "codex-native"
-            )
             # Restore the user's previous choice; picker interaction is covered separately.
             preferences = {
                 "omnigent:recent-workspaces": json.dumps({host.host_id: [str(workspace)]}),
-                "omnigent:last-agent-id": codex_agent["id"],
+                "omnigent:last-agent-id": builtin_agent_id("codex-native-ui"),
                 "omnigent:last-host-choice": host.host_id,
             }
             page.add_init_script(

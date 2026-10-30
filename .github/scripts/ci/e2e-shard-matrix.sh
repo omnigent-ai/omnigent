@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Emits the e2e shard matrix as `matrix=<json>` on $GITHUB_OUTPUT, or an EMPTY
-# matrix ({"include":[]}) to skip. Empty yields zero jobs and thus NO check-runs
-# -- the point of the indirection: a job-level `if:` skip would instead leave a
-# check-run with an unexpanded `E2E Tests (shard ${{ matrix.shard_id }}/...)` name.
+# matrix ({"include":[]}) to skip. The consuming job must guard this value
+# with a job-level `if:` before GitHub expands the matrix.
 #
 # Skips draft PRs and scopes without consumers in this suite.
 #

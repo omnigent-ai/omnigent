@@ -9,7 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
-import { FileViewerContext, type FilePosition } from "./FileViewerContext";
+import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
 import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
 import {
   dismissFilePosition,
@@ -57,7 +57,7 @@ import {
   Trash2Icon,
   WrapTextIcon,
 } from "lucide-react";
-import { useSearchParams } from "@/lib/routing";
+import { useSearchParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -81,6 +81,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
 import { useFileDiff } from "@/hooks/useFileDiff";
+import { useInertRef } from "@/hooks/useInertRef";
 import {
   type Comment,
   useAddComment,
@@ -95,6 +96,8 @@ import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
+import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -126,6 +129,14 @@ const MonacoDiffViewer = lazy(() =>
 // Helpers
 // ---------------------------------------------------------------------------
 
+function isFormattedMarkdownAnchor(comment: Comment): boolean {
+  return (
+    !!comment.anchor_content &&
+    detectLang(comment.path) === "markdown" &&
+    comment.end_index - comment.start_index !== comment.anchor_content.length
+  );
+}
+
 /**
  * Classify comments into open/addressed and remap open draft comments to
  * their correct absolute offsets when the file content has changed.
@@ -134,10 +145,13 @@ const MonacoDiffViewer = lazy(() =>
  *   moved, or at stored offsets if the anchor is no longer present
  *   (never silently dropped).
  * - **addressed**: handled by the agent or user (status "addressed").
+ *
+ * Markdown formatting/entity spans use the source map to avoid unrelated literal copies.
  */
 export function classifyAndRemapComments(
   comments: Comment[],
   fileContent: string,
+  remapFormatted?: ((comment: Comment, content: string) => Comment) | null,
 ): { open: Comment[]; addressed: Comment[] } {
   const open: Comment[] = [];
   const addressed: Comment[] = [];
@@ -161,6 +175,11 @@ export function classifyAndRemapComments(
     // File not yet loaded — keep at stored offsets rather than dropping.
     if (!fileContent) {
       open.push(c);
+      continue;
+    }
+    // Keep raw spans while loading; a failed import (null) uses legacy search.
+    if (isFormattedMarkdownAnchor(c) && remapFormatted !== null) {
+      open.push(remapFormatted?.(c, fileContent) ?? c);
       continue;
     }
     // Search near the stored offset first to handle the common case of a
@@ -301,6 +320,8 @@ function useToolbarOverflow(actionsKey: string): {
 // ---------------------------------------------------------------------------
 
 interface FileViewerProps {
+  syncUrl?: boolean;
+  agentId?: string | null;
   position?: FilePosition;
   open: boolean;
   /** Media visibility is independent of the mounted editor and its navigation guard. */
@@ -352,13 +373,17 @@ export function FileViewer(props: FileViewerProps) {
   // `omnigent run --server`.
   const agentId = useChatStore((s) => s.boundAgentId);
   return (
-    <CommentSenderProvider sessionId={props.conversationId} agentId={agentId}>
+    <CommentSenderProvider
+      sessionId={props.conversationId}
+      agentId={props.agentId === undefined ? agentId : props.agentId}
+    >
       <FileViewerBody {...props} />
     </CommentSenderProvider>
   );
 }
 
 function FileViewerBody({
+  syncUrl = true,
   position,
   open,
   mediaActive = true,
@@ -378,13 +403,15 @@ function FileViewerBody({
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
   const [searchParams, setSearchParams] = useSearchParams();
+  const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();
+  const { root: workspaceRoot } = useWorkspacePaths();
   const isActiveViewport = viewport === undefined || (viewport === "mobile") === isMobile;
   // Capture URL params once on open — we don't want re-renders caused by our own
   // param writes to re-run the initialization logic.
-  const initialDiffRef = useRef(searchParams.get("diff") === "1");
+  const initialDiffRef = useRef(syncUrl && searchParams.get("diff") === "1");
   const linkedFileRef = useRef(initialDiffRef.current ? { conversationId, path } : null);
-  const initialCommentIdRef = useRef(searchParams.get("comment"));
+  const initialCommentIdRef = useRef(syncUrl ? searchParams.get("comment") : null);
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -408,8 +435,11 @@ function FileViewerBody({
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
+  const onScreen = open && isActiveViewport && mediaActive;
   // Video playback reads the complete binary on demand, never the capped JSON preview.
-  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path);
+  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path, {
+    visible: onScreen,
+  });
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -448,6 +478,7 @@ function FileViewerBody({
   const setViewerRoot = useCallback((el: HTMLElement | null) => {
     viewerRootRef.current = el;
   }, []);
+  const setFramedViewerRoot = useInertRef<HTMLElement>(!open, setViewerRoot);
   const [contentWidth, setContentWidth] = useState<number | null>(null);
   // Tracks the in-progress comment textarea body. Used by MarkdownCommentPlugin
   // to decide whether to preserve the pending mark when the user clicks away.
@@ -559,6 +590,11 @@ function FileViewerBody({
   const copyFileLink = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
     const url = new URL(window.location.href);
+    if (!syncUrl) {
+      url.pathname = rebasePath(`/c/${conversationId}`);
+      url.search = "";
+      url.searchParams.set("file", path);
+    }
     if (!activeSelection) url.searchParams.delete("comment");
     navigator.clipboard.writeText(url.toString()).then(
       () => {
@@ -568,24 +604,55 @@ function FileViewerBody({
       },
       (err) => console.warn("Failed to copy file link", err),
     );
-  }, [activeSelection]);
+  }, [activeSelection, syncUrl, rebasePath, conversationId, path]);
 
-  const copyCommentLink = useCallback((commentId: string) => {
-    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
-    const url = new URL(window.location.href);
-    url.searchParams.set("comment", commentId);
-    navigator.clipboard
-      .writeText(url.toString())
-      .then(undefined, (err) => console.warn("Failed to copy comment link", err));
-  }, []);
+  const copyCommentLink = useCallback(
+    (commentId: string) => {
+      if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
+      const url = new URL(window.location.href);
+      if (!syncUrl) {
+        url.pathname = rebasePath(`/c/${conversationId}`);
+        url.search = "";
+        url.searchParams.set("file", path);
+      }
+      url.searchParams.set("comment", commentId);
+      navigator.clipboard
+        .writeText(url.toString())
+        .then(undefined, (err) => console.warn("Failed to copy comment link", err));
+    },
+    [syncUrl, rebasePath, conversationId, path],
+  );
 
   const sender = useOptionalCommentSender();
 
   const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
+  const [remapFormatted, setRemapFormatted] = useState<
+    ((comment: Comment, content: string) => Comment) | null
+  >();
+  const needsMarkdownRemap = allComments.some(
+    (comment) => comment.status !== "addressed" && isFormattedMarkdownAnchor(comment),
+  );
+  useEffect(() => {
+    if (!needsMarkdownRemap || remapFormatted !== undefined) return;
+    let cancelled = false;
+    import("./markdownCommentRemap").then(
+      ({ remapFormattedMarkdownComment }) => {
+        if (!cancelled) setRemapFormatted(() => remapFormattedMarkdownComment);
+      },
+      (error) => {
+        if (cancelled) return;
+        console.warn("Unable to load Markdown comment remapping; using legacy search", error);
+        setRemapFormatted(null);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [needsMarkdownRemap, remapFormatted]);
   const { open: openComments, addressed: addressedComments } = useMemo(
-    () => classifyAndRemapComments(allComments, fileContent),
-    [allComments, fileContent],
+    () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
+    [allComments, fileContent, remapFormatted],
   );
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
@@ -643,6 +710,7 @@ function FileViewerBody({
   useEffect(() => {
     if (!open || !onNavigateTo || currentNavIdx === -1) return;
     const handler = (e: KeyboardEvent) => {
+      if (!syncUrl && !viewerIsActiveSurfaceRef.current) return;
       if (!e.altKey) return;
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
       // Don't hijack word-navigation when the user is typing in an input.
@@ -663,12 +731,13 @@ function FileViewerBody({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
+  }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
   // Escape closes the active file tab (when search is not open).
   useEffect(() => {
     if (!open || !onCloseTab) return;
     const handler = (e: KeyboardEvent) => {
+      if (!syncUrl && !viewerIsActiveSurfaceRef.current) return;
       if (e.key !== "Escape" || e.defaultPrevented) return;
       if (searchOpen) return;
       const target = e.target;
@@ -683,7 +752,7 @@ function FileViewerBody({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [open, onCloseTab, searchOpen, guardDirty]);
+  }, [syncUrl, open, onCloseTab, searchOpen, guardDirty]);
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
@@ -1009,7 +1078,7 @@ function FileViewerBody({
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
-    if (!open || !isActiveViewport) return;
+    if (!syncUrl || !open || !isActiveViewport) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
@@ -1025,7 +1094,7 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1214,12 +1283,8 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // A single "⋯" menu folds the view controls that were previously separate
-  // top-level icons: Find in file and Download (all views), plus the diff-only
-  // toggles (wrap lines, whitespace changes). Grouping them frees toolbar width
-  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
-  // diff-settings menu. The toggles keep the menu open; actions close it as they
-  // hand off.
+  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
+  // whitespace toggle to save toolbar width; toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1248,7 +1313,9 @@ function FileViewerBody({
       onSelect: downloadFile,
     });
   }
-  if (viewMode === "diff") {
+  // One wrap preference covers the source editor and the diff. Other views
+  // (rich Markdown, previews, the Shiki source view) already wrap.
+  if (isMonacoFindSurface && (diffViewActive || !isDeletedFile)) {
     settingsMenu.push({
       key: "wrap-lines",
       label: "Wrap lines",
@@ -1258,6 +1325,8 @@ function FileViewerBody({
       keepOpen: true,
       onSelect: () => setWrapLines((prev) => !prev),
     });
+  }
+  if (viewMode === "diff") {
     settingsMenu.push({
       key: "hide-whitespace",
       label: "Hide whitespace changes",
@@ -1478,7 +1547,31 @@ function FileViewerBody({
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
-          <span className="min-w-0 truncate font-mono text-sm text-muted-foreground">{path}</span>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`Copy file path: ${path}`}
+                  className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => {
+                    const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
+                    if (absolutePath === null) {
+                      toast.error("Workspace path unavailable");
+                      return;
+                    }
+                    void copyText(absolutePath).then(
+                      () => toast.success("File path copied"),
+                      () => toast.error("Failed to copy file path"),
+                    );
+                  }}
+                >
+                  {path}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>Copy file path</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"
@@ -1638,6 +1731,19 @@ function FileViewerBody({
         </div>
       </div>
 
+      {fileQuery.isRefetchError && !isDeletedFile && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground"
+        >
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          <span>
+            Couldn&apos;t refresh this file (
+            {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
+            ). Showing the last loaded version.
+          </span>
+        </div>
+      )}
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
         <div
           ref={contentAreaRef}
@@ -1723,13 +1829,14 @@ function FileViewerBody({
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
               panelOpen={open}
-              mediaActive={open && isActiveViewport && mediaActive}
+              mediaActive={onScreen}
               searchOpen={searchOpen}
               setSearchOpen={setSearchOpen}
               searchFocusNonce={searchFocusNonce}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
               markdownSourceFallback={markdownSourceFallback ?? false}
+              wrapLines={wrapLines}
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
@@ -1771,15 +1878,16 @@ function FileViewerBody({
               });
               // Sync the selected comment into the URL so the address bar is
               // always shareable. AppShell clears this param when the viewer closes.
-              setSearchParams(
-                (prev) => {
-                  const next = new URLSearchParams(prev);
-                  if (comment.status === "draft") next.set("comment", comment.id);
-                  else next.delete("comment");
-                  return next;
-                },
-                { replace: true },
-              );
+              if (syncUrl)
+                setSearchParams(
+                  (prev) => {
+                    const next = new URLSearchParams(prev);
+                    if (comment.status === "draft") next.set("comment", comment.id);
+                    else next.delete("comment");
+                    return next;
+                  },
+                  { replace: true },
+                );
             }}
             onEditComment={(id, body) => updateComment.mutate({ commentId: id, body })}
             onDeleteComment={(id) => {
@@ -1859,7 +1967,7 @@ function FileViewerBody({
 
   return (
     <aside
-      ref={setViewerRoot}
+      ref={setFramedViewerRoot}
       data-testid="file-viewer"
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
@@ -1873,7 +1981,6 @@ function FileViewerBody({
       )}
       aria-hidden={!open}
       data-collapsed={!open || undefined}
-      inert={!open}
     >
       {/* Resize handle — desktop only (mobile is full-screen overlay) */}
       {isDesktop && (

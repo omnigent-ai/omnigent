@@ -2,7 +2,7 @@
 
 The real runner stays connected here: this covers the browser's save gate and
 Retry interaction under stale liveness. Disconnected-runner recovery is covered
-by test_filesystem_save_reconnects_runner_on_live_host in the server route suite.
+by test_filesystem_operation_reconnects_runner_on_live_host in the server route suite.
 """
 
 from __future__ import annotations

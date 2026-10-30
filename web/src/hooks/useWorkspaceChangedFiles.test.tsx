@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
@@ -31,6 +31,7 @@ import {
   resolveChatFilePath,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
+  useSessionActive,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceDirectory,
@@ -38,6 +39,10 @@ import {
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
 } from "./useWorkspaceChangedFiles";
+
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -1021,7 +1026,7 @@ function FileExistenceProbe({
 }) {
   const result = useWorkspaceFileExists(id, path, trusted);
   useEffect(() => {
-    onResult(result);
+    onResult({ exists: result.exists, settled: result.settled });
   }, [result, onResult]);
   return null;
 }
@@ -1175,6 +1180,27 @@ describe("useWorkspaceFileExists", () => {
     expect(results.length).toBeGreaterThan(0);
     expect(results).not.toContain(true);
     expect(results.at(-1)).toBe(false);
+  });
+
+  it("reports a listed folder as a directory, not as a verified-absent file", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [
+          dirEntry("experimental/data/mobile-touch-targets", "directory"),
+          dirEntry("experimental/data/notes.md"),
+        ],
+        has_more: false,
+      }),
+    );
+    const { result } = renderHook(
+      () => useWorkspaceFileExists("conv_1", "experimental/data/mobile-touch-targets", true),
+      { wrapper: Wrap },
+    );
+
+    await waitFor(() => expect(result.current.settled).toBe(true));
+    expect(result.current).toEqual({ exists: false, isDirectory: true, settled: true });
+    expect(fetchMock.mock.calls[0][0]).toContain("/filesystem/experimental/data?");
   });
 
   it("reports false (and 404-tolerant) when the parent directory is missing", async () => {
@@ -1743,4 +1769,25 @@ describe("browse-location wire form (survives a slash-merging proxy)", () => {
     expect(url).toContain("/filesystem/src/inner?");
     expect(url).not.toContain("base=");
   });
+});
+
+it.each([false, true])("gates background workspace activity on grid flag %s", (enabled) => {
+  stubChatStore(null, "idle");
+  const entry = conversationRegistry.acquire("grid-session");
+  const view = renderHook(() => useSessionActive("grid-session"), {
+    wrapper: ({ children }) => (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: enabled } }}
+      >
+        {children}
+      </CapabilitiesProvider>
+    ),
+  });
+  expect(view.result.current).toBe(false);
+  act(() => entry.setState({ sessionStatus: "running" }));
+  expect(view.result.current).toBe(enabled);
+  act(() => entry.setState({ sessionStatus: "idle" }));
+  expect(view.result.current).toBe(false);
+  view.unmount();
+  conversationRegistry.clear();
 });

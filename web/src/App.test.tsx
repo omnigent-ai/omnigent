@@ -19,6 +19,7 @@ vi.mock("@/shell/AppShell", () => ({
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation } = await import("react-router-dom");
   return {
@@ -104,6 +105,8 @@ describe("chunk load recovery", () => {
 
   it.each([
     { path: "/tasks", basename: undefined, needsSetup: false },
+    { path: "/tasks/templates", basename: undefined, needsSetup: false },
+    { path: "/mount/tasks/templates", basename: "/mount", needsSetup: false },
     { path: "/mount/tasks", basename: "/mount", needsSetup: false },
     { path: "/setup", basename: undefined, needsSetup: true },
   ])("recovers from a failed page at $path", async ({ path, basename, needsSetup }) => {
@@ -229,6 +232,19 @@ describe("Usage release feature route", () => {
     renderUsageRoute(true);
     expect(await screen.findByText("usage page")).toBeInTheDocument();
     expect(screen.queryByText("not found")).toBeNull();
+  });
+});
+
+describe("Automation detail release feature route", () => {
+  it("does not register /tasks/:taskId while automations_v2 is off", async () => {
+    renderRoute("/tasks/st_1");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("task detail page")).toBeNull();
+  });
+
+  it("registers /tasks/:taskId while automations_v2 is on", async () => {
+    renderRoute("/tasks/st_1", { automations_v2: true });
+    expect(await screen.findByText("task detail page")).toBeInTheDocument();
   });
 });
 

@@ -60,7 +60,18 @@ _INPUT = {
 
 
 @pytest.fixture
-def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+def startup_permissions(db_uri: str) -> SqlAlchemyPermissionStore:
+    return SqlAlchemyPermissionStore(db_uri)
+
+
+@pytest.fixture
+def auth_app(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    startup_permissions: SqlAlchemyPermissionStore,
+) -> FastAPI:
     """The shared auth-enabled app, with managed sandboxes configured."""
     from omnigent.server.auth import UnifiedAuthProvider
 
@@ -71,8 +82,10 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
-        permission_store=SqlAlchemyPermissionStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header"),
+        permission_store=startup_permissions,
+        auth_provider=UnifiedAuthProvider(
+            source="header", local_single_user=getattr(request, "param", False)
+        ),
         host_store=HostStore(db_uri),
         sandbox_config=parse_sandbox_config(
             {
@@ -391,28 +404,50 @@ async def test_uncertain_native_submission_is_not_retried_on_restart(startup_env
     assert env.conv_store.list_pending_inputs(session_id) == []
 
 
-async def test_dispatch_rechecks_saved_creators_access(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "auth_app,user_id,revoke_access",
+    [(False, "alice", False), (False, "alice", True), (True, "local", False)],
+    indirect=["auth_app"],
+    ids=["named-user", "revoked-user", "local-user"],
+)
+async def test_queued_input_preserves_identity_and_rechecks_access(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    startup_permissions: SqlAlchemyPermissionStore,
+    monkeypatch: pytest.MonkeyPatch,
+    user_id: str,
+    revoke_access: bool,
 ) -> None:
-    agent = await create_test_agent(auth_client, user="alice")
-    response = await auth_client.post(
-        "/v1/sessions", json={"agent_id": agent["id"]}, headers={"X-Forwarded-Email": "alice"}
-    )
+    if user_id != "local":
+        auth_client.headers["X-Forwarded-Email"] = user_id
+    agent = await create_test_agent(auth_client)
+    response = await auth_client.post("/v1/sessions", json={"agent_id": agent["id"]})
     assert response.status_code == 201, response.text
     session_id = response.json()["id"]
     startup = auth_app.state.startup_inputs
-    entry = await startup.enqueue(
-        session_id, SessionEventInput.model_validate(_INPUT), user_id="alice", headers=Headers()
-    )
-    SqlAlchemyPermissionStore(db_uri).revoke("alice", session_id)
+    startup.conversations.set_labels(session_id, {STARTUP_LABEL: "pending"})
+    response = await auth_client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+    assert response.status_code == 202, response.text
+    [entry] = startup.conversations.list_pending_inputs(session_id)
+    if revoke_access:
+        startup_permissions.revoke(user_id, session_id)
     forwarded: list[dict[str, Any]] = []
     runner = _stub_runner(monkeypatch, forwarded)
     try:
         await startup._deliver(auth_app, session_id, entry)
     finally:
         await runner.aclose()
-    assert not forwarded
-    assert startup.conversations.list_pending_inputs(session_id)[0].status == "failed"
+    if revoke_access:
+        assert not forwarded
+        assert startup.conversations.list_pending_inputs(session_id)[0].status == "failed"
+    else:
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1 and _TEXT in json.dumps(turns[0])
+        assert startup.conversations.list_pending_inputs(session_id) == []
+        history = (await auth_client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        [message] = [item for item in history if item["type"] == "message"]
+        assert message.get("created_by") == (None if user_id == "local" else user_id)
+    assert entry.created_by == user_id
 
 
 @pytest.mark.parametrize("with_first", [True, False])
@@ -870,6 +905,26 @@ async def test_crashed_create_launch_is_recorded_on_the_session(
     assert conv is not None and conv.labels.get(STARTUP_LABEL) == "failed"
     [error] = items
     assert isinstance(error.data, ErrorData) and "store unavailable" in error.data.message
+
+
+async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input(
+    startup_env: _Env,
+) -> None:
+    """A launch shutdown gives up on before it binds a host leaves no replica to deliver
+    the saved first message, so the session reports that instead of waiting forever."""
+    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+
+    env = startup_env
+    session_id = await _create(env)
+
+    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=5)
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"
+    [pending] = env.conv_store.list_pending_inputs(session_id)
+    assert pending.status == "failed"
+    [error] = env.conv_store.list_items(session_id).data
+    assert isinstance(error.data, ErrorData) and "shut down" in error.data.message
 
 
 async def test_refused_input_does_not_hold_back_the_next_one(

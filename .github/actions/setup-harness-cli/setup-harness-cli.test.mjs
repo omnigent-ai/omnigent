@@ -57,7 +57,7 @@ test("resolver keys default npm caches by committed lock digest", async () => {
   assert.equal(resolved.useLock, true);
   assert.equal(
     resolved.cacheKey,
-    `harness-cli-v1-npm-codex-Linux-X64-0.139.0-${manifest.codex.lockDigest.slice(0, 16)}`,
+    `harness-cli-v1-npm-codex-Linux-X64-0.142.0-${manifest.codex.lockDigest.slice(0, 16)}`,
   );
 });
 

@@ -4,10 +4,11 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -65,6 +66,10 @@ vi.mock("@/hooks/useComposerGitStatus", () => ({
 }));
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
+vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHarnessInventoryModule>()),
+  useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
@@ -241,6 +246,29 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     type("@");
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
     expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+  });
+
+  it("gives Shift+Tab to the open menu before the permission-mode shortcut", async () => {
+    const { setClaudePermissionMode } = useChatStore.getState();
+    // Zustand copies the spy into later states, so put the real setter back.
+    onTestFinished(() =>
+      useChatStore.setState({ setClaudePermissionMode, claudePermissionMode: "" }),
+    );
+    useChatStore.setState({ claudePermissionMode: "default" });
+    const setMode = vi
+      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
+      .mockResolvedValue(undefined);
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    type("@");
+    expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+
+    fireEvent.keyDown(textarea(), { key: "Tab", shiftKey: true });
+    expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(setMode).not.toHaveBeenCalled();
+
+    // Attaching a folder closes the menu, so the next press cycles the mode.
+    fireEvent.keyDown(textarea(), { key: "Tab", shiftKey: true });
+    await waitFor(() => expect(setMode).toHaveBeenCalledWith("auto"));
   });
 
   it("opens a folder to reveal nested files, then delivers the chosen file", () => {

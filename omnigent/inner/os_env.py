@@ -43,6 +43,7 @@ from .credential_proxy import (
 from .datamodel import CredentialProxySpec, OSEnvSpec
 from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
     ContainmentHandle,
     SandboxPolicy,
     activate_sandbox,
@@ -256,6 +257,7 @@ def build_helper_env(
     # but strip again so a spec author can't re-admit one by naming it
     # in ``sandbox.env_passthrough``.
     env.pop(SHARED_ENVIRONMENT_VAR, None)
+    env.pop(HOST_SANDBOX_BACKEND_ENV, None)
     return strip_runner_auth_secrets(env)
 
 

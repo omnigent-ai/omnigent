@@ -134,6 +134,9 @@ def replica_app(
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
 
     uri = f"sqlite:///{root / 'replicas.db'}"
     artifacts = LocalArtifactStore(str(root / "artifacts"))
@@ -182,6 +185,7 @@ def replica_app(
         artifact_store=artifacts,
         agent_cache=cache,
         host_store=HostStore(uri),
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(uri),
         extra_routers=[(control, "/__test", ["test-control"])],
         sandbox_config=ManagedSandboxDeployment.single(
             ManagedSandboxConfig(

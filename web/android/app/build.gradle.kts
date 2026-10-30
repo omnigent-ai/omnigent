@@ -41,13 +41,18 @@ val appVersionName = buildProperty("versionName") ?: "0.1.3"
 // The public first-party Databricks client the desktop and iOS apps use too.
 val databricksOAuthClientId = buildProperty("databricksOAuthClientId") ?: "omnigent"
 val databricksOAuthRedirectUrl =
-    buildProperty("databricksOAuthRedirectUrl") ?: "https://login.databricks.com/mobile-redirect"
+    buildProperty("databricksOAuthRedirectUrl") ?: "ai.omnigent.android://mobile-redirect"
 val databricksOAuthRedirectUri = URI(databricksOAuthRedirectUrl)
 require(
-    databricksOAuthRedirectUri.scheme == "https" &&
-        !databricksOAuthRedirectUri.host.isNullOrBlank() &&
-        !databricksOAuthRedirectUri.path.isNullOrBlank(),
-) { "databricksOAuthRedirectUrl must be an HTTPS URL with a host and path" }
+    (
+        databricksOAuthRedirectUri.scheme == "https" &&
+            !databricksOAuthRedirectUri.host.isNullOrBlank() &&
+            !databricksOAuthRedirectUri.path.isNullOrBlank()
+    ) ||
+        databricksOAuthRedirectUrl == "ai.omnigent.android://mobile-redirect",
+) {
+    "databricksOAuthRedirectUrl must be an HTTPS URL with a host and path or the Android private callback"
+}
 
 fun quotedBuildConfig(value: String): String =
     "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -78,6 +83,8 @@ android {
             databricksOAuthRedirectUri.host
         manifestPlaceholders["databricksOAuthRedirectPath"] =
             databricksOAuthRedirectUri.path
+        manifestPlaceholders["databricksOAuthRedirectAutoVerify"] =
+            (databricksOAuthRedirectUri.scheme == "https").toString()
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.

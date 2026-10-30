@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import pytest
 import tomllib
+
+import pytest
 
 from scripts.build_subpackages import (
     LEGAL_FILES,

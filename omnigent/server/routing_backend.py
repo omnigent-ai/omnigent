@@ -162,7 +162,7 @@ async def route_with_fallback(
         )
     try:
         result = await choice.client.route(message, available_models)
-    except Exception:  # noqa: BLE001 — the judge is the fallback for any failure
+    except Exception:  # the judge is the fallback for any failure
         _logger.warning(
             "routing: the external router raised; falling back to the built-in judge",
             exc_info=True,
