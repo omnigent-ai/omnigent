@@ -25,6 +25,7 @@ class Feature(StrEnum):
 
     SANDBOX_PROFILES = "sandbox_profiles"
     SESSION_ORCHESTRATION = "session_orchestration"
+    RELATED_SESSIONS = "related_sessions"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
@@ -53,6 +54,12 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.RELATED_SESSIONS,
+        description="Related full sessions sharing an existing execution environment",
+        owner="server",
+        review_by_release="0.22.0",
+    ),
     FeatureDefinition(
         feature=Feature.CODEX_PLAN_AT_LAUNCH,
         description="Start Codex in Plan mode with host compatibility checks",

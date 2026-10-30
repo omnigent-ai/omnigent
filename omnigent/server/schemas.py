@@ -941,6 +941,10 @@ class ChildSessionSummary(BaseModel):
     current_task_status: str | None = None
     busy: bool = False
     labels: dict[str, str] = Field(default_factory=dict)
+    session_role: Literal["peer"] | None = None
+    archived: bool = False
+    host_id: str | None = None
+    workspace: str | None = None
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
@@ -1555,6 +1559,9 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         When set, the server inherits the parent's ``runner_id``
         affinity and sets ``parent_conversation_id`` on the child
         conversation. ``None`` for top-level sessions.
+    :param related_to_session_id: Opt-in full peer creation. The source's owner
+        creates a child of its root on the source's existing runner, host and
+        workspace. Requires the ``related_sessions`` feature; fresh context only.
     :param sub_agent_name: For sub-agent sessions, the sub-agent
         type name within the parent's spec tree, e.g.
         ``"summarizer"``. The runner uses this to load the correct
@@ -1699,6 +1706,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
+    related_to_session_id: str | None = Field(default=None, min_length=1, max_length=64)
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
     # A managed create's ``host_id``, moved here at validation so ``host_id``
@@ -2471,6 +2479,7 @@ class SessionResponse(BaseModel):
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
+    archive_changed_session_ids: list[str] | None = None
     model_options: list[NativeModelOption] = Field(default_factory=list)
     inference_configured: bool = False
     inference_error: str | None = None
@@ -2623,6 +2632,8 @@ class UpdateSessionRequest(BaseModel):
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
     delete_worktree: bool = False
+    archive_scope: Literal["session", "tree"] = "session"
+    archive_session_ids: list[str] | None = None
     project_id: str | None = None
     silent: bool = False
 
@@ -2871,6 +2882,8 @@ class SessionForkRequest(_SandboxProfileSelection):
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
     # side-chat tab). It may share its parent's runner.
     side_chat: bool = False
+    # Full peer fork in the source group and execution environment. Owner-only and opt-in.
+    related_session: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2897,6 +2910,16 @@ class SessionForkRequest(_SandboxProfileSelection):
         # Lazy import: schemas is imported by nearly every module, so
         # pulling the (FastAPI/click-importing) managed-hosts module in
         # at module scope would risk import cycles.
+        if self.related_session and (
+            self.side_chat
+            or self.host_type != "external"
+            or self.host_id is not None
+            or self.workspace is not None
+            or self.workspaces is not None
+            or self.sandbox_provider is not None
+            or self.sandbox_profile_id is not None
+        ):
+            raise ValueError("Related forks use the source environment and cannot be side chats")
         from omnigent.server.managed_hosts import parse_repo_workspace
 
         if self.host_type == "managed":

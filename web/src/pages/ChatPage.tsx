@@ -1,3 +1,14 @@
+import {
+  useChatStoreApi,
+  takeFailedSendDraft,
+  composerAttachmentKey,
+  consumePendingInitialPrompt,
+  holdsInitialDraft,
+  isStaleTempConvId,
+  isTempConvId,
+  type PendingInitialPrompt,
+  useChatStore,
+} from "@/store/chatStore";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
@@ -31,7 +42,7 @@ import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
-import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
@@ -90,16 +101,6 @@ import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
-import {
-  takeFailedSendDraft,
-  composerAttachmentKey,
-  consumePendingInitialPrompt,
-  holdsInitialDraft,
-  isStaleTempConvId,
-  isTempConvId,
-  type PendingInitialPrompt,
-  useChatStore,
-} from "@/store/chatStore";
 import {
   isNativeTerminalSession,
   nativeCodingAgentForSession,
@@ -404,8 +405,10 @@ function truncateTitle(raw: string, max = 60): string {
  * and triggers `switchTo` when the URL changes. The store owns the
  * items fetch (no useConversationItems here).
  */
-export function ChatPage() {
-  const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+export function ChatPage({ sessionId }: { sessionId?: string } = {}) {
+  const chatStore = useChatStoreApi();
+  const { conversationId: routeConvId } = useParams<{ conversationId: string }>();
+  const urlConvId = sessionId ?? routeConvId;
   // The id for every server-scoped fetch/hook — `undefined` while the URL holds
   // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
   // the session exists. `switchTo` still gets the raw `urlConvId`.
@@ -490,8 +493,8 @@ export function ChatPage() {
       );
       return;
     }
-    void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate, pathname, search, rebasePath]);
+    void chatStore.getState().switchTo(urlConvId ?? null);
+  }, [chatStore, urlConvId, navigate, pathname, search, rebasePath]);
 
   useConversationRedirect(urlConvId);
 
@@ -622,9 +625,9 @@ export function ChatPage() {
     // predicate already guarantees these, so this never fires at runtime.
     if (initialPrompt === null || !agentId || !urlConvId) return;
     initialPromptSentForConvRef.current = urlConvId;
-    const { send, sendSlashCommand } = useChatStore.getState();
+    const { send, sendSlashCommand } = chatStore.getState();
     dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
-  }, [initialPrompt, urlConvId, loadingConversation, agentId]);
+  }, [chatStore, initialPrompt, urlConvId, loadingConversation, agentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
   // survives a re-mount of the chat surface. Declared BEFORE the
@@ -659,8 +662,8 @@ export function ChatPage() {
     if (runnerOnline !== true) return;
     const { text, files, replyDraft } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files, { replyDraft });
-  }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
+    void chatStore.getState().send(text, agentId, files, { replyDraft });
+  }, [chatStore, pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
   // Pending elicitation = parked on user input — suppress shimmer. Must
   // sit before the early-return guards below (Rules of Hooks). Read through
@@ -857,8 +860,9 @@ export function ChatPage() {
   useEffect(() => {
     const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
     const base = truncateTitle(activeConv?.title ?? subAgentTabTitle ?? fallback);
+    if (sessionId) return;
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
+  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName, sessionId]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const llmModel = useChatStore((s) => s.llmModel);
@@ -981,7 +985,7 @@ export function ChatPage() {
         void reconnect();
         // Posting now could record a failed turn, so the message waits for the host.
         if (sendReconnectsArca) {
-          useChatStore
+          chatStore
             .getState()
             .enqueueMessage(text, files, replyDraft, urlConvId, { waitingForHost: true });
         }
@@ -991,7 +995,7 @@ export function ChatPage() {
       // FIFO immediately when genuinely idle, so nothing stalls. With the
       // always-steer preference on, a mid-turn follow-up skips the queue and is
       // POSTed now instead.
-      const chat = useChatStore.getState();
+      const chat = chatStore.getState();
       // A codex /side command opens its own side chat off the parent thread, so
       // it must POST now even mid-turn rather than park in the queue (see the
       // matching gate in the store's send()). Only the native-fork harness
@@ -1012,7 +1016,7 @@ export function ChatPage() {
         chat.enqueueMessage(text, files, replyDraft);
         return;
       }
-      void useChatStore.getState().send(text, agentId, files, {
+      void chatStore.getState().send(text, agentId, files, {
         replyDraft,
         onConversationCreated: (newId) => {
           // Eager URL update: the moment the server tells us this
@@ -1024,6 +1028,7 @@ export function ChatPage() {
       });
     },
     [
+      chatStore,
       agentId,
       urlConvId,
       runnerOnline,
@@ -1049,13 +1054,14 @@ export function ChatPage() {
         void reconnect();
         return;
       }
-      void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+      void chatStore.getState().sendSlashCommand(name, args, agentId, {
         onConversationCreated: (newId) => {
           navigate(`/c/${newId}`, { replace: true });
         },
       });
     },
     [
+      chatStore,
       agentId,
       urlConvId,
       runnerOnline,
@@ -1068,8 +1074,8 @@ export function ChatPage() {
   );
 
   const onStop = useCallback(() => {
-    useChatStore.getState().stop();
-  }, []);
+    chatStore.getState().stop();
+  }, [chatStore]);
 
   // A client-only conversation has no server session to POST to yet. Keep the
   // composer editable so the user can draft the next message during creation,
@@ -1262,7 +1268,7 @@ export function ChatPage() {
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
-      <SessionLayout mainAgent={mainAgent} />
+      <SessionLayout mainAgent={mainAgent} sessionId={urlConvId} />
       <ReconnectSessionDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
@@ -1305,6 +1311,7 @@ export function ChatPage() {
 }
 
 interface SessionLayoutProps {
+  sessionId?: string;
   mainAgent: React.ReactNode;
 }
 
@@ -1317,13 +1324,17 @@ interface SessionLayoutProps {
  * tab inside the right Workspace rail (WorkspacePanel), so it never floats as a
  * mid-page column.
  */
-function SessionLayout({ mainAgent }: SessionLayoutProps) {
+function SessionLayout({ mainAgent, sessionId }: SessionLayoutProps) {
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
       {/* `relative`: positions MainAgentSurface's persistent terminal overlay
           and the composer's file-drop overlay (both absolute inset-0) against
           the main column. */}
-      <div data-chat-surface className="relative flex min-w-0 flex-1 flex-col">
+      <div
+        data-chat-surface
+        data-chat-session-id={sessionId}
+        className="relative flex min-w-0 flex-1 flex-col"
+      >
         {mainAgent}
       </div>
     </div>
@@ -2253,22 +2264,26 @@ function ComposerStatusLine() {
   );
 }
 
-/**
- * Sub-agent shelf tucked behind the workspace bar's rounded top.
- * Bottom padding keeps the label above the overlap; opaque surfaces prevent
- * the pink tint from bleeding through the bar.
- */
-function SubagentComposerTray({ label }: { label: string }) {
+/** Session identity tucked behind the workspace bar's rounded top. */
+function SessionComposerTray({ label, mainSessionId }: { label: string; mainSessionId?: string }) {
   return (
     <div
-      data-testid="composer-subagent-tray"
+      data-testid={mainSessionId ? "composer-related-session-tray" : "composer-subagent-tray"}
       className="composer-subagent-surface mx-3 -mb-4 flex items-center gap-1.5 rounded-t-2xl px-4 pb-5.5 pt-1.5 text-sm text-brand-accent"
     >
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
-      {/* truncate so a long sub-agent name never wraps the tray to two rows */}
       <span className="min-w-0 truncate">
-        Chatting with sub-agent <strong className="font-semibold">{label}</strong>
+        {mainSessionId ? "Chatting in" : "Chatting with sub-agent"}{" "}
+        <strong className="font-semibold">{label}</strong>
       </span>
+      {mainSessionId && (
+        <Link
+          to={`/c/${mainSessionId}`}
+          className="ml-auto shrink-0 rounded-sm text-xs underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+        >
+          Back to Main
+        </Link>
+      )}
     </div>
   );
 }
@@ -2351,6 +2366,7 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  const chatStore = useChatStoreApi();
   const {
     draft,
     value,
@@ -2526,6 +2542,10 @@ function ComposerImpl(
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
+  const peerMainSessionId =
+    composerSession?.labels?.["omnigent.session_role"] === "peer"
+      ? composerSession.parentSessionId
+      : null;
   const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
   const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
   const hostMcpHarness =
@@ -2575,6 +2595,8 @@ function ComposerImpl(
   useModelPickerHotkey(
     () => setPickerOpenNonce((n) => n + 1),
     showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable && !configBusy,
+    conversationId,
+    chatStore !== useChatStore,
   );
   const hydratedComposerContext = useMemo(
     () => composerContextFromLabels(composerSession?.labels),
@@ -2629,7 +2651,7 @@ function ComposerImpl(
     null,
   );
   const currentPermissionMode = (): string => {
-    const state = useChatStore.getState();
+    const state = chatStore.getState();
     return showClaudePermissionMode ? state.claudePermissionMode : state.codexApprovalMode;
   };
   /** Applies *mode*; resolves whether the session landed on it. */
@@ -2637,18 +2659,18 @@ function ComposerImpl(
     if (isReadOnly || unreachable || configBusyRef.current) return false;
     configBusyRef.current = true;
     setConfigBusy(true);
-    const sourceSessionId = useChatStore.getState().conversationId;
+    const sourceSessionId = chatStore.getState().conversationId;
     try {
-      const store = useChatStore.getState();
+      const store = chatStore.getState();
       if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
-      if (useChatStore.getState().conversationId !== sourceSessionId) return false;
+      if (chatStore.getState().conversationId !== sourceSessionId) return false;
       // The store reconciles to the mode the server confirms the session reached.
       const landed = currentPermissionMode() === mode;
       if (landed) cycleCursorRef.current = null;
       return landed;
     } catch (error) {
-      if (useChatStore.getState().conversationId === sourceSessionId)
+      if (chatStore.getState().conversationId === sourceSessionId)
         setCommandError(error instanceof Error ? error.message : "Unable to change permissions");
       return false;
     } finally {
@@ -2668,7 +2690,7 @@ function ComposerImpl(
     if (!permissionControlInteractive) return false;
     // Hold the key while a change is in flight so focus doesn't jump away.
     if (configBusyRef.current) return true;
-    const sessionId = useChatStore.getState().conversationId;
+    const sessionId = chatStore.getState().conversationId;
     // Read the store, not the render: a change may have landed since the last render.
     const selected = currentPermissionMode();
     if (!isSwitchableMode(selected)) return false;
@@ -2682,7 +2704,7 @@ function ComposerImpl(
     const next = resumed ?? nextCycledPermissionMode(permissionOptions, selected);
     if (next === null) return false;
     void changePermission(next).then((landed) => {
-      if (!landed && useChatStore.getState().conversationId === sessionId)
+      if (!landed && chatStore.getState().conversationId === sessionId)
         cycleCursorRef.current = { sessionId, from: currentPermissionMode(), past: next };
     });
     return true;
@@ -2729,9 +2751,14 @@ function ComposerImpl(
 
   // Ctrl+Shift+L focuses the composer input from anywhere in the session view.
   // No-op on mobile, where programmatic focus would pop the software keyboard.
-  useFocusComposerHotkey(() => {
-    if (!isMobileRef.current) textareaRef.current?.focus({ preventScroll: true });
-  });
+  useFocusComposerHotkey(
+    () => {
+      if (!isMobileRef.current) textareaRef.current?.focus({ preventScroll: true });
+    },
+    true,
+    conversationId,
+    chatStore !== useChatStore,
+  );
 
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
@@ -2930,7 +2957,7 @@ function ComposerImpl(
     setCommandError(null);
     setPlanModeBusy(true);
     try {
-      await useChatStore.getState().setCodexPlanMode(!codexPlanMode);
+      await chatStore.getState().setCodexPlanMode(!codexPlanMode);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
@@ -3026,16 +3053,16 @@ function ComposerImpl(
       }
       return fresh.length > 0 ? [...prev, ...fresh] : prev;
     });
-    useChatStore.getState().clearPendingComposerAttachments();
+    chatStore.getState().clearPendingComposerAttachments();
     textareaRef.current?.focus();
     // Defense-in-depth against the cross-session leak: if the composer unmounts
     // while an entry is still queued (route change, panel close, the
     // loading-conversation gate during a session switch), clear the queue so
     // the next-mounted composer doesn't drain a stale chip. ``switchTo`` also
     // resets the queue, but this closes the non-switch unmount paths too.
-    return () => useChatStore.getState().clearPendingComposerAttachments();
+    return () => chatStore.getState().clearPendingComposerAttachments();
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
-  }, [pendingComposerAttachments, setMentionedItems]);
+  }, [chatStore, pendingComposerAttachments, setMentionedItems]);
 
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
@@ -3080,7 +3107,7 @@ function ComposerImpl(
     const pending = pendingFailedSendRestore.current;
     if (pending?.stableId === restoredSendDraft.stableId && pending.draft === draft) return;
     pendingFailedSendRestore.current = null;
-    useChatStore.setState({ restoredSendDraft: null });
+    chatStore.setState({ restoredSendDraft: null });
     const expected = serializeReplyDraft(
       restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
     );
@@ -3092,7 +3119,7 @@ function ComposerImpl(
     attachmentsRef.current.replaceFiles([]);
     dirtyRef.current = false;
     if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
-  }, [restoredSendDraft, conversationId, settledConversationId, replaceText, draft]);
+  }, [chatStore, restoredSendDraft, conversationId, settledConversationId, replaceText, draft]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -3124,7 +3151,7 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
-        void useChatStore
+        void chatStore
           .getState()
           .clearContext()
           .catch((err: unknown) => {
@@ -3151,7 +3178,7 @@ function ComposerImpl(
           setCommandError(`/compact does not accept arguments for ${harnessName}`);
           return true;
         }
-        const chat = useChatStore.getState();
+        const chat = chatStore.getState();
         if (
           sessionHarness === "codex-native" &&
           (chat.status === "streaming" || chat.sessionStatus === "running") &&
@@ -3181,7 +3208,7 @@ function ComposerImpl(
           onSend(command);
           return true;
         }
-        void useChatStore
+        void chatStore
           .getState()
           .compact()
           .catch((err: unknown) => {
@@ -3200,7 +3227,7 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
-        void useChatStore
+        void chatStore
           .getState()
           .setEffort(level)
           .catch((err: unknown) => {
@@ -3215,7 +3242,7 @@ function ComposerImpl(
         if (!showModel) return false;
         const target = arg.trim();
         if (!target) {
-          const { sessionModelOverride, llmModel } = useChatStore.getState();
+          const { sessionModelOverride, llmModel } = chatStore.getState();
           const current = sessionModelOverride
             ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
@@ -3239,8 +3266,8 @@ function ComposerImpl(
         // not a transient composer hint. Surface only failures inline here.
         // Native reported-model sessions additionally show the pending
         // indicator until the harness's own report settles the ask.
-        const harness = useChatStore.getState().sessionHarness;
-        void useChatStore
+        const harness = chatStore.getState().sessionHarness;
+        void chatStore
           .getState()
           .setModel(reset ? null : target, {
             expectConfirmation: harness === "claude-native" || harness === "codex-native",
@@ -3251,7 +3278,7 @@ function ComposerImpl(
         return true;
       }
       case "/context": {
-        const state = useChatStore.getState();
+        const state = chatStore.getState();
         const { contextWindow, llmModel, sessionModelOverride, tokensUsed, blocks } = state;
         const lines: string[] = [];
         if (sessionModelOverride) lines.push(`Model: ${sessionModelOverride} (override)`);
@@ -3497,11 +3524,11 @@ function ComposerImpl(
     startSideChat(selectedText) {
       // Quote in the visible side chat, or open a pending tab immediately.
       // A pending tab creates its fork only when the user sends.
-      const sourceId = useChatStore.getState().conversationId;
+      const sourceId = chatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
         return;
       }
-      const store = useChatStore.getState();
+      const store = chatStore.getState();
       const target = store.sideChatSelectionTarget;
       if (target?.parentId === sourceId) {
         store.updateSideChatComposer(target.childId, (current) => ({
@@ -3577,7 +3604,7 @@ function ComposerImpl(
     // at a still-launching runner. Codex forks in-process instead (its /side
     // reaches the runner as plaintext).
     const openGenericSideChat = (question: string) => {
-      const sourceId = useChatStore.getState().conversationId;
+      const sourceId = chatStore.getState().conversationId;
       if (sourceId === null) return;
       setCommandError(null);
       createSideChat(sourceId).then(
@@ -3586,7 +3613,7 @@ function ComposerImpl(
           // create keeps the user's typed question instead of dropping it.
           dirtyRef.current = true;
           setValue("");
-          useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
+          chatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
         },
         // Surface the failure as a toast, not an inline composer error; the
         // composer text is left intact for a retry.
@@ -3913,11 +3940,14 @@ function ComposerImpl(
           onReorder={reorderQueuedMessage}
           widthClassName="mx-3 w-auto"
         />
-        {/* Sub-agent context tray — peeks above the workspace bar; reserves
-            its own layout slot so the bar sits below it (see
-            SubagentComposerTray). Truthy (not just non-null) so an empty
-            label never peeks a nameless tray. */}
-        {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+        {peerMainSessionId ? (
+          <SessionComposerTray
+            label={composerSession?.title || "Session"}
+            mainSessionId={peerMainSessionId}
+          />
+        ) : subAgentLabel ? (
+          <SessionComposerTray label={subAgentLabel} />
+        ) : null}
         <ComposerWorkspaceBar
           data-testid="composer-workspace-controls"
           className={cn(
@@ -4198,11 +4228,11 @@ function ComposerImpl(
                           dirtyRef.current = true;
                           return;
                         }
-                        const sourceId = useChatStore.getState().conversationId;
+                        const sourceId = chatStore.getState().conversationId;
                         if (sourceId === null) return;
                         createSideChat(sourceId).then(
                           ({ childSessionId }) =>
-                            useChatStore.setState({
+                            chatStore.setState({
                               sideChatToOpen: { childId: childSessionId, parentId: sourceId },
                             }),
                           () => toast.error("Couldn't start a side chat for this session."),
@@ -4705,6 +4735,7 @@ function SessionHarnessPicker({
   disabled: boolean;
   openNonce?: number;
 }) {
+  const chatStore = useChatStoreApi();
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
@@ -4814,13 +4845,13 @@ function SessionHarnessPicker({
     }
   };
   const changeModel = async (modelId: string | null, nextEffort?: string) => {
-    const store = useChatStore.getState();
+    const store = chatStore.getState();
     const sourceSessionId = store.conversationId;
     await store.setModel(modelId, {
       expectConfirmation:
         (modelPickerKind === "claude" || modelPickerKind === "codex") && !modelsFromLaunchPreview,
     });
-    if (useChatStore.getState().conversationId !== sourceSessionId) return;
+    if (chatStore.getState().conversationId !== sourceSessionId) return;
     if (
       selectedEffort !== null &&
       (isFusionModelUid(modelId) ||
@@ -4832,11 +4863,7 @@ function SessionHarnessPicker({
           ) === null))
     )
       await store.setEffort(null);
-    if (
-      costRoutingEligible &&
-      routingOn &&
-      useChatStore.getState().conversationId === sourceSessionId
-    )
+    if (costRoutingEligible && routingOn && chatStore.getState().conversationId === sourceSessionId)
       await store.setCostControlMode("off");
   };
   const selectModel = (modelId: string | null) => {
@@ -4845,7 +4872,7 @@ function SessionHarnessPicker({
   };
   const selectEffort = (effort: string) => {
     cancelCycle();
-    void apply(() => useChatStore.getState().setEffort(effort));
+    void apply(() => chatStore.getState().setEffort(effort));
   };
   // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
   // baked in, so it carries no separate reasoning effort.
@@ -5016,7 +5043,7 @@ function SessionHarnessPicker({
         : undefined;
   const applyCycle = () => {
     const draft = cycleDraftRef.current;
-    if (!draft || disabled || draft.sessionId !== useChatStore.getState().conversationId) {
+    if (!draft || disabled || draft.sessionId !== chatStore.getState().conversationId) {
       dismissPreview();
       return;
     }
@@ -5044,8 +5071,8 @@ function SessionHarnessPicker({
     cancelCycle();
     void apply(async () => {
       if (modelChanged) await changeModel(draft.model!.id, effort);
-      if (draft.sessionId !== useChatStore.getState().conversationId) return;
-      if (effortChanged) await useChatStore.getState().setEffort(effort);
+      if (draft.sessionId !== chatStore.getState().conversationId) return;
+      if (effortChanged) await chatStore.getState().setEffort(effort);
     }, modelChanged && modelPickWakesSession);
   };
   const { preview, dismissPreview } = useComposerConfigCycleHotkeys(
@@ -5073,9 +5100,7 @@ function SessionHarnessPicker({
             disabled={busy || pendingModelChange !== null}
             onSelect={() => {
               cancelCycle();
-              void apply(() =>
-                useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"),
-              );
+              void apply(() => chatStore.getState().setCostControlMode(routingOn ? "off" : "on"));
             }}
             data-active={routingOn ? "true" : undefined}
             className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"

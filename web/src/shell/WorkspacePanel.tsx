@@ -32,6 +32,8 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   ALT_KEY,
@@ -898,7 +900,11 @@ function WorkspacePanelImpl({
   useNewBrowserHotkey(addBrowser, showBrowserTab && !pending && !contained);
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
-  const sideChats = useSideChats(conversationId);
+  const relatedSessions = isFeatureEnabled(useServerInfo(), "related_sessions");
+  const sideChats = useSideChats(
+    conversationId,
+    relatedSessions ? `related:${rootSessionId ?? conversationId}` : undefined,
+  );
   const hasSubagentTabs = sideChats.tabs.some((id) => subagentSessionIdFromTab(id) !== null);
   useEffect(() => {
     onHasSubagentTabsChange?.(hasSubagentTabs);

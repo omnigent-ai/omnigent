@@ -25,7 +25,7 @@ const SCROLL_SETTLE_MS = 120;
 // Absolute cap so a flash always happens even if scroll events never settle.
 const SCROLL_SETTLE_MAX_MS = 1200;
 
-let cancelPendingFlash: (() => void) | null = null;
+const pendingFlashes = new WeakMap<EventTarget, () => void>();
 
 // Nearest scrollable ancestor — the element scrollIntoView actually moves and
 // whose `scroll` events tell us when motion stops. Falls back to window.
@@ -49,18 +49,22 @@ export function scrollToMessage(
   messageId: string,
   flash?: (id: string) => void,
   ensureVisible?: (id: string) => boolean,
+  sessionId?: string | null,
 ): void {
   // The row may be windowed out of the DOM (virtualized transcript). Ask the
   // transcript to scroll it into the mounted range first; its node then mounts
   // on the next frame, so retry the DOM lookup + centering scroll there.
   const scrolledIntoWindow = ensureVisible?.(messageId) ?? false;
+  const scope = sessionId
+    ? (document.querySelector(`[data-chat-session-id="${CSS.escape(sessionId)}"]`) ?? document)
+    : document;
   const el =
-    document.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`) ??
-    document.querySelector(`[data-user-message-id="${CSS.escape(messageId)}"]`);
+    scope.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`) ??
+    scope.querySelector(`[data-user-message-id="${CSS.escape(messageId)}"]`);
   if (!el) {
     if (scrolledIntoWindow) {
       // Row is being mounted by the virtualizer — center on it next frame.
-      requestAnimationFrame(() => scrollToMessage(messageId, flash));
+      requestAnimationFrame(() => scrollToMessage(messageId, flash, undefined, sessionId));
       return;
     }
     // Fail loud: id exists in the list but DOM anchor is missing.
@@ -70,13 +74,14 @@ export function scrollToMessage(
 
   // Supersede the previous jump's pending flash so rapid nav only flashes
   // the message we finally land on.
-  cancelPendingFlash?.();
+  const scroller: EventTarget = getScrollParent(el) ?? window;
+  pendingFlashes.get(scroller)?.();
 
   // Opening a tall transcript starts StickToBottom locked to the bottom.
   // Without releasing that lock, the next content-resize scrollToBottom
   // yanks the view back — deep-link / rail jumps look like a no-op on
   // multi-message sessions (single short transcripts stay in view anyway).
-  releaseConversationScrollLock();
+  releaseConversationScrollLock(el);
 
   el.scrollIntoView({ block: "center", behavior: "smooth" });
 
@@ -86,7 +91,6 @@ export function scrollToMessage(
 
   // Defer the flash until the smooth-scroll settles. On a long jump the
   // highlight would otherwise burn out before the message is on screen.
-  const scroller: EventTarget = getScrollParent(el) ?? window;
   let settleTimer = 0;
   let maxTimer = 0;
   let done = false;
@@ -95,7 +99,7 @@ export function scrollToMessage(
     window.clearTimeout(settleTimer);
     window.clearTimeout(maxTimer);
     scroller.removeEventListener("scroll", onScroll);
-    if (cancelPendingFlash === cleanup) cancelPendingFlash = null;
+    if (pendingFlashes.get(scroller) === cleanup) pendingFlashes.delete(scroller);
   }
 
   function finish(): void {
@@ -110,7 +114,7 @@ export function scrollToMessage(
     settleTimer = window.setTimeout(finish, SCROLL_SETTLE_MS);
   }
 
-  cancelPendingFlash = cleanup;
+  pendingFlashes.set(scroller, cleanup);
   scroller.addEventListener("scroll", onScroll, { passive: true });
   // First timer doubles as the "already in view, nothing scrolled" fast path;
   // each scroll event reschedules it while the smooth-scroll is in motion.
@@ -122,8 +126,9 @@ export function scrollToUserMessage(
   itemId: string,
   flash?: (id: string) => void,
   ensureVisible?: (id: string) => boolean,
+  sessionId?: string | null,
 ): void {
-  scrollToMessage(itemId, flash, ensureVisible);
+  scrollToMessage(itemId, flash, ensureVisible, sessionId);
 }
 
 export function useUserMessageNav(
@@ -132,6 +137,7 @@ export function useUserMessageNav(
   // before the centering scroll. Omitted in tests / non-virtualized callers.
   ensureItemVisible?: (id: string) => boolean,
 ): UserMessageNav {
+  const sessionId = useChatStore((s) => s.conversationId);
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const [anchorId, setAnchorId] = useState<string | null>(null);
 
@@ -149,16 +155,16 @@ export function useUserMessageNav(
       ? userMessageIds[userMessageIds.length - 1]
       : userMessageIds[currentIndex - 1];
     setAnchorId(target);
-    scrollToUserMessage(target, flashUserMessage, ensureItemVisible);
-  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible]);
+    scrollToUserMessage(target, flashUserMessage, ensureItemVisible, sessionId);
+  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible, sessionId]);
 
   const goNext = useCallback(() => {
     if (outside) return;
     if (currentIndex >= userMessageIds.length - 1) return;
     const target = userMessageIds[currentIndex + 1];
     setAnchorId(target);
-    scrollToUserMessage(target, flashUserMessage, ensureItemVisible);
-  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible]);
+    scrollToUserMessage(target, flashUserMessage, ensureItemVisible, sessionId);
+  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible, sessionId]);
 
   // Stable identity so consumers can put the return value in an
   // effect dep array without re-registering on every render.

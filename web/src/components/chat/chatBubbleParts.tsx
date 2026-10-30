@@ -1,3 +1,5 @@
+import { useRebasePath } from "@/lib/routing";
+import { useChatStoreApi, useChatStore, type PendingUserMessage } from "@/store/chatStore";
 // Bubble rendering, scroll helpers, and the working-indicator cluster for the
 // chat transcript. Extracted from ChatPage.tsx so <Transcript> can import them
 // without the ChatPage ↔ Transcript module cycle. ChatPage re-exports these for
@@ -68,7 +70,6 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -712,6 +713,8 @@ function useCopyMessageLink(messageId: string | null): {
   isLinkCopied: boolean;
   handleCopyLink: () => void;
 } {
+  const sessionId = useContext(ConversationScopeContext);
+  const rebasePath = useRebasePath();
   const [isLinkCopied, setIsLinkCopied] = useState(false);
   const timeoutRef = useRef<number>(0);
   const isMobile = useIsMobileViewport();
@@ -720,7 +723,12 @@ function useCopyMessageLink(messageId: string | null): {
 
   const handleCopyLink = useCallback(() => {
     if (!messageId || isLinkCopied) return;
-    copyText(buildMessageDeepLink(messageId)).then(
+    copyText(
+      buildMessageDeepLink(
+        messageId,
+        sessionId ? new URL(rebasePath(`/c/${sessionId}`), window.location.href).href : undefined,
+      ),
+    ).then(
       () => {
         setIsLinkCopied(true);
         window.clearTimeout(timeoutRef.current);
@@ -733,7 +741,7 @@ function useCopyMessageLink(messageId: string | null): {
         console.warn("Failed to copy message link", error);
       },
     );
-  }, [messageId, isLinkCopied, isMobile]);
+  }, [messageId, isLinkCopied, isMobile, sessionId, rebasePath]);
 
   return { isLinkCopied, handleCopyLink };
 }
@@ -999,6 +1007,7 @@ function AssistantBubble({
   actionsPersistent?: boolean;
   recoveryDisabled?: boolean;
 }) {
+  const chatStore = useChatStoreApi();
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
@@ -1040,9 +1049,9 @@ function AssistantBubble({
         // switching the active conversation out from under a queued retry.
         const current = scopedConversationId
           ? conversationRegistry.peek(scopedConversationId)?.getState()
-          : useChatStore.getState();
+          : chatStore.getState();
         if (!current) throw new Error("The selected session has changed");
-        if (!scopedConversationId && useChatStore.getState().conversationId !== conversationId) {
+        if (!scopedConversationId && chatStore.getState().conversationId !== conversationId) {
           throw new Error("The selected session has changed");
         }
         if (!isLastAssistant) throw new Error("Only the latest failed turn can be retried");
@@ -1072,7 +1081,7 @@ function AssistantBubble({
         throw error;
       }
     },
-    [conversationId, scopedConversationId, isLastAssistant, queryClient],
+    [chatStore, conversationId, scopedConversationId, isLastAssistant, queryClient],
   );
 
   if (bubble.items.length === 0) return null;
@@ -1381,6 +1390,7 @@ export function HistoryAutoLoader({
    */
   rowCount: number;
 }) {
+  const chatStore = useChatStoreApi();
   // useStickToBottomContext exposes scrollRef in the runtime context even though
   // the public TS types only declare isAtBottom and scrollToBottom. Cast to it.
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
@@ -1583,7 +1593,7 @@ export function HistoryAutoLoader({
       lastUpwardTickAtRef.current = Number.NEGATIVE_INFINITY;
     }
 
-    const state = useChatStore.getState();
+    const state = chatStore.getState();
     if (
       !state.oldestItemId ||
       !state.hasMoreHistory ||
@@ -1635,6 +1645,7 @@ export function HistoryAutoLoader({
     seekPagesLeftRef.current -= 1;
     void state.loadMoreHistory();
   }, [
+    chatStore,
     ctx.scrollRef,
     historyGeneration,
     loadingMoreHistory,
@@ -1696,6 +1707,7 @@ export function LatestTurnSpacer({
   measureRef?: React.RefObject<(() => void) | null>;
   remeasureNonce?: number;
 } = {}) {
+  const chatStore = useChatStoreApi();
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
@@ -1745,7 +1757,7 @@ export function LatestTurnSpacer({
       initialCommittedUserIdsRef.current = new Set(committedUserIds);
     } else {
       const ids = new Set<string>();
-      for (const block of useChatStore.getState().blocks) {
+      for (const block of chatStore.getState().blocks) {
         if (
           block.type === "user_message" &&
           !isSystemUserContent(block.content) &&
@@ -1798,7 +1810,7 @@ export function LatestTurnSpacer({
         const hasCommittedAnchor =
           hasCommittedAnchorProp ??
           (initialCommittedUserIdsRef.current!.size > 0 ||
-            useChatStore.getState().blocks.some((b) => b.type !== "user_message"));
+            chatStore.getState().blocks.some((b) => b.type !== "user_message"));
         // Rows not mounted yet: retry on the next frame, up to a small budget,
         // so a resize that never comes can't leave the spacer uncaptured — and
         // an anchorless turn (tool-only trailing bubble) still settles instead
@@ -1878,7 +1890,7 @@ export function LatestTurnSpacer({
     );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
-  }, [ctx.scrollRef, hasCommittedAnchorProp, scrollElement, topGapPx]);
+  }, [chatStore, ctx.scrollRef, hasCommittedAnchorProp, scrollElement, topGapPx]);
 
   // A block-count change shifts content; force past the same-node skip. The
   // range nonce (scroll) does NOT force — the guard skips it when the anchor
@@ -1978,6 +1990,7 @@ export function JumpToTopButton({
   scroller: ConversationScroller | null;
   hasMoreHistory: boolean;
 }) {
+  const chatStore = useChatStoreApi();
   const [atTop, setAtTop] = useState(true);
   const [hovering, setHovering] = useState(false);
   const [jumping, setJumping] = useState(false);
@@ -2062,8 +2075,8 @@ export function JumpToTopButton({
       // commit. The iteration cap is a backstop against a server that never
       // reports done.
       /* oxlint-disable no-await-in-loop */
-      for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
-        await useChatStore.getState().loadMoreHistory();
+      for (let i = 0; i < 1000 && chatStore.getState().hasMoreHistory; i++) {
+        await chatStore.getState().loadMoreHistory();
         // Keep the lock released — a prepend that briefly lands us near the
         // bottom can otherwise re-arm it via the library's scroll handler.
         state.isAtBottom = false;
@@ -2083,7 +2096,7 @@ export function JumpToTopButton({
     } finally {
       setJumping(false);
     }
-  }, [scroller]);
+  }, [chatStore, scroller]);
 
   return (
     <div

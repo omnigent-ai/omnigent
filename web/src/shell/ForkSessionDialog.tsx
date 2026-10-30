@@ -1,4 +1,7 @@
+import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
+import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -757,9 +760,11 @@ export function ForkSessionForm(
     props.sourceSessionId,
     { hostId: props.sourceHostId },
   );
-  const disabledReason =
-    forkDisabledReason ??
-    (props.workspaceRecovery ? workspaceRecoveryDisabledReason(forkSandboxProvider) : undefined);
+  // Related forks reuse the live environment; provider provisioning restrictions do not apply.
+  const disabledReason = props.relatedSession
+    ? undefined
+    : (forkDisabledReason ??
+      (props.workspaceRecovery ? workspaceRecoveryDisabledReason(forkSandboxProvider) : undefined));
   if (disabledReason) {
     const loading = disabledReason === SESSION_ACTIONS_LOADING;
     return (
@@ -790,7 +795,12 @@ export function ForkSessionForm(
       </>
     );
   }
-  return <SupportedForkSessionForm {...props} sandboxOnlyProvider={forkSandboxProvider} />;
+  return (
+    <SupportedForkSessionForm
+      {...props}
+      sandboxOnlyProvider={props.relatedSession ? undefined : forkSandboxProvider}
+    />
+  );
 }
 
 function SupportedForkSessionForm({
@@ -801,6 +811,7 @@ function SupportedForkSessionForm({
   sourceGitBranch,
   upToResponseId,
   workspaceRecovery = false,
+  relatedSession = false,
   sandboxOnlyProvider,
   visible,
   onClose,
@@ -812,12 +823,18 @@ function SupportedForkSessionForm({
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
   workspaceRecovery?: boolean;
+  relatedSession?: boolean;
   /** The only target offered: a fresh sandbox from this provider. */
   sandboxOnlyProvider?: string;
   visible: boolean;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
+  const openInPanel = useContext(SubagentPanelOpenerContext);
+  const openForkRef = useRef<(id: string) => void>(() => {});
+  openForkRef.current = (id) => {
+    if (!relatedSession || !openInPanel?.(id)) navigate(`/c/${id}`);
+  };
   const queryClient = useQueryClient();
   const formRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -835,7 +852,9 @@ function SupportedForkSessionForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // `submitting` covers the directory pre-flight; `request` the clone after it.
-  const requestKey = cloneKey(sourceSessionId, upToResponseId, workspaceRecovery);
+  const requestKey =
+    cloneKey(sourceSessionId, upToResponseId, workspaceRecovery) +
+    (relatedSession ? ":related" : "");
   const request = useSyncExternalStore(subscribeClones, () => pendingClone(requestKey));
   const busy = submitting || request !== undefined;
   // Read through a ref so a clone that settles later closes with the latest host callback.
@@ -844,7 +863,7 @@ function SupportedForkSessionForm({
   const [listener] = useState<CloneListener>(() => ({
     onSuccess: (forkId) => {
       onCloseRef.current();
-      navigate(`/c/${forkId}`);
+      openForkRef.current(forkId);
     },
     onError: setError,
   }));
@@ -881,10 +900,13 @@ function SupportedForkSessionForm({
   // directory to start; a sandbox-only fork always picks its sandbox. Others
   // fork with just name + agent (no directory to pick).
   const sandboxOnly = sandboxOnlyProvider !== undefined;
-  const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace) || sandboxOnly;
+  const isCodingSource =
+    !relatedSession && (workspaceRecovery || Boolean(sourceWorkspace) || sandboxOnly);
 
   // Host/dir/worktree state — only meaningful for a coding source.
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+  const [selectedHostId, setSelectedHostId] = useState<string | null>(
+    relatedSession ? (sourceHostId ?? null) : null,
+  );
   const [workspace, setWorkspace] = useState("");
   const [branchName, setBranchName] = useState("");
   const [browsing, setBrowsing] = useState(false);
@@ -1536,7 +1558,7 @@ function SupportedForkSessionForm({
         }
       }
       if (token.cancelled) return;
-      clone = beginClone(requestKey, listener, (forkId) => navigate(`/c/${forkId}`));
+      clone = beginClone(requestKey, listener, (forkId) => openForkRef.current(forkId));
       setSubmitting(false);
       const trimmed = title.trim();
       // Empty title → omit so the server derives "Fork of <source title>".
@@ -1547,6 +1569,7 @@ function SupportedForkSessionForm({
         agentId: switching ? agentChoice : undefined,
         upToResponseId: upToResponseId ?? undefined,
         config: runConfig,
+        ...(relatedSession ? { relatedSession: true } : {}),
         // Sandbox clone: the server provisions the host, so the fork call
         // carries the compute request itself and no launchRunner follows.
         // Older servers accept one explicit workspace or unchanged inherited repositories.
@@ -1568,6 +1591,11 @@ function SupportedForkSessionForm({
             }
           : undefined,
       });
+      if (relatedSession && fork.parentSessionId) {
+        void queryClient.invalidateQueries({
+          queryKey: childSessionsQueryKey(fork.parentSessionId),
+        });
+      }
       // Coding fork: launch the runner in the BACKGROUND, then navigate
       // into the (already-created, unbound) clone immediately — awaiting the
       // launch would block the modal for a worktree create (up to minutes)
@@ -1730,6 +1758,11 @@ function SupportedForkSessionForm({
               when a target is available (sandbox rows pinned above the
               connected hosts, with a collapsible "connect another" CLI hint),
               or the connect instructions directly when none is. */}
+        {relatedSession && (
+          <p className="text-sm text-muted-foreground">
+            Uses this session’s current environment{sourceWorkspace ? ` · ${sourceWorkspace}` : ""}.
+          </p>
+        )}
         {isCodingSource && (
           <div className="flex flex-col gap-2">
             <span className="text-sm font-medium text-muted-foreground">Host</span>
@@ -2178,7 +2211,13 @@ function SupportedForkSessionForm({
           aria-disabled={!canSubmit || undefined}
           className="aria-disabled:opacity-50"
         >
-          {workspaceRecovery ? "Continue" : isCodingSource ? "Clone & start" : "Clone"}
+          {relatedSession
+            ? "Fork session"
+            : workspaceRecovery
+              ? "Continue"
+              : isCodingSource
+                ? "Clone & start"
+                : "Clone"}
         </Button>
       </DialogFooter>
     </>
@@ -2213,6 +2252,7 @@ export function ForkSessionDialog({
   sourceGitBranch,
   upToResponseId,
   workspaceRecovery = false,
+  relatedSession = false,
   open,
   onOpenChange,
 }: {
@@ -2223,19 +2263,22 @@ export function ForkSessionDialog({
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
   workspaceRecovery?: boolean;
+  relatedSession?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const truncated = upToResponseId != null;
   // Shown in the title's info tooltip (and a visually-hidden DialogDescription
   // for screen readers). Coding sources also start on a picked host/directory.
-  const cloneDescription = `${
-    truncated
-      ? "Copies this session's history up to the selected response into a new session you own — messages after it aren't carried over"
-      : "Copies this session's history into a new session you own"
-  }${
-    sourceWorkspace ? ", then starts it on the host and directory you pick" : ""
-  }. Comments aren't copied, and changes in the clone won't affect the original.`;
+  const cloneDescription = relatedSession
+    ? "Copies this conversation into a full session in the same group. The sessions share the current host and working directory."
+    : `${
+        truncated
+          ? "Copies this session's history up to the selected response into a new session you own — messages after it aren't carried over"
+          : "Copies this session's history into a new session you own"
+      }${
+        sourceWorkspace ? ", then starts it on the host and directory you pick" : ""
+      }. Comments aren't copied, and changes in the clone won't affect the original.`;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -2245,11 +2288,13 @@ export function ForkSessionDialog({
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-1.5">
-            {workspaceRecovery
-              ? "Continue in another directory"
-              : truncated
-                ? "Fork from this response"
-                : "Clone session"}
+            {relatedSession
+              ? "Fork session"
+              : workspaceRecovery
+                ? "Continue in another directory"
+                : truncated
+                  ? "Fork from this response"
+                  : "Clone session"}
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -2283,6 +2328,7 @@ export function ForkSessionDialog({
           sourceGitBranch={sourceGitBranch}
           upToResponseId={upToResponseId}
           workspaceRecovery={workspaceRecovery}
+          relatedSession={relatedSession}
           visible={open}
           onClose={() => onOpenChange(false)}
         />

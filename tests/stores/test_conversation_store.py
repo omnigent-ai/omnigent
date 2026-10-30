@@ -668,6 +668,38 @@ def test_reported_model_round_trips_beside_the_request(
     assert fetched.reported_model == "claude-opus-4-8[1m]"
 
 
+def test_archive_subtree_preserves_prior_archives_and_rejects_foreign_undo(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    root = conversation_store.create_conversation()
+    peer = conversation_store.create_conversation(parent_conversation_id=root.id)
+    helper = conversation_store.create_conversation(parent_conversation_id=peer.id)
+    old_archive = conversation_store.create_conversation(parent_conversation_id=root.id)
+    unrelated = conversation_store.create_conversation()
+    conversation_store.update_conversation(old_archive.id, archived=True)
+    conversation_store.set_labels(root.id, {"omnigent.pinned.owner": "1"})
+
+    changed = conversation_store.archive_subtree(
+        root.id, True, unpin_label="omnigent.pinned.owner"
+    )
+    assert set(changed or []) == {root.id, peer.id, helper.id}
+    assert "omnigent.pinned.owner" not in conversation_store.get_conversation(root.id).labels
+    with pytest.raises(ValueError, match="outside this group"):
+        conversation_store.archive_subtree(root.id, False, only_ids=[root.id, unrelated.id])
+    assert conversation_store.get_conversation(root.id).archived is True
+    assert conversation_store.archive_subtree(root.id, True) == []
+
+    assert set(conversation_store.archive_subtree(root.id, False, only_ids=changed)) == set(
+        changed
+    )
+    for session_id in changed:
+        restored = conversation_store.get_conversation(session_id)
+        assert restored.archived is False
+        assert "omnigent.archived_at" not in restored.labels
+    assert conversation_store.get_conversation(old_archive.id).archived is True
+    assert conversation_store.get_conversation(unrelated.id).archived is False
+
+
 def test_update_archived_round_trip(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -1,5 +1,10 @@
+import type { ContextType } from "react";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { SidebarDataContext } from "@/hooks/useSidebarData";
+import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import type { Decorator, Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent } from "storybook/test";
+import { userEvent, within } from "storybook/test";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import type { Session } from "@/lib/types";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
@@ -39,14 +44,21 @@ function rootSession(overrides: Partial<Session> = {}): Session {
   };
 }
 
+const storySidebarData = { mine: { data: { pages: [{ data: [] }] } } } as unknown as ContextType<
+  typeof SidebarDataContext
+>;
+const storyPanelOpener = () => true;
+
 function panelEnvironment({
   activeId,
   session,
   tree,
+  related = false,
 }: {
   activeId: string;
   session: Session;
   tree: Record<string, ChildSessionInfo[]>;
+  related?: boolean;
 }): Decorator {
   const referencedIds = new Set(
     Object.values(tree)
@@ -63,12 +75,74 @@ function panelEnvironment({
         }
         for (const id of referencedIds) {
           if (!(id in tree)) queryClient.setQueryData(childSessionsQueryKey(id), []);
+          const summary = Object.values(tree)
+            .flat()
+            .find((entry) => entry.id === id);
+          queryClient.setQueryData(
+            ["session", id],
+            rootSession({
+              id,
+              parentSessionId: session.id,
+              title: summary?.title,
+              labels: summary?.labels,
+              hostId: "demo-host",
+            }),
+          );
+        }
+        queryClient.setQueryData(["available-agents-catalog"], {
+          agents: [
+            {
+              id: "agent-claude",
+              name: "claude-native-ui",
+              display_name: "Claude Code",
+              harness: "claude-native",
+              description: "Work with Claude Code in this workspace",
+              skills: [],
+              builtin: true,
+            },
+            {
+              id: "agent-codex",
+              name: "codex-native-ui",
+              display_name: "Codex",
+              harness: "codex-native",
+              description: "Work with Codex in this workspace",
+              skills: [],
+              builtin: true,
+            },
+          ],
+          suppressedNames: new Set(),
+        });
+        queryClient.setQueryData(["harness-labels"], {
+          labels: {},
+          setupSteps: {},
+          acpHarnesses: new Set(),
+          effortFamilies: {},
+        });
+        for (const harness of ["claude-native", "codex-native"]) {
+          queryClient.setQueryData(
+            ["host-model-options", "demo-host", harness],
+            [{ id: "default", displayName: "Recommended model" }],
+          );
         }
       }}
     >
-      <div className="h-[520px] w-[320px] overflow-hidden rounded-lg border bg-card">
-        <Story />
-      </div>
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: related ? { related_sessions: true } : {} }}
+      >
+        <SidebarDataContext.Provider value={storySidebarData}>
+          <SubagentPanelOpenerContext.Provider value={storyPanelOpener}>
+            <div
+              className={
+                related
+                  ? "h-[620px] w-[360px] overflow-hidden rounded-lg border bg-card"
+                  : "h-[520px] w-[320px] overflow-hidden rounded-lg border bg-card"
+              }
+            >
+              <Story />
+            </div>
+          </SubagentPanelOpenerContext.Provider>
+        </SidebarDataContext.Provider>
+      </CapabilitiesProvider>
     </StoryQueryRouter>
   );
 }
@@ -259,5 +333,76 @@ export const BrandIconsCollapsed: Story = {
       ?.querySelector<HTMLElement>('[data-testid="subagent-collapse-toggle"]');
     if (!toggle) throw new Error("Sub-agent collapse toggle not found");
     await userEvent.click(toggle);
+  },
+};
+
+const relatedTree = {
+  "conversation-root": [
+    child({
+      id: "main-helper",
+      tool: "Explore",
+      title: "Explore:API callers",
+      busy: true,
+      last_message_preview: "Finding existing API consumers…",
+    }),
+    child({
+      id: "review-session",
+      title: "Review",
+      tool: "codex",
+      labels: { "omnigent.session_role": "peer", "omnigent.wrapper": "codex-native-ui" },
+      busy: true,
+      last_message_preview: "Reviewing compatibility with older runners.",
+    }),
+    child({
+      id: "implementation-session",
+      title: "Implementation",
+      tool: "claude",
+      labels: { "omnigent.session_role": "peer", "omnigent.wrapper": "claude-code-native-ui" },
+      last_message_preview: "The new creation flow is ready to try.",
+    }),
+  ],
+  "review-session": [
+    child({
+      id: "review-tests",
+      tool: "test",
+      title: "test:API coverage",
+      pending_elicitations_count: 1,
+      last_message_preview: "Ready to run the integration checks.",
+    }),
+    child({
+      id: "review-security",
+      tool: "researcher",
+      title: "researcher:Permissions",
+      current_task_status: "completed",
+      last_message_preview: "Owner access is inherited from Main.",
+    }),
+  ],
+};
+
+export const RelatedSessions: Story = {
+  args: { conversationId: "conversation-root" },
+  decorators: [
+    panelEnvironment({
+      activeId: "conversation-root",
+      session: rootSession({
+        agentName: "claude-native-ui",
+        hostId: "demo-host",
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+      tree: relatedTree,
+      related: true,
+    }),
+  ],
+};
+
+export const NewRelatedSession: Story = {
+  ...RelatedSessions,
+  play: async ({ canvasElement }) => {
+    const button = canvasElement.querySelector<HTMLButtonElement>(
+      '[data-testid="add-agent-button"]',
+    );
+    if (button) await userEvent.click(button);
+    const codex = await within(document.body).findByTestId("agent-card-agent-codex");
+    await userEvent.click(codex);
   },
 };

@@ -1,10 +1,11 @@
+import { useChatStoreApi, useChatStore } from "@/store/chatStore";
 import { useEffect } from "react";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useLocation, useNavigate, useRebasePath } from "@/lib/routing";
-import { useChatStore } from "@/store/chatStore";
 
 /** Follow session supersession once, replacing the cleared session in history. */
 export function useConversationRedirect(conversationId: string | undefined) {
+  const chatStore = useChatStoreApi();
   const navigate = useNavigate();
   const { pathname, search } = useLocation();
   const rebasePath = useRebasePath();
@@ -21,6 +22,6 @@ export function useConversationRedirect(conversationId: string | undefined) {
         { replace: true },
       );
     }
-    useChatStore.setState({ redirectToConversationId: null });
-  }, [target, conversationId, navigate, pathname, search, rebasePath]);
+    chatStore.setState({ redirectToConversationId: null });
+  }, [chatStore, target, conversationId, navigate, pathname, search, rebasePath]);
 }

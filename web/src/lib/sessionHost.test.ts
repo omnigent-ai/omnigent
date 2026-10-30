@@ -1,6 +1,24 @@
 import { describe, expect, it } from "vitest";
 
-import { parentIdFromLabels } from "./sessionHost";
+import {
+  getSessionHost,
+  parentIdFromLabels,
+  setSessionHost,
+  setSessionParent,
+} from "./sessionHost";
+
+it("routes peers by their own environment, while helpers inherit their parent host", () => {
+  setSessionHost("routing-main", "root-host");
+  setSessionParent("routing-helper", "routing-main");
+  expect(getSessionHost("routing-helper")).toBe("root-host");
+  setSessionParent("routing-peer", "routing-main", { "omnigent.session_role": "peer" });
+  expect(getSessionHost("routing-peer")).toBeNull();
+  setSessionHost("routing-peer", "source-host");
+  expect(getSessionHost("routing-peer")).toBe("source-host");
+  setSessionHost("routing-main", null);
+  setSessionHost("routing-peer", null);
+  setSessionParent("routing-helper", null);
+});
 
 describe("parentIdFromLabels", () => {
   it("reads the explicit side-chat source id", () => {

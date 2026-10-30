@@ -1,6 +1,11 @@
+import * as Conversations from "@/hooks/useConversations";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   BookOpenIcon,
   BotIcon,
@@ -16,8 +21,34 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import { conversation } from "@/test/sidebarMockHelpers";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
+
+vi.mock("./NewChatDialog", () => ({
+  NewChatLandingScreen: ({
+    relatedSession,
+  }: {
+    relatedSession: { source: { id: string }; onCreated: (id: string) => void };
+  }) => (
+    <button type="button" onClick={() => relatedSession.onCreated("new_peer")}>
+      Create from {relatedSession.source.id}
+    </button>
+  ),
+}));
+vi.mock("./ForkSessionDialog", () => ({
+  ForkSessionDialog: ({
+    sourceSessionId,
+    relatedSession,
+  }: {
+    sourceSessionId: string;
+    relatedSession?: boolean;
+  }) => (
+    <div role="dialog">
+      Fork {sourceSessionId} {relatedSession ? "in group" : "standalone"}
+    </div>
+  ),
+}));
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
@@ -25,6 +56,8 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
 }));
+
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn(() => "loading") }));
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
@@ -66,9 +99,15 @@ function renderPanel({
   initialEntries,
 }: RenderOptions & { initialEntries?: string[] } = {}) {
   return render(
-    <MemoryRouter initialEntries={initialEntries}>
-      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-    </MemoryRouter>,
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
+      <MemoryRouter initialEntries={initialEntries}>
+        <TooltipProvider>
+          <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+        </TooltipProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
@@ -135,6 +174,7 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
 ];
 
 beforeEach(() => {
+  vi.mocked(useServerInfo).mockReturnValue("loading");
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
   // Default: parent's status is idle. Tests override per-case.
@@ -161,6 +201,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   cleanup();
   localStorage.clear();
 });
@@ -1591,5 +1632,318 @@ describe("SubagentsPanel", () => {
 
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
+  });
+});
+
+describe("related sessions", () => {
+  function enable() {
+    vi.mocked(useServerInfo).mockReturnValue({
+      ...FALLBACK_SERVER_INFO,
+      features: { related_sessions: true },
+    });
+  }
+  const tree = {
+    conv_parent: [
+      childInfo({ id: "helper", title: "research:Find callers", busy: true }),
+      childInfo({ id: "review", title: "Review", labels: { "omnigent.session_role": "peer" } }),
+      childInfo({
+        id: "build",
+        title: "Implementation",
+        labels: { "omnigent.session_role": "peer" },
+      }),
+    ],
+    review: [
+      childInfo({ id: "review_helper", title: "test:Coverage", pending_elicitations_count: 1 }),
+    ],
+  };
+
+  it.each([undefined, false])("keeps legacy rendering when feature value is %s", (enabled) => {
+    vi.mocked(useServerInfo).mockReturnValue({
+      ...FALLBACK_SERVER_INFO,
+      features: enabled === undefined ? {} : { related_sessions: enabled },
+    });
+    mockChildTree(tree);
+    renderPanel();
+    expect(screen.getByTestId("add-agent-button")).toHaveClass("hidden");
+    expect(screen.queryByTestId("peer-session-row")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("subagent-row")).toHaveLength(4);
+  });
+
+  it("collapses each full session's helpers independently and remembers it on remount", () => {
+    enable();
+    mockChildTree(tree);
+    const rendered = renderPanel();
+    expect(screen.getByRole("button", { name: "New session" })).toBeVisible();
+    const collapseMain = screen.getByRole("button", { name: "Collapse Main subagents" });
+    expect(collapseMain.parentElement).toBe(screen.getByTestId("subagent-main-row").parentElement);
+    expect(collapseMain.closest("a")).toBeNull();
+    expect(document.getElementById(collapseMain.getAttribute("aria-controls")!)).toContainElement(
+      rendered.container.querySelector('[data-child-session-id="helper"]'),
+    );
+    fireEvent.click(collapseMain);
+    expect(rendered.container.querySelector('[data-child-session-id="helper"]')).toBeNull();
+    expect(screen.getAllByTestId("peer-session-row")).toHaveLength(2);
+    expect(
+      rendered.container.querySelector('[data-child-session-id="review_helper"]'),
+    ).toBeInTheDocument();
+    const collapseReview = screen.getByRole("button", { name: "Collapse Review subagents" });
+    expect(collapseReview.parentElement).toBe(
+      screen.getAllByTestId("peer-session-row")[0].parentElement,
+    );
+    fireEvent.click(collapseReview);
+    rendered.unmount();
+    const restored = renderPanel({ conversationId: "review" });
+    expect(screen.getByRole("button", { name: "Expand Main subagents" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: "Expand Review subagents" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(restored.container.querySelector('[data-child-session-id="review_helper"]')).toBeNull();
+    expect(screen.getAllByTestId("peer-session-row")).toHaveLength(2);
+  });
+
+  it("preserves peer names containing colons and hides archived helpers at every level", () => {
+    enable();
+    mockChildTree({
+      conv_parent: [
+        childInfo({ id: "hidden-helper", title: "Old helper", archived: true }),
+        childInfo({ id: "active-helper", title: "Active helper" }),
+        childInfo({
+          id: "review",
+          title: "Review: API",
+          labels: { "omnigent.session_role": "peer" },
+        }),
+        childInfo({
+          id: "old-peer",
+          title: "Previous approach",
+          archived: true,
+          labels: { "omnigent.session_role": "peer" },
+        }),
+      ],
+      "active-helper": [
+        childInfo({ id: "hidden-nested", title: "Old nested helper", archived: true }),
+      ],
+      review: [
+        childInfo({ id: "hidden-review-helper", title: "Old review helper", archived: true }),
+      ],
+    });
+    renderPanel();
+    expect(screen.getAllByTestId("peer-session-row")[0]).toHaveTextContent("Review: API");
+    expect(screen.queryByText("Old helper")).not.toBeInTheDocument();
+    expect(screen.queryByText("Old nested helper")).not.toBeInTheDocument();
+    expect(screen.queryByText("Old review helper")).not.toBeInTheDocument();
+    expect(screen.getByText("Archived sessions")).toBeVisible();
+    expect(screen.getByText("Previous approach")).toBeVisible();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Previous approach actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(screen.getByRole("menuitem", { name: "Unarchive" })).toBeEnabled();
+  });
+
+  it("requires confirmation and deletes only the selected peer without shared worktree cleanup", () => {
+    enable();
+    mockChildTree(tree);
+    const mutate = vi.fn();
+    vi.spyOn(Conversations, "useStopAndDeleteConversation").mockReturnValue({
+      mutate,
+      isPending: false,
+    } as unknown as ReturnType<typeof Conversations.useStopAndDeleteConversation>);
+    renderPanel();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Review actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Delete Review?");
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    expect(mutate).not.toHaveBeenCalled();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Review actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete" }));
+    expect(mutate).toHaveBeenCalledWith(
+      { id: "review", deleteBranch: false },
+      expect.objectContaining({ onSuccess: expect.any(Function) }),
+    );
+  });
+
+  it("reorders peers with the keyboard and persists their order on remount", async () => {
+    enable();
+    mockChildTree(tree);
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      const id = this.dataset.peerSessionId;
+      if (!id) return originalRect.call(this);
+      const top = id === "review" ? 100 : 200;
+      return {
+        x: 0,
+        y: top,
+        width: 300,
+        height: 100,
+        top,
+        right: 300,
+        bottom: top + 100,
+        left: 0,
+        toJSON: () => ({}),
+      };
+    });
+    const rendered = renderPanel();
+    const handle = screen.getByRole("link", { name: "Review" });
+    handle.focus();
+    fireEvent.keyDown(handle, { key: " ", code: "Space" });
+    await waitFor(() => expect(handle.closest("li")).toHaveAttribute("data-dragging", "true"));
+    fireEvent.keyDown(document, { key: "ArrowDown", code: "ArrowDown" });
+    fireEvent.keyDown(document, { key: "Escape", code: "Escape" });
+    await waitFor(() => expect(handle.closest("li")).not.toHaveAttribute("data-dragging"));
+    expect(screen.getAllByTestId("peer-session-row")[0]).toHaveAttribute("href", "/c/review");
+    fireEvent.keyDown(handle, { key: " ", code: "Space" });
+    await waitFor(() => expect(handle.closest("li")).toHaveAttribute("data-dragging", "true"));
+    fireEvent.keyDown(document, { key: "ArrowDown", code: "ArrowDown" });
+    fireEvent.keyDown(document, { key: " ", code: "Space" });
+    await waitFor(() =>
+      expect(
+        screen.getAllByTestId("peer-session-row").map((row) => row.getAttribute("href")),
+      ).toEqual(["/c/build", "/c/review"]),
+    );
+    rendered.unmount();
+    const restored = renderPanel();
+    expect(screen.getAllByTestId("peer-session-row")[0]).toHaveAttribute("href", "/c/build");
+    expect(screen.getByTestId("subagent-main-row")).toHaveAttribute("href", "/c/conv_parent");
+    expect(
+      restored.container.querySelector(
+        '[data-peer-session-id="review"] [data-child-session-id="review_helper"]',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("creates inside Agents, supports Back, and opens the new chat in a tab without navigating", () => {
+    enable();
+    mockChildTree(tree);
+    const opener = vi.fn(() => true);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/c/conv_parent?panel=agents&newSession=1"]}>
+          <SubagentPanelOpenerContext.Provider value={opener}>
+            <TooltipProvider>
+              <SubagentsPanel conversationId="conv_parent" rootSessionId="conv_parent" />
+            </TooltipProvider>
+          </SubagentPanelOpenerContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("related-session-composer")).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Back to agents" }));
+    expect(screen.queryByTestId("related-session-composer")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New session" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create from conv_root" }));
+    expect(opener).toHaveBeenCalledWith("new_peer");
+    expect(screen.queryByTestId("related-session-composer")).not.toBeInTheDocument();
+    expect(screen.getByTestId("subagent-main-row")).toHaveAttribute("aria-current", "page");
+  });
+
+  it("orders hover actions Rename, Fork, More and opens the existing fork dialog for the source", () => {
+    enable();
+    mockChildTree(tree);
+    renderPanel();
+    const rename = screen.getByRole("button", { name: "Rename Review" });
+    expect(
+      within(rename.parentElement!)
+        .getAllByRole("button")
+        .map((button) => button.getAttribute("aria-label")),
+    ).toEqual(["Rename Review", "Fork Review", "Review actions"]);
+    fireEvent.click(screen.getByRole("button", { name: "Fork Review" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Fork review in group");
+  });
+
+  it("keeps taller harness rows and inline rename with Enter to save and Escape to cancel", async () => {
+    enable();
+    mockChildTree(tree);
+    const rename = vi
+      .spyOn(Conversations, "renameConversation")
+      .mockResolvedValue(conversation("review", { title: "API review" }));
+    renderPanel();
+    for (const row of [
+      screen.getByTestId("subagent-main-row"),
+      ...screen.getAllByTestId("peer-session-row"),
+    ]) {
+      expect(row).toHaveClass("py-2", "text-base");
+    }
+    const renameButton = screen.getByRole("button", { name: "Rename Review" });
+    expect(renameButton).toHaveClass("md:opacity-0", "md:group-hover:opacity-100");
+    expect(screen.getByRole("button", { name: "Review actions" })).not.toHaveClass("hidden");
+    fireEvent.click(renameButton);
+    let input = screen.getByRole("textbox", { name: "Rename session" });
+    expect(input).toHaveFocus();
+    fireEvent.change(input, { target: { value: "Cancelled name" } });
+    fireEvent.keyDown(input, { key: "Escape", code: "Escape" });
+    expect(rename).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Rename Review" }));
+    input = screen.getByRole("textbox", { name: "Rename session" });
+    fireEvent.change(input, { target: { value: "API review" } });
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(rename).toHaveBeenCalledWith("review", "API review"));
+  });
+
+  it("does not start a keyboard drag from session actions", () => {
+    enable();
+    mockChildTree(tree);
+    const { container } = renderPanel();
+    const action = screen.getByRole("button", { name: "Review actions" });
+    action.focus();
+    fireEvent.keyDown(action, { key: " ", code: "Space" });
+    expect(container.querySelector('[data-dragging="true"]')).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeVisible();
+  });
+
+  it("has separate center links and explicit panel actions for Main and peers", () => {
+    enable();
+    mockChildTree(tree);
+    const opener = vi.fn(() => true);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <SubagentPanelOpenerContext.Provider value={opener}>
+            <TooltipProvider>
+              <SubagentsPanel rootSessionId="conv_parent" conversationId="review" />
+            </TooltipProvider>
+          </SubagentPanelOpenerContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getAllByTestId("peer-session-row")[0]).toHaveAttribute("href", "/c/review");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Review actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open in side panel" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Main actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open in side panel" }));
+    expect(opener.mock.calls).toEqual([["review"], ["conv_parent"]]);
+  });
+
+  it("hides creation and editing for a read-only viewer", () => {
+    enable();
+    mockChildTree(tree);
+    const result = useSessionMock.getMockImplementation()?.("conv_parent");
+    useSessionMock.mockReturnValue({
+      ...result!,
+      session: { ...result!.session!, permissionLevel: 1 },
+    });
+    renderPanel();
+    expect(screen.getByTestId("add-agent-button")).toHaveClass("hidden");
+    expect(screen.queryByRole("button", { name: "Rename Review" })).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("peer-session-row")).toHaveLength(2);
   });
 });

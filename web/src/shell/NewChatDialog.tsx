@@ -117,10 +117,10 @@ import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/ide
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
-import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
-import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { recordOptimisticTitle, synthesizeOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   MAX_SANDBOX_REPOS,
@@ -345,7 +345,8 @@ import {
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import type { NativeModelOption } from "@/lib/types";
+import type { NativeModelOption, Session } from "@/lib/types";
+import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import {
   currentFusionCombo,
@@ -2068,11 +2069,21 @@ export function resetLandingDraft(): void {
   writeLandingDraft(null);
 }
 
-export function NewChatLandingScreen() {
+export interface RelatedSessionComposer {
+  source: Session;
+  rootSessionId: string;
+  onCreated: (sessionId: string) => void;
+}
+
+export function NewChatLandingScreen({
+  relatedSession,
+}: {
+  relatedSession?: RelatedSessionComposer;
+} = {}) {
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
-  const linkedPrompt = searchParams.get("prompt");
+  const linkedPrompt = relatedSession ? null : searchParams.get("prompt");
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2088,7 +2099,7 @@ export function NewChatLandingScreen() {
 
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
-  const projectParam = searchParams.get("project") ?? "";
+  const projectParam = relatedSession ? "" : (searchParams.get("project") ?? "");
   const [cacheUser, setCacheUser] = useState(getCurrentUserId);
   useEffect(() => {
     if (cacheUser !== null) return;
@@ -2101,7 +2112,7 @@ export function NewChatLandingScreen() {
       cancelled = true;
     };
   }, [cacheUser]);
-  const pickerCacheKey = getNewChatPickerCacheKey(projectParam, cacheUser);
+  const pickerCacheKey = relatedSession ? null : getNewChatPickerCacheKey(projectParam, cacheUser);
   // Snapshot once per scope: editing a cached menu changes the saved preferences.
   const cachedPickerOptions = useMemo(
     () => readNewChatPickerOptionsCache(pickerCacheKey),
@@ -2155,6 +2166,17 @@ export function NewChatLandingScreen() {
   // (plain visit / label-only folder / genuinely empty config), so it settles
   // immediately and the generic defaults take over.
   const prefillConfig = useMemo<ProjectPrefillConfig | undefined>(() => {
+    if (relatedSession) {
+      const source = relatedSession.source;
+      return {
+        agentId: source.agentId,
+        hostId: source.hostId ?? undefined,
+        workspace: source.workspace ?? undefined,
+        model: source.modelOverride ?? source.llmModel ?? undefined,
+        effort: source.reasoningEffort ?? undefined,
+        useWorktree: false,
+      };
+    }
     // A project-scoped visit must resolve name → id via the projects list
     // before we know whether there's a config to read — until it loads, the id
     // is falsely null, so wait rather than settle prematurely.
@@ -2173,6 +2195,7 @@ export function NewChatLandingScreen() {
       : {};
     return withProjectLaunchDefaults(stored, projectLaunch);
   }, [
+    relatedSession,
     projectParam,
     projectListLoading,
     configProjectId,
@@ -2196,10 +2219,17 @@ export function NewChatLandingScreen() {
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
   const {
-    data: hosts,
+    data: discoveredHosts,
     isLoading: hostsLoading,
     isError: hostsError,
-  } = useHosts({ refetchOnFocus: true });
+  } = useHosts({ refetchOnFocus: true, ...(relatedSession ? { includeSandbox: true } : {}) });
+  const hosts = useMemo(
+    () =>
+      relatedSession
+        ? discoveredHosts?.filter((host) => host.host_id === relatedSession.source.hostId)
+        : discoveredHosts,
+    [discoveredHosts, relatedSession],
+  );
 
   // Offer an import affordance on the empty landing: a brand-new user with no
   // Omnigent sessions can pull in their existing local CLI history. Same query
@@ -2250,15 +2280,16 @@ export function NewChatLandingScreen() {
   // the in-session view shows too — the picker stays reachable while starting
   // a new session. The hook hides it whenever the sidebar covers the surface.
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherForMainSurface(landingSurface, true);
+  useNativeServerSwitcherForMainSurface(landingSurface, !relatedSession);
 
   // Draft restore is project-scoped: the user's text and attachments always
   // come back, but agent/host/workspace slots parked under another project's
   // visit (or a plain one) must not beat THIS visit's project defaults —
   // strip them so the prefill machine (fill-empty-only) can seed. Read once
   // per mount; only the lazy state initializers below consume it.
-  const restoredDraft: LandingDraft | null =
-    landingDraft === null || landingDraft.project === projectParam
+  const restoredDraft: LandingDraft | null = relatedSession
+    ? null
+    : landingDraft === null || landingDraft.project === projectParam
       ? landingDraft
       : {
           ...landingDraft,
@@ -2284,7 +2315,7 @@ export function NewChatLandingScreen() {
     linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
   );
   useEffect(() => {
-    if (!searchParams.has("prompt")) return;
+    if (relatedSession || !searchParams.has("prompt")) return;
     if (linkedPrompt?.trim()) setMessage(linkedPrompt);
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2293,7 +2324,7 @@ export function NewChatLandingScreen() {
       { search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [linkedPrompt, searchParams, location.hash, location.state, navigate]);
+  }, [relatedSession, linkedPrompt, searchParams, location.hash, location.state, navigate]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2339,7 +2370,8 @@ export function NewChatLandingScreen() {
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
   const profilesEnabled = sandboxProfilesEnabled(info);
-  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const managedSandboxesEnabled =
+    !relatedSession && info !== "loading" && info.managed_sandboxes_enabled;
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
     selected: mcpRegistryServices,
@@ -2347,7 +2379,11 @@ export function NewChatLandingScreen() {
     catalog: mcpRegistryCatalog,
     selectionError: mcpSelectionError,
     servicesForLaunch: mcpServicesForLaunch,
-  } = useMcpRegistrySelection(restoredDraft?.mcpRegistryServices, mcpRegistryEnabled);
+  } = useMcpRegistrySelection(
+    restoredDraft?.mcpRegistryServices,
+    mcpRegistryEnabled,
+    !relatedSession,
+  );
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers
   // a family the host runs through the gateway; the built-in judge covers any
@@ -2392,7 +2428,8 @@ export function NewChatLandingScreen() {
   // Embed-only docs seam for Databricks git auth setup. Standalone leaves this
   // undefined, so no tooltip is rendered.
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
-  const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
+  const showDisabledSandboxWithDocs =
+    !relatedSession && !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
@@ -2400,11 +2437,14 @@ export function NewChatLandingScreen() {
   // project-driven visit defers to the project-prefill effect instead
   // (which falls back to the same last pick).
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
-    () => restoredDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
+    () =>
+      relatedSession?.source.agentId ??
+      restoredDraft?.pickedAgentId ??
+      (projectParam !== "" ? null : readLastAgentId()),
   );
-  const agentExplicitlySelectedRef = useRef(false);
+  const agentExplicitlySelectedRef = useRef(relatedSession !== undefined);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
-    () => restoredDraft?.selectedHostId ?? null,
+    () => relatedSession?.source.hostId ?? restoredDraft?.selectedHostId ?? null,
   );
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
@@ -2440,7 +2480,10 @@ export function NewChatLandingScreen() {
           ? (hosts ?? []).some((host) => host.host_id === rememberedHostChoice)
           : managedSandboxesEnabled || (hosts ?? []).some((host) => host.status === "online")));
   const noExecutionTargetSelected =
-    !sandboxSelected && selectedHostId === null && !executionTargetSelectionPending;
+    !relatedSession &&
+    !sandboxSelected &&
+    selectedHostId === null &&
+    !executionTargetSelectionPending;
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
@@ -2494,7 +2537,9 @@ export function NewChatLandingScreen() {
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
   const sandboxRepoPopoverRef = useRef<HTMLDivElement>(null);
-  const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  const [workspace, setWorkspace] = useState<string>(
+    () => relatedSession?.source.workspace ?? restoredDraft?.workspace ?? "",
+  );
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
   // the config. ANY other write — a picker selection, browsing, a host
@@ -2570,6 +2615,7 @@ export function NewChatLandingScreen() {
   // switch, seeded from the user's last stored pick for that agent.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
     () =>
+      relatedSession?.source.harness ??
       restoredDraft?.pickedHarness ??
       readLastHarness(restoredDraft?.pickedAgentId ?? readLastAgentId()),
   );
@@ -2696,13 +2742,14 @@ export function NewChatLandingScreen() {
     onScreenRef.current = true;
     return () => {
       onScreenRef.current = false;
+      if (relatedSession) return;
       if (!submittedRef.current) {
         writeLandingDraft(draftRef.current);
       } else if (submittedDraftRevisionRef.current === landingDraftRevision) {
         writeLandingDraft(null);
       }
     };
-  }, []);
+  }, [relatedSession]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -2724,7 +2771,7 @@ export function NewChatLandingScreen() {
   // not add a competing local-machine action.
   const thisMachineInList =
     thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
-  const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
+  const canConnectThisMachine = !relatedSession && Boolean(desktopHost?.cliInstalled);
   const showConnectThisMachine =
     canConnectThisMachine && !thisMachineInList && onlineHosts.length === 0;
 
@@ -2844,7 +2891,7 @@ export function NewChatLandingScreen() {
   // already in state (or restored from the in-memory draft) is never
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
-    if (!prefillSettled) return;
+    if (relatedSession || !prefillSettled) return;
     if (!onboardingHostSettled.current) {
       if (onboardingHost.pending) return;
       onboardingHostSettled.current = true;
@@ -2905,6 +2952,7 @@ export function NewChatLandingScreen() {
     defaultSandboxProvider,
     onboardingHost.pending,
     onboardingHost.hostId,
+    relatedSession,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -3000,7 +3048,7 @@ export function NewChatLandingScreen() {
   // derived home (which can arrive a render later, hence the dep). Holds
   // off while a project prefill is deciding on a workspace of its own.
   useEffect(() => {
-    if (!prefillSettled) return;
+    if (relatedSession || !prefillSettled) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
     if (autoSeedCandidate === null) return;
@@ -3040,6 +3088,7 @@ export function NewChatLandingScreen() {
     workspace,
     branchName,
     generateBranchName,
+    relatedSession,
   ]);
 
   // A pick only wins while it exists in the list — a persisted id whose
@@ -3049,11 +3098,11 @@ export function NewChatLandingScreen() {
   // managed sandbox — the sandbox create path doesn't provision a runner for a
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
-  const pendingAgentAllowedOnTarget = !sandboxSelected;
+  const pendingAgentAllowedOnTarget = !relatedSession && !sandboxSelected;
   // A configured agent absent from templates and the first 30 Mine sessions
   // stays unavailable until the user explicitly chooses another agent.
   const configuredAgentUnavailable =
-    projectParam !== "" &&
+    (projectParam !== "" || relatedSession !== undefined) &&
     prefillConfig?.agentId != null &&
     agents !== undefined &&
     !agentsArePlaceholder &&
@@ -3172,6 +3221,11 @@ export function NewChatLandingScreen() {
       ? cachedPickerOptions.models
       : undefined;
   const hostReadinessPending = hostSelected && (hostsLoading || selectedHost?.status === "offline");
+  const sourceModel = relatedSession?.source.modelOverride ?? relatedSession?.source.llmModel;
+  const sourceModelOptions = useMemo<NativeModelOption[] | undefined>(
+    () => (sourceModel ? [{ id: sourceModel }] : undefined),
+    [sourceModel],
+  );
   const availableHostModels = (
     harness: string,
     models: NativeModelOption[] | undefined,
@@ -3179,6 +3233,11 @@ export function NewChatLandingScreen() {
     cached?: NativeModelOption[],
   ) =>
     models ??
+    // Runner-only sessions have no host catalog; retain their current model.
+    (relatedSession?.source.harness === harness &&
+    relatedSession.source.agentId === effectiveAgentId
+      ? sourceModelOptions
+      : undefined) ??
     (selectedNativeHarness !== harness ||
     loading ||
     hostReadinessPending ||
@@ -3211,6 +3270,11 @@ export function NewChatLandingScreen() {
   } = useHostModelOptions(selectedHostId, "devin-native", canLoadHostModels("devin-native"), {
     poll: selectedNativeHarness === "devin-native",
   });
+  const availableDevinModels = availableHostModels(
+    "devin-native",
+    hostDevinModelOptions,
+    hostDevinModelsLoading,
+  );
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
@@ -3340,8 +3404,8 @@ export function NewChatLandingScreen() {
   // the id at launch (resolve_devin_launch_model), so the list stays short
   // instead of enumerating every effort variant.
   const devinModelOptions = useMemo(
-    () => (sandboxSelected ? (sandboxCatalog ?? []) : (hostDevinModelOptions ?? [])),
-    [hostDevinModelOptions, sandboxSelected, sandboxCatalog],
+    () => (sandboxSelected ? (sandboxCatalog ?? []) : (availableDevinModels ?? [])),
+    [availableDevinModels, sandboxSelected, sandboxCatalog],
   );
   const piModelOptions = useMemo(
     () =>
@@ -3777,7 +3841,7 @@ export function NewChatLandingScreen() {
         ...options,
       },
     });
-    writeHarnessOption(harness, options);
+    if (!relatedSession) writeHarnessOption(harness, options);
   };
   const selectPickerModel = (model: string) => {
     const selectionHarness =
@@ -3846,10 +3910,10 @@ export function NewChatLandingScreen() {
       setSmartRoutingDropped(null);
       setPickerEdits(null);
       setPickedHarness(harness);
-      writeLastHarness(agentId ?? effectiveAgentId, harness);
+      if (!relatedSession) writeLastHarness(agentId ?? effectiveAgentId, harness);
       _setCostControlMode(isAutoHarness(harness) ? "on" : null);
     },
-    [effectiveAgentId],
+    [effectiveAgentId, relatedSession],
   );
   const activeSdk = selectedAgentHasAdvancedSettings
     ? (pickedHarness ?? selectedAgent?.harness ?? null)
@@ -5221,14 +5285,16 @@ export function NewChatLandingScreen() {
           message: "Selected host is unavailable. Reconnect it or choose another host.",
         };
       }
-      if (!selectedHostId || !workspaceValid) {
+      if (!relatedSession && (!selectedHostId || !workspaceValid)) {
         return { field: "other", message: "Please choose a host and working directory" };
       }
     }
     if (configuredAgentUnavailable && selectedAgent == null) {
       return {
         field: "other",
-        message: "This project's configured agent is unavailable — pick an agent to continue",
+        message: relatedSession
+          ? "This session's agent is unavailable — pick an agent to continue"
+          : "This project's configured agent is unavailable — pick an agent to continue",
       };
     }
     if (message.trim().length === 0 && files.length === 0) {
@@ -5278,14 +5344,16 @@ export function NewChatLandingScreen() {
   // shells keep Run on Arca visible because reconnecting is their only recovery.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
-  const showArcaOption = arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
+  const showArcaOption =
+    !relatedSession && arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca
       ? "Connecting to Arca…"
       : sandboxSelected
         ? selectedSandboxLabel
-        : (selectedHostDisplayName ?? "No host selected");
+        : (selectedHostDisplayName ??
+          (relatedSession ? "Current environment" : "No host selected"));
   const hostTooltipRows =
     connectingThisMachine || connectingArca
       ? [
@@ -5364,9 +5432,9 @@ export function NewChatLandingScreen() {
     setPickerEdits(null);
     agentFromConfigRef.current = false;
     setPickedAgentId(placeholder.id);
-    writeLastAgentId(placeholder.id);
+    if (!relatedSession) writeLastAgentId(placeholder.id);
     setPickedHarness(AUTO_NATIVE_HARNESS_ID);
-    writeLastHarness(placeholder.id, AUTO_NATIVE_HARNESS_ID);
+    if (!relatedSession) writeLastHarness(placeholder.id, AUTO_NATIVE_HARNESS_ID);
     _setCostControlMode("on");
   };
 
@@ -5392,7 +5460,7 @@ export function NewChatLandingScreen() {
     // own choice: send it with the create rather than default-filling.
     agentFromConfigRef.current = false;
     setPickedAgentId(agent.id);
-    writeLastAgentId(agent.id);
+    if (!relatedSession) writeLastAgentId(agent.id);
     if (pickerEdits?.agentId !== agent.id) {
       setPickerEdits(
         pickerLoading
@@ -5418,7 +5486,7 @@ export function NewChatLandingScreen() {
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
     // for the next visit.
-    writeLastHostChoice(hostId);
+    if (!relatedSession) writeLastHostChoice(hostId);
     // Re-selecting the current host is a no-op. Clearing the workspace here
     // would empty the field for good: the seeding effect's deps (host id,
     // recents, derived home) are all unchanged on a same-host pick, so it
@@ -5575,7 +5643,7 @@ export function NewChatLandingScreen() {
       // The draft's files were validated when the user attached them, so
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
-    } else {
+    } else if (!relatedSession) {
       writeLandingDraft(returnedDraft);
     }
   }
@@ -5596,7 +5664,8 @@ export function NewChatLandingScreen() {
     // after the user has navigated elsewhere while this component is still
     // mounted in the outgoing transition tree.
     const createLocation = window.location.href;
-    const returnToCanvas = searchParams.has(CANVAS_QUERY_PARAM) && isFeatureEnabled(info, "canvas");
+    const returnToCanvas =
+      !relatedSession && searchParams.has(CANVAS_QUERY_PARAM) && isFeatureEnabled(info, "canvas");
     let createdCanvasId = selectedProject
       ? (configProjectId ?? `name:${selectedProject}`)
       : MAIN_CANVAS_ID;
@@ -5669,7 +5738,7 @@ export function NewChatLandingScreen() {
       submittedDraftRevisionRef.current = landingDraftRevision;
       submittedRef.current = true;
       trackClick("new_chat.start_session", "button");
-      if (sandboxRepoSelections.length > 0) {
+      if (!relatedSession && sandboxRepoSelections.length > 0) {
         writeLastSandboxRepos(sandboxRepoSelections);
       }
       const trimmedBranch = branchName.trim();
@@ -5890,28 +5959,29 @@ export function NewChatLandingScreen() {
         // Normal path: bind to an existing registered agent.
         const provisional = newTempConversation();
         try {
-          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
-            // Seed the temp session with the NORMALIZED create identity so the
-            // optimistic composer shows the model/effort/harness/routing being
-            // created, not state projected from the previously active session.
-            modelOverride: normalizedModelOverride,
-            llmModel: resolvedDefaultModel,
-            reasoningEffort: normalizedReasoningEffort,
-            // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
-            // usually-null pickedHarness for a native agent — so the temp page
-            // adapter can re-derive the native model/effort/permission identity.
-            harness: smartRoutingHarnessSelected
-              ? null
-              : (selectedNativeHarness ?? pickedHarness ?? null),
-            costControlModeOverride: costControlOverride ?? null,
-            boundAgentId: effectiveAgentId,
-            // Name (not just id) so the in-session temp composer can evaluate
-            // routing eligibility (isCostRoutingSession needs a bound agent).
-            boundAgentName: agent?.display_name ?? agent?.name ?? null,
-            // Chosen host so temp routing's per-family gateway guard uses the
-            // real host (null for a sandbox create).
-            hostId: sandboxSelected ? null : selectedHostId,
-          });
+          if (!relatedSession)
+            localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
+              // Seed the temp session with the NORMALIZED create identity so the
+              // optimistic composer shows the model/effort/harness/routing being
+              // created, not state projected from the previously active session.
+              modelOverride: normalizedModelOverride,
+              llmModel: resolvedDefaultModel,
+              reasoningEffort: normalizedReasoningEffort,
+              // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
+              // usually-null pickedHarness for a native agent — so the temp page
+              // adapter can re-derive the native model/effort/permission identity.
+              harness: smartRoutingHarnessSelected
+                ? null
+                : (selectedNativeHarness ?? pickedHarness ?? null),
+              costControlModeOverride: costControlOverride ?? null,
+              boundAgentId: effectiveAgentId,
+              // Name (not just id) so the in-session temp composer can evaluate
+              // routing eligibility (isCostRoutingSession needs a bound agent).
+              boundAgentName: agent?.display_name ?? agent?.name ?? null,
+              // Chosen host so temp routing's per-family gateway guard uses the
+              // real host (null for a sandbox create).
+              hostId: sandboxSelected ? null : selectedHostId,
+            });
           if (localConv !== null) navigate(sessionLocation(localConv.tempConvId));
         } catch {
           /* non-fatal: the response still opens the server session */
@@ -5921,63 +5991,72 @@ export function NewChatLandingScreen() {
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const createPayload = JSON.stringify({
+          ...(relatedSession
+            ? {
+                related_to_session_id: relatedSession.source.id,
+                // ponytail: name manual peers from their task; sidebar rename can refine it.
+                title: synthesizeOptimisticTitle(initialPrompt) ?? "New session",
+              }
+            : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
           // Config-seeded agent on a `project_id` create: omitted so the
           // server default-fills it from the project config.
           ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
           ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
           ...(createProjectId !== null ? { project_id: createProjectId } : {}),
-          ...(sandboxSelected
-            ? {
-                host_type: "managed",
-                // The repos to clone in parallel; the agent starts in the one
-                // repo, or the parent that holds them all. Empty = empty
-                // sandbox workspace.
-                workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
-                // On a `project_id` create an ABSENT (path) workspace would be
-                // default-filled with the config's path workspace, which a
-                // managed create rejects — pin an explicit null (explicit
-                // values are never replaced by project hints). Same guard for
-                // a config-stored `git` block: a sandbox has no host for the
-                // server to create a worktree on.
-                ...(createProjectId !== null ? { workspace: null, git: null } : {}),
-                // Omitted when null so a default create is unchanged.
-                ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
-                ...(selectedSandboxProfile !== null
-                  ? {
-                      sandbox_profile_id: selectedSandboxProfile.id,
-                      sandbox_profile_revision: selectedSandboxProfile.revision,
-                    }
-                  : {}),
-                // The new sandbox host's id, in the server's minted shape;
-                // keys the create and the session's requests until it binds.
-                ...(info !== "loading" && info.request_managed_sandbox_host_id
-                  ? { host_id: randomUUID().replace(/-/g, "") }
-                  : {}),
-                ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
-                  ? {
-                      inference_configuration_revision: sandboxModels.data.configuration_revision,
-                    }
-                  : {}),
-              }
-            : {
-                host_id: selectedHostId,
-                // Config-seeded workspace on a `project_id` create: omitted
-                // so the server default-fills it (see agent_id above).
-                ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
-                // Create a new worktree, or bind an existing one
-                // (`existing_worktree` records the branch for the sidebar +
-                // delete flow without creating anything), or neither. Always
-                // explicit when set: the branch name is generated (or typed)
-                // client-side, so the server cannot default-fill it.
-                git: shouldCreateWorktree
-                  ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                  : startInExistingWorktree
-                    ? { branch_name: activeWorktree!.branch!, existing_worktree: true }
-                    : createProjectId !== null && workspaceIsNonGit
-                      ? null
-                      : undefined,
-              }),
+          ...(relatedSession
+            ? {}
+            : sandboxSelected
+              ? {
+                  host_type: "managed",
+                  // The repos to clone in parallel; the agent starts in the one
+                  // repo, or the parent that holds them all. Empty = empty
+                  // sandbox workspace.
+                  workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
+                  // On a `project_id` create an ABSENT (path) workspace would be
+                  // default-filled with the config's path workspace, which a
+                  // managed create rejects — pin an explicit null (explicit
+                  // values are never replaced by project hints). Same guard for
+                  // a config-stored `git` block: a sandbox has no host for the
+                  // server to create a worktree on.
+                  ...(createProjectId !== null ? { workspace: null, git: null } : {}),
+                  // Omitted when null so a default create is unchanged.
+                  ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
+                  ...(selectedSandboxProfile !== null
+                    ? {
+                        sandbox_profile_id: selectedSandboxProfile.id,
+                        sandbox_profile_revision: selectedSandboxProfile.revision,
+                      }
+                    : {}),
+                  // The new sandbox host's id, in the server's minted shape;
+                  // keys the create and the session's requests until it binds.
+                  ...(info !== "loading" && info.request_managed_sandbox_host_id
+                    ? { host_id: randomUUID().replace(/-/g, "") }
+                    : {}),
+                  ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
+                    ? {
+                        inference_configuration_revision: sandboxModels.data.configuration_revision,
+                      }
+                    : {}),
+                }
+              : {
+                  host_id: selectedHostId,
+                  // Config-seeded workspace on a `project_id` create: omitted
+                  // so the server default-fills it (see agent_id above).
+                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
+                  // Create a new worktree, or bind an existing one
+                  // (`existing_worktree` records the branch for the sidebar +
+                  // delete flow without creating anything), or neither. Always
+                  // explicit when set: the branch name is generated (or typed)
+                  // client-side, so the server cannot default-fill it.
+                  git: shouldCreateWorktree
+                    ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
+                    : startInExistingWorktree
+                      ? { branch_name: activeWorktree!.branch!, existing_worktree: true }
+                      : createProjectId !== null && workspaceIsNonGit
+                        ? null
+                        : undefined,
+                }),
           // Native-wrapper labels + codex bypass + the born-filed project
           // label (see `createLabels` above).
           // Smart Routing sends none of these: the bound agent is only a
@@ -6019,7 +6098,9 @@ export function NewChatLandingScreen() {
           // routing hint is separate from first-input delivery.
           harness_override: smartRoutingHarnessSelected
             ? AUTO_HARNESS_ID
-            : (pickedHarness ?? undefined),
+            : relatedSession && selectedNativeHarness !== null
+              ? undefined
+              : (pickedHarness ?? undefined),
           smart_routing_message:
             smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
         });
@@ -6039,9 +6120,10 @@ export function NewChatLandingScreen() {
         // Managed launch validation continues after the row is announced, so
         // only its HTTP response can resolve the temp chat.
         const abortPush = new AbortController();
-        const pushedRow = sandboxSelected
-          ? Promise.resolve(null)
-          : nextPushedSession(matchOwnCreate, abortPush.signal);
+        const pushedRow =
+          sandboxSelected || relatedSession
+            ? Promise.resolve(null)
+            : nextPushedSession(matchOwnCreate, abortPush.signal);
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) {
@@ -6063,7 +6145,17 @@ export function NewChatLandingScreen() {
           const created = (await response.json()) as {
             id: string;
             labels?: Record<string, string>;
+            host_id?: string | null;
+            parent_session_id?: string | null;
           };
+          if (relatedSession) {
+            setSessionHost(created.id, created.host_id ?? null);
+            setSessionParent(
+              created.id,
+              created.parent_session_id ?? relatedSession.rootSessionId,
+              { ...created.labels, "omnigent.session_role": "peer" },
+            );
+          }
           // Route the new session's first requests by its chosen host id
           // before any snapshot of it loads. Only seeds: a null here would
           // erase a host the session's snapshot already recorded.
@@ -6204,7 +6296,7 @@ export function NewChatLandingScreen() {
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
-      if (submittedDraftRevisionRef.current === landingDraftRevision) {
+      if (!relatedSession && submittedDraftRevisionRef.current === landingDraftRevision) {
         writeLandingDraft(null);
       }
 
@@ -6234,8 +6326,14 @@ export function NewChatLandingScreen() {
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         if (!serverOwnsInitialInput)
           setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        if (relatedSession) {
+          await queryClient.invalidateQueries({
+            queryKey: childSessionsQueryKey(relatedSession.rootSessionId),
+          });
+        }
         if (onScreenRef.current && window.location.href === createLocation) {
-          navigate(sessionLocation(data.id));
+          if (relatedSession) relatedSession.onCreated(data.id);
+          else navigate(sessionLocation(data.id));
         }
       }
     } catch {
@@ -6341,7 +6439,13 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <ComposerWorkspaceTrigger
       kind="directory"
-      label={noExecutionTargetSelected ? "No host selected" : visibleWorktreeHeader.repositoryLabel}
+      label={
+        noExecutionTargetSelected
+          ? "No host selected"
+          : relatedSession && !visibleWorkspace
+            ? "Current working directory"
+            : visibleWorktreeHeader.repositoryLabel
+      }
       iconOnly={noExecutionTargetSelected}
       icon={
         workspaceIsGit ? (
@@ -6368,7 +6472,7 @@ export function NewChatLandingScreen() {
             ? "No host selected"
             : visibleWorkspace || "Working directory not selected"
       }
-      disabled={noExecutionTargetSelected || workspaceLoading}
+      disabled={relatedSession !== undefined || noExecutionTargetSelected || workspaceLoading}
       aria-busy={workspaceLoading || undefined}
       className={noExecutionTargetSelected || workspaceLoading ? "disabled:opacity-100" : undefined}
       data-testid="new-chat-landing-workspace-chip"
@@ -6386,35 +6490,42 @@ export function NewChatLandingScreen() {
           its shared 48rem column (800 − 32 = 768px) on desktop. px-4 (16px
           gutters) keeps the composer from feeling cramped against the
           viewport edges on phones. */}
-      <div className="flex min-h-0 w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-[max(20px,env(safe-area-inset-bottom))] md:pb-16 md:select-none">
-        <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 md:flex-none">
-          {selectedProject ? (
-            // Landing inside a project: swap Otto's eyes for the project's
-            // icon — the default pink folder, or a chosen emoji — and name the
-            // project. Sized to Otto's h-16 box so the centered composer doesn't
-            // shift when toggling between the two landings.
-            <ProjectLandingIcon
-              projectId={configProjectId}
-              projectName={selectedProject}
-              config={storedProjectConfig}
-              // Gate editing until the config resolves: the PATCH replaces the
-              // whole blob, so a write before the name→id and config have loaded
-              // would wipe the project's other defaults. A label-only folder
-              // (`configProjectId === null`) has no first-class config to lose.
-              configReady={
-                !projectListLoading &&
-                (configProjectId === null || storedProjectConfig !== undefined)
-              }
-            />
-          ) : (
-            <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
-          )}
-          {selectedProject || heading ? (
-            <h1 className="min-w-0 break-words text-center text-[24px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-              {selectedProject || heading}
-            </h1>
-          ) : null}
-        </div>
+      <div
+        className={cn(
+          "flex min-h-0 w-full max-w-[800px] flex-col items-center md:select-none",
+          !relatedSession && "px-4 pt-8 pb-[max(20px,env(safe-area-inset-bottom))] md:pb-16",
+        )}
+      >
+        {!relatedSession && (
+          <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 md:flex-none">
+            {selectedProject ? (
+              // Landing inside a project: swap Otto's eyes for the project's
+              // icon — the default pink folder, or a chosen emoji — and name the
+              // project. Sized to Otto's h-16 box so the centered composer doesn't
+              // shift when toggling between the two landings.
+              <ProjectLandingIcon
+                projectId={configProjectId}
+                projectName={selectedProject}
+                config={storedProjectConfig}
+                // Gate editing until the config resolves: the PATCH replaces the
+                // whole blob, so a write before the name→id and config have loaded
+                // would wipe the project's other defaults. A label-only folder
+                // (`configProjectId === null`) has no first-class config to lose.
+                configReady={
+                  !projectListLoading &&
+                  (configProjectId === null || storedProjectConfig !== undefined)
+                }
+              />
+            ) : (
+              <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
+            )}
+            {selectedProject || heading ? (
+              <h1 className="min-w-0 break-words text-center text-[24px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
+                {selectedProject || heading}
+              </h1>
+            ) : null}
+          </div>
+        )}
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <fieldset
@@ -6591,7 +6702,8 @@ export function NewChatLandingScreen() {
                 </PopoverContent>
               </Popover>
               {/* Worktree selection stays a separate real action from the directory picker. */}
-              {(!workspaceLoading || cachedWorkspace !== null) &&
+              {!relatedSession &&
+                (!workspaceLoading || cachedWorkspace !== null) &&
                 (noExecutionTargetSelected || workspaceIsGit) && (
                   <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                     <PopoverTrigger asChild>
@@ -6956,13 +7068,17 @@ export function NewChatLandingScreen() {
                                 : undefined
                             : undefined
                         }
-                        projects={projectList ?? []}
-                        onProjectSelect={(name) => {
-                          const params = new URLSearchParams(searchParams);
-                          params.set("project", name);
-                          navigate(`/?${params.toString()}`);
-                          requestAnimationFrame(() => textareaRef.current?.focus());
-                        }}
+                        projects={relatedSession ? [] : (projectList ?? [])}
+                        onProjectSelect={
+                          relatedSession
+                            ? undefined
+                            : (name) => {
+                                const params = new URLSearchParams(searchParams);
+                                params.set("project", name);
+                                navigate(`/?${params.toString()}`);
+                                requestAnimationFrame(() => textareaRef.current?.focus());
+                              }
+                        }
                       />
                     </div>
                     {/* Host chip */}
@@ -6994,12 +7110,14 @@ export function NewChatLandingScreen() {
                         <DropdownMenuTrigger asChild>
                           <ComposerHostTrigger
                             label={
-                              sandboxSelected
+                              sandboxSelected || relatedSession
                                 ? `Host: ${hostLabel}`
                                 : `Host: ${hostLabel}, ${selectedHost?.status === "online" ? "Online" : "Offline"}`
                             }
                             status={
-                              sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
+                              sandboxSelected || (relatedSession && !selectedHostId)
+                                ? undefined
+                                : (selectedHost?.status ?? "offline")
                             }
                             cloud={isCloudHost}
                             className={cn(
@@ -7017,187 +7135,206 @@ export function NewChatLandingScreen() {
                         className="composer-host-menu min-w-[220px] max-w-[min(360px,calc(100vw-24px))]"
                         data-testid="new-chat-landing-host-menu"
                       >
-                        {hasCloudOptions && (
-                          <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                            Cloud
-                          </div>
-                        )}
-                        {/* Server-provisioned sandbox — only advertised when
+                        {relatedSession ? (
+                          <>
+                            <DropdownMenuItem data-active="true">{hostLabel}</DropdownMenuItem>
+                            <p className="max-w-72 px-2 py-1.5 text-xs text-muted-foreground">
+                              New sessions currently share this session’s environment and working
+                              directory.
+                            </p>
+                          </>
+                        ) : (
+                          <>
+                            {hasCloudOptions && (
+                              <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
+                                Cloud
+                              </div>
+                            )}
+                            {/* Server-provisioned sandbox — only advertised when
                     /v1/info reports managed_sandboxes_enabled. Pinned
                     first, above the connected-host list. */}
-                        {(managedSandboxesEnabled || showDisabledSandboxWithDocs) &&
-                          (managedSandboxesEnabled ? (
-                            sandboxProviderRows.map((provider, index) => (
-                              <DropdownMenuItem
-                                key={provider ?? "default"}
-                                onSelect={() => selectSandbox(provider)}
-                                // First row keeps the original testid; later
-                                // rows get a scoped one.
-                                data-testid={
-                                  index === 0
-                                    ? "new-chat-landing-sandbox-option"
-                                    : `new-chat-landing-sandbox-option-${provider}`
-                                }
-                                data-active={
-                                  sandboxSelected && sandboxProvider === provider
-                                    ? "true"
-                                    : undefined
-                                }
-                                className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-                              >
-                                <span className="flex items-center gap-1">
-                                  <span className="flex size-4 shrink-0 items-center justify-center">
-                                    <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
+                            {(managedSandboxesEnabled || showDisabledSandboxWithDocs) &&
+                              (managedSandboxesEnabled ? (
+                                sandboxProviderRows.map((provider, index) => (
+                                  <DropdownMenuItem
+                                    key={provider ?? "default"}
+                                    onSelect={() => selectSandbox(provider)}
+                                    // First row keeps the original testid; later
+                                    // rows get a scoped one.
+                                    data-testid={
+                                      index === 0
+                                        ? "new-chat-landing-sandbox-option"
+                                        : `new-chat-landing-sandbox-option-${provider}`
+                                    }
+                                    data-active={
+                                      sandboxSelected && sandboxProvider === provider
+                                        ? "true"
+                                        : undefined
+                                    }
+                                    className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                                  >
+                                    <span className="flex items-center gap-1">
+                                      <span className="flex size-4 shrink-0 items-center justify-center">
+                                        <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
+                                      </span>
+                                      <span className="text-sm">
+                                        {sandboxOptionLabel(provider)}
+                                      </span>
+                                    </span>
+                                  </DropdownMenuItem>
+                                ))
+                              ) : (
+                                <DropdownMenuItem
+                                  aria-disabled="true"
+                                  onSelect={(e) => e.preventDefault()}
+                                  className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
+                                  data-testid="new-chat-landing-sandbox-option-disabled"
+                                >
+                                  <span className="flex items-center gap-1">
+                                    <span className="flex size-4 shrink-0 items-center justify-center">
+                                      <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
+                                    </span>
+                                    <span className="text-sm">New Sandbox</span>
                                   </span>
-                                  <span className="text-sm">{sandboxOptionLabel(provider)}</span>
-                                </span>
-                              </DropdownMenuItem>
-                            ))
-                          ) : (
-                            <DropdownMenuItem
-                              aria-disabled="true"
-                              onSelect={(e) => e.preventDefault()}
-                              className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
-                              data-testid="new-chat-landing-sandbox-option-disabled"
-                            >
-                              <span className="flex items-center gap-1">
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <button
+                                        type="button"
+                                        className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/80 hover:text-foreground"
+                                        aria-label="Why New Sandbox is unavailable"
+                                        onClick={(e) => e.stopPropagation()}
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Enter" || e.key === " ")
+                                            e.stopPropagation();
+                                        }}
+                                      >
+                                        <CircleHelpIcon className="size-3.5" />
+                                      </button>
+                                    </TooltipTrigger>
+                                    <TooltipContent className="max-w-64">
+                                      {newSandboxTooltipContent}
+                                    </TooltipContent>
+                                  </Tooltip>
+                                </DropdownMenuItem>
+                              ))}
+                            {cloudHosts.map(renderHostMenuItem)}
+                            {showArcaOption && (
+                              <DropdownMenuItem
+                                onSelect={() => {
+                                  pendingArcaConnectRef.current = true;
+                                }}
+                                disabled={connectingArca}
+                                data-testid="new-chat-landing-run-on-arca"
+                              >
                                 <span className="flex size-4 shrink-0 items-center justify-center">
                                   <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                                 </span>
-                                <span className="text-sm">New Sandbox</span>
-                              </span>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <button
-                                    type="button"
-                                    className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/80 hover:text-foreground"
-                                    aria-label="Why New Sandbox is unavailable"
-                                    onClick={(e) => e.stopPropagation()}
-                                    onKeyDown={(e) => {
-                                      if (e.key === "Enter" || e.key === " ") e.stopPropagation();
-                                    }}
-                                  >
-                                    <CircleHelpIcon className="size-3.5" />
-                                  </button>
-                                </TooltipTrigger>
-                                <TooltipContent className="max-w-64">
-                                  {newSandboxTooltipContent}
-                                </TooltipContent>
-                              </Tooltip>
-                            </DropdownMenuItem>
-                          ))}
-                        {cloudHosts.map(renderHostMenuItem)}
-                        {showArcaOption && (
-                          <DropdownMenuItem
-                            onSelect={() => {
-                              pendingArcaConnectRef.current = true;
-                            }}
-                            disabled={connectingArca}
-                            data-testid="new-chat-landing-run-on-arca"
-                          >
-                            <span className="flex size-4 shrink-0 items-center justify-center">
-                              <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
-                            </span>
-                            <span>{connectingArca ? "Connecting to Arca…" : "Run on Arca"}</span>
-                          </DropdownMenuItem>
-                        )}
-                        {hasCloudOptions && <DropdownMenuSeparator />}
-                        <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                          My machines
-                        </div>
-                        {localHosts.length === 0 &&
-                          !showConnectThisMachine &&
-                          myMachinesEmptyText && (
-                            <div className="px-2 py-1.5 text-sm text-muted-foreground">
-                              {myMachinesEmptyText}
+                                <span>
+                                  {connectingArca ? "Connecting to Arca…" : "Run on Arca"}
+                                </span>
+                              </DropdownMenuItem>
+                            )}
+                            {hasCloudOptions && <DropdownMenuSeparator />}
+                            <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
+                              My machines
                             </div>
-                          )}
-                        {localHosts.map(renderHostMenuItem)}
-                        {/* Desktop shell, no active host and machine not listed:
-                    show the disconnected local-machine state inline. */}
-                        {showConnectThisMachine && (
-                          <DropdownMenuItem
-                            onSelect={() => {
-                              pendingConnectRef.current = true;
-                            }}
-                            disabled={connectingThisMachine}
-                            data-testid="new-chat-landing-run-on-this-machine"
-                            className="group gap-1 text-sm"
-                          >
-                            <span className="flex size-4 shrink-0 items-center justify-center">
-                              <span
-                                aria-hidden
-                                className="size-2 rounded-full border-[1.5px] border-muted-foreground"
-                              />
-                            </span>
-                            <span className="min-w-0 flex-1 truncate text-sm">
-                              {localMachineLabel(navigator.userAgent)}
-                            </span>
-                            <span
-                              className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
-                              data-testid="new-chat-landing-use-this-machine"
-                            >
-                              {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
-                            </span>
-                          </DropdownMenuItem>
-                        )}
-                        {otherOfflineHosts.length > 0 && (
-                          <>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem
-                              aria-expanded={offlineHostLimit > 0}
-                              onSelect={(event) => {
-                                event.preventDefault();
-                                setOfflineHostLimit((limit) => (limit > 0 ? 0 : 5));
-                              }}
-                              className="text-muted-foreground"
-                            >
-                              {offlineHostLimit > 0 ? (
-                                <ChevronDownIcon className="size-4" />
-                              ) : (
-                                <ChevronRightIcon className="size-4" />
-                              )}
-                              Offline hosts ({otherOfflineHosts.length})
-                            </DropdownMenuItem>
-                            {offlineHostLimit > 0 && (
-                              <>
-                                <div
-                                  role="group"
-                                  aria-label="Offline hosts"
-                                  className="max-h-48 overflow-y-auto"
-                                >
-                                  {otherOfflineHosts
-                                    .slice(0, offlineHostLimit)
-                                    .map(renderHostMenuItem)}
+                            {localHosts.length === 0 &&
+                              !showConnectThisMachine &&
+                              myMachinesEmptyText && (
+                                <div className="px-2 py-1.5 text-sm text-muted-foreground">
+                                  {myMachinesEmptyText}
                                 </div>
-                                {offlineHostLimit < otherOfflineHosts.length && (
-                                  <DropdownMenuItem
-                                    onSelect={(event) => {
-                                      event.preventDefault();
-                                      setOfflineHostLimit((limit) => limit + 5);
-                                    }}
-                                    className="text-muted-foreground"
-                                  >
-                                    Show more ({otherOfflineHosts.length - offlineHostLimit}{" "}
-                                    remaining)
-                                  </DropdownMenuItem>
+                              )}
+                            {localHosts.map(renderHostMenuItem)}
+                            {/* Desktop shell, no active host and machine not listed:
+                    show the disconnected local-machine state inline. */}
+                            {showConnectThisMachine && (
+                              <DropdownMenuItem
+                                onSelect={() => {
+                                  pendingConnectRef.current = true;
+                                }}
+                                disabled={connectingThisMachine}
+                                data-testid="new-chat-landing-run-on-this-machine"
+                                className="group gap-1 text-sm"
+                              >
+                                <span className="flex size-4 shrink-0 items-center justify-center">
+                                  <span
+                                    aria-hidden
+                                    className="size-2 rounded-full border-[1.5px] border-muted-foreground"
+                                  />
+                                </span>
+                                <span className="min-w-0 flex-1 truncate text-sm">
+                                  {localMachineLabel(navigator.userAgent)}
+                                </span>
+                                <span
+                                  className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
+                                  data-testid="new-chat-landing-use-this-machine"
+                                >
+                                  {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
+                                </span>
+                              </DropdownMenuItem>
+                            )}
+                            {otherOfflineHosts.length > 0 && (
+                              <>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  aria-expanded={offlineHostLimit > 0}
+                                  onSelect={(event) => {
+                                    event.preventDefault();
+                                    setOfflineHostLimit((limit) => (limit > 0 ? 0 : 5));
+                                  }}
+                                  className="text-muted-foreground"
+                                >
+                                  {offlineHostLimit > 0 ? (
+                                    <ChevronDownIcon className="size-4" />
+                                  ) : (
+                                    <ChevronRightIcon className="size-4" />
+                                  )}
+                                  Offline hosts ({otherOfflineHosts.length})
+                                </DropdownMenuItem>
+                                {offlineHostLimit > 0 && (
+                                  <>
+                                    <div
+                                      role="group"
+                                      aria-label="Offline hosts"
+                                      className="max-h-48 overflow-y-auto"
+                                    >
+                                      {otherOfflineHosts
+                                        .slice(0, offlineHostLimit)
+                                        .map(renderHostMenuItem)}
+                                    </div>
+                                    {offlineHostLimit < otherOfflineHosts.length && (
+                                      <DropdownMenuItem
+                                        onSelect={(event) => {
+                                          event.preventDefault();
+                                          setOfflineHostLimit((limit) => limit + 5);
+                                        }}
+                                        className="text-muted-foreground"
+                                      >
+                                        Show more ({otherOfflineHosts.length - offlineHostLimit}{" "}
+                                        remaining)
+                                      </DropdownMenuItem>
+                                    )}
+                                  </>
                                 )}
                               </>
                             )}
-                          </>
-                        )}
-                        <DropdownMenuSeparator />
-                        {/* Persistent escape hatch: open the connect-a-host
+                            {!relatedSession && <DropdownMenuSeparator />}
+                            {/* Persistent escape hatch: open the connect-a-host
                     instructions. Present even with zero hosts so a fresh user
                     is never stuck. */}
-                        <DropdownMenuItem
-                          onSelect={() => setConnectOpen(true)}
-                          data-testid="new-chat-landing-connect-host"
-                          className="composer-host-connect text-muted-foreground"
-                        >
-                          <PlusIcon className="size-4" />
-                          Connect new host
-                        </DropdownMenuItem>
+                            {!relatedSession && (
+                              <DropdownMenuItem
+                                onSelect={() => setConnectOpen(true)}
+                                data-testid="new-chat-landing-connect-host"
+                                className="composer-host-connect text-muted-foreground"
+                              >
+                                <PlusIcon className="size-4" />
+                                Connect new host
+                              </DropdownMenuItem>
+                            )}
+                          </>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
 
@@ -7296,6 +7433,7 @@ export function NewChatLandingScreen() {
                         onSelectPending={handleSelectPending}
                         onCreateCustomAgent={() => setCreateAgentOpen(true)}
                         sandboxSelected={sandboxSelected}
+                        allowCreateCustomAgent={!relatedSession}
                         triggerTooltip={
                           smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
                         }
@@ -7604,7 +7742,7 @@ export function NewChatLandingScreen() {
             </p>
           )}
         </div>
-        {hasNoSessions ? (
+        {!relatedSession && hasNoSessions ? (
           <div className="mt-5 flex flex-col items-center gap-2">
             <Button
               variant="outline"
@@ -7617,7 +7755,7 @@ export function NewChatLandingScreen() {
         ) : null}
       </div>
 
-      {poweredBy ? (
+      {!relatedSession && poweredBy ? (
         <footer className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-4">
           <div className="pointer-events-auto">
             <PoweredByOmnigent />

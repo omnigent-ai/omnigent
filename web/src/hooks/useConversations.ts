@@ -73,6 +73,9 @@ import type { Session } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { fetchChildSessions, type ChildSessionInfo } from "./useChildSessions";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
@@ -161,6 +164,8 @@ export interface Conversation {
   updated_at: number;
   labels: Record<string, string>;
   permission_level: number | null;
+  /** Returned by an atomic group archive; used only by that operation's Undo. */
+  archive_changed_session_ids?: string[] | null;
   owner?: string | null;
   runner_id?: string | null;
   /** Host that launched the runner for this session, e.g. ``"host_a1b2"``. */
@@ -810,16 +815,40 @@ export async function archiveConversation(
   id: string,
   archived: boolean,
   deleteWorktree = false,
+  tree = false,
+  restoreIds?: string[],
 ): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(
-      archived && deleteWorktree ? { archived, delete_worktree: true } : { archived },
+      tree
+        ? {
+            archived,
+            archive_scope: "tree",
+            ...(restoreIds ? { archive_session_ids: restoreIds } : {}),
+          }
+        : archived && deleteWorktree
+          ? { archived, delete_worktree: true }
+          : { archived },
     ),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
+}
+
+async function archiveWithRelatedSessions(
+  id: string,
+  archived: boolean,
+  deleteWorktree: boolean,
+  relatedEnabled: boolean,
+) {
+  const tree =
+    relatedEnabled &&
+    (await fetchChildSessions(id, true)).some(
+      (child) => child.labels?.["omnigent.session_role"] === "peer",
+    );
+  return archiveConversation(id, archived, deleteWorktree, tree);
 }
 
 /**
@@ -1009,8 +1038,33 @@ async function paintConversationsArchived(
   return { snapshot, marked };
 }
 
+/** Apply a server-confirmed group mutation using the normal archive cache guards. */
+export async function applyConfirmedArchive(
+  queryClient: QueryClient,
+  ids: string[],
+  archived: boolean,
+): Promise<void> {
+  const context = await paintConversationsArchived(queryClient, ids, archived);
+  if (context.marked) expireSessionsArchiving(context.marked, ids);
+  for (const id of ids) {
+    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, archived } : old));
+  }
+  const changed = new Set(ids);
+  queryClient.setQueriesData<ChildSessionInfo[]>(
+    {
+      predicate: (query) =>
+        query.queryKey[0] === "conversation" && query.queryKey[2] === "child_sessions",
+    },
+    (rows) => rows?.map((row) => (changed.has(row.id) ? { ...row, archived } : row)),
+  );
+  void queryClient.invalidateQueries({ queryKey: ["projects"] });
+  void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+  void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+}
+
 export function useArchiveConversation() {
   const queryClient = useQueryClient();
+  const relatedEnabled = isFeatureEnabled(useServerInfo(), "related_sessions");
   return useMutation({
     mutationFn: ({
       id,
@@ -1020,7 +1074,7 @@ export function useArchiveConversation() {
       id: string;
       archived: boolean;
       deleteWorktree?: boolean;
-    }) => archiveConversation(id, archived, deleteWorktree),
+    }) => archiveWithRelatedSessions(id, archived, deleteWorktree, relatedEnabled),
     onMutate: ({ id, archived }) => paintConversationsArchived(queryClient, [id], archived),
     onError: (_err, { id, archived }, context) => {
       if (archived && context?.marked !== undefined) {
@@ -1041,6 +1095,9 @@ export function useArchiveConversation() {
       );
     },
     onSuccess: (updated, { archived }, context) => {
+      if (updated.archive_changed_session_ids) {
+        void applyConfirmedArchive(queryClient, updated.archive_changed_session_ids, archived);
+      }
       markConversationSeen(updated.id, updated.updated_at);
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
@@ -1182,7 +1239,16 @@ function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly st
   for (const id of ids) {
     queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
     queryClient.removeQueries({ queryKey: ["session", id] });
+    queryClient.removeQueries({ queryKey: ["conversation", id, "child_sessions"] });
   }
+  const deleted = new Set(ids);
+  queryClient.setQueriesData<ChildSessionInfo[]>(
+    {
+      predicate: (query) =>
+        query.queryKey[0] === "conversation" && query.queryKey[2] === "child_sessions",
+    },
+    (rows) => rows?.filter((row) => !deleted.has(row.id)),
+  );
   expireSessionsDeleting([...ids]);
   // Deleting the last member of a project empties it, so refresh the
   // project list to drop the now-empty folder. Unlike the conversations
@@ -1361,20 +1427,39 @@ export function useStopSession() {
  */
 export function useBulkArchiveConversations() {
   const queryClient = useQueryClient();
+  const relatedEnabled = isFeatureEnabled(useServerInfo(), "related_sessions");
   return useMutation({
     mutationFn: async ({
       ids,
       archived,
       deleteWorktreeIds,
+      onArchived,
     }: {
       ids: string[];
       archived: boolean;
       /** Archived sessions whose worktree should also be removed. */
       deleteWorktreeIds?: ReadonlySet<string>;
+      onArchived?: (conversations: Conversation[], startedAt: number) => void;
     }) => {
+      const startedAt = Date.now();
       const results = await Promise.allSettled(
-        ids.map((id) => archiveConversation(id, archived, deleteWorktreeIds?.has(id) === true)),
+        ids.map((id) =>
+          archiveWithRelatedSessions(
+            id,
+            archived,
+            deleteWorktreeIds?.has(id) === true,
+            relatedEnabled,
+          ),
+        ),
       );
+      const successful = results
+        .filter(
+          (result): result is PromiseFulfilledResult<Conversation> => result.status === "fulfilled",
+        )
+        .map((result) => result.value);
+      const changedIds = successful.flatMap((result) => result.archive_changed_session_ids ?? []);
+      if (changedIds.length > 0) await applyConfirmedArchive(queryClient, changedIds, archived);
+      if (archived) onArchived?.(successful, startedAt);
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
         if (results[i].status === "rejected") failed.push(ids[i]);
@@ -1485,13 +1570,29 @@ export async function undoArchiveConversations(
   // unarchive, so a lagging refetch can't drop them.
   void queryClient.invalidateQueries({ queryKey: ["conversations"] });
   try {
-    const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, false)));
+    const results = await Promise.allSettled(
+      conversations.map((conversation) =>
+        archiveConversation(
+          conversation.id,
+          false,
+          false,
+          conversation.archive_changed_session_ids != null,
+          conversation.archive_changed_session_ids ?? undefined,
+        ),
+      ),
+    );
     const failed: string[] = [];
+    const restoredIds: string[] = [];
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
-      if (result.status === "fulfilled") markConversationSeen(ids[i], result.value.updated_at);
-      else failed.push(ids[i]);
+      if (result.status === "fulfilled") {
+        markConversationSeen(ids[i], result.value.updated_at);
+        if (result.value.archive_changed_session_ids) {
+          restoredIds.push(...result.value.archive_changed_session_ids);
+        }
+      } else failed.push(ids[i]);
     }
+    if (restoredIds.length > 0) await applyConfirmedArchive(queryClient, restoredIds, false);
     if (failed.length > 0) {
       // The ids that stayed archived: drop them from the keep-alive so they stop
       // being re-injected, and overlay archived=true so they leave the list

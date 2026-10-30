@@ -103,6 +103,7 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SESSION_ROLE_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -1142,7 +1143,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                             f"parent conversation {parent_conversation_id!r} does not exist"
                         )
                     root_id = parent_row.root_conversation_id
-                if inference_snapshot is None:
+                if (
+                    inference_snapshot is None
+                    and (labels or {}).get(SESSION_ROLE_LABEL_KEY) != "peer"
+                ):
                     parent_meta = self._get_meta(parent_conversation_id)
                     encoded_inference_snapshot = (
                         parent_meta.inference_snapshot if parent_meta else None
@@ -5145,6 +5149,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        related_source: Conversation | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -5304,6 +5309,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             project_id=project_id,
             file_id_map=file_id_map,
             created_by=created_by,
+            related_source=related_source,
         )
 
     def _fork_conversation_with_id(
@@ -5333,6 +5339,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        related_source: Conversation | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -5401,10 +5408,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "created_at": now,
                 "updated_at": now,
                 "title": fork_title or "",  # None → empty string at DB layer
-                # A fork is a fresh top-level conversation, so its
-                # root mirrors its own id (matches the
-                # ``_new_session_conversation_row`` invariant).
-                "root_conversation_id": new_conv_id,
+                # Related forks join the source group; ordinary forks own a new root.
+                "root_conversation_id": related_source.root_conversation_id
+                if related_source
+                else new_conv_id,
+                "parent_conversation_id": related_source.root_conversation_id
+                if related_source
+                else None,
                 # An explicit agent_id (clone or existing) beats inheriting the
                 # source's binding.
                 "agent_id": agent_id if agent_id is not None else source.agent_id,
@@ -5765,6 +5775,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork_meta = SqlConversationMetadata(
                 id=new_conv_id,
                 kind=encoded_default_kind,
+                runner_id=related_source.runner_id if related_source else None,
+                host_id=related_source.host_id if related_source else None,
+                workspace=related_source.workspace if related_source else None,
                 terminal_launch_args=source_terminal_args,
                 inference_snapshot=(
                     source_meta_ref.inference_snapshot if source_meta_ref else None
@@ -5920,6 +5933,68 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 is not None
             )
+
+    def archive_subtree(
+        self,
+        conversation_id: str,
+        archived: bool,
+        *,
+        only_ids: list[str] | None = None,
+        unpin_label: str | None = None,
+    ) -> list[str] | None:
+        """Archive a subtree in one transaction, preserving previously archived rows."""
+        now = now_epoch()
+
+        def write(session: Session) -> list[str] | None:
+            subtree = (
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+                .cte(name="archive_subtree", recursive=True)
+            )
+            subtree = subtree.union_all(
+                select(SqlConversation.id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.parent_conversation_id == subtree.c.id,
+                )
+            )
+            query = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id.in_(select(subtree.c.id)),
+            )
+            if self._supports_for_update:
+                query = query.with_for_update()
+            rows = list(session.scalars(query))
+            if not rows:
+                return None
+            selected = set(only_ids) if only_ids is not None else {row.id for row in rows}
+            if not selected.issubset({row.id for row in rows}):
+                raise ValueError("Archive selection contains a session outside this group")
+            changed = []
+            for row in rows:
+                if row.id not in selected or row.archived == archived:
+                    continue
+                row.archived = archived
+                row.updated_at = now
+                changed.append(row.id)
+                if archived:
+                    _upsert_labels(session, row.id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now)
+            clear_labels = [unpin_label] if archived and unpin_label else []
+            if not archived:
+                clear_labels.append(ARCHIVED_AT_LABEL_KEY)
+            if changed and clear_labels:
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id.in_(changed),
+                        SqlConversationLabel.key.in_(clear_labels),
+                    )
+                )
+            return changed
+
+        return run_write_transaction(self._conv_session_immediate, "archive_session_group", write)
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """

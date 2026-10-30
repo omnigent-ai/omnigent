@@ -108,6 +108,7 @@ from omnigent.spec.types import (
     PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import SESSION_ROLE_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
@@ -1800,7 +1801,11 @@ def register_hooks_routes(
 
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         parent = None
-        if conv is not None and conv.parent_conversation_id is not None:
+        if (
+            conv is not None
+            and conv.parent_conversation_id is not None
+            and conv.labels.get(SESSION_ROLE_LABEL_KEY) != "peer"
+        ):
             parent = await asyncio.to_thread(
                 conversation_store.get_conversation, conv.parent_conversation_id
             )
@@ -1924,7 +1929,11 @@ def register_hooks_routes(
 
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         parent = None
-        if conv is not None and conv.parent_conversation_id is not None:
+        if (
+            conv is not None
+            and conv.parent_conversation_id is not None
+            and conv.labels.get(SESSION_ROLE_LABEL_KEY) != "peer"
+        ):
             parent = await asyncio.to_thread(
                 conversation_store.get_conversation, conv.parent_conversation_id
             )

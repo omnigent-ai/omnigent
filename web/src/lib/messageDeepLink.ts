@@ -21,6 +21,9 @@ export function buildMessageDeepLink(messageId: string, href?: string): string {
  *
  * @param messageId - The id encoded in ``?message=``.
  */
-export function findMessageElement(messageId: string): Element | null {
-  return document.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
+export function findMessageElement(messageId: string, sessionId?: string): Element | null {
+  const scope = sessionId
+    ? (document.querySelector(`[data-chat-session-id="${CSS.escape(sessionId)}"]`) ?? document)
+    : document;
+  return scope.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
 }

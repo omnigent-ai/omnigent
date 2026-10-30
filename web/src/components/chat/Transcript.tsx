@@ -1,4 +1,13 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useContext,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { flushSync } from "react-dom";
 import { measureElement, useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
@@ -22,7 +31,7 @@ import {
   createBubbleCache,
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
-import { useChatStore } from "@/store/chatStore";
+import { ChatStoreContext, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
@@ -240,7 +249,8 @@ function TranscriptImpl({
   }, [display.conversationId]);
   const disableVirtualization = nativeFindConversationId === display.conversationId;
   const [searchParams] = useSearchParams();
-  const messageId = searchParams.get(MESSAGE_QUERY_PARAM);
+  const secondary = useContext(ChatStoreContext) !== null;
+  const messageId = secondary ? null : searchParams.get(MESSAGE_QUERY_PARAM);
 
   // Virtualizer-derived geometry (scroll handle, active turn, range nonce),
   // published by VirtualBubbleList. The rail reads the active turn and the

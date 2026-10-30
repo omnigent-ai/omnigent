@@ -1,3 +1,4 @@
+import { usePreventDragClick } from "@/hooks/usePreventDragClick";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { GridSidebar } from "@/grid/GridWorkspace";
@@ -185,6 +186,10 @@ import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import {
+  useArchiveRelatedSessions,
+  useRelatedSessionGroup,
+} from "@/hooks/useRelatedSessionLifecycle";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -4082,6 +4087,9 @@ function ConversationMenuItems({
   moveToProject,
   setShareOpen,
   setForkOpen,
+  setAddAgentOpen,
+  hasRelatedSessions,
+  relatedSessionsPending,
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
@@ -4112,6 +4120,9 @@ function ConversationMenuItems({
   moveToProject: ReturnType<typeof useMoveToProject>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
+  setAddAgentOpen?: (open: boolean) => void;
+  hasRelatedSessions: boolean;
+  relatedSessionsPending: boolean;
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
@@ -4262,6 +4273,12 @@ function ConversationMenuItems({
         <GitForkIcon className="size-3.5" />
         Fork
       </SessionActionMenuItem>
+      {isOwner && !isArchived && setAddAgentOpen && (
+        <C.Item data-testid="add-agent-conversation" onSelect={() => setAddAgentOpen(true)}>
+          <PlusIcon className="size-3.5" />
+          Add agent…
+        </C.Item>
+      )}
       {isOwner ? (
         <C.Item
           data-testid="rename-conversation"
@@ -4385,13 +4402,18 @@ function ConversationMenuItems({
           </Tooltip>
         ))}
       {isOwner ? (
-        <C.Item data-testid="archive-conversation" onSelect={runArchive}>
+        <C.Item
+          data-testid="archive-conversation"
+          disabled={relatedSessionsPending}
+          onSelect={runArchive}
+        >
           {isArchived ? (
             <ArchiveRestoreIcon className="size-3.5" />
           ) : (
             <ArchiveIcon className="size-3.5" />
           )}
           {isArchived ? "Unarchive" : "Archive"}
+          {hasRelatedSessions ? " All" : ""}
         </C.Item>
       ) : (
         <Tooltip>
@@ -4404,6 +4426,7 @@ function ConversationMenuItems({
                   <ArchiveIcon className="size-3.5" />
                 )}
                 {isArchived ? "Unarchive" : "Archive"}
+                {hasRelatedSessions ? " All" : ""}
               </C.Item>
             </div>
           </TooltipTrigger>
@@ -4422,11 +4445,12 @@ function ConversationMenuItems({
       {isOwner || isSingleUser ? (
         <C.Item
           data-testid="delete-conversation"
+          disabled={relatedSessionsPending}
           variant="destructive"
           onSelect={() => setDeleteOpen(true)}
         >
           <Trash2Icon className="size-3.5" />
-          Delete
+          Delete{hasRelatedSessions ? " All" : ""}
         </C.Item>
       ) : (
         <C.Item
@@ -4822,6 +4846,9 @@ function ConversationRowImpl({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const [relatedActionsRequested, setRelatedActionsRequested] = useState(false);
+  const relatedGroup = useRelatedSessionGroup(conversation.id, relatedActionsRequested || isActive);
+  const archiveRelated = useArchiveRelatedSessions();
   const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
@@ -5019,22 +5046,7 @@ function ConversationRowImpl({
     disabled:
       (!isOwner && !gridsEnabled) || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
-  // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
-  // on the same anchor still fires a click); swallow that one click so a drag
-  // doesn't also navigate into the session. Flagged when a drag finishes,
-  // cleared on the next tick (after the click that follows pointer-up).
-  const justDraggedRef = useRef(false);
-  const wasDraggingRef = useRef(false);
-  useEffect(() => {
-    const was = wasDraggingRef.current;
-    wasDraggingRef.current = isDragging;
-    if (!was || isDragging) return undefined;
-    justDraggedRef.current = true;
-    const timer = setTimeout(() => {
-      justDraggedRef.current = false;
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [isDragging]);
+  usePreventDragClick(isDragging);
   // In the Pinned section each row is also a reorder target for other pins.
   const pinOrder = useContext(PinOrderContext);
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
@@ -5103,6 +5115,12 @@ function ConversationRowImpl({
   }
 
   function runArchive() {
+    if (relatedGroup.hasPeers) {
+      if (relatedGroup.loading || relatedGroup.error || archiveRelated.isPending) return;
+      if (!isArchived && isActive) navigate("/", { replace: true });
+      archiveRelated.mutate({ conversation, archived: !isArchived });
+      return;
+    }
     if (isArchived) {
       runUnarchive();
       return;
@@ -5137,6 +5155,10 @@ function ConversationRowImpl({
   }
 
   function runUnarchive() {
+    if (relatedGroup.hasPeers) {
+      runArchive();
+      return;
+    }
     const nextArchived = !isArchived;
     archive.mutate({ id: conversation.id, archived: nextArchived });
   }
@@ -5187,6 +5209,12 @@ function ConversationRowImpl({
     moveToProject,
     setShareOpen,
     setForkOpen,
+    setAddAgentOpen: relatedGroup.enabled
+      ? () => navigate(`/c/${conversation.id}?panel=agents&newSession=1`)
+      : undefined,
+    hasRelatedSessions: relatedGroup.hasPeers,
+    relatedSessionsPending:
+      relatedGroup.loading || !!relatedGroup.error || archiveRelated.isPending,
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
@@ -5241,11 +5269,7 @@ function ConversationRowImpl({
       )}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        // Swallow the click that trails a drag so it doesn't navigate.
-        if (justDraggedRef.current) {
-          e.preventDefault();
-          return;
-        }
+        if (e.defaultPrevented) return;
         if (selectionMode) {
           e.preventDefault();
           e.stopPropagation();
@@ -5312,6 +5336,10 @@ function ConversationRowImpl({
     <li
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
+      onPointerEnter={() => setRelatedActionsRequested(true)}
+      onFocusCapture={() => setRelatedActionsRequested(true)}
+      onContextMenuCapture={() => setRelatedActionsRequested(true)}
+      onPointerDownCapture={() => setRelatedActionsRequested(true)}
       onMouseDown={(event) => {
         // Portaled dialogs bubble through this row but must not start a drag.
         if (event.currentTarget.contains(event.target as Node)) {
@@ -5560,13 +5588,25 @@ function ConversationRowImpl({
                   <TooltipContent>
                     <TooltipArrow />
                     {isArchived ? "Unarchive" : "Archive"}
+                    {relatedGroup.hasPeers ? " All" : ""}
                   </TooltipContent>
                   <TooltipTrigger asChild>
                     <Button
                       type="button"
                       variant="ghost"
                       size="icon-xs"
-                      aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+                      aria-label={
+                        relatedGroup.hasPeers
+                          ? isArchived
+                            ? "Unarchive all sessions"
+                            : "Archive all sessions"
+                          : isArchived
+                            ? "Unarchive conversation"
+                            : "Archive conversation"
+                      }
+                      disabled={
+                        relatedGroup.loading || !!relatedGroup.error || archiveRelated.isPending
+                      }
                       data-testid="quick-archive-conversation"
                       className={cn(
                         "text-muted-foreground transition-opacity",
@@ -5679,9 +5719,12 @@ function ConversationRowImpl({
             onClick={(e) => e.stopPropagation()}
           >
             <DialogHeader>
-              <DialogTitle>Delete conversation?</DialogTitle>
+              <DialogTitle>
+                {relatedGroup.hasPeers ? "Delete all sessions?" : "Delete conversation?"}
+              </DialogTitle>
               <DialogDescription>
-                <span className="font-medium break-all">{label}</span> and all of its history will
+                <span className="font-medium break-all">{label}</span>
+                {relatedGroup.hasPeers ? ", its related sessions," : ""} and all of its history will
                 be removed. This cannot be undone.
               </DialogDescription>
             </DialogHeader>
@@ -5727,7 +5770,7 @@ function ConversationRowImpl({
                 disabled={del.isPending}
                 componentId="sidebar.conversation.delete"
               >
-                Delete
+                Delete{relatedGroup.hasPeers ? " All" : ""}
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -6543,6 +6586,7 @@ function BulkActionBar({
   const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
+  const relatedSessionsEnabled = isFeatureEnabled(useServerInfo(), "related_sessions");
   const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const bulkDelete = useBulkDeleteConversations();
   const bulkMove = useBulkMoveToProject();
@@ -6667,6 +6711,13 @@ function BulkActionBar({
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
     const toArchive = nonArchivedSelected;
+    if (relatedSessionsEnabled) {
+      if (toArchive.some((conversation) => conversation.git_branch)) {
+        showToast("Worktrees will be kept when archiving these sessions.");
+      }
+      archiveNow(toArchive, new Set());
+      return;
+    }
     archiveWorktreePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
       archiveNow(toArchive, deleteWorktreeIds),
     );
@@ -6681,11 +6732,21 @@ function BulkActionBar({
     // session they switched to meanwhile. Mirrors handleDelete.
     if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
     onDeselectAll();
-    bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, deleteWorktreeIds });
+    bulkArchive.mutate({
+      ids: toArchive.map((c) => c.id),
+      archived: true,
+      deleteWorktreeIds,
+      ...(relatedSessionsEnabled
+        ? {
+            onArchived: (updated: Conversation[], startedAt: number) =>
+              showArchiveUndoToast(queryClient, updated, navigate, startedAt),
+          }
+        : {}),
+    });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.
-    showArchiveUndoToast(queryClient, toArchive, navigate);
+    if (!relatedSessionsEnabled) showArchiveUndoToast(queryClient, toArchive, navigate);
   }
 
   function handleUnarchive() {

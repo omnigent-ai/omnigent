@@ -152,6 +152,7 @@ function renderDialog(
     sourceGitBranch?: string | null;
     upToResponseId?: string | null;
     workspaceRecovery?: boolean;
+    relatedSession?: boolean;
     // Server capabilities the dialog reads. Omitted leaves the context on
     // "loading", which fails the sandbox gate closed — the world every
     // pre-sandbox case here was written against.
@@ -168,6 +169,7 @@ function renderDialog(
   const form = { visible: true, upToResponseId: props.upToResponseId };
   const bareForm = () => (
     <ForkSessionForm
+      relatedSession={props.relatedSession}
       sourceSessionId="conv_src"
       sourceTitle={props.sourceTitle}
       sourceWorkspace={props.sourceWorkspace}
@@ -179,6 +181,7 @@ function renderDialog(
   );
   const dialog = () => (
     <ForkSessionDialog
+      relatedSession={props.relatedSession}
       sourceSessionId="conv_src"
       sourceTitle={props.sourceTitle}
       sourceWorkspace={props.sourceWorkspace}
@@ -448,6 +451,46 @@ describe("ForkSessionDialog", () => {
     expect(toastMock).not.toHaveBeenCalled();
     expect(toastMock.success).not.toHaveBeenCalled();
   });
+
+  it.each(["arclet", "lakebox", undefined])(
+    "forks within the current %s environment with the existing harness picker",
+    async (provider) => {
+      setHosts([host({ sandbox_provider: provider })]);
+      useSessionMock.mockReturnValue({
+        session: { id: "conv_src", hostId: "host_1", labels: { "omnigent.host_type": "managed" } },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      forkSessionMock.mockResolvedValue({
+        id: "conv_peer",
+        parentSessionId: "conv_root",
+      } as Awaited<ReturnType<typeof forkSession>>);
+      const { invalidateSpy } = renderDialog({
+        sourceWorkspace: "/workspace/source",
+        sourceHostId: "host_1",
+        relatedSession: true,
+      });
+      expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+      openAgentSelect();
+      fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_claude_native"));
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() =>
+        expect(forkSessionMock).toHaveBeenCalledWith(
+          "conv_src",
+          expect.objectContaining({
+            relatedSession: true,
+            agentId: "ag_claude_native",
+            sandbox: undefined,
+          }),
+        ),
+      );
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["conversation", "conv_root", "child_sessions"],
+      });
+    },
+  );
 
   it("spins the submit button while the fork is in flight", async () => {
     // The fork call can take seconds. Without the spinner the button only

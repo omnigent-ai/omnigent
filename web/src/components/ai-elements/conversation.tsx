@@ -21,17 +21,22 @@ export const ConversationScrollLockContext = createContext<ConversationScrollLoc
 // Module handle so non-React scroll helpers (deep links, activity rail,
 // Cmd+Alt nav) can release the bottom-lock without Conversation context.
 let activeScrollLock: ConversationScrollLock | null = null;
+const scrollLocks = new WeakMap<Element, ConversationScrollLock>();
 
 /**
  * Release StickToBottom's bottom-lock so a programmatic scroll is not
  * overridden by the next content-resize ``scrollToBottom``. Same recipe as
  * JumpToTopButton / the "Worked for" fold snap. No-op outside a conversation.
  */
-export function releaseConversationScrollLock(): void {
-  if (!activeScrollLock) return;
-  activeScrollLock.stopScroll();
-  activeScrollLock.state.isAtBottom = false;
-  activeScrollLock.state.escapedFromLock = true;
+export function releaseConversationScrollLock(element?: Element): void {
+  let lock = element ? null : activeScrollLock;
+  for (let node = element; node && !lock; node = node.parentElement ?? undefined) {
+    lock = scrollLocks.get(node) ?? null;
+  }
+  if (!lock) return;
+  lock.stopScroll();
+  lock.state.isAtBottom = false;
+  lock.state.escapedFromLock = true;
 }
 
 /**
@@ -54,10 +59,13 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
   // (message deep links) try to scroll away from the bottom.
   useLayoutEffect(() => {
     activeScrollLock = value;
+    const scroller = ctx.scrollRef.current;
+    if (scroller) scrollLocks.set(scroller, value);
     return () => {
       if (activeScrollLock === value) activeScrollLock = null;
+      if (scroller) scrollLocks.delete(scroller);
     };
-  }, [value]);
+  }, [value, ctx.scrollRef]);
   return (
     <ConversationScrollLockContext.Provider value={value}>
       {children}

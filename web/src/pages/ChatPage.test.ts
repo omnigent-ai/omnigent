@@ -1202,6 +1202,14 @@ describe("subAgentComposerLabel", () => {
     expect(subAgentComposerLabel(mkSession({ parentSessionId: null }))).toBeNull();
   });
 
+  it("does not describe a full peer as a delegated sub-agent", () => {
+    expect(
+      subAgentComposerLabel(
+        mkSession({ title: "Review: API", labels: { "omnigent.session_role": "peer" } }),
+      ),
+    ).toBeNull();
+  });
+
   it("returns null when no snapshot is loaded", () => {
     expect(subAgentComposerLabel(null)).toBeNull();
   });

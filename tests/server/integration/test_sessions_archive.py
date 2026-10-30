@@ -21,13 +21,17 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -48,6 +52,68 @@ def _no_archive_stop_grace() -> object:
 
 
 # ── Archive / unarchive lifecycle ────────────────────────
+
+
+async def test_archive_tree_and_undo_only_changed_sessions(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    session = await create_test_session(client, name="archive-group")
+    store = SqlAlchemyConversationStore(db_uri)
+    peer = store.create_conversation(parent_conversation_id=session["id"])
+    archived_peer = store.create_conversation(parent_conversation_id=session["id"])
+    store.update_conversation(archived_peer.id, archived=True)
+    body = {"archived": True, "archive_scope": "tree"}
+    disabled = await client.patch(f"/v1/sessions/{session['id']}", json=body)
+    assert disabled.status_code == 400
+    assert not store.get_conversation(peer.id).archived
+    app.state.feature_flags = FeatureFlags(frozenset({Feature.RELATED_SESSIONS}))
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 60):
+        response = await client.patch(f"/v1/sessions/{session['id']}", json=body)
+        assert response.status_code == 200, response.text
+        changed = response.json()["archive_changed_session_ids"]
+        assert set(changed) == {session["id"], peer.id}
+        assert store.get_conversation(peer.id).archived
+        restored = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"archived": False, "archive_scope": "tree", "archive_session_ids": changed},
+        )
+        assert restored.status_code == 200, restored.text
+    assert not store.get_conversation(peer.id).archived
+    assert store.get_conversation(archived_peer.id).archived
+
+
+async def test_group_lifecycle_inherits_owner_without_granting_readers_control(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+) -> None:
+    auth_app.state.feature_flags = FeatureFlags(frozenset({Feature.RELATED_SESSIONS}))
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    root = store.create_conversation()
+    peer = store.create_conversation(parent_conversation_id=root.id)
+    for user, level in [("owner", LEVEL_OWNER), ("reader", LEVEL_READ)]:
+        permissions.ensure_user(user)
+        permissions.grant(user, root.id, level)
+    for method, payload in [
+        ("PATCH", {"archived": True, "archive_scope": "tree"}),
+        ("DELETE", None),
+    ]:
+        response = await auth_client.request(
+            method,
+            f"/v1/sessions/{peer.id}",
+            headers={"X-Forwarded-Email": "reader"},
+            json=payload,
+        )
+        assert response.status_code == 403
+    assert not store.get_conversation(peer.id).archived
+    response = await auth_client.delete(
+        f"/v1/sessions/{peer.id}", headers={"X-Forwarded-Email": "owner"}
+    )
+    assert response.status_code == 200, response.text
+    assert store.get_conversation(root.id) is not None
 
 
 async def test_session_not_archived_by_default(
@@ -178,7 +244,7 @@ async def test_archive_does_not_block_on_slow_stop(
     release = asyncio.Event()
     stopped: list[str] = []
 
-    async def _parked_stop(sid: str, *_args: object) -> None:
+    async def _parked_stop(sid: str, *_args: object, **_kwargs: object) -> None:
         stopped.append(sid)
         await release.wait()
 
@@ -247,6 +313,31 @@ async def test_archive_idle_parent_stops_running_child(
         assert mock_stop.await_args.args[0] == child.id
     finally:
         _sessions_common._session_status_cache.pop(child.id, None)
+
+
+async def test_archive_timer_preserves_an_individually_restored_peer(
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+    helper = store.create_conversation(parent_conversation_id=root.id)
+    peer = store.create_conversation(
+        parent_conversation_id=root.id, labels={"omnigent.session_role": "peer"}
+    )
+    peer_helper = store.create_conversation(parent_conversation_id=peer.id)
+    store.archive_subtree(root.id, True)
+    store.archive_subtree(peer.id, False)
+    for session in [helper, peer, peer_helper]:
+        _sessions_common._session_status_cache[session.id] = "running"
+    try:
+        with patch.object(
+            _sessions_orchestration, "_stop_session_via_runner", AsyncMock()
+        ) as stop:
+            await _sessions_orchestration._archive_stop(root.id, store, None, None)
+        assert [call.args[0] for call in stop.await_args_list] == [helper.id]
+    finally:
+        for session in [helper, peer, peer_helper]:
+            _sessions_common._session_status_cache.pop(session.id, None)
 
 
 async def test_archive_tears_down_host_spawned_runner(

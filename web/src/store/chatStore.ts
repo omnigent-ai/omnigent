@@ -43,7 +43,8 @@
 //     deduping by item id.
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
-import { create } from "zustand";
+import { createContext, useContext } from "react";
+import { create, useStore, type StoreApi, type UseBoundStore } from "zustand";
 import type {
   AnyBlock,
   ElicitationBlock,
@@ -2111,7 +2112,7 @@ function cachedEffortFamilyForSession(
   return catalog.effortFamilies[session.harness] ?? null;
 }
 
-export const useChatStore = create<ChatState>((_rootSet, get) => ({
+const createChatState = (writeState: Setter, get: Getter): ChatState => ({
   conversationId: null,
   redirectToConversationId: null,
   blocks: [],
@@ -2229,13 +2230,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   dequeueMessage: (queueId) => {
-    setActive((s) => ({
+    writeState((s) => ({
       queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId),
     }));
   },
 
   releaseHostHeldMessages: (conversationId) => {
-    setActive((s) => {
+    writeState((s) => {
       if (!waitsForHost(s.queuedMessages, conversationId)) return {};
       return {
         queuedMessages: s.queuedMessages.map((m) =>
@@ -2248,7 +2249,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   reorderQueuedMessage: (queueId, beforeQueueId) => {
-    setActive((s) => {
+    writeState((s) => {
       const moved = s.queuedMessages.find((m) => m.queueId === queueId);
       if (moved === undefined || queueId === beforeQueueId) return {};
       const conversationId = moved.conversationId;
@@ -2288,7 +2289,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const targetState = setterForState(target.conversationId);
     if (targetState !== null && holdsInitialDraft(targetState)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
-    setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
+    writeState({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, queuedSendOptions(target));
   },
 
@@ -2318,7 +2319,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (batch.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
     const batchOrder = new Map(batch.map((m, index) => [m.queueId, index]));
     // Remove BEFORE the POSTs so a concurrent flush can't also send one.
-    setActive({
+    writeState({
       queuedMessages: s.queuedMessages.filter((m) => !batchOrder.has(m.queueId)),
     });
     for (const m of batch) {
@@ -2331,7 +2332,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   clearQueuedMessages: (conversationId) => {
     const removed = get().queuedMessages.filter((m) => m.conversationId === conversationId);
     if (removed.length === 0) return removed;
-    setActive((s) => ({
+    writeState((s) => ({
       queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
     }));
     return removed;
@@ -2340,7 +2341,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   restoreQueuedMessages: (messages) => {
     const conversationId = messages[0]?.conversationId;
     if (conversationId === undefined) return;
-    setActive((s) => {
+    writeState((s) => {
       const at = s.queuedMessages.findIndex((m) => m.conversationId === conversationId);
       const index = at === -1 ? s.queuedMessages.length : at;
       return {
@@ -2469,7 +2470,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
-      setActive((st) => ({
+      writeState((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
       if (head.command === "compact") {
@@ -2518,7 +2519,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             conversationId,
             Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
           );
-          setActive((st) => {
+          writeState((st) => {
             const idx = st.queuedMessages.findIndex((m) => m.conversationId === conversationId);
             const at = idx === -1 ? st.queuedMessages.length : idx;
             return {
@@ -2585,7 +2586,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // user moved to another chat still lands on the right one, not the one on
     // screen. `pinnedSetter` routes every write for this send there.
     const pinnedId = opts?.pinnedConversationId ?? null;
-    const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
+    const pinnedSetter: typeof writeState = pinnedId === null ? writeState : setterFor(pinnedId);
     const pinnedState = pinnedId === null ? get() : setterForState(pinnedId);
     const retryId = pinnedState?.pendingRetryStableId ?? null;
     const restoredDraft = pinnedState?.restoredSendDraft ?? null;
@@ -2655,7 +2656,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         queueSeq += 1;
         const queuedFor = target === get().conversationId ? get() : setterForState(target);
         const queuedAgentId = queuedFor?.boundAgentId ?? agentId;
-        setActive((s) => ({
+        writeState((s) => ({
           queuedMessages: [
             ...s.queuedMessages,
             {
@@ -3023,7 +3024,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // chat the user has since switched to. Null id (the landing composer's own
       // failure) falls back to the active conversation.
       const failTarget = postedSessionId ?? submitConversationId;
-      const failSet = failTarget === null ? setActive : setterFor(failTarget);
+      const failSet = failTarget === null ? writeState : setterFor(failTarget);
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
       // Roll back the optimistic bubble — no server idle will fire.
@@ -3087,7 +3088,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // See `send`: an explicit pin (navigate-first background dispatch) targets
     // the just-created session even after the user moved to another chat.
     const pinnedId = opts?.pinnedConversationId ?? null;
-    const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
+    const pinnedSetter: typeof writeState = pinnedId === null ? writeState : setterFor(pinnedId);
     // Mirror `send`'s lifecycle scaffolding (streaming flag + send-chain
     // serialization) so a skill invocation behaves like any other turn.
     const alreadyStreaming =
@@ -3191,7 +3192,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // but the pin/submit id already names the session, so a failed pinned
       // command settles the real session, not the visible one. Null → active.
       const failTarget = postedSessionId ?? submitConversationId;
-      const failSet = failTarget === null ? setActive : setterFor(failTarget);
+      const failSet = failTarget === null ? writeState : setterFor(failTarget);
       // Roll back the optimistic echo — no receipt will reconcile it.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
@@ -3218,7 +3219,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (initialDraft) {
       const draft = getSessionDraft(sessionId) ?? initialDraft;
       setSessionDraft(sessionId, draft);
-      setActive({
+      writeState({
         pendingUserMessages: [],
         status: "idle",
         sendLatchedAt: null,
@@ -3247,7 +3248,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // user's cancel won't reach the server, but the local UI already
       // reflects the user's stop request below.
     });
-    setActive((s) => {
+    writeState((s) => {
       if (s.conversationId !== sessionId) return {};
       const patch: Partial<ChatState> = {
         pendingUserMessages: [],
@@ -3499,30 +3500,30 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   flashUserMessage: (itemId) => {
     if (flashTimer !== null) clearTimeout(flashTimer);
-    setActive({ flashItemId: itemId });
+    writeState({ flashItemId: itemId });
     flashTimer = setTimeout(() => {
       flashTimer = null;
-      setActive({ flashItemId: null });
+      writeState({ flashItemId: null });
     }, FLASH_DURATION_MS);
   },
 
   addComposerAttachment: (attachment) => {
-    setActive((s) => {
+    writeState((s) => {
       const k = composerAttachmentKey(attachment);
       if (s.pendingComposerAttachments.some((a) => composerAttachmentKey(a) === k)) return s;
       return { pendingComposerAttachments: [...s.pendingComposerAttachments, attachment] };
     });
   },
 
-  clearPendingComposerAttachments: () => setActive({ pendingComposerAttachments: [] }),
+  clearPendingComposerAttachments: () => writeState({ pendingComposerAttachments: [] }),
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
 
-  dismissSandboxAction: (details) => setActive({ sandboxActionDismissed: details }),
+  dismissSandboxAction: (details) => writeState({ sandboxActionDismissed: details }),
 
   dismissBtwSidechat: () => {
     const { conversationId } = get();
-    setActive({ btwSidechat: null });
+    writeState({ btwSidechat: null });
     // Mirror the close to the terminal so its own /btw overlay (a separate
     // surface) shuts in lockstep. Best-effort and fire-and-forget: the pane
     // overlay also auto-dismisses on the next injected message, so a failed
@@ -3532,7 +3533,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
+  markRunnerLaunched: () => writeState({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
     const { conversationId } = get();
@@ -3556,7 +3557,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   setEffort: async (effort) => {
     const { conversationId, sessionReasoningEffort: previous } = get();
-    setActive({ sessionReasoningEffort: effort });
+    writeState({ sessionReasoningEffort: effort });
     if (conversationId) {
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
@@ -3594,7 +3595,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   setModel: async (model, opts) => {
     const { conversationId, sessionModelOverride: previous } = get();
-    setActive({ sessionModelOverride: model });
+    writeState({ sessionModelOverride: model });
     if (conversationId) {
       const expectConfirmation = opts?.expectConfirmation === true && model !== null;
       if (expectConfirmation) {
@@ -3725,7 +3726,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return;
     }
     if (get().conversationId !== conversationId) return;
-    setActive({
+    writeState({
       costControlModeOverride: session.costControlModeOverride ?? null,
       subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     });
@@ -3838,7 +3839,65 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
     }
   },
-}));
+});
+
+const rootChatStore = create<ChatState>((_set, get) => createChatState(setActive, get));
+export const ChatStoreContext = createContext<StoreApi<ChatState> | null>(null);
+
+export function useChatStoreApi(): StoreApi<ChatState> {
+  return useContext(ChatStoreContext) ?? useChatStore;
+}
+
+export const useChatStore: UseBoundStore<StoreApi<ChatState>> = Object.assign(function useChatStore<
+  T,
+>(selector: (state: ChatState) => T): T {
+  return useStore(useChatStoreApi(), selector);
+}, rootChatStore);
+
+/** Reuse the main chat's actions against a registry entry without activating it. */
+export function createSessionChatStore(sessionId: string): StoreApi<ChatState> {
+  let cachedRoot: ChatState | undefined;
+  let cachedConversation: ConversationState | undefined;
+  let snapshot: ChatState;
+  const empty = createInitialConversationState();
+  const getState = () => {
+    const root = useChatStore.getState();
+    const conversation = conversationRegistry.peek(sessionId)?.getState() ?? empty;
+    if (root !== cachedRoot || conversation !== cachedConversation) {
+      cachedRoot = root;
+      cachedConversation = conversation;
+      snapshot = { ...root, ...conversation, ...actions, conversationId: sessionId };
+    }
+    return snapshot;
+  };
+  const setState: StoreApi<ChatState>["setState"] = (patch) => setterFor(sessionId)(patch);
+  const initial = createChatState(setState, getState);
+  const actions = Object.fromEntries(
+    Object.entries(initial).filter(([, value]) => typeof value === "function"),
+  ) as unknown as ChatActions;
+  actions.switchTo = async () => {
+    await ensureConversationStreamed(sessionId);
+  };
+  return {
+    getState,
+    getInitialState: getState,
+    setState,
+    subscribe: (listener) => {
+      const notify = () => {
+        const previous = snapshot;
+        listener(getState(), previous);
+      };
+      const unsubscribeRoot = useChatStore.subscribe(notify);
+      const unsubscribeEntry = conversationRegistry.subscribe((id) => {
+        if (id === sessionId) notify();
+      });
+      return () => {
+        unsubscribeRoot();
+        unsubscribeEntry();
+      };
+    },
+  };
+}
 
 // ── Store-action setter ──────────────────────────────────
 //
@@ -4111,7 +4170,10 @@ function queueTarget(
   conversationId: string | undefined,
 ): { state: ChatState; write: Setter } | null {
   if (conversationId === undefined || conversationId === get().conversationId) {
-    return { state: get(), write: setActive };
+    return {
+      state: get(),
+      write: get().conversationId ? setterFor(get().conversationId) : setActive,
+    };
   }
   const state = setterForState(conversationId);
   return state === null ? null : { state, write: setterFor(conversationId) };

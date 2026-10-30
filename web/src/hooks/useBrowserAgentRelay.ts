@@ -263,7 +263,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
               retry: false,
             });
             setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels));
-            setSessionParent(source.id, source.parentSessionId);
+            setSessionParent(source.id, source.parentSessionId, source.labels);
             if (source.hostId) {
               sourceHostId = source.hostId;
               break;

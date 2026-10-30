@@ -83,7 +83,9 @@ export function setSessionParent(
   parentId: string | null | undefined,
   labels?: Record<string, string>,
 ): void {
-  const routingParent = parentId ?? parentIdFromLabels(labels);
+  // A peer's root groups conversations; its own source environment routes execution.
+  const routingParent =
+    labels?.["omnigent.session_role"] === "peer" ? null : (parentId ?? parentIdFromLabels(labels));
   const nextParent = routingParent && routingParent !== sessionId ? routingParent : null;
   if ((_sessionParents.get(sessionId) ?? null) === nextParent) return;
   if (nextParent) {

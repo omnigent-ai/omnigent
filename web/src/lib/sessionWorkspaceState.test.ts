@@ -19,6 +19,35 @@ afterEach(() => {
 });
 
 describe("sessionWorkspaceState", () => {
+  it("restores valid helper collapse and peer order without changing workspace state", () => {
+    writeSessionWorkspaceState("root", {
+      openFiles: ["main.py"],
+      collapsedSubagentIds: ["root", "peer"],
+      relatedSessionOrder: ["review", "build"],
+    });
+    expect(readSessionWorkspaceState("root")).toEqual({
+      openFiles: ["main.py"],
+      collapsedSubagentIds: ["root", "peer"],
+      relatedSessionOrder: ["review", "build"],
+    });
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "root",
+          state: {
+            collapsedSubagentIds: ["peer", null, "peer", ""],
+            relatedSessionOrder: ["build", false, "build", "review"],
+          },
+        },
+      ]),
+    );
+    expect(readSessionWorkspaceState("root")).toEqual({
+      collapsedSubagentIds: ["peer"],
+      relatedSessionOrder: ["build", "review"],
+    });
+  });
+
   it("returns an empty object for an unknown session", () => {
     // No stored entry must read as a clean "fresh session" state, not an error.
     expect(readSessionWorkspaceState("conv_unknown")).toEqual({});

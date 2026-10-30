@@ -21,7 +21,11 @@ from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec import AgentSpec
-from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SESSION_ROLE_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+)
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
@@ -108,6 +112,8 @@ def routing_host_session(
     current = conv
     root_id = None
     while True:
+        if current.labels.get(SESSION_ROLE_LABEL_KEY) == "peer":
+            return None
         is_side_chat = current.kind == "default" and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
         if current.kind == "sub_agent":
             ancestor_id = current.parent_conversation_id

@@ -413,6 +413,7 @@ from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SESSION_ROLE_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -724,6 +725,8 @@ async def _best_effort_stop(
     session_id: str,
     conversation_store: ConversationStore,
     runner_router: Any,
+    *,
+    preserve_unarchived_peers: bool = False,
 ) -> list[str]:
     """Stop a running session before a destructive lifecycle action.
 
@@ -743,11 +746,29 @@ async def _best_effort_stop(
     :param conversation_store: Store for descendant-id lookup.
     :param runner_router: The ``RunnerRouter`` for runner-client
         resolution, or ``None`` in tests / in-process setups.
+    :param preserve_unarchived_peers: An archive timer leaves restored peers
+        and their helpers running.
     :returns: The sub-agent descendant ids it looked up, so the caller can
         clean them up too; empty when the lookup failed.
     """
     try:
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        if preserve_unarchived_peers:
+            descendants = await asyncio.to_thread(
+                conversation_store.get_conversations, descendant_ids
+            )
+            excluded: set[str] = set()
+            # The descendant list is breadth-first, so an excluded parent precedes its helpers.
+            for descendant_id in descendant_ids:
+                row = descendants.get(descendant_id)
+                if row is not None and (
+                    row.parent_conversation_id in excluded
+                    or (row.labels.get(SESSION_ROLE_LABEL_KEY) == "peer" and not row.archived)
+                ):
+                    excluded.add(descendant_id)
+            descendant_ids = [
+                descendant_id for descendant_id in descendant_ids if descendant_id not in excluded
+            ]
         status = _session_status_with_child_rollup(session_id, descendant_ids)
         own_status = _session_status_from_cache(session_id)
     except Exception:  # noqa: BLE001
@@ -1010,7 +1031,9 @@ async def _archive_stop(
     # stop marker below, which would exclude the session from child recovery.
     _pending_archive_stops.pop(session_id, None)
 
-    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    await _facade._best_effort_stop(
+        session_id, conversation_store, runner_router, preserve_unarchived_peers=True
+    )
     if conv.host_id and conv.runner_id:
         try:
             # A sub-agent riding an ancestor's runner leaves it up for the owner.
@@ -3811,29 +3834,26 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
-    # Walk the ancestor chain (immediate parent first, then root) to find a
-    # live runner.  A single hop covers the common case; two hops cover nested
-    # sub-agents where the immediate parent's runner is also stale but the root
-    # is still healthy.
-    candidate_ids: list[str] = []
-    if child_conv.parent_conversation_id and child_conv.parent_conversation_id != child_conv.id:
-        candidate_ids.append(child_conv.parent_conversation_id)
-    if (
-        child_conv.root_conversation_id
-        and child_conv.root_conversation_id != child_conv.id
-        and child_conv.root_conversation_id not in candidate_ids
-    ):
-        candidate_ids.append(child_conv.root_conversation_id)
-    if not candidate_ids:
+    if child_conv.labels.get(SESSION_ROLE_LABEL_KEY) == "peer":
         return None
-
     live_runner_id: str | None = None
     live_client: httpx.AsyncClient | None = None
-    for ancestor_id in candidate_ids:
+    ancestor_id = child_conv.parent_conversation_id
+    seen = {child_conv.id}
+    while ancestor_id is not None and ancestor_id not in seen and len(seen) <= 32:
+        seen.add(ancestor_id)
         ancestor = await asyncio.to_thread(conversation_store.get_conversation, ancestor_id)
-        if ancestor is None or ancestor.runner_id is None:
-            continue
+        if ancestor is None:
+            break
+        next_ancestor_id = (
+            None
+            if ancestor.labels.get(SESSION_ROLE_LABEL_KEY) == "peer"
+            else ancestor.parent_conversation_id
+        )
         ancestor_runner_id = ancestor.runner_id
+        if ancestor_runner_id is None:
+            ancestor_id = next_ancestor_id
+            continue
         # Wait briefly for the ancestor's tunnel — covers the reconnect gap
         # right after a relaunch.  When no registry is wired (in-process /
         # tests) fall back to a best-effort direct resolve.
@@ -3851,6 +3871,7 @@ async def _heal_subagent_runner_binding_via_parent(
             live_runner_id = ancestor_runner_id
             live_client = client
             break
+        ancestor_id = next_ancestor_id
 
     if live_runner_id is None or live_client is None:
         return None
@@ -7371,7 +7392,11 @@ async def _forward_event_to_runner(
             _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
                 _auto_text,
                 session_id=session_id,
-                catalog_session_id=conv.parent_conversation_id,
+                catalog_session_id=(
+                    None
+                    if conv.labels.get(SESSION_ROLE_LABEL_KEY) == "peer"
+                    else conv.parent_conversation_id
+                ),
                 runner_client=runner_client,
                 gateway_backed=_auto_backed,
                 allow_static_fallback=_auto_backed,
@@ -7422,7 +7447,11 @@ async def _forward_event_to_runner(
     # knob governs every spawn.
     _parent_routing_on = False
     _parent_conv: Conversation | None = None
-    if conv.parent_conversation_id is not None:
+    _is_routed_child = (
+        conv.parent_conversation_id is not None
+        and conv.labels.get(SESSION_ROLE_LABEL_KEY) != "peer"
+    )
+    if _is_routed_child and conv.parent_conversation_id is not None:
         _parent_conv = await asyncio.to_thread(
             conversation_store.get_conversation, conv.parent_conversation_id
         )
@@ -7430,7 +7459,7 @@ async def _forward_event_to_runner(
             _parent_conv.subagent_routing_override
         )
     _routing_enabled = (
-        conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+        conv.cost_control_mode_override == "on" and not _is_routed_child
     ) or _parent_routing_on
     _routed_model: str | None = None
     _routed_harness: str | None = None
@@ -7456,9 +7485,7 @@ async def _forward_event_to_runner(
     # once-only gate is ``effective_runner_override is None``; the decision
     # label is the child's equivalent, because a child's model_override can be
     # set by ``sys_session_send`` without anything having routed.
-    _child_routed_before = conv.parent_conversation_id is not None and bool(
-        conv.labels.get(ROUTING_DECISION_LABEL_KEY)
-    )
+    _child_routed_before = _is_routed_child and bool(conv.labels.get(ROUTING_DECISION_LABEL_KEY))
     # For child sessions, route even when the orchestrator specified a model via
     # sys_session_send (effective_runner_override is already set). Smart routing
     # always wins over the LLM's own model choice when the parent toggle is on.
@@ -7469,7 +7496,7 @@ async def _forward_event_to_runner(
         # model) — don't re-run the router for the same message.
         and not _auto_resolved_this_turn
         and not _child_routed_before
-        and (effective_runner_override is None or conv.parent_conversation_id is not None)
+        and (effective_runner_override is None or _is_routed_child)
     )
     if _should_route:
         _user_text = _extract_user_text_for_routing(body)
@@ -8289,7 +8316,11 @@ async def _dispatch_session_event_to_runner_impl(
         # routes off its parent's subagent-routing switch.
         _native_parent_routing_on = False
         _native_parent_conv: Conversation | None = None
-        if conv.parent_conversation_id is not None:
+        _native_is_routed_child = (
+            conv.parent_conversation_id is not None
+            and conv.labels.get(SESSION_ROLE_LABEL_KEY) != "peer"
+        )
+        if _native_is_routed_child and conv.parent_conversation_id is not None:
             _native_parent_conv = await asyncio.to_thread(
                 conversation_store.get_conversation, conv.parent_conversation_id
             )
@@ -8298,7 +8329,7 @@ async def _dispatch_session_event_to_runner_impl(
                 and subagent_routing_enabled(_native_parent_conv.subagent_routing_override)
             )
         _native_routing_enabled = (
-            conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+            conv.cost_control_mode_override == "on" and not _native_is_routed_child
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
@@ -8313,9 +8344,7 @@ async def _dispatch_session_event_to_runner_impl(
         # pane cannot take must not become ``model_override``, which would
         # disable routing for every later turn and misattribute usage.
         _native_applied_model: str | None = None
-        if _native_routing_enabled and (
-            conv.model_override is None or conv.parent_conversation_id is not None
-        ):
+        if _native_routing_enabled and (conv.model_override is None or _native_is_routed_child):
             from omnigent.server.smart_routing import route_turn_or_decline
 
             _harness = _native_pane_harness(conv)
@@ -11004,7 +11033,9 @@ async def _reject_ungatewayed_model_routing(
 
     if body.cost_control_mode_override != "on":
         return
-    if body.parent_session_id is not None or body.sub_agent_name is not None:
+    if (
+        body.parent_session_id is not None and body.related_to_session_id is None
+    ) or body.sub_agent_name is not None:
         return
     harness = await asyncio.to_thread(
         _create_resolved_harness, agent, body.harness_override, agent_cache
@@ -11203,7 +11234,9 @@ def _fixed_native_routing_harness(
     # parent's family. Neither may take this branch.
     if body.harness_override == "auto":
         return None
-    if body.parent_session_id is not None or body.sub_agent_name is not None:
+    if (
+        body.parent_session_id is not None and body.related_to_session_id is None
+    ) or body.sub_agent_name is not None:
         return None
     # A client-pinned model wins over the router, exactly as it does per turn.
     if body.model_override is not None:
@@ -11243,7 +11276,9 @@ def _spec_routes_its_own_harness(
         return False
     if body.harness_override is not None or body.model_override is not None:
         return False
-    if body.parent_session_id is not None or body.sub_agent_name is not None:
+    if (
+        body.parent_session_id is not None and body.related_to_session_id is None
+    ) or body.sub_agent_name is not None:
         return False
     if agent_cache is None:
         return False
@@ -11511,8 +11546,12 @@ async def _create_session_from_existing_agent(
     """
     from omnigent.server.routes._session_create_validation import (
         resolve_project_session_create,
+        resolve_related_session_create,
     )
 
+    body, related_source = await resolve_related_session_create(
+        body, request, user_id, conversation_store, permission_store
+    )
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
@@ -11540,7 +11579,7 @@ async def _create_session_from_existing_agent(
     # chose; the rest of this function then runs as a plain native create.
     _native_smart_routing = (
         body.harness_override == "auto"
-        and body.parent_session_id is None
+        and (body.parent_session_id is None or related_source is not None)
         and native_coding_agent_for_agent_name(agent.name) is not None
     )
     _native_routed_model: str | None = None
@@ -11623,7 +11662,12 @@ async def _create_session_from_existing_agent(
         )
 
     sandbox_profile = await prepare_profile(
-        request, body, user_id=user_id, inherited_session_id=body.parent_session_id
+        request,
+        body,
+        user_id=user_id,
+        inherited_session_id=related_source.id
+        if related_source is not None
+        else body.parent_session_id,
     )
     if sandbox_profile is not None and body.host_type == "managed":
         body = body.model_copy(update={"sandbox_provider": sandbox_profile["provider"]})
@@ -11696,7 +11740,7 @@ async def _create_session_from_existing_agent(
     # children route in their own family instead.
     _force_auto_for_child = False
     _parent_for_routing: Conversation | None = None
-    if body.parent_session_id is not None:
+    if body.parent_session_id is not None and related_source is None:
         _parent_for_routing = await asyncio.to_thread(
             conversation_store.get_conversation, body.parent_session_id
         )
@@ -11826,7 +11870,9 @@ async def _create_session_from_existing_agent(
         if selection_spec is not None:
             inference_snapshot, model_override = await prepare_create_inference(
                 request,
-                body,
+                body.model_copy(update={"parent_session_id": related_source.id})
+                if related_source is not None
+                else body,
                 selection_spec,
                 user_id,
                 conversation_store,
@@ -11846,7 +11892,7 @@ async def _create_session_from_existing_agent(
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
     if body.parent_session_id is not None:
-        parent_conv = _parent_for_routing
+        parent_conv = related_source or _parent_for_routing
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
             # Defense-in-depth: don't inherit a runner the
@@ -11858,6 +11904,10 @@ async def _create_session_from_existing_agent(
             ):
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
+                    if related_source is not None:
+                        raise OmnigentError(
+                            "Source runner is not owned by the caller", code=ErrorCode.FORBIDDEN
+                        )
                     inherited_runner_id = None
 
     registry_labels: dict[str, str] = {}
@@ -11918,7 +11968,7 @@ async def _create_session_from_existing_agent(
         user_id=user_id,
         conversation_store=conversation_store,
         host_store=getattr(request.app.state, "host_store", None),
-        parent=_parent_for_routing,
+        parent=related_source or _parent_for_routing,
     )
     require_codex_plan_launch_support(
         harness=selected_harness,
@@ -12057,6 +12107,9 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if related_source is not None:
+        initial_labels[SESSION_ROLE_LABEL_KEY] = "peer"
+        initial_labels[CREATED_BY_SESSION_LABEL_KEY] = related_source.id
     client_surface = resolve_client_surface(
         request.headers,
         parent_labels=_parent_for_routing.labels if _parent_for_routing is not None else None,

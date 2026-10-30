@@ -87,20 +87,24 @@ export function showArchiveUndoToast(
   queryClient: QueryClient,
   conversations: readonly Conversation[],
   navigate: NavigateFn,
+  startedAtMs = Date.now(),
 ): void {
   if (conversations.length === 0) return;
   const now = Date.now();
+  if (now - startedAtMs >= ARCHIVE_UNDO_DURATION_MS) return;
   // Start (or restart) the batch when there is none, or when the current one
   // has hit its absolute deadline — a late archive must not join a batch whose
   // pill is expiring, or it would extend an Undo past the server grace.
   if (batchStartedAtMs === null || now - batchStartedAtMs >= ARCHIVE_UNDO_MAX_LIFETIME_MS) {
     batched = [];
-    batchStartedAtMs = now;
+    batchStartedAtMs = startedAtMs;
   }
   activeQueryClient = queryClient;
   activeNavigate = navigate;
   const seen = new Set(batched.map((c) => c.id));
   for (const conv of conversations) {
+    if (conv.archive_changed_session_ids && !conv.archive_changed_session_ids.includes(conv.id))
+      continue;
     if (!seen.has(conv.id)) {
       batched.push(conv);
       seen.add(conv.id);
@@ -113,7 +117,9 @@ export function showArchiveUndoToast(
     ARCHIVE_UNDO_DURATION_MS,
     batchStartedAtMs + ARCHIVE_UNDO_MAX_LIFETIME_MS - now,
   );
-  const count = batched.length;
+  const count = new Set(batched.flatMap((conv) => conv.archive_changed_session_ids ?? [conv.id]))
+    .size;
+  if (count === 0) return;
   toast(`Archived ${count} ${count === 1 ? "session" : "sessions"}`, {
     id: ARCHIVE_UNDO_TOAST_ID,
     duration: remaining,

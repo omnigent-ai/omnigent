@@ -16,13 +16,15 @@ type TabsChange = (current: SideChatTabsState) => SideChatTabsState;
 
 const MAX_UNSAVED_CHANGES = 50;
 
-function readSideChatTabsState(conversationId: string): SideChatTabsState {
+function readSideChatTabsState(conversationId: string, subagentScopeId: string): SideChatTabsState {
   const saved = readSessionWorkspaceState(conversationId);
+  const shared =
+    subagentScopeId === conversationId ? saved : readSessionWorkspaceState(subagentScopeId);
   const tabs = saved.openSideChats ?? [];
-  const subagentTabs = (saved.openSubagentTabs ?? []).filter(
+  const subagentTabs = (shared.openSubagentTabs ?? []).filter(
     (id) => subagentSessionIdFromTab(id) !== null,
   );
-  const selected = saved.selectedSideChatId ?? "";
+  const selected = shared.selectedSideChatId ?? saved.selectedSideChatId ?? "";
   return {
     tabs,
     subagentTabs,
@@ -45,8 +47,8 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
  *
  * @param conversationId The parent (main) conversation whose rail owns these tabs.
  */
-export function useSideChats(conversationId: string) {
-  const [state, setState] = useState(() => readSideChatTabsState(conversationId));
+export function useSideChats(conversationId: string, subagentScopeId = conversationId) {
+  const [state, setState] = useState(() => readSideChatTabsState(conversationId, subagentScopeId));
   // Changes a failed storage write couldn't save. Each update replays them on
   // fresh storage, so they survive without undoing other windows' changes.
   const unsaved = useRef<{ conversationId: string; changes: TabsChange[] } | null>(null);
@@ -56,8 +58,8 @@ export function useSideChats(conversationId: string) {
   // side-chat tabs would linger in the new one's rail.
   useEffect(() => {
     unsaved.current = null;
-    setState(readSideChatTabsState(conversationId));
-  }, [conversationId]);
+    setState(readSideChatTabsState(conversationId, subagentScopeId));
+  }, [conversationId, subagentScopeId]);
   const update = useCallback(
     (mutate: TabsChange) => {
       const pending =
@@ -65,20 +67,32 @@ export function useSideChats(conversationId: string) {
       const changes = [...pending, mutate];
       const next = changes.reduce(
         (current, change) => change(current),
-        readSideChatTabsState(conversationId),
+        readSideChatTabsState(conversationId, subagentScopeId),
       );
+      const separateScope = subagentScopeId !== conversationId;
       const saved = saveSessionWorkspaceState(conversationId, {
         openSideChats: next.tabs,
         // Omitted when empty, so a session without sub-agent tabs is stored as before.
-        openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
-        selectedSideChatId: next.selected,
+        ...(!separateScope && {
+          openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
+        }),
+        selectedSideChatId:
+          separateScope && next.subagentTabs.includes(next.selected ?? "") ? null : next.selected,
       });
+      const sharedSaved =
+        !separateScope ||
+        saveSessionWorkspaceState(subagentScopeId, {
+          openSubagentTabs: next.subagentTabs,
+          selectedSideChatId: next.subagentTabs.includes(next.selected ?? "")
+            ? next.selected
+            : null,
+        });
       // Past the cap, keep only the result so a long storage outage can't grow the replay.
       const kept = changes.length > MAX_UNSAVED_CHANGES ? [() => next] : changes;
-      unsaved.current = saved ? null : { conversationId, changes: kept };
+      unsaved.current = saved && sharedSaved ? null : { conversationId, changes: kept };
       setState(next);
     },
-    [conversationId],
+    [conversationId, subagentScopeId],
   );
 
   /** Select a side-chat tab, or clear the selection (null). */

@@ -184,6 +184,9 @@ SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
 
+# Full conversations presented beside their root, rather than as delegated helpers.
+SESSION_ROLE_LABEL_KEY = "omnigent.session_role"
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -237,6 +240,7 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
+    SESSION_ROLE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -507,6 +511,22 @@ class ConversationStore(ABC):
     ) -> list[str]:
         """Page the sessions assigned to a host, including not-yet-launched sessions."""
         return []
+
+    def archive_subtree(
+        self,
+        conversation_id: str,
+        archived: bool,
+        *,
+        only_ids: list[str] | None = None,
+        unpin_label: str | None = None,
+    ) -> list[str] | None:
+        """Atomically change a subtree's archive state, returning only changed IDs.
+
+        ``only_ids`` restricts Undo to the previous operation's changes; every
+        supplied ID must still belong to this subtree. ``None`` means missing
+        root. Legacy stores may leave this optional capability unsupported.
+        """
+        raise NotImplementedError("Group archive is not supported by this store")
 
     def __init__(
         self, storage_location: str, conversation_storage_location: str | None = None
@@ -2084,11 +2104,13 @@ class ConversationStore(ABC):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        related_source: Conversation | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
 
-        Creates a new top-level conversation
+        Unless ``related_source`` supplies a group and execution binding,
+        creates a new top-level conversation
         (``kind="default"``, ``parent_conversation_id=None``)
         with the source's ``reasoning_effort``, then copies every
         item (with fresh IDs) preserving position order,

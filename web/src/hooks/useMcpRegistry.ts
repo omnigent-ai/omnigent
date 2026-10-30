@@ -52,13 +52,17 @@ export function useMcpRegistryCatalog(enabled = true) {
 }
 
 /** Keep preferences intact until an explicit toggle; filter only the launch payload. */
-export function useMcpRegistrySelection(draft: string[] | undefined, enabled: boolean) {
+export function useMcpRegistrySelection(
+  draft: string[] | undefined,
+  enabled: boolean,
+  persist = true,
+) {
   const [selected, setSelected] = useState(() => draft ?? readLastMcpServices());
   const catalog = useMcpRegistryCatalog(enabled);
   const toggle = (id: string, next: boolean) => {
     setSelected((current) => {
       const updated = next ? [...new Set([...current, id])] : current.filter((s) => s !== id);
-      writeLastMcpServices(updated);
+      if (persist) writeLastMcpServices(updated);
       return updated;
     });
   };
