@@ -855,3 +855,26 @@ def test_get_comments_fingerprints_reflects_delete_of_older_comment(
     # the newest) — the count drop is what makes the fingerprint move.
     # This is the reason the fingerprint carries a count at all.
     assert after == CommentsFingerprint(count=1, last_updated_at=2_000 * _US)
+
+
+def test_pr_anchor_persists_through_comment_lifecycle(store: SqlAlchemyCommentStore) -> None:
+    """PR context is immutable across edits, status changes and store reloads."""
+    from omnigent.entities.comment import PullRequestCommentAnchor
+
+    anchor = PullRequestCommentAnchor(
+        "https://github.com/acme/app/pull/1", "LEFT", 9, 7, "a" * 40, "b" * 40
+    )
+    session_id = "4e92b5a0c0ee6db3f874f9c4a3f855a5"
+    comment = store.add(session_id, "old.py", "Fix deleted code", 0, 0, review_anchor=anchor)
+    loaded = store.get(comment.id, session_id)
+    assert loaded is not None
+    assert loaded.review_anchor == anchor
+    store.update_comment(comment.id, session_id, body="Updated", status="addressed")
+    restored = store.list_for_conversation(session_id)[0]
+    assert restored.review_anchor == anchor
+    assert restored.body == "Updated"
+    assert restored.status == "addressed"
+    assert store.get(comment.id, "0" * 32) is None
+    deleted = store.delete(comment.id, session_id)
+    assert deleted is not None
+    assert deleted.review_anchor == anchor

@@ -78,3 +78,48 @@ def test_add_comment_request_rejects_end_index_before_start_index() -> None:
     """end_index must be >= start_index; a smaller end_index is rejected."""
     with pytest.raises(ValidationError, match="end_index must be >= start_index"):
         AddCommentRequest(**_valid_kwargs(start_index=10, end_index=5))
+
+
+@pytest.mark.parametrize("side,line,start", [("LEFT", 9, 7), ("RIGHT", 1, None)])
+def test_pr_comment_anchor(side: str, line: int, start: int | None) -> None:
+    """PR coordinates survive validation independently of file offsets."""
+    request = AddCommentRequest(
+        **_valid_kwargs(
+            review_anchor={
+                "pr_url": "https://github.com/acme/app/pull/1",
+                "side": side,
+                "line": line,
+                "start_line": start,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+            }
+        )
+    )
+    assert request.review_anchor is not None
+    assert request.review_anchor.side == side
+    assert request.review_anchor.line == line
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"side": "OTHER"},
+        {"line": 0},
+        {"start_line": 10},
+        {"head_sha": ""},
+        {"base_sha": "not-a-sha"},
+        {"pr_url": "x" * 4097},
+    ],
+)
+def test_invalid_pr_comment_anchor(override: dict) -> None:
+    """Reject unusable coordinates and oversized metadata before persistence."""
+    anchor = {
+        "pr_url": "https://github.com/acme/app/pull/1",
+        "side": "LEFT",
+        "line": 9,
+        "start_line": 7,
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
+    }
+    with pytest.raises(ValidationError):
+        AddCommentRequest(**_valid_kwargs(review_anchor={**anchor, **override}))

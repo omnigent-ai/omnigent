@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 
 from omnigent.entities import Comment, CommentsFingerprint
+from omnigent.entities.comment import PullRequestCommentAnchor
 
 
 class CommentStore(ABC):
@@ -48,6 +49,7 @@ class CommentStore(ABC):
         end_index: int,
         anchor_content: str | None = None,
         created_by: str | None = None,
+        review_anchor: PullRequestCommentAnchor | None = None,
     ) -> Comment:
         """Create and persist a new comment.
 

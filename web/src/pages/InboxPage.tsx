@@ -565,10 +565,14 @@ export function InboxPage() {
               {/* Deep-link into the file browser with this comment selected —
                   opening it there marks it seen, which clears this item. */}
               <Link
-                to={`/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
+                to={
+                  comment.review_anchor
+                    ? `/c/${entry.item.row.id}`
+                    : `/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`
+                }
                 componentId="inbox.comment.open_file"
               >
-                Open file
+                {comment.review_anchor ? "Open session" : "Open file"}
                 <ArrowRightIcon className="size-3.5" />
               </Link>
             </Button>

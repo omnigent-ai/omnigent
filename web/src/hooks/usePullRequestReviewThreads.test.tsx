@@ -264,3 +264,43 @@ it("fetches on opening Diff, polls only while active, and removes deleted commen
   expect(fetch).toHaveBeenCalledTimes(count + 1);
   client.clear();
 });
+
+it("retains the local destination and settles a save after navigating away", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  let respond!: (response: Response) => void;
+  const fetch = vi.fn(
+    () =>
+      new Promise<Response>((resolve) => {
+        respond = resolve;
+      }),
+  );
+  vi.stubGlobal("fetch", fetch);
+  const wrapper = ({ children }: PropsWithChildren) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  const { result, rerender } = renderHook(
+    ({ url }) => usePullRequestReviewThreadComposer("session", url, "app.py", "head", "base"),
+    { wrapper, initialProps: { url: "pr" } },
+  );
+  act(() => result.current.setDestination("local"));
+  act(() => result.current.selectLines({ side: "LEFT", line: 9, start_line: 7 }));
+  act(() => result.current.setBody("Keep this check"));
+  rerender({ url: "other" });
+  rerender({ url: "pr" });
+  expect(result.current.draft.destination).toBe("local");
+  act(() => result.current.post());
+  await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+  expect(fetch).toHaveBeenCalledWith(
+    "/v1/sessions/session/comments",
+    expect.objectContaining({ method: "POST" }),
+  );
+  rerender({ url: "other" });
+  act(() => result.current.setBody("Other PR draft"));
+  await waitFor(() => expect(result.current.draft.body).toBe("Other PR draft"));
+  await act(async () => respond(new Response(JSON.stringify({ id: "saved" }))));
+  expect(result.current.draft.body).toBe("Other PR draft");
+  rerender({ url: "pr" });
+  await waitFor(() => expect(result.current.draft.pending).toBe(false));
+  expect(result.current.draft.body).toBe("");
+  expect(result.current.draft.destination).toBe("local");
+});

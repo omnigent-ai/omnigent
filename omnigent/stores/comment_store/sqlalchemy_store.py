@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import uuid
+from dataclasses import asdict
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -16,6 +18,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Comment, CommentsFingerprint
+from omnigent.entities.comment import PullRequestCommentAnchor
 from omnigent.stores.comment_store import CommentStore
 
 
@@ -37,6 +40,9 @@ def _to_entity(row: SqlComment) -> Comment:
         updated_at=row.updated_at,
         anchor_content=row.anchor_content,
         created_by=row.created_by,
+        review_anchor=PullRequestCommentAnchor(**json.loads(row.review_anchor))
+        if row.review_anchor
+        else None,
     )
 
 
@@ -85,6 +91,7 @@ class SqlAlchemyCommentStore(CommentStore):
         end_index: int,
         anchor_content: str | None = None,
         created_by: str | None = None,
+        review_anchor: PullRequestCommentAnchor | None = None,
     ) -> Comment:
         """Create and persist a new comment. See base class for contract."""
         # One clock read for both timestamps so a never-edited comment's
@@ -107,6 +114,7 @@ class SqlAlchemyCommentStore(CommentStore):
                 updated_at=created_us,
                 anchor_content=anchor_content,
                 created_by=created_by,
+                review_anchor=json.dumps(asdict(review_anchor)) if review_anchor else None,
             )
             session.add(row)
             return _to_entity(row)

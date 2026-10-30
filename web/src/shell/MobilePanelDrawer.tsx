@@ -21,7 +21,7 @@ import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { cn } from "@/lib/utils";
 
 const MobilePanelHeaderContext = createContext<
-  { actions: HTMLElement | null; title: HTMLElement | null } | undefined
+  { actions: HTMLElement | null; title: HTMLElement | null; close: () => void } | undefined
 >(undefined);
 
 /** Header destinations; undefined outside a drawer, targets null before mounting. */
@@ -83,8 +83,8 @@ export function MobilePanelDrawer({
   const [headerTarget, setHeaderTarget] = useState<HTMLDivElement | null>(null);
   const [titleTarget, setTitleTarget] = useState<HTMLDivElement | null>(null);
   const headerTargets = useMemo(
-    () => ({ actions: headerTarget, title: titleTarget }),
-    [headerTarget, titleTarget],
+    () => ({ actions: headerTarget, title: titleTarget, close: onClose }),
+    [headerTarget, titleTarget, onClose],
   );
   const inertRef = useInertRef<HTMLElement>(!open);
   return (

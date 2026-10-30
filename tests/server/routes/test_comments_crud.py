@@ -192,3 +192,32 @@ async def test_send_comments_not_found(client: httpx.AsyncClient, session_id: st
         json={"comment_ids": ["nonexistent_id"]},
     )
     assert resp.status_code == 404
+
+
+async def test_local_pr_comment_round_trip(client: httpx.AsyncClient, session_id: str) -> None:
+    """Local PR comments use session CRUD and retain coordinates in agent handoff."""
+    anchor = {
+        "pr_url": "https://github.com/acme/app/pull/1",
+        "side": "LEFT",
+        "line": 9,
+        "start_line": 7,
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
+    }
+    response = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_comment_payload(review_anchor=anchor, start_index=0, end_index=0),
+    )
+    assert response.status_code == 200
+    comment = response.json()
+    assert comment["review_anchor"] == anchor
+    listed = await client.get(f"/v1/sessions/{session_id}/comments")
+    assert listed.json()[0]["review_anchor"] == anchor
+    formatted = await client.post(
+        f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [comment["id"]]}
+    )
+    assert formatted.status_code == 200
+    message = formatted.json()["formatted_message"]
+    assert "LEFT lines 7–9" in message
+    assert anchor["head_sha"] in message
+    assert comment["id"] in message

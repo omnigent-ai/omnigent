@@ -1,3 +1,4 @@
+import type { LocalReviewAnchor } from "@/lib/localReviewComments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 // TanStack Query hooks for the comments API:
@@ -33,6 +34,7 @@ export interface Comment {
   updated_at: number;
   anchor_content: string | null;
   created_by: string | null;
+  review_anchor?: LocalReviewAnchor | null;
 }
 
 // ── Query helpers ────────────────────────────────────────────────────────────
@@ -69,28 +71,36 @@ export function useComments(sessionId: string | undefined, path?: string) {
   });
 }
 
+export interface AddCommentPayload {
+  path: string;
+  start_index: number;
+  end_index: number;
+  body: string;
+  anchor_content?: string | null;
+  review_anchor?: LocalReviewAnchor;
+}
+
+export async function createComment(
+  sessionId: string,
+  payload: AddCommentPayload,
+): Promise<Comment> {
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/comments`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  return response.json();
+}
+
 /** POST /v1/sessions/{id}/comments */
 export function useAddComment(sessionId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (payload: {
-      path: string;
-      start_index: number;
-      end_index: number;
-      body: string;
-      anchor_content?: string | null;
-    }) => {
-      const res = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(sessionId)}/comments`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        },
-      );
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as Comment;
-    },
+    mutationFn: (payload: AddCommentPayload) => createComment(sessionId, payload),
     onSuccess: (comment) => {
       // Invalidate both the full-session list and the per-file list
       // so the sidebar and any per-file views refresh.

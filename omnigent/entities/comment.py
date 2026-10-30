@@ -5,6 +5,36 @@ from __future__ import annotations
 import dataclasses
 
 
+@dataclasses.dataclass(frozen=True)
+class PullRequestCommentAnchor:
+    """Immutable PR coordinates for a session-only review comment."""
+
+    pr_url: str
+    side: str
+    line: int
+    start_line: int | None
+    head_sha: str
+    base_sha: str
+
+    def __post_init__(self) -> None:
+        """Validate coordinates and bound persisted metadata."""
+        if self.side not in {"LEFT", "RIGHT"}:
+            raise ValueError("side must be LEFT or RIGHT")
+        if self.line < 1 or (
+            self.start_line is not None and not 1 <= self.start_line <= self.line
+        ):
+            raise ValueError("review lines must be positive and ordered")
+        if not self.pr_url or len(self.pr_url.encode()) > 4096:
+            raise ValueError("pr_url must contain 1–4096 bytes")
+        for revision in (self.head_sha, self.base_sha):
+            if (
+                not revision
+                or len(revision) > 64
+                or any(character not in "0123456789abcdef" for character in revision)
+            ):
+                raise ValueError("review revisions must be hexadecimal commit IDs")
+
+
 @dataclasses.dataclass
 class Comment:
     """A single review comment anchored to a text range in a file.
@@ -36,6 +66,8 @@ class Comment:
     :param created_by: Email of the user who created the comment,
         e.g. ``"alice@example.com"``. ``None`` for legacy comments created
         before per-user attribution was added, or in single-user mode.
+    :param review_anchor: Immutable PR coordinates for session-only review comments.
+        When set, character offsets do not locate the comment in the workspace file.
     """
 
     id: str
@@ -49,6 +81,7 @@ class Comment:
     updated_at: int  # unix timestamp (microseconds) of last body/status mutation
     anchor_content: str | None = None
     created_by: str | None = None
+    review_anchor: PullRequestCommentAnchor | None = None
 
 
 @dataclasses.dataclass

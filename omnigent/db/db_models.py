@@ -1119,6 +1119,10 @@ class SqlComment(OmnigentBase):
     anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
+    review_anchor: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=16_383), nullable=True
+    )
+
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
 
