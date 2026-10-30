@@ -311,6 +311,7 @@ def _to_conversation(
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
+        background_work_running=meta.background_work_running if meta else None,
         project_id=meta.project_id if meta else None,
     )
 
@@ -4170,6 +4171,51 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
+
+    def set_background_work_running(
+        self,
+        conversation_id: str,
+        running: bool,
+        *,
+        runner_id: str | None = None,
+        unseen_since: int | None = None,
+    ) -> None:
+        """
+        Persist whether a session's background shells outlive its ended turn.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param running: ``True`` while a background shell outlives the turn.
+        :param runner_id: When set, write only while the session is bound to it.
+        :param unseen_since: When set, write only while the runner was last seen
+            before this epoch second, or never.
+        """
+        from sqlalchemy import or_, update
+
+        conditions = [
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.id == conversation_id,
+        ]
+        if runner_id is not None:
+            conditions.append(SqlConversationMetadata.runner_id == runner_id)
+        if unseen_since is not None:
+            conditions.append(
+                or_(
+                    SqlConversationMetadata.runner_last_seen.is_(None),
+                    SqlConversationMetadata.runner_last_seen < unseen_since,
+                )
+            )
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(*conditions)
+                .values(background_work_running=running)
+            )
+
+        run_write_transaction(self._session_immediate, "set_background_work_running", write)
 
     def replace_runner_id(
         self,

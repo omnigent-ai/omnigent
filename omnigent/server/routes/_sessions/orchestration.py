@@ -237,6 +237,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_background_work_running_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -255,6 +256,7 @@ from omnigent.server.routes._sessions.helpers import (
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
     _await_settled_managed_launch,
+    _background_work_running_for,
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
@@ -759,9 +761,9 @@ async def _best_effort_stop(
         )
         return []
 
-    # Background shells outlive their turn without making the session read as
-    # running (the sidebar must not spin for an ended turn), but they are live
-    # work on the runner — a destructive action still has to stop them.
+    # Background shells outlive their turn without making the session's status
+    # running (it still takes a new message), but they are live work on the
+    # runner — a destructive action still has to stop them.
     has_background_tasks = (
         own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
     )
@@ -1291,6 +1293,9 @@ def _build_session_list_item(
             max(pending_count, conv.pending_elicitation_count or 0)
             if conv.runner_id is not None
             else pending_count
+        ),
+        background_work_running=_background_work_running_for(
+            conv.id, conv.background_work_running, conv.runner_id
         ),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
@@ -4161,6 +4166,7 @@ async def _mark_runner_sessions_offline_impl(
     :returns: None.
     """
     pending = convs
+    swept_at = int(time.time())
     for delay in (0.0, *_RUNNER_OFFLINE_RETRY_DELAYS_S):
         if delay:
             await asyncio.sleep(delay)
@@ -4170,6 +4176,7 @@ async def _mark_runner_sessions_offline_impl(
             conversation_store,
             fail_idle_top_level=fail_idle_top_level,
             disconnect_evidence=disconnect_evidence,
+            swept_at=swept_at,
         )
         if not pending:
             return
@@ -4181,6 +4188,30 @@ async def _mark_runner_sessions_offline_impl(
     )
 
 
+def _clear_departed_runner_background_work(conv: Conversation, swept_at: int) -> None:
+    """
+    Drop the background flag of a session whose runner the offline sweep found gone.
+
+    The departed runner's background work ended with it, and nothing on a runner
+    that comes back under the same id would report it ending. A runner that
+    reconnected since the sweep began keeps its report: one connected here is
+    skipped, and the stored clear applies only while the session is still bound
+    to the runner and the runner has not been seen since the sweep began.
+
+    :param conv: Session snapshot the sweep loaded for the departed runner.
+    :param swept_at: Epoch seconds when the sweep began.
+    """
+    if conv.runner_id is None:
+        return
+    router = get_server_runner_router()
+    if router is not None and router.runner_is_online(conv.runner_id):
+        return
+    _session_background_work_running_cache.pop(conv.id, None)
+    session_live_state.clear_background_work_running(
+        conv.id, conv.runner_id, unseen_since=swept_at
+    )
+
+
 async def _mark_runner_sessions_offline_once(
     convs: list[Conversation],
     error: ErrorDetail,
@@ -4188,6 +4219,7 @@ async def _mark_runner_sessions_offline_once(
     *,
     fail_idle_top_level: bool,
     disconnect_evidence: Mapping[str, str] | None = None,
+    swept_at: int,
 ) -> list[Conversation]:
     """Reconcile each session once and return the ones blocked by metadata errors."""
     retry: list[Conversation] = []
@@ -4199,6 +4231,7 @@ async def _mark_runner_sessions_offline_once(
             if stopped_runner_id == conv.runner_id:
                 _intentional_stop_sessions.pop(conv.id, None)
             continue
+        _clear_departed_runner_background_work(conv, swept_at)
         if stopped_runner_id is not None and stopped_runner_id != conv.runner_id:
             try:
                 binding = await asyncio.to_thread(conversation_store.get_runner_liveness, conv.id)
@@ -8567,6 +8600,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
+    _session_background_work_running_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
 

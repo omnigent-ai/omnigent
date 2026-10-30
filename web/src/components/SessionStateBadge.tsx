@@ -37,13 +37,15 @@ function describe(state: SessionState): Visual {
         ),
       };
     }
-    case "running":
+    case "running": {
+      const tooltip = state.background ? "Background shell running" : "Session running";
       return {
         kind: state.kind,
-        ariaLabel: "Session running",
-        tooltip: "Session running",
+        ariaLabel: tooltip,
+        tooltip,
         render: () => <RunningDot className="size-3" />,
       };
+    }
     case "starting":
       // Same spinner as running — the session is coming up, not yet working.
       return {

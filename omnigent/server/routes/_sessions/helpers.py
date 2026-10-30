@@ -247,6 +247,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_background_work_running_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -1375,16 +1376,53 @@ def _session_status_with_child_rollup(
     own_status = _session_status_from_cache(conversation_id, db_status)
     if own_status == "running":
         return "running"
-    # Background shells outliving a turn do NOT make the row running: the
-    # session takes a new message immediately, and the tally only refreshes on
-    # the next ``Stop`` hook, so a spinner keyed off it can outlive the shells.
-    # The in-chat indicator still reports them from the count.
+    # Background shells outliving a turn do NOT make the row's status running:
+    # the session takes a new message immediately. The row reports them in its
+    # separate ``background_work_running`` field instead.
     if any(
         _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
     ):
         return "running"
     return own_status
+
+
+def _set_background_work_running(
+    session_id: str, running: bool, *, runner_id: str | None = None
+) -> None:
+    """
+    Record whether a session's background shells outlive its ended turn.
+
+    The runner reports this from Claude's status file. The session list shows
+    such a session as working; its turn status is left alone, so a new message
+    still sends immediately.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param running: ``True`` while a background shell outlives the turn.
+    :param runner_id: The reporting runner, when known; the stored flag is
+        written only while the session is still bound to it.
+    """
+    _session_background_work_running_cache[session_id] = (runner_id, running)
+    session_live_state.persist_background_work_running(session_id, running, runner_id=runner_id)
+
+
+def _background_work_running_for(
+    conversation_id: str, db_value: bool | None, runner_id: str | None
+) -> bool:
+    """
+    Return the session-list ``background_work_running`` value for one session.
+
+    :param conversation_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param db_value: The row's persisted value, used when this replica has no
+        report from the session's current runner.
+    :param runner_id: The runner the session is bound to now. A report this
+        replica cached from another runner is ignored.
+    :returns: Whether a background shell outlives the session's ended turn.
+    """
+    cached = _session_background_work_running_cache.get(conversation_id)
+    if cached is not None and cached[0] in (None, runner_id):
+        return cached[1]
+    return db_value is True
 
 
 async def _collect_descendant_conversation_ids(
@@ -1501,6 +1539,9 @@ async def _apply_liveness_to_items(
         # runner reconnects (see ``_on_runner_connect``'s pending resync).
         if not result.runner_online:
             item.pending_elicitations_count = 0
+            # Background shells end with their runner, which may die without
+            # reporting it; the runner re-reports on reconnect.
+            item.background_work_running = False
 
 
 def _targeted_elicitation_event(
@@ -12317,6 +12358,7 @@ __all__ = [
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
     "_background_task_delivery_status",
+    "_background_work_running_for",
     "_build_actor",
     "_build_evaluation_context",
     "_build_new_item",
@@ -12493,6 +12535,7 @@ __all__ = [
     "_seed_missing_title_from_user_message",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
+    "_set_background_work_running",
     "_set_read_state",
     "_signal_harness_elicitation_resolved_by_id",
     "_signal_terminal_resolved_harness_elicitation",

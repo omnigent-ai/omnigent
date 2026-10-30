@@ -118,6 +118,9 @@ class ClaudeProgramStatusPoller:
                     status = "running" if report.state in {"working", "blocked"} else "idle"
                     self._on_status(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
+            # OSC reports ``done`` while a background shell still runs; only the
+            # file says ``shell``, so keep reading it for that one signal.
+            self._fallback.observe()
         else:
             if self._using_osc:
                 self._fallback.resync()

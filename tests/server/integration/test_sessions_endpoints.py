@@ -1293,6 +1293,101 @@ async def test_external_session_status_event_lands_in_status_cache(
         sessions_module._session_status_cache.pop(session["id"], None)
 
 
+async def test_external_background_work_sets_sidebar_flag_without_status_edge(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_background_work`` sets the session-list flag and publishes no edge.
+
+    A background shell that outlives its turn keeps the session working. The
+    turn status stays as reported, so the session still takes a new message.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sessions_module._session_background_work_running_cache.pop(session["id"], None)
+
+    async def listed_item() -> dict[str, Any]:
+        """Return this session's row from the session list."""
+        list_resp = await client.get("/v1/sessions")
+        return next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+
+    try:
+        status_before = (await listed_item())["status"]
+        published.clear()
+        for running in (True, False):
+            resp = await client.post(
+                f"/v1/sessions/{session['id']}/events",
+                json={"type": "external_background_work", "data": {"running": running}},
+            )
+            assert resp.status_code == 202, resp.text
+            assert resp.json() == {"queued": False}
+            assert (await listed_item())["background_work_running"] is running
+        assert published == []
+        assert (await listed_item())["status"] == status_before
+    finally:
+        sessions_module._session_background_work_running_cache.pop(session["id"], None)
+
+
+async def test_external_background_work_from_a_replaced_runner_is_rejected(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A report delayed past a rebind cannot overwrite the replacement runner's value."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], token_bound_runner_id("token-a"))
+
+    async def report(token: str, running: bool) -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+            json={"type": "external_background_work", "data": {"running": running}},
+        )
+
+    try:
+        assert (await report("token-a", False)).status_code == 202
+        store.replace_runner_id(session["id"], token_bound_runner_id("token-b"))
+        assert (await report("token-b", False)).status_code == 202
+
+        late = await report("token-a", True)
+
+        assert late.status_code == 403, late.text
+        session_live_state.submit("drain", lambda: None).result(timeout=10)
+        list_resp = await client.get("/v1/sessions")
+        row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+        assert row["background_work_running"] is False
+        stored = store.get_conversation(session["id"])
+        assert stored is not None and stored.background_work_running is False
+    finally:
+        sessions_module._session_background_work_running_cache.pop(session["id"], None)
+
+
+async def test_post_external_background_work_rejects_non_boolean_flag(
+    client: httpx.AsyncClient,
+) -> None:
+    """A non-boolean ``data.running`` fails loud rather than setting the flag."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_background_work", "data": {"running": "yes"}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "external_background_work" in resp.text
+
+
 # ── POST /v1/sessions/{id}/events external_session_superseded ─────
 
 

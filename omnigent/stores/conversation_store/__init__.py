@@ -1703,6 +1703,33 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_background_work_running(
+        self,
+        conversation_id: str,
+        running: bool,
+        *,
+        runner_id: str | None = None,
+        unseen_since: int | None = None,
+    ) -> None:
+        """
+        Persist whether a session's background shells outlive its ended turn.
+
+        Written by the replica holding the runner tunnel so any replica's
+        session list can show the session as working. Must NOT bump
+        ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param running: ``True`` while a background shell outlives the turn.
+        :param runner_id: When set, write only while the session is still bound
+            to this runner, so clearing a departed runner's flag cannot erase a
+            replacement runner's report.
+        :param unseen_since: When set, write only while ``runner_last_seen`` is
+            NULL or earlier than this epoch second, so a runner that reconnected
+            keeps its report.
+        """
+        ...
+
+    @abstractmethod
     def replace_runner_id(
         self,
         conversation_id: str,

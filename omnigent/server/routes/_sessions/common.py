@@ -134,6 +134,11 @@ _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
 )
 
 
+# Work that outlives the ended turn, such as a background shell. Sidebar-only:
+# it publishes no status edge.
+_EXTERNAL_BACKGROUND_WORK_TYPE: str = "external_background_work"
+
+
 _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT: int = 1000
 
 
@@ -592,6 +597,7 @@ _RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_BTW_SIDECHAT_TYPE,
         _EXTERNAL_ELICITATION_RESOLVED_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
+        _EXTERNAL_BACKGROUND_WORK_TYPE,
         _SUBAGENT_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
         _EXTERNAL_PULL_REQUESTS_TYPE,
@@ -664,6 +670,14 @@ _session_background_task_count_cache: WorkspaceScopedCache[str, int] = Workspace
 # ``_publish_status``) so a reload/reconnect can restore it. Absent when the
 # count cache is absent, or when a runner reported only the count with no detail.
 _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
+    WorkspaceScopedCache()
+)
+
+
+# Whether a session's background shells outlive its ended turn, as the runner
+# last reported it to this replica, with that runner's id when known. Absent when
+# this replica has no report, in which case the session list reads the row.
+_session_background_work_running_cache: WorkspaceScopedCache[str, tuple[str | None, bool]] = (
     WorkspaceScopedCache()
 )
 
@@ -1160,6 +1174,7 @@ __all__ = [
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
+    "_EXTERNAL_BACKGROUND_WORK_TYPE",
     "_EXTERNAL_BTW_DISMISS_TYPE",
     "_EXTERNAL_BTW_SIDECHAT_TYPE",
     "_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE",
@@ -1286,6 +1301,7 @@ __all__ = [
     "_session_active_response_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
+    "_session_background_work_running_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

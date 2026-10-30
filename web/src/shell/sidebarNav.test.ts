@@ -694,6 +694,11 @@ describe("statusBucket", () => {
     expect(statusBucket({ ...base, status: "idle" }, false, true)).toBe("Draft");
     expect(statusBucket({ ...base, status: "idle" }, false, false)).toBe("Done");
   });
+  it("keeps an ended turn with a running background shell in Working", () => {
+    const shells = { ...base, background_work_running: true };
+    expect(statusBucket({ ...shells, status: "idle" }, true, true)).toBe("Working");
+    expect(statusBucket({ ...shells, status: "failed" }, false, false)).toBe("Needs attention");
+  });
 });
 
 describe("dateBucket", () => {

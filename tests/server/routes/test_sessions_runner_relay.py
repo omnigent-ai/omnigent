@@ -2962,6 +2962,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
         sessions_module._session_status_cache[session_id] = cached
     if intentional_stop:
         sessions_module._intentional_stop_sessions[session_id] = "runner-offline"
+    sessions_module._session_background_work_running_cache[session_id] = ("runner-offline", True)
 
     try:
         await sessions_module._mark_runner_sessions_offline(
@@ -2971,6 +2972,8 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
             fail_idle_top_level=fail_idle_top_level,
         )
 
+        # This replica's copy of the departed runner's flag is gone, whatever the turn did.
+        assert session_id not in sessions_module._session_background_work_running_cache
         status = sessions_module._session_status_cache.get(session_id)
         refreshed = store.get_conversation(session_id)
         assert refreshed is not None
@@ -2995,6 +2998,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
     finally:
         sessions_module._intentional_stop_sessions.pop(session_id, None)
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_work_running_cache.pop(session_id, None)
         session_stream.close(session_id)
 
 
@@ -3331,6 +3335,7 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
     Anchoring ownership to the exiting runner keeps the cause.
     """
     from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.schemas import ErrorDetail
 
@@ -3352,7 +3357,10 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
     )
     # A concurrent reconnect rebinds the row to a replacement before the re-read.
     store.replace_runner_id(conv.id, "runner-replacement")
+    # The replacement reported a background shell through another replica.
+    store.set_background_work_running(conv.id, True)
     sessions_module._session_status_cache[conv.id] = "failed"
+    session_live_state.configure(store)
     try:
         with capture_debug_rows("server") as rows:
             await sessions_module._mark_runner_sessions_offline(
@@ -3361,15 +3369,83 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
                 store,
                 fail_idle_top_level=True,
             )
+        session_live_state.submit("drain", lambda: None).result(timeout=10)
         refreshed = store.get_conversation(conv.id)
         assert refreshed is not None
         assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
         assert not any(row["event_name"] == "session_turn_failed" for row in rows)
         decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
         assert decision["attributes"]["decision"] == "already_failed"
+        # Sweeping the exiting runner leaves the replacement's flag visible here too.
+        assert refreshed.background_work_running is True
+        assert sessions_module._background_work_running_for(conv.id, True, "runner-replacement")
     finally:
+        session_live_state.configure(None)
         sessions_module._session_status_cache.pop(conv.id, None)
         session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_offline_sweep_keeps_the_flag_a_reconnected_runner_reported(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that reconnects under the same id while the sweep runs keeps its report.
+
+    The sweep handles the first session, the runner reconnects here and resyncs a
+    running shell on the second, then the sweep reaches the second session. Neither
+    this replica's copy nor the stored flag may be cleared.
+    """
+    import time
+
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    first = store.create_conversation(runner_id="runner-back")
+    second = store.create_conversation(runner_id="runner-back")
+    snapshots = [store.get_conversation(first.id), store.get_conversation(second.id)]
+    assert all(snapshot is not None for snapshot in snapshots)
+    online: set[str] = set()
+
+    class _Router:
+        def runner_is_online(self, runner_id: str) -> bool:
+            return runner_id in online
+
+    decide = orchestration._runner_disconnect_requires_failure
+
+    async def reconnect_during_the_sweep(*args: Any, **kwargs: Any) -> bool:
+        if not online:
+            online.add("runner-back")
+            store.touch_runner_liveness(["runner-back"], now=int(time.time()))
+            sessions_module._set_background_work_running(second.id, True)
+        return await decide(*args, **kwargs)
+
+    monkeypatch.setattr(
+        orchestration, "_runner_disconnect_requires_failure", reconnect_during_the_sweep
+    )
+    monkeypatch.setattr(orchestration, "get_server_runner_router", lambda: _Router())
+    session_live_state.configure(store)
+    try:
+        await sessions_module._mark_runner_sessions_offline(
+            snapshots,  # type: ignore[arg-type]
+            ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly."),
+            store,
+        )
+        session_live_state.submit("drain", lambda: None).result(timeout=10)
+        refreshed = store.get_conversation(second.id)
+        assert refreshed is not None
+        assert refreshed.background_work_running is True
+        assert sessions_module._background_work_running_for(second.id, False, "runner-back")
+    finally:
+        session_live_state.configure(None)
+        for conv in (first, second):
+            sessions_module._session_background_work_running_cache.pop(conv.id, None)
+            sessions_module._session_status_cache.pop(conv.id, None)
+            session_stream.close(conv.id)
 
 
 @pytest.mark.asyncio
@@ -3591,6 +3667,7 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
         )
         assert handle is not None
         sessions_module._session_status_cache[session_id] = "running"
+        sessions_module._session_background_work_running_cache[session_id] = (runner_id, True)
         shutdown_state.mark_runner_handed_off(runner_id, reason="rebalance")
 
         with capture_debug_rows("server") as rows:
@@ -3600,6 +3677,8 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
         assert handle.task.exception() is None
         assert session_id not in store.labels
         assert session_id not in sessions_module._session_status_cache
+        # The new owner's report reaches this replica through the row.
+        assert sessions_module._background_work_running_for(session_id, False, runner_id) is False
         assert not any(row["event_name"] == "session_turn_failed" for row in rows)
         outcome = next(row for row in rows if row["event_name"] == "runner_stream_disconnected")
         attributes = cast("dict[str, object]", outcome["attributes"])
@@ -3614,6 +3693,7 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_work_running_cache.pop(session_id, None)
         session_stream.close(session_id)
 
 
