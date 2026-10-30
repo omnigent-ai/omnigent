@@ -403,12 +403,6 @@ const nativeScrollFadeContracts = [
     transparentStop: "transparent var(--fade-start)",
     opaqueStop: "black calc(var(--fade-start) + 32px)",
   },
-  {
-    platform: "native Settings",
-    selector: ":is([data-ios-native], [data-android-native]) .settings-page-scroll",
-    transparentStop: "transparent var(--status-bar-cut)",
-    opaqueStop: "black var(--status-bar-cut)",
-  },
 ] as const;
 
 describe("index.css native status-bar scroll fades", () => {
@@ -426,6 +420,31 @@ describe("index.css native status-bar scroll fades", () => {
       expect(opens - closes, `${selector} must not sit inside a width media query`).toBe(0);
     },
   );
+});
+
+describe("index.css native Settings status bar", () => {
+  const ruleFor = (selector: string) =>
+    cssBlocks.find(([block]) => selectorOf(block).replace(/\s+/g, " ") === selector);
+  const mediaOf = (index: number) => {
+    const before = cssSource.slice(0, index);
+    return before.slice(before.lastIndexOf("@media")).split("{")[0];
+  };
+
+  it("extends the phone header backdrop over the status bar instead of masking", () => {
+    const backdrop = ruleFor(
+      ":is([data-ios-native], [data-android-native]) .settings-mobile-header::before",
+    );
+    expect(backdrop).toBeDefined();
+    expect(backdrop![0]).toContain("top: calc(-1 * var(--header-offset))");
+    expect(mediaOf(backdrop!.index!)).toContain("width < 48rem");
+  });
+
+  it("masks the status bar on wide settings pages only", () => {
+    const mask = ruleFor(":is([data-ios-native], [data-android-native]) .settings-page-scroll");
+    expect(mask).toBeDefined();
+    expect(mask![0]).toContain("transparent var(--omnigent-safe-top)");
+    expect(mediaOf(mask!.index!)).toContain("width >= 48rem");
+  });
 });
 
 /* The unified native-panel rule: one ungated :is() list covering the

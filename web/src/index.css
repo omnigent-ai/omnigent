@@ -1515,20 +1515,37 @@ html[data-electron-mac] .breadcrumb-folder {
   );
 }
 
-/* Hide settings content in the status-bar band above the offset header; the
- * header backdrop covers everything below its top edge. */
-:is([data-ios-native], [data-android-native]) .settings-page-scroll {
-  --status-bar-cut: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
-  mask-image: linear-gradient(
-    to bottom,
-    transparent var(--status-bar-cut),
-    black var(--status-bar-cut)
-  );
-  -webkit-mask-image: linear-gradient(
-    to bottom,
-    transparent var(--status-bar-cut),
-    black var(--status-bar-cut)
-  );
+/* Start native transcripts below the header and top fade, and keep snapped
+ * "Worked for" rows out of the faded band. */
+:is([data-ios-native], [data-android-native]) .chat-conversation-content {
+  padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
+}
+
+:is([data-ios-native], [data-android-native])
+  .chat-conversation-content.chat-content-under-arca-banner {
+  padding-top: 1rem;
+}
+
+[data-ios-native] .turn-fold-row {
+  scroll-margin-top: calc(88px + var(--omnigent-inset-top));
+}
+
+/* Wide settings pages scroll under the status bar; hide that band. Phone
+ * widths skip the mask because it would trap the fixed title beneath the
+ * header, and extend the header backdrop instead. */
+@media (width >= 48rem) {
+  :is([data-ios-native], [data-android-native]) .settings-page-scroll {
+    mask-image: linear-gradient(
+      to bottom,
+      transparent var(--omnigent-safe-top),
+      black var(--omnigent-safe-top)
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent var(--omnigent-safe-top),
+      black var(--omnigent-safe-top)
+    );
+  }
 }
 
 /* Settings titles join the mobile header row beside the sidebar control. */
@@ -1563,6 +1580,18 @@ html[data-electron-mac] .breadcrumb-folder {
 
   :is([data-ios-native], [data-android-native]) .settings-page-title {
     top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  }
+
+  /* The header sits below the status bar; reach its backdrop up over it. */
+  :is([data-ios-native], [data-android-native]) .settings-mobile-header::before {
+    --header-offset: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+    top: calc(-1 * var(--header-offset));
+    height: calc(80px + var(--header-offset));
+    background: linear-gradient(
+      to bottom,
+      var(--background) 0 calc(48px + var(--header-offset)),
+      transparent calc(80px + var(--header-offset))
+    );
   }
 }
 
@@ -1611,25 +1640,9 @@ html[data-electron-mac] .breadcrumb-folder {
     font-size: var(--text-ui);
   }
 
-  [data-ios-native] .chat-conversation-content,
-  [data-android-native] .chat-conversation-content {
-    /* header band + 1.5rem breathing room + OS safe area, sourced from the
-       shared inset vars (was a hardcoded 5rem). */
-    padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
-  }
-
-  :is([data-ios-native], [data-android-native])
-    .chat-conversation-content.chat-content-under-arca-banner {
-    padding-top: 1rem;
-  }
-
   [data-ios-native] .main-terminal-view,
   [data-android-native] .main-terminal-view {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
-  }
-
-  [data-ios-native] .turn-fold-row {
-    scroll-margin-top: calc(88px + var(--omnigent-inset-top));
   }
 
   [data-ios-native] .chat-composer-form,
