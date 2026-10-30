@@ -3304,6 +3304,8 @@ describe("Composer permission-mode shortcut", () => {
       return onSend;
     }
 
+    const sendButton = () => screen.getByRole("button", { name: "Send" });
+
     it.each(harnesses)(
       "opens the $name permission control on submit without sending",
       async ({ harness, props, option }) => {
@@ -3313,7 +3315,8 @@ describe("Composer permission-mode shortcut", () => {
           .mockResolvedValue(undefined);
         const onSend = renderPermissionSession(harness, props);
         fireEvent.change(textarea(), { target: { value: "/permissions" } });
-        fireEvent.keyDown(textarea(), { key: "Enter" });
+        // Send skips the slash menu, which would otherwise take the Enter.
+        fireEvent.click(sendButton());
 
         expect(onSend).not.toHaveBeenCalled();
         expect(textarea()).toHaveValue("");
@@ -3325,21 +3328,44 @@ describe("Composer permission-mode shortcut", () => {
       },
     );
 
-    it.each(harnesses)(
-      "lists /permissions for $name and opens the control from the menu",
-      async ({ harness, props }) => {
-        const onSend = renderPermissionSession(harness, props);
-        fireEvent.change(textarea(), { target: { value: "/perm" } });
-        expect(screen.getByTestId("slash-menu-item-permissions")).toHaveTextContent(
-          "/permissionsChange the permission mode for this session",
-        );
-        fireEvent.keyDown(textarea(), { key: "Enter" });
+    it("lists /permissions and opens the control from the slash menu", async () => {
+      const onSend = renderPermissionSession("claude-native", { showClaudePermissionMode: true });
+      fireEvent.change(textarea(), { target: { value: "/perm" } });
+      expect(screen.getByTestId("slash-menu-item-permissions")).toHaveTextContent(
+        "/permissionsChange the permission mode for this session",
+      );
+      fireEvent.keyDown(textarea(), { key: "Enter" });
 
-        expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
-        expect(textarea()).toHaveValue("");
-        expect(onSend).not.toHaveBeenCalled();
-      },
-    );
+      expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+      expect(textarea()).toHaveValue("");
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("refuses to reopen the control while a change is in flight", async () => {
+      let finish: () => void = () => {};
+      const setMode = vi
+        .spyOn(useChatStore.getState(), "setClaudePermissionMode")
+        .mockImplementation(
+          () =>
+            new Promise<void>((resolve) => {
+              finish = resolve;
+            }),
+        );
+      const onSend = renderPermissionSession("claude-native", { showClaudePermissionMode: true });
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      fireEvent.click(await screen.findByTestId("composer-permission-option-acceptEdits"));
+      await waitFor(() => expect(screen.getByTestId("composer-permission-chip")).toBeDisabled());
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      expect(screen.getByText("The permission mode can't be changed right now")).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(setMode).toHaveBeenCalledTimes(1);
+      finish();
+      await waitFor(() => expect(screen.getByTestId("composer-permission-chip")).toBeEnabled());
+    });
 
     it("is not listed, and stays plain text, for sessions without a permission control", () => {
       const onSend = renderPermissionSession("claude-sdk", {});

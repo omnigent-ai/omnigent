@@ -10,11 +10,15 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.codex_approval_modes import codex_permission_switch_confirmed
 from tests.e2e_ui.chat.test_claude_native_permission_switch_from_dont_ask import (
+    _render_terminal,
+    _terminal_id,
     _wait_for_footer,
 )
 
@@ -25,6 +29,20 @@ _COMPOSER_PLACEHOLDER = "Send a message…"
 _TUI_TIMEOUT_S = 120.0
 # The runner drives Codex's popup and waits for its confirmation.
 _SWITCH_TIMEOUT_MS = 60_000
+
+
+def _wait_for_codex_confirmation(base_url: str, session_id: str, label: str) -> None:
+    """Poll Codex's rendered screen until it confirms the switch to *label*."""
+    deadline = time.monotonic() + 30.0
+    screen = ""
+    while time.monotonic() < deadline:
+        terminal_id = _terminal_id(base_url, session_id)
+        if terminal_id is not None:
+            screen = _render_terminal(base_url, session_id, terminal_id)
+            if codex_permission_switch_confirmed(screen, label):
+                return
+        time.sleep(1.0)
+    raise AssertionError(f"Codex never confirmed {label!r}; last screen:\n{screen}")
 
 
 @pytest.mark.nightly
@@ -77,6 +95,9 @@ def test_permissions_command_opens_codex_approval_picker(
     assert json.loads(response.request.post_data or "{}") == {"approval_mode": _TARGET_MODE}
     expect(chip).to_contain_text(_TARGET_LABEL)
     assert session_posts == []
+    # The runner types its own /permissions into Codex to apply the switch, so
+    # check Codex's confirmation rather than the command's absence.
+    _wait_for_codex_confirmation(base_url, session_id, _TARGET_LABEL)
 
     # End on Codex's own pane: the switch applied without a stray command.
     page.get_by_test_id("view-mode-terminal").click()
