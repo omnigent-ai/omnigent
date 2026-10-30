@@ -1561,7 +1561,6 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
-    skill_store: SkillStore | None = None,
     project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
@@ -1597,6 +1596,7 @@ def create_app(
     suppressed_agent_names: frozenset[str] = frozenset(),
     preference_store: PreferenceStore | None = None,
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
+    skill_store: SkillStore | None = None,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
 ) -> FastAPI:

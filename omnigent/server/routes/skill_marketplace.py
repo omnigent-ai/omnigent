@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from omnigent.entities import InstalledSkill, SkillSource
+from omnigent.entities.skill import SkillScope
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -312,7 +313,7 @@ def create_skill_marketplace_router(
         policy.require_allowed(url)
         return url, ref
 
-    async def refuse_when_full(user_id: str | None, scope: str, names: list[str]) -> None:
+    async def refuse_when_full(user_id: str | None, scope: SkillScope, names: list[str]) -> None:
         """Save a clone when the principal is plainly full; the store's check is the authority."""
         present = await asyncio.to_thread(skill_store.find_for_user, user_id, names)
         replacing = {skill.name for skill in present if skill.scope == scope}

@@ -87,10 +87,10 @@ class SkillFrontmatterLoader(yaml.SafeLoader):
     it does not own.
     """
 
-    def compose_node(self, parent: object, index: object) -> object:
+    def compose_node(self, parent: yaml.Node | None, index: int) -> yaml.Node | None:
         if self.check_event(yaml.events.AliasEvent):
             raise yaml.YAMLError("YAML anchors are not allowed in skill frontmatter")
-        return super().compose_node(parent, index)  # type: ignore[arg-type]
+        return super().compose_node(parent, index)
 
 
 def load_skill_frontmatter(frontmatter_str: str) -> object:
