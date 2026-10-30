@@ -409,7 +409,7 @@ def _actions_workflow_run(check: dict[str, Any]) -> tuple[str, int] | None:
     if not isinstance(url, str):
         return None
     match = re.fullmatch(r"(https?://[^/]+/[^/]+/[^/]+)/actions/runs/(\d+)(?:/.*)?", url)
-    return (match[1], int(match[2])) if match else None
+    return (match[1].lower(), int(match[2])) if match else None
 
 
 def _filter_superseded_actions_runs(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
@@ -436,9 +436,7 @@ def _filter_superseded_actions_runs(data: dict[str, Any], *, cwd: str, token: st
         and (run := _actions_workflow_run(check))
         and run[0] == repository_url
     ]
-    if len({run for _, run in actions_checks}) < 2 or not any(
-        _classify_check(check) == "failing" for check, _ in actions_checks
-    ):
+    if not any(_classify_check(check) in ("failing", "cancelled") for check, _ in actions_checks):
         return
     try:
         host = _host_args(cwd, reference)

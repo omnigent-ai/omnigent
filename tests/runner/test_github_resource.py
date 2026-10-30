@@ -999,8 +999,9 @@ def _actions_run(run_id: int, **fields: object) -> dict:
 
 
 @pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("mixed_case", [False, True])
 def test_github_checks_ignore_confirmed_superseded_cancelled_runs(
-    monkeypatch: pytest.MonkeyPatch, reverse: bool
+    monkeypatch: pytest.MonkeyPatch, reverse: bool, mixed_case: bool
 ) -> None:
     rollup = [
         {**_actions_check(9, "Docker result"), "startedAt": "2026-10-30T22:01:56Z"},
@@ -1021,6 +1022,12 @@ def test_github_checks_ignore_confirmed_superseded_cancelled_runs(
         },
         {**_actions_check(12, "unknown run", ""), "workflowName": None},
     ]
+    if mixed_case:
+        for check in rollup:
+            if isinstance(check.get("detailsUrl"), str):
+                check["detailsUrl"] = check["detailsUrl"].replace(
+                    "github.com/acme/app", "GitHub.com/AcMe/ApP"
+                )
     metadata = [
         {
             "workflow_runs": [
@@ -1087,7 +1094,14 @@ def test_github_checks_ignore_confirmed_superseded_cancelled_runs(
     if reverse:
         expected.reverse()
     assert result["runs"] == [
-        {"name": name, "bucket": bucket, "url": url} for name, bucket, url in expected
+        {
+            "name": name,
+            "bucket": bucket,
+            "url": url.replace("github.com/acme/app", "GitHub.com/AcMe/ApP")
+            if mixed_case and url
+            else url,
+        }
+        for name, bucket, url in expected
     ]
     assert len(calls) == 2
     assert calls[1] == (
@@ -1126,9 +1140,10 @@ def test_github_checks_preserve_failures_without_confirmed_replacement(
         _actions_run(200, **newer),
     ]
 
-    def gh(argv, **kwargs):
-        if argv[:2] == ["pr", "view"]:
-            return (
+    _stub_gh(
+        monkeypatch,
+        {
+            ("pr", "view"): (
                 0,
                 json.dumps(
                     {
@@ -1138,10 +1153,10 @@ def test_github_checks_preserve_failures_without_confirmed_replacement(
                     }
                 ),
                 "",
-            )
-        return 0, json.dumps([{"workflow_runs": metadata}]), ""
-
-    monkeypatch.setattr(github_resource, "_gh", gh)
+            ),
+            ("api",): (0, json.dumps([{"workflow_runs": metadata}]), ""),
+        },
+    )
     data = github_resource._gh_pr_view([], "url,headRefOid,statusCheckRollup", cwd="/workspace")
     assert data is not None
     assert data["statusCheckRollup"] == checks
@@ -1164,9 +1179,10 @@ def test_github_checks_preserve_failures_when_actions_metadata_is_unavailable(
 ) -> None:
     checks = [_actions_check(100, "result"), _actions_check(200, "gate", "SUCCESS")]
 
-    def gh(argv, **kwargs):
-        if argv[:2] == ["pr", "view"]:
-            return (
+    _stub_gh(
+        monkeypatch,
+        {
+            ("pr", "view"): (
                 0,
                 json.dumps(
                     {
@@ -1176,19 +1192,60 @@ def test_github_checks_preserve_failures_when_actions_metadata_is_unavailable(
                     }
                 ),
                 "",
-            )
-        return returncode, response, ""
-
-    monkeypatch.setattr(github_resource, "_gh", gh)
+            ),
+            ("api",): (returncode, response, ""),
+        },
+    )
     data = github_resource._gh_pr_view([], "url,headRefOid,statusCheckRollup", cwd="/workspace")
     assert data is not None
     assert data["statusCheckRollup"] == checks
     assert github_resource._checks_fields(data)["checks"]["failing"] == 1
 
 
-@pytest.mark.parametrize(
-    "variant", ["clean", "single_run", "external", "no_head", "enterprise_auth"]
-)
+@pytest.mark.parametrize("conclusion", ["FAILURE", "CANCELLED"])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_github_checks_find_queued_replacement_without_visible_check(
+    monkeypatch: pytest.MonkeyPatch, conclusion: str, replacement: bool
+) -> None:
+    checks = [_actions_check(100, "result", conclusion)]
+    metadata = [_actions_run(100, conclusion="cancelled")]
+    if replacement:
+        metadata.append(_actions_run(200, conclusion=None, status="queued"))
+    _stub_gh(
+        monkeypatch,
+        {
+            ("pr", "view"): (
+                0,
+                json.dumps(
+                    {
+                        "url": "https://github.com/acme/app/pull/42",
+                        "headRefOid": "a" * 40,
+                        "statusCheckRollup": checks,
+                    }
+                ),
+                "",
+            ),
+            ("api",): (0, json.dumps([{"workflow_runs": metadata}]), ""),
+        },
+    )
+    data = github_resource._gh_pr_view([], "url,headRefOid,statusCheckRollup", cwd="/workspace")
+    assert data is not None
+    assert data["statusCheckRollup"] == ([] if replacement else checks)
+    result = github_resource._checks_fields(data)["checks"]
+    assert result["runs"] == (
+        []
+        if replacement
+        else [
+            {
+                "name": "result",
+                "bucket": "failing" if conclusion == "FAILURE" else "cancelled",
+                "url": "https://github.com/acme/app/actions/runs/100/job/1",
+            }
+        ]
+    )
+
+
+@pytest.mark.parametrize("variant", ["clean", "external", "no_head", "enterprise_auth"])
 def test_github_checks_skip_unnecessary_actions_metadata_requests(
     monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
@@ -1200,8 +1257,6 @@ def test_github_checks_skip_unnecessary_actions_metadata_requests(
     }
     if variant == "clean":
         checks[0]["conclusion"] = "SUCCESS"
-    elif variant == "single_run":
-        checks[0]["detailsUrl"] = checks[1]["detailsUrl"]
     elif variant == "external":
         checks[0]["detailsUrl"] = "https://ci.example/result"
     elif variant == "no_head":
