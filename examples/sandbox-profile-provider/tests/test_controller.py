@@ -162,6 +162,53 @@ def test_adapter_bounds_and_sanitizes_responses(monkeypatch, failure):
     assert "private-provider-secret" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("workspace", None),
+        ("workspace", ""),
+        ("workspace", {"private-provider-secret": "path"}),
+        ("running", "false"),
+        ("running", 1),
+    ],
+)
+def test_controller_rejects_invalid_lifecycle_response(monkeypatch, field, value):
+    from omnigent.onboarding.sandboxes.profiles import ProviderSandboxProfile
+
+    monkeypatch.setenv("SANDBOX_CONTROLLER_TOKEN", "test-service-token")
+    original = httpx.Client
+    profile = ProviderSandboxProfile(id="build", name="Build", revision="1")
+
+    def dispatch(request):
+        payload = (
+            {"profile": profile.model_dump()}
+            if request.url.path.startswith("/profiles/")
+            else {field: value}
+        )
+        return httpx.Response(200, json=payload)
+
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: original(transport=httpx.MockTransport(dispatch), **kwargs),
+    )
+    launcher = ControllerSandboxLauncher(config=ControllerConfig(url="http://localhost"))
+    launcher.select_profile(SandboxProfileContext(user_id="alice", workspace_id=0), profile)
+    with pytest.raises(SandboxConfigError, match="Controller returned an invalid") as caught:
+        if field == "workspace":
+            launcher.start_host(
+                "sandbox",
+                token="host-secret",
+                host_id="host",
+                host_name="host",
+                server_url="http://server",
+            )
+        else:
+            launcher.is_running("sandbox")
+    assert "private-provider-secret" not in str(caught.value)
+    assert "host-secret" not in str(caught.value)
+
+
 def test_controller_requires_safe_url_and_explicit_selection():
     for url in [
         "http://remote.example",

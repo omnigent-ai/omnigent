@@ -46,6 +46,48 @@ from tests.server.integration._sandbox_profile_support import env as env
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("conflicting_host", [False, True])
+async def test_ordinary_runner_replacement_with_large_history_in_mixed_deployment(
+    env, monkeypatch, conflicting_host
+):
+    from sqlalchemy import insert
+
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    host_id = uuid.uuid4().hex
+    env.hosts.upsert_on_connect(host_id, "ordinary-host", _OWNER)
+    runner_id = "ordinary-runner"
+    env.app.state.tunnel_registry = env.app.state.profile_test_tunnels
+    register_test_runner(env.app, runner_id, harnesses=["codex"], owner=_OWNER)
+    monkeypatch.setattr(sessions_routes, "_get_runner_client", AsyncMock(return_value=None))
+    rows = [
+        {
+            "id": f"{index:032x}",
+            "host_id": host_id,
+            "workspace": "/workspace",
+            "runner_id": runner_id,
+        }
+        for index in range(1, 202)
+    ]
+    if conflicting_host:
+        rows.append({**rows[0], "id": "f" * 32, "host_id": uuid.uuid4().hex})
+    with env.conversations._session_immediate("seed_large_runner_history") as transaction:
+        transaction.execute(insert(SqlConversationMetadata), rows)
+    response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+    assert response.status_code == 201, response.text
+    session_id = response.json()["id"]
+    env.recording.allowed_users.clear()
+    response = await env.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id})
+    assert response.status_code == (400 if conflicting_host else 200), response.text
+    if conflicting_host:
+        assert "multiple hosts" in response.text
+    assert env.conversations.get_conversation(session_id).runner_id == (
+        None if conflicting_host else runner_id
+    )
+    assert env.catalog.get_session_snapshot(session_id) is None
+    assert env.recording.selections == []
+
+
 @pytest.mark.parametrize("env", ["controller"], indirect=True)
 async def test_missing_sandbox_uses_bound_reference_with_large_host_history(env, monkeypatch):
     from sqlalchemy import insert
@@ -138,7 +180,8 @@ async def test_foreign_saved_identity_is_rejected_before_credentials_or_provider
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-async def test_malformed_legacy_profile_labels_remain_readable(env, enabled):
+@pytest.mark.parametrize("legacy_key", ["sandbox_profile:team", "sandbox_profile:id"])
+async def test_malformed_legacy_profile_labels_remain_readable(env, enabled, legacy_key):
     from omnigent.db.db_models import SqlConversationLabel
 
     response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
@@ -147,7 +190,7 @@ async def test_malformed_legacy_profile_labels_remain_readable(env, enabled):
     with env.conversations._conv_session_immediate("seed_legacy_profile_label") as transaction:
         transaction.add(
             SqlConversationLabel(
-                conversation_id=session_id, key="sandbox_profile:team", value="build", updated_at=0
+                conversation_id=session_id, key=legacy_key, value="build", updated_at=0
             )
         )
     if not enabled:
@@ -157,8 +200,11 @@ async def test_malformed_legacy_profile_labels_remain_readable(env, enabled):
     assert response.json()["sandbox_profile"] is None
     assert env.recording.selections == []
     if enabled:
-        with pytest.raises(HTTPException, match="Incomplete saved sandbox profile"):
-            env.catalog.get_session_snapshot(session_id)
+        if legacy_key == "sandbox_profile:id":
+            with pytest.raises(HTTPException, match="Incomplete saved sandbox profile"):
+                env.catalog.get_session_snapshot(session_id)
+        else:
+            assert env.catalog.get_session_snapshot(session_id) is None
 
 
 @pytest.mark.parametrize("transport", ["json", "multipart"])

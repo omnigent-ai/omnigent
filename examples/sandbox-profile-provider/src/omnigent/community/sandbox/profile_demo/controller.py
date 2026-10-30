@@ -215,7 +215,10 @@ class ControllerSandboxLauncher(SandboxHostLauncher):
                 "repos": [{"url": repo.url, "branch": repo.branch} for repo in repos],
             },
         )
-        return result["workspace"]
+        workspace = result.get("workspace")
+        if not isinstance(workspace, str) or not workspace.strip():
+            raise SandboxConfigError("Controller returned an invalid workspace")
+        return workspace
 
     def terminate(self, sandbox_id: str) -> None:
         with suppress(SandboxGoneError):
@@ -226,4 +229,7 @@ class ControllerSandboxLauncher(SandboxHostLauncher):
             result = self._request("GET", f"/sandboxes/{quote(sandbox_id, safe='')}")
         except SandboxGoneError:
             return False
-        return result.get("running")
+        running = result.get("running")
+        if running is not None and not isinstance(running, bool):
+            raise SandboxConfigError("Controller returned an invalid running status")
+        return running

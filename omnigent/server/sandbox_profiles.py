@@ -22,7 +22,6 @@ from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SO
 from omnigent.stores.sandbox_profile_store import (
     SandboxProfileStore,
     encode_snapshot,
-    profile_from_labels,
     same_profile_identity,
 )
 
@@ -318,8 +317,8 @@ class SandboxProfileCatalog:
         side_chat = conversation.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
         if side_chat and profile is not None:
             source_id = conversation.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
-            source = conversation_store.get_conversation(source_id) if source_id else None
-            if source is None or source.runner_id != runner_id:
+            source_runners = conversation_store.get_runner_ids([source_id]) if source_id else {}
+            if source_id is None or source_runners.get(source_id) != runner_id:
                 raise OmnigentError(
                     "A side chat must use its source session's runner",
                     code=ErrorCode.INVALID_INPUT,
@@ -377,13 +376,9 @@ class SandboxProfileCatalog:
         self, host_id: str, reference_session_id: str | None = None
     ) -> dict[str, Any] | None:
         try:
-            if reference_session_id is not None:
-                conversation = self._store.conversations.get_conversation(reference_session_id)
-                if conversation is not None and conversation.host_id == host_id:
-                    snapshot = profile_from_labels(conversation.labels)
-                    if snapshot is not None:
-                        return snapshot
-            return self._store.get_host_snapshot(host_id)
+            return self._store.get_host_snapshot(
+                host_id, reference_session_id=reference_session_id
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

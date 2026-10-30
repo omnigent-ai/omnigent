@@ -3731,21 +3731,15 @@ def test_runner_host_lookup_is_bounded(
 
     event.listen(conversation_store._engine, "before_cursor_execute", capture)
     try:
-        if sessions_per_host == 250:
-            with pytest.raises(ValueError, match="lookup limit"):
-                conversation_store.get_runner_host_ids("runner-target")
-        else:
-            assert conversation_store.get_runner_host_ids("runner-target") == hosts[:2]
+        assert conversation_store.get_runner_host_ids("runner-target") == hosts[:2]
     finally:
         event.remove(conversation_store._engine, "before_cursor_execute", capture)
-    assert len(queries) == 1
+    assert len(queries) == 1, "Host classification must use one statement snapshot"
     assert all("LIMIT" in statement for statement, _ in queries)
     with conversation_store._engine.connect() as connection:
-        statement, parameters = queries[0]
-        assert len(connection.exec_driver_sql(statement, parameters).all()) == min(
-            201, sessions_per_host * (host_count + 1)
-        )
-    assert "host_id =" not in statement
+        for statement, parameters in queries:
+            assert len(connection.exec_driver_sql(statement, parameters).all()) <= 10_001
+            assert "host_id =" not in statement
     if conversation_store._engine.dialect.name == "sqlite":
         with conversation_store._engine.connect() as connection:
             for statement, parameters in queries:
@@ -3754,6 +3748,90 @@ def test_runner_host_lookup_is_bounded(
                 )
                 assert "ix_conversation_metadata_runner_id" in plan, plan
                 assert "TEMP B-TREE" not in plan, plan
+
+
+@pytest.mark.parametrize("row_count", [10_000, 10_001])
+def test_runner_host_lookup_fails_closed_at_safety_budget(conversation_store, row_count):
+    from sqlalchemy import insert
+
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    host_id = "a" * 32
+    with conversation_store._session_immediate("seed_runner_lookup_budget") as session:
+        session.execute(
+            insert(SqlConversationMetadata),
+            [
+                {
+                    "id": f"{index:032x}",
+                    "runner_id": "runner-target",
+                    "host_id": host_id,
+                    "workspace": "/workspace",
+                }
+                for index in range(row_count)
+            ],
+        )
+    if row_count == 10_000:
+        assert conversation_store.get_runner_host_ids("runner-target") == [host_id]
+    else:
+        with pytest.raises(ValueError, match="safety limit"):
+            conversation_store.get_runner_host_ids("runner-target")
+
+
+def test_runner_host_lookup_retains_snapshot_during_rotation(conversation_store):
+    from sqlalchemy import insert, update
+
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    host_id = "a" * 32
+    replacement_id, source_id = "0" * 32, "f" * 32
+    with conversation_store._session_immediate("seed_runner_rotation") as session:
+        session.execute(
+            insert(SqlConversationMetadata),
+            [
+                {"id": replacement_id, "runner_id": None, "host_id": None},
+                {
+                    "id": source_id,
+                    "runner_id": "runner-target",
+                    "host_id": host_id,
+                    "workspace": "/workspace",
+                },
+                *[
+                    {"id": f"{index:032x}", "runner_id": "runner-target", "host_id": None}
+                    for index in range(1, 251)
+                ],
+            ],
+        )
+    rotated = False
+
+    def rotate(_conn, _cursor, statement, _parameters, _context, _many):
+        nonlocal rotated
+        if rotated or not (
+            statement.lstrip().upper().startswith("SELECT") and "runner_id =" in statement
+        ):
+            return
+        rotated = True
+        # Move the only host association behind a keyset cursor while a read is open.
+        with conversation_store._engine.begin() as connection:
+            for session_id, runner_id, bound_host in (
+                (replacement_id, "runner-target", host_id),
+                (source_id, None, None),
+            ):
+                connection.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == session_id,
+                    )
+                    .values(runner_id=runner_id, host_id=bound_host, workspace="/workspace")
+                )
+
+    event.listen(conversation_store._engine, "after_cursor_execute", rotate)
+    try:
+        assert conversation_store.get_runner_host_ids("runner-target") == [host_id]
+        assert rotated
+    finally:
+        event.remove(conversation_store._engine, "after_cursor_execute", rotate)
+    assert conversation_store.get_runner_host_ids("runner-target") == [host_id]
 
 
 def test_list_conversations_by_runner_id_filters(

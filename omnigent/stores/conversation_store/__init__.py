@@ -1826,7 +1826,7 @@ class ConversationStore(ABC):
         raise NotImplementedError
 
     def get_runner_host_ids(self, runner_id: str) -> list[str]:
-        """Return up to two hosts; reject runner histories exceeding the fixed read budget."""
+        """Find up to two hosts in one bounded snapshot of the existing runner index."""
         raise NotImplementedError
 
     def reassign_runner_with_host(
@@ -1843,7 +1843,7 @@ class ConversationStore(ABC):
         raise NotImplementedError
 
     def get_profile_host_binding(self, conversation_id: str) -> ProfileHostBinding:
-        """Capture state before a launch whose commit acknowledgement may be lost."""
+        """Read host metadata and canonical profile labels by their complete unique keys."""
         raise NotImplementedError
 
     def bind_profiled_host(

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.onboarding.sandboxes.profiles import ProviderSandboxProfile
+from omnigent.stores.conversation_store import ConversationNotFoundError
 
 if TYPE_CHECKING:
     from omnigent.stores.conversation_store import ConversationStore
@@ -103,21 +104,33 @@ class SandboxProfileStore:
         self.conversations.accept_sandbox_profile(session_id, snapshot)
 
     def get_session_snapshot(self, session_id: str) -> dict[str, Any] | None:
-        conversation = self.conversations.get_conversation(session_id)
-        return profile_from_labels(conversation.labels) if conversation else None
+        try:
+            binding = self.conversations.get_profile_host_binding(session_id)
+        except ConversationNotFoundError:
+            return None
+        return json.loads(binding.profile_snapshot) if binding.profile_snapshot else None
 
     def can_bind_host(self, session_id: str, host_id: str) -> bool:
         return self.conversations.can_bind_profile_host(session_id, host_id)
 
     def get_session_host_id(self, session_id: str) -> str | None:
-        conversation = self.conversations.get_conversation(session_id)
-        return (
-            conversation.host_id
-            if conversation and profile_from_labels(conversation.labels)
-            else None
-        )
+        try:
+            binding = self.conversations.get_profile_host_binding(session_id)
+        except ConversationNotFoundError:
+            return None
+        return binding.profile_host_id
 
-    def get_host_snapshot(self, host_id: str) -> dict[str, Any] | None:
+    def get_host_snapshot(
+        self, host_id: str, *, reference_session_id: str | None = None
+    ) -> dict[str, Any] | None:
+        if reference_session_id is not None:
+            try:
+                binding = self.conversations.get_profile_host_binding(reference_session_id)
+            except ConversationNotFoundError:
+                pass
+            else:
+                if binding.host_id == host_id and binding.profile_snapshot:
+                    return json.loads(binding.profile_snapshot)
         ids = self.conversations.list_host_conversation_ids(
             host_id, limit=PROFILE_HOST_SESSION_LIMIT + 1
         )

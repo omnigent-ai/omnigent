@@ -135,6 +135,7 @@ _logger = logging.getLogger(__name__)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
 _RUNNER_BINDING_LIMIT = 200
+_RUNNER_HOST_LOOKUP_LIMIT = 10_000
 
 
 def _decode_session_state(
@@ -4369,31 +4370,44 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def get_runner_host_ids(self, runner_id: str) -> list[str]:
         """Resolve legacy runner-only clients through the existing runner index."""
+        # One statement keeps a consistent snapshot during concurrent runner rotation.
+        # Discovery has its own safety budget; mutation source lookups stay smaller.
         with self._session("resolve_runner_host") as session:
-            rows = self._runner_binding_candidates(session, runner_id)
-            if len(rows) > _RUNNER_BINDING_LIMIT:
-                raise ValueError(
-                    "Runner history exceeds the binding lookup limit; launch a new runner"
+            rows = (
+                session.execute(
+                    select(SqlConversationMetadata.host_id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.runner_id == runner_id,
+                    )
+                    .order_by(SqlConversationMetadata.id)
+                    .limit(_RUNNER_HOST_LOOKUP_LIMIT + 1)
                 )
-            return sorted({row.host_id for row in rows if row.host_id is not None})[:2]
+                .scalars()
+                .all()
+            )
+        host_ids = sorted({host_id for host_id in rows if host_id is not None})
+        if len(host_ids) > 1:
+            return host_ids[:2]
+        if len(rows) > _RUNNER_HOST_LOOKUP_LIMIT:
+            raise ValueError("Runner host lookup exceeds the safety limit; launch a new runner")
+        return host_ids
 
     @staticmethod
     def _runner_binding_candidates(session: Session, runner_id: str | None) -> list[Any]:
         # Apply residual host/source checks in Python after this indexed, bounded read.
+        statement = select(
+            SqlConversationMetadata.id,
+            SqlConversationMetadata.host_id,
+            SqlConversationMetadata.workspace,
+            SqlConversationMetadata.git_branch,
+        ).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.runner_id == runner_id,
+        )
         return list(
             session.execute(
-                select(
-                    SqlConversationMetadata.id,
-                    SqlConversationMetadata.host_id,
-                    SqlConversationMetadata.workspace,
-                    SqlConversationMetadata.git_branch,
-                )
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.runner_id == runner_id,
-                )
-                .order_by(SqlConversationMetadata.id)
-                .limit(_RUNNER_BINDING_LIMIT + 1)
+                statement.order_by(SqlConversationMetadata.id).limit(_RUNNER_BINDING_LIMIT + 1)
             )
         )
 

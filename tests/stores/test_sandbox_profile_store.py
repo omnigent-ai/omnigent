@@ -101,6 +101,7 @@ def test_profile_binding_queries_stay_bounded_with_many_unrelated_labels(store):
 
     labels = {f"customer:{index}": "value" for index in range(1000)}
     conversation = store.create_conversation(labels=labels)
+    profiles = SandboxProfileStore(store)
     host_id = uuid4().hex
     queries = []
 
@@ -113,11 +114,18 @@ def test_profile_binding_queries_stay_bounded_with_many_unrelated_labels(store):
     event.listen(store._conv_engine, "before_cursor_execute", capture)
     try:
         before = store.get_profile_host_binding(conversation.id)
+        assert profiles.get_session_snapshot(conversation.id) is None
+        assert profiles.get_session_host_id(conversation.id) is None
         previous = store.bind_profiled_host(
             conversation.id, host_id, "/workspace", PROFILE, runner_id="attempt"
         )
         assert previous == before
         assert store.get_profile_host_binding(conversation.id).profile_snapshot is not None
+        assert profiles.get_session_snapshot(conversation.id) == PROFILE
+        assert profiles.get_session_host_id(conversation.id) == host_id
+        assert profiles.get_host_snapshot(host_id) == PROFILE
+        assert profiles.get_host_snapshot(host_id, reference_session_id=conversation.id) == PROFILE
+        assert profiles.get_host_snapshot(host_id, reference_session_id=uuid4().hex) == PROFILE
         with pytest.raises(ValueError, match="cannot be changed"):
             store.accept_sandbox_profile(conversation.id, {**PROFILE, "revision": "v2"})
         assert store.rollback_profiled_host(
@@ -199,7 +207,8 @@ def test_oversized_identity_is_rejected_without_partial_labels(store):
     assert profile_labels(PROFILE)["sandbox_profile:description:1"] == "x" * 250
 
 
-def test_legacy_partial_labels_do_not_block_ordinary_host_changes(store):
+@pytest.mark.parametrize("legacy_key", ["sandbox_profile:team", "sandbox_profile:id"])
+def test_legacy_partial_labels_do_not_block_ordinary_host_changes(store, legacy_key):
     from uuid import uuid4
 
     from omnigent.db.db_models import SqlConversationLabel
@@ -214,7 +223,7 @@ def test_legacy_partial_labels_do_not_block_ordinary_host_changes(store):
         transaction.add(
             SqlConversationLabel(
                 conversation_id=conversation.id,
-                key="sandbox_profile:team",
+                key=legacy_key,
                 value="build",
                 updated_at=0,
             )
@@ -223,8 +232,11 @@ def test_legacy_partial_labels_do_not_block_ordinary_host_changes(store):
     assert store.get_conversation(conversation.id).host_id == second
     store.clear_host_binding(conversation.id)
     assert store.get_conversation(conversation.id).host_id is None
-    with pytest.raises(ValueError, match="Incomplete saved sandbox profile"):
-        SandboxProfileStore(store).get_session_snapshot(conversation.id)
+    if legacy_key == "sandbox_profile:id":
+        with pytest.raises(ValueError, match="Incomplete saved sandbox profile"):
+            SandboxProfileStore(store).get_session_snapshot(conversation.id)
+    else:
+        assert SandboxProfileStore(store).get_session_snapshot(conversation.id) is None
 
 
 def test_failed_metadata_commit_never_leaves_a_runner_or_mutable_profile(store, monkeypatch):

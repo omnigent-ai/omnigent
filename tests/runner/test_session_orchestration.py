@@ -30,6 +30,10 @@ def test_native_message_schema(spec):
             "sandbox_profile_id": "build",
             "sandbox_profile_revision": "v1",
         },
+        {"sandbox_profile_revision": "v1"},
+        {"sandbox_provider": ""},
+        {"sandbox_profile_id": " "},
+        {"sandbox_profile_revision": ""},
     ],
 )
 async def test_create_placement(placement, monkeypatch, profile):
@@ -40,9 +44,9 @@ async def test_create_placement(placement, monkeypatch, profile):
     requests = []
 
     def handler(request):
+        requests.append(request)
         if request.url.path == "/v1/info":
             return httpx.Response(200, json={"request_managed_sandbox_host_id": True})
-        requests.append(request)
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(201, json={"id": uuid4().hex, "agent_id": "worker"})
@@ -70,7 +74,16 @@ async def test_create_placement(placement, monkeypatch, profile):
         assert "requires placement='managed'" in result["error"]
         assert requests == []
         return
+    if profile and any(not value.strip() for value in profile.values()):
+        assert "nonempty strings" in result["error"]
+        assert requests == []
+        return
+    if profile and "sandbox_profile_id" not in profile:
+        assert "requires sandbox_profile_id" in result["error"]
+        assert requests == []
+        return
     assert "error" not in result, result
+    requests = [request for request in requests if request.url.path != "/v1/info"]
     assert len(requests) == (2 if placement == "same_host" else 1)
     body = json.loads(requests[0].content)
     if placement == "child":

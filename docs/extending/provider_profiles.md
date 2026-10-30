@@ -173,6 +173,10 @@ shows at most **20 results**, with a bounded scroll area and truncated text; use
 refine the search to find later matches. A selected profile is fetched separately
 by ID, so being outside the first page does not invalidate it. Query cancellation
 and separate search keys keep older responses from replacing newer results.
+While capability discovery or a catalog refresh is pending or failed, sandbox
+launch is disabled, including for ordinary providers whose participation is not
+yet known. A background refresh briefly disables Start even with a selected
+profile. Retry after an error or select an ordinary connected host to continue.
 
 | Operation | Reference and behavior |
 | --- | --- |
@@ -199,15 +203,18 @@ conversation `host_id`. Capable controllers remain authoritative for sandbox
 assignments; a missing sandbox can be replaced from its bound session's reference.
 Ordinary hosts skip
 profile discovery entirely. Legacy host recovery reads at most 201 session IDs
-through the existing host index and rejects histories over 200 before hydrating
-labels. Enable controller assignment lookup for large histories or orphan recovery.
-Runner-only adoption reads at most 201 metadata rows through the existing runner
-index, rejecting more than 200 associations rather than guessing a host. Start a
-new runner when that limit is reached. Rotation and rollback also bound their
+through the existing host index and rejects histories over 200 before reading
+profile references. Each reference read uses only the seven canonical label keys.
+Enable controller assignment lookup for large histories or orphan recovery.
+Runner-only adoption reads host IDs through the existing runner index in one
+statement snapshot, so concurrent rotation cannot hide a host between pages.
+This read has a separate safety budget of 10,000 currently attached sessions
+(10,001 rows detect overflow). Conflicting hosts or overflow fail closed; launch
+a new runner on overflow. Ordinary runners with 201 or more attached sessions
+remain usable within that budget in mixed deployments.
+Rotation and rollback still bound their
 source lookup to 201 rows and leave the binding intact if no source is found.
-Ordinary-only deployments skip runner profile discovery. Mixed deployments retain
-the runner bound even for unprofiled sessions: a truncated history cannot prove
-that no unseen association belongs to a profile-managed host.
+Ordinary-only deployments skip runner profile discovery.
 
 Incomplete legacy labels remain readable with `sandbox_profile: null`; they
 do not impose profile affinity on ordinary metadata binding operations and
