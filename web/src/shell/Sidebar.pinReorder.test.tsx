@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as capabilities from "@/lib/CapabilitiesContext";
 import * as serverOrigin from "@/lib/serverOrigin";
+import * as gridSessions from "@/grid/GridSessionsContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { readSidebarViewPreferences } from "@/lib/sidebarViewPreferences";
 
@@ -29,6 +30,7 @@ vi.mock("@/hooks/useConversations", async () => {
   return {
     ...conversationHooksMock(),
     useProjects: vi.fn(() => ({ data: [] })),
+    useProjectSessions: vi.fn(() => conversationPage([])),
     useMoveToProject: () => ({ mutate: mocks.moveToProject }),
     usePinnedConversations: () => ({
       data: { conversations: mocks.pinned, filterHonored: mocks.filterHonored },
@@ -44,7 +46,7 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
-import { useConversations, useProjects } from "@/hooks/useConversations";
+import { useConversations, useProjects, useProjectSessions } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 
@@ -55,6 +57,7 @@ function stubRowRects() {
   return vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
     this: Element,
   ) {
+    if (this.getAttribute("data-grid-drop-edge") === "left") return new DOMRect(300, 0, 200, 200);
     const rows = [...document.querySelectorAll("li[data-sidebar-session-id]")];
     const projectFolder = this.querySelector("[data-project-order-name]");
     const indices = rows.flatMap((row, index) =>
@@ -94,6 +97,7 @@ async function dropOnto(sourceId: string, targetId: string, { expectTarget = tru
 beforeEach(() => {
   localStorage.clear();
   mocks.filterHonored = true;
+  vi.mocked(useProjectSessions).mockReturnValue(conversationPage([]));
   vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useProjects>);
   mocks.pinned = [
     conv("conv_a", { labels: { "omnigent.pinned": "1000" } }),
@@ -106,6 +110,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  vi.useRealTimers();
   fireEvent.mouseUp(document);
   cleanup();
   await new Promise((resolve) => {
@@ -222,18 +227,30 @@ describe("custom session ordering", () => {
   });
 
   it.each([
-    { sourceProject: null, pinned: false },
-    { sourceProject: "Other", pinned: false },
-    { sourceProject: "Target", pinned: true },
-    { sourceProject: "Target", pinned: false },
-  ])("routes a drop over a project member: %j", async ({ sourceProject, pinned }) => {
+    { sourceProject: null, pinned: false, archived: false },
+    { sourceProject: "Other", pinned: false, archived: false },
+    { sourceProject: "Target", pinned: true, archived: false },
+    { sourceProject: "Target", pinned: false, archived: false },
+    { sourceProject: "Target", pinned: false, archived: true },
+  ])("routes a drop over a project member: %j", async ({ sourceProject, pinned, archived }) => {
     vi.mocked(useProjects).mockReturnValue({
       data: ["Target", "Other"].map((name) => ({ id: null, name })),
     } as unknown as ReturnType<typeof useProjects>);
     localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Target", "Other"]));
-    const source = conv("source", { labels: sourceProject ? { omni_project: sourceProject } : {} });
-    const target = conv("target", { labels: { omni_project: "Target" } });
-    vi.mocked(useConversations).mockImplementation(() => conversationPage([source, target]));
+    const source = conv("source", {
+      archived,
+      labels: sourceProject ? { omni_project: sourceProject } : {},
+    });
+    const target = conv("target", { archived, labels: { omni_project: "Target" } });
+    vi.mocked(useConversations).mockImplementation(() =>
+      conversationPage(archived ? [] : [source, target]),
+    );
+    if (archived) {
+      localStorage.setItem("omnigent:session-filter", "archived");
+      vi.mocked(useProjectSessions).mockImplementation((name) =>
+        conversationPage(name === "Target" ? [source, target] : []),
+      );
+    }
     if (pinned) mocks.pinned = [source];
     mocks.pinFn.mockResolvedValue({});
     renderSidebar();
@@ -246,6 +263,7 @@ describe("custom session ordering", () => {
       expect(mocks.moveToProject).not.toHaveBeenCalled();
       expect(readSidebarViewPreferences().ordering).toBe("custom");
       expect(rowIds()).toEqual(["source", "target"]);
+      expect(readSidebarViewPreferences().customOrder?.ids).toEqual(["source", "target"]);
     } else {
       expect(mocks.moveToProject).toHaveBeenCalledExactlyOnceWith({
         id: "source",
@@ -257,12 +275,47 @@ describe("custom session ordering", () => {
     }
   });
 
+  it.each([
+    { archived: false, owner: null },
+    { archived: false, owner: "someone-else" },
+    { archived: true, owner: null },
+  ])("allows only live sessions into a grid: %j", async ({ archived, owner }) => {
+    vi.spyOn(serverOrigin, "isCurrentServerLocal").mockReturnValue(false);
+    localStorage.setItem("omnigent:session-filter", archived ? "archived" : "all");
+    vi.mocked(useConversations).mockImplementation(() =>
+      conversationPage([conv("source", { archived, owner })]),
+    );
+    const split = vi.fn();
+    vi.spyOn(gridSessions, "useGridSessions").mockReturnValue({
+      enabled: true,
+      desktop: true,
+      grids: [],
+      conversationId: "current",
+      split,
+    } as unknown as NonNullable<ReturnType<typeof gridSessions.useGridSessions>>);
+    render(<div data-grid-session="current" />);
+    renderSidebar();
+    await hoverOnto("source", "source");
+    const point = { clientX: 350, clientY: 100 };
+    await act(async () => {
+      fireEvent.mouseMove(document, point);
+    });
+    expect(screen.queryByTestId("grid-drop-ghost") !== null).toBe(!archived);
+    await act(async () => {
+      fireEvent.mouseUp(document, point);
+    });
+    if (archived) expect(split).not.toHaveBeenCalled();
+    else expect(split).toHaveBeenCalledExactlyOnceWith("current", "source", "left");
+    expect(readSidebarViewPreferences().ordering).toBe("updated");
+  });
+
   it.each(["drop", "cancel"])(
     "prevents native link navigation after a same-row %s",
     async (finish) => {
       renderSidebar({ route: "/c/conv_d" });
       const link = screen.getByRole("link", { name: "conv_c" });
       const point = await hoverOnto("conv_c", "conv_c");
+      vi.useFakeTimers();
       await act(async () => {
         if (finish === "cancel") fireEvent.keyDown(document, { key: "Escape", code: "Escape" });
         fireEvent.mouseUp(document, point);
@@ -270,12 +323,11 @@ describe("custom session ordering", () => {
       });
       expect(readSidebarViewPreferences().ordering).toBe("updated");
 
-      // Once dnd-kit's click blocker expires, the next intentional click is untouched.
+      // Flush dnd-kit's pending listener cleanup without depending on its delay.
       await act(async () => {
-        await new Promise((resolve) => {
-          setTimeout(resolve, 50);
-        });
+        await vi.runOnlyPendingTimersAsync();
       });
+      vi.useRealTimers();
       const defaultPrevented = vi.fn((event: Event) => event.defaultPrevented);
       link.addEventListener("click", defaultPrevented, { once: true });
       fireEvent.pointerDown(link, { button: 0 });

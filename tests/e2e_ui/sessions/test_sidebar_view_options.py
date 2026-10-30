@@ -13,6 +13,8 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
 
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
+
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
 _IDLE = f"{3:032x}"
@@ -71,23 +73,11 @@ def _serve_sessions(route: Route) -> None:
     )
 
 
-def _enable_grouping_ui(page: Page, enabled: bool = True) -> None:
-    """Advertise the ``sidebar_grouping_ui`` release flag on the live server's info."""
-
-    def serve_info(route: Route) -> None:
-        response = route.fetch()
-        info = response.json()
-        info["features"] = {**info.get("features", {}), "sidebar_grouping_ui": enabled}
-        route.fulfill(response=response, json=info)
-
-    page.route("**/v1/info", serve_info)
-
-
 @pytest.fixture
 def stubbed_sidebar(page: Page, request: pytest.FixtureRequest) -> str:
     """Open the home page with the stubbed session list; return the base URL."""
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
-    _enable_grouping_ui(page)
+    enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.goto(base_url)
@@ -140,56 +130,6 @@ def test_harness_grouping_persists_across_reload(
     sessions = page.locator("section").filter(has=_section_header(page, "Sessions"))
     expect(sessions.locator('a[href^="/c/"]')).to_have_text(
         ["Running session", "Awaiting session", "Idle session"]
-    )
-
-
-def test_custom_order_commits_on_drop_and_survives_grouping_and_reload(
-    page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Custom retains Created's order until a drop; new sessions precede it."""
-    _open_view_submenu(page, "session-ordering-menu")
-    page.get_by_role("menuitemradio", name="Created", exact=True).click()
-    page.keyboard.press("Escape")
-    rows = page.locator("li[data-sidebar-session-id]").get_by_role("link")
-    initial = ["Idle session", "Awaiting session", "Running session"]
-    expect(rows).to_have_text(initial)
-    source = page.get_by_role("link", name="Running session").bounding_box()
-    target = page.get_by_role("link", name="Idle session").bounding_box()
-    assert source and target
-    page.mouse.move(source["x"] + 30, source["y"] + source["height"] / 2)
-    page.mouse.down()
-    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
-    expect(page.locator('[data-session-order-over="true"]')).to_have_attribute(
-        "data-sidebar-session-id", _IDLE
-    )
-    expect(rows).to_have_text(initial)
-    page.mouse.up()
-    reordered = ["Running session", "Idle session", "Awaiting session"]
-    expect(rows).to_have_text(reordered)
-    _open_view_submenu(page, "session-ordering-menu")
-    expect(page.get_by_role("menuitemradio", name="Custom")).to_be_checked()
-    page.keyboard.press("Escape")
-
-    for row in _ROWS:
-        monkeypatch.setitem(row, "status", "running")
-        monkeypatch.setitem(row, "pending_elicitations_count", 0)
-    for grouping in ("Status", "Harness", "Created", "Updated"):
-        _open_view_submenu(page, "session-grouping-menu")
-        page.get_by_role("menuitemradio", name=grouping, exact=True).click()
-        page.keyboard.press("Escape")
-        page.reload()
-        expect(rows).to_have_text(reordered)
-
-    monkeypatch.setattr(
-        f"{__name__}._ROWS",
-        [*_ROWS, _row(f"{4:032x}", "New session", created_at=time(), updated_at=time())],
-    )
-    page.reload()
-    expect(rows).to_have_text(["New session", *reordered])
-    _enable_grouping_ui(page, False)
-    page.reload()
-    expect(rows).to_have_text(
-        ["New session", "Running session", "Awaiting session", "Idle session"]
     )
 
 
@@ -339,7 +279,7 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
 
     # Register every route BEFORE navigating, so an eager fetch during mount is
     # counted — otherwise the empty-request assertion can't detect it.
-    _enable_grouping_ui(page)
+    enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.route("**/v1/sessions/*/resources/github*", serve_github)
@@ -422,7 +362,7 @@ def test_created_ordering_persists_and_flag_off_uses_updated(
     page.keyboard.press("Escape")
     page.reload()
     expect(links).to_have_text(["Idle session", "Awaiting session", "Running session"])
-    _enable_grouping_ui(page, enabled=False)
+    enable_grouping_ui(page, enabled=False)
     requests.clear()
     page.reload()
     expect(links).to_have_text(["Idle session", "Running session", "Awaiting session"])

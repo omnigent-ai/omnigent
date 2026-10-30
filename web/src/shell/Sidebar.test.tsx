@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  readSidebarViewPreferences,
+  removeSidebarCustomOrderIds,
+} from "@/lib/sidebarViewPreferences";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
@@ -4615,7 +4619,16 @@ describe("sidebar_grouping_ui release flag", () => {
       });
       mockConversations([live, archived, unfiled, shared]);
       // Folder pages can contain members outside the global archived window.
-      const older = conv("older_archived_filed", "Claude Code", { ...filed, archived: true });
+      const older = conv("older_archived_filed", "Claude Code", {
+        ...filed,
+        archived: true,
+        updated_at: 20,
+      });
+      const oldest = conv("oldest_archived_filed", "Claude Code", {
+        ...filed,
+        archived: true,
+        updated_at: 10,
+      });
       const original = useConvMock.getMockImplementation()!;
       useConvMock.mockImplementation((...args) =>
         args[4] === "archived"
@@ -4633,7 +4646,7 @@ describe("sidebar_grouping_ui release flag", () => {
       fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
       expect(screen.getByText("live_filed")).toBeInTheDocument();
 
-      projectSessionsMock.current.Alpha = [archived, older, shared];
+      projectSessionsMock.current.Alpha = [archived, older, oldest, shared];
       selectSessionFilter("archived");
       const folder = screen.getByRole("button", { name: "Alpha" }).closest("section")!;
       const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
@@ -4643,6 +4656,29 @@ describe("sidebar_grouping_ui release flag", () => {
       expect(screen.queryByText("live_filed")).toBeNull();
       expect(within(sessions).getByText("archived_unfiled")).toBeInTheDocument();
       expect(within(sessions).queryByText("archived_filed")).toBeNull();
+      const folderOrder = () =>
+        within(folder)
+          .getAllByRole("link", { name: /archived_filed$/ })
+          .map((link) => link.textContent);
+      expect(folderOrder()).toEqual([older.id, oldest.id, archived.id]);
+      fireEvent.pointerDown(
+        within(folder)
+          .getByRole("link", { name: oldest.id })
+          .closest("li")!
+          .querySelector('[data-testid="conversation-actions"]')!,
+        { button: 0 },
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Move up" }));
+      expect(folderOrder()).toEqual([oldest.id, older.id, archived.id]);
+      const saved = readSidebarViewPreferences();
+      expect(saved.ordering).toBe("custom");
+      expect(saved.customOrder!.ids.indexOf(oldest.id)).toBeLessThan(
+        saved.customOrder!.ids.indexOf(older.id),
+      );
+      projectSessionsMock.current.Alpha = [archived, older, shared];
+      act(() => removeSidebarCustomOrderIds([oldest.id]));
+      expect(folderOrder()).toEqual([older.id, archived.id]);
+      expect(readSidebarViewPreferences().customOrder?.ids).not.toContain(oldest.id);
       fireEvent.click(screen.getByRole("button", { name: "Empty" }));
       expect(screen.getByText("No archived sessions")).toBeInTheDocument();
       expect(

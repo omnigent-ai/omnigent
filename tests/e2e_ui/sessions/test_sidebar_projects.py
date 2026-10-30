@@ -30,7 +30,7 @@ import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
-from tests.e2e_ui.sessions.test_sidebar_view_options import _enable_grouping_ui
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -91,7 +91,7 @@ def test_move_session_into_new_project(
     _set_title(base_url, other_id, f"{title}-other")
     project = f"Project {uuid.uuid4().hex[:6]}"
 
-    _enable_grouping_ui(page)
+    enable_grouping_ui(page)
     page.goto(f"{base_url}/c/{session_id}")
 
     row = _row(page, session_id)

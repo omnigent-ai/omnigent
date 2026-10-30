@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { clearRecentlyCreated, markRecentlyCreated } from "@/lib/sessionListCache";
 import {
   type ActiveChatOverride,
   bareConversationId,
@@ -22,6 +23,8 @@ import {
   statusBucket,
   dateBucket,
 } from "./sidebarNav";
+
+afterEach(clearRecentlyCreated);
 
 function conversation(
   id: string,
@@ -798,12 +801,39 @@ it.each(["created", "updated"] as const)(
   (baseOrdering) => {
     const row = (id: string, createdAt: number) => conversation(id, id, new Date(createdAt * 1000));
     const order = { baseOrdering, ids: ["a", "unloaded", "b"], startedAt: 100 };
-    const rows = [row("b", 20), row("a", 10), row("history", 1), row("new", 110)];
+    const sameSecondNew = row("same-second-new", 100);
+    markRecentlyCreated(sameSecondNew);
+    const rows = [
+      row("b", 20),
+      row("a", 10),
+      row("history", 1),
+      row("new", 110),
+      row("same-second-history", 100),
+      sameSecondNew,
+    ];
     const sortBy = baseOrdering === "created" ? "created_at" : "updated_at";
-    const sorted = sortConversations(rows, null, null, sortBy, order);
-    expect(sorted.map((session) => session.id)).toEqual(["new", "a", "b", "history"]);
+    const frozen = new Map<string, number>();
+    const sorted = sortConversations(rows, null, frozen, sortBy, order);
+    // Date grouping still uses these frozen keys when positions come from Custom.
+    expect(frozen.get("a")).toBe(10);
+    expect(sorted.map((session) => session.id)).toEqual([
+      "new",
+      "same-second-new",
+      "a",
+      "b",
+      "same-second-history",
+      "history",
+    ]);
     const saved = extendSidebarCustomOrder(order, sorted);
-    expect(saved.ids).toEqual(["new", "a", "unloaded", "b", "history"]);
+    expect(saved.ids).toEqual([
+      "new",
+      "same-second-new",
+      "a",
+      "unloaded",
+      "b",
+      "same-second-history",
+      "history",
+    ]);
     expect(extendSidebarCustomOrder(saved, sorted)).toBe(saved);
     expect(
       sortConversations(
@@ -827,14 +857,21 @@ it.each(["created", "updated"] as const)(
 it("seeds an empty Custom list from server timestamps before loading older pages", () => {
   const empty = { baseOrdering: "updated" as const, ids: [], startedAt: 0 };
   expect(extendSidebarCustomOrder(empty, [])).toBe(empty);
-  const first = extendSidebarCustomOrder(empty, [
-    conversation("a", "A", new Date(10_000), { updatedAt: new Date(100_000) }),
-  ]);
+  const first = extendSidebarCustomOrder(empty, [conversation("z", "Z", new Date(100_000))]);
   expect(first.startedAt).toBe(100);
+  const sameSecondNew = conversation("new-same-second", "New", new Date(100_000));
+  markRecentlyCreated(sameSecondNew);
   expect(
     extendSidebarCustomOrder(first, [
       conversation("new", "New", new Date(101_000)),
+      sameSecondNew,
+      conversation("a", "History in the same second", new Date(100_000)),
       conversation("history", "History", new Date(90_000)),
     ]).ids,
-  ).toEqual(["new", "a", "history"]);
+  ).toEqual(["new", "new-same-second", "z", "a", "history"]);
+  expect(
+    extendSidebarCustomOrder({ ...first, ids: [] }, [
+      conversation("history", "History", new Date(90_000)),
+    ]).startedAt,
+  ).toBe(100);
 });

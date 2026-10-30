@@ -1,7 +1,11 @@
 import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
-import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  PROJECT_LABEL_KEY,
+  PINNED_LABEL_KEY,
+  recentlyCreatedSessions,
+} from "@/lib/sessionListCache";
 import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
@@ -212,21 +216,40 @@ export function filterConversations(
   });
 }
 
-/** Keep saved positions; prepend new sessions and append newly loaded history. */
+const customOrderPositions = new WeakMap<SidebarCustomOrder, ReadonlyMap<string, number>>();
+
+function positionsForCustomOrder(order: SidebarCustomOrder): ReadonlyMap<string, number> {
+  let positions = customOrderPositions.get(order);
+  if (!positions) {
+    positions = new Map(order.ids.map((id, index) => [id, index]));
+    customOrderPositions.set(order, positions);
+  }
+  return positions;
+}
+
+function isNewCustomOrderSession(row: Conversation, order: SidebarCustomOrder): boolean {
+  // Creation/stream arrivals disambiguate timestamps shared with an older page.
+  return (
+    row.created_at > order.startedAt ||
+    (row.created_at === order.startedAt && recentlyCreatedSessions.has(row.id))
+  );
+}
+
+/** Keep saved positions, including unloaded IDs; append newly loaded history. */
 export function extendSidebarCustomOrder(
   order: SidebarCustomOrder,
   orderedRows: readonly Conversation[],
 ): SidebarCustomOrder {
-  const known = new Set(order.ids);
+  const positions = positionsForCustomOrder(order);
+  const added = new Set<string>();
   const newer: string[] = [];
   const older: string[] = [];
   for (const row of orderedRows) {
-    if (known.has(row.id)) continue;
-    known.add(row.id);
-    (row.created_at >= order.startedAt ? newer : older).push(row.id);
+    if (positions.has(row.id) || added.has(row.id)) continue;
+    added.add(row.id);
+    (isNewCustomOrderSession(row, order) ? newer : older).push(row.id);
   }
   if (newer.length === 0 && older.length === 0) return order;
-  // ponytail: retain unloaded IDs; fetch them explicitly if full-history restoration is needed.
   return {
     ...order,
     ids: [...newer, ...order.ids, ...older],
@@ -234,7 +257,10 @@ export function extendSidebarCustomOrder(
     startedAt:
       order.ids.length > 0
         ? order.startedAt
-        : orderedRows.reduce((latest, row) => Math.max(latest, row.created_at, row.updated_at), 0),
+        : orderedRows.reduce(
+            (latest, row) => Math.max(latest, row.created_at, row.updated_at),
+            order.startedAt,
+          ),
   };
 }
 
@@ -254,14 +280,14 @@ export function sortConversations(
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  const ordered = [...conversations].sort(
-    (a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id),
-  );
-  if (!customOrder) return ordered;
-  const positions = new Map(
-    extendSidebarCustomOrder(customOrder, ordered).ids.map((id, index) => [id, index]),
-  );
-  return ordered.sort((a, b) => positions.get(a.id)! - positions.get(b.id)!);
+  const positions = customOrder && positionsForCustomOrder(customOrder);
+  const position = (row: Conversation): number =>
+    positions?.get(row.id) ??
+    (customOrder && isNewCustomOrderSession(row, customOrder) ? -1 : (positions?.size ?? 0));
+  return [...conversations].sort((a, b) => {
+    const byTime = effective(b) - effective(a);
+    return position(a) - position(b) || byTime || b.id.localeCompare(a.id);
+  });
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */

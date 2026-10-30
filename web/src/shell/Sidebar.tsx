@@ -1967,6 +1967,7 @@ function ConversationList({
     label: string;
     project: string | null;
     isPinned: boolean;
+    canGrid: boolean;
   } | null>(null);
   const { mutateAsync: pinAt } = useTogglePinnedConversation();
   // Pin writes don't overlap (the hooks refuse one while another saves), so the
@@ -2063,43 +2064,6 @@ function ConversationList({
     frozenKeysRef.current.clear();
     frozenStatusRef.current.clear();
   }, [orderFrozen]);
-
-  const orderingRows = useMemo(
-    () =>
-      sortConversations(
-        dedupeConversationsById([...allConversations, ...loadedRows]).filter(
-          (row) => !row.provisional,
-        ),
-        activeOverride,
-        frozenKeys,
-        sortBy,
-      ),
-    [allConversations, loadedRows, activeOverride, frozenKeys, sortBy],
-  );
-  const captureCustomOrder = () =>
-    extendSidebarCustomOrder(
-      {
-        baseOrdering: sidebarBaseOrdering(view),
-        ids: [],
-        startedAt: 0,
-      },
-      orderingRows,
-    );
-  const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
-    if (patch.grouping !== undefined && patch.grouping !== view.grouping && selectionMode) {
-      onExitSelectionMode();
-    }
-    saveView(
-      patch.ordering === "custom"
-        ? { ...patch, customOrder: view.customOrder ?? captureCustomOrder() }
-        : patch,
-    );
-  });
-  useEffect(() => {
-    if (!customOrder) return;
-    const next = extendSidebarCustomOrder(customOrder, orderingRows);
-    if (next !== customOrder) saveView({ customOrder: next });
-  }, [customOrder, orderingRows, saveView]);
 
   // Build sections: Pinned and Archived are peeled off; the rest splits into
   // the viewer's own sessions (Chats) and ones shared with them. Archived
@@ -2417,6 +2381,56 @@ function ConversationList({
     [folderConversations],
   );
 
+  // Folder pages include members outside the global window, including archives.
+  // Selection and order capture must use the same complete membership pool.
+  const projectSessionPool = useMemo(
+    () =>
+      dedupeConversationsById([
+        ...[...folderConversations.values()].flatMap((folder) => folder.conversations),
+        ...sections.projectGroups.flatMap((group) => group.conversations),
+      ]),
+    [sections.projectGroups, folderConversations],
+  );
+  const orderingRows = useMemo(
+    () =>
+      sortConversations(
+        dedupeConversationsById([...allConversations, ...loadedRows, ...projectSessionPool]).filter(
+          (row) => !row.provisional,
+        ),
+        activeOverride,
+        frozenKeys,
+        sortBy,
+      ),
+    [allConversations, loadedRows, projectSessionPool, activeOverride, frozenKeys, sortBy],
+  );
+  const captureCustomOrder = () =>
+    extendSidebarCustomOrder(
+      { baseOrdering: sidebarBaseOrdering(view), ids: [], startedAt: 0 },
+      orderingRows,
+    );
+  const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
+    if (patch.grouping !== undefined && patch.grouping !== view.grouping && selectionMode) {
+      onExitSelectionMode();
+    }
+    saveView(
+      patch.ordering === "custom"
+        ? { ...patch, customOrder: view.customOrder ?? captureCustomOrder() }
+        : patch,
+    );
+  });
+  const observedOrderIds = useRef<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    const previous = observedOrderIds.current;
+    observedOrderIds.current = new Set(customOrder ? orderingRows.map((row) => row.id) : []);
+    if (!customOrder) return;
+    // Capture arrivals once; a stale folder snapshot must not re-add a confirmed removal.
+    const next = extendSidebarCustomOrder(
+      customOrder,
+      orderingRows.filter((row) => !previous.has(row.id)),
+    );
+    if (next !== customOrder) saveView({ customOrder: next });
+  }, [customOrder, orderingRows, saveView]);
+
   const sessionOrderGroups = useMemo(() => {
     const groups = new Map<string, readonly string[]>();
     if (!groupingUi || selectionMode) return groups;
@@ -2503,12 +2517,14 @@ function ConversationList({
       return;
     }
     const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
+      | { label?: string; project?: string | null; isPinned?: boolean; canGrid?: boolean }
+      | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
       project: data?.project ?? null,
       isPinned: data?.isPinned ?? false,
+      canGrid: data?.canGrid !== false,
     });
   }, []);
   const handleDragEnd = useCallback(
@@ -2528,7 +2544,7 @@ function ConversationList({
       if (!dragged) return;
       const gridTarget = event.over?.data.current as GridDropTarget | undefined;
       if (gridTarget?.type === "session-grid") {
-        grids?.split(gridTarget.targetId, dragged.id, gridTarget.edge);
+        if (dragged.canGrid) grids?.split(gridTarget.targetId, dragged.id, gridTarget.edge);
         return;
       }
       if (event.over?.data.current?.type === "session-order") {
@@ -2615,22 +2631,6 @@ function ConversationList({
       return [];
     });
   }, []);
-
-  // The projects-scope selection pool: the folders' own rendered rows (the
-  // authoritative, possibly-out-of-window set) unioned with the global-derived
-  // membership as a fallback for folders that haven't reported yet. Deduped by
-  // id. This backs the bulk-action bar, the shift-select range, and the
-  // stranding guard so all three agree on what's selectable.
-  const projectSessionPool = useMemo(() => {
-    const byId = new Map<string, Conversation>();
-    for (const group of sections.projectGroups) {
-      for (const c of group.conversations) byId.set(c.id, c);
-    }
-    for (const { conversations } of folderConversations.values()) {
-      for (const c of conversations) byId.set(c.id, c);
-    }
-    return [...byId.values()];
-  }, [sections.projectGroups, folderConversations]);
 
   // The bulk-action bar lives under the header of the section it targets, so it
   // unmounts when that section empties (e.g. every selected session
@@ -2910,9 +2910,9 @@ function ConversationList({
                     target.id !== args.active.id &&
                     sessionOrderGroups.get(target.id) === orderGroup
                   );
-                return (
-                  args.active.data.current?.canManage !== false || target?.type === "session-grid"
-                );
+                return target?.type === "session-grid"
+                  ? args.active.data.current?.canGrid !== false
+                  : args.active.data.current?.canManage !== false;
               }),
             });
             const row = collisions.find(
@@ -2955,7 +2955,7 @@ function ConversationList({
           setOverProject(null);
         }}
       >
-        {activeDrag && <GridDropTargets sessionId={activeDrag.id} />}
+        {activeDrag?.canGrid && <GridDropTargets sessionId={activeDrag.id} />}
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <PinSavingContext.Provider value={pinWriting}>
             <div
@@ -5162,6 +5162,7 @@ function ConversationRowImpl({
       project: currentProject,
       isPinned,
       canManage: isOwner && !isArchived,
+      canGrid: !isArchived,
     },
     disabled:
       (!isOwner && !gridsEnabled && !orderGroup) ||

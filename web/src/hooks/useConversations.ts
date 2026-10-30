@@ -58,6 +58,7 @@ import {
 } from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
+import { removeSidebarCustomOrderIds } from "@/lib/sidebarViewPreferences";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
@@ -1179,6 +1180,7 @@ function restoreDeletedConversations(
  * @param ids - Conversation ids the server confirmed deleted.
  */
 function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly string[]): void {
+  removeSidebarCustomOrderIds(ids);
   for (const id of ids) {
     queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
     queryClient.removeQueries({ queryKey: ["session", id] });

@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
+  removeSidebarCustomOrderIds,
   sidebarBaseOrdering,
+  subscribeSidebarViewPreferences,
   writeSidebarViewPreferences,
 } from "./sidebarViewPreferences";
 
@@ -72,6 +74,17 @@ describe("sidebarViewPreferences", () => {
     expect(sidebarBaseOrdering(view)).toBe("created");
     writeSidebarViewPreferences(view);
     expect(readSidebarViewPreferences()).toEqual(view);
+    const changed = vi.fn();
+    const unsubscribe = subscribeSidebarViewPreferences(changed);
+    removeSidebarCustomOrderIds(["missing"]);
+    expect(changed).not.toHaveBeenCalled();
+    removeSidebarCustomOrderIds(["b"]);
+    expect(readSidebarViewPreferences().customOrder?.ids).toEqual(["a"]);
+    expect(changed).toHaveBeenCalledExactlyOnceWith(readSidebarViewPreferences());
+    unsubscribe();
+    removeSidebarCustomOrderIds(["a"]);
+    expect(readSidebarViewPreferences().customOrder?.ids).toEqual([]);
+    expect(changed).toHaveBeenCalledOnce();
   });
 
   it.each([null, {}, { ids: [], startedAt: "bad" }, { ids: [], startedAt: -1 }])(

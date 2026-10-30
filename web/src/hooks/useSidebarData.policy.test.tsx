@@ -12,6 +12,10 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  readSidebarViewPreferences,
+  removeSidebarCustomOrderIds,
+} from "@/lib/sidebarViewPreferences";
 import { sessionRowsPage, type ScopeCacheData } from "@/lib/sidebarData";
 import type { Session } from "@/lib/types";
 import type * as IdentityModule from "@/lib/identity";
@@ -651,7 +655,10 @@ it.each(["created", "updated"] as const)(
     act(() =>
       result.current.updateView({ customOrder: { ...customOrder, ids: ["mine", "mine-older"] } }),
     );
+    act(() => removeSidebarCustomOrderIds(["mine-older"]));
+    expect(result.current.view.customOrder?.ids).toEqual(["mine"]);
     act(() => result.current.updateView({ ordering: baseOrdering }));
+    expect(readSidebarViewPreferences().customOrder?.ids).toEqual(["mine"]);
     expect(result.current.mine.data).toBe(data);
     expect(fetchMock).not.toHaveBeenCalled();
   },

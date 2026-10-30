@@ -40,6 +40,15 @@ export const DEFAULT_SIDEBAR_VIEW: SidebarViewPreferences = {
   show: [],
 };
 
+const listeners = new Set<(view: SidebarViewPreferences) => void>();
+
+export function subscribeSidebarViewPreferences(listener: (view: SidebarViewPreferences) => void) {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
 function pick<T extends string>(allowed: readonly T[], value: unknown, fallback: T): T {
   return allowed.includes(value as T) ? (value as T) : fallback;
 }
@@ -96,5 +105,17 @@ export function writeSidebarViewPreferences(value: SidebarViewPreferences): void
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
   } catch {
     // A local view preference; losing it is harmless.
+  }
+  for (const listener of listeners) listener(value);
+}
+
+/** Forget confirmed deletions or lost access, never merely unloaded sessions. */
+export function removeSidebarCustomOrderIds(removedIds: readonly string[]): void {
+  const view = readSidebarViewPreferences();
+  if (!view.customOrder || removedIds.length === 0) return;
+  const removed = new Set(removedIds);
+  const ids = view.customOrder.ids.filter((id) => !removed.has(id));
+  if (ids.length !== view.customOrder.ids.length) {
+    writeSidebarViewPreferences({ ...view, customOrder: { ...view.customOrder, ids } });
   }
 }

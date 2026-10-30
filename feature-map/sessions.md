@@ -166,12 +166,16 @@ the header menu), and each place is a separate entry point.
   preference. Custom starts from the current order and keeps
   existing sessions fixed as updates arrive, with new sessions at the top and
   older sessions added by Load more at the bottom. It retains Created/Updated
-  for fetching pages. Choosing an automatic order preserves the saved Custom
+  for fetching pages. Equal timestamps do not lift history above the saved order.
+  Deleting a session removes its saved position; paging or collapsing folders preserves it.
+  Choosing an automatic order preserves the saved Custom
   order for later. Drag within a group, or use a row's Move up/down menu actions,
   to switch to Custom. Hover marks valid reorder targets with a faint brand-colored
   dashed border; dropping commits the move.
   Cancelled, outside, self, and cross-group drops do not change the order.
-  Pinned keeps its own ordering. Shared sessions support personal ordering too
+  Pinned keeps its own ordering. Archived project members can be reordered even
+  before the global list reaches them; archived sessions cannot be dropped into grids.
+  Shared sessions support personal ordering too
   and get their own section above Sessions. Status groups are Needs attention, Unread,
   Working, Draft, and Done. Working stays visible with muted “No sessions” text
   when empty. Starting or running sessions enter Working immediately; idle must
@@ -1023,8 +1027,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`,
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_custom_order_commits_on_drop_and_survives_grouping_and_reload`
-  (enable the flag by patching `GET /v1/info`). Unit tests in
+  (enable the flag by patching `GET /v1/info`).
+  `tests/browser_ui/test_sessions_appearance.py::test_custom_order_commits_on_drop_and_survives_grouping_and_reload`
+  uses the built SPA with mocked backend contracts to check real pointer drops,
+  the faint 2px dashed outline, grouping, and reload persistence. Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
 - **`project-show-more`:** no browser test drives it. Component tests in

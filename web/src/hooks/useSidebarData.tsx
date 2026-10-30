@@ -14,6 +14,7 @@ import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
   sidebarBaseOrdering,
+  subscribeSidebarViewPreferences,
   writeSidebarViewPreferences,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
@@ -48,6 +49,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
   const serverInfo = useServerInfo();
   const [storedView, setView] = useState(readSidebarViewPreferences);
+  useLayoutEffect(() => subscribeSidebarViewPreferences(setView), []);
   const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
     ? storedView
     : DEFAULT_SIDEBAR_VIEW;
@@ -72,7 +74,6 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         }
         void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
       }
-      setView(next);
     },
     [storedView, client],
   );
