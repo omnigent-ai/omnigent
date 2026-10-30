@@ -1,8 +1,8 @@
 """Composer menus over a long transcript must not let its text ghost through in dark mode.
 
-Built-in dark palettes make ``bg-popover`` translucent, so the ``/`` and ``@`` menus need a
-backdrop blur; light mode (opaque popover) is the control. The leak is the share of panel
-pixels that change when the transcript text behind the panel is hidden.
+Dark menu surfaces may be opaque or combine translucency with backdrop blur. Light mode is
+the opaque control. The leak is the share of panel pixels that change when the transcript
+text behind the panel is hidden.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ _MENUS = {
     "slash": ("/", "slash-command-menu", "[data-testid^='slash-menu-item-']"),
     "mention": ("@", "file-mention-menu", "[data-testid^='file-mention-item-']"),
 }
-# Transcript glyphs leaking through an 80 %-opaque panel differ from the panel fill by
+# Transcript glyphs leaking through a translucent panel differ from the panel fill by
 # ~40 grey levels and cover ~5 % of the panel; a blurred or opaque panel leaves ~0 %.
 _LEAK_LEVELS = 8
 _MAX_LEAK_FRACTION = 0.005
@@ -102,8 +102,11 @@ def _set_panel_backdrop_filter(panel: Locator, value: str | None) -> None:
 
 
 def _background_alpha(color: str) -> float:
-    """Alpha channel of a computed ``rgb()``/``rgba()`` color; opaque colors return 1.0."""
+    """Alpha channel of a computed CSS color; opaque colors return 1.0."""
     inside = color[color.index("(") + 1 : color.index(")")]
+    if "/" in inside:
+        alpha = inside.rsplit("/", 1)[1].strip()
+        return float(alpha.removesuffix("%")) / 100 if alpha.endswith("%") else float(alpha)
     channels = [part.strip() for part in inside.split(",")]
     return float(channels[3]) if len(channels) == 4 else 1.0
 
@@ -158,7 +161,7 @@ def _measure_transcript_leak(page: Page, panel: Locator, label: str) -> dict[str
 def test_composer_menu_hides_the_transcript_in_dark_mode(
     page: Page, chat_session_contract: ChatSessionContract, menu: str
 ) -> None:
-    """Light mode is the opaque control; dark mode must blur the reply behind the open menu."""
+    """Light mode is the opaque control; dark mode must hide the reply behind the menu."""
     chat = chat_session_contract
     # Native coding-agent harnesses enable "@" mentions; the slash menu is harness-agnostic.
     chat.harness = "claude-native"
@@ -188,15 +191,13 @@ def test_composer_menu_hides_the_transcript_in_dark_mode(
         f"transcript text shows through the {menu} menu: {dark}"
     )
 
-    # Negative control: the same panel without its blur must expose the ghosting, proving
-    # the measurement can detect transcript text behind the menu. This needs a translucent
-    # dark popover, so check that first — an opaque theme would make the control moot.
-    assert _background_alpha(dark["panel_style"]["backgroundColor"]) < 1, (
-        f"dark popover is opaque, so the blur negative control is moot: {dark}"
-    )
-    _set_panel_backdrop_filter(panel, "none")
-    unblurred = _measure_transcript_leak(page, panel, f"dark-{menu}-unblurred")
-    _set_panel_backdrop_filter(panel, None)
-    assert unblurred["leak_fraction"] > _MAX_LEAK_FRACTION, (
-        f"the leak measurement cannot detect ghosting: {unblurred}"
-    )
+    # For a translucent surface, removing blur must expose ghosting and proves the
+    # measurement can detect transcript text. Opaque palette-composed surfaces need no
+    # negative control because the transcript cannot affect their pixels.
+    if _background_alpha(dark["panel_style"]["backgroundColor"]) < 1:
+        _set_panel_backdrop_filter(panel, "none")
+        unblurred = _measure_transcript_leak(page, panel, f"dark-{menu}-unblurred")
+        _set_panel_backdrop_filter(panel, None)
+        assert unblurred["leak_fraction"] > _MAX_LEAK_FRACTION, (
+            f"the leak measurement cannot detect ghosting: {unblurred}"
+        )

@@ -181,13 +181,15 @@ def isolated_local_server(
     env: Mapping[str, str | None] | None = None,
     base_env: Mapping[str, str] | None = None,
     extra_args: Sequence[str] = (),
-    cwd: Path | None = None,
+    cwd: Path | str | None = None,
+    executable: str = sys.executable,
 ) -> Iterator[str]:
     """Run this checkout's server; yield its URL and retain server.log.
 
     Supply a bootstrap only when the scenario needs a fault installed before
     the CLI starts. Defaults to single-user header auth; env can override or
     remove defaults (None removes a key). Extra CLI args configure agents, etc.
+    ``executable`` lets a compatibility run use its pinned server interpreter.
     HOME and data belong to this server. Existing profile/compatibility tests should use
     :func:`start_live_server` instead.
     """
@@ -200,7 +202,7 @@ def isolated_local_server(
     with log_path.open("w") as log:
         proc = subprocess.Popen(
             [
-                sys.executable,
+                executable,
                 "-c",
                 bootstrap,
                 "server",

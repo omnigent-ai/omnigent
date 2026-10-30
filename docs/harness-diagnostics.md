@@ -203,6 +203,11 @@ classes. `native_launch_os_errno`, `native_launch_os_errno_name`, and
 chain. Missing fields mean unavailable evidence. These fields contain no raw
 exception messages, paths, arguments, or pane output.
 
+`native_launch_code_origin` identifies the last available Omnigent module,
+function, and line in the exception traceback, falling back to the available
+leaf when no framework frame exists. It names the launch operation without
+exporting its filesystem path; an exception without a traceback omits it.
+
 Older runners can omit the context; malformed and unknown fields are ignored.
 The context does not change error codes, display text, status handling, or
 retry policy, and does not add failure records.
@@ -317,6 +322,11 @@ For example, a Claude `StopFailure` containing `error=server_error` and
 evidence of the cause. If the server fills in absent detail from stored assistant
 output, it records `detail_source=assistant_output_fallback`; if it finds no
 output, it records `detail_source=missing`.
+
+If Claude hook evidence collection raises, the failed status still carries the
+hook identity, category when present, and runner version. Its
+`failure_context_error_phase` and `failure_context_error_type` describe the
+diagnostic failure, not the native turn's cause; no exception text is added.
 
 | Attributes | Source and meaning |
 | --- | --- |
@@ -497,6 +507,21 @@ input correlation IDs when available. It contains no file paths, state bytes,
 startup-error text, or user input. Error wording, wait budgets, and undelivered
 input handling are unchanged.
 
+## Harness IPC directory recovery
+
+The process manager recreates its private temporary root and per-instance
+directory before spawning a harness, including when replacing a live harness
+whose socket pathname disappeared. It restores the current process's
+namespace-qualified `AP_PID` owner claim so orphan cleanup recognizes the
+directory as live. Recreated directories use mode `0700`; bound sockets use
+`0600`. This recovery also runs with diagnostic capture disabled.
+
+A missing socket parent otherwise causes uvicorn's `create_unix_server` to
+raise `FileNotFoundError`, followed by an exited-during-spawn error in the
+runner. Continued deletion during startup, permission errors and filesystem
+failures can still prevent binding; retain the harness traceback to distinguish
+these cases.
+
 ## Verification
 
 ```sh
@@ -569,3 +594,18 @@ the process and reader states with its tail. With the flag unset or `0`, confirm
 `stderr_reader_state = 'failed'` and `stderr_reader_error_type = 'ValueError'`
 distinguishes a failed drain from a live reader with an otherwise stalled
 startup. Use the return code and adjacent lifecycle events to interpret it.
+
+
+For failed status events, `session_turn_failed` also records the incoming error,
+code, message, output, detail, context, and response-ID field availability under
+`failure_wire_*`. These observations precede server detail enrichment and contain
+no event text. Existing normalized native hook metadata remains on the same row.
+`active_response_id_at_failure` names the server's cached response when available;
+it is an observation, not proof that a bare status belongs to that response.
+
+`failure_connection_source=relay_stream` identifies the connection retained by
+the stream response, with its advertised version, connection ID, and generation.
+A replacement tunnel does not change that snapshot. For external status posts,
+`bound_runner_at_intake` describes the currently bound local runner and does not
+claim it sent the event. An absent local connection is explicitly unavailable;
+it may be owned by another server replica. No version is inferred from the server.
