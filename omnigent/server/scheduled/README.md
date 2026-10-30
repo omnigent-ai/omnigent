@@ -412,6 +412,8 @@ it leaves out use the defaults:
 | `on_expired(run)` | Inspects an interrupted startup, keeps delivered work, and cleans up abandoned resources. | The built-in executor |
 | `owned_hosts(keys)` | Returns the host keys this replica owns, so it only starts or recovers that work. | Every key |
 | `fire_identity(task)` | An async context manager the built-in executor enters to act as the task's owner, for example by assuming a stored delegation. | None |
+| `dispatch_enabled()` | Whether this replica may dispatch. Checked at the start of each poll and before Run now starts a run here. See [Pausing dispatch](#pausing-dispatch). | Always on |
+| `poll_interval()` | Seconds to wait before the next poll, read before each wait. Overrides `poll_seconds` without a restart. | `poll_seconds` |
 
 Replace `on_fire` and `on_expired` together or not at all. `fire_identity` only
 works with the built-in executor; a replacement executor acts as the owner itself.
@@ -440,6 +442,27 @@ same mode.
   over.
 - Polling waits for `owned_hosts`, so it must return quickly and respect
   cancellation.
+
+### Pausing dispatch
+
+When `dispatch_enabled()` returns false, a poll does nothing: it reads no tasks,
+claims nothing and starts no recovery pass. Run now records the request but
+leaves it pending. The loop keeps waking at the poll interval and resumes on the
+first poll after the check returns true again.
+
+- Tasks, runs and pending requests are kept. Startups already in progress keep
+  renewing their leases and finish; a run left `starting` is recovered once
+  dispatch resumes.
+- When dispatch resumes, an overdue task runs once and then moves to its next
+  future time, as after downtime. Pending Run now requests start on that poll or a
+  later one.
+- A check that raises is logged and counts as on, so a failing flag lookup does
+  not stop every automation.
+- The routes stay available. To hide them too, also turn off
+  [the automations gate](#turning-automations-off-for-some-callers).
+
+A `poll_interval()` that raises, or returns a value that is not a positive
+finite number, is logged and the scheduler waits `poll_seconds` instead.
 
 ### Writing an executor
 
@@ -499,7 +522,8 @@ scheduled_task_scheduler:
   file named by `OMNIGENT_CONFIG`. A wrapper can also pass
   `scheduled_task_scheduler_config=ScheduledTaskSchedulerConfig(...)` to replace
   the YAML settings.
-- Settings are read at startup. Values must be positive and finite, lease seconds
+- Settings are read at startup; the `poll_interval` hook can change the poll
+  interval while running. Values must be positive and finite, lease seconds
   and capacities must be whole numbers, and `renewal_seconds` must be less than
   `lease_seconds`.
 - With the flag on, an invalid setting stops the server from starting. With the

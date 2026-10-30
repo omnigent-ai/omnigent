@@ -120,6 +120,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_ENV_FILE": claude_native.claude_tool_env_file(),
     }
     assert spec["os_env_type"] == "caller_process"
     # Claude Code emits long interactive transcripts; this value is
@@ -267,6 +268,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_ENV_FILE": claude_native.claude_tool_env_file(),
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     args = spec["args"]
@@ -12318,6 +12320,83 @@ def test_managed_gateway_endpoint_takes_precedence(
     assert claude_native._ambient_env_is_non_anthropic_gateway() is is_gateway
     monkeypatch.delenv("ANTHROPIC_BASE_URL")
     assert claude_native.claude_catalog_fingerprint(None) == fingerprint
+
+
+@pytest.mark.parametrize(
+    ("managed", "user", "process", "effective", "leaves_login"),
+    [
+        pytest.param(
+            {"CLAUDE_CODE_USE_BEDROCK": "0"},
+            {"CLAUDE_CODE_USE_BEDROCK": "1"},
+            {},
+            {"CLAUDE_CODE_USE_BEDROCK": "0"},
+            False,
+            id="managed-off-over-user-on",
+        ),
+        pytest.param(
+            {},
+            {"CLAUDE_CODE_USE_VERTEX": "1"},
+            {"CLAUDE_CODE_USE_VERTEX": "0"},
+            {"CLAUDE_CODE_USE_VERTEX": "1"},
+            True,
+            id="user-on-over-process-off",
+        ),
+        pytest.param(
+            {},
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            {"ANTHROPIC_BASE_URL": "https://gateway.example"},
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            False,
+            id="user-anthropic-over-process-gateway",
+        ),
+        pytest.param(
+            {"ANTHROPIC_BASE_URL": "https://gateway.example"},
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            {},
+            {"ANTHROPIC_BASE_URL": "https://gateway.example"},
+            True,
+            id="managed-gateway-over-user-anthropic",
+        ),
+        pytest.param(
+            {},
+            {},
+            {"CLAUDE_CODE_USE_FOUNDRY": "on"},
+            {"CLAUDE_CODE_USE_FOUNDRY": "on"},
+            True,
+            id="process-foundry-on",
+        ),
+    ],
+)
+def test_ambient_transport_takes_managed_then_user_then_process_values(
+    managed: dict[str, str],
+    user: dict[str, str],
+    process: dict[str, str],
+    effective: dict[str, str],
+    leaves_login: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each transport setting comes from managed settings, else user settings, else the env."""
+    for name in (
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(json.dumps({"env": managed}))
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    (tmp_path / "claude-config").mkdir()
+    (tmp_path / "claude-config" / "settings.json").write_text(json.dumps({"env": user}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    for name, value in process.items():
+        monkeypatch.setenv(name, value)
+
+    transport = claude_native.claude_ambient_transport()
+
+    assert dict(transport.env) == effective
+    assert transport.leaves_login() is leaves_login
 
 
 def test_catalog_fingerprint_changes_with_managed_gateway(

@@ -59,11 +59,14 @@ be able to write resources without a separate Omnigent account.
   with the user's config, runs `omnigent login` there with the sign-in callback
   port forwarded to the laptop, then starts `omnigent host --background`.
   States: consent, trusting a new host key, a key passphrase or password,
-  installing omnigent when it is missing, finishing in the browser, connected
-  (the new host selected), already connected, closing the window mid sign-in
-  (nothing left running on the machine), and failures, shown only in the app's
-  own window. Hidden where **Run on Arca** is offered (the Databricks-internal
-  flag on a Databricks-managed server).
+  installing omnigent when it is missing, finishing in the browser (with a
+  confirmation code on OIDC servers), connected (the new host selected),
+  already connected, connected but the new host unconfirmed (the dialog stays
+  open to pick it from the host list), closing the window mid sign-in (nothing
+  left running on the machine), a sign-in link the machine shouldn't print
+  (refused, no browser), and failures, shown only in the app's own window.
+  Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
+  Databricks-managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -99,9 +102,13 @@ be able to write resources without a separate Omnigent account.
 **CLI sign-in:** `omnigent login <server-url>`.
 
 **Host:** `omnigent host <server-url>` (or `--server`), `omnigent host ""` for a
-local server, `--background`, `--no-open`, `--non-interactive`, and the
+local server, `--background`, `--no-open`, `--open-in-desktop` (or
+`OMNIGENT_HOST_OPEN_IN_DESKTOP=1`), `--non-interactive`, and the
 management commands `status`, `stop`, `stop-session`, `reset-id`, `enable`,
-and `disable`.
+and `disable`. With `--open-in-desktop`, a supported desktop app accepts
+the request before navigating or asking for consent. If it cannot accept within
+five seconds, the browser opens instead. URLs with base paths or selectors keep
+their original destination in the browser. `--no-open` suppresses both.
 
 **Web:** a harness that needs sign-in is marked in the harness picker, and a
 session whose host went offline offers reconnect (see [sessions](./sessions.md)).

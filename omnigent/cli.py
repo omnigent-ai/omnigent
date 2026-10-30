@@ -5287,6 +5287,13 @@ def server_status(json_output: bool) -> None:
     help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
 )
 @click.option(
+    "--open-in-desktop",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_OPEN_IN_DESKTOP",
+    show_envvar=True,
+    help="Open the host web UI in the Omnigent desktop app instead of a browser.",
+)
+@click.option(
     "--non-interactive",
     "non_interactive",
     is_flag=True,
@@ -5297,7 +5304,7 @@ def server_status(json_output: bool) -> None:
         "launching the browser login flow. Use this in scripts and CI."
     ),
 )
-def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
+def start(server: str | None, no_open: bool, open_in_desktop: bool, non_interactive: bool) -> None:
     """Start Omnigent on this machine, in the background.
 
     The on switch, and the counterpart of ``omnigent stop``: brings up the
@@ -5314,6 +5321,8 @@ def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
         ``"https://example.databricksapps.com"``. ``None`` falls back to
         config; empty string forces local mode.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :param non_interactive: When ``True``, never launch the browser login for
         an un-authed remote server — fail with the ``omnigent login`` hint
         instead.
@@ -5324,6 +5333,7 @@ def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
         stop_command=f"{cli_invocation()} stop",
         non_interactive=non_interactive,
         no_open=no_open,
+        open_in_desktop=open_in_desktop,
     )
 
 
@@ -9534,6 +9544,7 @@ def _maybe_open_host_web_ui(
     *,
     non_interactive: bool,
     no_open: bool,
+    open_in_desktop: bool,
     cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
 ) -> None:
     """Open the host web UI when interactive and enabled."""
@@ -9555,7 +9566,7 @@ def _maybe_open_host_web_ui(
     if base_path:
         web_url = web_url.rstrip("/") + base_path
     try:
-        opened = open_conversation_url(web_url)
+        opened = open_conversation_url(web_url, desktop=open_in_desktop)
     except OSError:
         opened = False
     if not opened:
@@ -9568,6 +9579,7 @@ def _run_background_host(
     stop_command: str,
     non_interactive: bool,
     no_open: bool,
+    open_in_desktop: bool,
 ) -> None:
     """Spawn (or reuse) the detached host daemon and report it.
 
@@ -9590,6 +9602,8 @@ def _run_background_host(
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :raises click.ClickException: If the daemon cannot be spawned, exits
         immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
@@ -9659,7 +9673,12 @@ def _run_background_host(
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
-    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive, no_open=no_open)
+    _maybe_open_host_web_ui(
+        server_url,
+        non_interactive=non_interactive,
+        no_open=no_open,
+        open_in_desktop=open_in_desktop,
+    )
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -9701,6 +9720,13 @@ def _host_stop_command(explicit_server: str | None) -> str:
     help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
 )
 @click.option(
+    "--open-in-desktop",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_OPEN_IN_DESKTOP",
+    show_envvar=True,
+    help="Open the host web UI in the Omnigent desktop app instead of a browser.",
+)
+@click.option(
     "--background",
     "background",
     is_flag=True,
@@ -9729,6 +9755,7 @@ def host(
     server: str | None,
     background: bool,
     no_open: bool,
+    open_in_desktop: bool,
     non_interactive: bool,
 ) -> None:
     """
@@ -9741,6 +9768,7 @@ def host(
       omnigent host ""   # spawn + connect to a local server
       omnigent host --background   # spawn detached, return immediately
       omnigent host --no-open   # connect without opening the web UI
+      omnigent host --open-in-desktop   # open the web UI in the desktop app
       omnigent host enable   # install and start a per-user system service
       omnigent host disable  # stop and remove the per-user system service
 
@@ -9764,6 +9792,8 @@ def host(
     :param background: When ``True``, spawn the daemon detached and return
         instead of running the daemon loop in the foreground.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :param non_interactive: When ``True``, never launch the browser login
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
@@ -9792,6 +9822,7 @@ def host(
             stop_command=_host_stop_command(explicit_server),
             non_interactive=non_interactive,
             no_open=no_open,
+            open_in_desktop=open_in_desktop,
         )
         return
 
@@ -9841,7 +9872,13 @@ def host(
             if sibling is not None:
                 _raise_live_daemon_conflict(record, sibling)
             workspace_lock = _claim_foreground_workspace(record, server, workspace_id=workspace_id)
-        _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
+        _maybe_open_host_web_ui(
+            server,
+            non_interactive=non_interactive,
+            no_open=no_open,
+            open_in_desktop=open_in_desktop,
+            cfg=cfg,
+        )
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:

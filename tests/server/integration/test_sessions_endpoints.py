@@ -13084,6 +13084,44 @@ async def test_native_message_to_hostless_gone_runner_is_refused(
     assert snap["status"] == "idle"
 
 
+async def test_native_message_to_side_chat_of_hostless_gone_source_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A side chat whose host-less source runner is gone is refused like its source.
+
+    The side chat runs on its source's local-terminal runner, so recovery
+    through the source can't bring it back. The refusal names the source's
+    resume command and records nothing, so the client keeps the message.
+    """
+    agent = await create_test_agent(client)
+    labels = {"omnigent.wrapper": "claude-code-native-ui"}
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = (await _create_session(client, agent["id"], labels=labels))["id"]
+    side_chat_labels = {
+        **labels,
+        "omnigent.side_chat": "1",
+        "omnigent.side_chat.source_id": source_id,
+    }
+    assert store.set_runner_id(source_id, "runner_local_terminal")
+    sid = store.create_conversation(
+        agent_id=agent["id"], runner_id="runner_local_terminal", labels=side_chat_labels
+    ).id
+
+    resp = await _post_native_message(client, sid)
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "side chat" in error["message"]
+    assert f"claude --resume {source_id}" in error["message"]
+
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    assert not [i for i in items if i["type"] in {"message", "error"}], items
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] == "idle"
+
+
 @pytest.mark.parametrize("case", ["side_chat", "sub_agent", "exit_report"])
 async def test_native_message_to_gone_runner_still_persisted_when_recoverable(
     client: httpx.AsyncClient,

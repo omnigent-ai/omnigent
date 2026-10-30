@@ -85,6 +85,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
 from omnigent.harnesses.diagnostics import (
     SIGN_IN_RESEND_STEP,
     detect_sign_in_prompt,
+    launcher_install_prompt,
     launcher_password_prompt,
     sign_in_next_step,
     sign_in_running_elsewhere,
@@ -246,6 +247,9 @@ _TMUX_FILE = "tmux.json"
 # Written into the pane's private dir just before Omnigent kills the pane, so the
 # runner reads the exit as Omnigent's own close rather than the terminal dying.
 _EXPECTED_CLOSE_FILE = "expected_close"
+# Written there before every Omnigent kill (stop, reap), so an exit without it
+# that tmux reports as a killed session came from outside Omnigent.
+_OMNIGENT_KILL_FILE = "omnigent_kill"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -320,6 +324,9 @@ _TITLED_RULE_EDGE_GLYPHS = "".join(
 # Narrowest a labelled rule may be: the composer's rule spans the pane, so a
 # short run of glyphs around a word is decoration, not the box.
 _MIN_TITLED_RULE_WIDTH = 20
+# Glyphs Claude Code pads a row-filling label with: it keeps a label that is
+# within two columns of the row and fills only the remainder.
+_OVERFLOWED_LABEL_MAX_TRAIL = 2
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
@@ -4835,8 +4842,11 @@ def kill_session(
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    marker = Path(info["socket_path"]).parent / _EXPECTED_CLOSE_FILE
+    private_dir = Path(info["socket_path"]).parent
+    markers = [private_dir / _OMNIGENT_KILL_FILE]
     if expected_close:
+        markers.append(private_dir / _EXPECTED_CLOSE_FILE)
+    for marker in markers:
         with contextlib.suppress(OSError):
             marker.touch()
     try:
@@ -4848,7 +4858,7 @@ def kill_session(
             allow_missing_target=True,
         )
     except RuntimeError:
-        if expected_close:
+        for marker in markers:
             marker.unlink(missing_ok=True)
         raise
 
@@ -4863,6 +4873,18 @@ def pane_closed_by_omnigent(private_dir: Path) -> bool:
         close and the kill did not fail.
     """
     return (private_dir / _EXPECTED_CLOSE_FILE).exists()
+
+
+def pane_killed_by_omnigent(private_dir: Path) -> bool:
+    """
+    Return whether Omnigent itself killed the Claude pane in *private_dir*.
+
+    :param private_dir: The terminal instance's private dir, which holds its
+        tmux socket, e.g. ``/tmp/omnigent-terminal-abc/``.
+    :returns: ``True`` when :func:`kill_session` ran for this pane (a stop or a
+        reap) and the kill did not fail.
+    """
+    return (private_dir / _OMNIGENT_KILL_FILE).exists()
 
 
 @_serialize_bridge_injection
@@ -5897,7 +5919,9 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     return _ClaudePaneState(None)
 
 
-def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
+def _request_claude_repaint(
+    socket_path: str, tmux_target: str, bridge_dir: Path | None = None
+) -> int:
     """
     Ask Claude Code to redraw its whole screen.
 
@@ -5911,9 +5935,15 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     without a handler ignores it, so the whole tree under the pane gets it: a
     launcher may run Claude Code as its child.
 
+    A launcher may also run Claude Code outside that tree: isaac's fast launch
+    pumps the pane to a pre-started worker's terminal. Claude Code's session
+    registry still names its process, so that process gets the signal too.
+
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge directory whose Claude session the registry
+        is searched for, or ``None`` to signal only the pane's tree.
     :returns: How many processes were signalled; ``0`` when the pane's
         process could not be found.
     """
@@ -5921,6 +5951,8 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     import subprocess
 
     import psutil
+
+    from omnigent.harnesses.claude_native.status_file import session_pids
 
     if IS_WINDOWS:
         return 0
@@ -5943,6 +5975,13 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
         tree = [root, *root.children(recursive=True)]
     except psutil.Error:
         return 0
+    claude_session_id = read_claude_session_id(bridge_dir) if bridge_dir is not None else None
+    if claude_session_id is not None:
+        in_tree = {process.pid for process in tree}
+        for pid in session_pids(claude_session_id):
+            if pid not in in_tree:
+                with contextlib.suppress(psutil.Error):
+                    tree.append(psutil.Process(pid))
     signalled = 0
     for process in tree:
         with contextlib.suppress(psutil.Error):
@@ -6465,11 +6504,16 @@ def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
     The last two rules can be a frame edge and a draft line; the less-indented
     rule identifies the frame in both a complete and a clipped input box.
     """
-    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    starts: dict[int, int] = {}
+    for idx, line in enumerate(lines):
+        start = _box_rule_start(line)
+        if start is not None:
+            starts[idx] = start
+    rules = list(starts)
     if len(rules) < 2:
         return rules
-    frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
-    rules = [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
+    frame_indent = min(starts[idx] for idx in rules[-2:])
+    rules = [idx for idx in rules if starts[idx] == frame_indent]
     last_prompt = next((line for line in lines[rules[-1] + 1 :] if line.strip()), "")
     if (
         last_prompt.strip()[:1] in _COMPOSER_MODE_GLYPHS
@@ -6565,6 +6609,12 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     capture is likewise retried without sending clearing keys, then refused
     if no readable box appears within the budget.
 
+    Before refusing, Claude Code is asked to repaint once
+    (:func:`_request_claude_repaint`) and the rounds start over. Output
+    another process printed over the box, such as a launcher's log line, is
+    not part of the draft, so no key deletes it; after the repaint the
+    capture shows the real input box.
+
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
@@ -6574,12 +6624,19 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
-    for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
+    repainted = False
+    round_no = 0
+    while True:
         pane = _capture_pane(socket_path, tmux_target)
         box = _composer_box(pane)
         # Blank rows after the glyph row hold nothing a paste could join.
         settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            if not repainted and _request_claude_repaint(socket_path, tmux_target):
+                repainted, round_no = True, 0
+                delivery_diagnostics.record_details(composer_repaint_requested=True)
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                continue
             delivery_diagnostics.record_composer_not_cleared(
                 pane=pane,
                 rows=None if box is None else box.rows,
@@ -6594,6 +6651,7 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
             _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
             if settled:
                 return
+        round_no += 1
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
@@ -6671,6 +6729,16 @@ def _is_box_rule(line: str) -> bool:
     """
     Return whether a line is a TUI box-drawing horizontal rule.
 
+    :param line: A single pane line, e.g. ``"──────────"``.
+    :returns: ``True`` when :func:`_box_rule_start` places a rule on it.
+    """
+    return _box_rule_start(line) is not None
+
+
+def _box_rule_start(line: str) -> int | None:
+    """
+    Return the column a TUI box-drawing horizontal rule starts at, or ``None``.
+
     Claude Code frames the input box with a row of ``─``
     (:data:`_BOX_RULE_CHARS`), with or without corner glyphs depending on
     the version. Both spellings count: :func:`_composer_row` anchors on
@@ -6697,23 +6765,38 @@ def _is_box_rule(line: str) -> bool:
     glyph once the title nears the pane width, and the pane is only as wide
     as the person's browser terminal.
 
+    A title too long for the row leaves no leading run at all: Claude Code
+    truncates it with ``…`` and draws the padded label from the first
+    column, followed by at most :data:`_OVERFLOWED_LABEL_MAX_TRAIL` glyphs
+    (``" my long session title… ─"``). That label's single leading space is
+    its padding, so the rule starts at column 0 like the closing rule
+    below it, whereas a draft or transcript row is indented further.
+
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
-    :returns: ``True`` when the line is a box-drawing rule.
+    :returns: The rule's first column, e.g. ``0``, or ``None`` when the
+        line is not a box-drawing rule.
     """
     stripped = line.strip()
     if len(stripped) < 3:
-        return False
+        return None
+    start = len(line) - len(line.lstrip())
     if all(ch in _BOX_RULE_CHARS for ch in stripped):
-        return True
+        return start
     lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
     trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
-    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
-        return False
+    if trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
+        return None
     label = stripped[lead : len(stripped) - trail]
+    if lead < 1:
+        if start != 1 or trail > _OVERFLOWED_LABEL_MAX_TRAIL:
+            return None
+        label, start = f" {label}", 0
     if any(ch in _BOX_RULE_CHARS for ch in label):
-        return False
-    return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
+        return None
+    if label.startswith(" ") and label.endswith(" ") and label.strip():
+        return start
+    return None
 
 
 def _submit_needle(content: str) -> str:
@@ -6931,8 +7014,8 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
-        A launcher password prompt (see :func:`launcher_password_prompt`) on
-        two consecutive polls is reported the same way.
+        A launcher password or installation prompt on two consecutive polls
+        is reported the same way.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -6971,6 +7054,7 @@ def _wait_for_claude_prompt_ready(
     sign_in_url: str | None = None
     waited_on_sign_in = False
     waited_on_password = False
+    waited_on_install = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -7035,6 +7119,15 @@ def _wait_for_claude_prompt_ready(
                 "then resend your message." + _format_terminal_failure_tail(pane)
             )
         waited_on_password = at_password_prompt
+        at_install_prompt = launcher_install_prompt(pane)
+        if at_install_prompt and waited_on_install:
+            raise ClaudeTerminalDialog(
+                "Claude Code's launch command is waiting for installation confirmation "
+                "in its terminal, so the message was not delivered. Open the terminal, "
+                "answer the install prompt, then resend your message."
+                + _format_terminal_failure_tail(pane)
+            )
+        waited_on_install = at_install_prompt
         # A launcher sign-in prompt printed before Claude Code runs: an address
         # to open, often with a device code. Real when the same address shows
         # on two consecutive polls. Fail now with the link rather than wait out
@@ -7072,7 +7165,7 @@ def _wait_for_claude_prompt_ready(
         if now >= next_repaint:
             # Output from another process can hide a live composer until
             # Claude Code repaints.
-            if _request_claude_repaint(socket_path, tmux_target):
+            if _request_claude_repaint(socket_path, tmux_target, bridge_dir):
                 repaint_requests += 1
                 delivery_diagnostics.record_readiness(prompt_repaint_requests=repaint_requests)
             next_repaint = time.monotonic() + _CLAUDE_REPAINT_INTERVAL_S

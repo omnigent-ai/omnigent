@@ -51,6 +51,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SESSION_TITLE_INSTRUCTIONS_KEY = "session_title_instructions"
+#: Agent names the New Chat picker should offer, e.g. ``["polly"]``. Empty or
+#: absent offers the full roster.
+RESTRICT_TO_AGENT_NAMES_KEY = "restrict_to_agent_names"
+#: Agent name a fresh New Chat starts on, e.g. ``"polly"``.
+DEFAULT_AGENT_NAME_KEY = "default_agent_name"
 SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 
 
@@ -138,6 +143,80 @@ def session_title_instructions(config: Mapping[str, Any]) -> str | None:
         )
         return None
     return value
+
+
+@dataclass(frozen=True)
+class PickerCuration:
+    """Which agents the New Chat picker offers, and which one it starts on.
+
+    Display only: see "Curating the New Chat picker" in ``deploy/README.md``.
+
+    :param restrict_to_agent_names: Names the picker may show. Empty means no
+        restriction, which is the default.
+    :param default_agent_name: Name a fresh New Chat pre-selects, or ``None``.
+        A user's remembered pick still wins; this only decides where someone
+        with no history starts.
+    """
+
+    restrict_to_agent_names: tuple[str, ...] = ()
+    default_agent_name: str | None = None
+
+    @property
+    def restricted(self) -> bool:
+        """Whether the picker is limited to a named set."""
+        return bool(self.restrict_to_agent_names)
+
+    def config(self) -> dict[str, Any]:
+        """Return the public picker block surfaced by ``GET /v1/info``."""
+        return {
+            "restrict_to_agent_names": list(self.restrict_to_agent_names),
+            "default_agent_name": self.default_agent_name,
+        }
+
+
+def load_picker_curation(config: Mapping[str, Any]) -> PickerCuration:
+    """Read the New Chat picker's display curation from the server config.
+
+    Both keys fail open: a malformed value logs and is ignored rather than
+    emptying a deployment's picker over a typo. A default outside a non-empty
+    allowlist is dropped, since it could never be selected.
+
+    :param config: Loaded server config carrying the optional
+        ``restrict_to_agent_names`` and ``default_agent_name`` keys.
+    :returns: The curation, empty when neither key is set.
+    """
+    raw_names = config.get(RESTRICT_TO_AGENT_NAMES_KEY)
+    # Each element has to be a string too: ``[42]`` would otherwise become an
+    # active restriction on ``"42"`` that matches nothing.
+    elements = raw_names if isinstance(raw_names, list) else [raw_names]
+    if raw_names is not None and not all(isinstance(item, str) for item in elements):
+        logger.warning(
+            "server config %s must be a name or a list of names — ignoring it",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+        )
+        raw_names = None
+    # Order is the operator's: the picker shows a restricted roster in the
+    # order it was configured, so a deployment can put its own agent first.
+    names: tuple[str, ...] = tuple(dict.fromkeys(config_str_list(raw_names)))
+
+    raw_default = config.get(DEFAULT_AGENT_NAME_KEY)
+    default: str | None = None
+    if raw_default is not None:
+        if not isinstance(raw_default, str):
+            logger.warning(
+                "server config %s must be a string — ignoring it", DEFAULT_AGENT_NAME_KEY
+            )
+        else:
+            default = raw_default.strip() or None
+    if default is not None and names and default not in names:
+        logger.warning(
+            "server config %s is %r, which %s does not offer — ignoring the default",
+            DEFAULT_AGENT_NAME_KEY,
+            default,
+            RESTRICT_TO_AGENT_NAMES_KEY,
+        )
+        default = None
+    return PickerCuration(restrict_to_agent_names=names, default_agent_name=default)
 
 
 def _config_positive_int(key: str, default: int) -> int:

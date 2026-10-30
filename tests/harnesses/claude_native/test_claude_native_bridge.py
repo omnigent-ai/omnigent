@@ -55,6 +55,7 @@ from omnigent.harnesses.claude_native.bridge import (
     is_auth_slash_command,
     kill_session,
     pane_closed_by_omnigent,
+    pane_killed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
@@ -6207,13 +6208,14 @@ def test_failed_expected_close_kill_leaves_no_marker(
         kill_session(bridge_dir, expected_close=True)
 
     assert not pane_closed_by_omnigent(private_dir)
+    assert not pane_killed_by_omnigent(private_dir)
 
 
 def test_kill_session_without_expected_close_leaves_no_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The stop affordance keeps its existing exit handling; it marks nothing."""
+    """The stop affordance marks Omnigent's kill but not an expected close."""
     private_dir = tmp_path / "omnigent-terminal-pane"
     private_dir.mkdir()
     bridge_dir = tmp_path / "bridge"
@@ -6230,6 +6232,7 @@ def test_kill_session_without_expected_close_leaves_no_marker(
     kill_session(bridge_dir)
 
     assert not pane_closed_by_omnigent(private_dir)
+    assert pane_killed_by_omnigent(private_dir)
 
 
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
@@ -10106,6 +10109,11 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
         # 46-char title on a browser terminal only 50 columns wide.
         "── " + "t" * 75 + " ─",
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+        # A title too long for the row leaves no leading run: Claude Code
+        # truncates it and draws the padded label from the first column, then
+        # one or two glyphs. The first comes off a 42-column pane after /rename.
+        " Investigate the flaky billing webhook … ─",
+        " " + "t" * 38 + " ──",
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -10130,11 +10138,72 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "│   │   │",  # deeper nesting, same shape
         "│   ├── src",  # a ``tree`` row
         "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+        # Only a label padded from the first column may stand in for the run.
+        "  " + "t" * 38 + "… ─",  # indented like a transcript or draft row
+        "t" * 39 + "… ─",  # no padding space before the text
+        " " + "t" * 37 + " ───",  # more glyphs than Claude Code pads a label with
+        " a │ b row filling label … ─",  # a vertical glyph inside the label
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
     """Ordinary rows must not pass as a rule now that labels are allowed."""
     assert _is_box_rule(line) is False
+
+
+@pytest.mark.parametrize(
+    ("line", "start"),
+    [
+        ("─" * 40, 0),
+        ("  " + "─" * 40, 2),  # a rule typed into a draft, under the glyph
+        ("─" * 30 + " my session ─", 0),
+        (" Investigate the flaky billing webhook … ─", 0),  # padding, not indent
+    ],
+)
+def test_box_rule_start_reports_the_rule_column(line: str, start: int) -> None:
+    """A row-filling label's padding space belongs to the rule, so it starts at column 0."""
+    assert claude_native_bridge._box_rule_start(line) == start
+
+
+def test_claude_prompt_rendered_sees_prompt_under_row_filling_title() -> None:
+    """
+    A title too long for the row does not hide the input box.
+
+    Claude Code then drops the glyph run left of the title, truncates the
+    title with ``…`` and starts the rule with the label's padding space.
+    Reading that row as text left no opening rule, so every message waited
+    out the readiness budget and the timeout reaped the live pane. Pane
+    shape is taken from Claude Code 2.1.312 at 42 columns after ``/rename``.
+    """
+    pane = "\n".join(
+        [
+            "  ⎿ Session renamed to: Investigate the",
+            "    flaky billing webhook retry backoff in",
+            "    the staging cluster",
+            "                      ◐ medium · /effort",
+            " Investigate the flaky billing webhook … ─",  # opening rule
+            "❯ ",
+            "─" * 42,  # closing rule
+            "  Opus 5.5 │ medium │ 0/1M $0.00",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_composer_box_reads_draft_under_row_filling_title() -> None:
+    """The rows between a row-filling title and the closing rule are the whole box."""
+    pane = "\n".join(
+        [
+            " Investigate the flaky billing webhook … ─",
+            "❯ fix the bug",
+            "  in foo.py",
+            "─" * 42,
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert claude_native_bridge._composer_box(pane) == claude_native_bridge._ComposerBox(
+        ["❯ fix the bug", "  in foo.py"], framed=True
+    )
 
 
 def test_claude_prompt_rendered_sees_prompt_over_pasted_tree_output() -> None:
@@ -10854,19 +10923,31 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
 
 
-def test_wait_for_claude_prompt_ready_reports_a_launcher_password_prompt(
+@pytest.mark.parametrize(
+    ("prompt", "description"),
+    [
+        ("Enter password to configure settings.\nPassword:", "a password"),
+        (
+            "No Claude Code installation found. Would you like to install it? [Y/n]:",
+            "installation confirmation",
+        ),
+    ],
+    ids=["password", "install-confirmation"],
+)
+def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+    description: str,
 ) -> None:
     """
-    A launcher waiting for a password fails delivery as a terminal dialog within
-    two polls, instead of waiting out the budget and reaping the pane that holds
-    the prompt the person must answer.
+    A launcher waiting for an answer reports its prompt without reaping the pane.
     """
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captures: list[int] = []
 
     def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
         captures.append(1)
-        return "Installing launcher...\nEnter password to configure settings.\nPassword:\n"
+        return f"Installing launcher...\n{prompt}\n"
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
     monkeypatch.setattr(
@@ -10880,9 +10961,9 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_password_prompt(
             timeout_s=30.0,
         )
     assert str(raised.value).startswith(
-        "Claude Code's launch command is waiting for a password in its terminal"
+        f"Claude Code's launch command is waiting for {description} in its terminal"
     )
-    assert "Password:" in str(raised.value)
+    assert prompt in str(raised.value)
     assert len(captures) == 2
 
 
@@ -11718,6 +11799,8 @@ class _EditableComposer:
         monkeypatch.setattr(claude_native_bridge, "_run_tmux", self._run_tmux)
         monkeypatch.setattr(claude_native_bridge, "_capture_pane", self._capture_pane)
         monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+        # No Claude Code process runs behind this box for a repaint signal to reach.
+        monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 0)
 
     def _run_tmux(self, socket_path: str, *args: str) -> None:
         del socket_path
@@ -12121,6 +12204,80 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
             "/effort high" if slash else "hello from the web"
         ]
     assert sum(args[-1] == "C-l" for args in operations) == (scenario != "scrollback")
+
+
+# Another process's output printed from the input row's cursor onward: it
+# wrapped across the closing rule, so no key can delete it. In the second, a
+# redraw of the input row already erased an idle-compaction notice's marker.
+_PRINTED_OVER_BOX_PANES = {
+    "launcher-warning": """\
+──────────────────────────────
+❯ Background token refresh failed: certificate expired. Troubleshooting step
+s: 1. Renew the certificate, then send your message again.
+  ? for shortcuts
+""",
+    "idle-compact-tail": """\
+──────────────────────────────
+❯
+ens (example-model) -> sent /compact. Use /rewind if you need to return to a spec
+ific earlier point.
+  ? for shortcuts
+""",
+}
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("draft", ["", _STALE_MULTILINE_DRAFT], ids=["empty", "hidden-draft"])
+@pytest.mark.parametrize("printed", list(_PRINTED_OVER_BOX_PANES))
+@pytest.mark.parametrize("repaint_shows_box", [True, False], ids=["repainted", "still-covered"])
+def test_output_printed_over_the_input_box_is_repainted_before_refusing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    draft: str,
+    printed: str,
+    repaint_shows_box: bool,
+) -> None:
+    """Output another process printed over the box is repainted, not refused as a draft."""
+    composer = _EditableComposer(draft, cursor=len(draft))
+    composer.install(monkeypatch)
+    covered = True
+    repaints: list[str] = []
+
+    def repaint(socket_path: str, tmux_target: str) -> int:
+        nonlocal covered
+        repaints.append(tmux_target)
+        covered = not repaint_shows_box
+        return 1
+
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", repaint)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *args: (
+            _PRINTED_OVER_BOX_PANES[printed] if covered else composer._capture_pane(*args)
+        ),
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    def inject() -> None:
+        if slash:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+        else:
+            inject_user_message(bridge_dir, content="hello from the web")
+
+    if repaint_shows_box:
+        inject()
+        assert [text.strip() for text in composer.submitted] == [
+            "/effort high" if slash else "hello from the web"
+        ]
+    else:
+        with pytest.raises(
+            claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
+        ):
+            inject()
+        assert composer.submitted == []
+    assert len(repaints) == 1
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
