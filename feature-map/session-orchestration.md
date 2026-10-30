@@ -11,6 +11,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   allowed and their readers see the message. Use `sys_session_send(session_id, args)`;
   normal queue/steering applies. This is the single session-send tool; parentage
   selects child tracking or peer delivery automatically.
+- `placement-choice`: natural-language requests distinguish a child under the
+  current conversation from a separate top-level session on the same host.
+  A follow-up reuses the chosen worker through the same send tool.
 - `read-results`: peer sends return `reply_mode: "poll"`; the manager reads
   history/status and replies are not forwarded. Direct-child sends keep their
   tracked task handles, inbox results and completion wake notices.
@@ -117,6 +120,22 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   tests/e2e/test_subagent_restart_recovery_e2e.py --reruns 0` checks named and
   by-ID child sends with automatic wake-up, plus named-send inbox recovery
   after a runner restart, through real SDK processes with a scripted provider.
+- Opt-in live-model smoke: with a prepared live-provider `OMNIGENT_CONFIG_HOME`
+  and native credentials usable from an isolated home, run
+  `OMNIGENT_E2E_LIVE_SESSION_PLACEMENT=1 uv run --no-sync pytest
+  tests/e2e/test_private_session_orchestration.py::test_live_natural_language_session_placement
+  --reruns 0 -n 0`. Optional `OMNIGENT_E2E_CLAUDE_MODEL` /
+  `OMNIGENT_E2E_CODEX_MODEL` select models; `CLAUDE_CONFIG_DIR` / `CODEX_HOME`
+  may point to prepared native configuration. This makes real paid model calls.
+  Each fresh Claude/Codex manager hears either "Start a child Omnigent session
+  under this conversation" or "Start a separate top-level Omnigent session on
+  this same machine", then "ask that same worker to double its previous total".
+  Prompts give no tool names or placement enum values. Check actual parentage,
+  independent-worker attribution/host, worker and manager answers, and that the
+  follow-up creates no additional session. Evidence JSON remains in pytest's
+  temporary directory. A native in-process helper, a worker on a separate
+  server, or a claimed creation without an actual Omnigent session does not pass. This is a usability smoke, not a
+  deterministic CI gate or proof for ambiguous wording or other models.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
 

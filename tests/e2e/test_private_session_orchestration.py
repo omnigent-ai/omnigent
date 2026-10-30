@@ -1,8 +1,9 @@
-"""Real local host/server/SDK and Codex processes; scripted model, no cloud sandbox."""
+"""Isolated orchestration journeys: scripted providers and an opt-in native live smoke."""
 
 import ast
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -15,7 +16,7 @@ from dev.repro_env.runtime import write_model_config
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
-from tests._helpers.session import bundle_files, post_session_bundle
+from tests._helpers.session import bundle_files, post_session_bundle, send_user_text
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallback_mock_llm
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -521,3 +522,135 @@ def test_private_manager_launch_send_read_and_sharing(
                 # Native tool results reach the model without entering the UI transcript.
                 side_chat_results = tool_results("side-chat-message")
                 assert "Shared sessions cannot" in json.dumps(side_chat_results)
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_LIVE_SESSION_PLACEMENT") != "1",
+    reason="opt-in live-model smoke; requires configured native provider credentials",
+)
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+@pytest.mark.parametrize("placement", ["child", "top-level"])
+def test_live_natural_language_session_placement(tmp_path, harness, placement):
+    """Choose placement from prose, then reuse the worker for a follow-up task."""
+    cli = harness.removesuffix("-native")
+    assert shutil.which(cli) and shutil.which("tmux"), "Native CLI and tmux are required"
+    config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
+    assert config_home, "Set OMNIGENT_CONFIG_HOME to a prepared live-provider configuration"
+    model = os.environ.get(f"OMNIGENT_E2E_{cli.upper()}_MODEL")
+    base_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "LANG", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR"}
+    }
+    evidence = {"harness": harness, "placement": placement, "model": model}
+    with tempfile.TemporaryDirectory(prefix="orch-live-", dir="/tmp") as native_state:
+        env = {
+            "OMNIGENT_CONFIG_HOME": config_home,
+            "OMNIGENT_FEATURES": None,
+            "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(Path(native_state) / "codex"),
+            "OMNIGENT_CLAUDE_NATIVE_STATE_DIR": str(Path(native_state) / "claude"),
+            "OMNIGENT_NO_UPDATE_CHECK": "1",
+            "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+        }
+        with server_runner(
+            tmp_path / "stack", server_cwd=_REPO, server_env=env, base_env=base_env
+        ) as stack:
+            (stack.workspace / "inventory.txt").write_text("apples: 137\npears: 246\n")
+            stack.start_host(env=env, cwd=_REPO)
+            with httpx.Client(base_url=stack.base_url, timeout=30, trust_env=False) as client:
+
+                def get(path, **params):
+                    response = client.get(path, params=params)
+                    response.raise_for_status()
+                    return response.json()
+
+                poll_until(
+                    lambda: any(h.get("status") == "online" for h in get("/v1/hosts")["hosts"]),
+                    timeout_s=60,
+                )
+                host_id = next(
+                    h["host_id"] for h in get("/v1/hosts")["hosts"] if h["status"] == "online"
+                )
+                metadata = {
+                    "title": f"Natural language {cli} {placement}",
+                    "host_id": host_id,
+                    "workspace": str(stack.workspace),
+                }
+                if cli == "claude" and model:
+                    metadata["terminal_launch_args"] = ["--model", model]
+                manager = create_native_session(
+                    client,
+                    stack.base_url,
+                    harness=cli,
+                    metadata=metadata,
+                    model=model if cli == "codex" else None,
+                )["session_id"]
+                evidence.update(manager=manager, url=stack.base_url)
+
+                def workers():
+                    errors = [
+                        row
+                        for row in get(f"/v1/sessions/{manager}/items", limit=100)["data"]
+                        if row.get("type") == "error"
+                    ]
+                    assert not errors, errors
+                    response = client.get(
+                        "/v1/sessions", params={"kind": "any", "visibility": "mine"}
+                    )
+                    response.raise_for_status()
+                    return [row for row in response.json()["data"] if row["id"] != manager]
+
+                def answered(session, total):
+                    rows = get(f"/v1/sessions/{session}/items", limit=100)["data"]
+                    (tmp_path / f"{session}-items.json").write_text(json.dumps(rows, indent=2))
+                    return any(
+                        row.get("role") == "assistant"
+                        and row.get("status") == "completed"
+                        and re.search(rf"\b{total}\b", json.dumps(row.get("content", [])))
+                        for row in rows
+                    )
+
+                instruction = (
+                    "Start a child Omnigent session under this conversation. "
+                    if placement == "child"
+                    else "Start a separate top-level Omnigent session on this same machine. "
+                    "I want to keep working in that conversation independently later. "
+                )
+                instruction += (
+                    "Use the same harness as you. Have the worker read inventory.txt in "
+                    "this workspace and calculate the total number of fruit. Bring its "
+                    "answer back here. Don't change any files."
+                )
+                evidence["prompt"] = instruction
+                try:
+                    send_user_text(client, session_id=manager, text=instruction)
+                    poll_until(lambda: workers(), timeout_s=180)
+                    assert len(workers()) == 1, "Expected one Omnigent worker conversation"
+                    worker = workers()[0]["id"]
+                    snapshot = get(f"/v1/sessions/{worker}")
+                    evidence["worker"] = snapshot
+                    expected_parent = manager if placement == "child" else None
+                    assert snapshot.get("parent_session_id") == expected_parent, snapshot
+                    if placement == "top-level":
+                        assert snapshot["labels"]["omnigent.created_by_session_id"] == manager
+                        assert snapshot["host_id"] == host_id
+                    poll_until(
+                        lambda: answered(worker, 383) and answered(manager, 383), timeout_s=180
+                    )
+                    follow_up = (
+                        "Now ask that same worker to double its previous total and tell me "
+                        "its answer. Reuse the same conversation; don't start another one."
+                    )
+                    evidence["follow_up"] = follow_up
+                    send_user_text(client, session_id=manager, text=follow_up)
+                    poll_until(
+                        lambda: answered(worker, 766) and answered(manager, 766), timeout_s=180
+                    )
+                    assert [row["id"] for row in workers()] == [worker]
+                    evidence["result"] = "passed"
+                finally:
+                    evidence["manager_items"] = get(f"/v1/sessions/{manager}/items", limit=100)[
+                        "data"
+                    ]
+                    (tmp_path / "evidence.json").write_text(json.dumps(evidence, indent=2))
