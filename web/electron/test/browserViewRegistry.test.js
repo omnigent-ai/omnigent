@@ -624,6 +624,51 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
   });
 
+  it("allows this-machine loopback subresources and workers while refusing LAN and metadata", async () => {
+    const { registry, idOf, lookups } = makeNetworkGuardRegistry({
+      allowsLocalhost: (context) => context?.hostIsThisMachine === true,
+    });
+    registry.openOrNavigate("local", "https://example.com/", undefined, {
+      agent: true,
+      agentContext: { hostIsThisMachine: true },
+    });
+    registry.openOrNavigate("remote", "https://example.com/", undefined, { agent: true });
+    const partition = agentPartition("w-test", "local");
+    await Promise.all(
+      ["localhost", "127.0.0.1", "[::1]"].flatMap((host) =>
+        ["xhr", "script", "image", "webSocket"].map(async (resourceType) => {
+          const url = `${resourceType === "webSocket" ? "ws" : "http"}://${host}:5173/x`;
+          const ip = host === "[::1]" ? "::1" : "127.0.0.1";
+          const local = { webContentsId: idOf("local"), resourceType, url, ip };
+          assert.equal(await registry.shouldCancelAgentRequest(local), false, url);
+          assert.equal(await registry.shouldCancelAgentResponse(local), false, url);
+          const worker = { ...local, webContentsId: undefined };
+          assert.equal(await registry.shouldCancelAgentRequest(worker, partition), false);
+          assert.equal(await registry.shouldCancelAgentResponse(worker, partition), false);
+          const remote = { ...local, webContentsId: idOf("remote") };
+          assert.equal(await registry.shouldCancelAgentRequest(remote), true);
+          assert.equal(await registry.shouldCancelAgentResponse(remote), true);
+        }),
+      ),
+    );
+    await Promise.all(
+      ["192.168.1.1", "169.254.169.254"].map(async (ip) => {
+        const request = {
+          webContentsId: idOf("local"),
+          url: `http://${ip}/x`,
+          resourceType: "xhr",
+          ip,
+        };
+        assert.equal(await registry.shouldCancelAgentRequest(request), true);
+        assert.equal(await registry.shouldCancelAgentResponse(request), true);
+        const worker = { ...request, webContentsId: undefined };
+        assert.equal(await registry.shouldCancelAgentRequest(worker, partition), true);
+        assert.equal(await registry.shouldCancelAgentResponse(worker, partition), true);
+      }),
+    );
+    assert.deepEqual(lookups, [], "eligible subresources add no DNS lookups");
+  });
+
   it("refuses an agent first hop to a name that resolves to loopback", async () => {
     const { registry, lookups } = makeNetworkGuardRegistry();
     const verdict = await registry.checkAgentNavigation("conv_1", "http://lvh.me:8899/", null);

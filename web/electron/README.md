@@ -635,9 +635,9 @@ against its local Chromium, and the result is posted back.
   requests without a view ID use the most restrictive owner in the partition,
   or public-only access if no owners remain. Only documents resolve DNS before
   sending; subresources use URL rules followed by the connected-address check.
-  The existing exact-loopback exception also applies to these requests; LAN
-  and metadata addresses stay blocked. Enforcement cancels requests and keeps
-  the view open.
+  The exact-loopback exception for eligible Arca and this-machine sessions also
+  applies to these requests; LAN and metadata addresses stay blocked. Enforcement
+  cancels requests and keeps the view open.
   Those requests skip HTTP-cache reads so every response reports
   the address Chromium connected to, and a response whose address is missing
   or non-public (a DNS answer that changed after the check) is cancelled,
