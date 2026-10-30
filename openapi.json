@@ -11541,7 +11541,7 @@
     },
     "/v1/hosts/{host_id}": {
       "get": {
-        "description": "Get details for a single host.\n\n**Returns:** Host details dict \u2014 the `list_hosts` fields (including `gateway_inference`, `None` when unreported) plus `runners`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.\n- `OmnigentError` \u2014 With `require_live`, 400 for a wrong replica or 409 when the host is offline.",
+        "description": "Get details for a single host.\n\n**Returns:** Host details dict \u2014 the `list_hosts` fields (including `gateway_inference`, `None` when unreported) plus `runners`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",
         "parameters": [
           {
@@ -11552,17 +11552,6 @@
             "schema": {
               "title": "Host Id",
               "type": "string"
-            }
-          },
-          {
-            "description": "Require this replica's connection metadata, returning a routing error when a live host is connected to another replica.",
-            "in": "query",
-            "name": "require_live",
-            "required": false,
-            "schema": {
-              "default": false,
-              "title": "Require Live",
-              "type": "boolean"
             }
           }
         ],

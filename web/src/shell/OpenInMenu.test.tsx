@@ -1,27 +1,35 @@
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  renderHook,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { Host } from "@/hooks/useHosts";
 
 const fetchHost = vi.fn();
 const open = vi.fn();
 const revealFile = vi.fn();
 let client: QueryClient;
+let serverHosts: Host[];
+
+function host(hostId: string, name: string, sandboxProvider: string | null = null): Host {
+  return {
+    host_id: hostId,
+    name,
+    owner: "owner@example.test",
+    status: "online",
+    sandbox_provider: sandboxProvider,
+  };
+}
 
 beforeEach(() => {
   vi.resetModules();
   localStorage.clear();
   client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
-  fetchHost
-    .mockReset()
-    .mockImplementation(async () => new Response(JSON.stringify({ ssh_target: "arclet_dev.ssh" })));
+  serverHosts = [];
+  fetchHost.mockReset().mockImplementation(async (input: string) => {
+    if (input === "/v1/hosts") {
+      return new Response(JSON.stringify({ hosts: serverHosts }));
+    }
+    return new Response("", { status: 404 });
+  });
   open.mockReset();
   revealFile.mockReset().mockResolvedValue(true);
   vi.stubGlobal("fetch", fetchHost);
@@ -37,7 +45,6 @@ afterEach(() => {
   cleanup();
   client.clear();
   vi.unstubAllGlobals();
-  vi.useRealTimers();
   document.querySelectorAll("iframe").forEach((frame) => frame.remove());
 });
 
@@ -100,88 +107,39 @@ it("opens the default editor directly using a local deep link and bundled icon",
     "noopener,noreferrer",
   );
   expect(screen.queryByRole("menu")).toBeNull();
+  // The host list may load before the asynchronous desktop identity resolves.
+  expect(fetchHost.mock.calls.every(([input]) => input === "/v1/hosts")).toBe(true);
 });
 
-it.each(["desktop", "browser"])("opens remote folders/files from %s", async (platform) => {
-  if (platform === "browser") vi.stubGlobal("omnigentDesktop", undefined);
-  const latestLink = () =>
-    platform === "desktop"
-      ? open.mock.calls.at(-1)?.[0]
-      : Array.from(document.querySelectorAll("iframe")).at(-1)?.getAttribute("src");
-  const { changeTarget } = await renderMenu("/workspace", "remote", true);
-  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
-  expect(latestLink()).toBe("vscode://vscode-remote/ssh-remote+arclet_dev.ssh/workspace");
-  changeTarget("src/a #.ts", "remote", false);
-  await openMenu();
-  expect(screen.queryByRole("menuitem", { name: /Finder|file manager/ })).toBeNull();
-  expect(screen.queryByRole("dialog")).toBeNull();
-  fireEvent.click(screen.getByRole("menuitem", { name: "Cursor" }));
-  expect(latestLink()).toBe(
-    "cursor://vscode-remote/ssh-remote+arclet_dev.ssh/workspace/src/a%20%23.ts:1:1",
-  );
-  if (platform === "browser") expect(open).not.toHaveBeenCalled();
-  expect(fetchHost.mock.calls[0][0]).toContain("/v1/hosts/remote?require_live=true");
-});
-
-it("loads remote metadata without newer AbortSignal APIs", async () => {
-  vi.stubGlobal("omnigentDesktop", undefined);
-  vi.stubGlobal(
-    "AbortSignal",
-    new Proxy(AbortSignal, {
-      get: (target, key, receiver) =>
-        key === "any" || key === "timeout" ? undefined : Reflect.get(target, key, receiver),
-    }),
-  );
-  await renderMenu("/workspace", "remote", true);
-  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
-  expect(document.querySelector("iframe")).toHaveAttribute(
-    "src",
-    "vscode://vscode-remote/ssh-remote+arclet_dev.ssh/workspace",
-  );
-  expect(open).not.toHaveBeenCalled();
-});
-
-it("preserves host-list updates after loading a remote SSH target", async () => {
-  const hostListKey = ["hosts", { includeSandbox: false }];
-  client.setQueryDefaults(hostListKey, { gcTime: Infinity });
-  client.setQueryData(hostListKey, [{ host_id: "remote", name: "Remote host" }]);
-  await renderMenu("/workspace", "remote", true);
-  expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeVisible();
-  const accounts = { codex: { kind: "chatgpt", email: "owner@example.test" } };
-  fetchHost.mockImplementation(
-    async () => new Response(JSON.stringify({ harness_accounts: accounts })),
-  );
-  const { useRefreshHarnessAccounts } = await import("@/hooks/useHosts");
-  renderHook(() => useRefreshHarnessAccounts("remote", true), {
-    wrapper: ({ children }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    ),
-  });
-  await waitFor(() =>
-    expect(client.getQueryData(hostListKey)).toEqual([
-      { host_id: "remote", name: "Remote host", harness_accounts: accounts },
-    ]),
-  );
-  fireEvent.click(screen.getByRole("button", { name: "Open in VS Code" }));
-  expect(open.mock.calls.at(-1)?.[0]).toBe(
-    "vscode://vscode-remote/ssh-remote+arclet_dev.ssh/workspace",
-  );
-});
-
-it("times out an unresponsive metadata request", async () => {
-  vi.useFakeTimers();
-  fetchHost.mockImplementation(
-    (_url, { signal }: RequestInit) =>
-      new Promise((_resolve, reject) => {
-        signal!.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
-      }),
-  );
-  await renderMenu("/workspace", "remote", true);
-  expect(fetchHost).toHaveBeenCalledTimes(1);
-  await act(() => vi.advanceTimersByTimeAsync(3000));
-  expect(client.isFetching()).toBe(0);
-  expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
-});
+it.each([
+  ["desktop", "arclet", "conversant-crane", "arclet_conversant-crane.ssh"],
+  ["browser", "arclet", "conversant-crane", "arclet_conversant-crane.ssh"],
+  ["desktop", "databricks-arca", "my-arca", "arca.ssh"],
+  ["browser", "databricks-arca", "my-arca", "arca.ssh"],
+] as const)(
+  "opens remote folders/files from %s for %s",
+  async (platform, provider, name, sshTarget) => {
+    serverHosts = [host("remote", name, provider)];
+    if (platform === "browser") vi.stubGlobal("omnigentDesktop", undefined);
+    const latestLink = () =>
+      platform === "desktop"
+        ? open.mock.calls.at(-1)?.[0]
+        : Array.from(document.querySelectorAll("iframe")).at(-1)?.getAttribute("src");
+    const { changeTarget } = await renderMenu("/workspace", "remote", true);
+    fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
+    expect(latestLink()).toBe(`vscode://vscode-remote/ssh-remote+${sshTarget}/workspace`);
+    changeTarget("src/a #.ts", "remote", false);
+    await openMenu();
+    expect(screen.queryByRole("menuitem", { name: /Finder|file manager/ })).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Cursor" }));
+    expect(latestLink()).toBe(
+      `cursor://vscode-remote/ssh-remote+${sshTarget}/workspace/src/a%20%23.ts:1:1`,
+    );
+    if (platform === "browser") expect(open).not.toHaveBeenCalled();
+    expect(fetchHost.mock.calls.map(([input]) => input)).toEqual(["/v1/hosts"]);
+  },
+);
 
 it("shares and remembers the editor preference across both controls", async () => {
   await renderMenu("/workspace", "local", true);
@@ -200,6 +158,9 @@ it("shares and remembers the editor preference across both controls", async () =
 it.each(["local", "remote"])(
   "resolves a late inherited %s host for both controls",
   async (hostId) => {
+    if (hostId === "remote") {
+      serverHosts = [host("remote", "conversant-crane", "arclet")];
+    }
     const { setSessionHost, setSessionParent } = await import("@/lib/sessionHost");
     setSessionParent("conv_1", "parent");
     await renderMenu("/workspace", null, true);
@@ -209,7 +170,8 @@ it.each(["local", "remote"])(
     const buttons = await screen.findAllByRole("button", { name: "Open in VS Code" });
     expect(buttons).toHaveLength(2);
     buttons.forEach((button) => fireEvent.click(button));
-    const location = hostId === "local" ? "file" : "vscode-remote/ssh-remote+arclet_dev.ssh";
+    const location =
+      hostId === "local" ? "file" : "vscode-remote/ssh-remote+arclet_conversant-crane.ssh";
     expect(open.mock.calls.map(([url]) => url)).toEqual([
       `vscode://${location}/workspace`,
       `vscode://${location}/workspace/src/main.ts${hostId === "remote" ? ":1:1" : ""}`,
@@ -224,51 +186,51 @@ it("keeps local reveal available", async () => {
   expect(revealFile).toHaveBeenCalledWith("local", "/workspace/packages");
 });
 
-it.each([undefined, null, "", "bad target"])(
-  "hides unknown remote destinations: %j",
-  async (ssh_target) => {
-    fetchHost.mockImplementation(async () => new Response(JSON.stringify({ ssh_target })));
-    await renderMenu("/workspace", "remote", true);
-    await waitFor(() => expect(client.isFetching()).toBe(0));
-    expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
-  },
-);
-
-it("clears disconnected targets and recovers after a host update", async () => {
+it.each([
+  ["missing host", []],
+  ["ordinary remote", [host("remote", "custom-alias")]],
+  ["unsupported sandbox", [host("remote", "lakebox", "databricks-lakebox")]],
+  ["invalid Arclet name", [host("remote", "bad name", "arclet")]],
+] as const)("hides an unknown remote destination: %s", async (_case, hosts) => {
+  serverHosts = [...hosts];
   await renderMenu("/workspace", "remote", true);
-  expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeVisible();
-  fetchHost.mockImplementation(async () => new Response("", { status: 409 }));
-  await act(() => client.invalidateQueries({ queryKey: ["host-ssh-target"] }));
-  await waitFor(() => expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull());
-  fetchHost.mockImplementation(
-    async () => new Response(JSON.stringify({ ssh_target: "arclet_new.ssh" })),
-  );
-  await act(() => client.invalidateQueries({ queryKey: ["host-ssh-target"] }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
-  expect(open.mock.calls.at(-1)?.[0]).toBe(
-    "vscode://vscode-remote/ssh-remote+arclet_new.ssh/workspace",
-  );
+  await waitFor(() => expect(client.isFetching()).toBe(0));
+  expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
 });
 
-it("does not reuse a pending destination when switching hosts", async () => {
-  let finish!: (response: Response) => void;
-  fetchHost.mockImplementation(
-    () =>
-      new Promise<Response>((resolve) => {
-        finish = resolve;
-      }),
-  );
-  const { changeTarget } = await renderMenu("/workspace", "first", true);
-  await waitFor(() => expect(fetchHost).toHaveBeenCalled());
-  const firstSignal = fetchHost.mock.calls[0][1].signal as AbortSignal;
-  fetchHost.mockImplementation(
-    async () => new Response(JSON.stringify({ ssh_target: "arclet_second.ssh" })),
-  );
-  changeTarget("/second", "second");
-  expect(firstSignal.aborted).toBe(true);
-  await act(() => finish(new Response(JSON.stringify({ ssh_target: "arclet_first.ssh" }))));
+it("updates and clears an inferred target when the host list changes", async () => {
+  serverHosts = [host("remote", "first-bird", "arclet")];
+  await renderMenu("/workspace", "remote", true);
   fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
-  expect(open.mock.calls[0][0]).toBe("vscode://vscode-remote/ssh-remote+arclet_second.ssh/second");
+  expect(open.mock.calls.at(-1)?.[0]).toContain("ssh-remote+arclet_first-bird.ssh");
+
+  serverHosts = [{ ...host("remote", "renamed-bird", "arclet"), status: "offline" }];
+  await act(() => client.invalidateQueries({ queryKey: ["hosts"] }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
+  expect(open.mock.calls.at(-1)?.[0]).toContain("ssh-remote+arclet_renamed-bird.ssh");
+
+  serverHosts = [];
+  await act(() => client.invalidateQueries({ queryKey: ["hosts"] }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull());
+});
+
+it("uses the selected host row when switching between remote, unknown, and local hosts", async () => {
+  serverHosts = [
+    host("first", "first-bird", "arclet"),
+    host("second", "my-arca", "databricks-arca"),
+  ];
+  const { changeTarget } = await renderMenu("/workspace", "first", true);
+  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
+  expect(open.mock.calls.at(-1)?.[0]).toContain("ssh-remote+arclet_first-bird.ssh");
+  changeTarget("/second", "second");
+  fireEvent.click(screen.getByRole("button", { name: "Open in VS Code" }));
+  expect(open.mock.calls.at(-1)?.[0]).toBe("vscode://vscode-remote/ssh-remote+arca.ssh/second");
+  changeTarget("/unknown", "unknown");
+  expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
+  changeTarget("/local", "local");
+  fireEvent.click(screen.getByRole("button", { name: "Open in VS Code" }));
+  expect(open.mock.calls.at(-1)?.[0]).toBe("vscode://file/local");
+  expect(fetchHost.mock.calls.map(([input]) => input)).toEqual(["/v1/hosts"]);
 });
 
 it.each(["ios", "android"])("hides desktop editor choices in the %s shell", async (kind) => {

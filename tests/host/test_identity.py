@@ -14,76 +14,9 @@ from omnigent.host.identity import (
     export_configured_slice_key,
     host_identity_env_override_active,
     load_host_identity_if_present,
-    load_host_ssh_target,
     load_or_create_host_identity,
     reset_host_id,
 )
-
-
-@pytest.fixture
-def ssh_target_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    from omnigent.host import identity
-
-    monkeypatch.setattr(identity, "_ARCA_MARKER", tmp_path / "arca")
-    monkeypatch.setattr(identity, "_ARCLET_MARKER", tmp_path / "arclet")
-    monkeypatch.setattr(identity, "_ARCLET_NAME", tmp_path / "arclet-name")
-    monkeypatch.delenv("DATABRICKS_ARCLET_NAME_FILE", raising=False)
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    return tmp_path / "config.yaml"
-
-
-@pytest.mark.parametrize(
-    ("config", "expected"),
-    [
-        ({"host": {"ssh_target": "me@my-box"}}, "me@my-box"),
-        ({"host": {"ssh_target": "arclet_custom.ssh"}}, "arclet_custom.ssh"),
-        ({"host": {"ssh_target": None}}, None),
-        ({"host": {"ssh_target": "bad target"}}, None),
-        ({"host": {"ssh_target": 123}}, None),
-        ({"host": []}, None),
-        (["invalid-config"], None),
-    ],
-)
-def test_host_ssh_target_setting_overrides_detection(
-    ssh_target_config: Path, config: object, expected: str | None
-) -> None:
-    (ssh_target_config.parent / "arca").touch()
-    ssh_target_config.write_text(yaml.safe_dump(config))
-    assert load_host_ssh_target(ssh_target_config) == expected
-    assert load_host_ssh_target() == expected
-
-
-def test_host_ssh_target_detects_arca_arclet_and_rename(ssh_target_config: Path) -> None:
-    root = ssh_target_config.parent
-    assert load_host_ssh_target() is None
-    (root / "arca").touch()
-    assert load_host_ssh_target() == "arca.ssh"
-    (root / "arclet").touch()
-    assert load_host_ssh_target() is None
-    name_file = root / "arclet-name"
-    name_file.write_text("friendly-bird\n")
-    assert load_host_ssh_target() == "arclet_friendly-bird.ssh"
-    name_file.write_text("renamed-bird")
-    assert load_host_ssh_target() == "arclet_renamed-bird.ssh"
-    name_file.write_text("bad name")
-    assert load_host_ssh_target() is None
-    assert not ssh_target_config.exists()
-
-
-def test_host_ssh_target_handles_name_override_and_unreadable_config(
-    ssh_target_config: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = ssh_target_config.parent
-    (root / "arclet").touch()
-    override = root / "override-name"
-    override.write_text("dev")
-    monkeypatch.setenv("DATABRICKS_ARCLET_NAME_FILE", str(override))
-    assert load_host_ssh_target() == "arclet_dev.ssh"
-    ssh_target_config.write_text("host: [invalid")
-    assert load_host_ssh_target() is None
-    ssh_target_config.unlink()
-    ssh_target_config.mkdir()
-    assert load_host_ssh_target() is None
 
 
 def test_create_identity_when_no_config(tmp_path: Path) -> None:

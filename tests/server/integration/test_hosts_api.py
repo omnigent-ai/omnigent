@@ -54,7 +54,6 @@ def _make_hello(
     gateway_inference: dict[str, bool] | None = None,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
-    ssh_target: str | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -76,7 +75,6 @@ def _make_hello(
             gateway_inference=gateway_inference,
             harness_accounts=harness_accounts,
             capabilities=capabilities or [],
-            ssh_target=ssh_target,
         )
     )
 
@@ -154,7 +152,6 @@ async def _connect_host(
     gateway_inference: dict[str, bool] | None = None,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
-    ssh_target: str | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -183,7 +180,6 @@ async def _connect_host(
                 gateway_inference,
                 harness_accounts,
                 capabilities,
-                ssh_target=ssh_target,
             ),
         },
     )
@@ -486,48 +482,6 @@ async def test_hosts_api_gateway_inference_null_for_older_host(
     assert listing.json()["hosts"][0]["gateway_inference"] is None
     assert single.status_code == 200
     assert single.json()["gateway_inference"] is None
-
-
-@pytest.mark.parametrize(
-    ("ssh_target", "sharded"), [(None, False), ("arca.ssh", False), ("arclet_dev.ssh", True)]
-)
-async def test_host_ssh_identity_is_live_connection_metadata(
-    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    ssh_target: str | None,
-    sharded: bool,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("omnigent.server.routes._host_launch._host_sharded", sharded)
-    app, registry, _hs, _cs = host_api_app
-    comm = await _connect_host(app, registry, ssh_target=ssh_target)
-    other_app, _, _, _ = _build_host_api_app(db_uri)
-    host_url = f"/v1/hosts/{_HOST_ID}"
-    live_url = f"{host_url}?require_live=true"
-    async with AsyncClient(
-        transport=ASGITransport(app=other_app), base_url="http://test"
-    ) as other:
-        response = await other.get(host_url)
-        assert response.status_code == 200
-        assert response.json()["status"] == "online"
-        assert response.json()["ssh_target"] is None
-        response = await other.get(live_url)
-        assert response.status_code == (400 if sharded else 409)
-        assert response.json()["error"]["code"] == (
-            ErrorCode.WRONG_REPLICA if sharded else ErrorCode.CONFLICT
-        )
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get(live_url)
-        assert response.status_code == 200
-        assert response.json()["ssh_target"] == ssh_target
-        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
-        await comm.wait(timeout=budget(1.0))
-        response = await client.get(host_url)
-        assert response.status_code == 200
-        assert response.json()["ssh_target"] is None
-        response = await client.get(live_url)
-        assert response.status_code == 409
-        assert response.json()["error"]["code"] == ErrorCode.CONFLICT
 
 
 async def test_gateway_inference_reconverges_after_a_server_restart(

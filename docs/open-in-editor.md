@@ -10,29 +10,19 @@ button. The browser or desktop shell may ask permission to open the editor's
 protocol link. Local file links are offered only when the desktop app can
 identify the session's host as its own machine. Mobile shells hide the controls.
 
-Hosts advertise their SSH destination when they connect. Standard Arca and
-Arclet images automatically report `arca.ssh` and `arclet_<name>.ssh`, using the
-image markers and Arclet name file. The corresponding alias must exist in your
-local SSH configuration; Arca Companion creates these aliases for Arclets.
+The UI infers standard SSH aliases from the existing host list: provider
+`databricks-arca` uses `arca.ssh`, and provider `arclet` uses
+`arclet_<host.name>.ssh`. Arclet names follow Arclet's existing validation:
+1–64 ASCII letters, digits, underscores, or hyphens; a letter or digit first;
+and no `arclet_` or `arclet-` prefix. The alias must exist in your local SSH
+configuration; Arca Companion creates these aliases for Arclets.
 Remote links currently support POSIX paths, including Arca and Arclet workspaces.
 
-For another remote host, or a custom alias, set this in the host machine's
-`~/.omnigent/config.yaml` (or the config under `OMNIGENT_CONFIG_HOME`):
-
-```yaml
-host:
-  ssh_target: my-devbox
-```
-
-Preserve the other existing host settings. An explicit `ssh_target: null`
-disables remote editor links. Reconnect the host after changing this setting;
-it is read again on each connection. The value is compatible with Isaac's
-`host.ssh_target` setting.
-
-The server keeps this metadata on the live host connection, so no database
-migration is needed. Remote controls are hidden when the host is disconnected,
-does not report a destination, or belongs to another user. They refresh when
-host state changes and periodically while the panel is open. The browser
+Other remote providers, custom aliases, missing host rows, and invalid Arclet
+names hide the remote controls. Inference uses persisted host rows, so a
+recognized offline host can retain the action; connecting still requires that
+host to be reachable over SSH. Host-list updates refresh the inferred alias.
+No new host protocol, server API, or database migration is required. The browser
 cannot check whether an editor or SSH alias is installed locally.
 
 To verify, open an Arca or Arclet session, choose **Files**, and click **Open**

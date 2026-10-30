@@ -19,12 +19,21 @@ seeded_session = seeded_session_fixture
 
 
 @pytest.mark.parametrize(
-    ("width", "host_id", "ssh_host", "desktop"),
+    ("width", "host_id", "host_name", "sandbox_provider", "ssh_host", "desktop", "available"),
     [
-        (360, "local", None, True),
-        (950, "local", None, True),
-        (950, "arca", "arca.ssh", True),
-        (360, "arclet", "arclet_dev.ssh", False),
+        (360, "local", "laptop", None, None, True, True),
+        (950, "local", "laptop", None, None, True, True),
+        (950, "arca", "my-arca", "databricks-arca", "arca.ssh", True, True),
+        (
+            360,
+            "arclet",
+            "conversant-crane",
+            "arclet",
+            "arclet_conversant-crane.ssh",
+            False,
+            True,
+        ),
+        (950, "unknown", "custom-alias", None, None, False, False),
     ],
 )
 def test_open_folder_and_file_in_app(
@@ -32,8 +41,11 @@ def test_open_folder_and_file_in_app(
     seeded_session: BrowserSession,
     width: int,
     host_id: str,
+    host_name: str,
+    sandbox_provider: str | None,
     ssh_host: str | None,
     desktop: bool,
+    available: bool,
     tmp_path: Path,
 ) -> None:
     session = seeded_session
@@ -68,7 +80,20 @@ def test_open_folder_and_file_in_app(
         },
     )
     session.contract.json(f"/v1/hosts/{host_id}/worktrees", {"data": []})
-    session.contract.json(f"/v1/hosts/{host_id}", {"ssh_target": ssh_host})
+    session.contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": host_id,
+                    "name": host_name,
+                    "owner": "local",
+                    "status": "online",
+                    "sandbox_provider": sandbox_provider,
+                }
+            ]
+        },
+    )
     state = [{"id": sid, "state": {"open": True, "widthPx": width, "rightRailTab": "files"}}]
     encoded_state = json.dumps(json.dumps(state))
     page.add_init_script(
@@ -99,6 +124,15 @@ def test_open_folder_and_file_in_app(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Files")).click()
     folder_open = rail.get_by_role("button", name="Choose app to open in", exact=True)
+    if not available:
+        expect(folder_open).to_have_count(0)
+        rail.get_by_text("main.md", exact=True).click()
+        viewer = rail.get_by_test_id("file-viewer")
+        expect(viewer).to_be_visible()
+        expect(
+            viewer.get_by_role("button", name="Choose app to open in", exact=True)
+        ).to_have_count(0)
+        return
     expect(folder_open).to_be_visible()
     copy_folder = rail.get_by_role("button", name="Copy folder path: workspace")
     default_folder = rail.get_by_role("button", name="Open in VS Code", exact=True)

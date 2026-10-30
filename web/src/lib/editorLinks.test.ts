@@ -1,5 +1,10 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { editorLink, launchEditorLink, normalizeSshTarget } from "./editorLinks";
+import {
+  editorLink,
+  inferHostSshTarget,
+  launchEditorLink,
+  normalizeSshTarget,
+} from "./editorLinks";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -33,6 +38,39 @@ it("keeps remote folder links distinct from file links", () => {
   expect(editorLink("cursor", "/repo/file.ts", "arclet_dev.ssh", false)).toBe(
     "cursor://vscode-remote/ssh-remote+arclet_dev.ssh/repo/file.ts:1:1",
   );
+});
+
+it.each([
+  [{ name: "my-arca", sandbox_provider: "databricks-arca" }, "arca.ssh"],
+  [{ name: "conversant-crane", sandbox_provider: "arclet" }, "arclet_conversant-crane.ssh"],
+  [
+    { name: "omnigent-arclet-session", sandbox_provider: "arclet" },
+    "arclet_omnigent-arclet-session.ssh",
+  ],
+  [{ name: "x".repeat(64), sandbox_provider: "arclet" }, `arclet_${"x".repeat(64)}.ssh`],
+] as const)("infers the standard Databricks SSH target from %j", (host, expected) => {
+  expect(inferHostSshTarget(host)).toBe(expected);
+});
+
+it.each([
+  undefined,
+  null,
+  { name: "remote", sandbox_provider: null },
+  { name: "lakebox", sandbox_provider: "databricks-lakebox" },
+  { name: "", sandbox_provider: "arclet" },
+  { name: "bad name", sandbox_provider: "arclet" },
+  { name: "bad.name", sandbox_provider: "arclet" },
+  { name: "bird\n", sandbox_provider: "arclet" },
+  { name: "bird/other", sandbox_provider: "arclet" },
+  { name: "bird@other", sandbox_provider: "arclet" },
+  { name: "bird?query", sandbox_provider: "arclet" },
+  { name: "bird#fragment", sandbox_provider: "arclet" },
+  { name: "-bad", sandbox_provider: "arclet" },
+  { name: "arclet_dev", sandbox_provider: "arclet" },
+  { name: "Arclet-dev", sandbox_provider: "arclet" },
+  { name: "x".repeat(65), sandbox_provider: "arclet" },
+])("does not infer an SSH target from %j", (host) => {
+  expect(inferHostSshTarget(host)).toBeNull();
 });
 
 it.each(["relative/file", "/file\0", "/file\n", ""])("rejects invalid path %j", (path) => {

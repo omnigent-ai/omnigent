@@ -885,7 +885,7 @@ async def test_handle_model_options_reports_the_endpoints_wider_catalog(
     _cleanup_host(host)
 
 
-def _make_host_process(config_path: Path | None = None) -> HostProcess:
+def _make_host_process() -> HostProcess:
     """Create a HostProcess with a test identity.
 
     :returns: A :class:`HostProcess` for testing.
@@ -897,7 +897,6 @@ def _make_host_process(config_path: Path | None = None) -> HostProcess:
     return HostProcess(
         identity=identity,
         server_url="http://localhost:8000",
-        config_path=config_path,
     )
 
 
@@ -2667,19 +2666,6 @@ async def test_unreported_exit_flushes_after_reconnect(
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}
-
-
-async def test_hello_rereads_ssh_target_on_reconnect(tmp_path: Path) -> None:
-    config = tmp_path / "config.yaml"
-    host = _make_host_process(config)
-    for target in ["arclet_first.ssh", "arclet_renamed.ssh", None]:
-        config.write_text(json.dumps({"host": {"ssh_target": target}}))
-        tunnel = _FakeTunnel()
-        with pytest.raises(ConnectionError, match="test disconnect"):
-            await host._serve_frames(tunnel)  # type: ignore[arg-type]
-        hello = decode_host_frame(tunnel.sent[0])
-        assert isinstance(hello, HostHelloFrame)
-        assert hello.ssh_target == target
 
 
 async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
