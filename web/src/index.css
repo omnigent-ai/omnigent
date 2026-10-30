@@ -16,6 +16,15 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+
+/* CSS-pixel floor, independent of viewport width and pointer capability. */
+@utility mobile-touch-target {
+  &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
 
 @theme inline {
   --font-heading: var(--font-sans);
