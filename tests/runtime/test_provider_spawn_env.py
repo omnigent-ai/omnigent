@@ -1708,10 +1708,14 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
 
 
 @pytest.mark.parametrize(
-    ("turn_config", "expected_effort"),
+    ("turn_config", "expected_model", "expected_effort"),
     [
-        (None, None),
-        (ExecutorConfig(model="gpt-6-luna", extra={"reasoning_effort": "high"}), "high"),
+        (None, "gpt-6-luna", None),
+        (
+            ExecutorConfig(model="gpt-6-sol", extra={"reasoning_effort": "high"}),
+            "gpt-6-sol",
+            "high",
+        ),
     ],
     ids=["spec_model", "dispatch_model_and_effort"],
 )
@@ -1719,6 +1723,7 @@ def test_codex_subscription_thread_start_uses_selected_model(
     config_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     turn_config: ExecutorConfig | None,
+    expected_model: str,
     expected_effort: str | None,
 ) -> None:
     """A codex subscription session starts its Codex thread on the selected model."""
@@ -1756,7 +1761,7 @@ def test_codex_subscription_thread_start_uses_selected_model(
     asyncio.run(_drive())
 
     assert thread_starts[0]["reasoning_effort"] == expected_effort
-    assert thread_starts[0]["model"] == "gpt-6-luna"
+    assert thread_starts[0]["model"] == expected_model
 
 
 def test_openai_agents_cli_config_default_fails_loud(config_home: Path) -> None:

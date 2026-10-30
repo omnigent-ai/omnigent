@@ -5024,13 +5024,10 @@ class CodexExecutor(Executor):
             self._brokered_version_identity = validated_identity
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
-        # cfg.model (per-request /model override) wins over the spec default.
-        # An unresolved default comes from the active provider catalog.
-        # A custom config.toml provider (cli-config) owns its model list and rejects
-        # aliases it cannot resolve (e.g. gpt-5.6), so thread/start gets no model.
-        # The built-in ``openai`` pin (subscription) still takes the selected model.
+        # cfg.model (per-request /model override) wins; unresolved defaults come from the catalog.
         model = cfg.model or self._model_override
         if self._model_provider_override is not None:
+            # Custom config.toml providers reject unknown aliases; built-in openai keeps the model.
             if self._model_provider_override != "openai":
                 model = None
         elif model is None:
