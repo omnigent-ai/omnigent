@@ -131,9 +131,12 @@ class QuestionPicker:
         question = self.current
         if not question.options:
             if question.text_default is not None:
-                return text  # editor: the exact text is the answer
-            typed = text.strip()
-            return typed if typed and question.allow_custom else None
+                value = text  # editor: the exact text is the answer
+            else:
+                value = text.strip()
+                if not value or not question.allow_custom:
+                    return None
+            return [value] if question.multi_select else value
         if not question.allow_custom and text.strip():
             # Never turn typed text into the highlighted option: typing "No"
             # must not submit a "Yes" that happens to be highlighted.

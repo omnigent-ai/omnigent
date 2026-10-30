@@ -5,10 +5,10 @@ TerminalHost driver for the inline question selector PTY test
 Boots a :class:`TerminalHost` and asks a fixed sequence of questions through
 :meth:`TerminalHost.ask_questions`, printing each result as one
 ``ANSWER <n> <json>`` line so the test can assert what real keystrokes chose.
-Lines submitted as chat are printed as ``CHAT <json>``; the selector must never
-produce any.
+Lines submitted as chat are printed as ``CHAT <json>`` and appended to the chat
+log, a durable record the test reads; the selector must never produce any.
 
-Run directly with ``python _question_selector_driver.py <history-file>``.
+Run directly with ``python _question_selector_driver.py <history-file> <chat-log>``.
 """
 
 from __future__ import annotations
@@ -48,11 +48,13 @@ QUESTIONS: list[list[QuestionSpec]] = [
 ]
 
 
-async def _main(history_file: str) -> None:
+async def _main(history_file: str, chat_log: str) -> None:
     """Run the host and ask :data:`QUESTIONS` one after another."""
     host = TerminalHost(model_name="test", history_file=history_file)
 
     async def _chat(text: str, files: list[Any]) -> None:
+        with open(chat_log, "a", encoding="utf-8") as log:
+            log.write(json.dumps(text) + "\n")
         host.output(Text(f"CHAT {json.dumps(text)}"))
 
     async def _ask_all() -> None:
@@ -72,4 +74,4 @@ async def _main(history_file: str) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(_main(sys.argv[1]))
+    asyncio.run(_main(sys.argv[1], sys.argv[2]))

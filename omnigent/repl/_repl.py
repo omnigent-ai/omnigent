@@ -2900,9 +2900,7 @@ class _SessionsChatReplAdapter:
                 finally:
                     self._open_ticket = None
             if resolve_payload is not None:
-                await self._post_elicitation_verdict(
-                    session_id, ticket.elicitation_id, resolve_payload
-                )
+                await self._post_elicitation_verdict(session_id, ticket, resolve_payload)
         finally:
             # Finished with this request, so a later one may reuse its id.
             if self._prompt_tickets.get(ticket.elicitation_id) is ticket:
@@ -3000,20 +2998,24 @@ class _SessionsChatReplAdapter:
     async def _post_elicitation_verdict(
         self,
         session_id: str,
-        elicitation_id: str,
+        ticket: _PromptTicket,
         resolve_payload: dict[str, object],
     ) -> None:
-        """POST the verdict, retrying transport errors."""
+        """POST the verdict, retrying transport errors until *ticket* is settled."""
         # URL-based elicitation: deliver the verdict to the elicitation's
         # dedicated resolve URL rather than as an in-band ``approval`` event.
         # A transport error can happen after the server accepted the POST but
         # before the client received its response, so retrying is safe: the
         # server either accepts the retry or reports the elicitation resolved.
         for attempt in range(3):
+            if ticket.settled:
+                # Settled meanwhile, perhaps by an earlier attempt; the id may
+                # now belong to a re-asked request this verdict must not answer.
+                return
             try:
                 await self._client.sessions.resolve_elicitation(
                     session_id,
-                    elicitation_id,
+                    ticket.elicitation_id,
                     resolve_payload,
                 )
                 return

@@ -35,11 +35,11 @@ _UNDO = "\x1f"  # Ctrl+_
 
 @pytest.fixture
 def selector_child(tmp_path: Path) -> Iterator[tuple[pexpect.spawn, Path]]:
-    """Spawn the selector driver under a PTY with a throwaway history file."""
+    """Spawn the selector driver under a PTY with a throwaway history file and chat log."""
     history = tmp_path / "history"
     child = pexpect.spawn(
         sys.executable,
-        [str(_DRIVER), str(history)],
+        [str(_DRIVER), str(history), str(tmp_path / "chat.log")],
         env={"TERM": _TERM, "LINES": str(_ROWS), "COLUMNS": str(_COLS)},
         encoding="utf-8",
         timeout=_BOOT_TIMEOUT,
@@ -113,10 +113,11 @@ def test_selector_answers_with_real_keystrokes(
     child.send(_UNDO)
     child.send("\r")
     child.send("probe\r")
-    rendered = wait('CHAT "probe"')
+    wait('CHAT "probe"')
 
-    chat = [line.strip() for line in rendered.splitlines() if line.strip().startswith("CHAT")]
-    assert chat == ['CHAT "probe"'], f"an answer reached the chat:\n{rendered}"
+    # Every chat submission, including any that scrolled off the screen.
+    chat_log = history.parent / "chat.log"
+    assert chat_log.read_text().splitlines() == ['"probe"'], chat_log.read_text()
     saved = history.read_text() if history.exists() else ""
-    for answer in ("qa", "draft notes", "synthetic"):
+    for answer in ("staging", "us-east", "ap-south", "qa", "draft notes", "synthetic"):
         assert answer not in saved, saved

@@ -1810,6 +1810,10 @@ async def test_question_picker_answers_follow_the_web_form() -> None:
     assert closed.answer("") is True
     assert await closed.future == {"Env?": "dev"}
 
+    free_multi = QuestionPicker([_env_question(options=(), multi_select=True)])
+    assert free_multi.answer("eu-west") is True
+    assert await free_multi.future == {"Env?": ["eu-west"]}
+
     editor = QuestionPicker([_env_question(options=(), text_default="draft")])
     assert editor.answer("") is True, "an editor answer may be empty"
     assert await editor.future == {"Env?": ""}

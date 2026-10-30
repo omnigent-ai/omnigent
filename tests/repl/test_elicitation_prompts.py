@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from omnigent_client import StreamHooks
 
@@ -97,7 +98,11 @@ def _question_event(elicitation_id: str = "elicit_q", questions: Any = None) -> 
         content_preview="",
         url=None,
         ask_user_question={
-            "questions": questions or [{"question": "Env?", "options": ["dev", "prod"]}]
+            "questions": (
+                [{"question": "Env?", "options": ["dev", "prod"]}]
+                if questions is None
+                else questions
+            )
         },
     )
 
@@ -182,6 +187,7 @@ def test_one_unanswerable_question_rejects_the_batch() -> None:
         "not-a-question",
     ):
         assert _question_prompts({"questions": [valid, unusable]}) == [], unusable
+    assert _question_prompts({"questions": []}) == []
     assert _question_prompts({"questions": "nope"}) == []
     assert _question_prompts(None) == []
 
@@ -246,8 +252,9 @@ async def test_secret_questions_are_left_for_another_client() -> None:
             {"question": "Env?", "options": ["dev"]},
             {"question": "Q?", "options": [], "isOther": False},
         ],
+        [],
     ],
-    ids=["malformed", "one-unanswerable"],
+    ids=["malformed", "one-unanswerable", "no-questions"],
 )
 async def test_unusable_questions_decline_without_any_prompt(questions: Any) -> None:
     adapter, host, _, client, approval_hook = _adapter()
@@ -384,6 +391,38 @@ async def test_a_re_ask_under_an_open_id_replaces_the_old_prompt(old_prompt: str
     assert [q.question for q in host.asked[-1]] == ["Region?"]
     assert _posted(client) == [
         ("conv_abc", "elicit_x", {"action": "accept", "content": {"Region?": "eu"}})
+    ]
+
+
+async def test_a_retry_stops_once_its_request_is_settled() -> None:
+    # A's first send drops; before its retry, the id is re-asked as B. The
+    # retry must not post A's answer against B.
+    adapter, host, _, client, _ = _adapter()
+    sent: list[Any] = []
+
+    async def _drop_the_first_send(*args: Any) -> None:
+        sent.append(args)
+        if len(sent) == 1:
+            raise httpx.ConnectError("dropped")
+
+    client.sessions.resolve_elicitation = AsyncMock(side_effect=_drop_the_first_send)
+    first = asyncio.create_task(
+        adapter._handle_elicitation("conv_abc", _question_event("elicit_x"))
+    )
+    await _until(lambda: host.selector_open, "question A never opened")
+    host.answer({"Env?": "dev"})
+    await _until(lambda: len(sent) == 1, "A's answer was never sent")
+    question_b = _question_event("elicit_x", [{"question": "Region?", "options": ["us", "eu"]}])
+    second = adapter.queue_elicitation("conv_abc", question_b)
+    assert second is not None
+    await first
+    await _until(lambda: host.selector_open, "question B never opened")
+    host.answer({"Region?": "eu"})
+    await second
+
+    assert [args[2] for args in sent] == [
+        {"action": "accept", "content": {"Env?": "dev"}},
+        {"action": "accept", "content": {"Region?": "eu"}},
     ]
 
 
