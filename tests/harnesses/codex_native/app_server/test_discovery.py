@@ -957,6 +957,7 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     providers = tomllib.loads(text)["model_providers"]
     assert providers["local"]["auth"] == {"command": "local-secret-helper"}
     if outcome == "inherited":
+        assert providers["Inherited.Provider"]["name"] == "Inherited.Provider"
         assert providers["Inherited.Provider"]["http_headers"] == {
             "Databricks-Custom-Coding-Agent": "codex",
             "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug",
