@@ -59,11 +59,14 @@ be able to write resources without a separate Omnigent account.
   with the user's config, runs `omnigent login` there with the sign-in callback
   port forwarded to the laptop, then starts `omnigent host --background`.
   States: consent, trusting a new host key, a key passphrase or password,
-  installing omnigent when it is missing, finishing in the browser, connected
-  (the new host selected), already connected, closing the window mid sign-in
-  (nothing left running on the machine), and failures, shown only in the app's
-  own window. Hidden where **Run on Arca** is offered (the Databricks-internal
-  flag on a Databricks-managed server).
+  installing omnigent when it is missing, finishing in the browser (with a
+  confirmation code on OIDC servers), connected (the new host selected),
+  already connected, connected but the new host unconfirmed (the dialog stays
+  open to pick it from the host list), closing the window mid sign-in (nothing
+  left running on the machine), a sign-in link the machine shouldn't print
+  (refused, no browser), and failures, shown only in the app's own window.
+  Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
+  Databricks-managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.

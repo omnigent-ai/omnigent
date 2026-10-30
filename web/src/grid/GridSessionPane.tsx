@@ -4,6 +4,7 @@ import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
 import { useInertRef } from "@/hooks/useInertRef";
@@ -407,7 +408,9 @@ export function GridSessionPane({
           </header>
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
             <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
-              <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+              <RenderErrorBoundary name="chat" resetKey={sessionId}>
+                <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+              </RenderErrorBoundary>
             </div>
             {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
               <div
@@ -418,16 +421,18 @@ export function GridSessionPane({
                 ref={terminalInertRef}
                 aria-hidden={!showTerminal}
               >
-                <MainTerminalView
-                  conversationId={sessionId}
-                  visible={showTerminal}
-                  active={selected && !workspacePanel.maximized}
-                  className="pt-0"
-                  readOnly={!session || !isOwnerLevel(permissionLevel)}
-                  runnerOnline={runnerOnline}
-                  onResume={canEdit ? resume : undefined}
-                  sandboxOffline={liveness.kind === "host_asleep"}
-                />
+                <RenderErrorBoundary name="terminal" resetKey={sessionId}>
+                  <MainTerminalView
+                    conversationId={sessionId}
+                    visible={showTerminal}
+                    active={selected && !workspacePanel.maximized}
+                    className="pt-0"
+                    readOnly={!session || !isOwnerLevel(permissionLevel)}
+                    runnerOnline={runnerOnline}
+                    onResume={canEdit ? resume : undefined}
+                    sandboxOffline={liveness.kind === "host_asleep"}
+                  />
+                </RenderErrorBoundary>
               </div>
             )}
           </div>

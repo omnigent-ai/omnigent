@@ -5206,6 +5206,32 @@ describe("find bar teardown (src/main.js)", () => {
     assert.doesNotThrow(() => bar.close());
     assert.equal(h.calls.focused, undefined);
   });
+
+  it("tells the page the bar opened, since the menu sends no page keydown", (t) => {
+    const { h } = openBar();
+    t.after(h.cleanup);
+    const opened = h.calls.progress.filter(({ channel }) => channel === "omnigent:find-opened");
+    assert.equal(opened.length, 1);
+  });
+
+  it("closes when the window switches conversation, not within one or in a subframe, under a mount", (t) => {
+    const h = loadNavigationHarness({ serverUrl: "https://omni.example/tenant/c/foo/c/alpha" });
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = () => {};
+    h.win.removeListener = () => {};
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    h.webContents.emit(
+      "did-navigate-in-page",
+      "https://omni.example/tenant/c/foo/c/alpha?message=m1",
+      true,
+    );
+    h.webContents.emit("did-navigate-in-page", "https://embed.example/#tab", false);
+    assert.equal(bar.isDestroyed(), false);
+    h.webContents.emit("did-navigate-in-page", "https://omni.example/tenant/c/foo/c/beta", true);
+    assert.equal(bar.isDestroyed(), true);
+  });
 });
 
 describe("server names from the manifest", () => {

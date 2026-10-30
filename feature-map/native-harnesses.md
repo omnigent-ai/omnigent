@@ -10,6 +10,21 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
+- `picker-curation`: server config `restrict_to_agent_names` limits and orders
+  what New Chat offers, and `default_agent_name` pre-selects one for a user
+  with no remembered pick. Curated, the menu is one flat list with no Harnesses
+  heading, no "Other..." submenus, no "Create custom agent" entry and no Smart
+  Routing entry; a name matching nothing shows an empty state and logs at
+  startup, while a failed agent fetch says so rather than blaming the
+  deployment. A returning user's cached picker stays closed while `/v1/info` is
+  pending, including behind the embedded app's offline stand-in, so the full
+  roster never shows ahead of the curation (a failed probe falls back to the
+  uncurated picker); "Hide unconfigured harnesses" and the per-entry hides in
+  Settings > Appearance apply to the curated list too. A remembered pick the curation drops falls back to the
+  configured default carrying that agent's own brain harness, never the
+  rejected agent's, and a project's configured agent outside the curation is
+  reported unavailable until the user picks an offered one. Display only,
+  and New Chat only: the scheduled-task and project-settings pickers are untouched.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
@@ -440,6 +455,14 @@ Cross-harness journeys:
   response contract is covered by
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
+- **`picker-curation`:** `tests/server/test_server_config.py` (parsing),
+  `tests/server/test_app.py` (the `/v1/info` block and the startup warning),
+  `web/src/lib/capabilities.test.ts` (probe parsing),
+  the "curated New Chat picker" cases in `web/src/shell/AgentHarnessPicker.test.tsx`
+  (menu shape) and the
+  "picker curation" cases in `web/src/shell/NewChatDialog.test.tsx` (default
+  pre-selection, remembered picks and the empty state in the real landing
+  flow). Set the two keys in the server config, restart, and open New Chat.
 - **`needs-auth`:**
   `web/src/pages/settings/SettingsHarnessesSection.test.tsx` covers the
   flag-gated credential warning card, its Reconfigure affordance, and full-card click.

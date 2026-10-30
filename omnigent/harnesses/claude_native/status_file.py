@@ -351,6 +351,16 @@ def session_has_live_process(session_id: str, *, config_dir: Path | None = None)
     return next(_live_session_records(session_id, config_dir), None) is not None
 
 
+def session_pids(session_id: str, *, config_dir: Path | None = None) -> list[int]:
+    """Return the live Claude processes the registry names for *session_id*.
+
+    :param session_id: Claude session uuid, matched case-insensitively.
+    :param config_dir: Explicit Claude config dir override (tests).
+    :returns: Their pids, e.g. ``[4242]``; empty when none is live.
+    """
+    return [pid for pid, _record in _live_session_records(session_id, config_dir)]
+
+
 def _is_recorded_process(pid: int, proc_start: object) -> bool:
     """Whether *pid* is still the live process a registry record describes.
 

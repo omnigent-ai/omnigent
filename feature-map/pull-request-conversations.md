@@ -24,6 +24,8 @@ request's Changes subtab. Top-level comments remain in Comments.
   other subtabs, the PR list and the collapsed rail stop requesting them.
   A compact **Loading review threads** spinner beside the layout toggle indicates
   an in-flight read. Conversation navigation shares the diff toolbar.
+- `render-recovery`: A panel render failure shows **Try again** while chat,
+  Workspace tabs and mobile Close remain usable.
 
 ## How to get to it (user POV)
 
@@ -35,6 +37,10 @@ request's Changes subtab. Top-level comments remain in Comments.
   then open Changes.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link,
   select a request, then open Changes.
+
+On each surface, **Try again** retries failed panel content. Switching sessions
+also clears a failed panel. Healthy chat drafts stay mounted; content inside a
+failed panel is recreated on recovery.
 
 ## Driving it with the repro environment
 
@@ -60,6 +66,13 @@ The existing
 `tests/e2e_ui/github/test_github_tab.py::test_post_top_level_pr_comment`
 covers the separate Comments composer. Component and runner tests carry the
 pagination, old-side placement, revision, permission and failure matrices.
+
+Render recovery has component coverage in
+`web/src/components/RenderErrorBoundary.test.tsx` and
+`web/src/shell/AppShell.pullRequestTabVisibility.test.tsx`. Manually inject a
+render exception in the panel and open it through each entry above. Confirm
+chat, Workspace tabs or mobile Close still work; clear the fault and choose
+**Try again**. Also navigate to another session and confirm recovery.
 
 For a live check, use a disposable GitHub PR with current, old-side, resolved
 and outdated threads. Open Changes, compare both layouts to GitHub, focus the

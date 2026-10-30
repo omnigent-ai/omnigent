@@ -32,6 +32,7 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.inner.native_attachments import reject_authored_framework_notices
+from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1516,7 +1517,23 @@ _MAX_MANAGED_WORKSPACES = 10
 _MANAGED_HOST_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
-class _SessionCreateRequestBase(BaseModel):
+class _SandboxProfileSelection(BaseModel):
+    sandbox_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    sandbox_profile_revision: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _check_sandbox_profile_selection(self) -> Self:
+        if self.sandbox_profile_revision is not None and self.sandbox_profile_id is None:
+            raise ValueError("sandbox_profile_revision requires sandbox_profile_id")
+        if self.sandbox_profile_id is not None:
+            if getattr(self, "host_type", None) != "managed":
+                raise ValueError("sandbox_profile_id requires host_type 'managed'")
+            if getattr(self, "parent_session_id", None) is not None:
+                raise ValueError("Child sessions inherit their parent's sandbox profile")
+        return self
+
+
+class _SessionCreateRequestBase(_SandboxProfileSelection):
     """
     JSON request body for ``POST /v1/sessions``.
 
@@ -1861,7 +1878,7 @@ class ProjectSessionCreateRequest(_SessionCreateRequestBase):
 SessionCreateInput = SessionCreateRequest | ProjectSessionCreateRequest
 
 
-class SessionCreateMetadata(BaseModel):
+class SessionCreateMetadata(_SandboxProfileSelection):
     """
     Metadata JSON part for multipart ``POST /v1/sessions``.
 
@@ -2458,6 +2475,7 @@ class SessionResponse(BaseModel):
     inference_configured: bool = False
     inference_error: str | None = None
     terminal_pending: bool = False
+    sandbox_profile: SandboxProfileSummary | None = None
     sandbox_status: SandboxStatus | None = None
     # Per-MCP-server startup state for native harness sessions
     # (codex-native), present while the harness boots its MCP servers or
@@ -2758,7 +2776,7 @@ class ClearCodexGoalResponse(BaseModel):
     cleared: bool
 
 
-class SessionForkRequest(BaseModel):
+class SessionForkRequest(_SandboxProfileSelection):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.
 

@@ -839,6 +839,73 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     return claude_managed_gateway(_managed_settings_paths())
 
 
+# Env flags that switch Claude Code to a cloud transport.
+_CLAUDE_CLOUD_TRANSPORT_FLAGS = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+@dataclass(frozen=True)
+class ClaudeAmbientTransport:
+    """Settings that can move an unconfigured Claude Code launch off its own login.
+
+    :param env: The effective ``ANTHROPIC_BASE_URL`` and cloud transport flags,
+        each from managed settings, else user settings, else the process env,
+        e.g. ``(("ANTHROPIC_BASE_URL", "https://gateway.example"),)``.
+    :param user_api_key_helper: Whether user settings name an ``apiKeyHelper``.
+    """
+
+    env: tuple[tuple[str, str], ...]
+    user_api_key_helper: bool
+
+    def leaves_login(self) -> bool:
+        """Whether Claude Code would use a gateway, helper, or cloud transport.
+
+        :returns: ``True`` when the effective base URL is not Anthropic's, a cloud
+            transport is enabled, or user settings name an ``apiKeyHelper``.
+        """
+        env = dict(self.env)
+        if self.user_api_key_helper or any(
+            env.get(name, "").lower() in ("1", "true", "yes", "on")
+            for name in _CLAUDE_CLOUD_TRANSPORT_FLAGS
+        ):
+            return True
+        base_url = env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+        if not base_url:
+            return False
+        host = (urlparse(base_url).hostname or "").lower()
+        return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
+def claude_ambient_transport() -> ClaudeAmbientTransport:
+    """Read the transport settings an unconfigured Claude Code launch applies.
+
+    Project settings depend on the session workspace and are not read here.
+
+    :returns: The effective transport settings across managed settings, user
+        settings, and the process env.
+    """
+    from omnigent.onboarding.ambient import read_claude_managed_settings, read_claude_user_settings
+
+    user_settings = read_claude_user_settings() or {}
+    layers: list[Mapping[str, object]] = []
+    for settings in (read_claude_managed_settings(_managed_settings_paths()), user_settings):
+        env = settings.get("env") if settings is not None else None
+        layers.append(env if isinstance(env, dict) else {})
+    layers.append(os.environ)
+    effective: list[tuple[str, str]] = []
+    for name in (_UCODE_CLAUDE_BASE_URL_ENV, *_CLAUDE_CLOUD_TRANSPORT_FLAGS):
+        values = (str(layer.get(name) or "").strip() for layer in layers)
+        value = next((value for value in values if value), None)
+        if value is not None:
+            effective.append((name, value))
+    return ClaudeAmbientTransport(
+        env=tuple(effective), user_api_key_helper=bool(user_settings.get("apiKeyHelper"))
+    )
+
+
 def claude_native_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]]:
@@ -1353,10 +1420,9 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, launch_args = _claude_model_probe_launch(claude_config, stream_input=True)
-    ambient_gateway = None
-    if claude_config is None:
-        managed_base_url, _ = managed_claude_gateway_signal()
-        ambient_gateway = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV)
+    # Keying on every transport setting means a catalog probed under a gateway or
+    # cloud transport is never read again once that setting is removed.
+    ambient_transport = claude_ambient_transport() if claude_config is None else None
     return fingerprint_of(
         "claude-native",
         "control-picker-v3",
@@ -1368,7 +1434,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         launch_args,
         binary_identity(command),
         binary_identity("claude"),
-        ambient_gateway,
+        ambient_transport,
         claude_managed_model_picker() if claude_config is None else None,
     )
 

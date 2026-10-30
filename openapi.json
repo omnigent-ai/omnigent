@@ -4793,6 +4793,34 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PickerInfo": {
+        "description": "How a deployment curates what the New Chat picker shows.\n\nDisplay only: it narrows the picker, never what exists. Every agent stays\nseeded, forkable and reachable through the API.",
+        "properties": {
+          "default_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Name a fresh New Chat starts on, or `None`. A user's remembered pick wins over it.",
+            "title": "Default Agent Name"
+          },
+          "restrict_to_agent_names": {
+            "default": [],
+            "description": "Names the picker may offer; empty means the full roster.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Restrict To Agent Names",
+            "type": "array"
+          }
+        },
+        "title": "PickerInfo",
+        "type": "object"
+      },
       "PluginAsset": {
         "properties": {
           "id": {
@@ -5819,6 +5847,85 @@
         "title": "RoutingDecisionData",
         "type": "object"
       },
+      "SandboxProfileSummary": {
+        "additionalProperties": false,
+        "description": "Public session/host reference; execution identity stays on the server.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Provider",
+            "type": "string"
+          },
+          "revision": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "revision",
+          "provider"
+        ],
+        "title": "SandboxProfileSummary",
+        "type": "object"
+      },
+      "SandboxProfilesResponse": {
+        "properties": {
+          "managed_providers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Managed Providers",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxProfileSummary"
+            },
+            "title": "Profiles",
+            "type": "array"
+          }
+        },
+        "required": [
+          "profiles",
+          "managed_providers",
+          "next_cursor"
+        ],
+        "title": "SandboxProfilesResponse",
+        "type": "object"
+      },
       "SandboxStatus": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nCarried on the session snapshot only while the session's\nbackground sandbox launch is in flight or has failed; `None`\nfor sessions without a managed launch and once the launch\nsucceeds (the session then looks like any host-bound session).",
         "properties": {
@@ -6009,6 +6116,12 @@
           "needs_setup": {
             "title": "Needs Setup",
             "type": "boolean"
+          },
+          "picker": {
+            "$ref": "#/components/schemas/PickerInfo",
+            "default": {
+              "restrict_to_agent_names": []
+            }
           },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
@@ -6778,6 +6891,32 @@
             ],
             "description": "Per-session reasoning-effort override to apply to the fork, e.g. `\"high\"`. **Omitting** the field inherits the source's effort; an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets it. Validated against the shared effort vocabulary; provider support is enforced at launch. Set by the web fork dialog's effort picker.",
             "title": "Reasoning Effort"
+          },
+          "sandbox_profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Profile Id"
+          },
+          "sandbox_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Profile Revision"
           },
           "sandbox_provider": {
             "anyOf": [
@@ -8680,6 +8819,16 @@
             ],
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. This is the sole reachability signal: `True` means the client can chat normally. It does **not** fold in host-relaunch optimism (a dead runner on a live host reads `False` here, not `True`) \u2014 the open-session view pairs it with `host_online` to decide what to show. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
+          },
+          "sandbox_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SandboxProfileSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "sandbox_status": {
             "anyOf": [
@@ -11638,6 +11787,22 @@
               "title": "Host Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
           }
         ],
         "responses": {
@@ -13774,6 +13939,114 @@
         "summary": "Mint Runner Owner Token",
         "tags": [
           "runners"
+        ]
+      }
+    },
+    "/v1/sandbox-profiles": {
+      "get": {
+        "operationId": "list_profiles_v1_sandbox_profiles_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 32,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Provider"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 200,
+              "title": "Search",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxProfilesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Profiles",
+        "tags": [
+          "sandbox profiles"
         ]
       }
     },

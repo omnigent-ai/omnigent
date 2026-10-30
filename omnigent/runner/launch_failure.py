@@ -641,6 +641,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The agent CLI on the host is too old for the selected model. Update it on the "
         "host, then start a new session."
     ),
+    "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 

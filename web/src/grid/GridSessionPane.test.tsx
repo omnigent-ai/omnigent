@@ -23,15 +23,27 @@ const fixture = vi.hoisted(() => ({
   terminalPending: false,
   composerDisabled: false,
   hostOnline: undefined as boolean | undefined,
+  failedChat: "",
+  failedTerminal: "",
+  renderError: new Error("Grid surface render failed"),
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
   retrySession: vi.fn(async () => ({ recovered: true })),
 }));
 vi.mock("@/components/blocks/TerminalView", () => ({
-  TerminalView: ({ active, readOnly }: { active: boolean; readOnly: boolean }) => (
-    <textarea aria-label="Terminal input" data-active={active} readOnly={readOnly} />
-  ),
+  TerminalView: ({
+    sessionId,
+    active,
+    readOnly,
+  }: {
+    sessionId: string;
+    active: boolean;
+    readOnly: boolean;
+  }) => {
+    if (sessionId === fixture.failedTerminal) throw fixture.renderError;
+    return <textarea aria-label="Terminal input" data-active={active} readOnly={readOnly} />;
+  },
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
@@ -84,9 +96,10 @@ vi.mock("./GridSessionsContext", () => ({
   gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: () => {
+  SideChatPane: ({ childId }: { childId: string }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
+    if (childId === fixture.failedChat) throw fixture.renderError;
     return (
       <>
         <textarea aria-label="Message" disabled={fixture.composerDisabled} />
@@ -153,6 +166,8 @@ afterEach(() => {
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
   fixture.hostOnline = undefined;
+  fixture.failedChat = "";
+  fixture.failedTerminal = "";
   vi.restoreAllMocks();
 });
 
@@ -254,6 +269,81 @@ it("keeps cell views, input, permissions and shortcut targets independent", asyn
     within(screen.getByRole("region", { name: "second" })).getByLabelText("Message"),
   ).toBeVisible();
 });
+
+it.each(["chat", "terminal"])(
+  "contains a grid %s render failure without losing healthy drafts or cell controls",
+  async (surface) => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const suppressExpectedError = (event: ErrorEvent) => {
+      if (event.error === fixture.renderError) event.preventDefault();
+    };
+    window.addEventListener("error", suppressExpectedError);
+    onTestFinished(() => window.removeEventListener("error", suppressExpectedError));
+    fixture.labels = { "omnigent.ui": "terminal" };
+    fixture.terminals = [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }];
+    const tree = () => (
+      <MemoryRouter>
+        <TooltipProvider>
+          <RearrangeableGrid
+            grid={{ id: "render-failure", layout: splitGrid("first", "first", "second", "right")! }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>
+    );
+    const view = render(tree());
+    const first = screen.getByRole("region", { name: "first (active)" });
+    const second = screen.getByRole("region", { name: "second" });
+    const chat = within(first).getByLabelText("Message");
+    const neighborChat = within(second).getByLabelText("Message");
+    fireEvent.change(chat, { target: { value: "Chat draft" } });
+    fireEvent.change(neighborChat, { target: { value: "Neighbor draft" } });
+    fireEvent.click(within(first).getByText("Open citation"));
+    const workspaceDraft = within(screen.getByTestId("workspace-first")).getByLabelText(
+      "File draft",
+    );
+    fireEvent.change(workspaceDraft, { target: { value: "Unsaved file" } });
+    fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+    const terminal = await within(first).findByLabelText("Terminal input");
+    fireEvent.change(terminal, { target: { value: "Terminal draft" } });
+    if (surface === "chat") {
+      fireEvent.click(within(first).getByRole("button", { name: "Chat view" }));
+      fixture.failedChat = "first";
+    } else {
+      fixture.failedTerminal = "first";
+    }
+
+    view.rerender(tree());
+
+    const failure = within(first).getByRole("alert");
+    expect(failure).toHaveTextContent(`Unable to display ${surface}.`);
+    expect(within(first).getByRole("button", { name: "Move first" })).toBeEnabled();
+    expect(within(first).getByRole("link", { name: "Open first full screen" })).toHaveAttribute(
+      "href",
+      "/c/first",
+    );
+    expect(within(first).getByRole("button", { name: "Remove first from grid" })).toBeEnabled();
+    const survivor = surface === "chat" ? terminal : chat;
+    expect(within(first).getByLabelText(surface === "chat" ? "Terminal input" : "Message")).toBe(
+      survivor,
+    );
+    expect(survivor).toHaveValue(surface === "chat" ? "Terminal draft" : "Chat draft");
+    expect(within(second).getByLabelText("Message")).toBe(neighborChat);
+    expect(neighborChat).toHaveValue("Neighbor draft");
+    expect(within(screen.getByTestId("workspace-first")).getByLabelText("File draft")).toBe(
+      workspaceDraft,
+    );
+    expect(workspaceDraft).toHaveValue("Unsaved file");
+
+    fixture.failedChat = "";
+    fixture.failedTerminal = "";
+    fireEvent.click(within(failure).getByRole("button", { name: "Try again" }));
+    expect(within(first).queryByRole("alert")).toBeNull();
+    expect(
+      await within(first).findByLabelText(surface === "chat" ? "Message" : "Terminal input"),
+    ).toBeInTheDocument();
+    expect(survivor).toHaveValue(surface === "chat" ? "Terminal draft" : "Chat draft");
+  },
+);
 
 it("cycles keyboard focus through cells and toggles the grid workspace from the keyboard", () => {
   fixture.labels = { "omnigent.ui": "terminal" };
