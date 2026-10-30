@@ -855,24 +855,26 @@ describe("HostBadge during a sandbox launch", () => {
   const approve = { stage: "action_required", details: "Approve the sandbox in Arclet" } as const;
 
   it.each([
-    ["a user action", timedOut, [approve]],
-    ["the same failure again", timedOut, [{ stage: "provisioning" }, timedOut]],
-    ["the same user action again", approve, [{ stage: "provisioning" }, approve]],
-  ] as const)("spins a wake past an earlier stop until it stops on %s", (_stop, before, stages) => {
+    ["failure", timedOut],
+    ["user action", approve],
+  ] as const)("spins this tab's wake over an earlier %s", (_stop, before) => {
     useChatStore.setState({ conversationId: "conv_1", sandboxStatus: before });
     useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
     useSessionMock.mockReturnValue({ session: { hostId: "host_a1b2", hostResumable: true } });
     useSessionHostOnlineMock.mockReturnValue(false);
-    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
+    const { rerender } = render(
+      <HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />,
+    );
     const trigger = screen.getByTestId("composer-host-select");
     const dot = screen.getByTestId("composer-host-status");
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Starting");
     expect(dot).toHaveAttribute("data-status", "starting");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
 
-    for (const sandboxStatus of stages) act(() => useChatStore.setState({ sandboxStatus }));
+    rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, offline");
     expect(dot).toHaveAttribute("data-status", "offline");
-    fireEvent.pointerDown(trigger, { button: 0 });
     expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
   });
 

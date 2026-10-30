@@ -84,11 +84,6 @@ const CONNECTION_WORD: Record<HostBadgeStatus, string> = {
   unknown: "Unknown",
 };
 
-/** Identifies a reported launch stage by value; snapshots rebuild the object. */
-function launchKey(launch: SandboxStatus | null): string {
-  return launch ? JSON.stringify([launch.stage, launch.error, launch.details]) : "";
-}
-
 /** Composer status for a sandbox that is still launching, or failed to launch. */
 function launchStatusWord(launch: SandboxStatus): string {
   if (launch.stage === "failed") return "Sandbox launch failed";
@@ -127,15 +122,6 @@ export function HostBadge({
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
   // The open session's sandbox launch, which its chat progress banners also show.
   const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
-  // A failed or waiting stage left over from before a wake mustn't stop its
-  // spinner; one reported since then does, even if it repeats the old one.
-  const currentLaunch = launchKey(launch);
-  const [wake, setWake] = useState({ starting: false, launch: "", stageChanged: false });
-  if (starting !== wake.starting) {
-    setWake({ starting, launch: currentLaunch, stageChanged: false });
-  } else if (starting && !wake.stageChanged && currentLaunch !== wake.launch) {
-    setWake({ ...wake, stageChanged: true });
-  }
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
   // poll. A host switch repoints `hostId` as soon as the session snapshot
@@ -183,9 +169,8 @@ export function HostBadge({
     // dot until the host itself is online. A launch waiting on the user isn't progress.
     const launchInProgress =
       launch !== null && launch.stage !== "failed" && launch.stage !== "action_required";
-    const launchStoppedWake =
-      launch !== null && !launchInProgress && (wake.stageChanged || currentLaunch !== wake.launch);
-    const localWakeRunning = starting && !!badge && !launchStoppedWake;
+    // The wake's owner ends `starting` when the launch reports a stop.
+    const localWakeRunning = starting && !!badge;
     const hostStarting = (localWakeRunning || launchInProgress) && badge?.status !== "online";
     const startingWord = launch && launchInProgress ? launchStatusWord(launch) : "Starting";
     const dotStatus = hostStarting ? "starting" : (badge?.status ?? "unknown");

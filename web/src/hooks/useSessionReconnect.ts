@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
-import { refreshRunnerHealth } from "@/hooks/useRunnerHealth";
+import { POLL_INTERVAL_MS, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -12,9 +12,16 @@ import {
   supportsArcaConnect,
 } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
+import type { SandboxStatus } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
 
-/** How long a woken sandbox may wait to read online; spans three 10s health polls. */
-export const SANDBOX_WAKE_ONLINE_GRACE_MS = 30_000;
+/** How long a woken sandbox may wait to read online: three health polls. */
+export const SANDBOX_WAKE_ONLINE_GRACE_MS = 3 * POLL_INTERVAL_MS;
+
+/** Identifies a reported launch stage by value; snapshots rebuild the object. */
+function launchKey(launch: SandboxStatus | null): string {
+  return launch ? JSON.stringify([launch.stage, launch.error, launch.details]) : "";
+}
 
 /**
  * Reconnect this desktop's host directly; use the dialog for fallback and retry.
@@ -44,6 +51,11 @@ export function useSessionReconnect({
   const [canReconnectArca, setCanReconnectArca] = useState(false);
   const [sandboxWake, setSandboxWake] = useState<"waking" | "awaiting_online" | null>(null);
   const inFlight = useRef<{ progressToast?: string | number } | null>(null);
+  // The open session's launch stage, compared against its value at the wake's click.
+  const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const wakeStart = useRef<{ operation: object; launch: string; stageChanged: boolean } | null>(
+    null,
+  );
   const isSessionArcaHost = useCallback(
     () =>
       hostId !== null && isArcaHost({ host_id: hostId, name: hostName ?? "" }, readArcaHostId()),
@@ -136,12 +148,28 @@ export function useSessionReconnect({
     return () => clearTimeout(timer);
   }, [sandboxWake]);
 
+  // A failed or waiting stage left over from before the click mustn't end the
+  // wake; one reported since then does, even if it repeats the old one.
+  useEffect(() => {
+    const start = wakeStart.current;
+    if (sandboxWake === null || !start) return;
+    if (launchKey(launch) !== start.launch) start.stageChanged = true;
+    if (!start.stageChanged || (launch?.stage !== "failed" && launch?.stage !== "action_required"))
+      return;
+    if (inFlight.current === start.operation) inFlight.current = null;
+    wakeStart.current = null;
+    setSandboxWake(null);
+  }, [sandboxWake, launch]);
+
   // The server resumes the sandbox and starts the agent, as it does for a
   // message, so this works in the browser and for anyone who can send one.
   const wakeSandbox = useCallback(async () => {
     if (inFlight.current || !sessionId) return;
     const operation = {};
     inFlight.current = operation;
+    const store = useChatStore.getState();
+    const clickLaunch = store.conversationId === sessionId ? store.sandboxStatus : null;
+    wakeStart.current = { operation, launch: launchKey(clickLaunch), stageChanged: false };
     setSandboxWake("waking");
     try {
       await retrySession(sessionId);

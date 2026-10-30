@@ -16,10 +16,14 @@ import {
 import type { ArcaConnectResult, HostActionResult, HostIdentity } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
 import type { PostEventResponse } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { SANDBOX_WAKE_ONLINE_GRACE_MS, useSessionReconnect } from "./useSessionReconnect";
 
 vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn() }));
-vi.mock("@/hooks/useRunnerHealth", () => ({ refreshRunnerHealth: vi.fn() }));
+vi.mock("@/hooks/useRunnerHealth", () => ({
+  POLL_INTERVAL_MS: 10_000,
+  refreshRunnerHealth: vi.fn(),
+}));
 vi.mock("@/lib/nativeBridge", () => ({
   connectArcaHost: vi.fn(),
   controlHost: vi.fn(),
@@ -63,6 +67,7 @@ beforeEach(() => {
   vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
   vi.mocked(fetchHosts).mockResolvedValue([hostRow("arca-host", "online")]);
   writeArcaHostId(null);
+  useChatStore.setState({ conversationId: null, sandboxStatus: null });
 });
 afterEach(() => {
   cleanup();
@@ -566,6 +571,72 @@ describe("useSessionReconnect", () => {
       }
     },
   );
+
+  const timedOut = { stage: "failed", error: "Sandbox launch timed out" } as const;
+  const approve = { stage: "action_required", details: "Approve the sandbox in Arclet" } as const;
+
+  it.each([
+    ["a user action", timedOut, [approve]],
+    ["the same failure again", timedOut, [{ stage: "provisioning" }, timedOut]],
+    ["the same user action again", approve, [{ stage: "provisioning" }, approve]],
+  ] as const)(
+    "ends a sandbox wake past an earlier stop when it stops on %s, and wakes again",
+    async (_stop, before, stages) => {
+      vi.useFakeTimers();
+      try {
+        useChatStore.setState({ conversationId: "session", sandboxStatus: before });
+        vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
+        const { result } = renderHook(() =>
+          useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+        );
+        await act(async () => {
+          await result.current.reconnect();
+        });
+        expect(result.current.sandboxStarting).toBe(true);
+
+        for (const sandboxStatus of stages) act(() => useChatStore.setState({ sandboxStatus }));
+        expect(result.current.sandboxStarting).toBe(false);
+        // The stopped wake leaves no deadline behind.
+        act(() => vi.advanceTimersByTime(SANDBOX_WAKE_ONLINE_GRACE_MS));
+        expect(toast.error).not.toHaveBeenCalled();
+
+        await act(async () => {
+          await result.current.reconnect();
+        });
+        expect(retrySession).toHaveBeenCalledTimes(2);
+        expect(result.current.sandboxStarting).toBe(true);
+        act(() => vi.advanceTimersByTime(SANDBOX_WAKE_ONLINE_GRACE_MS));
+        expect(toast.error).toHaveBeenCalledExactlyOnceWith(
+          "The sandbox didn't come online. Try Reconnect host again.",
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("ends a pending sandbox wake when its launch fails, ignoring the late answer", async () => {
+    const pending = deferred<PostEventResponse>();
+    vi.mocked(retrySession).mockReturnValue(pending.promise);
+    useChatStore.setState({ conversationId: "session", sandboxStatus: { stage: "provisioning" } });
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+    );
+    let reconnect!: Promise<void>;
+    await act(async () => {
+      reconnect = result.current.reconnect();
+    });
+    act(() => useChatStore.setState({ sandboxStatus: timedOut }));
+    expect(result.current.sandboxStarting).toBe(false);
+
+    await act(async () => {
+      pending.resolve({ queued: false, recovered: true });
+      await reconnect;
+    });
+    expect(result.current.sandboxStarting).toBe(false);
+    expect(refreshRunnerHealth).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
 
   it("shows why a sandbox wake failed and lets the next action retry it", async () => {
     vi.mocked(retrySession).mockRejectedValueOnce(new Error("managed host wake timed out"));

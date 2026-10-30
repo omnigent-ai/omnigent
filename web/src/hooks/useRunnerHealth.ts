@@ -40,7 +40,7 @@ export interface SessionLiveness {
   host_version: string | null;
 }
 
-const POLL_INTERVAL_MS = 10_000;
+export const POLL_INTERVAL_MS = 10_000;
 // Exponential-backoff ceiling on consecutive /health failures.
 const POLL_MAX_INTERVAL_MS = 60_000;
 
