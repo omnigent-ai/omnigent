@@ -89,6 +89,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -139,7 +140,7 @@ _ENV_MODEL_EGRESS = "HARNESS_CODEX_MODEL_EGRESS"
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
 
-def _parse_truthy(env_var: str, default: bool) -> bool:
+def _parse_truthy(env_var: str, default: bool, env: Mapping[str, str] | None = None) -> bool:
     """
     Parse a boolean-style env var the same way the claude-sdk
     wrap does.
@@ -149,14 +150,40 @@ def _parse_truthy(env_var: str, default: bool) -> bool:
         empty. Used so each caller can express "unset means
         True" or "unset means False" without duplicating
         empty-string handling.
+    :param env: The environment to read, or ``None`` for this process's.
     :returns: ``True`` if the value is in :data:`_TRUTHY_STRINGS`
         (case-insensitive); ``False`` for any other non-empty
         value; *default* when unset or empty.
     """
-    raw = os.environ.get(env_var, "").strip().lower()
+    raw = (os.environ if env is None else env).get(env_var, "").strip().lower()
     if not raw:
         return default
     return raw in _TRUTHY_STRINGS
+
+
+def codex_child_model_provider(env: Mapping[str, str]) -> str | None:
+    """Return the ``model_provider`` a Codex child launched with *env* pins.
+
+    Reads the same variables :func:`_build_codex_executor` does: a gateway,
+    Databricks profile, gateway host or URL, auth command, or model signer
+    routes the child through a generated provider.
+
+    :param env: The child's environment, e.g. the runner env plus its spawn env.
+    :returns: The pinned provider id, e.g. ``"openai"``; ``""`` when the child is
+        routed through a generated provider; ``None`` when ``config.toml`` decides.
+    """
+    if _parse_truthy(_ENV_GATEWAY, default=False, env=env) or any(
+        env.get(name, "").strip()
+        for name in (
+            _ENV_DATABRICKS_PROFILE,
+            _ENV_GATEWAY_HOST,
+            _ENV_GATEWAY_BASE_URL,
+            _ENV_GATEWAY_AUTH_COMMAND,
+            _ENV_SIGNER_PROVIDER,
+        )
+    ):
+        return ""
+    return env.get(_ENV_MODEL_PROVIDER, "").strip() or None
 
 
 def _resolve_os_env() -> OSEnvSpec:
