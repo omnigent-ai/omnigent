@@ -15,6 +15,7 @@ import hashlib
 import io
 import logging
 import tarfile
+import uuid
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -205,10 +206,14 @@ async def _require_can_mutate(
     raise OmnigentError("Not the owner of this skill", code=ErrorCode.FORBIDDEN)
 
 
-def _skill_location(skill_name: str, scope: str, owner: str | None, tarball: bytes) -> str:
-    digest = hashlib.sha256(tarball).hexdigest()[:16]
+def _skill_location(skill_name: str, scope: str, owner: str | None) -> str:
+    """A key unique to this write, so each row owns its object outright.
+
+    A shared (content-addressed) key would let one request's failure cleanup
+    delete an object that a concurrent request's committed row points at.
+    """
     bucket = "org" if scope == "org" else hashlib.sha256((owner or "").encode()).hexdigest()[:16]
-    return f"skills/{bucket}/{skill_name}/{digest}.tar.gz"
+    return f"skills/{bucket}/{skill_name}/{uuid.uuid4().hex}.tar.gz"
 
 
 def _catalog_response(
@@ -478,17 +483,13 @@ def create_skill_marketplace_router(
         # Every tarball is stored first; the rows then commit in one transaction
         # under the principal's lock, so a refusal leaves no row and no new object.
         items: list[SkillInstall] = []
-        # Locations this request brought into existence. A location that already
-        # held an object is left out: the key is content-addressed, so an
-        # existing row may point at the identical bytes.
+        # Every location is unique to this request, so no other row can point at one.
         created: list[str] = []
         try:
             for skill in packaged:
-                location = _skill_location(skill.entry.name, body.scope, user_id, skill.tarball)
-                is_new = not await asyncio.to_thread(artifact_store.exists, location)
+                location = _skill_location(skill.entry.name, body.scope, user_id)
+                created.append(location)
                 await asyncio.to_thread(artifact_store.put, location, skill.tarball)
-                if is_new:
-                    created.append(location)
                 items.append(
                     SkillInstall(
                         name=skill.entry.name,
@@ -524,10 +525,9 @@ def create_skill_marketplace_router(
             for location in created:
                 _drop_artifact(artifact_store, location)
             raise _invalid(exc) from None
-        # A reinstall with changed content leaves its old object unreferenced.
-        kept = {item.bundle_location for item in items}
+        # A reinstall leaves the row's previous object unreferenced.
         for result in results:
-            if result.replaced_location and result.replaced_location not in kept:
+            if result.replaced_location is not None:
                 _drop_artifact(artifact_store, result.replaced_location)
         return InstalledSkillList(data=[_skill_object(r.skill) for r in results])
 
@@ -582,7 +582,7 @@ def create_skill_marketplace_router(
             raise _invalid(exc) from None
         fresh = packaged[0]
         checked(fresh)
-        location = _skill_location(skill.name, skill.scope, skill.owner_user_id, fresh.tarball)
+        location = _skill_location(skill.name, skill.scope, skill.owner_user_id)
         await asyncio.to_thread(artifact_store.put, location, fresh.tarball)
         try:
             updated = await asyncio.to_thread(
@@ -597,8 +597,7 @@ def create_skill_marketplace_router(
                 user_invocable=fresh.entry.user_invocable,
             )
         except SkillValueError as exc:
-            if location != skill.bundle_location:
-                _drop_artifact(artifact_store, location)
+            _drop_artifact(artifact_store, location)
             raise _invalid(exc) from None
         if updated is None:
             # Removed while the fetch ran: the object just stored belongs to no row.

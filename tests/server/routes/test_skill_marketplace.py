@@ -6,8 +6,10 @@ network and no git; everything else (store, artifact store, routes) is real.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import tarfile
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -289,30 +291,37 @@ async def test_a_failed_install_leaves_no_object_it_created(market) -> None:
     assert len(stored) == 1 and not artifact_store.exists(stored[0])
     assert (await client.get("/v1/installed-skills")).json()["data"] == []
 
-    # A reinstall of identical content targets an existing object. When the
-    # write is refused the object stays, because the committed row needs it.
+    # Two installs of identical content race: the batch that fails afterwards
+    # cleans up only its own objects, so the install that committed still reads.
     artifact_store.put = real_put  # type: ignore[method-assign]
-    first = await client.post(
-        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
-    )
-    assert first.status_code == 201, first.text
-    location = await _location(app, first.json()["data"][0]["id"])
     real_install = app.state.skill_store.install_many
+    failing_batch_waiting = threading.Event()
+    release_failing_batch = threading.Event()
 
-    def refuse(items, **kwargs):  # type: ignore[no-untyped-def]
-        del items, kwargs
-        raise SkillValueError("name is longer than 255 characters")
+    def refuse_the_batch_after_a_rival_commits(items, **kwargs):  # type: ignore[no-untyped-def]
+        if len(items) == 1:
+            return real_install(items, **kwargs)
+        failing_batch_waiting.set()
+        assert release_failing_batch.wait(timeout=10)
+        raise SkillValueError("installing these would exceed the byte budget")
 
-    app.state.skill_store.install_many = refuse
-    refused = await client.post(
+    app.state.skill_store.install_many = refuse_the_batch_after_a_rival_commits
+    failing = asyncio.create_task(
+        client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review", "triage"]}
+        )
+    )
+    assert await asyncio.to_thread(failing_batch_waiting.wait, 10)
+    committed = await client.post(
         "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
     )
+    release_failing_batch.set()
+    assert (await failing).status_code == 400
     app.state.skill_store.install_many = real_install
-    assert refused.status_code == 400
-    assert artifact_store.exists(location)
-    assert (
-        await client.get(f"/v1/installed-skills/{first.json()['data'][0]['id']}/content")
-    ).status_code == 200
+    assert committed.status_code == 201, committed.text
+    skill_id = committed.json()["data"][0]["id"]
+    assert artifact_store.exists(await _location(app, skill_id))
+    assert (await client.get(f"/v1/installed-skills/{skill_id}/content")).status_code == 200
 
 
 @pytest.mark.asyncio
