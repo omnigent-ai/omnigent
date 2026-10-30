@@ -45,6 +45,7 @@ from omnigent.inner.model_egress import (
 )
 from omnigent.llms import Client as LLMClient
 from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.onboarding.ambient import claude_managed_gateway
 from omnigent.onboarding.databricks_config import (
@@ -1234,7 +1235,7 @@ def _resolve_provider_for_build(
         # Global ApiKeyAuth — threaded by the builder's global-auth branch.
         return None
     model = _resolve_spec_model(spec)
-    if model is not None and model.startswith(("databricks-", "databricks/")):
+    if model is not None and is_databricks_model_id(model):
         # The model name itself signals Databricks intent (no pinned profile).
         return _legacy_databricks_provider(None, harness_type=harness_type, for_launch=for_launch)
     effective = effective_config_with_detected(explicit_config)
@@ -1373,7 +1374,7 @@ def _build_claude_sdk_spawn_env(
     # 3. Global config ~/.omnigent/config.yaml auth: — only when spec has
     #    no auth at all (same guard as openai-agents to prevent global defaults
     #    from silently overriding YAML-declared legacy profiles).
-    # 4. Auto-Databricks: databricks-* model prefix triggers Databricks routing.
+    # 4. Auto-Databricks: a Databricks model id triggers Databricks routing.
     provider = _resolve_provider_for_build(spec, harness_type="claude-sdk", for_launch=True)
     if provider is not None:
         configure_agent_harness_with_provider(env, provider, harness_type="claude-sdk")
@@ -1395,10 +1396,10 @@ def _build_claude_sdk_spawn_env(
                 env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] = auth_from_spec.base_url
                 env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] = _key_cmd
         # Enable the gateway for an ApiKeyAuth ``base_url`` (a custom endpoint) or
-        # a ``databricks-`` model; without the flag the executor ignores the base
+        # a Databricks model; without the flag the executor ignores the base
         # URL and falls through to api.anthropic.com.
         if (isinstance(auth_from_spec, ApiKeyAuth) and bool(auth_from_spec.base_url)) or (
-            model is not None and model.startswith(("databricks-", "databricks/"))
+            model is not None and is_databricks_model_id(model)
         ):
             env["HARNESS_CLAUDE_SDK_GATEWAY"] = "true"
     _add_claude_sdk_skills_env(env, spec, workdir)
@@ -2156,8 +2157,8 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
         # Legacy path: executor.config["profile"] (deprecated — use executor.auth instead).
         # DEPRECATED: config["profile"] will be removed once all specs migrate to auth:.
         profile = spec.executor.config.get("profile")
-        if not profile and model and model.startswith(("databricks-", "databricks/")):
-            # databricks- / databricks/ prefix: route to Databricks (avoiding the
+        if not profile and model and is_databricks_model_id(model):
+            # A Databricks model id: route to Databricks (avoiding the
             # OPENAI_API_KEY short-circuit) via the SDK's DEFAULT profile. The
             # ambient DATABRICKS_CONFIG_PROFILE env var is deliberately NOT
             # consulted — credentials are controlled by the spec or by

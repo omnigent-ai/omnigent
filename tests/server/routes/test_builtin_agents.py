@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import httpx
 import pytest_asyncio
+from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -63,6 +64,8 @@ async def test_list_builtin_agents_response_shape(
         assert "id" in agent
         assert "name" in agent
         assert "created_at" in agent
+    # An untrimmed deployment reports an empty list, never a missing field.
+    assert resp.json()["suppressed_agent_names"] == []
 
 
 async def test_builtin_flag_distinguishes_seeded_from_registered(
@@ -87,3 +90,34 @@ async def test_builtin_flag_distinguishes_seeded_from_registered(
     by_id = {a["id"]: a for a in resp.json()["data"]}
     assert by_id[seeded_id]["builtin"] is True
     assert by_id[registered_id]["builtin"] is False
+
+
+async def test_suppressed_agents_are_hidden_and_named(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A suppressed packaged built-in is left out of the list, named, and kept.
+
+    The names let a client that also discovers agents from session history
+    (the web picker) drop a hidden built-in instead of resurfacing it as a
+    custom agent. An operator's own agent is never suppressed.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_store.create(builtin_agent_id("polly"), name="polly", bundle_location="test:///p")
+    agent_store.create(
+        builtin_agent_id("house-agent"), name="house-agent", bundle_location="test:///h"
+    )
+    app.state.suppressed_agent_names = frozenset({"polly", "debby"})
+
+    resp = await client.get("/v1/agents?limit=100")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    names = [a["name"] for a in body["data"]]
+    assert "polly" not in names
+    assert "house-agent" in names
+    assert body["suppressed_agent_names"] == ["debby", "polly"]
+    # Hidden, not deleted: sessions bound to the row can still resolve it.
+    assert agent_store.get_by_name("polly") is not None
