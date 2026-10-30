@@ -96,12 +96,14 @@ it.each([HOST, "other-host"])("gates reveal on an inherited host %s", async (par
   await renderTree({ sessionHostId: null });
   await act(() => setSessionHost("parent", parentHostId));
   const allowed = parentHostId === HOST;
-  expect(fireEvent.contextMenu(screen.getByText("main.ts"))).toBe(!allowed);
+  // The row actions menu always opens; only its reveal item is gated.
+  fireEvent.contextMenu(screen.getByText("main.ts"));
   if (allowed) {
     fireEvent.click(await screen.findByRole("menuitem", { name: "Show in Finder" }));
     expect(revealFile).toHaveBeenCalledWith(HOST, "/Users/me/project/src/main.ts");
   } else {
-    expect(screen.queryByRole("menuitem")).toBeNull();
+    await screen.findByRole("menu");
+    expect(screen.queryByRole("menuitem", { name: "Show in Finder" })).toBeNull();
     expect(revealFile).not.toHaveBeenCalled();
   }
 });
