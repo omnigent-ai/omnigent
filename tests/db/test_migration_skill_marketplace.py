@@ -271,6 +271,10 @@ def test_identities_are_unique_on_the_engine(db_uri: str) -> None:
 def test_a_scope_outside_the_codec_is_refused_by_the_table(db_uri: str) -> None:
     with Session(get_or_create_engine(db_uri)) as session:
         session.add(_installed("review", "org", scope=3))
-        with pytest.raises(sa.exc.IntegrityError, match=r"ck_installed_skills_scope|CHECK"):
+        # MySQL reports a check-constraint violation (error 3819) as OperationalError.
+        with pytest.raises(
+            (sa.exc.IntegrityError, sa.exc.OperationalError),
+            match=r"ck_installed_skills_scope|CHECK",
+        ):
             session.flush()
         session.rollback()

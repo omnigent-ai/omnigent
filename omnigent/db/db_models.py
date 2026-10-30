@@ -1725,10 +1725,11 @@ class BoundedString(TypeDecorator[str]):
 
     def __init__(self, length: int, *, exact: bool = False) -> None:
         super().__init__(length)
+        self.length = length
         self.exact = exact
 
     def load_dialect_impl(self, dialect: Any) -> Any:
-        length = self.impl.length
+        length = self.length
         if self.exact and dialect.name == "mysql":
             return dialect.type_descriptor(
                 MySQLVarchar(length, charset="utf8mb4", collation="utf8mb4_bin")
@@ -1737,7 +1738,7 @@ class BoundedString(TypeDecorator[str]):
 
     def process_bind_param(self, value: str | None, dialect: object) -> str | None:
         del dialect
-        limit = self.impl.length
+        limit = self.length
         if value is not None and len(value) > limit:
             raise ValueError(f"value of {len(value)} characters is longer than {limit}")
         return value
@@ -1779,7 +1780,7 @@ class SqlSkillSource(OmnigentBase):
     ref: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
     name: Mapped[str] = mapped_column(BoundedString(256), nullable=False)
     created_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
-    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     @validates("url", "ref", "name", "created_by")
     def _within_declared_length(self, key: str, value: str | None) -> str | None:
@@ -1793,7 +1794,10 @@ def _within_declared_length(row: OmnigentBase, key: str, value: str | None) -> s
     path; this only turns the failure into a field-named error at construction
     or assignment, where the caller can still see which value was too long.
     """
-    limit = row.__table__.c[key].type.length
+    column_type = row.__table__.c[key].type
+    if not isinstance(column_type, BoundedString):
+        raise TypeError(f"{key} is not a BoundedString column")
+    limit = column_type.length
     if value is not None and len(value) > limit:
         raise ValueError(f"{key} is longer than {limit} characters")
     return value
@@ -1873,8 +1877,8 @@ class SqlInstalledSkill(OmnigentBase):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
     user_invocable: Mapped[bool] = mapped_column(Boolean, nullable=False)
     installed_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
-    installed_at: Mapped[int] = mapped_column(Integer, nullable=False)
-    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    installed_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     @validates(
         "name",
@@ -1920,7 +1924,7 @@ class SqlSkillPrincipal(OmnigentBase):
     principal: Mapped[str] = mapped_column(BoundedString(133, exact=True), primary_key=True)
     installed_count: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     @validates("principal")
     def _within_declared_length(self, key: str, value: str | None) -> str | None:

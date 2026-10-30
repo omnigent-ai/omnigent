@@ -38,7 +38,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def _exact_string(length: int) -> sa.String:
-    """Identity text compared byte for byte on MySQL too; see ``db_models._exact_string``."""
+    """Identity text compared byte for byte on MySQL too; see ``db_models.BoundedString``."""
     return sa.String(length).with_variant(
         mysql.VARCHAR(length, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
     )
@@ -53,7 +53,7 @@ def _skill_sources_columns() -> list[sa.Column]:
         sa.Column("ref", _exact_string(255), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
         sa.Column("created_by", sa.String(128), nullable=True),
-        sa.Column("created_at", sa.Integer(), nullable=False),
+        sa.Column("created_at", sa.BigInteger(), nullable=False),
     ]
 
 
@@ -80,8 +80,8 @@ def _installed_skills_columns() -> list[sa.Column]:
         # while it is still delivered to the agent.
         sa.Column("user_invocable", sa.Boolean(), nullable=False),
         sa.Column("installed_by", sa.String(128), nullable=True),
-        sa.Column("installed_at", sa.Integer(), nullable=False),
-        sa.Column("updated_at", sa.Integer(), nullable=True),
+        sa.Column("installed_at", sa.BigInteger(), nullable=False),
+        sa.Column("updated_at", sa.BigInteger(), nullable=True),
     ]
 
 
@@ -92,7 +92,7 @@ def _skill_principals_columns() -> list[sa.Column]:
         # Maintained under the row's lock: a quota check reads these, never the rows.
         sa.Column("installed_count", sa.Integer(), nullable=False),
         sa.Column("enabled_bytes", sa.BigInteger(), nullable=False),
-        sa.Column("created_at", sa.Integer(), nullable=False),
+        sa.Column("created_at", sa.BigInteger(), nullable=False),
     ]
 
 
@@ -145,6 +145,7 @@ def _existing_indexes(table: str) -> dict[str, bool]:
     return {
         index["name"]: bool(index["unique"])
         for index in sa.inspect(op.get_bind()).get_indexes(table)
+        if index["name"] is not None
     }
 
 
