@@ -36,6 +36,10 @@ The panel renders `sign_in_required` as an amber row with a **Sign in** link tha
 harness is reported as `sign_in_required`, it polls this file (through the host inventory) every few seconds, so flipping the entry
 to `connected` updates the row.
 
+Flipping a `claude` entry to `connected` also lets a running claude-sdk session use the
+server: Claude Code connects MCP servers only when the session starts, so at its next
+turn the session reconnects a server that failed to connect before the sign-in.
+
 ## Rules the reader enforces
 
 - An entry naming a server the host did not discover is ignored. Report servers under
