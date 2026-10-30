@@ -282,6 +282,31 @@ async def test_presession_catalog_matches_filtered_invocations(
     assert response.json()["warnings"] == []
 
 
+async def test_agent_object_without_loadable_bundle_keeps_user_settings(
+    presession_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _, _, _, agent, _ = presession_app
+
+    def fail_load(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("bundle unavailable")
+
+    monkeypatch.setattr(app.state.agent_cache, "load", fail_load)
+    from omnigent.server.routes.builtin_agents import _to_agent_object as builtin_agent_object
+    from omnigent.server.routes.sessions.routes_permissions import (
+        _to_agent_object as session_agent_object,
+    )
+
+    for agent_object in (
+        builtin_agent_object(agent, app.state.agent_cache),
+        session_agent_object(agent, app.state.agent_cache, mcp_servers_editable=True),
+    ):
+        # Without the spec, `skills: none` can't be told apart, so /mcp keeps user servers.
+        assert agent_object.loads_user_settings is True
+        assert agent_object.harness is None
+        assert agent_object.mcp_servers == []
+        assert agent_object.skills == []
+
+
 async def test_presession_discovery_rejects_private_agent(
     presession_app, monkeypatch: pytest.MonkeyPatch
 ) -> None:
