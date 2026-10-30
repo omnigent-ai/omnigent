@@ -65,6 +65,10 @@ services:
       # Comma-separated feature overrides: name enables, -name disables.
       # Empty uses defaults; see .env.example.
       OMNIGENT_FEATURES: "${OMNIGENT_FEATURES:-}"
+      # Packaged built-in agents to offer (comma-separated); see README.
+      # Deliberately value-less: an unset .env entry stays unset in the
+      # container (keep all), while an explicit empty value keeps none.
+      OMNIGENT_SEEDED_AGENTS:
       # Anchor the server's data dir on the persistent volume so
       # file-backed operator config survives container restarts:
       # the admin roster (/data/admins) and allowed-domains file
@@ -120,6 +124,9 @@ services:
       # IdPs (e.g. Microsoft Entra ID) that issue preferred_username
       # instead of email. Empty means the default (email); see .env.example.
       OMNIGENT_OIDC_EMAIL_CLAIM: "${OMNIGENT_OIDC_EMAIL_CLAIM:-}"
+      # Set to 0 for IdPs (e.g. Cloudflare Access) that omit auth_time on
+      # forced re-authentication. Empty keeps the check; see .env.example.
+      OMNIGENT_OIDC_REQUIRE_REAUTH: "${OMNIGENT_OIDC_REQUIRE_REAUTH:-}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —

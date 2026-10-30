@@ -108,6 +108,7 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    SessionActivity,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -162,6 +163,31 @@ def _encode_session_state(
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
+# ``list_conversations(search_scope=...)`` values; see its docstring.
+_SEARCH_SCOPES = frozenset({"all", "title", "content"})
+
+# Escapes LIKE wildcards in a search query. ``/``, as SQLAlchemy's own
+# ``autoescape`` uses, sidesteps MySQL's backslash handling in string literals.
+_LIKE_ESCAPE = "/"
+
+
+def _like_contains_pattern(query: str) -> str:
+    """
+    Return a lowercase ``LIKE`` pattern matching ``query`` as a literal substring.
+
+    :param query: The user's search string, e.g. ``"50%_off"``.
+    :returns: The pattern with ``%``, ``_`` and the escape character escaped,
+        e.g. ``"%50/%/_off%"``; pass ``escape=_LIKE_ESCAPE`` alongside it.
+    """
+    escaped = (
+        query.lower()
+        .replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", f"{_LIKE_ESCAPE}%")
+        .replace("_", f"{_LIKE_ESCAPE}_")
+    )
+    return f"%{escaped}%"
+
+
 # Upper bound on rows fetched per SQL statement when listing conversation
 # items. A deployed managed-Postgres backend failed one oversized read of a
 # large conversation (multi-megabyte pages 500'd at limit>=500 while limit<=400
@@ -170,6 +196,9 @@ _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 # read size (row payloads vary) while the default 100-row page stays the
 # single statement it always was.
 _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
+
+# Max stable ids bound per idempotency-probe statement; each can match a full row.
+_APPEND_STABLE_ID_PROBE_BATCH = _LIST_ITEMS_MAX_ROWS_PER_STATEMENT
 
 # How many co-located sessions ``has_other_live_session_in_workspace`` will
 # name before it stops looking. Real directories hold one or two sessions; the
@@ -660,7 +689,7 @@ def _fetch_search_snippets(
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
+    pattern = _like_contains_pattern(query)
     workspace_id = current_workspace_id()
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
@@ -672,7 +701,7 @@ def _fetch_search_snippets(
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+        SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -1354,6 +1383,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in meta_rows
         }
+
+    def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SessionActivity]:
+        """One ``SELECT`` per database for the ids' update times and live statuses."""
+        if not conversation_ids:
+            return {}
+        unique_ids = list(set(conversation_ids))
+        with self._conv_session("get_session_activity") as session:
+            updated = session.execute(
+                select(SqlConversation.id, SqlConversation.updated_at).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(unique_ids),
+                )
+            ).all()
+        if not updated:
+            return {}
+        with self._session("get_session_activity") as session:
+            meta_rows = session.execute(
+                select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_([row.id for row in updated]),
+                )
+            ).all()
+        statuses = {row.id: row.live_status for row in meta_rows}
+        activity: dict[str, SessionActivity] = {}
+        for row in updated:
+            status = statuses.get(row.id)
+            try:
+                live_status = decode_session_live_status(status) if status is not None else None
+            except ValueError:
+                # A newer replica's status must not drop the rest of the batch.
+                live_status = None
+            activity[row.id] = SessionActivity(updated_at=row.updated_at, live_status=live_status)
+        return activity
 
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
         """
@@ -2565,26 +2627,29 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
-            # Idempotent-append probe: one query for the whole batch. Rows
-            # already persisted under a stable id ARE those items' append
-            # result; running under the lock just taken serializes with a
-            # concurrent retry (READ COMMITTED gives this statement a fresh
-            # snapshot after the lock wait), so it cannot double-insert.
-            stable_ids = [item.stable_id for item in items if item.stable_id is not None]
+            # Idempotent-append probe: rows already stored under a stable id are
+            # those items' result. Each id is a bind parameter, so probe in bounded
+            # batches; the lock just taken serializes concurrent retries.
+            stable_ids = list(
+                dict.fromkeys(item.stable_id for item in items if item.stable_id is not None)
+            )
             existing_by_id: dict[str, SqlConversationItem] = {}
             deduped_by_id: dict[str, ConversationItem] = {}
             if stable_ids:
-                existing_rows = (
-                    session.execute(
-                        select(SqlConversationItem).where(
-                            SqlConversationItem.workspace_id == current_workspace_id(),
-                            SqlConversationItem.conversation_id == conversation_id,
-                            SqlConversationItem.id.in_(stable_ids),
+                existing_rows: list[SqlConversationItem] = []
+                for start in range(0, len(stable_ids), _APPEND_STABLE_ID_PROBE_BATCH):
+                    batch = stable_ids[start : start + _APPEND_STABLE_ID_PROBE_BATCH]
+                    existing_rows.extend(
+                        session.execute(
+                            select(SqlConversationItem).where(
+                                SqlConversationItem.workspace_id == current_workspace_id(),
+                                SqlConversationItem.conversation_id == conversation_id,
+                                SqlConversationItem.id.in_(batch),
+                            )
                         )
+                        .scalars()
+                        .all()
                     )
-                    .scalars()
-                    .all()
-                )
                 replaced_ids = {item.replaces_pending_id for item in items}
                 existing_rows = [
                     row
@@ -2911,6 +2976,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
         accessible_by: str | None = None,
         owned_by: str | None = None,
         shared_only: bool = False,
@@ -2961,6 +3027,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
             Postgres without extra extensions.
+        :param search_scope: Which matches ``search_query`` returns:
+            ``"all"`` (title or content), ``"title"`` (title matches
+            only), or ``"content"`` (content matches whose title does
+            not match), so the two groups never overlap. Ignored when
+            ``search_query`` is empty.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2989,6 +3060,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``False`` (default) disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
+        :raises ValueError: If ``search_scope`` is not a known scope.
         """
         from omnigent.server.auth import LEVEL_OWNER
 
@@ -3014,6 +3086,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         needs_meta_filter = (accessible_by is not None) or (owned_by is not None) or shared_only
         if shared_only and accessible_by is None:
             raise ValueError("shared_only=True requires accessible_by to be set")
+        if search_scope not in _SEARCH_SCOPES:
+            raise ValueError(f"invalid search_scope: {search_scope!r}")
 
         # ACL strategy. Single-DB (the AP and Omnigent tables share one bind):
         # push the permission check into the conversations query as a
@@ -3179,8 +3253,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:
-                pattern = f"%{search_query.lower()}%"
-                title_match = func.lower(SqlConversation.title).like(pattern)
+                pattern = _like_contains_pattern(search_query)
+                title_match = func.lower(SqlConversation.title).like(pattern, escape=_LIKE_ESCAPE)
                 # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
                 # form is uncorrelated, so the match set is built for the WHOLE
                 # workspace before the outer query discards every row the caller
@@ -3200,11 +3274,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                        SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE),
                     )
                     .exists()
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                if search_scope == "title":
+                    stmt = stmt.where(title_match)
+                elif search_scope == "content":
+                    stmt = stmt.where(~title_match, content_match)
+                else:
+                    stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -3336,7 +3415,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(session, row_ids, search_query)
+                if search_query and search_scope != "title"
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
@@ -3487,6 +3568,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        label_updates: dict[str, str] | None = None,
     ) -> ConversationUpdateResult | None:
         """
         Update mutable fields on a conversation.
@@ -3532,6 +3614,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             append). JSON-encoded into the column.
         :param archived: New archived state. ``True`` archives,
             ``False`` unarchives, ``None`` leaves unchanged.
+        :param label_updates: Labels to merge in the same transaction as model
+            and effort settings. Omitted labels remain unchanged.
         :returns: The updated conversation and requested model-setting change
             flags, or ``None`` if the conversation does not exist.
         """
@@ -3628,6 +3712,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 row.archived = archived
+                ap_changed = True
+            if label_updates:
+                _upsert_labels(ap_sess, conversation_id, label_updates, now)
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now
@@ -5029,6 +5116,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     mapped_boundary_id = copied_item_ids.get(boundary_id)
                     if mapped_boundary_id is not None:
                         compaction_data["last_item_id"] = mapped_boundary_id
+                    # Replay snapshots own attachment references just like message rows.
+                    if file_id_map:
+                        for message in compaction_data.get("compacted_messages") or []:
+                            if isinstance(message, dict):
+                                _remap_item_file_references(message, file_id_map, new_conv_id)
                     remapped.append(json.dumps(compaction_data))
                 remapped_compaction_data = dict(
                     zip(

@@ -94,6 +94,7 @@ module.exports = pi => {
         await ctx.ui.select("Select color", ["Blue", "Red"]),
         await ctx.ui.input("Enter name", "Name"),
         await ctx.ui.editor("Edit note", "original note"),
+        await ctx.ui.editor("Cancel edit", "keep original"),
       ];
       fs.writeFileSync(RESULT_PATH, JSON.stringify(values));
     }
@@ -147,6 +148,15 @@ module.exports = pi => {
             response.raise_for_status()
             return response.json().get("pending_elicitations") or []
 
+        def sidebar_pending():
+            response = client.get("/v1/sessions", params={"visibility": "all"})
+            response.raise_for_status()
+            return next(
+                row["pending_elicitations_count"]
+                for row in response.json()["data"]
+                if row["id"] == session_id
+            )
+
         def replied(marker):
             response = client.get(
                 f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
@@ -172,7 +182,8 @@ module.exports = pi => {
             ("Confirm choice", "decline", None),
             ("Select color", "accept", {"0": "Blue"}),
             ("Enter name", "accept", {"0": "Ada"}),
-            ("Edit note", "accept", {"0": "two\nlines"}),
+            ("Edit note", "accept", {"0": "Keep as-is"}),
+            ("Cancel edit", "decline", None),
         ]:
             poll_until(
                 lambda previous_id=previous_id: any(
@@ -196,9 +207,10 @@ module.exports = pi => {
                 },
             ).raise_for_status()
         poll_until(result.exists, timeout_s=60, interval_s=0.1)
-        assert json.loads(result.read_text()) == [False, "Blue", "Ada", "two\nlines"]
+        assert json.loads(result.read_text()) == [False, "Blue", "Ada", "Keep as-is", None]
         poll_until(lambda: replied("DIALOGS_ANSWERED"), timeout_s=60, interval_s=0.1)
         poll_until(lambda: not pending(), timeout_s=60, interval_s=0.1)
+        poll_until(lambda: sidebar_pending() == 0, timeout_s=15, interval_s=0.1)
         send_user_text(client, session_id=session_id, text="PI_DIALOG_FOLLOWUP")
         poll_until(lambda: replied("FOLLOWUP_WORKED"), timeout_s=60, interval_s=0.1)
         requests = get_mock_requests(mock_llm_server_url)
@@ -213,3 +225,4 @@ module.exports = pi => {
             assert outcome["value"] is False and outcome["elapsedMs"] < 1500, outcome
             poll_until(lambda: replied("ABORT_CONTINUED"), timeout_s=60, interval_s=0.1)
             poll_until(lambda: not pending(), timeout_s=60, interval_s=0.1)
+            poll_until(lambda: sidebar_pending() == 0, timeout_s=15, interval_s=0.1)
