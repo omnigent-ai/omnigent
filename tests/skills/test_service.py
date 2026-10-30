@@ -43,13 +43,17 @@ def test_catalog_cache_is_bounded_and_drops_expired_entries_first(
 
     clock = {"now": 1_000.0}
     monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
-    fetcher = SkillFetcher(clone=fake_clone(plain_repo), ttl_s=100, max_cached=2)
+    clone = fake_clone(plain_repo)
+    fetcher = SkillFetcher(clone=clone, ttl_s=100, max_cached=2)
 
     for index in range(3):
         fetcher.catalog(f"acme/r{index}")
     # Any signed-in user can preview repositories; retention never exceeds the cap.
     assert fetcher.cached_catalogs == 2
-    assert fetcher.catalog("acme/r0").fetched_at == clock["now"]  # evicted, so refetched
+    fetcher.catalog("acme/r2")
+    assert len(clone.calls) == 3  # still cached
+    fetcher.catalog("acme/r0")
+    assert len(clone.calls) == 4  # evicted, so cloned again
 
     clock["now"] += 200
     fetcher.catalog("acme/r9")

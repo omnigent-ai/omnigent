@@ -216,6 +216,42 @@ def test_token_travels_in_the_environment_not_the_command_line(
     assert "GIT_CONFIG_COUNT" not in seen[1][1]
 
 
+class _HangingGit:
+    """A git that never finishes: every wait times out until it is killed."""
+
+    returncode: int | None = None
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self.killed = False
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        if self.killed:
+            self.returncode = -9
+            return "", ""
+        raise subprocess.TimeoutExpired("git", timeout or 0)
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _no_git(*_args: object, **_kwargs: object) -> None:
+    raise FileNotFoundError("git")
+
+
+@pytest.mark.parametrize(
+    ("popen", "message"),
+    [(_no_git, "needs git on your PATH"), (_HangingGit, "Timed out cloning")],
+)
+def test_clone_reports_a_missing_or_hanging_git(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, popen: object, message: str
+) -> None:
+    monkeypatch.setattr(git_source.subprocess, "Popen", popen)
+    monkeypatch.setattr(git_source, "CLONE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(git_source, "CHECKOUT_POLL_S", 0.01)
+    with pytest.raises(git_source.GitSourceError, match=message):
+        git_source.clone_github_source("https://github.com/a/b.git", None, tmp_path / "r")
+
+
 def test_a_clone_is_killed_once_it_exceeds_its_byte_budget(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

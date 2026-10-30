@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from sqlalchemy import String, Table
 
-from omnigent.db.db_models import BoundedString, SqlInstalledSkill, SqlSkillSource
+from omnigent.db.db_models import (
+    BoundedString,
+    SqlInstalledSkill,
+    SqlSkillPrincipal,
+    SqlSkillSource,
+)
 from omnigent.skills import limits
 
 STORED_VALUE_LIMIT_BYTES = 16_384
@@ -18,7 +23,7 @@ def _string_lengths(table: Table) -> dict[str, int]:
     """
     plain = [c.name for c in table.c if type(c.type) is String]
     assert plain == [], plain
-    return {c.name: c.type.impl.length for c in table.c if isinstance(c.type, BoundedString)}
+    return {c.name: c.type.length for c in table.c if isinstance(c.type, BoundedString)}
 
 
 def test_column_bounds_match_the_schema() -> None:
@@ -40,6 +45,9 @@ def test_column_bounds_match_the_schema() -> None:
         "ref": limits.MAX_REF_CHARS,
         "name": limits.MAX_DISPLAY_NAME_CHARS,
         "created_by": limits.MAX_USER_ID_CHARS,
+    }
+    assert _string_lengths(SqlSkillPrincipal.__table__) == {
+        "principal": limits.MAX_PRINCIPAL_CHARS,
     }
     # The widest column stays under the stored-value limit at four bytes a character.
     widest = max(
