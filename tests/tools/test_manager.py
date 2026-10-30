@@ -60,7 +60,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # Read-only session discovery tools are registered for every
         # agent (a user-added agent that declares no sub-agents still
         # needs to list/peek/get-info on its session-mates); the
-        # mutating tools (sys_session_send/close/create/share) are
+        # lifecycle/access tools (sys_session_close/create/share) are
         # opt-in via tools.agents or the top-level ``spawn: true``.
         "sys_session_get_history",
         "sys_session_list",
@@ -68,7 +68,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_rename",
         # Peer messaging is advertised for every agent; the server
         # enforces the orchestration flag and source authorization.
-        "sys_session_message",
+        "sys_session_send",
         "ui_open_file",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
@@ -126,11 +126,12 @@ def _non_lifecycle_schemas(
     ]
 
 
-@pytest.mark.parametrize("tool_name", ["sys_session_rename", "sys_session_message"])
+@pytest.mark.parametrize("tool_name", ["sys_session_rename", "sys_session_send"])
 def test_session_tools_are_registered_for_every_agent(tool_name: str) -> None:
     names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
 
     assert tool_name in names
+    assert "sys_session_message" not in names
 
 
 @pytest.fixture()
@@ -420,20 +421,8 @@ def test_client_schemas_isolate_a_failing_tool(
     assert any("boom" in record.getMessage() for record in caplog.records)
 
 
-def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
-    """
-    Read-only session discovery (``sys_session_get_history`` /
-    ``sys_session_list`` / ``sys_session_get_info``) is registered for
-    **every** agent, even one that declares no sub-agents — so a
-    user-added agent can read its session-mates for context. The
-    opt-in session-spawn tools (``sys_session_send`` /
-    ``sys_session_close`` / ``sys_session_create`` /
-    ``sys_session_share``) are NOT registered without an opt-in
-    (``tools.agents`` or top-level ``spawn: true``). A regression that
-    registered the writes by default would expose the child-session
-    spawn surface — and, for share, the ability to expose the session
-    to a third party or ``__public__`` — to every custom agent.
-    """
+def test_session_reads_and_send_registered_but_spawn_and_share_gated() -> None:
+    """Every agent can address sessions; spawning and sharing remain opt-in."""
     mgr = ToolManager(_make_spec([]))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
     assert "sys_session_get_history" in names
@@ -443,7 +432,7 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     # in _register_sub_agent_tools regressed and the orchestrator can't
     # check session status.
     assert "sys_session_get_info" in names
-    assert "sys_session_send" not in names
+    assert "sys_session_send" in names
     assert "sys_session_close" not in names
     assert "sys_session_create" not in names
     # Sharing has its OWN dedicated `share:` flag (default `none`), so it
@@ -451,8 +440,7 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     # regression registering it by default would let any prompt-injected
     # agent expose its session (incl. via __public__).
     assert "sys_session_share" not in names
-    # Model awareness pairs with the dispatch grant — without send there
-    # is no args.model to pick, so the listing tool must stay gated too.
+    # Model overrides apply to creation, so model listing stays gated.
     assert "sys_list_models" not in names
     # The read-only sys_agent_get/list/download stay always-on.
     assert "sys_agent_get" in names
@@ -484,9 +472,10 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_share" not in names
 
 
-def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
+@pytest.mark.parametrize("spawn", [False, True])
+def test_session_send_schema_drops_named_mode_without_sub_agents(spawn: bool) -> None:
     """
-    With the ``spawn: true`` opt-in but no declared sub-agents,
+    With or without ``spawn: true``, when no sub-agents are declared,
     ``sys_session_send``'s schema omits the named-mode ``agent`` /
     ``title`` parameters (an empty enum is unusable and invalid for
     some providers) and advertises only the ``session_id`` mode; with
@@ -495,7 +484,7 @@ def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
     ``"enum": []``, providers that validate schemas would reject the
     tool list outright.
     """
-    bare = ToolManager(AgentSpec(spec_version=1, spawn=True))
+    bare = ToolManager(AgentSpec(spec_version=1, spawn=spawn))
     bare_schema = next(
         s for s in bare.get_tool_schemas() if s["function"]["name"] == "sys_session_send"
     )
@@ -604,7 +593,7 @@ def test_share_non_public_registers_share_tool_without_public() -> None:
     schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
     assert "sys_session_share" in schemas
     # Sharing is decoupled from spawn — none of the spawn writes ride along.
-    assert "sys_session_send" not in schemas
+    assert "sys_session_send" in schemas
     assert "sys_session_close" not in schemas
     assert "sys_session_create" not in schemas
     # non-public must not advertise the public sentinel.

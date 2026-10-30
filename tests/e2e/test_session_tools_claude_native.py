@@ -518,7 +518,8 @@ def test_claude_native_relay_advertises_broadened_orchestrator_surface(
         # tools.agents, no spawn: true), so the gated spawn-writes must
         # NOT be relayed — native gating parity with the ToolManager
         # gate non-native harnesses get via request.tools.
-        gated_writes = {"sys_session_create", "sys_session_send", "sys_session_close"}
+        assert "sys_session_send" in relay_tools
+        gated_writes = {"sys_session_create", "sys_session_close"}
         leaked = gated_writes & relay_tools
         assert not leaked, (
             f"tool_relay.json leaked spawn-write tools {sorted(leaked)} for an agent "

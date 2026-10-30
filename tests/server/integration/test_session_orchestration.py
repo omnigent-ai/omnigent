@@ -53,8 +53,8 @@ async def peers(auth_client, auth_app, db_uri, monkeypatch):
 async def _send(client, source, target, message="Please inspect the PR"):
     return json.loads(
         await execute_tool(
-            tool_name="sys_session_message",
-            arguments=json.dumps({"session_id": target["id"], "message": message}),
+            tool_name="sys_session_send",
+            arguments=json.dumps({"session_id": target["id"], "args": message}),
             server_client=client,
             conversation_id=source["id"],
         )
@@ -93,6 +93,7 @@ async def test_private_sender_can_message_shared_receiver(
         assert not captured.get("posts")
         return
     assert result.get("queued") is True, result
+    assert result["reply_mode"] == "poll"
     assert "Please inspect the PR" in json.dumps(captured)
     items = await auth_client.get(f"/v1/sessions/{target['id']}/items")
     assert f"[Message from session {source['id']}]" in items.text

@@ -7692,12 +7692,12 @@ async def test_agent_tools_map_404_to_agent_not_found(
         pytest.param("none", set(), id="no-opt-in"),
         pytest.param(
             "agents",
-            {"sys_session_send", "sys_session_close"},
+            {"sys_session_close"},
             id="declared-agents",
         ),
         pytest.param(
             "spawn",
-            {"sys_session_send", "sys_session_close", "sys_session_create"},
+            {"sys_session_close", "sys_session_create"},
             id="spawn-flag",
         ),
     ],
@@ -7757,15 +7757,17 @@ def test_native_relay_builtin_set_matches_toolmanager_gating(
     assert {"sys_session_list", "sys_session_get_history", "sys_session_get_info"} <= relayed
     assert {"sys_call_async", "sys_read_inbox", "sys_cancel_async", "sys_cancel_task"} <= relayed
     assert {"list_comments", "update_comment"} <= relayed
+    assert "sys_session_send" in relayed
+    assert "sys_session_message" not in relayed
 
     # Exact-set check on the writes: an extra name means a grant leaked
     # beyond its arm (e.g. create from tools.agents alone — letting a
     # whitelisted-sub-agents spec launch arbitrary bundles); a missing
     # name strands an opted-in agent.
-    spawn_writes = {"sys_session_send", "sys_session_close", "sys_session_create"}
+    spawn_writes = {"sys_session_close", "sys_session_create"}
     assert relayed & spawn_writes == expected_writes
-    # Model awareness rides the dispatch grant: relayed iff send is.
-    assert ("sys_list_models" in relayed) == ("sys_session_send" in expected_writes)
+    # Model awareness rides the creation grant, not messaging.
+    assert ("sys_list_models" in relayed) == (opt_in != "none")
     # Advise-models also requires a routing client; default caps have none.
     assert "sys_advise_models" not in relayed
 
@@ -9234,42 +9236,33 @@ async def test_sys_session_send_failed_continuation_receipts_its_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_send_session_id_posts_to_direct_child(
+async def test_session_tools_direct_child_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    ``sys_session_send`` in by-session-id mode verifies the target is a
-    direct child of the caller, posts the message, and returns a running
-    handle. Proves the unified session_id mode: the message reaches the
-    existing child and the handle carries its id with ``status:running``
-    (the result is delivered asynchronously via ``sys_read_inbox``).
-
-    :param monkeypatch: Stubs the runner-local child registration so the
-        dispatch runs without a live runner.
-    """
+    """Send to a direct child retains its task handle and inbox tracking."""
     from omnigent.runner.tool_dispatch import execute_tool
 
     monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-
+    parent_id = "a" * 32
+    child_id = "b" * 32
     event_posts: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
-            # Target IS a direct child of the caller.
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
             return httpx.Response(
                 200,
                 json={
-                    "id": "conv_child",
-                    "parent_session_id": "conv_caller",
+                    "id": child_id,
+                    "parent_session_id": parent_id,
                     "title": "researcher:auth",
                 },
             )
-        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+        if request.method == "PATCH" and request.url.path == f"/v1/sessions/{child_id}":
             return httpx.Response(200, json={"ok": True})
-        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
             event_posts.append(json.loads(request.content))
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -9279,75 +9272,118 @@ async def test_sys_session_send_session_id_posts_to_direct_child(
         try:
             output = await execute_tool(
                 tool_name="sys_session_send",
-                arguments=json.dumps({"session_id": "conv_child", "args": "continue please"}),
+                arguments=json.dumps({"session_id": child_id, "args": "continue please"}),
                 server_client=server_client,
-                conversation_id="conv_caller",
+                conversation_id=parent_id,
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
                 session_inbox=session_inbox,
             )
+            result = json.loads(output)
+            assert len(event_posts) == 1
+            assert event_posts[0]["type"] == "message"
+            assert event_posts[0]["data"]["content"][0]["text"] == "continue please"
+            assert result["conversation_id"] == child_id
+            assert result["task_id"] == child_id
+            assert result["kind"] == "sub_agent"
+            assert result["status"] == "launching"
+            assert "reply_mode" not in result
+            assert subagent_work.get_subagent_work(child_id) is not None
+            assert subagent_work._session_inboxes_ref[parent_id] is session_inbox
         finally:
-            subagent_work.unregister_subagent_work("conv_child")
-            subagent_work._session_inboxes_ref.pop("conv_caller", None)
-
-    # Message reached the existing child; handle carries its id + running status.
-    assert event_posts[0]["data"]["content"][0]["text"] == "continue please"
-    handle = json.loads(output)
-    assert handle["conversation_id"] == "conv_child"
-    assert handle["status"] == "launching"
+            subagent_work.unregister_subagent_work(child_id)
+            subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio
-async def test_sys_session_send_session_id_rejects_non_child() -> None:
-    """
-    By-session-id send refuses a target that is NOT a direct child of the
-    caller (``parent_session_id`` mismatch) — returning
-    ``session_out_of_tree`` and posting NO message. This is the
-    child-only safety guarantee: an orchestrator can't drive a sibling or
-    an unrelated session it merely has read access to. If the parentage
-    check regressed, the message would be posted and the assertion on
-    ``event_posts`` would fail.
-    """
+@pytest.mark.parametrize("parent", [None, "another_parent"])
+@pytest.mark.parametrize("status", [202, 403])
+@pytest.mark.parametrize("message_args", ["hi", {"input": "hi", "purpose": "review"}])
+async def test_sys_session_send_session_id_routes_non_child_through_peer_gate(
+    parent, status, message_args
+) -> None:
+    """Peer sends never use child events or tracking, even after a gate refusal."""
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
     from omnigent.runner.tool_dispatch import execute_tool
 
-    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    event_posts: list[dict[str, Any]] = []
+    target = "b" * 32
+    source = "a" * 32
+    event_posts = []
 
-    async def _server_handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_other":
-            # Target's parent is someone ELSE, not the caller.
+    def respond(request):
+        if request.method == "GET":
+            assert request.url.path == f"/v1/sessions/{target}"
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+            }
             return httpx.Response(
                 200,
                 json={
-                    "id": "conv_other",
-                    "parent_session_id": "conv_someone_else",
-                    "title": "x:y",
+                    "id": target,
+                    "parent_session_id": parent,
+                    "labels": {"omnigent.created_by_session_id": source},
                 },
             )
-        if request.url.path == "/v1/sessions/conv_other/events":
-            event_posts.append(json.loads(request.content))
-            return httpx.Response(200, json={"ok": True})
-        return httpx.Response(404, json={"error": str(request.url)})
+        assert request.method == "POST"
+        assert request.url.path == f"/v1/sessions/{target}/events"
+        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == source
+        event_posts.append(json.loads(request.content))
+        return httpx.Response(
+            status, json={"queued": True} if status == 202 else {"detail": "refused"}
+        )
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        try:
-            output = await execute_tool(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
                 tool_name="sys_session_send",
-                arguments=json.dumps({"session_id": "conv_other", "args": "hi"}),
-                server_client=server_client,
-                conversation_id="conv_caller",
-                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
-                session_inbox=session_inbox,
+                arguments=json.dumps({"session_id": target, "args": message_args}),
+                server_client=client,
+                conversation_id=source,
             )
-        finally:
-            subagent_work._session_inboxes_ref.pop("conv_caller", None)
+        )
+    assert event_posts == [{"type": "session_message", "data": {"message": "hi"}}]
+    assert subagent_work.get_subagent_work(target) is None
+    assert source not in subagent_work._session_inboxes_ref
+    assert "task_id" not in result
+    if status == 202:
+        assert result["queued"] is True
+        assert result["reply_mode"] == "poll"
+        assert "sys_session_get_history" in result["message"]
+    else:
+        assert result["error"] == "Session message refused"
+        assert "reply_mode" not in result
 
-    info = json.loads(output)
-    assert info["error"] == "session_out_of_tree"
-    # No message was posted to the non-child session.
-    assert event_posts == []
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["not-a-session-id", "b" * 32 + "?unexpected"])
+async def test_sys_session_send_rejects_invalid_destination_without_delivery(target) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        assert request.method == "GET"
+        return httpx.Response(404, json={"detail": "Session not found"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps({"session_id": target, "args": "Continue the task"}),
+            server_client=client,
+            conversation_id="a" * 32,
+        )
+    if "?" in target:
+        assert result.startswith("Error: sys_session_send failed to look up session:")
+        assert requests == []
+    else:
+        assert json.loads(result)["error"] == "session_not_found"
+        assert len(requests) == 1
 
 
 @pytest.mark.parametrize("empty_output", ["", "   ", "\n\t "])

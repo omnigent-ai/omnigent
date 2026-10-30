@@ -8,8 +8,15 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 ## Sub-features
 
 - `message`: private sender, same owner and workspace; shared destinations are
-  allowed and their readers see the message. Normal queue/steering applies.
-- `read-results`: the manager reads history/status; replies are not forwarded.
+  allowed and their readers see the message. Use `sys_session_send(session_id, args)`;
+  normal queue/steering applies. This is the single session-send tool; parentage
+  selects child tracking or peer delivery automatically.
+- `placement-choice`: natural-language requests distinguish a child under the
+  current conversation from a separate top-level session on the same host.
+  A follow-up reuses the chosen worker through the same send tool.
+- `read-results`: peer sends return `reply_mode: "poll"`; the manager reads
+  history/status and replies are not forwarded. Direct-child sends keep their
+  tracked task handles, inbox results and completion wake notices.
   Existing owner-authorized reads remain allowed when a session is shared.
 - `created-by`: independent workers record their creating session. The worker's
   Chat/Terminal header rechecks access when opened, hides attribution during the
@@ -43,7 +50,7 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 ## How to get to it (user POV)
 
 - In an SDK session's Chat, ask the agent to send a task using
-  `sys_session_message`, then inspect the destination's history.
+  `sys_session_send(session_id=…, args=…)`, then inspect the destination's history.
 - In a native session's Chat or agent terminal, ask for the same operation;
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with
@@ -88,8 +95,9 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   Both harnesses also exercise a server restart with the explicit kill switch:
   existing runners remain opted in, but their subsequent peer sends and independent
   creates are refused without writes; session-info reads still work.
+  Both harnesses check the model receives only the unified send tool.
   It also fires an owner-created schedule through the real server/host and checks
-  that the resulting worker cannot message a peer or create an independent worker.
+  that the resulting worker can message a peer and create an independent worker.
 - Component integration: `uv run --no-sync pytest
   tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   authenticated routes, ownership stores, refusal matrix and managed request /
@@ -112,6 +120,27 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   Append `-session_orchestration` to the isolated server's feature settings and
   restart it, then repeat from a private manager: expect a disabled error, no new
   task and no independent worker. Read history/info to confirm reads still work.
+- Existing child replies: `uv run --no-sync pytest
+  tests/e2e/test_subagent_autowake_e2e.py
+  tests/e2e/test_subagent_restart_recovery_e2e.py --reruns 0` checks named and
+  by-ID child sends with automatic wake-up, plus named-send inbox recovery
+  after a runner restart, through real SDK processes with a scripted provider.
+- Opt-in live-model smoke: with a prepared live-provider `OMNIGENT_CONFIG_HOME`
+  and native credentials usable from an isolated home, run
+  `OMNIGENT_E2E_LIVE_SESSION_PLACEMENT=1 uv run --no-sync pytest
+  tests/e2e/test_private_session_orchestration.py::test_live_natural_language_session_placement
+  --reruns 0 -n 0`. Optional `OMNIGENT_E2E_CLAUDE_MODEL` /
+  `OMNIGENT_E2E_CODEX_MODEL` select models; `CLAUDE_CONFIG_DIR` / `CODEX_HOME`
+  may point to prepared native configuration. This makes real paid model calls.
+  Each fresh Claude/Codex manager hears either "Start a child Omnigent session
+  under this conversation" or "Start a separate top-level Omnigent session on
+  this same machine", then "ask that same worker to double its previous total".
+  Prompts give no tool names or placement enum values. Check actual parentage,
+  independent-worker attribution/host, worker and manager answers, and that the
+  follow-up creates no additional session. Evidence JSON remains in pytest's
+  temporary directory. A native in-process helper, a worker on a separate
+  server, or a claimed creation without an actual Omnigent session does not pass. This is a usability smoke, not a
+  deterministic CI gate or proof for ambiguous wording or other models.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
 
@@ -177,8 +206,18 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   orchestration: an unattended run messages and creates sessions under the same
   owner, privacy and sharing checks as an interactive turn. The release flag
   still turns all orchestration off.
-- Existing child creation and `sys_session_send` keep their parent/completion
-  semantics. Independent workers use `sys_session_message` for later work.
+- Existing child creation and direct-child `sys_session_send` keep their
+  parent/completion semantics. The same send tool addresses independent workers
+  through the peer gate, without registering child work or returning a task handle.
+  `created_by_session_id` records origin; it does not select child semantics.
+  Policies keyed to `sys_session_send` (such as dispatch-purpose requirements
+  and per-turn dispatch limits) also apply to its peer sends.
+- Version 0.21 removes `sys_session_message` (released opt-in in 0.20) without
+  a tool alias. Update prompts, integrations and tool-name policies to
+  `sys_session_send`, changing the text argument from `message` to `args`.
+  Restart or resume runners to refresh their tool schemas. The server's
+  `session_message` event remains supported for older runners and peer delivery.
+  Direct-child sends now use tracked completion; there is no untracked child mode.
 - The server enforces the flag even though tool schemas are discoverable while
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
   retains its existing `spawn` advertisement gate. No schema migration or

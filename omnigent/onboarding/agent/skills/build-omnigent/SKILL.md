@@ -1,9 +1,30 @@
 ---
 name: build-omnigent
-description: Patterns and templates for generating valid Omnigent agent directories. Load when ready to create files.
+description: Author or edit reusable Omnigent agent definitions (config.yaml, AGENTS.md, skills, and tools). To start another conversation from an existing agent, use sys_session_create.
 ---
 
 # Agent Generation
+
+## Starting a session or authoring an agent?
+
+An agent definition is reusable configuration; a session is a conversation
+running that agent. Starting another session usually needs no new files.
+When session tools are available, choose from the user's intent:
+
+| Request | Tool |
+| --- | --- |
+| A child Omnigent conversation under this one | `sys_session_create(agent_id=..., placement="child", message=...)` |
+| A separate top-level conversation on this machine | `sys_session_create(agent_id=..., placement="same_host", message=...)` |
+| A top-level conversation in a new managed sandbox | `sys_session_create(agent_id=..., placement="managed", message=...)` |
+| More work in an existing conversation | `sys_session_send(session_id=..., args=...)` |
+
+Use `sys_agent_get` for the current session's agent, or `sys_agent_list` to
+choose another harness. These tools keep sessions on the current Omnigent
+server. Starting a standalone CLI/server is a separate setup workflow, not
+needed for a top-level worker. If session creation is unavailable or denied,
+report that limitation rather than working around it with a separate server.
+
+Continue below when the user needs a new or changed agent definition.
 
 Use these patterns to generate a valid agent directory. Always generate
 the minimal set of files needed — don't over-engineer.
@@ -248,7 +269,7 @@ You have sub-agents you can delegate to:
 - **{sub_agent_1}** — {sub_agent_1_description}
 - **{sub_agent_2}** — {sub_agent_2_description}
 
-Call `sys_session_send(type="<name>", input="<task>")` to dispatch a
+Call `sys_session_send(agent="<name>", args="<task>")` to dispatch a
 declared sub-agent. Emit multiple `sys_session_send` tool calls in the
 same response to run them in parallel; results arrive via the inbox.
 ```
