@@ -68,9 +68,11 @@
         ".github/"
       ],
       "owners": [
-        "PattaraS",
         "dhruv0811",
         "TomeHirata"
+      ],
+      "owners_paused": [
+        "PattaraS"
       ]
     },
     {
@@ -301,7 +303,9 @@
         "omnigent/llms/"
       ],
       "owners": [
-        "dhruv0811",
+        "dhruv0811"
+      ],
+      "owners_paused": [
         "PattaraS"
       ]
     },
@@ -483,8 +487,10 @@
       ],
       "owners": [
         "dhruv0811",
-        "PattaraS",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "PattaraS"
       ]
     },
     {
@@ -584,7 +590,9 @@
         "omnigent/onboarding/gemini_auth.py"
       ],
       "owners": [
-        "TomeHirata",
+        "TomeHirata"
+      ],
+      "owners_paused": [
         "PattaraS"
       ]
     },
@@ -601,7 +609,9 @@
         "omnigent/onboarding/goose_auth.py"
       ],
       "owners": [
-        "dhruv0811",
+        "dhruv0811"
+      ],
+      "owners_paused": [
         "PattaraS"
       ]
     },
@@ -652,9 +662,11 @@
         "omnigent/kiro_native"
       ],
       "owners": [
-        "PattaraS",
         "TomeHirata",
         "dhruv0811"
+      ],
+      "owners_paused": [
+        "PattaraS"
       ]
     },
     {
@@ -671,9 +683,11 @@
       ],
       "owners": [
         "dhruv0811",
-        "PattaraS",
         "TomeHirata",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "PattaraS"
       ]
     },
     {
@@ -721,9 +735,11 @@
         "omnigent/onboarding/copilot_auth.py"
       ],
       "owners": [
-        "PattaraS",
         "TomeHirata",
         "dhruv0811"
+      ],
+      "owners_paused": [
+        "PattaraS"
       ]
     }
   ]
