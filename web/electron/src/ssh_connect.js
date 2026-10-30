@@ -25,7 +25,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { lastLine, SAFE_URL_RE } = require("./arca");
-const { isDatabricksManagedServerUrl } = require("./url");
+const { isDatabricksOAuthServerUrl } = require("./url");
 const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 const { UV_INSTALLER } = require("./cli_install");
 const { createAskpass } = require("./ssh_askpass");
@@ -186,7 +186,7 @@ function parseSignInLink(line) {
         return { url, port, kind: "databricks" };
       }
     } catch {
-      // No usable redirect_uri; open the link without a forward.
+      // No usable redirect_uri; signInLinkRefusal stops it.
     }
     return { url, port: null, kind: "databricks" };
   }
@@ -197,7 +197,7 @@ function parseSignInLink(line) {
 /**
  * Why not to open a sign-in link the remote machine printed, or null to open it.
  * The machine could be compromised, so its links are held to what the CLI prints:
- * the server's own page, or a Databricks workspace calling back on 8020 to 8040.
+ * the server's own page, or a workspace sign-in calling back to loopback on 8020 to 8040.
  *
  * @param {{ url: string, port: number | null, kind: "databricks" | "server" }} link
  * @param {string} serverUrl
@@ -214,14 +214,15 @@ function signInLinkRefusal(link, serverUrl) {
   if (link.kind === "server" && origin !== serverOrigin) {
     return `The sign-in link goes to ${origin}, not this server (${serverOrigin}).`;
   }
-  if (
-    link.kind === "databricks" &&
-    origin !== serverOrigin &&
-    !isDatabricksManagedServerUrl(link.url)
-  ) {
+  if (link.kind === "server") return null;
+  // Workspace and account sign-in hosts only: Databricks Apps hosts serve app content.
+  if (origin !== serverOrigin && !isDatabricksOAuthServerUrl(link.url)) {
     return `The sign-in link goes to ${origin}, which isn't this server or a Databricks workspace.`;
   }
-  if (link.port !== null && (link.port < SIGN_IN_FIRST_PORT || link.port > SIGN_IN_LAST_PORT)) {
+  if (link.port === null) {
+    return "The sign-in link doesn't call back to this computer, so sign-in can't finish here.";
+  }
+  if (link.port < SIGN_IN_FIRST_PORT || link.port > SIGN_IN_LAST_PORT) {
     return `The sign-in link waits on port ${link.port}, outside ${SIGN_IN_FIRST_PORT} to ${SIGN_IN_LAST_PORT}.`;
   }
   return null;

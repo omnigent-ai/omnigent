@@ -211,6 +211,8 @@ describe("signInLinkRefusal", () => {
   // The remote machine prints these links, so a compromised one could print anything.
   const databricksLink = (origin, port) =>
     `${origin}/oidc/v1/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A${port}`;
+  const withRedirect = (query) =>
+    `https://example.cloud.databricks.com/oidc/v1/authorize?client_id=databricks-cli${query}`;
   const cases = {
     "the server's own page": [`Opening browser for login: ${SERVER}/auth/cli?t=1`, null],
     "a Databricks workspace calling back on 8020 to 8040": [authorizeLink(8040), null],
@@ -232,6 +234,23 @@ describe("signInLinkRefusal", () => {
       /isn't this server or a Databricks workspace/,
     ],
     "a callback port outside 8020 to 8040": [authorizeLink(22), /port 22, outside 8020 to 8040/],
+    "a Databricks Apps host, which serves app content, even with a valid callback": [
+      databricksLink("https://attacker-1.aws.databricksapps.com", 8020),
+      /isn't this server or a Databricks workspace/,
+    ],
+    "a workspace link with no callback": [withRedirect(""), /doesn't call back to this computer/],
+    "a workspace link with a malformed callback": [
+      withRedirect("&redirect_uri=not%20a%20url"),
+      /doesn't call back to this computer/,
+    ],
+    "a workspace link calling back to another machine": [
+      withRedirect("&redirect_uri=https%3A%2F%2Fevil.example%3A8020%2Fcb"),
+      /doesn't call back to this computer/,
+    ],
+    "a workspace link calling back to loopback without a port": [
+      withRedirect("&redirect_uri=http%3A%2F%2Flocalhost%2F"),
+      /doesn't call back to this computer/,
+    ],
   };
   for (const [label, [line, refusal, serverUrl = SERVER]] of Object.entries(cases)) {
     it(`${refusal ? "refuses" : "opens"} ${label}`, () => {
@@ -500,19 +519,35 @@ describe("runSshConnect", () => {
     });
   }
 
-  it("stops sign-in without a browser when the link goes somewhere unexpected", async () => {
-    const session = fakeSession({
-      logins: [{ lines: ["Opening browser for login: https://evil.example/auth/cli"], code: 0 }],
+  // Refused before any forward for the link's port (8021) or a browser; the port taken
+  // up front (8020) is still released.
+  const unexpectedLinks = {
+    "a server sign-in on another site": [
+      "Opening browser for login: https://evil.example/auth/cli",
+      /goes to https:\/\/evil\.example, not this server/,
+    ],
+    "a Databricks sign-in on another site": [
+      "https://evil.example/oidc/v1/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8021",
+      /isn't this server or a Databricks workspace/,
+    ],
+  };
+  for (const [label, [line, error]] of Object.entries(unexpectedLinks)) {
+    it(`stops sign-in without a forward or browser for ${label}`, async () => {
+      const session = fakeSession({ logins: [{ lines: [line], code: 0 }] });
+      const { ctx, opened } = connectContext(session);
+
+      const result = await runSshConnect(ctx);
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, error);
+      assert.deepEqual(opened, []);
+      assert.ok(session.calls.includes("cancel-exec"));
+      assert.deepEqual(
+        session.calls.filter((call) => /^(forward|cancel)Local/.test(call)),
+        ["forwardLocal 8020", "cancelLocal 8020"],
+      );
     });
-    const { ctx, opened } = connectContext(session);
-
-    const result = await runSshConnect(ctx);
-
-    assert.equal(result.ok, false);
-    assert.match(result.error, /goes to https:\/\/evil\.example, not this server/);
-    assert.deepEqual(opened, []);
-    assert.ok(session.calls.includes("cancel-exec"));
-  });
+  }
 
   it("keeps the port it took when another tool forwards the CLI's port mid sign-in", async () => {
     let probes = 0;
