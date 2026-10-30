@@ -191,12 +191,35 @@ it.each(["loading", "missing", "disabled", "ordinary", "managed-disabled"])(
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     );
-    const { result } = renderHook(() => useSandboxProfileCatalog("company", rows[0]), { wrapper });
+    const { result, unmount } = renderHook(() => useSandboxProfileCatalog("company", rows[0]), {
+      wrapper,
+    });
     if (state === "ordinary")
       await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
     expect(result.current.selection).toBeNull();
     expect(result.current.launchError).toBeNull();
     if (state !== "ordinary") expect(fetchSandboxProfiles).not.toHaveBeenCalled();
+    else {
+      const cached = result.current.query.data;
+      unmount();
+      client.setQueryData([...SANDBOX_PROFILES_QUERY_KEY, "company"], cached, {
+        updatedAt: Date.now() - 31_000,
+      });
+      let rejectRefresh!: (reason: Error) => void;
+      vi.mocked(fetchSandboxProfiles).mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectRefresh = reject;
+          }),
+      );
+      const remounted = renderHook(() => useSandboxProfileCatalog("company", rows[0]), { wrapper });
+      await waitFor(() => expect(remounted.result.current.query.isFetching).toBe(true));
+      expect(remounted.result.current.launchError).toBeNull();
+      await act(async () => rejectRefresh(new Error("Catalog unavailable")));
+      await waitFor(() => expect(remounted.result.current.query.isError).toBe(true));
+      expect(remounted.result.current.selection).toBeNull();
+      expect(remounted.result.current.launchError).toBeNull();
+    }
   },
 );
 

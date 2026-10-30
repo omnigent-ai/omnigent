@@ -91,9 +91,12 @@ integration evidence separately; the browser test does not exercise them.
   Native `/clear` and `/fork` reauthorize and
   bind the replacement before detaching the source; the last directly bound
   runner session cannot detach. Host and profile mismatches remain blocked.
-- Missing sandboxes use the bound session's reference for replacement. Legacy host recovery and runner-only
-  adoption reject histories over 200 associations; use controller lookup for host
-  recovery and a new runner for runner adoption. Ordinary hosts skip recovery scans.
+- Missing sandboxes use the bound session's reference for replacement. Legacy host
+  recovery rejects histories over 200 sessions; use controller lookup for larger
+  histories. Runner-host discovery and reconnect liveness have a separate limit
+  of 10,000 attached sessions; launch a new runner on overflow. Rotation, adoption
+  and rollback use a smaller source lookup of at most 201 candidates and preserve
+  the binding if no source is found. Ordinary hosts skip recovery scans.
   Native `/clear` retains old sessions on the host, so a long-lived sandbox without
   controller lookup can reach the host limit through normal use. Ordinary-only
   deployments skip runner profile discovery; mixed deployments keep its safety bound.

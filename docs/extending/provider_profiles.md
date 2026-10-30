@@ -288,9 +288,11 @@ behavior with either flag setting. The reserved label namespace applies globally
 To roll back, stop new profiled launches and drain their running sandboxes before
 disabling the flag or using an older server. A flag-off server does not enforce
 profile authorization, so disabling it is not an access-revocation mechanism.
-Profile-capable launchers reject unselected launches at their boundary. Keep the
-controller and stable provider configuration available for cleanup and preserve
-controller assignments and surviving session labels for later recovery.
+Omnigent rejects unselected profile launches before invoking the launcher. Custom
+callers invoking a launcher directly must enforce selection themselves; the
+file-backed example inherits lifecycle methods without its own selection guard.
+Keep the controller and stable provider configuration available for cleanup and
+preserve controller assignments and surviving session labels for later recovery.
 
 Use the [local walkthrough](../../examples/sandbox-profile-provider/README.md) to:
 

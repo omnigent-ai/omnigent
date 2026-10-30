@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from omnigent.db.db_models import current_workspace_id
+from omnigent.db.db_models import current_workspace_id, uuid_to_bytes
 from omnigent.onboarding.sandboxes.profiles import ProviderSandboxProfile
 from omnigent.stores.conversation_store import ConversationNotFoundError
 
@@ -123,6 +123,7 @@ class SandboxProfileStore:
     def get_host_snapshot(
         self, host_id: str, *, reference_session_id: str | None = None
     ) -> dict[str, Any] | None:
+        host_id = uuid_to_bytes(host_id).hex()
         if reference_session_id is not None:
             try:
                 binding = self.conversations.get_profile_host_binding(reference_session_id)

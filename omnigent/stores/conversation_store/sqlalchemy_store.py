@@ -4488,6 +4488,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         return previous is None or previous.deleted_at is not None
 
     def can_bind_profile_host(self, conversation_id: str, host_id: str) -> bool:
+        host_id = uuid_to_bytes(host_id).hex()
         with self._session("check_profile_host_affinity") as session:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             return meta is not None and self._can_bind_profile_host(session, meta.host_id, host_id)

@@ -574,7 +574,8 @@ def test_host_binding_cannot_lose_original_host_profile(
         _accept(catalog, session_id, profile)
         _bind(catalog, session_id, bound_host)
         _bind(catalog, session_id, f"host_{bound_host}")
-        _require(catalog, session_id, f"host_{bound_host}", bind=False)
+        for supplied_host in (bound_host, f"host_{bound_host}", str(uuid.UUID(bound_host))):
+            catalog.require_session_host(session_id, supplied_host, bind=False, user_id=_ALICE)
     for bind in (False, True):
         with pytest.raises(HTTPException, match="different host"):
             _require(catalog, source_id, other_host_id, bind=bind)

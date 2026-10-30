@@ -21,7 +21,7 @@ PROFILE = {
 
 def test_host_recovery_has_a_fixed_work_bound_and_skips_ordinary_hosts(store, monkeypatch):
     from unittest.mock import Mock
-    from uuid import uuid4
+    from uuid import UUID, uuid4
 
     from sqlalchemy import event, insert
 
@@ -44,6 +44,15 @@ def test_host_recovery_has_a_fixed_work_bound_and_skips_ordinary_hosts(store, mo
     lookup = Mock(wraps=store.list_host_conversation_ids)
     monkeypatch.setattr(store, "list_host_conversation_ids", lookup)
     assert catalog.get_host_snapshot(host_id) is None
+    lookup.assert_not_called()
+
+    reference = store.create_conversation(host_id=host_id, workspace="/workspace")
+    profiles = SandboxProfileStore(store)
+    profiles.bind_session(reference.id, PROFILE)
+    for supplied_host in (host_id, f"host_{host_id}", str(UUID(host_id))):
+        assert (
+            profiles.get_host_snapshot(supplied_host, reference_session_id=reference.id) == PROFILE
+        )
     lookup.assert_not_called()
 
     hydrate = Mock(side_effect=AssertionError("Overflow must not hydrate session history"))

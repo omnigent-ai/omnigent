@@ -1,5 +1,5 @@
 import { testAgent } from "@/test/agentFixtures";
-import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
+import { fetchSandboxProfiles, SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 
 vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
@@ -1402,7 +1402,7 @@ function renderLanding(
     dictation_available: false,
     ...infoOverrides,
   };
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
@@ -1421,6 +1421,7 @@ function renderLanding(
     </QueryClientProvider>,
     { reactStrictMode: strictMode },
   );
+  return { ...view, client };
 }
 
 function tooltipKeys(tooltip: HTMLElement): string[] {
@@ -8614,7 +8615,7 @@ describe("NewChatLandingScreen", () => {
           next_cursor: null,
         });
       }
-      renderLanding({
+      const { client } = renderLanding({
         managed_sandboxes_enabled: true,
         sandbox_provider: "agent_sandbox",
         sandbox_providers: ["agent_sandbox"],
@@ -8635,6 +8636,24 @@ describe("NewChatLandingScreen", () => {
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
         target: { value: "build the project" },
       });
+      if (enabled === "provider-opt-out") {
+        let rejectRefresh!: (reason: Error) => void;
+        vi.mocked(fetchSandboxProfiles).mockImplementation(
+          () =>
+            new Promise((_resolve, reject) => {
+              rejectRefresh = reject;
+            }),
+        );
+        const refresh = client.refetchQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+        await waitFor(() => expect(fetchSandboxProfiles).toHaveBeenCalledTimes(2));
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        await act(async () => {
+          rejectRefresh(new Error("Catalog unavailable"));
+          await refresh;
+        });
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        expect(screen.queryByRole("button", { name: /Sandbox profile:/ })).toBeNull();
+      }
       fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
       await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
       const body = JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string);

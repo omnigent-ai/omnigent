@@ -50,7 +50,7 @@ export function useSandboxProfileCatalog(
   const stale =
     selection !== null && selectedQuery.isSuccess && current?.revision !== selection.revision;
   const launchError =
-    !enabled || provider === null
+    !enabled || provider === null || (query.data !== undefined && !required)
       ? null
       : query.isPending ||
           query.isFetching ||
@@ -121,7 +121,7 @@ export function SandboxProfilePicker({
     .filter((p) => p.provider === provider)
     .slice(0, SANDBOX_PROFILE_RESULT_LIMIT);
   const loading = searching && (search.trim() !== debouncedSearch || results.isFetching);
-  if (!enabled || provider === null || (query.isSuccess && !required)) return null;
+  if (!enabled || provider === null || (query.data !== undefined && !required)) return null;
   const label = query.isPending
     ? "Loading profiles…"
     : query.isError
