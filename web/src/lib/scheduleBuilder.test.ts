@@ -11,6 +11,8 @@ import {
   DEFAULT_SCHEDULE_MODEL,
   parseRRuleToScheduleModel,
   type ScheduleModel,
+  validateSchedule,
+  parseUntil,
 } from "./scheduleBuilder";
 
 /** A schedule model with overrides on top of the default. */
@@ -65,8 +67,56 @@ describe("parseRRuleToScheduleModel", () => {
     });
   });
 
-  it("rejects interval rules the visible form cannot represent", () => {
-    expect(parseRRuleToScheduleModel("FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0")).toBeNull();
+  it("opens interval rules in the custom editor", () => {
+    expect(parseRRuleToScheduleModel("FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0")).toMatchObject({
+      preset: "custom",
+      customFreq: "daily",
+      interval: 2,
+    });
+  });
+
+  it.each([
+    { customFreq: "hourly", interval: 3, minute: 7 },
+    { customFreq: "daily", interval: 2 },
+    { customFreq: "weekly", interval: 3, weekdays: ["MO", "FR"] },
+    { customFreq: "monthly", interval: 1, monthDays: [1, 15, 31] },
+    { customFreq: "yearly", interval: 2, month: 6, monthDays: [1, 15] },
+  ] as Partial<ScheduleModel>[])(
+    "round-trips custom recurrence %j with each ending",
+    (overrides) => {
+      for (const end of [
+        undefined,
+        { type: "count", count: 5 },
+        { type: "until", until: "20271231T155959Z" },
+      ] as ScheduleModel["end"][]) {
+        const rule = buildRRule(model({ preset: "custom", ...overrides, end }));
+        const parsed = parseRRuleToScheduleModel(rule);
+        expect(parsed).not.toBeNull();
+        expect(buildRRule(parsed!)).toBe(rule);
+      }
+    },
+  );
+
+  it.each([
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=30",
+    "FREQ=WEEKLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;INTERVAL=367",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYHOUR=10",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3;UNTIL=20271231T155959Z",
+    "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=32;BYHOUR=9;BYMINUTE=0",
+  ])("does not silently discard unsupported fields: %s", (rule) => {
+    expect(parseRRuleToScheduleModel(rule)).toBeNull();
+  });
+
+  it("validates bounds and rejects impossible cutoff dates", () => {
+    expect(validateSchedule(model({ preset: "custom", interval: 367 }))).not.toBeNull();
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "monthly", monthDays: [32] })),
+    ).not.toBeNull();
+    expect(validateSchedule(model({ end: { type: "count", count: 1 } }))).not.toBeNull();
+    expect(parseUntil("20270230T235959Z")).toBeNull();
+    expect(parseUntil("20270228T235959Z")?.toISOString()).toBe("2027-02-28T23:59:59.000Z");
   });
 
   it("round-trips non-quarter-hour daily minutes", () => {

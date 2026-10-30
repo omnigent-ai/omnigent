@@ -36,9 +36,6 @@ const FALLBACK_ZONES = [
  * currently-selected value) so a preselected local/uncommon zone is never
  * missing from the list.
  *
- * NOTE: not currently called — v1 infers the timezone from the browser
- * (`localTimezone`) with no visible picker. Retained for the future
- * cross-timezone picker (see the comment in CreateScheduledTaskDialog).
  */
 export function commonTimezones(ensure?: string): string[] {
   let zones: string[];
@@ -60,4 +57,46 @@ export function commonTimezones(ensure?: string): string[] {
     if (b === "UTC") return 1;
     return a.localeCompare(b);
   });
+}
+
+/** Calendar date in the schedule's timezone, independent of the browser's zone. */
+export function dateInTimezone(date: Date, timezone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)!.value;
+  return `${value("year")}-${value("month")}-${value("day")}`;
+}
+
+/** Inclusive end of a calendar day, accounting for the offset on that date. */
+export function endOfDayInTimezone(day: string, timezone: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  const target = Date.parse(`${day}T23:59:59Z`);
+  if (!Number.isFinite(target) || new Date(target).toISOString().slice(0, 10) !== day) return null;
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+  let instant = target;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const parts = formatter.formatToParts(new Date(instant));
+    const value = (type: Intl.DateTimeFormatPartTypes) =>
+      parts.find((part) => part.type === type)!.value;
+    const wallTime = Date.parse(
+      `${value("year")}-${value("month")}-${value("day")}T${value("hour")}:${value("minute")}:${value("second")}Z`,
+    );
+    if (wallTime === target) return new Date(instant);
+    instant += target - wallTime;
+  }
+  return null;
 }

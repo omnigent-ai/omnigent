@@ -421,7 +421,7 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
     agent_trigger.click()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
-    expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Daily")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Every day")
 
     time_input = page.get_by_test_id("schedule-time")
     time_input.click()
@@ -586,6 +586,77 @@ def _pick_select_option(page: Page, trigger_test_id: str, option_label: str) -> 
     """
     page.get_by_test_id(trigger_test_id).click()
     page.get_by_role("option", name=option_label, exact=True).click()
+
+
+@pytest.mark.usefixtures("online_host")
+def test_scheduled_task_custom_schedule_round_trip(page: Page, live_server: str) -> None:
+    """Nested schedule pickers stay open and persist the visual recurrence and timezone."""
+    name = f"Custom schedule {uuid.uuid4().hex[:8]}"
+    _open_automations_page(page, live_server)
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill(name)
+    page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
+    _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
+    page.get_by_label("Repeat every", exact=True).fill("2")
+    _pick_select_option(page, "custom-freq-trigger", "Months")
+    page.get_by_test_id("custom-freq-trigger").click()
+    expect(page.get_by_role("listbox")).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("listbox")).to_have_count(0)
+    expect(
+        page.locator('[data-slot="popover-content"]').filter(
+            has=page.get_by_label("Repeat every", exact=True)
+        )
+    ).to_have_attribute("data-state", "open")
+    days = page.get_by_role("group", name="Days of the month")
+    days.get_by_role("button", name="15", exact=True).click()
+    page.get_by_test_id("schedule-time").fill("23:37")
+    page.get_by_label("Repeat every", exact=True).click()
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    page.get_by_role("button", name="Apply", exact=True).click()
+    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
+
+    page.get_by_test_id("task-timezone-trigger").click()
+    page.get_by_placeholder("Search timezones…").fill("Singapore")
+    page.get_by_role("option", name="Asia/Singapore", exact=True).click()
+    expect(page.get_by_test_id("task-timezone-trigger")).to_contain_text("Asia/Singapore")
+    page.get_by_role("combobox", name="Schedule ends", exact=True).click()
+    page.get_by_role("option", name="After", exact=True).click()
+    page.get_by_label("Occurrences", exact=True).fill("4")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    row = _row_by_name(page, name)
+    expect(row).to_be_visible(timeout=30_000)
+    response = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0)
+    response.raise_for_status()
+    task = next(task for task in response.json()["scheduled_tasks"] if task["name"] == name)
+    assert task["rrule"] == "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15;BYHOUR=23;BYMINUTE=37;COUNT=4"
+    assert task["timezone"] == "Asia/Singapore"
+
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    page.get_by_test_id("custom-schedule-trigger").click()
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
+    expect(page.get_by_test_id("custom-freq-trigger")).to_have_text("Months")
+    expect(page.get_by_test_id("schedule-time")).to_have_value("11:37 PM")
+    expect(days.get_by_role("button", name="15", exact=True)).to_have_attribute(
+        "aria-pressed", "true"
+    )
+    page.get_by_label("Repeat every", exact=True).fill("3")
+    page.keyboard.press("Escape")
+    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
+    page.get_by_test_id("custom-schedule-trigger").click()
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
+    page.get_by_role("button", name="Apply", exact=True).click()
+    page.get_by_role("combobox", name="Schedule ends", exact=True).click()
+    page.get_by_role("option", name="On date", exact=True).click()
+    page.get_by_label("End date", exact=True).fill("2030-06-10")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
+    response = httpx.get(f"{live_server}/v1/scheduled-tasks/{task['id']}", timeout=10.0)
+    response.raise_for_status()
+    assert response.json()["rrule"].endswith(";UNTIL=20300610T155959Z")
 
 
 def test_scheduled_task_model_effort_controls_visible_for_capable_agent(

@@ -14,9 +14,15 @@ type Story = StoryObj<typeof meta>;
 
 function ScheduleExample({ initialModel }: { initialModel: ScheduleModel }) {
   const [model, setModel] = useState(initialModel);
+  const [timezone, setTimezone] = useState("Asia/Singapore");
   return (
     <div className="w-[560px] rounded-xl border bg-card p-4">
-      <ScheduleFields model={model} onChange={setModel} />
+      <ScheduleFields
+        model={model}
+        onChange={setModel}
+        timezone={timezone}
+        onTimezoneChange={setTimezone}
+      />
     </div>
   );
 }
