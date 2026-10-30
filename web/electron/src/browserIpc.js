@@ -12,6 +12,7 @@ const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
 const { buildDesignModeScript } = require("./designModeScript");
+const { captureBrowserView } = require("./browserCapture");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
@@ -346,7 +347,8 @@ function makeDesignModeInputHandler(gestureState) {
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
  * @param {(event: Electron.IpcMainInvokeEvent) => (object | null)} [deps.getWindowForEvent]
- *        The shell window that owns the sender, used to parent native dialogs.
+ *        The shell window that owns the sender, used to parent native dialogs and
+ *        to stage a detached browser view for screenshots.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -524,13 +526,12 @@ function registerBrowserIpc({
     const { conversationId } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    try {
-      const image = await entry.view.webContents.capturePage();
-      const dataUrl = `data:image/png;base64,${image.toPNG().toString("base64")}`;
-      return { ok: true, dataUrl };
-    } catch (e) {
-      return { ok: false, error: e && e.message ? e.message : String(e) };
-    }
+    return captureBrowserView({
+      registry: g.registry,
+      conversationId,
+      entry,
+      win: getWindowForEvent(event),
+    });
   });
 
   // Both transports converge on main-owned scripts and the same sender gate.
