@@ -708,6 +708,7 @@ def register_test_runner(
     *,
     harnesses: list[str] | None = None,
     owner: str | None = None,
+    capabilities: list[str] | None = None,
 ) -> None:
     """
     Register a runner in the app's live tunnel registry.
@@ -720,6 +721,7 @@ def register_test_runner(
         ``["default"]``.
     :param owner: Authenticated user who owns this runner, e.g.
         ``"alice@example.com"``. ``None`` for single-user mode.
+    :param capabilities: Optional capabilities advertised in the hello frame.
     :returns: None.
     """
     app.state.tunnel_registry.register(
@@ -730,6 +732,7 @@ def register_test_runner(
             frame_protocol_version=1,
             harnesses=harnesses or ["default"],
             envs=["os_sandbox"],
+            capabilities=capabilities or [],
         ),
         owner=owner,
     )
