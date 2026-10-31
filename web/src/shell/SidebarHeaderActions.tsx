@@ -5,13 +5,15 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { HistoryNavigationButtons } from "./HistoryNavigationButtons";
 
 const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
 const SEARCH_KEYS = [MOD_KEY, "K"] as const;
 const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
 
 /**
- * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
+ * Back / Forward / Search / Settings / sidebar-toggle cluster from the
+ * sidebar's header row.
  *
  * Extracted so it can render in TWO places without duplicating the markup:
  * inside the sidebar (every browser and non-mac platform, and the macOS shell
@@ -21,7 +23,7 @@ const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
  * `inert`, so a cluster living inside it would be clipped and unclickable, and
  * while peeking the card floats at `inset-2` and drags the cluster off the
  * traffic lights' centre line. Hoisting it out of the sidebar is what keeps the
- * three icons in one fixed place across open, collapsed, and peeking.
+ * icons in one fixed place across open, collapsed, and peeking.
  *
  * Only the toggle's meaning changes with state: it collapses an open sidebar and
  * opens a closed or peeking one, so the caller passes `expanded` and the icon
@@ -62,6 +64,7 @@ export function SidebarHeaderActions({
 }) {
   return (
     <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
+      <HistoryNavigationButtons />
       <SidebarSearchButton onOpenSearch={onOpenSearch} />
       <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
       <Tooltip>
