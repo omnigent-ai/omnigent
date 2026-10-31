@@ -15,6 +15,7 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 vi.mock("@/lib/serverOrigin", () => ({
   isCurrentServerLocal: () => false,
@@ -349,6 +350,32 @@ describe("mobile sidebar drawer swipe to close", () => {
     expect(drawer.style.transform).toBe("");
     expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("");
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("leaves a row long-press to drag-to-reorder", async () => {
+    stubMobileLayout(true);
+    vi.useFakeTimers();
+    const { onClose, drawer } = renderDrawer();
+    const row = screen.getByRole("link", { name: "conv_a" }).closest("li")!;
+    const dragPreview = () => document.body.querySelector('[class*="max-w-[16rem]"]');
+
+    try {
+      touch(row, "touchstart", 300, 0);
+      await act(() => vi.advanceTimersByTimeAsync(300));
+      expect(dragPreview()).not.toBeNull();
+
+      touch(row, "touchmove", 250, 300);
+      touch(row, "touchmove", 100, 360);
+      expect(drawer.style.transform).toBe("");
+      touch(row, "touchend", 0, 400);
+
+      expect(drawer.style.transform).toBe("");
+      expect(onClose).not.toHaveBeenCalled();
+    } finally {
+      // dnd-kit defers removing its document listeners by 50 ms.
+      await act(() => vi.advanceTimersByTimeAsync(50));
+      vi.useRealTimers();
+    }
   });
 
   it.each([

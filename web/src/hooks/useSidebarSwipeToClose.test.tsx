@@ -125,9 +125,8 @@ describe("useSidebarSwipeToClose", () => {
   });
 
   it.each([
-    ["at 0.62 px/ms", 31, 200, true],
+    ["at 0.62 px/ms, lifted 100 ms after the last move", 31, 200, true],
     ["below 0.6 px/ms", 29, 200, false],
-    ["lifted 100 ms after the last move", 31, 200, true],
     ["lifted 101 ms after the last move", 31, 201, false],
   ])("treats a short drag as a flick only %s", (_label, stepPx, liftAt, close) => {
     const { getByTestId, onSettle } = setup();
@@ -157,15 +156,31 @@ describe("useSidebarSwipeToClose", () => {
     expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
   });
 
-  it("does not overstate a steady drag reported by sparse moves", () => {
+  // Each is a steady drag below flick speed whose window opens between samples.
+  it.each([
+    [
+      "0.5 px/ms",
+      [
+        [170, 60],
+        [125, 150],
+      ],
+      160,
+    ],
+    [
+      "0.375 px/ms",
+      [
+        [170, 80],
+        [140, 160],
+      ],
+      176,
+    ],
+  ])("does not overstate a steady %s drag reported by sparse moves", (_label, moves, liftAt) => {
     const { getByTestId, onSettle } = setup();
     const row = getByTestId("row");
 
-    // A steady 0.5 px/ms; the window opens between the first two samples.
     touch(row, "touchstart", 200, 100, 0);
-    touch(row, "touchmove", 170, 100, 60);
-    touch(row, "touchmove", 125, 100, 150);
-    touch(row, "touchend", 0, 0, 160);
+    for (const [x, time] of moves) touch(row, "touchmove", x, 100, time);
+    touch(row, "touchend", 0, 0, liftAt);
 
     expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
   });
