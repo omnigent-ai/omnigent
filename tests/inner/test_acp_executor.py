@@ -38,6 +38,7 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
+    InterruptOutcome,
     ReasoningChunk,
     SubAgentCompleted,
     SubAgentStarted,
@@ -1808,6 +1809,22 @@ async def test_interrupt_sends_session_cancel() -> None:
 @pytest.mark.asyncio
 async def test_interrupt_noop_without_session() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert await ex.interrupt_session("ignored") is False
+    report = await ex.interrupt_session_report("ignored")
+    assert report.outcome is InterruptOutcome.NOTHING_TO_STOP
+
+
+@pytest.mark.asyncio
+async def test_interrupt_whose_cancel_cannot_be_sent_is_unconfirmed_not_idle() -> None:
+    """A live session whose ``session/cancel`` failed may still be generating."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._session_id = "s1"
+    ex._proc = type("P", (), {"returncode": None})()  # type: ignore[assignment]
+    ex._send = AsyncMock(side_effect=BrokenPipeError("agent stdin closed"))  # type: ignore[method-assign]
+
+    report = await ex.interrupt_session_report("ignored")
+
+    assert report.outcome is InterruptOutcome.UNCONFIRMED
     assert await ex.interrupt_session("ignored") is False
 
 
