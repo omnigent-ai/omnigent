@@ -117,6 +117,26 @@ def bundle_skill_names(bundle_bytes: bytes, *, prefix: str = "") -> set[str]:
     return names
 
 
+def bundle_skill_directories(bundle_bytes: bytes, *, prefix: str = "") -> set[str]:
+    """Names directly under ``<prefix>skills/``: skills and namespace folders alike.
+
+    An installed skill named after a namespace folder would put a
+    ``SKILL.md`` in it, and the parser would then take the folder for a skill
+    and stop looking inside, hiding the bundle's own skills there.
+    """
+    lead = _prefix_parts(prefix)
+    names: set[str] = set()
+    with _open(bundle_bytes) as tf:
+        for member in tf:
+            parts = [part for part in PurePosixPath(member.name).parts if part != "."]
+            if parts[: len(lead)] != lead:
+                continue
+            rest = parts[len(lead) :]
+            if len(rest) >= 2 and rest[0] == "skills" and (len(rest) > 2 or member.isdir()):
+                names.add(rest[1])
+    return names
+
+
 def overlay_skills(
     bundle_bytes: bytes,
     skills: Sequence[tuple[str, bytes]],
@@ -159,7 +179,11 @@ def overlay_skills_within(
     if not skills:
         return bundle_bytes, []
     lead = _prefix_parts(prefix)
-    present = bundle_skill_names(bundle_bytes, prefix=prefix) | set(reserved)
+    present = (
+        bundle_skill_names(bundle_bytes, prefix=prefix)
+        | bundle_skill_directories(bundle_bytes, prefix=prefix)
+        | set(reserved)
+    )
     used = UnpackedSize(0, 0)
     skipped: list[str] = []
     out = io.BytesIO()

@@ -1123,3 +1123,20 @@ async def test_server_policy_binds_sources_url_installs_and_delivery(
         assert "skills/review/SKILL.md" not in _names(contents.content)
         assert (await client.get("/v1/installed-skills")).json()["data"][0]["id"] == skill_id
         assert (await client.delete(f"/v1/skill-sources/{source_id}")).status_code == 204
+
+
+def test_a_bundle_namespace_folder_is_a_reserved_install_name(tmp_path: Path) -> None:
+    # The overlay skips an install named after a bundle namespace folder, so
+    # the menu must not offer it either.
+    from omnigent.server.skill_injection import spec_reserved_names
+    from omnigent.spec.types import AgentSpec, SkillSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="a",
+        skills=[
+            SkillSpec("triage", "d", "c", skill_dir=tmp_path / "skills" / "team" / "triage"),
+            SkillSpec("lint", "d", "c", skill_dir=tmp_path / "skills" / "lint"),
+        ],
+    )
+    assert spec_reserved_names(spec) == {"triage", "team", "lint"}

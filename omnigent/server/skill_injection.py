@@ -97,6 +97,22 @@ def _find_sub_agent(spec: AgentSpec, name: str, prefix: str) -> SessionTarget | 
     return None
 
 
+def spec_reserved_names(spec: AgentSpec) -> set[str]:
+    """Names an installed skill cannot take: the spec's skills and their namespace folders.
+
+    The overlay skips an install named after a bundle folder under
+    ``skills/`` (see :func:`omnigent.skills.overlay.bundle_skill_directories`),
+    so the menu must not offer one either.
+    """
+    names: set[str] = set()
+    for skill in spec.skills:
+        names.add(skill.name)
+        parent = skill.skill_dir.parent if skill.skill_dir is not None else None
+        if parent is not None and parent.name != "skills" and parent.parent.name == "skills":
+            names.add(parent.name)
+    return names
+
+
 def skill_allowed(spec: AgentSpec | None, name: str) -> bool:
     """Apply the agent spec's ``skills:`` filter the way host skills honour it."""
     skills_filter = getattr(spec, "skills_filter", "all") if spec is not None else "all"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -85,20 +86,22 @@ def test_a_link_in_a_skill_tarball_is_rejected() -> None:
         overlay_skills(BUNDLE, [("evil", out.getvalue())])
 
 
-def test_namespaced_and_reserved_names_keep_bundle_precedence() -> None:
+def test_namespaced_and_reserved_names_keep_bundle_precedence(tmp_path: Path) -> None:
     # A bundle skill two levels down is still ``triage``; the parsed spec's
     # canonical names (``code-review`` for a legacy ``Code_Review`` dir) win too.
     bundle = _tar(
         {
             "config.yaml": b"name: a\n",
-            "skills/team/triage/SKILL.md": b"---\nname: triage\n---\n",
+            "skills/team/triage/SKILL.md": b"---\nname: triage\ndescription: t\n---\n",
             "skills/Code_Review/SKILL.md": b"---\nname: review\n---\n",
         }
     )
     assert bundle_skill_names(bundle) == {"triage", "Code_Review"}
+    skill = _tar({"SKILL.md": b"---\nname: x\ndescription: d\n---\n", "notes.txt": b"n"})
     merged = overlay_skills(
         bundle,
-        [("triage", SKILL), ("code-review", SKILL), ("fresh", SKILL)],
+        # "team" is the bundle's namespace folder, not a skill of its own.
+        [("triage", skill), ("code-review", skill), ("fresh", skill), ("team", skill)],
         reserved={"code-review"},
     )
     assert _names(merged) == [
@@ -108,6 +111,14 @@ def test_namespaced_and_reserved_names_keep_bundle_precedence() -> None:
         "skills/fresh/notes.txt",
         "skills/team/triage/SKILL.md",
     ]
+    # Parsed as the runner parses it, the namespaced bundle skill is still found.
+    from omnigent.spec.parser import _discover_skills
+    from omnigent.spec.tar_utils import extract_safe
+
+    extract_safe(merged, tmp_path / "bundle")
+    skipped: list[str] = []
+    found = {s.name for s in _discover_skills(tmp_path / "bundle" / "skills", skipped=skipped)}
+    assert {"triage", "fresh"} <= found and "team" not in found
 
 
 def test_overlay_bytes_do_not_depend_on_the_clock(monkeypatch: pytest.MonkeyPatch) -> None:
