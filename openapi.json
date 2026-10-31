@@ -6184,6 +6184,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_bundle_model_override": {
+            "default": true,
+            "title": "Session Bundle Model Override",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {

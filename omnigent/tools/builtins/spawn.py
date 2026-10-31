@@ -1055,10 +1055,9 @@ class SysSessionCreateTool(Tool):
                             ],
                             "description": (
                                 "Optional reasoning level for the child "
-                                "session, e.g. 'high'. Only valid with "
-                                "'agent_id', and only for harnesses with "
-                                "effort plumbing; omit to use the agent's "
-                                "default."
+                                "session, e.g. 'high'. Only for harnesses "
+                                "with effort plumbing; omit to use the "
+                                "agent's default."
                             ),
                         },
                     },

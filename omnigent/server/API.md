@@ -548,7 +548,13 @@ Request parts:
 
   metadata (JSON string, required)
     Session metadata. Shape matches `SessionCreateMetadata`:
-    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null, model_override?: string | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `model_override` and `reasoning_effort` are session-level and win over
+    the uploaded bundle's `executor.model` / `executor.reasoning_effort`, as on
+    the JSON create. An effort the bundle's harness cannot use fails with 400;
+    an alias folds to that harness's value (`ultra` to `xhigh` on codex).
+    Servers that accept `model_override` here report
+    `session_bundle_model_override` in `GET /v1/info`; older ones reject it.
     `terminal_launch_args` carries pass-through CLI args for a native
     terminal wrapper, e.g. `["--permission-mode", "bypassPermissions"]`
     (same field as the JSON create path below). Unknown fields fail with 400.
