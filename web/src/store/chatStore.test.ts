@@ -7123,6 +7123,48 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("rewindToPrompt", () => {
+    function answerRewind(response: Response): () => RequestInit | undefined {
+      let sent: RequestInit | undefined;
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_old/rewind")) {
+          sent = init;
+          return Promise.resolve(response.clone());
+        }
+        return base(input, init);
+      });
+      return () => sent;
+    }
+
+    it("opens the rewound session with the prompt in its composer", async () => {
+      onTestFinished(() => clearSessionDrafts());
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      const sent = answerRewind(
+        Response.json({ session_id: "conv_new", prompt: "Add parser tests" }),
+      );
+
+      await useChatStore.getState().rewindToPrompt("msg_second");
+
+      expect(JSON.parse(String(sent()?.body))).toEqual({ item_id: "msg_second" });
+      expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+    });
+
+    it("leaves the view in place when the server refuses", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerRewind(
+        Response.json(
+          { error: { code: "invalid_input", message: "Stop the current turn first." } },
+          { status: 400 },
+        ),
+      );
+
+      await expect(useChatStore.getState().rewindToPrompt("msg_second")).rejects.toThrow();
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
+  });
+
   describe("session.status", () => {
     it("updates sessionStatus from the event", () => {
       const event: SessionStatusEvent = {
