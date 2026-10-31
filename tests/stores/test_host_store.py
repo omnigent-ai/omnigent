@@ -292,9 +292,20 @@ def test_host_store_drops_unknown_harness_availability(
     assert fetched.configured_harnesses == {"codex": "needs-auth"}
 
 
+@pytest.mark.parametrize(
+    ("refreshed_name", "previous_host_id", "expected_name"),
+    [
+        (None, None, "ip-10-90-45-193"),
+        ("ip-10-90-37-46", "a1ed1ab71de2311e20488a989e61701c", "ip-10-90-37-46"),
+    ],
+    ids=["same-name", "refreshed-then-reset"],
+)
 def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     host_store: HostStore,
     db_uri: str,
+    refreshed_name: str | None,
+    previous_host_id: str | None,
+    expected_name: str,
 ) -> None:
     """A host_id rotation must not orphan or break conversations bound to it.
 
@@ -310,7 +321,8 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     ``_create_engine``), so this exercises the same constraint that
     fires on the hosted Postgres deploy. The fix must (a) not raise and
     (b) repoint the conversation to the new host_id so its binding
-    survives the rotation.
+    survives the rotation. After a hostname refresh renamed the row,
+    ``reset-id``'s previous host_id identifies it instead of the name.
     """
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
@@ -320,7 +332,7 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
 
     host_store.upsert_on_connect(
         host_id="a1ed1ab71de2311e20488a989e61701c",
-        name="dev-laptop",
+        name="ip-10-90-45-193",
         user_id="dana@example.com",
     )
     # Bind a conversation to the old host_id (workspace is required by
@@ -329,16 +341,27 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
         host_id="a1ed1ab71de2311e20488a989e61701c",
         workspace="/Users/dana/proj",
     )
+    host_store.upsert_on_connect(
+        host_id="a1ed1ab71de2311e20488a989e61701c",
+        name="ip-10-90-45-193",
+        user_id="dana@example.com",
+        refreshed_name=refreshed_name,
+    )
 
-    # Same (owner, name), rotated host_id — this used to raise.
+    # Same machine, rotated host_id — this used to raise.
     updated = host_store.upsert_on_connect(
         host_id="b1b5efd7dfc33b5a6241f1866ffb00e6",
-        name="dev-laptop",
+        name="ip-10-90-45-193",
         user_id="dana@example.com",
+        refreshed_name=refreshed_name,
+        previous_host_id=previous_host_id,
     )
 
     assert updated.host_id == "b1b5efd7dfc33b5a6241f1866ffb00e6"
     assert updated.status == "online"
+    assert [(host.host_id, host.name) for host in host_store.list_hosts("dana@example.com")] == [
+        ("b1b5efd7dfc33b5a6241f1866ffb00e6", expected_name)
+    ]
     # The binding followed the rotation — the conversation now points at
     # the new host_id, not the old (dangling) one or NULL.
     rebound = conversations.get_conversation(conv.id)
@@ -347,6 +370,27 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
         "conversation must be repointed to the rotated host_id so the "
         "session stays bound to the reconnected host"
     )
+
+
+def test_previous_host_id_moves_only_the_owners_external_host(host_store: HostStore) -> None:
+    """Another owner's host and a managed host keep their rows despite a matching previous id."""
+    owner = "grace@example.com"
+    other_owner_box = "66" * 16
+    host_store.upsert_on_connect(other_owner_box, "ip-10-90-45-193", "erin@example.com")
+    _reserve(host_store, owner=owner)
+
+    host_store.upsert_on_connect(
+        "77" * 16, "ip-10-90-37-46", owner, previous_host_id=other_owner_box
+    )
+    host_store.upsert_on_connect(
+        "88" * 16, "ip-10-90-18-185", owner, previous_host_id=_RESERVED_HOST_ID
+    )
+
+    other_owners_host = host_store.get_host(other_owner_box)
+    assert other_owners_host is not None
+    assert other_owners_host.user_id == "erin@example.com"
+    assert host_store.get_host(_RESERVED_HOST_ID) is not None
+    assert {host.host_id for host in host_store.list_hosts(owner)} >= {"77" * 16, "88" * 16}
 
 
 def test_reown_host_id_across_owner_change_preserves_conversation_binding(
@@ -813,6 +857,72 @@ def test_upsert_conflict_preserves_created_at(
     assert fetched[0].created_at == original_created
     # updated_at should be >= the original (reconnect bumps it).
     assert fetched[0].updated_at >= original_created
+
+
+def test_reconnect_renames_known_host_unless_another_host_holds_the_name(
+    host_store: HostStore,
+) -> None:
+    """A reconnect renames in place unless another of the owner's hosts holds the name."""
+    owner = "grace@example.com"
+    earlier_box, current_box, deleted_box = "11" * 16, "22" * 16, "33" * 16
+    host_store.upsert_on_connect(earlier_box, "ip-10-90-37-46", owner)
+    host_store.set_offline(earlier_box)
+    host_store.register_managed_host(
+        host_id=deleted_box,
+        name="ip-10-90-50-7",
+        user_id=owner,
+        token="raw-launch-token",
+        provider="modal",
+        sandbox_id="sb-pending-cleanup",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host_store.delete_host(deleted_box) is not None
+    host_store.upsert_on_connect(current_box, "ip-10-90-45-193", owner)
+
+    renamed = host_store.upsert_on_connect(current_box, "ip-10-90-18-185", owner)
+    collided = host_store.upsert_on_connect(current_box, "ip-10-90-37-46", owner)
+    behind_tombstone = host_store.upsert_on_connect(current_box, "ip-10-90-50-7", owner)
+
+    assert renamed.name == "ip-10-90-18-185"
+    assert collided.name == "ip-10-90-18-185"
+    assert collided.status == "online"
+    assert behind_tombstone.name == "ip-10-90-18-185"
+    hosts = {host.host_id: host for host in host_store.list_hosts(owner)}
+    assert hosts[current_box].name == "ip-10-90-18-185"
+    assert hosts[earlier_box].name == "ip-10-90-37-46"
+    assert hosts[earlier_box].status == "offline"
+
+
+def test_refreshed_name_applies_only_while_no_other_host_holds_it(
+    host_store: HostStore,
+) -> None:
+    """A refreshed name replaces the registered one only while no other host holds it."""
+    owner = "grace@example.com"
+    box, reused_ip_box, next_ip_box = "11" * 16, "22" * 16, "33" * 16
+    host_store.upsert_on_connect(box, "ip-10-90-45-193", owner)
+    refreshed = host_store.upsert_on_connect(
+        box, "ip-10-90-45-193", owner, refreshed_name="ip-10-90-37-46"
+    )
+    host_store.upsert_on_connect(reused_ip_box, "ip-10-90-45-193", owner)
+    host_store.upsert_on_connect(next_ip_box, "ip-10-90-18-185", owner)
+
+    both_held = host_store.upsert_on_connect(
+        box, "ip-10-90-45-193", owner, refreshed_name="ip-10-90-18-185"
+    )
+    new_free = host_store.upsert_on_connect(
+        "44" * 16, "ip-10-90-60-1", owner, refreshed_name="ip-10-90-50-7"
+    )
+    new_held = host_store.upsert_on_connect(
+        "55" * 16, "ip-10-90-60-2", owner, refreshed_name="ip-10-90-18-185"
+    )
+
+    assert refreshed.name == "ip-10-90-37-46"
+    assert (both_held.name, both_held.status) == ("ip-10-90-37-46", "online")
+    assert new_free.name == "ip-10-90-50-7"
+    assert new_held.name == "ip-10-90-60-2"
+    hosts = {host.host_id: host.name for host in host_store.list_hosts(owner)}
+    assert hosts[reused_ip_box] == "ip-10-90-45-193"
+    assert hosts[next_ip_box] == "ip-10-90-18-185"
 
 
 _RESERVED_HOST_ID = "ab" * 16
