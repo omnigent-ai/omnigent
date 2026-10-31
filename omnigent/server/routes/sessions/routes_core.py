@@ -260,8 +260,11 @@ from omnigent.util.session_lifecycle import (
 )
 from omnigent.version import VERSION
 
-# Continues a claude-sdk session in a fresh session on ``/clear``; returns its id.
-ClearSessionIntoFreshSession = Callable[[Request, Conversation], Awaitable[str]]
+# Continues a claude-sdk session in a fresh session on ``/clear`` once the
+# release callback has freed its client; returns the new session's id.
+ClearSessionIntoFreshSession = Callable[
+    [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
+]
 
 
 def _require_attachment_compatible_history(
@@ -4545,6 +4548,7 @@ def register_core_routes(
         title: str,
         notice: Callable[[str], str],
         reason: SupersessionReason,
+        prepare: Callable[[], Awaitable[None]] | None = None,
     ) -> str:
         """
         Continue *source* in a fork on the same placement, superseding it.
@@ -4562,6 +4566,8 @@ def register_core_routes(
         :param title: The fork's title; ``""`` lets its first message name it.
         :param notice: Builds the source's notice from the fork's id.
         :param reason: ``session.superseded`` reason, e.g. ``"clear"``.
+        :param prepare: Runs once the request is known to be allowed, before
+            the fork exists, e.g. to free the source's live client.
         :returns: The fork's session id.
         :raises OmnigentError: When the caller does not own *source*, it is a
             sub-agent or running a turn, or no runner or host can take the fork.
@@ -4592,6 +4598,8 @@ def register_core_routes(
                 "Reconnect the session (send a message to wake it), then try again.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        if prepare is not None:
+            await prepare()
 
         fork = await _fork_session(
             request,
@@ -4646,7 +4654,11 @@ def register_core_routes(
         )
         return fork.id
 
-    async def clear_session_into_fresh_session(request: Request, source: Conversation) -> str:
+    async def clear_session_into_fresh_session(
+        request: Request,
+        source: Conversation,
+        release_source: Callable[[], Awaitable[None]],
+    ) -> str:
         """
         Continue *source* in a fresh session on the same placement.
 
@@ -4656,6 +4668,8 @@ def register_core_routes(
 
         :param request: The incoming request, whose caller must own *source*.
         :param source: Session being cleared.
+        :param release_source: Frees the source's live client; runs only once
+            the clear is allowed.
         :returns: The new session's id.
         """
         first = await asyncio.to_thread(
@@ -4670,6 +4684,7 @@ def register_core_routes(
             title="",
             notice=supersession_notice_text,
             reason="clear",
+            prepare=release_source,
         )
 
     return clear_session_into_fresh_session
