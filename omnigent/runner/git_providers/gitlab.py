@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -20,6 +21,7 @@ from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
     PullRequestFacet,
+    ReviewerRef,
     gitlab_observer,
     local_git,
 )
@@ -557,6 +559,78 @@ class GitLabPullRequests:
         del root, reference
         if account is not None or remote is not None:
             raise ValueError("Use glab on the host to select a GitLab account or remote.")
+
+    def repo_labels(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        del root, reference
+        raise ValueError("Editing GitLab merge request labels is not supported yet.")
+
+    def edit_labels(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[str],
+        remove: Sequence[str],
+    ) -> dict[str, Any]:
+        del root, reference, add, remove
+        raise ValueError("Editing GitLab merge request labels is not supported yet.")
+
+    def merge_options(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        del root, reference
+        raise ValueError("Merging GitLab merge requests from Omnigent is not supported yet.")
+
+    def merge(
+        self, root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+    ) -> dict[str, Any]:
+        del root, reference, merge_method, expected_head
+        raise ValueError("Merging GitLab merge requests from Omnigent is not supported yet.")
+
+    def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        del root, reference
+        raise ValueError("Merging GitLab merge requests from Omnigent is not supported yet.")
+
+    def review_candidates(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        del root, reference
+        raise ValueError("Editing GitLab merge request reviewers is not supported yet.")
+
+    def edit_reviewers(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[ReviewerRef],
+        remove: Sequence[ReviewerRef],
+    ) -> dict[str, Any]:
+        del root, reference, add, remove
+        raise ValueError("Editing GitLab merge request reviewers is not supported yet.")
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Reject comment posting for this provider."""
+        del root, reference, body
+        raise ValueError("Posting comments for this provider is not supported yet.")
+
+    def edit_details(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        title: str | None,
+        body: str | None,
+    ) -> dict[str, Any]:
+        del root, reference, title, body
+        raise ValueError("Editing GitLab merge request descriptions is not supported yet.")
+
+    def upload_attachment(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        name: str,
+        content_type: str,
+        content: bytes,
+    ) -> dict[str, Any]:
+        del root, reference, name, content_type, content
+        raise ValueError("Attaching files to GitLab merge requests is not supported yet.")
 
 
 PULL_REQUESTS: PullRequestFacet = GitLabPullRequests()

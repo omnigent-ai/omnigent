@@ -291,7 +291,7 @@ def _load_user_hermes_config() -> _ConfigObject:
 
         full = yaml.safe_load(user_config.read_text()) or {}
         return {k: v for k, v in full.items() if k in _USER_CONFIG_KEYS}
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.debug("Failed to load user Hermes config at %s", user_config, exc_info=True)
         return {}
 

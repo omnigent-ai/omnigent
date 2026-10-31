@@ -33,3 +33,10 @@ def test_marker_inside_string_literal_is_not_honored() -> None:
 
 def test_no_markers_returns_empty() -> None:
     assert disabled_rules_by_line("x = 1\ny = {}\n") == {}
+
+
+def test_uneven_indentation_keeps_earlier_markers_instead_of_raising() -> None:
+    src = (
+        "x = 1  # custom-lint: disable=rule-a\n    y = 2\n  z = 3  # custom-lint: disable=rule-b\n"
+    )
+    assert disabled_rules_by_line(src) == {1: {"rule-a"}}

@@ -113,18 +113,33 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Automations introduction](./automations-introduction.md) covers the first-visit
+  walkthrough, capability-dependent content, and browser-local dismissal.
+
+- [Pull request conversations](./pull-request-conversations.md) covers inline
+  GitHub threads and replies through Workspace, composer, mobile and Canvas.
+
+- [Session orchestration](./session-orchestration.md) covers private-owner
+  messaging, top-level worker creation, polling results and sharing restrictions.
+
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
 
 - [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
   checklist, connects existing bench probes to user journeys, and records
-  per-harness coverage gaps separately from observed results.
+  per-harness coverage gaps separately from observed results. Its
+  [comparison guidance](./harness-acceptance.md#compare-harnesses-by-user-journey)
+  separates declared capabilities, mapped tests and observed CUJ results.
 
 - [Markdown editor](./markdown-editor.md) defines the file-editor CUJ, fixed
   before/after recordings, load probes, and complementary persistence checks.
 
 - [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
   review, deletion, and capability gating.
+
+- [Remote agent launch](./remote-agent-launch.md) covers registered-agent
+  discovery and selection through `omnigent run --server`, interactive and
+  one-shot host launch, existing-session boundaries, and failure diagnostics.
 
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, and slash commands.
@@ -135,7 +150,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   approvals, resume, and terminal behavior, with native disconnect test boundaries.
 - [Preferences and config defaults](./preferences.md) covers local user/project
   defaults, invocation overrides, related settings surfaces, and the boundary
-  between the shared-preference foundation and user journeys not yet available.
+  between explicit cloud save/import, the shared-preference foundation, and
+  deferred automatic following.
 - [Login and host authentication](./login-and-host-auth.md) covers
   `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
   authentication for project writes.
@@ -143,6 +159,11 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
+- [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
+  counts, the expanded field, error and Raw views, and tool-run folding.
+- [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
+  desktop and mobile profile selection, and the boundary between browser
+  request proof and live resource/network enforcement.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
@@ -168,8 +189,8 @@ map an area, remove it here in the same change.
 **Web and apps** (UI test areas):
 
 - Chat transcript, errors, and MCP status: `tests/e2e_ui/chat/` (only the
-  composer, side-chat, model-picker, harness-visibility, reconnect, and
-  terminal journeys are mapped)
+  composer, side-chat, model-picker, harness-visibility, reconnect, terminal,
+  and tool-call journeys are mapped)
 - Approvals, permission cards, and the inbox: `tests/e2e_ui/approvals/` (only
   native edit-tool approvals are mapped)
 - Sub-agents and the agent info popover: `tests/e2e_ui/agents/` (only Claude-native
@@ -186,12 +207,13 @@ map an area, remove it here in the same change.
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity,
-  Claude shell-command settlement, and refused-delivery persistence are mapped)
+  Claude and Codex shell-command settlement, refused-delivery persistence, and
+  tool-run folding are mapped)
 - Mobile layout: `tests/e2e_ui/mobile/` (only composer labels, the composer
   after an unacknowledged send, sidebar rename under the keyboard, and
   terminal touch scroll are mapped)
-- Onboarding and host import review: `tests/e2e_ui/onboarding/` (only the
-  import review modal's link to Harnesses is mapped)
+- Onboarding and host import review: `tests/e2e_ui/onboarding/` (the import
+  review modal's link to Harnesses and provider profile selection/clone flows are mapped)
 - Visual snapshots: `tests/e2e_ui/visual/`
 
 **CLI commands:**
@@ -200,7 +222,8 @@ map an area, remove it here in the same change.
   `omnigent diagnose`, `omnigent debug`, `omnigent usage` (config defaults are
   mapped; credential configuration and the other commands remain unmapped)
 - Install lifecycle: `omnigent upgrade`, `omnigent update`, `omnigent uninstall`
-- Running agents and servers: `omnigent run`, `omnigent start`, `omnigent stop`,
+- Other running-agent and server workflows: `omnigent run` (local/native modes),
+  `omnigent start`, `omnigent stop`,
   `omnigent server`, `omnigent attach`, `omnigent resume`, `omnigent session`,
   `omnigent import`
 - Bundled agents and the Copilot harness: `omnigent polly`, `omnigent debby`,
@@ -220,7 +243,20 @@ interruptions for claude-native are tracked as scenario rows in
 header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
-budgets, MCP servers, sandbox providers, and smart routing.
+budgets, MCP servers, sandbox provider lifecycle beyond profile configuration,
+and smart routing. Smart routing's per-worker model lists, which `sys_list_models`
+also returns, are covered by component tests: `tests/test_model_catalog.py` for
+the worker rows and `tests/host/test_connect.py` for the host's
+`GET /v1/hosts/{id}/harnesses/claude-sdk/model-options` answer. A Claude Code or
+Codex SDK worker on a CLI login lists the host's cached native probe of that
+login; behind a gateway, `apiKeyHelper` or cloud transport, with Codex logged
+out, or when the child launches a different CLI or arguments than the host
+probed, it lists nothing. To check one by hand, give an `openai-agents` brain on
+the mock model a `codex` SDK worker as an agent tool, launch it on a host with a
+Codex subscription, script it to call `sys_list_models`, and open the List models
+result; the host's boot probe writes the catalog, and Codex lists models without
+a login. A host passes `HARNESS_CODEX_*` to its runners only when
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` names them.
 
 ## Keeping the map current
 

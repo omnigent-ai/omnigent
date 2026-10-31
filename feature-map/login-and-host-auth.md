@@ -15,6 +15,11 @@ be able to write resources without a separate Omnigent account.
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
+- `workspace-selector-validation`: a URL's `?o=` routes the current command
+  without replacing saved login details. Login and launch auth probes compare
+  it with the server's workspace header, even on HTTP 200; a mismatch names both
+  workspaces and asks for the full URL. Only successful verification saves the
+  selector. Servers without the header retain their existing login behavior.
 - `cli-browser-ticket-consent`: an OIDC sign-in opens a ticket-specific browser
   login and then an **Authorize sign-in** page. Compare its code with the CLI,
   choose **Approve** to complete sign-in, or **Deny** to stop it. Signing in
@@ -28,15 +33,40 @@ be able to write resources without a separate Omnigent account.
 - `expired-credential`: an expired or revoked Databricks credential leads to a
   re-authentication prompt. When a newly launched runner explicitly reports a
   pending host sign-in, its first message waits on that same runner until the
-  sign-in finishes or its bounded wait expires.
+  sign-in finishes or its bounded wait expires. A runner the server refuses on
+  credentials before it connects is reported with a sign-in-again instruction
+  naming `omnigent login`, not as a runner crash.
 - `proxy-env`: login detects the right mode even with HTTP proxy variables set.
 - `host-lifecycle`: register in the foreground or background, run as a per-user
   system service, and check status, stop, stop a session, or reset the host ID.
+  A machine runs one host per host ID and Databricks workspace, even through
+  two URLs for it, once the workspace ID is known from the server or a login
+  record; otherwise (a non-Databricks server, or an unreachable server with no
+  login record) daemons stay per URL. A second background daemon yields and
+  `host --background` or `start` reports the running one, a foreground `host`
+  refuses after retrying for about 6 s, and a service host waits until the
+  other daemon stops. If the server reports the running daemon's host offline,
+  a launch doesn't reuse it; it refuses and names the login and `host stop`
+  commands that fix it. Without file locks (Windows), daemons check only each
+  other's records, so two that start at the same moment can both connect.
 - `host-inline-login`: `omnigent host` against a Databricks-fronted server that
   the user is not signed in to runs the login flow first; `--non-interactive`
   fails with the login command instead. States: missing Databricks SDK extra,
   missing Databricks CLI, first browser login followed by host registration,
   and a saved login reused on the next invocation.
+- `desktop-ssh-connect`: in the desktop app (macOS and Linux), **Connect a host**
+  connects a machine the user reaches over SSH. The app runs the system `ssh`
+  with the user's config, runs `omnigent login` there with the sign-in callback
+  port forwarded to the laptop, then starts `omnigent host --background`.
+  States: consent, trusting a new host key, a key passphrase or password,
+  installing omnigent when it is missing, finishing in the browser (with a
+  confirmation code on OIDC servers), connected (the new host selected),
+  already connected, connected but the new host unconfirmed (the dialog stays
+  open to pick it from the host list), closing the window mid sign-in (nothing
+  left running on the machine), a sign-in link the machine shouldn't print
+  (refused, no browser), and failures, shown only in the app's own window.
+  Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
+  Databricks-managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -72,9 +102,13 @@ be able to write resources without a separate Omnigent account.
 **CLI sign-in:** `omnigent login <server-url>`.
 
 **Host:** `omnigent host <server-url>` (or `--server`), `omnigent host ""` for a
-local server, `--background`, `--no-open`, `--non-interactive`, and the
+local server, `--background`, `--no-open`, `--open-in-desktop` (or
+`OMNIGENT_HOST_OPEN_IN_DESKTOP=1`), `--non-interactive`, and the
 management commands `status`, `stop`, `stop-session`, `reset-id`, `enable`,
-and `disable`.
+and `disable`. With `--open-in-desktop`, a supported desktop app accepts
+the request before navigating or asking for consent. If it cannot accept within
+five seconds, the browser opens instead. URLs with base paths or selectors keep
+their original destination in the browser. `--no-open` suppresses both.
 
 **Web:** a harness that needs sign-in is marked in the harness picker, and a
 session whose host went offline offers reconnect (see [sessions](./sessions.md)).
@@ -83,7 +117,11 @@ session whose host went offline offers reconnect (see [sessions](./sessions.md))
 server; relaunching the app, New Window, deep links, and switching servers on a
 signed-in server; the app's sign-out in Settings, **Server → Sign Out of Server**
 in the native menu, and **Sign out of <server>** in the sidebar server picker (Databricks and OIDC servers; the next Connect opens
-the browser, which is how a user switches accounts).
+the browser, which is how a user switches accounts). To connect a machine over SSH,
+use the SSH field under the `omni host` command (desktop app only; not yet on
+Windows): **Connect new host** in a new session's host menu, or the clone dialog
+(from the header or the reconnect dialog's Clone tab) when no host is online or
+under **Connect another host from your terminal**. Each selects the new host.
 
 **iOS:** Connect on the connect screen to an OIDC server; a server picked in the
 native server menu or the sidebar server picker; relaunching the app, deep links,
@@ -123,6 +161,14 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   (starts its own accounts server; run with plain `uv run pytest`).
 - **`profile-selection`:**
   `tests/e2e/test_host_auth_prefers_user_over_m2m_sp_e2e.py::test_resolve_auth_for_host_must_not_select_m2m_sp_over_user_profile`
+- **`workspace-selector-validation`:**
+  `tests/e2e/test_host_inline_login.py::test_login_rejects_truncated_workspace_selector`
+  runs the real CLI and local server behind the existing mock HTTPS workspace,
+  using a test-owned PAT and CA. The proxy accepts the bearer but reports a
+  different workspace. Login must fail without changing auth/config files; a
+  corrected URL must succeed. This tests CLI, HTTP and file boundaries, not a
+  live Databricks deployment. The login and backend unit suites cover cached,
+  refreshed and header-auth responses, omitted headers, and process-local routing.
 - **`expired-credential`:**
   `tests/e2e/test_expired_databricks_credential_launch.py::test_expired_databricks_credential_offers_reauth_not_edge_403`
 - **Pending host sign-in:**
@@ -134,11 +180,46 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   covers cancellation, stop, replacement, process exit and expiry. The isolated
   header-mode environment has no interactive credential source, so it cannot
   drive an actual browser reauthorization.
+- **Runner refused on credentials:**
+  `tests/host/test_connect.py::test_watch_runner_reports_refused_credentials_as_sign_in`
+  (plain `uv run pytest`) checks the sign-in instruction before a connection
+  and an ordinary runner fault after one.
+- **`desktop-ssh-connect`:**
+  `tests/e2e/test_desktop_ssh_connect.py::test_ssh_connect_signs_in_through_forward_and_starts_host`
+  runs the app's production connect code against a real `sshd`, with the laptop
+  side in an unprivileged network namespace, through the real omnigent and
+  Databricks CLIs and the mock workspace. It needs Linux with `unshare -rn`,
+  `sshd`, node, openssl and the Databricks CLI; CI runners lack `sshd` and the
+  Databricks CLI, so it skips there. The window's states render from
+  `web/electron/ssh-connect/index.html` with a stub `window.sshConnect` bridge.
+  The SSH field needs the desktop app (`just electron-dev`) on a server that
+  serves this web build. A real Databricks sign-in needs a real remote machine
+  and workspace.
 - **`databricks-credential-kind`:** needs a real workspace and one test
   profile of each kind. No e2e covers the host daemon against a real workspace.
 - **`host-lifecycle`:** run `omnigent host --help` and the management commands
   inside cli-setup-verify's sandbox; the system service commands change the
-  user's login items, so only run them on a disposable machine.
+  user's login items, so only run them on a disposable machine. One host per
+  workspace: `tests/host/test_daemon_lifecycle.py` (the `test_daemon_yields_*`
+  cases, `test_daemon_without_flock_yields_to_current_workspace_record`, and
+  `test_background_daemon_loser_exits_before_connecting`),
+  `tests/host/test_cli_host.py`
+  (`test_background_commands_report_reuse_when_the_spawned_daemon_yields` and
+  the `test_foreground_host_*_workspace*` cases; offline daemons:
+  `test_same_workspace_daemon_offline_reason*` and
+  `test_host_background_reuses_same_workspace_daemon_only_when_online`), and
+  `tests/host/test_service.py::test_service_entry_waits_while_another_daemon_serves_the_workspace`.
+  A real check needs two URLs that reach one workspace, so run it only in a
+  private-network sandbox against a disposable server.
+- **Background harness credentials (own environment, installed Codex/Claude SDK):**
+  `tests/e2e/test_background_host_harness_credentials.py` compares real foreground
+  and background hosts. Saved provider env references and named passthrough keep
+  the configured harness ready; unreferenced keys remain filtered. Uses isolated
+  homes and synthetic credentials without model requests. The Claude SDK case
+  needs bubblewrap when machine-managed settings exist. This covers fresh hosts;
+  existing-daemon refresh and installed OS services need separate verification.
+  `tests/host/test_service.py::test_service_persists_explicit_host_credentials_privately`
+  checks launchd/systemd file contents and permissions with service commands mocked.
 - **`host-inline-login` (own environment, Linux):** run
   `uv run --no-sync pytest tests/e2e/test_host_inline_login.py --reruns 0 -q`.
   It starts an isolated real server and a local HTTPS mock workspace, then
@@ -221,6 +302,10 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 
 ## Gotchas
 
+- Background hosts capture their environment when started; restart the host after
+  changing forwarded credentials. `host enable` saves explicitly forwarded values
+  in plaintext in the per-user service definition, readable only by its owner
+  (0600), so the service can retain them across logins.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one

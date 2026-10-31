@@ -24,6 +24,7 @@ _CONTEXT_FILE = "context.json"
 # (no Python spawn on Claude's blocking statusLine path). The forwarder
 # normalizes it into ``context.json`` via :func:`sync_raw_status_context`.
 CONTEXT_RAW_FILE = "context_raw.json"
+_MAX_VERSION_CHARS = 32
 
 
 def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | None:
@@ -71,6 +72,10 @@ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | 
         model_id = model.strip()
     if model_id is not None:
         record["model"] = model_id
+    # The Claude Code build behind the pane, so delivery diagnostics can tell versions apart.
+    version = payload.get("version")
+    if isinstance(version, str) and 0 < len(version) <= _MAX_VERSION_CHARS:
+        record["claude_code_version"] = version
     return record
 
 

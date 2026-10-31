@@ -90,6 +90,11 @@ interface NativeShellApi {
    */
   onOpenPath?: (callback: (path: string) => void) => () => void;
   /**
+   * Subscribe to the desktop find bar opening, from the shortcut or the Edit
+   * menu. Absent on older shells / outside Electron; returns an unsubscribe.
+   */
+  onFindOpened?: (callback: () => void) => () => void;
+  /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
    * can drive its sidebar as an interactive drawer: `begin`/`move` carry a 0→1
@@ -190,6 +195,10 @@ interface ElectronDesktopApi extends NativeShellApi {
   updates?: ElectronUpdateBridge;
   /** Reveal one of this machine's files in the OS file manager. */
   revealFile?: (hostId: string, path: string) => Promise<boolean>;
+  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
+  chooseDirectory?: (defaultPath?: string) => Promise<string | null>;
+  /** This machine's path for a dropped File; "" if none or off the pinned server. */
+  getPathForFile?: (file: File) => Promise<string>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -200,6 +209,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
+  /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
+  connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
   /** Extend this machine's running Arca instance with an approved mode. */
   extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
   /** Renew this machine's dbcert; Arca Companion copies it to the user's Arca and Arclets. */
@@ -245,6 +256,74 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => Promise<{ ok: boolean; error?: string }>;
   /** Clear native key interception when the recent-session gesture was declined. */
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Inspect the local Google Chrome profiles for cookies in the site tree the
+   * conversation's view is on. Metadata only (profile + per-scope counts): no
+   * Keychain access and no cookie values. Absent on shells predating the feature.
+   */
+  browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
+  /**
+   * Copy that site's cookies out of one Chrome profile into the conversation's
+   * own in-memory browser session. Decrypts via the Keychain (system prompt on
+   * the first import); `expectedHost` must still match the view's current site.
+   */
+  browserChromeCookieImport?: (
+    conversationId: string,
+    args: { profileId: string; expectedHost: string; scope?: string },
+  ) => Promise<ChromeCookieImportResult>;
+}
+
+/** One importable site tree and how many cookies a profile holds for it. */
+export interface ChromeCookieScopeCount {
+  /** The page's host or one of its parent domains. */
+  host: string;
+  /** Cookies on that domain and its subdomains, plus inherited domain cookies. */
+  cookieCount: number;
+}
+
+/** One local Chrome profile that holds cookies for the current site. */
+export interface ChromeCookieProfile {
+  /** Chrome's profile directory name (e.g. `Default`, `Profile 2`). */
+  id: string;
+  /** Chrome's profile display name, falling back to the directory name. */
+  name: string;
+  /** How many cookies the profile holds for the page's own host tree. */
+  cookieCount: number;
+  /** Counts per scope, narrowest first (see {@link ChromeCookiePreviewResult.scopes}).
+   *  Only scopes this profile actually holds cookies for are listed. */
+  scopes?: ChromeCookieScopeCount[];
+}
+
+export interface ChromeCookiePreviewResult {
+  ok: boolean;
+  /** Host whose page asked for the import (main-derived from the real URL). */
+  host?: string;
+  /** Scopes the user may pick: `host`, then each parent domain Chrome holds
+   *  a domain cookie for. */
+  scopes?: string[];
+  /** Profiles with at least one cookie for any scope; empty when none match. */
+  profiles?: ChromeCookieProfile[];
+  error?: string;
+}
+
+export interface ChromeCookieImportResult {
+  ok: boolean;
+  /** The user declined the shell's own confirmation; nothing was read. */
+  cancelled?: boolean;
+  host?: string;
+  /** The site tree actually copied (the page's host unless the user widened it). */
+  scope?: string;
+  profileId?: string;
+  profileName?: string;
+  /** Cookies matching the site tree (before decryption). */
+  found?: number;
+  /** Cookies written into the conversation's session. */
+  imported?: number;
+  /** Matched cookies we could not decrypt and left out. */
+  skipped?: number;
+  /** Cookies Chrome believes are valid but the session rejected. */
+  failed?: number;
+  error?: string;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -297,6 +376,8 @@ export interface DesktopFeatures {
   canRefreshDbcert?: boolean;
   /** Shell can restore Arca preview identity after a desktop restart. */
   arcaPreviewRecovery?: boolean;
+  /** This shell can import the current site's cookies from local Google Chrome. */
+  chromeCookieImport?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -722,6 +803,21 @@ export function onOpenPath(callback: (path: string) => void): () => void {
 }
 
 /**
+ * Subscribe to the desktop find bar opening. A no-op outside the Electron
+ * shell or under a shell too old to send it.
+ */
+export function onFindOpened(callback: () => void): () => void {
+  const native = nativeApi();
+  if (!native?.onFindOpened) return () => {};
+  try {
+    return native.onFindOpened(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onFindOpened failed:", err);
+    return () => {};
+  }
+}
+
+/**
  * Subscribe to native sidebar-drag events from the iOS shell's left-edge swipe
  * (the gesture it repurposed from back-navigation), so the renderer can drive
  * its sidebar as an interactive drawer — tracking the finger on `begin`/`move`
@@ -1018,6 +1114,11 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
   }
 }
 
+/** Whether this desktop shell can connect the user's Arca instance as a host. */
+export function supportsArcaConnect(): boolean {
+  return typeof electronApi()?.connectArcaHost === "function";
+}
+
 /**
  * Connect the user's Arca instance (Databricks-internal sandbox) to the
  * window's server as a host, via the desktop shell. The shell asks native
@@ -1033,6 +1134,29 @@ export async function connectArcaHost(): Promise<ArcaConnectResult> {
     return await electron.connectArcaHost();
   } catch (err) {
     console.warn("[nativeBridge] electron connectArcaHost failed:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Whether this desktop shell can connect a machine the user reaches over SSH. */
+export function supportsSshConnect(): boolean {
+  return typeof electronApi()?.connectSshHost === "function";
+}
+
+/**
+ * Connect `destination` (an ssh alias, host or user@host) to the window's
+ * server as a host. The shell asks consent and handles ssh prompts and the
+ * browser sign-in in its own window. A no-op `{ ok: false }` outside the shell.
+ */
+export async function connectSshHost(destination: string): Promise<ArcaConnectResult> {
+  const electron = electronApi();
+  if (!electron?.connectSshHost) {
+    return { ok: false, error: "not running under the desktop shell" };
+  }
+  try {
+    return await electron.connectSshHost(destination);
+  } catch (err) {
+    console.warn("[nativeBridge] electron connectSshHost failed:", err);
     return { ok: false, error: String(err) };
   }
 }
@@ -1152,5 +1276,35 @@ export async function revealFile(hostId: string, path: string): Promise<boolean>
     return (await electronApi()?.revealFile?.(hostId, path)) ?? false;
   } catch {
     return false;
+  }
+}
+
+/** True when the desktop shell can open the OS folder chooser for this machine. */
+export function supportsDirectoryChooser(): boolean {
+  return typeof electronApi()?.chooseDirectory === "function";
+}
+
+/** Open the OS folder chooser; resolves the chosen path, or null on cancel or failure. */
+export async function chooseDirectory(defaultPath?: string): Promise<string | null> {
+  try {
+    return (await electronApi()?.chooseDirectory?.(defaultPath)) ?? null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron chooseDirectory failed:", err);
+    return null;
+  }
+}
+
+/** True when the desktop shell can resolve paths of files dropped from the OS. */
+export function supportsDroppedFilePaths(): boolean {
+  return typeof electronApi()?.getPathForFile === "function";
+}
+
+/** This machine's path for a dropped ``file``, or null when the shell can't resolve one. */
+export async function droppedFilePath(file: File): Promise<string | null> {
+  try {
+    return (await electronApi()?.getPathForFile?.(file)) || null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron getPathForFile failed:", err);
+    return null;
   }
 }

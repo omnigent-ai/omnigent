@@ -191,6 +191,14 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             headers=[(k, v) for k, v in head.headers],
             stream=stream,
             request=request,
+            extensions={
+                "omnigent_runner_connection": {
+                    "runner_id": state.session.runner_id,
+                    "runner_version": state.session.hello.runner_version,
+                    "connection_id": state.session.hello.connection_id,
+                    "generation": state.session.generation,
+                }
+            },
         )
 
     async def aclose(self) -> None:

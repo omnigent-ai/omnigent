@@ -43,6 +43,7 @@ import os
 import queue
 import re
 import secrets
+import select
 import shlex
 import socket
 import socketserver
@@ -68,7 +69,11 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
-from omnigent.harnesses.claude_native import delivery_diagnostics
+from omnigent.harnesses.claude_native import (
+    PEER_MESSAGE_WAKE_KIND,
+    PEER_MESSAGE_WAKE_TEXT,
+    delivery_diagnostics,
+)
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
@@ -78,11 +83,15 @@ from omnigent.harnesses.claude_native.submit_verification import (
     has_matching_hook_refusal,
 )
 from omnigent.harnesses.diagnostics import (
+    SIGN_IN_RESEND_STEP,
     detect_sign_in_prompt,
+    launcher_install_prompt,
+    launcher_password_prompt,
     sign_in_next_step,
     sign_in_running_elsewhere,
 )
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
+from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
@@ -99,7 +108,7 @@ if TYPE_CHECKING:
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
-from omnigent.native import native_bridge_common
+from omnigent.native import native_bridge_common, policy_allow_cache
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -117,6 +126,7 @@ _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
+RESUME_COPY_MARKER_SUFFIX = ".omnigent-resume-copy"
 
 
 def _bridge_injection_lock(bridge_dir: Path) -> threading.Lock:
@@ -159,7 +169,17 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
             _cancellable_injection_lock(_bridge_injection_lock(bridge_dir)),
             _cancellable_injection_lock(_bridge_injection_file_lock(bridge_dir)),
         ):
-            return function(bridge_dir, *args, **kwargs)
+            try:
+                return function(bridge_dir, *args, **kwargs)
+            except ClaudeComposerNotCleared:
+                # The refused paste sent nothing. Give a clipped composer room,
+                # then recheck readiness and pending prompts before retrying.
+                info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
+                with _usable_composer_height(info["socket_path"], info["tmux_target"]) as resized:
+                    if not resized:
+                        raise
+                    time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                    return function(bridge_dir, *args, **kwargs)
 
     return cast(_InjectionFunction, wrapped)
 
@@ -224,6 +244,12 @@ _TOOL_RELAY_FILE = "tool_relay.json"
 # on every relay start, so hooks survive runner restarts (new port).
 _TOOL_RELAY_ENV_FILE = "tool_relay.env"
 _TMUX_FILE = "tmux.json"
+# Written into the pane's private dir just before Omnigent kills the pane, so the
+# runner reads the exit as Omnigent's own close rather than the terminal dying.
+_EXPECTED_CLOSE_FILE = "expected_close"
+# Written there before every Omnigent kill (stop, reap), so an exit without it
+# that tmux reports as a killed session came from outside Omnigent.
+_OMNIGENT_KILL_FILE = "omnigent_kill"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -298,6 +324,9 @@ _TITLED_RULE_EDGE_GLYPHS = "".join(
 # Narrowest a labelled rule may be: the composer's rule spans the pane, so a
 # short run of glyphs around a word is decoration, not the box.
 _MIN_TITLED_RULE_WIDTH = 20
+# Glyphs Claude Code pads a row-filling label with: it keeps a label that is
+# within two columns of the row and fills only the remainder.
+_OVERFLOWED_LABEL_MAX_TRAIL = 2
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
@@ -312,6 +341,10 @@ _DIALOG_FOOTER_RE = re.compile(
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
+# A pane whose prompt has not rendered for this long is asked to repaint
+# (see :func:`_request_claude_repaint`), then again at the interval.
+_CLAUDE_REPAINT_AFTER_S = 5.0
+_CLAUDE_REPAINT_INTERVAL_S = 20.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # Ctrl+K and Ctrl+U as CSI-u sequences, so Claude Code reads them as keys
 # rather than as text when they arrive in one burst.
@@ -319,6 +352,8 @@ _COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
 _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
 # Retry rounds when the capture cannot show the whole box.
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
+# Footer rows Claude Code draws under the input box (mode hints, status line).
+_SCROLLED_DRAFT_MAX_FOOTER_ROWS = 4
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -365,6 +400,8 @@ _UNKNOWN_COMMAND_REJECTION_PREFIX = "Unknown command: "
 # Claude Code collapses large pastes into this placeholder in the
 # input box instead of rendering the text itself.
 _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
+# Hint Claude Code shows in the empty input box while a submitted message is queued.
+_QUEUED_MESSAGE_HINT = "Press up to edit queued messages"
 # How many characters of the draft's first line to use when checking
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
@@ -417,11 +454,9 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 _OVERLAY_SURFACE = "an overlay"
 # What :func:`_occupying_surface` reports when the box is in ``!`` shell mode.
 _SHELL_MODE_SURFACE = "shell mode"
-# Ctrl+U, CSI-u encoded like the other clearing keys. Claude Code leaves shell
-# mode on it only with the cursor at the start of the line, so a typed command
-# takes two: the first clears the line, the second switches the box back to
-# chat input. Neither submits, and unlike Escape neither interrupts a turn.
-_CLEAR_LINE_KEY = "\x1b[117;5u"
+# What :func:`_occupying_surface` reports when a draft taller than the pane
+# has scrolled the box's glyph row out of view.
+_SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
 # The dismissal every surface drawn over the input box advertises in its
 # footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
 # an action with "/", so the task details panels print "Esc/Enter/Space to
@@ -510,6 +545,7 @@ _CONFIRM_DIALOG_RETRY_INTERVAL_S = 0.75
 # surfaces in the web UI error banner instead of only in the terminal.
 _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
+_TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
@@ -1789,6 +1825,7 @@ def prepare_bridge_dir(
         token = config.get("token") if isinstance(config, dict) else None
         if not isinstance(token, str) or not token:
             token = secrets.token_urlsafe(32)
+        previous_session_id = config.get("active_session_id") if isinstance(config, dict) else None
         payload: dict[str, object] = {
             "bridge_id": resolved_bridge_id,
             "active_session_id": conversation_id,
@@ -1811,6 +1848,9 @@ def prepare_bridge_dir(
         if sandbox is not None:
             payload["sandbox"] = _bridge_sandbox_payload(sandbox)
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
+        if previous_session_id != conversation_id:
+            # A window opened for another session must not answer this one's hooks.
+            policy_allow_cache.invalidate(bridge_dir)
         # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
         # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
         # breaks approval routing on reattach/rebind. ``build_hook_settings``
@@ -1922,14 +1962,16 @@ def _account_home_dir() -> Path:
 
 def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
     """
-    Pre-accept Claude Code's first-run trust + onboarding prompts.
+    Pre-accept Claude Code's first-run trust, onboarding, and mode prompts.
 
-    Claude Code blocks on two TUI prompts the first time it launches in
+    Claude Code blocks on TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
     top-level ``hasCompletedOnboarding`` key in its global config
-    (:func:`claude_global_config_path`, usually ``~/.claude.json``), and a
+    (:func:`claude_global_config_path`, usually ``~/.claude.json``), a
     per-directory "Do you trust the files in this folder?" dialog gated
-    by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
+    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, and a "Make auto
+    mode your default permission mode?" question gated by
+    ``hasSeenAutoDefaultNudge``. None fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
@@ -1938,10 +1980,10 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     rooted at the home directory, whose interactively accepted trust
     Claude keeps for that session only.
 
-    Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other global config state (the
+    Seed the gating keys idempotently so the launch never blocks. Only
+    those keys are written; all other global config state (the
     user's own onboarding choices, project history, MCP config, OAuth
-    account) is preserved, and the file is left untouched when both keys
+    account) is preserved, and the file is left untouched when all keys
     are already set. This deliberately does NOT skip per-tool permission
     prompts — those still route to the web UI via the ``PermissionRequest``
     hook; only the unhookable startup gates are pre-accepted.
@@ -1993,6 +2035,11 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     # has never run Claude Code interactively.
     if data.get("hasCompletedOnboarding") is not True:
         data["hasCompletedOnboarding"] = True
+        changed = True
+    # Startup question offering to make auto the default mode, asked when the
+    # user's own settings pin another default. Declining it sets only this key.
+    if data.get("hasSeenAutoDefaultNudge") is not True:
+        data["hasSeenAutoDefaultNudge"] = True
         changed = True
 
     # Per-directory trust gate. Claude keys its ``projects`` map by the
@@ -2232,6 +2279,8 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
         config["conversation_id"] = session_id
         config["updated_at"] = time.time()
         _write_json_file(bridge_dir / _CONFIG_FILE, config)
+    # The new session's policies were never checked.
+    policy_allow_cache.invalidate(bridge_dir)
 
 
 def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
@@ -2486,8 +2535,12 @@ def build_hook_settings(
     }
     from omnigent.native.tool_observer_hook import hook_settings
 
-    observer_hook = hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")
-    observer_hook["command"] = _pin_runner_tmpdir(cast(str, observer_hook["command"]))
+    observer_hook = hook_settings(
+        bridge_dir,
+        python,
+        "omnigent.harnesses.claude_native.hook",
+        wrap_python=_pin_runner_tmpdir,
+    )
     hooks["PostToolUse"].append({"hooks": [observer_hook]})
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
@@ -2566,7 +2619,9 @@ def build_hook_settings(
         )
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
-            "command": evaluate_policy_command,
+            "command": policy_allow_cache.guarded_hook_command(
+                bridge_dir, evaluate_policy_command
+            ),
         }
 
         # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
@@ -2796,7 +2851,6 @@ def augment_claude_args(
         ``False`` keeps every prompt off the routing round trip.
     :returns: Augmented argument list for the terminal resource.
     """
-    mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
     hook_settings = build_hook_settings(
         bridge_dir,
         python_executable=python_executable,
@@ -2807,7 +2861,7 @@ def augment_claude_args(
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
-        launch_effort=_arg_value(claude_args, "--effort"),
+        launch_effort=_launch_effort_arg(claude_args),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
@@ -2815,14 +2869,18 @@ def augment_claude_args(
     args = _merge_allowed_tools(args, allowed_tools)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
-    args.extend(
-        [
-            "--mcp-config",
-            json.dumps(mcp_config, separators=(",", ":")),
-            "--settings",
-            str(settings_path),
-        ]
-    )
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
+
+    if claude_code_managed_mcp_present():
+        # Claude Code exits at startup on --mcp-config while an enterprise MCP config exists.
+        _logger.warning(
+            "Claude Code has an enterprise managed-mcp.json; launching without "
+            "Omnigent's MCP tools."
+        )
+    else:
+        mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
+        args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
+    args.extend(["--settings", str(settings_path)])
     if append_system_prompt:
         args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
@@ -2867,6 +2925,12 @@ def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
             if candidate and not candidate.startswith("--"):
                 value = candidate
     return value
+
+
+def _launch_effort_arg(args: tuple[str, ...]) -> str | None:
+    """Return the valid ``--effort`` in ``args``, trimmed and lowercased as Claude does."""
+    effort = (_arg_value(args, "--effort") or "").strip().lower()
+    return effort if effort in CLAUDE_EFFORTS else None
 
 
 def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
@@ -2959,17 +3023,24 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
         if isinstance(event_name, str) and event_name:
             state["last_hook_event_name"] = event_name
         claude_session_id = payload.get("session_id")
+        transcript_path = payload.get("transcript_path")
+        agent_id = payload.get("agent_id")
+        child_identity = (isinstance(agent_id, str) and bool(agent_id)) or (
+            isinstance(transcript_path, str) and "subagents" in Path(transcript_path).parts
+        )
         pinned = state.get("claude_session_id")
         # Identity pin: only a SessionStart or an event from the already-pinned
         # session may change transcript/session identity; a side-channel event
         # (e.g. a background Task agent's edge) must not re-aim the forwarder.
-        identity_allowed = event_name == "SessionStart" or (
-            isinstance(claude_session_id, str)
-            and claude_session_id != ""
-            and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
+        identity_allowed = not child_identity and (
+            event_name == "SessionStart"
+            or (
+                isinstance(claude_session_id, str)
+                and claude_session_id != ""
+                and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
+            )
         )
         if identity_allowed:
-            transcript_path = payload.get("transcript_path")
             if isinstance(transcript_path, str) and transcript_path:
                 state["transcript_path"] = transcript_path
             if isinstance(claude_session_id, str) and claude_session_id:
@@ -3296,6 +3367,8 @@ def read_transcript_items_since_with_position(
     agent_name: str,
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
+    pending_settled_response_id: str | None = None,
+    pending_settled_at: float | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items from a line cursor and return byte position.
@@ -3316,6 +3389,9 @@ def read_transcript_items_since_with_position(
     :param settled_response_id: Response id whose turn already ended
         (its ``Stop`` edge posted) — assistant output inheriting it is
         a scheduled/automatic wake and opens a new marked turn.
+    :param pending_settled_response_id: Stopped turn awaiting transcript
+        quiescence; used only to identify peer inputs that wake a new turn.
+    :param pending_settled_at: Stop timestamp; earlier peer input belongs to the stopped turn.
     :returns: Parsed items plus line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
@@ -3327,6 +3403,7 @@ def read_transcript_items_since_with_position(
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
     active_settled_id = settled_response_id
+    active_pending_settled_id = pending_settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
@@ -3357,6 +3434,8 @@ def read_transcript_items_since_with_position(
             agent_name=agent_name,
             current_response_id=active_response_id,
             settled_response_id=active_settled_id,
+            pending_settled_response_id=active_pending_settled_id,
+            pending_settled_at=pending_settled_at,
         )
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
@@ -3364,6 +3443,7 @@ def read_transcript_items_since_with_position(
         # resume against a still-armed settle (spurious wake marker).
         if any(item.is_compact_summary for item in parsed):
             active_settled_id = None
+            active_pending_settled_id = None
         usage = _usage_from_transcript_entry(entry)
         if usage is not None:
             latest_usage = usage
@@ -3408,6 +3488,8 @@ def read_transcript_items_from_offset(
     agent_name: str,
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
+    pending_settled_response_id: str | None = None,
+    pending_settled_at: float | None = None,
     include_sidechains: bool = False,
     legacy_agent_messages: bool = False,
 ) -> TranscriptReadResult:
@@ -3432,6 +3514,9 @@ def read_transcript_items_from_offset(
     :param settled_response_id: Response id whose turn already ended
         (its ``Stop`` edge posted) — assistant output inheriting it is
         a scheduled/automatic wake and opens a new marked turn.
+    :param pending_settled_response_id: Stopped turn awaiting transcript
+        quiescence; used only to identify peer inputs that wake a new turn.
+    :param pending_settled_at: Stop timestamp; earlier peer input belongs to the stopped turn.
     :param include_sidechains: Pass ``True`` when reading a
         sub-agent's own ``agent-<id>.jsonl`` — every record there is
         a sidechain by Claude's definition, and dropping them would
@@ -3450,6 +3535,7 @@ def read_transcript_items_from_offset(
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
     active_settled_id = settled_response_id
+    active_pending_settled_id = pending_settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
@@ -3481,6 +3567,8 @@ def read_transcript_items_from_offset(
             agent_name=agent_name,
             current_response_id=active_response_id,
             settled_response_id=active_settled_id,
+            pending_settled_response_id=active_pending_settled_id,
+            pending_settled_at=pending_settled_at,
             include_sidechains=include_sidechains,
         )
         if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
@@ -3491,6 +3579,7 @@ def read_transcript_items_from_offset(
         # resume against a still-armed settle (spurious wake marker).
         if any(item.is_compact_summary for item in parsed):
             active_settled_id = None
+            active_pending_settled_id = None
         usage = _usage_from_transcript_entry(entry)
         if usage is not None:
             latest_usage = usage
@@ -3782,10 +3871,9 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     """
     Return whether Claude reported a stop event after a hook cursor.
 
-    Only counts stop events from the parent Claude process — subagent
-    stop events (carrying an ``agent_id``, or whose ``transcript_path``
-    contains a ``subagents/`` component) are ignored so a finishing
-    subagent does not prematurely signal the parent turn as complete.
+    Only counts stop events from the parent Claude process. A foreign
+    native session, ``agent_id``, or ``subagents/`` transcript identifies
+    a child whose completion must not end the parent's turn.
 
     :param bridge_dir: Bridge directory path.
     :param start_event_count: Hook record count captured before a
@@ -3794,6 +3882,7 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
         ``StopFailure`` hook has been recorded after the cursor.
     """
     path = bridge_dir / _HOOKS_FILE
+    parent_session_ids = read_seen_claude_session_ids(bridge_dir)
     try:
         with path.open("r", encoding="utf-8") as handle:
             for index, line in enumerate(handle, start=1):
@@ -3805,13 +3894,19 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                     continue
                 payload = envelope.get("payload") if isinstance(envelope, dict) else None
                 event_name = payload.get("hook_event_name") if isinstance(payload, dict) else None
-                if event_name in {"Stop", "StopFailure"}:
-                    transcript_path = (
-                        payload.get("transcript_path") if isinstance(payload, dict) else None
-                    )
+                if event_name in {"Stop", "StopFailure"} and isinstance(payload, dict):
+                    native_session_id = payload.get("session_id")
+                    if (
+                        parent_session_ids
+                        and isinstance(native_session_id, str)
+                        and native_session_id
+                        and native_session_id not in parent_session_ids
+                    ):
+                        continue
+                    transcript_path = payload.get("transcript_path")
                     if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
                         continue
-                    if isinstance(payload, dict) and payload.get("agent_id"):
+                    if payload.get("agent_id"):
                         continue
                     return True
     except FileNotFoundError:
@@ -4386,6 +4481,7 @@ def _paste_and_submit(
             "-t",
             tmux_target,
         )
+        delivery_diagnostics.record_details(paste_sent=True)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
@@ -4422,6 +4518,7 @@ def _paste_and_submit(
         polls=polls,
         empty_captures=empty_captures,
     )
+    delivery_diagnostics.record_submit_composer(pane=pane, box_reader=_composer_box, baseline=True)
     time.sleep(_PASTE_SETTLE_S)
     delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
@@ -4508,6 +4605,8 @@ def _verify_submit_accepted(
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
         ownership of the web input remains unconfirmed.
+    :raises RuntimeError: Pane capture remains unavailable after submitting;
+        delivery cannot be confirmed safely.
     """
     start = time.monotonic()
     last_enter = start
@@ -4520,6 +4619,7 @@ def _verify_submit_accepted(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
+        delivery_diagnostics.record_submit_composer(pane=pane, box_reader=_composer_box)
         if (
             bridge_dir is not None
             and submit_boundary is not None
@@ -4540,6 +4640,10 @@ def _verify_submit_accepted(
                 "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
                 "could not be confirmed; inspect the terminal before retrying."
             )
+        # An empty capture can be a repaint or failed tmux read. It proves
+        # neither that the draft cleared nor that another Enter is safe.
+        if not pane.strip():
+            continue
         if not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
@@ -4575,7 +4679,7 @@ def _verify_submit_accepted(
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     delivery_diagnostics.record_verification(
-        draft_still_present=True,
+        draft_still_present=_draft_in_input_box(pane, needle),
         pane=pane,
         needle=needle,
         prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -4583,6 +4687,12 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
+    if not pane.strip():
+        raise RuntimeError(
+            f"Claude Code {what} delivery could not be confirmed within "
+            f"{_SUBMIT_VERIFY_TIMEOUT_S}s because terminal capture is unavailable. "
+            "Inspect the terminal before retrying; the message may already have been delivered."
+        )
     return False
 
 
@@ -4699,6 +4809,7 @@ def kill_session(
     bridge_dir: Path,
     *,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    expected_close: bool = False,
 ) -> None:
     """
     Forcefully terminate the Claude tmux session via ``kill-session``.
@@ -4725,18 +4836,58 @@ def kill_session(
         advertised by the runner, e.g. ``30.0``. A short value is
         appropriate for the UI path — a missing ``tmux.json`` means
         there is no live session to kill.
+    :param expected_close: ``True`` when Omnigent ends the pane to fail a
+        turn itself (a delivery timeout). The runner then reads the exit
+        as expected instead of a terminal crash; see
+        :func:`pane_closed_by_omnigent`.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    private_dir = Path(info["socket_path"]).parent
+    markers = [private_dir / _OMNIGENT_KILL_FILE]
+    if expected_close:
+        markers.append(private_dir / _EXPECTED_CLOSE_FILE)
+    for marker in markers:
+        with contextlib.suppress(OSError):
+            marker.touch()
     try:
-        _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
-    except RuntimeError as exc:
-        detail = str(exc).lower()
-        if "can't find session" in detail or "no server running on" in detail:
-            return
+        _run_tmux(
+            info["socket_path"],
+            "kill-session",
+            "-t",
+            info["tmux_target"],
+            allow_missing_target=True,
+        )
+    except RuntimeError:
+        for marker in markers:
+            marker.unlink(missing_ok=True)
         raise
+
+
+def pane_closed_by_omnigent(private_dir: Path) -> bool:
+    """
+    Return whether Omnigent itself killed the Claude pane in *private_dir*.
+
+    :param private_dir: The terminal instance's private dir, which holds its
+        tmux socket, e.g. ``/tmp/omnigent-terminal-abc/``.
+    :returns: ``True`` when :func:`kill_session` was asked for an expected
+        close and the kill did not fail.
+    """
+    return (private_dir / _EXPECTED_CLOSE_FILE).exists()
+
+
+def pane_killed_by_omnigent(private_dir: Path) -> bool:
+    """
+    Return whether Omnigent itself killed the Claude pane in *private_dir*.
+
+    :param private_dir: The terminal instance's private dir, which holds its
+        tmux socket, e.g. ``/tmp/omnigent-terminal-abc/``.
+    :returns: ``True`` when :func:`kill_session` ran for this pane (a stop or a
+        reap) and the kill did not fail.
+    """
+    return (private_dir / _OMNIGENT_KILL_FILE).exists()
 
 
 @_serialize_bridge_injection
@@ -5533,7 +5684,7 @@ class _UnixHTTPConnection(HTTPConnection):
         self.sock = sock
 
 
-def _run_tmux(socket_path: str, *args: str) -> None:
+def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
 
@@ -5546,6 +5697,8 @@ def _run_tmux(socket_path: str, *args: str) -> None:
         was launched on, e.g. ``"/tmp/.../tmux.sock"``.
     :param args: Arguments after ``tmux -S <socket_path>``, e.g.
         ``("send-keys", "-l", "-t", "claude:0.0", "hello")``.
+    :param allow_missing_target: Treat a confirmed missing tmux server or
+        target as success.
     :returns: None.
     :raises RuntimeError: If the subprocess exits non-zero or times
         out.
@@ -5575,7 +5728,88 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     if proc.returncode != 0:
         delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
+        if allow_missing_target:
+            from omnigent.inner.terminal import _tmux_reports_target_gone
+
+            if _tmux_reports_target_gone(detail):
+                return
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
+
+
+@contextlib.contextmanager
+def _usable_composer_height(socket_path: str, tmux_target: str) -> Iterator[bool]:
+    """Give a short pane room to render its complete input box during delivery.
+
+    Yield whether the pane grew; callers wait for the redraw before typing.
+    Restore automatic sizing so a browser resize during delivery takes effect.
+    """
+    import subprocess
+
+    _check_injection_cancelled()
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{window_width} #{window_height} #{window-size}",
+                ";",
+                "show-options",
+                "-w",
+                "-v",
+                "-t",
+                tmux_target,
+                "window-size",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+        lines = proc.stdout.splitlines()
+        width, height, policy = lines[0].split()
+        needs_resize = proc.returncode == 0 and int(width) > 0 and 0 < int(height) < 24
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        yield False
+        return
+    if not needs_resize or policy not in {"manual", "latest", "largest", "smallest"}:
+        yield False
+        return
+
+    restore_policy = (
+        ("set-option", "-w", "-t", tmux_target, "window-size", policy)
+        if len(lines) > 1
+        else ("set-option", "-wu", "-t", tmux_target, "window-size")
+    )
+    try:
+        _run_tmux(socket_path, "resize-window", "-t", tmux_target, "-y", "24")
+        yield True
+    finally:
+        # A cancelled delivery still releases its temporary sizing override.
+        token = _INJECTION_CANCEL_EVENT.set(None)
+        try:
+            # Restore dimensions for detached windows, then let attached clients resize.
+            _run_tmux(
+                socket_path,
+                "resize-window",
+                "-t",
+                tmux_target,
+                "-x",
+                width,
+                "-y",
+                height,
+                ";",
+                *restore_policy,
+                allow_missing_target=True,
+            )
+        except (OSError, RuntimeError):
+            _logger.warning("claude-native: could not restore terminal size", exc_info=True)
+        finally:
+            _INJECTION_CANCEL_EVENT.reset(token)
 
 
 def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
@@ -5688,6 +5922,77 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     return _ClaudePaneState(None)
 
 
+def _request_claude_repaint(
+    socket_path: str, tmux_target: str, bridge_dir: Path | None = None
+) -> int:
+    """
+    Ask Claude Code to redraw its whole screen.
+
+    Another process writing to the terminal Claude Code renders on (say, a
+    launcher's background thread logging to the stderr they share) overwrites
+    rows Claude Code's differential renderer believes are unchanged, so it
+    never redraws them. Text over the input box's frame hides a live composer
+    from :func:`_composer_row`, and the readiness wait would reap a healthy
+    pane. ``SIGCONT`` runs Claude Code's resume handler, which drops its
+    cached frame and repaints everything, as after ``fg``. A running process
+    without a handler ignores it, so the whole tree under the pane gets it: a
+    launcher may run Claude Code as its child.
+
+    A launcher may also run Claude Code outside that tree: isaac's fast launch
+    pumps the pane to a pre-started worker's terminal. Claude Code's session
+    registry still names its process, so that process gets the signal too.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge directory whose Claude session the registry
+        is searched for, or ``None`` to signal only the pane's tree.
+    :returns: How many processes were signalled; ``0`` when the pane's
+        process could not be found.
+    """
+    import signal
+    import subprocess
+
+    import psutil
+
+    from omnigent.harnesses.claude_native.status_file import session_pids
+
+    if IS_WINDOWS:
+        return 0
+    _check_injection_cancelled()
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return 0
+    fields = proc.stdout.split() if proc.returncode == 0 else []
+    if not fields or not fields[0].isdigit():
+        return 0
+    try:
+        root = psutil.Process(int(fields[0]))
+        tree = [root, *root.children(recursive=True)]
+    except psutil.Error:
+        return 0
+    claude_session_id = read_claude_session_id(bridge_dir) if bridge_dir is not None else None
+    if claude_session_id is not None:
+        in_tree = {process.pid for process in tree}
+        for pid in session_pids(claude_session_id):
+            if pid not in in_tree:
+                with contextlib.suppress(psutil.Error):
+                    tree.append(psutil.Process(pid))
+    signalled = 0
+    for process in tree:
+        with contextlib.suppress(psutil.Error):
+            process.send_signal(signal.SIGCONT)
+            signalled += 1
+    return signalled
+
+
 def claude_pane_ready(bridge_dir: Path) -> bool:
     """
     Report whether the Claude pane is showing a usable input box right now.
@@ -5779,13 +6084,18 @@ def _raise_if_user_prompt_pending(
         :class:`ClaudeUserPromptPending`).
     """
     if _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT):
+        delivery_diagnostics.record_pending_prompt("billing_consent")
         raise ClaudeUserPromptPending(
             "Claude Code is waiting for your auto-mode classifier billing choice. "
             "The message was not delivered. Open the terminal, answer the prompt, "
             "then resend your message.",
             nothing_typed=nothing_typed,
         )
-    if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(pane):
+    if bridge_dir is not None and _has_approval_wait(bridge_dir):
+        delivery_diagnostics.record_pending_prompt("hook_wait")
+        raise ClaudeUserPromptPending(message, nothing_typed=nothing_typed)
+    if _user_prompt_visible(pane):
+        delivery_diagnostics.record_pending_prompt("visible_prompt")
         raise ClaudeUserPromptPending(message, nothing_typed=nothing_typed)
 
 
@@ -5796,6 +6106,7 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
     :returns: Whether a question or permission request needs an explicit answer.
     """
     if _has_approval_wait(bridge_dir):
+        delivery_diagnostics.record_pending_prompt("hook_wait")
         return True
     info = _read_json_file(bridge_dir / _TMUX_FILE)
     if not isinstance(info, dict):
@@ -5803,7 +6114,10 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
     socket_path, target = info.get("socket_path"), info.get("tmux_target")
     if not isinstance(socket_path, str) or not isinstance(target, str):
         return False
-    return _user_prompt_visible(_capture_pane(socket_path, target))
+    pending = _user_prompt_visible(_capture_pane(socket_path, target))
+    if pending:
+        delivery_diagnostics.record_pending_prompt("visible_prompt")
+    return pending
 
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
@@ -5922,12 +6236,18 @@ def _restore_occupied_input(
     the web-UI message wins the pane. The exception is a shell-mode box
     holding a typed command, which Escape leaves in shell mode: that command
     is cleared from the box instead (see :func:`_shell_mode_draft`), the way
-    an unsent chat draft is cleared before a paste.
+    an unsent chat draft is cleared before a paste. So is a draft taller than
+    the pane, which scrolls the box's glyph row out of view
+    (:func:`_scrolled_draft_rows`).
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
     startup dialogs whose Escape quits Claude Code instead of closing them
     (:func:`_escape_quits_claude`): they are left for the person to answer.
+
+    Isaac's idle-compaction log can overwrite the rendered input box. Redraw
+    it once with Ctrl+L before any edit keys can erase its identifying prefix,
+    then check the actual composer and pending prompts again.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -5962,6 +6282,7 @@ def _restore_occupied_input(
     last_escape: float | None = None
     confirmed = False
     unclearable_seen = False
+    notice_redrawn = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -5977,6 +6298,18 @@ def _restore_occupied_input(
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
         surface = _occupying_surface(pane)
+        delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
+        box = _composer_box(pane)
+        if (
+            not notice_redrawn
+            and box is not None
+            and any("[idle-compact]" in row for row in box.rows)
+        ):
+            _logger.info("claude-native: redrawing an idle-compaction notice over the input box")
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-l")
+            notice_redrawn = True
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            continue
         if surface is None:
             return None
         now = time.monotonic()
@@ -6004,15 +6337,22 @@ def _restore_occupied_input(
             # transient back to a caller that will refuse to type into it.
             if unclearable_seen:
                 return surface
+        elif surface == _SCROLLED_DRAFT_SURFACE:
+            # Deleting lines shrinks the box until its glyph row is back on
+            # screen; the keys only edit the draft, so they need no spacing.
+            _logger.info("claude-native: clearing a draft taller than the terminal")
+            delivery_diagnostics.record_restore_action("scrolled_draft_clear")
+            _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
                 # Escape keeps a typed shell command in shell mode, so the
                 # command is cleared instead, as a chat draft is before a paste.
                 _logger.info("claude-native: clearing a shell-mode draft from the input box")
-                for _ in range(2):
-                    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _CLEAR_LINE_KEY)
+                delivery_diagnostics.record_restore_action("shell_clear")
+                _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
             else:
                 _logger.info("claude-native: dismissing %s covering the input box", surface)
+                delivery_diagnostics.record_restore_action("escape")
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         unclearable_seen = unclearable
@@ -6063,7 +6403,8 @@ def _occupying_surface(pane: str) -> str | None:
         return "the prompt-history search"
     row = _composer_row(pane)
     if row is None:
-        return _OVERLAY_SURFACE
+        box = _composer_box(pane)
+        return _SCROLLED_DRAFT_SURFACE if box is not None else _OVERLAY_SURFACE
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return _SHELL_MODE_SURFACE
@@ -6075,16 +6416,17 @@ def _shell_mode_draft(pane: str) -> bool:
 
     Escape takes an empty shell-mode box back to chat input, but Claude Code
     keeps a box holding a typed command in shell mode, so that one is
-    cleared with :data:`_CLEAR_LINE_KEY` instead.
+    cleared with the same line edits as a chat draft instead.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when the composer row leads with the shell-mode glyph
-        and carries text after it.
+    :returns: ``True`` when the shell-mode composer holds text on any row.
     """
-    row = _composer_row(pane)
-    if row is None or not row.strip().startswith(_SHELL_MODE_GLYPH):
+    box = _composer_box(pane)
+    if box is None or not box.rows[0].strip().startswith(_SHELL_MODE_GLYPH):
         return False
-    return bool(row.strip()[len(_SHELL_MODE_GLYPH) :].strip())
+    return bool(box.rows[0].strip()[len(_SHELL_MODE_GLYPH) :].strip()) or any(
+        row.strip() for row in box.rows[1:]
+    )
 
 
 def _composer_row(pane: str) -> str | None:
@@ -6112,19 +6454,40 @@ def _composer_row(pane: str) -> str | None:
     :returns: The row's text, e.g. ``"❯ fix the bug"`` or ``"!"`` in shell
         mode, or ``None`` when no input box is on screen.
     """
+    rows = _composer_rows(pane)
+    return rows[0] if rows else None
+
+
+def _composer_rows(pane: str) -> list[str]:
+    """
+    Return every row inside Claude Code's live input box, or ``[]``.
+
+    The first row is :func:`_composer_row`'s glyph row; the rest are the
+    continuation rows down to the box's closing rule. A multi-line draft
+    can render below the glyph row — a collapsed paste shows a blank
+    ``❯`` with ``[Pasted text #1 +N lines]`` on the next row. Rows below
+    the box (the mode footer, a status line, a dialog) are never included:
+    when no closing rule follows the glyph row, the box's extent is
+    unknown, so only the glyph row is returned. A draft continuing below
+    the glyph row of such a clipped box is then not seen, and delivery
+    falls back to its unverified submit.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The framed rows, e.g. ``["❯", "[Pasted text #1 +7 lines]"]``.
+    """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+    rules = _composer_frame_rule_indices(non_empty)
     if not rules:
-        return None
+        return []
     candidates = [rules[-2] + 1] if len(rules) >= 2 else []
     candidates.append(rules[-1] + 1)
     for idx in candidates:
         if idx >= len(non_empty):
             continue
-        row = non_empty[idx]
-        if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            return row
-    return None
+        if non_empty[idx].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+            end = next((rule for rule in rules if rule > idx), idx + 1)
+            return non_empty[idx:end]
+    return []
 
 
 class _ComposerBox(NamedTuple):
@@ -6133,36 +6496,97 @@ class _ComposerBox(NamedTuple):
     #: The box's rows, e.g. ``["❯ fix the bug", "  in foo.py"]``. Blank rows
     #: are kept, since a draft's empty lines are lines too.
     rows: list[str]
-    #: Whether the closing rule was on screen, so ``rows`` is the whole box
-    #: rather than the part of it above the bottom of the pane.
+    #: Whether both rules were on screen, so ``rows`` is the whole box rather
+    #: than the part of it the pane had room for.
     framed: bool
+
+
+def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
+    """Keep frame edges, excluding further-indented rule text in a draft.
+
+    The last two rules can be a frame edge and a draft line; the less-indented
+    rule identifies the frame in both a complete and a clipped input box.
+    """
+    starts: dict[int, int] = {}
+    for idx, line in enumerate(lines):
+        start = _box_rule_start(line)
+        if start is not None:
+            starts[idx] = start
+    rules = list(starts)
+    if len(rules) < 2:
+        return rules
+    frame_indent = min(starts[idx] for idx in rules[-2:])
+    rules = [idx for idx in rules if starts[idx] == frame_indent]
+    last_prompt = next((line for line in lines[rules[-1] + 1 :] if line.strip()), "")
+    if (
+        last_prompt.strip()[:1] in _COMPOSER_MODE_GLYPHS
+        and len(last_prompt) - len(last_prompt.lstrip()) == frame_indent
+    ):
+        # A lower prompt makes the last rule an opening edge. The older frame
+        # cannot establish that this clipped draft is complete or empty.
+        return [rules[-1]]
+    return rules
 
 
 def _composer_box(pane: str) -> _ComposerBox | None:
     """
     Return every visible row of Claude Code's live input box, or ``None``.
 
-    The box is located as in :func:`_composer_row`: its first row sits
-    directly under the opening rule, led by a composer glyph. The rows run to
-    the closing rule, or to the bottom of the pane when there is none on
-    screen.
+    The box is located as in :func:`_composer_row`: its first row is the
+    first non-blank one under the opening rule, led by a composer glyph. The
+    rows run to the closing rule, or to the bottom of the pane when there is
+    none on screen. A draft taller than the pane is read as well
+    (:func:`_scrolled_draft_rows`), without its first rows.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: The box's visible rows and whether its closing rule was on
+    :returns: The box's visible rows and whether both of its rules were on
         screen, or ``None`` when no input box is on screen.
     """
     lines = pane.splitlines()
-    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    rules = _composer_frame_rule_indices(lines)
     if not rules:
         return None
     if len(rules) >= 2:
-        first = rules[-2] + 1
+        first = _first_non_blank(lines, rules[-2] + 1, rules[-1])
         if first < rules[-1] and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return _ComposerBox(lines[first : rules[-1]], framed=True)
-    first = rules[-1] + 1
+    first = _first_non_blank(lines, rules[-1] + 1, len(lines))
     if first < len(lines) and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
         return _ComposerBox(lines[first:], framed=False)
-    return None
+    scrolled = _scrolled_draft_rows(lines, rules)
+    return None if scrolled is None else _ComposerBox(scrolled, framed=False)
+
+
+def _first_non_blank(lines: list[str], start: int, end: int) -> int:
+    """Return the index of the first non-blank line in ``lines[start:end]``, else *end*."""
+    return next((idx for idx in range(start, end) if lines[idx].strip()), end)
+
+
+def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None:
+    """
+    Return the visible rows of a draft taller than the pane, or ``None``.
+
+    Claude Code keeps the bottom of its screen in view, so such a draft pushes
+    the box's opening rule and glyph row off the top: the pane shows draft rows
+    (indented under the glyph) down to the closing rule, then the footer.
+
+    :param lines: Captured pane lines.
+    :param rules: Frame rule indices from :func:`_composer_frame_rule_indices`.
+    :returns: The draft rows above the closing rule, e.g. ``["  step 9", "  step 10"]``.
+    """
+    if len(rules) != 1:
+        return None
+    rows = lines[: rules[0]]
+    footer = [line for line in lines[rules[0] + 1 :] if line.strip()]
+    if len(footer) > _SCROLLED_DRAFT_MAX_FOOTER_ROWS:
+        return None
+    text = [row for row in rows if row.strip()]
+    if len(text) < 2 or any(not row.startswith("  ") for row in text):
+        return None
+    # A visible selection glyph may belong to a clipped dialog or history search.
+    if any(_CLAUDE_PROMPT_GLYPH in line for line in lines):
+        return None
+    return rows
 
 
 def _clear_composer(socket_path: str, tmux_target: str) -> None:
@@ -6177,9 +6601,9 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     next message.
 
     One burst is known to have emptied the box only when the capture showed
-    the box whole (closing rule on screen) with a single row. A box with
-    more rows, or one cut off by the bottom of the pane (a draft taller than
-    the pane, or a sliver-height pane with no room for the closing rule),
+    the box whole (both rules on screen) with nothing after its glyph row but
+    blank rows. A box with more text, or one the pane cut off (a draft taller
+    than the pane, or a sliver-height pane with no room for the closing rule),
     may still hold lines the capture did not show, so it is cleared again,
     up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. A box still in that
     state afterwards is refused rather than pasted into: an exhausted budget
@@ -6187,6 +6611,12 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     submit the person's draft along with the injected input. An unavailable
     capture is likewise retried without sending clearing keys, then refused
     if no readable box appears within the budget.
+
+    Before refusing, Claude Code is asked to repaint once
+    (:func:`_request_claude_repaint`) and the rounds start over. Output
+    another process printed over the box, such as a launcher's log line, is
+    not part of the draft, so no key deletes it; after the repaint the
+    capture shows the real input box.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
@@ -6197,21 +6627,48 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
-    for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
-        box = _composer_box(_capture_pane(socket_path, tmux_target))
-        settled = box is not None and box.framed and len(box.rows) <= 1
+    repainted = False
+    round_no = 0
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        box = _composer_box(pane)
+        # Blank rows after the glyph row hold nothing a paste could join.
+        settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            if not repainted and _request_claude_repaint(socket_path, tmux_target):
+                repainted, round_no = True, 0
+                delivery_diagnostics.record_details(composer_repaint_requested=True)
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                continue
+            delivery_diagnostics.record_composer_not_cleared(
+                pane=pane,
+                rows=None if box is None else box.rows,
+                framed=box is not None and box.framed,
+                rule_count=sum(1 for line in pane.splitlines() if _is_box_rule(line)),
+            )
             raise ClaudeComposerNotCleared(
-                "A draft left in Claude Code's input box could not be cleared, so nothing "
-                "was sent. Open the terminal, clear the input box, then retry."
+                "Claude Code's input box could not be verified clear, so nothing was sent. "
+                "Open the terminal, expand it and clear the input box, then retry."
             )
         if box is not None:
-            presses = 2 * len(box.rows)
-            keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
-            _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
+            _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
             if settled:
                 return
+        round_no += 1
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _send_composer_clear_keys(socket_path: str, tmux_target: str, *, rows: int) -> None:
+    """
+    Send the Ctrl+K and Ctrl+U presses that empty *rows* rows of a draft.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param rows: Draft rows to delete, e.g. ``3``.
+    """
+    presses = 2 * rows
+    keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
@@ -6275,6 +6732,16 @@ def _is_box_rule(line: str) -> bool:
     """
     Return whether a line is a TUI box-drawing horizontal rule.
 
+    :param line: A single pane line, e.g. ``"──────────"``.
+    :returns: ``True`` when :func:`_box_rule_start` places a rule on it.
+    """
+    return _box_rule_start(line) is not None
+
+
+def _box_rule_start(line: str) -> int | None:
+    """
+    Return the column a TUI box-drawing horizontal rule starts at, or ``None``.
+
     Claude Code frames the input box with a row of ``─``
     (:data:`_BOX_RULE_CHARS`), with or without corner glyphs depending on
     the version. Both spellings count: :func:`_composer_row` anchors on
@@ -6301,23 +6768,38 @@ def _is_box_rule(line: str) -> bool:
     glyph once the title nears the pane width, and the pane is only as wide
     as the person's browser terminal.
 
+    A title too long for the row leaves no leading run at all: Claude Code
+    truncates it with ``…`` and draws the padded label from the first
+    column, followed by at most :data:`_OVERFLOWED_LABEL_MAX_TRAIL` glyphs
+    (``" my long session title… ─"``). That label's single leading space is
+    its padding, so the rule starts at column 0 like the closing rule
+    below it, whereas a draft or transcript row is indented further.
+
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
-    :returns: ``True`` when the line is a box-drawing rule.
+    :returns: The rule's first column, e.g. ``0``, or ``None`` when the
+        line is not a box-drawing rule.
     """
     stripped = line.strip()
     if len(stripped) < 3:
-        return False
+        return None
+    start = len(line) - len(line.lstrip())
     if all(ch in _BOX_RULE_CHARS for ch in stripped):
-        return True
+        return start
     lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
     trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
-    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
-        return False
+    if trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
+        return None
     label = stripped[lead : len(stripped) - trail]
+    if lead < 1:
+        if start != 1 or trail > _OVERFLOWED_LABEL_MAX_TRAIL:
+            return None
+        label, start = f" {label}", 0
     if any(ch in _BOX_RULE_CHARS for ch in label):
-        return False
-    return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
+        return None
+    if label.startswith(" ") and label.endswith(" ") and label.strip():
+        return start
+    return None
 
 
 def _submit_needle(content: str) -> str:
@@ -6354,14 +6836,19 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     """
     Return whether the pasted draft is visible in Claude's input box.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
+    Reads the framed input box (:func:`_composer_rows`): the glyph row
+    plus the rows under it down to the closing rule, since a collapsed
+    paste can render as a blank ``❯`` with the placeholder one row
+    below. Rows above the frame, such as the submitted message's
+    transcript echo, are never read. Without a frame on screen it falls
+    back to the text after the **last** :data:`_CLAUDE_PROMPT_GLYPH` in
+    the pane, as before; that row can be an echo or a dialog row. The draft
+    counts as visible when that text contains *needle* (small pastes
+    render verbatim) or the :data:`_PASTED_PLACEHOLDER_PREFIX`
+    placeholder (Claude Code collapses large pastes).
+    Whitespace is ignored, so a needle wrapped across rows still matches,
+    and so are Unicode control and format characters (e.g. U+FEFF), which
+    Claude Code keeps in the draft but does not render.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :param needle: Marker from :func:`_submit_needle`, e.g.
@@ -6369,13 +6856,38 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         only the paste placeholder is then considered.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
-        return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
+    rows = _composer_rows(pane)
+    if rows and _CLAUDE_PROMPT_GLYPH in rows[0]:
+        tail = "\n".join([rows[0].split(_CLAUDE_PROMPT_GLYPH, 1)[1], *rows[1:]])
+    else:
+        glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
+        if not glyph_lines:
+            return False
+        tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
-    return bool(needle) and needle in tail
+    # The hint is not a draft, but a short needle such as "to" or "a" matches its words.
+    tail = tail.replace(_QUEUED_MESSAGE_HINT, "")
+    target = _comparable_draft_text(needle)
+    return bool(target) and target in _comparable_draft_text(tail)
+
+
+def _comparable_draft_text(text: str) -> str:
+    """
+    Reduce draft text to the characters a pane capture can be matched on.
+
+    A long draft wraps, so the needle can straddle rows: whitespace is
+    dropped, which also rejoins a word that a hard wrap split mid-token.
+    Control and format characters (categories ``Cc``/``Cf``, e.g. U+FEFF)
+    are dropped too: Claude Code keeps them in the draft but never renders
+    them, so a needle that kept them could not match the pane.
+
+    :param text: Needle or captured input-box text, e.g. ``"\ufefffix it"``.
+    :returns: The comparable text, e.g. ``"fixit"``.
+    """
+    return "".join(
+        ch for ch in text if not ch.isspace() and unicodedata.category(ch) not in {"Cc", "Cf"}
+    )
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
@@ -6401,7 +6913,22 @@ def _format_terminal_failure_tail(pane: str) -> str:
     tail = "\n".join(lines[-_TERMINAL_FAILURE_TAIL_LINES:])
     if len(tail) > _TERMINAL_FAILURE_TAIL_CHARS:
         tail = "…" + tail[-_TERMINAL_FAILURE_TAIL_CHARS:]
-    return f" Last terminal output:\n{tail}"
+    return f"{_TERMINAL_FAILURE_TAIL_PREFIX}{tail}"
+
+
+def terminal_failure_tail(message: str) -> str:
+    """
+    Return the terminal-output block a readiness failure message ends with.
+
+    Lets a caller that rewords a failure for its own action (a model switch
+    rather than a chat message) keep the pane text that names the cause.
+
+    :param message: A failure message, e.g. ``str(ClaudePromptTimeout(...))``.
+    :returns: The block :func:`_format_terminal_failure_tail` appended, or
+        ``""`` when the message carries none.
+    """
+    _, prefix, tail = message.partition(_TERMINAL_FAILURE_TAIL_PREFIX)
+    return f"{prefix}{tail}" if prefix else ""
 
 
 def _terminal_dialog_headline(pane: str) -> str | None:
@@ -6456,7 +6983,9 @@ def _wait_for_claude_prompt_ready(
     dropped, so the first web-UI message silently vanishes. This gate
     polls ``capture-pane`` for the input prompt before injection;
     it returns immediately once mounted, so 2nd+ messages are
-    unaffected.
+    unaffected. While the prompt stays missing it periodically asks
+    Claude Code to repaint (:func:`_request_claude_repaint`), which
+    restores an input box another process's output drew over.
 
     Claude-native only — this is called from :func:`inject_user_message`
     and :func:`inject_slash_command`, which exclusively serve the Claude
@@ -6479,14 +7008,17 @@ def _wait_for_claude_prompt_ready(
         while a dead pane still ends it at the first liveness check, a
         :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
     :returns: None.
-    :raises ClaudeTerminalExited: If tmux affirms the pane's process has
-        exited, carrying the pane's wait-status so a clean quit is
-        distinguishable from a crash.
+    :raises ClaudeTerminalExited: If the pane is gone: tmux affirms the
+        process exited, carrying its wait-status so a clean quit is
+        distinguishable from a crash, or tmux no longer reports the pane
+        (no wait-status, so ``exit_status`` is ``None``).
     :raises ClaudeTerminalDialog: If a consent or selection dialog is holding
         the terminal (see :func:`_terminal_dialog_headline`) on two
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
+        A launcher password or installation prompt on two consecutive polls
+        is reported the same way.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -6496,7 +7028,8 @@ def _wait_for_claude_prompt_ready(
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
-        count, how many of those polls saw an empty capture, and the tail
+        count, how many of those polls saw an empty capture, how many
+        repaints were requested, and the tail
         of the last non-empty capture the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a startup crash, a torn/empty capture under a mid-turn repaint, or
@@ -6507,8 +7040,10 @@ def _wait_for_claude_prompt_ready(
     hard_deadline = started + (
         max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S) if extend_for_slow_boot else timeout_s
     )
+    next_repaint = started + _CLAUDE_REPAINT_AFTER_S
     polls = 0
     empty_polls = 0
+    repaint_requests = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
     # capture taken after the deadline. A post-timeout re-capture can show
     # a different (often healthier-looking) frame than any decision the
@@ -6517,10 +7052,12 @@ def _wait_for_claude_prompt_ready(
     # while it mattered keeps the error honest.
     last_nonempty = ""
     exited_status: str | None = None
-    pane_exited = False
+    pane_gone = False
     dialog_headline: str | None = None
     sign_in_url: str | None = None
     waited_on_sign_in = False
+    waited_on_password = False
+    waited_on_install = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -6539,6 +7076,28 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
+        remaining = hard_deadline - time.monotonic()
+        if (
+            bridge_dir is not None
+            and remaining > 0
+            and _occupying_surface(pane) == _OVERLAY_SURFACE
+            and _ESCAPE_DISMISS_HINT.search(pane)
+            and _terminal_dialog_headline(pane) is None
+            and not _escape_quits_claude(pane)
+        ):
+            # A panel can appear after preflight or an empty startup capture.
+            surface = _restore_occupied_input(
+                socket_path,
+                tmux_target,
+                bridge_dir=bridge_dir,
+                timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, remaining),
+            )
+            if surface is not None:
+                raise ClaudeTerminalDialog(
+                    "A panel is covering Claude Code's input box, so nothing was sent. "
+                    "Open the terminal, dismiss the panel, then retry."
+                )
+            continue
         billing_notice = auto_mode_billing_notice_visible(pane)
         if billing_notice:
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
@@ -6552,6 +7111,26 @@ def _wait_for_claude_prompt_ready(
                 "prompt, then resend your message." + _format_terminal_failure_tail(pane)
             )
         dialog_headline = headline
+        # A launcher asking for a password, e.g. sudo writing managed settings.
+        # Only the person can type it, so report it rather than wait out the
+        # budget and reap the pane holding the prompt.
+        at_password_prompt = launcher_password_prompt(pane)
+        if at_password_prompt and waited_on_password:
+            raise ClaudeTerminalDialog(
+                "Claude Code's launch command is waiting for a password in its terminal, "
+                "so the message was not delivered. Open the terminal, enter the password, "
+                "then resend your message." + _format_terminal_failure_tail(pane)
+            )
+        waited_on_password = at_password_prompt
+        at_install_prompt = launcher_install_prompt(pane)
+        if at_install_prompt and waited_on_install:
+            raise ClaudeTerminalDialog(
+                "Claude Code's launch command is waiting for installation confirmation "
+                "in its terminal, so the message was not delivered. Open the terminal, "
+                "answer the install prompt, then resend your message."
+                + _format_terminal_failure_tail(pane)
+            )
+        waited_on_install = at_install_prompt
         # A launcher sign-in prompt printed before Claude Code runs: an address
         # to open, often with a device code. Real when the same address shows
         # on two consecutive polls. Fail now with the link rather than wait out
@@ -6581,15 +7160,22 @@ def _wait_for_claude_prompt_ready(
                 remediation=(
                     "Finish the sign-in that another session opened, in your browser or in "
                     "that session's terminal. Claude Code continues on its own once it "
-                    "completes; then send your message again."
+                    f"completes{SIGN_IN_RESEND_STEP}"
                 ),
             )
         waited_on_sign_in = waiting_on_sign_in
         now = time.monotonic()
+        if now >= next_repaint:
+            # Output from another process can hide a live composer until
+            # Claude Code repaints.
+            if _request_claude_repaint(socket_path, tmux_target, bridge_dir):
+                repaint_requests += 1
+                delivery_diagnostics.record_readiness(prompt_repaint_requests=repaint_requests)
+            next_repaint = time.monotonic() + _CLAUDE_REPAINT_INTERVAL_S
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.alive is False:
-                pane_exited = state.exited
+                pane_gone = True
                 exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
@@ -6602,22 +7188,27 @@ def _wait_for_claude_prompt_ready(
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     waited_s = time.monotonic() - started
-    if pane_exited:
+    if pane_gone:
         # A readiness timeout's poll counts describe a box that never mounted,
-        # which reads as a rendering bug. An exited process is a different
-        # failure and its wait-status is what tells a quit from a crash.
-        status = "unknown" if exited_status is None else exited_status
+        # which reads as a rendering bug. A pane tmux no longer reports is a
+        # different failure: the terminal is gone, so a relaunch is the fix.
+        # Its wait-status, when tmux gave one, tells a quit from a crash.
+        gone = (
+            "is no longer running (exit status unknown)"
+            if exited_status is None
+            else f"has exited (status {exited_status})"
+        )
         raise ClaudeTerminalExited(
-            f"The Claude Code terminal has exited (status {status}), so the "
-            "message was not delivered. Relaunch the terminal to continue "
-            "this conversation." + _format_terminal_failure_tail(last_nonempty),
+            f"The Claude Code terminal {gone}, so the message was not delivered. "
+            "Relaunch the terminal to continue this conversation."
+            + _format_terminal_failure_tail(last_nonempty),
             exit_status=exited_status,
         )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
-        f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        f"{empty_polls} empty captures, {repaint_requests} repaint requests). "
+        "The message was not delivered." + _format_terminal_failure_tail(last_nonempty)
     )
 
 
@@ -7199,6 +7790,7 @@ def _tool_relay_handler_factory(
                 "/tool",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
+                "/hook/pi/extension-ui",
                 "/hook/observe-tool",
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -7233,6 +7825,9 @@ def _tool_relay_handler_factory(
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
                 return
+            if self.path == "/hook/pi/extension-ui":
+                self._handle_pi_extension_ui(payload)
+                return
             name = payload.get("name")
             arguments = payload.get("arguments")
             if not isinstance(name, str) or not name:
@@ -7240,7 +7835,16 @@ def _tool_relay_handler_factory(
                 return
             if not isinstance(arguments, dict):
                 arguments = {}
-            self._send_json(_run_relay_tool(tool_executor, loop, name, arguments))
+            # Native hooks may be reusing a no-policy ALLOW; keep that from
+            # outliving a policy this call adds.
+            mutation = (
+                policy_allow_cache.policy_mutation(bridge_dir)
+                if name == "sys_add_policy" and bridge_dir is not None
+                else contextlib.nullcontext()
+            )
+            with mutation:
+                result = _run_relay_tool(tool_executor, loop, name, arguments)
+            self._send_json(result)
 
         def _respond_hook_output(self, output: dict[str, object] | None) -> None:
             """Answer a hook-evaluate request with final hook output JSON.
@@ -7304,6 +7908,15 @@ def _tool_relay_handler_factory(
             import urllib.parse as _up
 
             url = f"/v1/sessions/{_up.quote(session_id, safe='')}/policies/evaluate"
+            cache_generation = (
+                policy_allow_cache.generation(bridge_dir) if bridge_dir is not None else None
+            )
+            # This relay evaluates its own session; a bridge that has switched
+            # sessions must not get a window from that answer.
+            relay_session_active = bridge_dir is not None and read_active_session_id(
+                bridge_dir
+            ) in (None, session_id)
+            requested_at = time.time()
             verdict: object = None
             last_error: str | None = None
             attempts = 0
@@ -7353,6 +7966,8 @@ def _tool_relay_handler_factory(
                 )
                 self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
                 return
+            if bridge_dir is not None and relay_session_active:
+                policy_allow_cache.record(bridge_dir, cache_generation, verdict, requested_at)
             hook_output = evaluation_response_to_hook_output(hook_event, verdict)
             hook_specific = (hook_output or {}).get("hookSpecificOutput")
             decision = (
@@ -7374,19 +7989,40 @@ def _tool_relay_handler_factory(
             self._respond_hook_output(hook_output)
 
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
+            self._proxy_parked_request(payload, "/policies/evaluate")
+
+        def _handle_pi_extension_ui(self, payload: _JsonObject) -> None:
+            self._proxy_parked_request(payload, "/hooks/pi-extension-ui", watch_disconnect=True)
+
+        def _proxy_parked_request(
+            self, payload: _JsonObject, path: str, *, watch_disconnect: bool = False
+        ) -> None:
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            import urllib.parse as _up
-
-            session_component = _up.quote(session_id, safe="")
-            url = f"/v1/sessions/{session_component}/policies/evaluate"
+            session_component = urllib.parse.quote(session_id, safe="")
+            url = f"/v1/sessions/{session_component}{path}"
             future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
             try:
+                if watch_disconnect:
+                    deadline = time.monotonic() + 86400.0
+                    while not future.done():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Dialog wait expired")
+                        try:
+                            readable, _, _ = select.select([self.connection], [], [], 0.1)
+                            if readable:
+                                # EOF or pipelined bytes end this single-request wait.
+                                return
+                        except OSError:
+                            return
                 resp = future.result(timeout=86400.0)
             except Exception as exc:  # noqa: BLE001
                 self._send_policy_proxy_error(exc)
                 return
+            finally:
+                # Closing a dialog releases the upstream parked card.
+                future.cancel()
             raw = resp.content
             self.send_response(resp.status_code)
             for header in ("Content-Type", "Content-Length"):
@@ -8369,7 +9005,7 @@ def read_user_effort_level() -> str | None:
     Return the user's configured Claude Code effort level, if any.
 
     Read client-side from ``effortLevel`` in ``~/.claude/settings.json`` —
-    the level the wrapped ``claude`` actually runs at (we pass no ``--effort``).
+    the level the wrapped ``claude`` runs at when no ``--effort`` is passed.
 
     :returns: A recognized effort, e.g. ``"medium"``; ``None`` when unset,
         unreadable, or not a valid Claude effort (fail-soft, never blocks launch).
@@ -8388,6 +9024,23 @@ def read_user_effort_level() -> str | None:
     if isinstance(effort, str) and effort in CLAUDE_EFFORTS:
         return effort
     return None
+
+
+def resolve_launch_effort_level(claude_args: tuple[str, ...]) -> str | None:
+    """
+    Return the effort the wrapped ``claude`` will run at for ``claude_args``.
+
+    The last ``--effort`` with a value wins if it names a valid effort; after a
+    later empty or flag-like ``--effort``, Claude falls back to that same effort
+    via the invocation ``effortLevel`` from :func:`augment_claude_args`.
+    Otherwise fall back to :func:`read_user_effort_level`.
+
+    :param claude_args: Pass-through Claude CLI args, e.g.
+        ``("--effort", "xhigh")``.
+    :returns: A recognized effort, e.g. ``"xhigh"``; ``None`` when neither
+        the args nor ``~/.claude/settings.json`` carry a valid one.
+    """
+    return _launch_effort_arg(claude_args) or read_user_effort_level()
 
 
 def _usage_from_transcript_entry(entry: _JsonObject) -> dict[str, int] | None:
@@ -8470,6 +9123,8 @@ def _transcript_items_from_entry(
     agent_name: str,
     current_response_id: str | None,
     settled_response_id: str | None = None,
+    pending_settled_response_id: str | None = None,
+    pending_settled_at: float | None = None,
     include_sidechains: bool = False,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
@@ -8498,12 +9153,22 @@ def _transcript_items_from_entry(
     if not include_sidechains and entry.get("isSidechain") is True:
         return current_response_id, []
     if entry.get("type") == "attachment":
-        return _attachment_transcript_items_from_entry(
+        response_id, items = _attachment_transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
             current_response_id=current_response_id,
         )
+        marker = _peer_message_wake_marker(
+            entry,
+            line_number,
+            record_offset,
+            current_response_id,
+            settled_response_id,
+            pending_settled_response_id,
+            pending_settled_at,
+        )
+        return (marker.response_id, [marker, *items]) if marker else (response_id, items)
     if entry.get("subtype") == "local_command":
         return _local_command_transcript_items_from_entry(
             entry,
@@ -8523,13 +9188,23 @@ def _transcript_items_from_entry(
         return current_response_id, []
     role = message.get("role")
     if role == "user":
-        return _user_transcript_items_from_entry(
+        response_id, items = _user_transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+        marker = _peer_message_wake_marker(
+            entry,
+            line_number,
+            record_offset,
+            current_response_id,
+            settled_response_id,
+            pending_settled_response_id,
+            pending_settled_at,
+        )
+        return (marker.response_id, [marker, *items]) if marker else (response_id, items)
     if role == "assistant":
         return _assistant_transcript_items_from_entry(
             entry,
@@ -8772,7 +9447,9 @@ _CLI_SCAFFOLDING_MARKERS: tuple[str, ...] = (
 #
 # - DROPPED — pure UI affordances (``/help``, ``/login``) and local
 #   config (``/permissions``, ``/add-dir``). No conversation-visible
-#   effect; surfacing them in the web UI is noise.
+#   effect; surfacing them in the web UI is noise. This includes the
+#   panels (``/export``, ``/usage``) that leave no transcript record, so a
+#   web message that opens one would never be confirmed delivered.
 # - SURFACED — commands that change the next turn's behavior or the
 #   conversation state (``/effort high``, ``/clear``, ``/compact``,
 #   ``/model``, ``/ultrareview``). A web observer needs to see these,
@@ -8789,6 +9466,7 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "cost",
         "doctor",
         "exit",
+        "export",
         "fast",
         "feedback",
         "help",
@@ -8798,6 +9476,7 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "logout",
         "mcp",
         "memory",
+        "mobile",
         "onboarding",
         "permissions",
         "plugin",
@@ -8805,10 +9484,17 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "quit",
         "release-notes",
         "resume",
+        "rewind",
+        "sandbox",
         "save",
+        "skills",
+        "stats",
         "status",
+        "tasks",
         "terminal-setup",
+        "theme",
         "upgrade",
+        "usage",
         "verbose",
     }
 )
@@ -9032,6 +9718,78 @@ def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> 
     stripped = text.lstrip()
     return stripped.startswith("<task-notification>") and all(
         marker in stripped for marker in _TASK_NOTIFICATION_REQUIRED_MARKERS
+    )
+
+
+def _peer_message_wake_marker(
+    entry: _JsonObject,
+    line_number: int,
+    record_offset: int | None,
+    current_response_id: str | None,
+    settled_response_id: str | None,
+    pending_settled_response_id: str | None,
+    pending_settled_at: float | None,
+) -> ClaudeTranscriptItem | None:
+    """Label a peer input after a stopped turn without exposing its hidden context."""
+    if current_response_id is None or current_response_id not in (
+        settled_response_id,
+        pending_settled_response_id,
+    ):
+        return None
+    if current_response_id != settled_response_id:
+        timestamp = _transcript_timestamp(entry.get("timestamp"))
+        if pending_settled_at is None or timestamp is None or timestamp <= pending_settled_at:
+            return None
+    if entry.get("isCompactSummary") is True:
+        return None
+    if entry.get("type") == "attachment":
+        metadata = entry.get("attachment")
+        if not isinstance(metadata, dict) or metadata.get("type") != "queued_command":
+            return None
+        content = metadata.get("prompt")
+        if not isinstance(content, str) or (
+            metadata.get("commandMode") != "prompt"
+            and _subagent_handback_id(metadata.get("origin")) is None
+            and not _is_task_completion_text(content)
+        ):
+            return None
+    else:
+        metadata = entry
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+    texts = (
+        [content]
+        if isinstance(content, str)
+        else [
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    if not texts or not any(text.strip() for text in texts):
+        return None
+    origin = metadata.get("origin")
+    peer_origin = isinstance(origin, dict) and origin.get("kind") == "peer"
+    meta_peer_envelope = metadata.get("isMeta") is True and all(
+        not text.lstrip().startswith("<task-notification>") and _is_agent_notification_text(text)
+        for text in texts
+    )
+    if not peer_origin and not meta_peer_envelope:
+        return None
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, PEER_MESSAGE_WAKE_KIND),
+        item_type="message",
+        data={
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": PEER_MESSAGE_WAKE_TEXT}],
+        },
+        response_id=_response_id_from_source(source_key),
     )
 
 
@@ -9492,6 +10250,8 @@ def _assistant_transcript_items_from_entry(
         items.
     """
     message = entry["message"]
+    if _is_no_response_placeholder(message):
+        return current_response_id, []
     content = message.get("content") if isinstance(message, dict) else None
     source_key = _transcript_source_key(entry, line_number, record_offset)
     waking = current_response_id is not None and current_response_id == settled_response_id
@@ -9640,7 +10400,8 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
 # web chat, where ``/login`` is a dropped command: it is escaped into
 # plain text and answered by the same expired session with the same
 # line. These records get guidance APPENDED sending the user to
-# ``omni setup`` on the host, which does re-authenticate.
+# ``omni setup`` on the host, which does re-authenticate — or, on a
+# managed sandbox that cannot run it, to a new session.
 #
 # The strings are hardcoded constants in the CLI binary (read out of
 # @anthropic-ai/claude-code 2.1.212), and there is more than one shape:
@@ -9689,6 +10450,21 @@ _LOGIN_GUIDANCE = (
     "`/login` is not available from the Omnigent web chat — run "
     "`omni setup` on the host to sign in again."
 )
+# Shared with the executor's /login short-circuit so the two surfaces cannot
+# drift apart; a new session is the only self-service step on a managed sandbox.
+MANAGED_SANDBOX_SIGN_IN_REMEDY = (
+    "This sandbox received its sign-in credentials at launch. Start a new "
+    "session; if sign-in still fails, ask the sandbox administrator to refresh "
+    "its credentials."
+)
+_LOGIN_GUIDANCE_MANAGED_SANDBOX = (
+    "`/login` is not available from the Omnigent web chat. " + MANAGED_SANDBOX_SIGN_IN_REMEDY
+)
+
+
+def _login_guidance() -> str:
+    """Return the ``/login`` remedy the user can perform where the session runs."""
+    return _LOGIN_GUIDANCE_MANAGED_SANDBOX if in_managed_sandbox() else _LOGIN_GUIDANCE
 
 
 def _is_api_error_entry(entry: _JsonObject) -> bool:
@@ -9712,6 +10488,27 @@ def _is_api_error_entry(entry: _JsonObject) -> bool:
         return True
     message = entry.get("message")
     return isinstance(message, dict) and message.get("isApiErrorMessage") is True
+
+
+_NO_RESPONSE_PLACEHOLDER_TEXT = "No response requested."
+
+
+def _is_no_response_placeholder(message: object) -> bool:
+    """
+    Return whether an assistant message is Claude Code's no-reply placeholder.
+
+    The CLI writes it when it resumes an interrupted turn or a rate limit ends
+    a turn without a message, and never renders it; this mirrors its own check.
+
+    :param message: The transcript record's ``message`` value.
+    :returns: ``True`` for the synthetic ``No response requested.`` message.
+    """
+    if not isinstance(message, dict) or message.get("model") != "<synthetic>":
+        return False
+    content = message.get("content")
+    if isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict):
+        content = content[0].get("text") if content[0].get("type") == "text" else None
+    return content == _NO_RESPONSE_PLACEHOLDER_TEXT
 
 
 def _assistant_message_item(
@@ -9767,7 +10564,7 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
-        return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
+        return f"{text.rstrip()}\n\n{_login_guidance()}"
     return text
 
 

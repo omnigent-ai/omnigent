@@ -382,6 +382,10 @@ def databricks_bearer_token_command(
         f"token=$({mint} --output json | jq -r '.access_token // empty'); "
         "fi; "
         f"{fallback}"
+        # A single CLI/OIDC blip must not empty the token: retry the plain mint once.
+        'if [ -z "$token" ]; then sleep 1; '
+        f"token=$({mint} --output json | jq -r '.access_token // empty'); "
+        "fi; "
         'printf "%s\\n" "$token"; fi'
     )
 
@@ -1486,7 +1490,7 @@ class DatabricksExecutor(Executor):
                 timeout=_API_CALL_TIMEOUT_SECONDS,
             )
             state.active_stream = stream
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 "DatabricksExecutor: API call timed out after %ss", _API_CALL_TIMEOUT_SECONDS
             )
@@ -1526,7 +1530,7 @@ class DatabricksExecutor(Executor):
                     )
                 except StopAsyncIteration:
                     break
-                except asyncio.TimeoutError as exc:
+                except TimeoutError as exc:
                     raise TimeoutError(
                         f"Databricks stream was idle for {int(_STREAM_IDLE_TIMEOUT_SECONDS)}s"
                     ) from exc

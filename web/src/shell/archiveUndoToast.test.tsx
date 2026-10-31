@@ -82,14 +82,12 @@ beforeEach(() => {
   toast.dismiss();
 });
 
-afterEach(() => {
-  // Clear any pending pill/batch before unmounting so a Sonner timer queued
-  // during a fake-timer test can't fire into a torn-down module (where the
-  // mocked `toast` is gone) and surface as an unhandled error.
+afterEach(async () => {
   resetArchiveUndoBatchForTests();
-  toast.dismiss();
+  act(() => toast.dismiss());
+  // Sonner queues removal callbacks during its exit animation.
+  await waitFor(() => expect(document.querySelector("[data-sonner-toast]")).toBeNull());
   cleanup();
-  // Always leave real timers installed so no fake-timer state escapes the file.
   vi.useRealTimers();
 });
 

@@ -11,9 +11,11 @@ from playwright.sync_api import Page, Route, expect
 from tests._helpers.session import bundle_files
 
 
+@pytest.mark.parametrize("strip_if_match", [False, True], ids=["if-match", "no-if-match"])
+@pytest.mark.parametrize("strip_etag", [False, True], ids=["etag", "no-etag"])
 @pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "mobile"])
 def test_custom_agent_edit_preserves_fields_and_recovers_conflict(
-    page: Page, live_server: str, mobile: bool
+    page: Page, live_server: str, mobile: bool, strip_etag: bool, strip_if_match: bool
 ) -> None:
     name = f"edit-{uuid.uuid4().hex[:8]}"
     bundle = bundle_files(
@@ -43,6 +45,19 @@ def test_custom_agent_edit_preserves_fields_and_recovers_conflict(
         installed.raise_for_status()
         agent_id = installed.json()["id"]
         path = f"/v1/agents/{agent_id}"
+
+        def strip_revision_headers(route: Route) -> None:
+            request_headers = route.request.all_headers()
+            if strip_if_match:
+                request_headers.pop("if-match", None)
+            response = route.fetch(headers=request_headers)
+            response_headers = response.headers
+            if strip_etag:
+                response_headers.pop("etag", None)
+            route.fulfill(response=response, headers=response_headers)
+
+        if strip_etag or strip_if_match:
+            page.route(f"**{path}{{,/config}}", strip_revision_headers)
         try:
             page.goto(f"{live_server}/settings/custom-agents" + ("" if mobile else f"/{agent_id}"))
             if mobile:
@@ -66,7 +81,10 @@ def test_custom_agent_edit_preserves_fields_and_recovers_conflict(
             ) as saving:
                 form.get_by_role("button", name="Save changes").click()
             assert saving.value.post_data_json == {"description": "Updated from Settings"}
-            assert saving.value.headers["if-match"].startswith('"')
+            if strip_etag:
+                assert "if-match" not in saving.value.headers
+            else:
+                assert saving.value.headers["if-match"].startswith('"')
             expect(form.get_by_label("Description", exact=True)).to_have_value(
                 "Updated from Settings"
             )
@@ -91,13 +109,23 @@ def test_custom_agent_edit_preserves_fields_and_recovers_conflict(
             )
             competing.raise_for_status()
             form.get_by_role("button", name="Save changes").click()
-            expect(form.get_by_role("alert")).to_contain_text("Your draft is still here")
-            expect(form.get_by_label("Description", exact=True)).to_have_value(
-                "Unsaved local draft"
-            )
-            form.get_by_role("button", name="Reload latest").click()
-            page.get_by_role("button", name="Discard changes").click()
-            expect(form.get_by_label("Description", exact=True)).to_have_value("Concurrent winner")
+            if strip_etag or strip_if_match:
+                expect(form.get_by_role("button", name="Save changes")).to_be_disabled()
+                expect(form.get_by_role("button", name="Cancel", exact=True)).to_be_enabled()
+                latest = api.get(f"{path}/config")
+                latest.raise_for_status()
+                assert latest.json()["description"] == "Unsaved local draft"
+                assert latest.json()["instructions"] == "Keep these instructions.\n"
+            else:
+                expect(form.get_by_role("alert")).to_contain_text("Your draft is still here")
+                expect(form.get_by_label("Description", exact=True)).to_have_value(
+                    "Unsaved local draft"
+                )
+                form.get_by_role("button", name="Reload latest").click()
+                page.get_by_role("button", name="Discard changes").click()
+                expect(form.get_by_label("Description", exact=True)).to_have_value(
+                    "Concurrent winner"
+                )
             form.get_by_role("button", name="Cancel", exact=True).click()
             expect(page.get_by_role("heading", name="Custom agents", exact=True)).to_be_visible()
         finally:
