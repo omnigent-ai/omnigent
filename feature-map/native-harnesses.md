@@ -106,6 +106,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `subagent-discovery`: Claude children appear under the agent that spawned
   them, including forked slash commands and delayed spawns; an unresolved
   spawn does not keep an idle runner re-reading unchanged conversations.
+- `opencode-tui-sessions`: after `/new` or the session picker in the OpenCode
+  TUI, that session's prompts and replies reach Chat and Chat sends there.
+  Overlapping root sessions keep separate replies; the turn ends with the last.
 - `disconnect`: startup waits and active operations settle when their native
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
@@ -924,6 +927,13 @@ Cross-harness journeys:
   `tests/server/integration/test_codex_model_change_after_idle_reap.py` covers
   Codex reap-then-resume through a real server with a scripted app-server, not
   the Codex CLI; it crashes an xdist worker, so run it with `-p no:xdist`.
+- **`opencode-tui-sessions` (plain `uv run pytest`, no vendor model):**
+  `tests/test_opencode_native_forwarder.py` drives scripted events for a
+  TUI-created root, overlapping roots and child questions;
+  `tests/test_opencode_forwarder_reconnect.py` covers catch-up and an
+  unreachable server. Live: with an OpenAI-compatible loopback provider, run
+  `/new` in the Terminal view and prompt there; the prompt and reply appear in
+  Chat. Send from Chat next and confirm it lands in the new TUI session.
 - **`working-status`, opencode-native interrupt (plain `uv run pytest`, no
   vendor model):**
   `tests/runner/test_native_subagent_turn_outcome_delivery.py::test_interrupt_then_quiescence_idle_delivers_cancelled_with_output`

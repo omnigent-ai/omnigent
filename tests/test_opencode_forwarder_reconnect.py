@@ -486,11 +486,11 @@ async def test_running_turn_ends_when_opencode_server_stays_unreachable() -> Non
     """When ``opencode serve`` dies mid-turn every reconnect fails to connect."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
-    connections = {"n": 0}
+    edges_at_connection: list[list[str]] = []
 
     async def _consume_until_server_dies() -> None:
-        connections["n"] += 1
-        if connections["n"] > 1:
+        edges_at_connection.append(_status_edges(server))
+        if len(edges_at_connection) > 1:
             raise httpx.ConnectError("All connection attempts failed")
         await fwd.handle_event(_ev("session.status", status={"type": "busy"}))
         await fwd.handle_event(_ev("message.updated", info={"id": "msg_1", "role": "assistant"}))
@@ -506,8 +506,12 @@ async def test_running_turn_ends_when_opencode_server_stays_unreachable() -> Non
 
     await _run_without_backoff(fwd, max_reconnects=20)
 
-    assert _status_edges(server)[0] == "running"
-    assert _status_edges(server)[-1] != "running"
+    refused = fwd_mod._MAX_CONNECT_FAILURES_DURING_TURN
+    assert edges_at_connection[refused] == ["running"]
+    assert edges_at_connection[refused + 1] == ["running", "failed"]
+    assert _status_edges(server) == ["running", "failed"]
+    failed = [b for _u, b in server.posts if b["type"] == "external_session_status"][-1]
+    assert failed["data"]["output"] == fwd_mod._SERVER_UNREACHABLE_OUTPUT
 
 
 @pytest.mark.parametrize(
@@ -542,6 +546,25 @@ async def test_catch_up_ends_the_turn_only_when_history_shows_it_finished(
     await fwd.catch_up_from_history()
 
     assert _status_edges(server) == expected_edges
+
+
+async def test_catch_up_settles_a_root_session_left_running_after_tui_new() -> None:
+    """After TUI ``/new``, catch-up still reads the earlier root whose turn was in flight."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_ev("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_ev("session.created", sessionID="ses_new", info={"id": "ses_new"}))
+    finished = {"id": "msg_1", "role": "assistant", "finish": "stop", "time": {"completed": 2}}
+    histories = {_SESSION: [{"info": finished, "parts": []}], "ses_new": []}
+
+    async def _history(session_id: str) -> list[dict[str, Any]]:
+        return histories[session_id]
+
+    opencode.list_messages = _history  # type: ignore[method-assign]
+
+    await fwd.catch_up_from_history()
+
+    assert _status_edges(server) == ["running", "idle"]
 
 
 async def test_reconnect_that_reaches_the_server_resets_the_unreachable_count() -> None:

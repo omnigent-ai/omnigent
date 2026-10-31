@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
 from omnigent.harnesses.opencode_native.bridge import (
@@ -930,7 +931,13 @@ def _hook_post(server: _RecordingServerClient) -> dict[str, Any] | None:
     return None
 
 
-async def test_question_asked_accept_single_select_replies() -> None:
+_ROOT_OR_SUBAGENT = pytest.mark.parametrize(
+    "session_id", [_SESSION, "ses_child"], ids=["root", "subagent"]
+)
+
+
+@_ROOT_OR_SUBAGENT
+async def test_question_asked_accept_single_select_replies(session_id: str) -> None:
     """A single-select web verdict → reply_question with the chosen label list.
 
     The asked event carries the request id under ``id``; the question is parked
@@ -944,6 +951,7 @@ async def test_question_asked_accept_single_select_replies() -> None:
         _event(
             "question.asked",
             id="que_1",
+            sessionID=session_id,
             tool="question",
             questions=[
                 {
@@ -1040,7 +1048,8 @@ async def test_question_asked_empty_verdict_rejects() -> None:
     assert _hook_post(server) is not None
 
 
-async def test_question_replied_cancels_pending_task_and_clears_card() -> None:
+@_ROOT_OR_SUBAGENT
+async def test_question_replied_cancels_pending_task_and_clears_card(session_id: str) -> None:
     """``question.replied`` (TUI answered) cancels the park and withdraws the card.
 
     ``replied`` keys the id as ``requestID`` (not ``id``). It must cancel the
@@ -1055,7 +1064,9 @@ async def test_question_replied_cancels_pending_task_and_clears_card() -> None:
 
     pending: asyncio.Task[None] = asyncio.create_task(_never())
     fwd._question_tasks["que_1"] = pending
-    await fwd.handle_event(_event("question.replied", requestID="que_1", answers=[["A"]]))
+    await fwd.handle_event(
+        _event("question.replied", requestID="que_1", sessionID=session_id, answers=[["A"]])
+    )
     # The parked task was cancelled and removed from the registry.
     assert "que_1" not in fwd._question_tasks
     with contextlib.suppress(asyncio.CancelledError):
@@ -1070,11 +1081,12 @@ async def test_question_replied_cancels_pending_task_and_clears_card() -> None:
     assert opencode.question_rejects == []
 
 
-async def test_question_rejected_clears_card() -> None:
+@_ROOT_OR_SUBAGENT
+async def test_question_rejected_clears_card(session_id: str) -> None:
     """``question.rejected`` (TUI declined) withdraws the web card."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("question.rejected", requestID="que_9"))
+    await fwd.handle_event(_event("question.rejected", requestID="que_9", sessionID=session_id))
     resolved = next(
         b["data"] for _u, b in server.posts if b["type"] == "external_elicitation_resolved"
     )
@@ -1188,9 +1200,9 @@ def _text_part(part_id: str, message_id: str, text: str, **props: Any) -> OpenCo
     return _event("message.part.updated", part=part, **props)
 
 
-def _step_finish(part_id: str, message_id: str) -> OpenCodeEvent:
+def _step_finish(part_id: str, message_id: str, **props: Any) -> OpenCodeEvent:
     part = {"id": part_id, "messageID": message_id, "type": "step-finish", "reason": "stop"}
-    return _event("message.part.updated", part=part)
+    return _event("message.part.updated", part=part, **props)
 
 
 async def test_prompt_queued_during_streaming_reply_is_mirrored_after_that_reply() -> None:
@@ -1245,26 +1257,63 @@ async def test_prompt_queued_during_streaming_reply_is_mirrored_after_that_reply
     ]
 
 
-async def test_prompt_in_session_created_from_tui_reaches_web_transcript() -> None:
-    """After TUI ``/new``, prompts in the new top-level session still reach the web chat."""
+@pytest.mark.parametrize(
+    ("first_root_end", "final_status", "final_output"),
+    [
+        pytest.param(_event("session.idle"), "idle", None, id="first-root-idle"),
+        pytest.param(
+            _event("session.error", error={"name": "APIError", "data": {"message": "overloaded"}}),
+            "failed",
+            "overloaded",
+            id="first-root-failed",
+        ),
+    ],
+)
+async def test_root_sessions_streaming_at_once_keep_their_own_replies_and_turn(
+    first_root_end: OpenCodeEvent, final_status: str, final_output: str | None
+) -> None:
+    """TUI ``/new`` and a prompt there while the first session is still replying."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "session.created", sessionID="ses_new", info={"id": "ses_new", "title": "New session"}
-        )
-    )
-    await fwd.handle_event(
-        _event(
-            "message.updated",
-            sessionID="ses_new",
-            info={"id": "msg_new", "role": "user", "sessionID": "ses_new"},
-        )
-    )
-    await fwd.handle_event(
-        _text_part("prt_new", "msg_new", "prompt after new", sessionID="ses_new")
-    )
-    assert _message_texts(server.posts) == [("user", "prompt after new")]
+    new = {"sessionID": "ses_new"}
+    for event in (
+        _event("message.updated", info={"id": "msg_1", "role": "user"}),
+        _text_part("prt_u1", "msg_1", "prompt one"),
+        _event("message.updated", info={"id": "msg_2", "role": "assistant"}),
+        _text_part("prt_a1", "msg_2", "reply one, partial"),
+        _event("session.created", info={"id": "ses_new"}, **new),
+        _event("message.updated", info={"id": "msg_3", "role": "user", **new}, **new),
+        _text_part("prt_u2", "msg_3", "prompt in new session", **new),
+    ):
+        await fwd.handle_event(event)
+    assert _message_texts(server.posts)[-1] == ("user", "prompt in new session")
+
+    for event in (
+        _event("message.updated", info={"id": "msg_4", "role": "assistant"}, **new),
+        _text_part("prt_a2", "msg_4", "reply two, partial", **new),
+        _text_part("prt_a1", "msg_2", "reply one, complete"),
+        _step_finish("prt_f1", "msg_2"),
+        first_root_end,
+    ):
+        await fwd.handle_event(event)
+    statuses = [b["data"] for _u, b in server.posts if b["type"] == "external_session_status"]
+    assert [status["status"] for status in statuses] == ["running"]
+
+    for event in (
+        _text_part("prt_a2", "msg_4", "reply two, complete", **new),
+        _step_finish("prt_f2", "msg_4", **new),
+        _event("session.idle", **new),
+    ):
+        await fwd.handle_event(event)
+    assert _message_texts(server.posts) == [
+        ("user", "prompt one"),
+        ("user", "prompt in new session"),
+        ("assistant", "reply one, complete"),
+        ("assistant", "reply two, complete"),
+    ]
+    statuses = [b["data"] for _u, b in server.posts if b["type"] == "external_session_status"]
+    assert [status["status"] for status in statuses] == ["running", final_status]
+    assert statuses[-1].get("output") == final_output
 
 
 async def test_subagent_permission_request_goes_through_policy() -> None:
