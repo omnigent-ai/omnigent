@@ -24,6 +24,7 @@ from omnigent.server.skill_injection import (
     effective_installed_skills,
     session_target,
     skill_allowed,
+    spec_reserved_names,
 )
 from omnigent.skills.git_source import repository_label
 from omnigent.skills.policy import DEFAULT_POLICY
@@ -190,7 +191,7 @@ def create_skills_router(
         # Hidden bundled skills also reserve their names against collisions,
         # from the spec the session runs: the host already lists them itself.
         reserving = installed_spec if installed_spec is not None else spec
-        bundled = {skill.name for skill in reserving.skills} if reserving is not None else set()
+        bundled = spec_reserved_names(reserving) if reserving is not None else set()
         if spec is not None:
             skills = [
                 SkillSummary(
