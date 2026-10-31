@@ -6282,10 +6282,7 @@ export function NewChatLandingScreen() {
     myMachinesEmptyText = "No hosts online.";
   }
   const hasCloudOptions =
-    managedSandboxesEnabled ||
-    showDisabledSandboxWithDocs ||
-    cloudHosts.length > 0 ||
-    showArcaOption;
+    managedSandboxesEnabled || showDisabledSandboxWithDocs || cloudHosts.length > 0;
   const renderHostMenuItem = (host: Host) => {
     const reconnect = isReconnectRow(host);
     return (
@@ -7087,6 +7084,10 @@ export function NewChatLandingScreen() {
                             </DropdownMenuItem>
                           ))}
                         {cloudHosts.map(renderHostMenuItem)}
+                        {hasCloudOptions && <DropdownMenuSeparator />}
+                        <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
+                          My machines
+                        </div>
                         {showArcaOption && (
                           <DropdownMenuItem
                             onSelect={() => {
@@ -7101,12 +7102,9 @@ export function NewChatLandingScreen() {
                             <span>{connectingArca ? "Connecting to Arca…" : "Run on Arca"}</span>
                           </DropdownMenuItem>
                         )}
-                        {hasCloudOptions && <DropdownMenuSeparator />}
-                        <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                          My machines
-                        </div>
                         {localHosts.length === 0 &&
                           !showConnectThisMachine &&
+                          !showArcaOption &&
                           myMachinesEmptyText && (
                             <div className="px-2 py-1.5 text-sm text-muted-foreground">
                               {myMachinesEmptyText}
