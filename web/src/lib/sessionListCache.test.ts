@@ -380,11 +380,20 @@ describe("filtersFromConversationQueryKey", () => {
     });
   });
 
-  it("accepts creation-order caches for live updates and optimistic mutations", () => {
-    expect(
-      filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
-    ).toEqual({ searchQuery: "", includeArchived: false, project: undefined, visibility: "mine" });
-  });
+  it.each(["created_at", "title"])(
+    "accepts %s-order caches for live updates and optimistic mutations",
+    (sortBy) => {
+      expect(
+        filtersFromConversationQueryKey(["conversations", "", false, null, "mine", sortBy]),
+      ).toEqual({
+        searchQuery: "",
+        includeArchived: false,
+        project: undefined,
+        visibility: "mine",
+        sortBy,
+      });
+    },
+  );
 
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
@@ -469,7 +478,7 @@ describe("collectConversationIds", () => {
 });
 
 describe("parseProjectSessionsQueryKey", () => {
-  it.each(["updated_at", "created_at"])(
+  it.each(["updated_at", "created_at", "title"])(
     "keeps sort and archive scope separate for %s",
     (sortBy) => {
       for (const archived of [false, true]) {
@@ -490,6 +499,7 @@ describe("project-folder cache membership", () => {
   it.each([
     ["project-sessions", "proj", "updated_at", true],
     ["project-sessions", "proj", "created_at", true],
+    ["project-sessions", "proj", "title", true],
   ])("retains a renamed archive in %j and evicts it from live folders", (...archivedKey) => {
     const qc = new QueryClient();
     const row = conv("a", { archived: true });
@@ -585,6 +595,40 @@ describe("insertNewRowsIntoPages", () => {
       DEFAULT_FILTERS,
     );
     expect(inserted).toHaveLength(0);
+  });
+
+  it.each([
+    ["inserts into a Name list with every page loaded", "zeta", false, ["zeta", "beta", "delta"]],
+    [
+      "inserts a row that sorts inside a partial Name window",
+      "Alpha",
+      true,
+      ["Alpha", "beta", "delta"],
+    ],
+    [
+      "leaves a row that sorts past a partial Name window to the refetch",
+      "zeta",
+      true,
+      ["beta", "delta"],
+    ],
+  ])("%s", (_name, title, hasMore, expected) => {
+    const before = data([conv("beta"), conv("delta")]);
+    before.pages[0].has_more = hasMore;
+    const { data: after } = insertNewRowsIntoPages(before, candidate(title, { title }), {
+      ...DEFAULT_FILTERS,
+      sortBy: "title",
+    });
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(expected);
+  });
+
+  it("still prepends to a partial newest-first window", () => {
+    const before = data([conv("beta"), conv("delta")]);
+    before.pages[0].has_more = true;
+    const { inserted } = insertNewRowsIntoPages(before, candidate("zeta", { title: "zeta" }), {
+      ...DEFAULT_FILTERS,
+      sortBy: "created_at",
+    });
+    expect(inserted.map((c) => c.id)).toEqual(["zeta"]);
   });
 
   it("skips ids the caller excludes (e.g. a session being deleted)", () => {

@@ -23,6 +23,12 @@ describe("sidebarViewPreferences", () => {
     },
   );
 
+  it("round-trips Name ordering", () => {
+    const view = { grouping: "default", ordering: "name", show: [] } as const;
+    writeSidebarViewPreferences(view);
+    expect(readSidebarViewPreferences()).toEqual(view);
+  });
+
   it("restores saved Status grouping while preserving ordering and metadata", () => {
     localStorage.setItem(
       "omnigent:sidebar-view",

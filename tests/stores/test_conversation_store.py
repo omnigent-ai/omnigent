@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import string
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -3108,6 +3109,75 @@ def test_list_conversations_sort_by_updated_at_with_pagination(
     assert len(page2.data) == 1
     assert page2.has_more is False
     assert page2.data[0].id == ids[1]
+
+
+def test_list_conversations_sort_by_title(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``sort_by="title"`` folds ASCII case only, compares by code point, lists
+    untitled conversations last when ascending, breaks ties by id, and pages
+    without gaps. The web client reproduces this exact order.
+    """
+    titles = ["beta", "", "Alpha", "ab", "a-c", "alpha", "Gamma", "", "  "]
+    titles += ["\u00e9clair", "\u00c9clair", "\uff21 wide", "\U0001f600 smile"]
+    for title in titles:
+        conversation_store.create_conversation(title=title)
+    # "b " gets the smaller id, so a padded comparison that ties it with "b"
+    # would list it first.
+    conversation_store.create_conversation(title="b ", conversation_id="0" * 32)
+    conversation_store.create_conversation(title="b", conversation_id="f" * 32)
+
+    full = conversation_store.list_conversations(sort_by="title", order="asc", kind=None)
+    ascii_fold = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+    expected = sorted(
+        full.data,
+        key=lambda c: ("0" + c.title.translate(ascii_fold) if c.title else "1", c.id),
+    )
+    assert [c.id for c in full.data] == [c.id for c in expected]
+    # Spaces and "-" sort before letters, trailing spaces count, accented
+    # capitals stay unfolded, and the emoji follows U+FF21 by code point (a
+    # UTF-16 comparison would invert it).
+    listed = [c.title or "" for c in full.data]
+    assert sorted(listed[3:5]) == ["Alpha", "alpha"], listed
+    assert listed[:3] + listed[5:] == [
+        "  ",
+        "a-c",
+        "ab",
+        "b",
+        "b ",
+        "beta",
+        "Gamma",
+        "\u00c9clair",
+        "\u00e9clair",
+        "\uff21 wide",
+        "\U0001f600 smile",
+        "",
+        "",
+    ], listed
+
+    descending = conversation_store.list_conversations(sort_by="title", order="desc", kind=None)
+    assert [c.id for c in descending.data] == [c.id for c in reversed(full.data)]
+
+    # Pages of two split both folded ties ("Alpha"/"alpha" and the untitled
+    # pair) across a cursor.
+    walked: list[str] = []
+    after: str | None = None
+    while True:
+        page = conversation_store.list_conversations(
+            limit=2, after=after, sort_by="title", order="asc", kind=None
+        )
+        walked.extend(c.id for c in page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+    assert walked == [c.id for c in full.data]
+    full_ids = [c.id for c in full.data]
+    for index, cursor in enumerate(full_ids):
+        preceding = conversation_store.list_conversations(
+            before=cursor, sort_by="title", order="asc", kind=None
+        )
+        assert [c.id for c in preceding.data] == full_ids[:index], index
 
 
 # ─── Phase 4: parent_conversation_id + name uniqueness ──────
@@ -8282,8 +8352,8 @@ def test_list_conversations_acl_with_cursor_pagination(
 ) -> None:
     """Cursor pagination composes with the ACL filter: walking every page
     yields exactly the granted rows (no leak, no overlap, none lost), and a
-    NON-granted conversation used as the cursor still returns the granted
-    rows that follow it — an empty page would not satisfy this.
+    NON-granted conversation used as the cursor is rejected as stale, since
+    paging from it would compare its sort key against the caller's rows.
 
     Owns the ACL-vs-cursor COMPOSITION: removing the filter (``needs_meta_filter
     = False``) fails here, because the ungranted rows appear. It deliberately
@@ -8315,13 +8385,57 @@ def test_list_conversations_acl_with_cursor_pagination(
     assert set(seen) == granted
     assert seen == [convs[0].id, convs[1].id, convs[4].id, convs[5].id]
 
-    # A non-granted conversation (c2, positioned between granted rows) as
-    # the cursor: position filter only, ACL still applied — so the result is
-    # exactly the granted rows after it, not an empty page.
-    page3 = conversation_store.list_conversations(
-        accessible_by="alice@example.com", limit=10, after=convs[2].id
-    )
-    assert [c.id for c in page3.data] == [convs[4].id, convs[5].id]
+    # A non-granted conversation (c2, positioned between granted rows) as the
+    # cursor fails like a deleted one rather than positioning the page.
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_conversations(
+            accessible_by="alice@example.com", limit=10, after=convs[2].id
+        )
+
+
+@pytest.mark.parametrize("sort_by", ["updated_at", "created_at", "title"])
+@pytest.mark.parametrize("direction", ["after", "before"])
+@pytest.mark.parametrize("scope", ["accessible_by", "owned_by"])
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+def test_list_cursor_on_ungranted_session_reveals_nothing(
+    request: pytest.FixtureRequest, store_fixture: str, scope: str, direction: str, sort_by: str
+) -> None:
+    """A cursor naming another user's private session can't position a page.
+
+    Otherwise which of the caller's own sessions come back would reveal how the
+    private session's sort key compares with theirs.
+    """
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    perms = SqlAlchemyPermissionStore(store._engine.url.render_as_string(hide_password=False))
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    probes = [store.create_conversation(title=title) for title in ("a probe", "z probe")]
+    for probe in probes:
+        perms.grant("alice@example.com", probe.id, 4)
+    secret = store.create_conversation(title="m secret")
+    perms.grant("bob@example.com", secret.id, 4)
+
+    def _page(**cursor: str) -> list[str]:
+        return [
+            c.id
+            for c in store.list_conversations(
+                **{scope: "alice@example.com"},  # type: ignore[arg-type]
+                **cursor,  # type: ignore[arg-type]
+                sort_by=sort_by,  # type: ignore[arg-type]
+                order="asc",
+            ).data
+        ]
+
+    with pytest.raises(StaleCursorError):
+        _page(**{direction: secret.id})
+    # The caller's own cursors still page.
+    first, second = _page()
+    if direction == "after":
+        assert _page(after=first) == [second]
+    else:
+        assert _page(before=second) == [first]
 
 
 def test_list_projects_single_db_uses_exists_pushdown(
@@ -8580,7 +8694,7 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
 
 
 @pytest.mark.parametrize("order", ["desc", "asc"])
-@pytest.mark.parametrize("sort_by", ["created_at", "updated_at"])
+@pytest.mark.parametrize("sort_by", ["created_at", "updated_at", "title"])
 def test_cursor_pages_forward_and_backward_in_both_orders(
     conversation_store: SqlAlchemyConversationStore, db_uri: str, sort_by: str, order: str
 ) -> None:

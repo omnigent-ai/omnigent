@@ -967,6 +967,28 @@ async def test_list_sessions_pagination(
     assert page2["data"][0]["id"] != page1["data"][0]["id"]
 
 
+async def test_list_sessions_sort_by_title_pages_a_to_z(
+    client: httpx.AsyncClient,
+) -> None:
+    """``sort_by=title&order=asc`` pages sessions A to Z, ignoring case, untitled last."""
+    agent = await create_test_agent(client)
+    await _create_session(client, agent["id"])
+    for title in ("charlie", "Alpha", "bravo"):
+        await _create_session(client, agent["id"], title=title)
+
+    params = {"limit": 2, "order": "asc", "sort_by": "title"}
+    resp = await client.get("/v1/sessions", params=params)
+    assert resp.status_code == 200, resp.text
+    page1 = resp.json()
+    assert [s["title"] for s in page1["data"]] == ["Alpha", "bravo"]
+    assert page1["has_more"] is True
+
+    resp = await client.get("/v1/sessions", params={**params, "after": page1["last_id"]})
+    assert resp.status_code == 200, resp.text
+    # Untitled sessions omit the field on the wire.
+    assert [s.get("title") for s in resp.json()["data"]] == ["charlie", None]
+
+
 async def test_list_sessions_deleted_cursor_returns_stale_cursor_400(
     client: httpx.AsyncClient,
 ) -> None:

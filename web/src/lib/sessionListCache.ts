@@ -12,6 +12,7 @@
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import { compareSessionRows } from "@/lib/sidebarData";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -68,6 +69,8 @@ export interface ConversationListFilters {
    * only archived sessions. ``undefined`` is the default all-sessions list.
    */
   visibility?: "mine" | "shared" | "archived";
+  /** Ordering of a list that isn't newest-first by update time. */
+  sortBy?: SessionSortBy;
 }
 
 /**
@@ -139,7 +142,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
  * - 4 elements: `[..., project]` — the Archived settings picker's project filter.
  * - 5 elements: `[..., project|null, visibility]` — the sidebar's mine/shared
  *   tab-scoped query (project is `null` here since it's always unset for those
- *   tabs). A sixth `created_at` element selects creation-time ordering.
+ *   tabs). A sixth `created_at` or `title` element selects that ordering.
  *   These variants are accepted so the rename overlay and push-delta merge
  *   — which iterate *every* cached `["conversations", ...]` query — never throw
  *   on unknown variants. Query membership decisions depend on these dimensions,
@@ -153,7 +156,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
   if (key.length < 3 || key.length > 6 || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
-  if (key.length === 6 && key[5] !== "created_at") {
+  if (key.length === 6 && key[5] !== "created_at" && key[5] !== "title") {
     throw new Error("Invalid conversations query key");
   }
   const [, searchQuery, includeArchived, project] = key;
@@ -180,6 +183,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
     // Treat null (visibility-scoped key) the same as undefined (no project filter).
     project: project ?? undefined,
     visibility: visibility as ConversationListFilters["visibility"],
+    ...(key.length === 6 ? { sortBy: key[5] as SessionSortBy } : {}),
   };
 }
 
@@ -357,13 +361,32 @@ export function unmarkRecentlyCreated(id: string): void {
 }
 
 /**
+ * Whether a row added locally belongs in a list's loaded pages. Timestamp
+ * lists show a new or restored row first; a Name list holds it only when every
+ * page is loaded or it sorts at or before a loaded row. Otherwise the server's
+ * refetch places it.
+ */
+export function belongsInLoadedWindow(
+  pages: readonly ConversationsPage[],
+  row: Conversation,
+  sortBy: SessionSortBy | undefined,
+): boolean {
+  if (sortBy !== "title" || pages.at(-1)?.has_more !== true) return true;
+  return pages.some((page) =>
+    page.data.some((other) => compareSessionRows(row, other, sortBy) <= 0),
+  );
+}
+
+/**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
- * refetch (which lags the search index). A new row sorts newest-first, so page 0
- * is its home. Skips: search lists (membership unknown), archived/wrong-project
- * rows, sub-agent children (`parent_session_id` — they live off the sidebar),
- * and ids the caller excludes via `skip` (e.g. an optimistic delete in flight).
- * `candidates` should already exclude rows the list holds.
+ * refetch (which lags the search index). The sidebar orders rows itself, so
+ * page 0 holds any row that {@link belongsInLoadedWindow}. Skips: search lists
+ * (membership unknown), archived/wrong-project rows, sub-agent children
+ * (`parent_session_id` — they live off the sidebar), rows outside a Name
+ * list's loaded pages, and ids the caller excludes via `skip` (e.g. an
+ * optimistic delete in flight). `candidates` should already exclude rows the
+ * list holds.
  */
 export function insertNewRowsIntoPages(
   data: ConversationsInfiniteData | undefined,
@@ -397,6 +420,7 @@ export function insertNewRowsIntoPages(
     const ownedByViewer = conv.owner == null || conv.owner === viewerId;
     if (filters.visibility === "mine" && !ownedByViewer) continue;
     if (filters.visibility === "shared" && ownedByViewer) continue;
+    if (!belongsInLoadedWindow(data.pages, conv, filters.sortBy)) continue;
     rows.push(conv);
   }
   if (rows.length === 0) return { data, inserted: [] };
@@ -469,7 +493,7 @@ export function parseProjectSessionsQueryKey(key: readonly unknown[]): {
     key.length !== 4 ||
     prefix !== "project-sessions" ||
     typeof project !== "string" ||
-    (sortBy !== "updated_at" && sortBy !== "created_at") ||
+    (sortBy !== "updated_at" && sortBy !== "created_at" && sortBy !== "title") ||
     typeof archived !== "boolean"
   )
     throw new Error("Invalid project sessions query key");
@@ -478,11 +502,12 @@ export function parseProjectSessionsQueryKey(key: readonly unknown[]): {
 
 /** Membership filters for an unsearched project-folder query. */
 export function filtersFromProjectQueryKey(key: readonly unknown[]): ConversationListFilters {
-  const { archived } = parseProjectSessionsQueryKey(key);
+  const { sortBy, archived } = parseProjectSessionsQueryKey(key);
   return {
     searchQuery: "",
     includeArchived: archived,
     visibility: archived ? "archived" : "mine",
+    sortBy,
   };
 }
 

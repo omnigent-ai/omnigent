@@ -7,11 +7,19 @@ grouping is deterministic; everything else comes from the live server.
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass
 from time import time
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
+
+from tests._helpers.polling import poll_until
+from tests.e2e_ui.collaboration._multi_user_server import create_user_session
 
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
@@ -382,3 +390,133 @@ def test_created_ordering_persists_and_flag_off_uses_updated(
     expect(page.get_by_role("tooltip")).to_have_text("Filter sessions")
     filter_button.click()
     expect(page.get_by_test_id("session-ordering-menu")).to_have_count(0)
+
+
+@dataclass(frozen=True)
+class _NamedSessions:
+    base_url: str
+    project: str
+    # Session ids keyed by title; the untitled session is keyed by "".
+    folder: dict[str, str]
+    unfiled: dict[str, str]
+
+
+def _seed_session(base_url: str, title: str, project: str | None) -> str:
+    metadata: dict[str, object] = {"title": title} if title else {}
+    if project:
+        metadata["labels"] = {"omni_project": project}
+    return create_user_session(base_url, headers={}, metadata=metadata)
+
+
+_UNFILED_TITLES = ["!mango plan", "!Zebra notes", "!lemon tasks"]
+_UNFILED_A_TO_Z = ["!lemon tasks", "!mango plan", "!Zebra notes"]
+
+
+@pytest.fixture
+def named_sessions(request: pytest.FixtureRequest) -> Iterator[_NamedSessions]:
+    """Seed live sessions with mixed-case titles in a folder and unfiled, newest last."""
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    project = f"Sorting {uuid.uuid4().hex[:4]}"
+    folder: dict[str, str] = {}
+    unfiled: dict[str, str] = {}
+    try:
+        # Created in this order, so Updated lists each group roughly reversed.
+        for title in ["date list", "Banana bread", "", "kiwi trip", "apple pie", "Cherry jam"]:
+            folder[title] = _seed_session(base_url, title, project)
+        # Unfiled rows share the server with other tests; "!" keeps them on
+        # the first A to Z page while "Z" vs "l" still checks case folding.
+        for title in _UNFILED_TITLES:
+            unfiled[title] = _seed_session(base_url, title, None)
+        yield _NamedSessions(base_url, project, folder, unfiled)
+    finally:
+        for session_id in [*folder.values(), *unfiled.values()]:
+            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+
+
+def _pause_for_recording(page: Page, milliseconds: int) -> None:
+    """Hold a step on screen long enough to read, only while recording a demo."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(milliseconds)
+
+
+def _listed_titles(page: Page, ids: dict[str, str]) -> list[str]:
+    """Titles of the seeded sessions in their on-screen order."""
+    titles = {session_id: title for title, session_id in ids.items()}
+    hrefs = page.locator('aside a[href^="/c/"]').evaluate_all(
+        "links => links.map((link) => link.getAttribute('href').slice(3))"
+    )
+    return [titles[href] for href in hrefs if href in titles]
+
+
+def _wait_for_order(page: Page, ids: dict[str, str], expected: list[str]) -> None:
+    """Wait until the seeded sessions in *ids* are listed as *expected*, leading."""
+    try:
+        poll_until(lambda: _listed_titles(page, ids)[: len(expected)] == expected, timeout_s=15)
+    except AssertionError:
+        assert _listed_titles(page, ids) == expected
+        raise
+
+
+_NAME_ORDER_VIEWPORT = {"width": 1280, "height": 800}
+
+
+@pytest.mark.browser_context_args(
+    viewport=_NAME_ORDER_VIEWPORT, record_video_size=_NAME_ORDER_VIEWPORT
+)
+def test_name_ordering_lists_live_sessions_a_to_z_and_persists(
+    request: pytest.FixtureRequest, named_sessions: _NamedSessions
+) -> None:
+    """Name orders the server's sessions and folders A to Z, untitled last, across reloads."""
+    # Request the page after seeding so a recording starts at the user's first view.
+    page: Page = request.getfixturevalue("page")
+    requests: list[str] = []
+    page.on(
+        "request",
+        lambda req: requests.append(req.url) if "/v1/sessions?" in req.url else None,
+    )
+    _enable_grouping_ui(page)
+    page.goto(named_sessions.base_url)
+    folder_header = page.locator(f'button[data-project-order-name="{named_sessions.project}"]')
+    expect(folder_header).to_be_visible(timeout=30_000)
+    folder_header.click()
+    expect(page.get_by_test_id("project-show-more")).to_be_visible()
+    poll_until(lambda: len(_listed_titles(page, named_sessions.unfiled)) == 3, timeout_s=15)
+    _pause_for_recording(page, 1_000)
+
+    _open_view_submenu(page, "session-ordering-menu")
+    _pause_for_recording(page, 700)
+    page.get_by_role("menuitemradio", name="Name (A to Z)", exact=True).click()
+    page.keyboard.press("Escape")
+    _wait_for_order(
+        page,
+        named_sessions.folder,
+        ["apple pie", "Banana bread", "Cherry jam", "date list", "kiwi trip"],
+    )
+    _wait_for_order(page, named_sessions.unfiled, _UNFILED_A_TO_Z)
+    assert any(
+        parse_qs(urlparse(url).query).get("sort_by") == ["title"]
+        and parse_qs(urlparse(url).query).get("order") == ["asc"]
+        for url in requests
+    )
+    _pause_for_recording(page, 1_500)
+    page.get_by_test_id("project-show-more").click()
+    _wait_for_order(
+        page,
+        named_sessions.folder,
+        ["apple pie", "Banana bread", "Cherry jam", "date list", "kiwi trip", ""],
+    )
+    untitled = page.locator(f'aside a[href="/c/{named_sessions.folder[""]}"]')
+    expect(untitled).to_have_text("New session")
+    _pause_for_recording(page, 1_500)
+
+    page.reload()
+    expect(folder_header).to_be_visible(timeout=30_000)
+    _wait_for_order(page, named_sessions.unfiled, _UNFILED_A_TO_Z)
+    _wait_for_order(
+        page,
+        named_sessions.folder,
+        ["apple pie", "Banana bread", "Cherry jam", "date list", "kiwi trip"],
+    )
+    _open_view_submenu(page, "session-ordering-menu")
+    expect(page.get_by_role("menuitemradio", name="Name (A to Z)", exact=True)).to_be_checked()
+    _pause_for_recording(page, 2_000)
