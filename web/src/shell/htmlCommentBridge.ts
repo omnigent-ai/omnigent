@@ -26,6 +26,7 @@
 import { escapeHtmlAttr } from "@/lib/html";
 import bridgeRuntime from "./htmlCommentBridgeRuntime.js?raw";
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
+import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
 
 /** Protocol version — bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -49,6 +50,8 @@ export const BRIDGE_MSG = {
   commentClick: "omni:commentClick",
   /** iframe → parent: the selection collapsed without hitting a comment. */
   selectionCleared: "omni:selectionCleared",
+  /** iframe → parent: the user pressed a zoom shortcut inside the preview. */
+  zoom: "omni:zoom",
 } as const;
 
 /** Rect of a selection in the iframe's own viewport coordinates. */
@@ -68,6 +71,8 @@ export interface BridgeSelection {
    * parent anchors to the copy the user picked rather than the first match. */
   occ: number;
   rect: BridgeRect;
+  /** The frame resized and re-reported an unchanged selection at its new position. */
+  reflow: boolean;
 }
 
 export interface BridgeCommentClick {
@@ -83,9 +88,14 @@ export interface BridgeReady {
   type: typeof BRIDGE_MSG.ready;
 }
 
+export interface BridgeZoom {
+  type: typeof BRIDGE_MSG.zoom;
+  action: HtmlPreviewZoomAction;
+}
+
 /** Any message the iframe can send to the parent (post-handshake). */
 export type InboundBridgeMessage =
-  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared;
+  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared | BridgeZoom;
 
 // ---------------------------------------------------------------------------
 // Inbound message validation
@@ -123,7 +133,13 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
         // occ is optional for resilience against older frames — default to the
         // first occurrence, which is the pre-occurrence behavior.
         const occ = typeof d.occ === "number" && d.occ >= 0 ? d.occ : 0;
-        return { type: BRIDGE_MSG.selection, text: d.text, occ, rect: d.rect };
+        return {
+          type: BRIDGE_MSG.selection,
+          text: d.text,
+          occ,
+          rect: d.rect,
+          reflow: d.reflow === true,
+        };
       }
       return null;
     case BRIDGE_MSG.commentClick:
@@ -133,6 +149,8 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
       return null;
     case BRIDGE_MSG.selectionCleared:
       return { type: BRIDGE_MSG.selectionCleared };
+    case BRIDGE_MSG.zoom:
+      return isHtmlPreviewZoomAction(d.action) ? { type: BRIDGE_MSG.zoom, action: d.action } : null;
     default:
       return null;
   }

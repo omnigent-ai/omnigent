@@ -539,11 +539,14 @@ class SysSessionListTool(Tool):
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
             "every session "
-            "you can access, each with status + runner connectivity, "
-            "for orchestration (inspect via sys_agent_get / "
-            "sys_session_get_info, or drive via sys_session_send by "
-            "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent. Calls without pagination keep "
+            "you can access, each with status, runner connectivity and "
+            "created_by_session_id (creation origin for independent workers). "
+            "Match that field to your session ID to find workers you created. "
+            "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
+            "for children or sys_session_message for independent sessions. "
+            "Pass agent_name to filter the global list to "
+            "sessions running that agent, and include_archived to also list "
+            "archived sessions (marked archived). Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
@@ -573,6 +576,14 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: also list archived sessions in the "
+                                "global 'sessions' view; each row then carries "
+                                "'archived'. Defaults to false."
                             ),
                         },
                         "limit": {
@@ -927,7 +938,7 @@ class SysSessionCreateTool(Tool):
             "using the server's configured default provider. Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
-            "and a private, non-scheduled sending session, including its side-chat source chain. "
+            "and a private sending session, including its side-chat source chain. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
@@ -963,6 +974,22 @@ class SysSessionCreateTool(Tool):
                                 "Default child; same_host or managed launches a private "
                                 "top-level session (agent_id only)."
                             ),
+                        },
+                        "sandbox_provider": {
+                            "type": "string",
+                            "description": "Optional provider for placement='managed'.",
+                        },
+                        "sandbox_profile_id": {
+                            "type": "string",
+                            "description": (
+                                "Authorized profile ID for placement='managed', required by "
+                                "providers that manage profiles. Use a selection supplied by "
+                                "the user or discovered through GET /v1/sandbox-profiles."
+                            ),
+                        },
+                        "sandbox_profile_revision": {
+                            "type": "string",
+                            "description": "Expected catalog revision of sandbox_profile_id.",
                         },
                         "agent_id": {
                             "type": "string",

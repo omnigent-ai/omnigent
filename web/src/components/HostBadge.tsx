@@ -161,8 +161,7 @@ export function HostBadge({
   if (appearance === "composer") {
     // A launching sandbox has no host record yet: show the launch, not a missing host.
     const launchStatus = launch && !host ? launchStatusWord(launch) : null;
-    const reconnectable =
-      !launchStatus && badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
+    const reconnectable = !launchStatus && badge?.status === "offline" && !!onReconnect;
     let label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
     // A dormant resumable host wakes on the next message; it isn't disconnected.
     const asleep = badge?.status === "offline" && !!session?.hostResumable;
@@ -258,10 +257,9 @@ export function HostBadge({
   }
   if (!badge) return null;
 
-  // A resumable managed host that reports offline is idle-stopped, not
-  // disconnected — the next message resumes it, and `omnigent host` (what the
-  // reconnect dialog hands out) is the wrong instruction for it.
-  const reconnectable = badge.status === "offline" && !session?.hostResumable && !!onReconnect;
+  // An offline resumable managed host is idle-stopped; reconnecting asks the
+  // server to resume it rather than handing out `omnigent host`.
+  const reconnectable = badge.status === "offline" && !!onReconnect;
   const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
   const title = `Host ${badge.label}, ${statusWord}`;
   // The dot is decorative (aria-hidden), so the status would otherwise be
