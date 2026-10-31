@@ -34,6 +34,7 @@ import {
   filtersFromConversationQueryKey,
   filtersFromProjectQueryKey,
   insertNewRowsIntoPages,
+  isOwnedByViewer,
   mergeItemsIntoPages,
   nullsToUndefined,
   PROJECT_LABEL_KEY,
@@ -74,6 +75,15 @@ function applyItemsToCache(
       nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
     );
   }
+  // The open session is always in the watch-set, so its row arrives with every
+  // snapshot whether or not the server lists it. Another user's session opened by
+  // link (e.g. shared only through a group) must not be inserted: list membership
+  // is the server's call. A session newly shared with the viewer is announced
+  // while unwatched, so it is never the open one and still inserts.
+  const activeItem = activeId === undefined ? undefined : itemsById.get(activeId);
+  const skipInsert = (id: string) =>
+    isSessionDeleting(id) ||
+    (id === activeId && activeItem !== undefined && !isOwnedByViewer(activeItem, viewerId));
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
@@ -99,7 +109,7 @@ function applyItemsToCache(
       merged,
       missingHere,
       filters,
-      isSessionDeleting,
+      skipInsert,
       viewerId,
     );
     for (const row of inserted) {

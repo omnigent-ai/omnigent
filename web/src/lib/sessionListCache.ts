@@ -357,6 +357,14 @@ export function unmarkRecentlyCreated(id: string): void {
 }
 
 /**
+ * Whether `row` belongs to the viewer. `owner` is null/absent when the viewer owns
+ * the row (single-user / legacy shape) and another user's id when it was shared.
+ */
+export function isOwnedByViewer(row: { owner?: string | null }, viewerId?: string | null): boolean {
+  return row.owner == null || row.owner === viewerId;
+}
+
+/**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
  * refetch (which lags the search index). A new row sorts newest-first, so page 0
@@ -391,10 +399,8 @@ export function insertNewRowsIntoPages(
       id,
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
-    // Ownership-aware insertion for scoped caches. `conv.owner` is null/absent
-    // when the row is owned by the viewer (single-user / legacy shape) or
-    // explicitly set to another user's id when the session was shared.
-    const ownedByViewer = conv.owner == null || conv.owner === viewerId;
+    // Ownership-aware insertion for scoped caches.
+    const ownedByViewer = isOwnedByViewer(conv, viewerId);
     if (filters.visibility === "mine" && !ownedByViewer) continue;
     if (filters.visibility === "shared" && ownedByViewer) continue;
     rows.push(conv);
