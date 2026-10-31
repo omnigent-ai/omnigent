@@ -15,6 +15,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from cachetools import LRUCache
+
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.server.schemas import ElicitationResult
 
@@ -121,6 +123,13 @@ _harness_pre_resolved_elicitations: WorkspaceScopedCache[str, _PreResolvedHarnes
     WorkspaceScopedCache()
 )
 
+# Monotonic time each harness elicitation id was first parked. A hook re-parks
+# the same id, so the runner-hold cap counts from the first park. Bounded so
+# abandoned prompts cannot grow it without limit.
+_harness_elicitation_first_parked_at: WorkspaceScopedCache[str, float] = WorkspaceScopedCache(
+    lambda: LRUCache(maxsize=4096)
+)
+
 
 def reset_for_tests() -> None:
     """
@@ -137,11 +146,13 @@ def reset_for_tests() -> None:
     _harness_elicitation_owners.clear()
     _harness_parked_elicitations.clear()
     _harness_pre_resolved_elicitations.clear()
+    _harness_elicitation_first_parked_at.clear()
 
 
 __all__ = [
     "_ParkedHarnessElicitation",
     "_PreResolvedHarnessElicitation",
+    "_harness_elicitation_first_parked_at",
     "_harness_elicitation_owners",
     "_harness_elicitation_registry",
     "_harness_parked_elicitations",
