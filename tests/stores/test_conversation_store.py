@@ -8393,16 +8393,17 @@ def test_list_conversations_acl_with_cursor_pagination(
         )
 
 
+@pytest.mark.parametrize("sort_by", ["updated_at", "created_at", "title"])
 @pytest.mark.parametrize("direction", ["after", "before"])
 @pytest.mark.parametrize("scope", ["accessible_by", "owned_by"])
 @pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
 def test_list_cursor_on_ungranted_session_reveals_nothing(
-    request: pytest.FixtureRequest, store_fixture: str, scope: str, direction: str
+    request: pytest.FixtureRequest, store_fixture: str, scope: str, direction: str, sort_by: str
 ) -> None:
     """A cursor naming another user's private session can't position a page.
 
     Otherwise which of the caller's own sessions come back would reveal how the
-    private title compares with theirs.
+    private session's sort key compares with theirs.
     """
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
@@ -8416,23 +8417,25 @@ def test_list_cursor_on_ungranted_session_reveals_nothing(
     secret = store.create_conversation(title="m secret")
     perms.grant("bob@example.com", secret.id, 4)
 
-    def _page(cursor: str) -> list[str | None]:
+    def _page(**cursor: str) -> list[str]:
         return [
-            c.title
+            c.id
             for c in store.list_conversations(
-                **{scope: "alice@example.com", direction: cursor},  # type: ignore[arg-type]
-                sort_by="title",
+                **{scope: "alice@example.com"},  # type: ignore[arg-type]
+                **cursor,  # type: ignore[arg-type]
+                sort_by=sort_by,  # type: ignore[arg-type]
                 order="asc",
             ).data
         ]
 
     with pytest.raises(StaleCursorError):
-        _page(secret.id)
+        _page(**{direction: secret.id})
     # The caller's own cursors still page.
-    granted_cursor, expected = (
-        (probes[0].id, ["z probe"]) if direction == "after" else (probes[1].id, ["a probe"])
-    )
-    assert _page(granted_cursor) == expected
+    first, second = _page()
+    if direction == "after":
+        assert _page(after=first) == [second]
+    else:
+        assert _page(before=second) == [first]
 
 
 def test_list_projects_single_db_uses_exists_pushdown(
