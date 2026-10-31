@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -146,6 +147,59 @@ def test_runner_resource_attach_unknown_terminal_closes_4404(tmp_path: Path) -> 
 
     with TestClient(app).websocket_connect(
         "/v1/sessions/conv_abc/resources/terminals/terminal_bash_nope/attach"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+
+    assert exc_info.value.code == 4404
+
+
+def test_runner_resource_attach_await_launch_waits_for_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``?await_launch=true`` attaches once an in-flight launch registers."""
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    calls: list[tuple[str, str, bool]] = []
+    _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
+    launch = threading.Timer(
+        0.2,
+        _seed_registry,
+        args=(registry, "conv_abc", _make_running_instance("zsh", "u-ab12cd", tmp_path)),
+    )
+
+    launch.start()
+    with pytest.raises(RuntimeError, match="bridge stopped"):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_zsh_u-ab12cd/attach"
+            "?await_launch=true"
+        ) as ws:
+            ws.receive_bytes()
+    launch.join()
+
+    assert calls == [(str(tmp_path / "zsh-u-ab12cd.sock"), "main", False)]
+
+
+def test_runner_resource_attach_await_launch_times_out_with_4404(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch that never registers still ends in 4404 after the wait."""
+    monkeypatch.setattr(
+        "omnigent.entities.session_resources.TERMINAL_LAUNCH_ATTACH_WAIT_S",
+        0.1,
+    )
+    app = create_runner_app(
+        terminal_registry=TerminalRegistry(),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
     ) as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
             ws.receive_bytes()
@@ -556,7 +610,7 @@ def test_runner_resource_attach_without_registry_closes_4404() -> None:
 
 
 def _make_direct_app(
-    events: list[tuple[str, str, bool]],
+    events: list[tuple[str, str, bool, bool]],
 ) -> FastAPI:
     """A direct-attach app whose attach handler records its arguments.
 
@@ -570,8 +624,9 @@ def _make_direct_app(
         session_id: str,
         terminal_id: str,
         read_only: bool = False,
+        await_launch: bool = False,
     ) -> None:
-        events.append((session_id, terminal_id, read_only))
+        events.append((session_id, terminal_id, read_only, await_launch))
         await websocket.accept()  # type: ignore[attr-defined]
         await websocket.close()  # type: ignore[attr-defined]
 
@@ -628,7 +683,7 @@ def test_direct_attach_probe_accepts_loopback_dev_origin(origin: str) -> None:
     ],
 )
 def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
-    events: list[tuple[str, str, bool]] = []
+    events: list[tuple[str, str, bool, bool]] = []
     app = _make_direct_app(events)
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(path):
@@ -648,7 +703,7 @@ def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
 )
 def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -> None:
     """A DNS-rebinding-style page presents its own origin — refused."""
-    events: list[tuple[str, str, bool]] = []
+    events: list[tuple[str, str, bool, bool]] = []
     app = _make_direct_app(events)
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(
@@ -662,16 +717,16 @@ def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -
 
 def test_direct_attach_forwards_attach_params_to_handler() -> None:
     """The attach wrapper hands session/terminal/read-only through unchanged."""
-    events: list[tuple[str, str, bool]] = []
+    events: list[tuple[str, str, bool, bool]] = []
     app = _make_direct_app(events)
     with contextlib.suppress(WebSocketDisconnect):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv1/resources/terminals/terminal_bash_s1/attach"
-            "?token=sekret-token&read_only=true",
+            "?token=sekret-token&read_only=true&await_launch=true",
             headers={"origin": "https://app.example"},
         ):
             pass
-    assert events == [("conv1", "terminal_bash_s1", True)]
+    assert events == [("conv1", "terminal_bash_s1", True, True)]
 
 
 def test_allowed_origin_for_server_strips_path_and_keeps_port() -> None:
@@ -689,7 +744,7 @@ async def test_direct_attach_listener_serves_probe_on_loopback() -> None:
     """The uvicorn listener binds 127.0.0.1:0 and answers the probe route."""
     import websockets
 
-    events: list[tuple[str, str, bool]] = []
+    events: list[tuple[str, str, bool, bool]] = []
     listener = await start_direct_attach_listener(_make_direct_app(events))
     assert listener is not None, "listener failed to start on loopback"
     try:

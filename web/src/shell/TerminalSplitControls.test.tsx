@@ -34,7 +34,7 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => fixtu
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: () => ({ terminals: fixture.terminals }),
-  useCreateTerminal: () => ({ mutate: fixture.createTerminal, isPending: fixture.createPending }),
+  useCreateTerminal: () => ({ launch: fixture.createTerminal, isPending: fixture.createPending }),
   useDeleteTerminal: () => ({ mutate: fixture.deleteTerminal, isPending: false }),
 }));
 
@@ -109,7 +109,7 @@ it.each([
 });
 
 it("splits the agent pane with the picked shell and focuses the new pane", async () => {
-  fixture.createTerminal.mockImplementation((_shell: string, { onSuccess }) => onSuccess(BASH));
+  fixture.createTerminal.mockImplementation((_shell: string, { onOpen }) => onOpen(BASH));
   renderControls("conv_controls_split");
 
   // Radix menus open on pointerdown, not click.
@@ -131,7 +131,7 @@ it("splits the agent pane with the picked shell and focuses the new pane", async
 });
 
 it("splits right with the preferred shell from the keyboard, skipping the picker", async () => {
-  fixture.createTerminal.mockImplementation((_shell: string, { onSuccess }) => onSuccess(BASH));
+  fixture.createTerminal.mockImplementation((_shell: string, { onOpen }) => onOpen(BASH));
   writePreferredShell("bash");
   renderControls("conv_controls_hotkey");
 

@@ -30,7 +30,12 @@ import {
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
-import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
+import {
+  isTerminalLaunching,
+  resolveInitialAttachUrl,
+  watchDirectUpgrade,
+  withAttachParams,
+} from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
   TerminalClipboardPrompt,
@@ -577,7 +582,13 @@ export function TerminalView({
           const h = getSessionHost(sessionId);
           return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
+        const relayUrl = buildAttachUrl(
+          sessionId,
+          terminalId,
+          readOnly,
+          computedHostId,
+          isTerminalLaunching(terminalId),
+        );
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
         // direct only when the loopback listener is already known
@@ -890,6 +901,9 @@ function resumeErrorText(error: unknown, target: string): string {
  *     e.g. ``"terminal_bash_s1"``.
  * :param readOnly: If true, requests a read-only attach. Forwarded
  *     to the server as ``?read_only=true``.
+ * :param hostId: The session's host_id, forwarded as ``?omnigent_slice_key=``.
+ * :param awaitLaunch: If true, the terminal's create request is still in
+ *     flight; ``?await_launch=true`` asks the server to wait for it.
  * :returns: The path-and-query portion of the WS URL, e.g.
  *     ``"/v1/sessions/.../resources/terminals/.../attach"``.
  */
@@ -898,6 +912,7 @@ export function buildAttachPath(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
+  awaitLaunch = false,
 ): string {
   const path =
     `/v1/sessions/${encodeURIComponent(sessionId)}` +
@@ -911,6 +926,7 @@ export function buildAttachPath(
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
   if (hostId) params.set("omnigent_slice_key", hostId);
+  if (awaitLaunch) params.set("await_launch", "true");
   const qs = params.toString();
   return qs ? `${path}?${qs}` : path;
 }
@@ -927,6 +943,7 @@ export function buildAttachPath(
  * :param readOnly: If true, requests a read-only attach.
  * :param hostId: The session's host_id, forwarded as the routing key
  *     ``?omnigent_slice_key=``.
+ * :param awaitLaunch: Wait for a terminal whose create is still in flight.
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
 function buildAttachUrl(
@@ -934,8 +951,9 @@ function buildAttachUrl(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
+  awaitLaunch = false,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId));
+  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, awaitLaunch));
 }

@@ -254,8 +254,8 @@ function NewTabMenu({
     // (runner-asleep) session the POST can lag the tab's arrival by seconds;
     // ``onOpenTerminal`` on success is a backstop for when it's already open.
     onCreateStart?.();
-    create.mutate(name, {
-      onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
+    create.launch(name, {
+      onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
       onError: () => onCreateError?.(),
     });
   };

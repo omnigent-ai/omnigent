@@ -29,6 +29,7 @@ from omnigent.entities.session_resources import (
     resolve_terminal_entry_by_resource_id,
     session_resource_view_to_dict,
     terminal_resource_id,
+    wait_for_terminal_entry_by_resource_id,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
@@ -963,6 +964,7 @@ def register_resource_routes(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        await_launch: bool = Query(default=False),
     ) -> None:
         await websocket.accept()
         entry = resolve_terminal_entry_by_resource_id(
@@ -970,6 +972,12 @@ def register_resource_routes(
             terminal_id,
             terminal_registry,
         )
+        if entry is None and await_launch:
+            entry = await wait_for_terminal_entry_by_resource_id(
+                session_id,
+                terminal_id,
+                terminal_registry,
+            )
         terminal_role = (
             resource_registry.terminal_resource_role(session_id, terminal_id)
             if resource_registry is not None

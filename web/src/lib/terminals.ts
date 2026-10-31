@@ -249,3 +249,39 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
     directAttachUrl: parseDirectAttachUrl(metadata.direct_attach_url),
   };
 }
+
+/** Mirror of the server's ``safe_resource_component`` (``entities/session_resources.py``). */
+function safeResourceComponent(value: string): string {
+  const safe = value
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return safe || "resource";
+}
+
+/**
+ * The resource id the server assigns a terminal, e.g. ``"terminal_zsh_u-ab12cd"``.
+ *
+ * Mirrors ``terminal_resource_id`` so the web can address a new shell before
+ * its create request returns.
+ */
+export function terminalResourceId(terminalName: string, sessionKey: string): string {
+  return `terminal_${safeResourceComponent(terminalName)}_${safeResourceComponent(sessionKey)}`;
+}
+
+/** Terminal ids whose create request is still in flight. */
+const launchingTerminalIds = new Set<string>();
+
+/** Record whether *terminalId*'s create request is in flight. */
+export function setTerminalLaunching(terminalId: string, launching: boolean): void {
+  if (launching) launchingTerminalIds.add(terminalId);
+  else launchingTerminalIds.delete(terminalId);
+}
+
+/**
+ * Whether an attach to *terminalId* should ask the server to wait for the
+ * launch (``?await_launch=true``) rather than close as not found.
+ */
+export function isTerminalLaunching(terminalId: string): boolean {
+  return launchingTerminalIds.has(terminalId);
+}

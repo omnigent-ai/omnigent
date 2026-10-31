@@ -54,7 +54,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import _server_state, open_right_rail
@@ -118,6 +118,42 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
     close_tab.click()
     page.get_by_role("button", name="Close shell").click()
     expect(terminal_view).to_have_count(0)
+
+
+def test_new_shell_attaches_while_create_in_flight(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A new shell's attach opens before its create returns, then connects.
+
+    The create POST is held in the browser, so the attach (flagged
+    ``await_launch``) reaches the runner before the launch does; releasing
+    the POST must still end in a connected shell.
+    """
+    base_url, session_id = terminal_session
+    held: list[Route] = []
+    page.route(
+        re.compile(r"/v1/sessions/[^/]+/resources/terminals$"),
+        lambda route: held.append(route) if route.request.method == "POST" else route.continue_(),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+
+    with page.expect_websocket(
+        lambda ws: "/resources/terminals/terminal_zsh_u-" in ws.url, timeout=30_000
+    ) as attach:
+        _open_new_shell(page)
+    assert "await_launch=true" in attach.value.url
+    # Route handlers only run while Playwright waits, so wait through it.
+    deadline = time.monotonic() + 10
+    while not held and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+    assert len(held) == 1, "create POST never sent"
+
+    held[0].continue_()
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_test_id("terminal-view").last).to_have_attribute(
+        "data-state", "connected", timeout=20_000
+    )
 
 
 def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str, str]) -> None:

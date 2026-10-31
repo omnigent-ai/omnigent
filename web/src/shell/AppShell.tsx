@@ -2063,8 +2063,8 @@ function AppShellImpl() {
     const name = resolveDefaultShell(boundAgent?.terminals ?? []);
     if (name === null) return;
     markShellCreateStarted();
-    createTerminal.mutate(name, {
-      onSuccess: (info) => openTerminalTab(terminalTabKey(info)),
+    createTerminal.launch(name, {
+      onOpen: (info) => openTerminalTab(terminalTabKey(info)),
       onError: () => clearShellCreatePending(),
     });
   }, [
