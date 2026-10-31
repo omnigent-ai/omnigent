@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/status_scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/brand_background"
+    android:clickable="true"
+    android:focusable="true"
+    android:fillViewport="true"
+    android:importantForAccessibility="yes">
+
+    <LinearLayout
+        android:id="@+id/status_column"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:orientation="vertical"
+        android:paddingLeft="24dp"
+        android:paddingRight="24dp"
+        android:paddingBottom="16dp">
+
+        <ImageView
+            android:id="@+id/status_logo"
+            android:layout_width="wrap_content"
+            android:layout_height="32dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="24dp"
+            android:adjustViewBounds="true"
+            android:contentDescription="@string/connect_logo_desc"
+            android:src="@drawable/omnigents_logo" />
+
+        <View
+            android:id="@+id/status_anchor_gap"
+            android:layout_width="match_parent"
+            android:layout_height="64dp"
+            android:importantForAccessibility="no" />
+
+        <LinearLayout
+            android:id="@+id/status_content"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:gravity="center_horizontal"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <FrameLayout
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:importantForAccessibility="no">
+
+                <ProgressBar
+                    android:id="@+id/status_progress"
+                    style="?android:attr/progressBarStyle"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:layout_gravity="center"
+                    android:indeterminate="true"
+                    android:indeterminateTint="@color/brand_accent" />
+
+                <ImageView
+                    android:id="@+id/status_icon"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:contentDescription="@null"
+                    android:importantForAccessibility="no"
+                    android:visibility="gone" />
+            </FrameLayout>
+
+            <TextView
+                android:id="@+id/status_headline"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:accessibilityLiveRegion="polite"
+                android:fontFamily="sans-serif-medium"
+                android:gravity="center"
+                android:textColor="@color/brand_foreground"
+                android:textSize="22sp" />
+
+            <TextView
+                android:id="@+id/status_body"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:textColor="@color/brand_muted_foreground"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/status_host"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:background="@drawable/bg_input"
+                android:drawableStart="@drawable/ic_status_host"
+                android:drawablePadding="8dp"
+                android:gravity="center"
+                android:minHeight="32dp"
+                android:paddingLeft="12dp"
+                android:paddingTop="6dp"
+                android:paddingRight="12dp"
+                android:paddingBottom="6dp"
+                android:textColor="@color/brand_foreground"
+                android:textIsSelectable="true"
+                android:textSize="14sp" />
+
+            <LinearLayout
+                android:id="@+id/status_details_panel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:background="@drawable/bg_input"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <Button
+                    android:id="@+id/status_details_toggle"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:drawableEnd="@drawable/ic_status_chevron"
+                    android:gravity="start|center_vertical"
+                    android:paddingLeft="16dp"
+                    android:paddingRight="16dp"
+                    android:text="@string/status_details"
+                    android:textAllCaps="false"
+                    android:textColor="@color/brand_foreground" />
+
+                <LinearLayout
+                    android:id="@+id/status_details_content"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
+
+                    <TextView
+                        android:id="@+id/status_details_text"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:paddingLeft="16dp"
+                        android:paddingTop="8dp"
+                        android:paddingRight="16dp"
+                        android:paddingBottom="12dp"
+                        android:textColor="@color/brand_foreground"
+                        android:textIsSelectable="true"
+                        android:textSize="13sp" />
+
+                    <View
+                        android:id="@+id/status_details_divider"
+                        android:layout_width="match_parent"
+                        android:layout_height="1dp"
+                        android:background="@color/brand_border"
+                        android:importantForAccessibility="no" />
+
+                    <Button
+                        android:id="@+id/status_copy_details"
+                        android:layout_width="match_parent"
+                        android:layout_height="48dp"
+                        android:background="?android:attr/selectableItemBackground"
+                        android:drawableStart="@drawable/ic_status_copy"
+                        android:drawablePadding="8dp"
+                        android:gravity="start|center_vertical"
+                        android:paddingLeft="16dp"
+                        android:paddingRight="16dp"
+                        android:text="@string/status_copy_details"
+                        android:textAllCaps="false"
+                        android:textColor="@color/brand_foreground" />
+                </LinearLayout>
+            </LinearLayout>
+
+        </LinearLayout>
+
+        <View
+            android:id="@+id/status_action_spacer"
+            android:layout_width="match_parent"
+            android:layout_height="32dp"
+            android:layout_weight="1"
+            android:importantForAccessibility="no" />
+
+        <LinearLayout
+            android:id="@+id/status_actions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <Button
+                android:id="@+id/status_primary"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:background="@drawable/bg_button_primary"
+                android:textAllCaps="false"
+                android:textColor="@color/brand_on_primary"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/status_secondary"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/bg_button_secondary"
+                android:textAllCaps="false"
+                android:textColor="@color/brand_on_secondary"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/status_cancel"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="12dp"
+                android:background="?android:attr/selectableItemBackground"
+                android:text="@string/oauth_cancel"
+                android:textAllCaps="false"
+                android:textColor="@color/brand_foreground"
+                android:visibility="gone" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

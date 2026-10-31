@@ -162,6 +162,29 @@ connections, with **Clear Session Cookie** and **Clear Refresh Token**.
 
 ### Manual verification
 
+#### Native connection/status screen
+
+Build `./gradlew assembleDebug` and install
+`app/build/outputs/apk/debug/app-debug.apk` on an isolated emulator. The upstream
+debug build installs as `ai.omnigent.android`. Save a
+local server URL on the Connect screen, then cold-start the app. Connecting
+should remain visible until the server's main page commits. Stop the server,
+relaunch, and verify the native “Can’t reach the server” screen has **Retry**,
+**Change server**, and collapsed **Details**. Expand Details: Server must show
+only the origin, never a route or query. Retry after restarting the server;
+the page should appear and the status screen should disappear. Change server
+should open the Connect screen.
+
+Repeat with the emulator's dark theme, a narrow landscape window, and 200%
+font size. Keep a connection pending beyond ten seconds to check “Still trying
+to reach …” and its Change server and Cancel actions. With reduced motion on,
+the spinner should be hidden and state changes should cut instantly. For a
+legacy OIDC ticket server that answers `/auth/cli-login` with ticket
+`upgrade-required`, check **How to update** opens `/auth/cli-upgrade` in a
+Custom Tab and **Change server** remains available on return. The native
+progress and recovery screens should remain readable with TalkBack; Back
+cancels progress and finishes the activity on action screens.
+
 Run an OIDC server whose manifest lists the app's redirect, for example a local
 server with `OMNIGENT_AUTH_PROVIDER=oidc` against the e2e fake identity provider
 (`tests/e2e_ui/auth/_fake_idp.py`). On an emulator, `adb reverse` the server's
