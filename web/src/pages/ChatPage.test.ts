@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
-import type { ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -13,6 +13,7 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
+  composerOffersClear,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
@@ -1396,6 +1397,22 @@ describe("collectBubbleMarkdown", () => {
 });
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
+
+describe("composer /clear gating", () => {
+  const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
+
+  it.each([
+    ["claude-sdk", true],
+    ["claude-native", true],
+    ["codex-native", true],
+    ["openai-agents", false],
+    [null, false],
+  ] as const)("offers /clear for %s when the server accepts the control", (harness, offered) => {
+    expect(composerOffersClear(harness, info({ session_event_types: ["clear"] }))).toBe(offered);
+    expect(composerOffersClear(harness, info({ session_event_types: ["message"] }))).toBe(false);
+    expect(composerOffersClear(harness, "loading")).toBe(false);
+  });
+});
 
 describe("buildSlashCommandMap", () => {
   const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];
