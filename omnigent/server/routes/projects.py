@@ -22,6 +22,7 @@ from fastapi import APIRouter, Request
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.project_colors import pick_distinct_project_color, with_auto_project_color
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
@@ -29,6 +30,7 @@ from omnigent.server.schemas import (
     CreateProjectRequest,
     ProjectOrderRequest,
     ProjectOrderResponse,
+    RecommendedProjectColorResponse,
     UpdateProjectRequest,
 )
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
@@ -70,6 +72,9 @@ def create_projects_router(
     ) -> dict[str, Any]:
         """Create a new, empty project owned by the caller.
 
+        A project created with neither an emoji nor a color is assigned the
+        color most different from the caller's other projects' colors.
+
         :param request: The incoming request, used to identify the user.
         :param body: Project payload (name).
         :returns: The created project as a serialized dict.
@@ -77,13 +82,13 @@ def create_projects_router(
             if the caller already has a project with this name.
         """
         user_id = require_user(request, auth_provider)
-        project = await asyncio.to_thread(
-            project_store.create,
-            uuid.uuid4().hex,
-            body.name,
-            user_id,
-            body.config,
-        )
+
+        def create() -> Project:
+            existing = project_store.list(user_id=user_id)
+            config = with_auto_project_color(body.config, (p.config for p in existing))
+            return project_store.create(uuid.uuid4().hex, body.name, user_id, config)
+
+        project = await asyncio.to_thread(create)
         # Push the change to the owner's other connected clients so their
         # sidebars pick up the new folder without a reload.
         announce_projects_changed(user_id)
@@ -131,6 +136,23 @@ def create_projects_router(
         )
         announce_projects_changed(user_id)
         return preference
+
+    @router.get("/projects/recommended-color")
+    async def get_recommended_project_color(
+        request: Request, exclude_project_id: str | None = None
+    ) -> RecommendedProjectColorResponse:
+        """Recommend a color for a new project, or a replacement for one.
+
+        :param request: The incoming request, used to identify the user.
+        :param exclude_project_id: A project whose own color is left out, when
+            recommending a replacement for it.
+        :returns: The recommended palette id.
+        :raises OmnigentError: 401 if unauthenticated in multi-user mode.
+        """
+        user_id = require_user(request, auth_provider)
+        projects = await asyncio.to_thread(project_store.list, user_id=user_id)
+        used = [p.config.get("color") for p in projects if p.id != exclude_project_id]
+        return RecommendedProjectColorResponse(color=pick_distinct_project_color(used))
 
     @router.get("/projects/{project_id}")
     async def get_project(request: Request, project_id: str) -> dict[str, Any]:
