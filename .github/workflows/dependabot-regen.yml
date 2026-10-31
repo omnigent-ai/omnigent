@@ -1,0 +1,139 @@
+# Repair a Dependabot PR's lockfiles automatically. Dependabot regenerates the
+# lockfile of the ecosystem it bumps, but not always completely: an npm bump can
+# arrive with only `web/package.json` changed, so `pnpm install
+# --frozen-lockfile` fails in CI and the auto-merge policy cannot classify the
+# PR. This runs the same repair a maintainer's `/regen` comment performs
+# (oss-regen-on-comment.yml), on every Dependabot push, without the comment:
+# check both lockfiles, regenerate only what is inconsistent, push the result
+# back to the PR branch. A consistent PR is left untouched, so the push this
+# job makes re-triggers it once and it exits clean.
+#
+# A pushed repair commit stops Dependabot from rebasing the PR itself; the
+# auto-merge sweep refreshes the base through the API, so that is not relied on.
+name: Dependabot lockfile regen
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+# One repair per PR at a time; a later push waits rather than racing a push.
+concurrency:
+  group: dependabot-regen-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  regen:
+    # Same-repo Dependabot PRs only: the job pushes to the head branch.
+    if: >-
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write      # push the regenerated lockfiles to the PR branch
+      pull-requests: write # comment the result on the PR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # No persisted credentials: `uv lock` can execute PR-chosen build
+      # backends, which must not find a push token on disk. The App token is
+      # minted only after the lockfiles are regenerated.
+      - name: Checkout the PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      # Pinned to a known main commit rather than the checked-out tree, since
+      # the tree is the PR head (same pattern as the `/regen` workflow).
+      - name: Set up uv (clean public resolution, no proxy cache)
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
+        with:
+          enable-cache: false
+          version: "0.13.4"
+
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      # Check-first, per ecosystem, like the scheduled regen job: only a real
+      # manifest/lock desync is regenerated, so a PR whose lockfile is already
+      # consistent gets no commit. Cooldowns come from uv.toml and
+      # pnpm-workspace.yaml, recorded as relative spans.
+      - name: Regenerate whichever lockfile is inconsistent
+        id: regen
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          changed=""
+          if ! uv lock --check; then
+            uv lock
+            python3 scripts/normalize_uv_lock_registry.py uv.lock || true
+            python3 scripts/normalize_uv_lock_registry.py --check uv.lock
+            changed="$changed uv.lock"
+          fi
+          if ! pnpm install --frozen-lockfile --lockfile-only; then
+            pnpm install --lockfile-only --ignore-scripts
+            changed="$changed pnpm-lock.yaml"
+          fi
+          # --porcelain so a first-time UNTRACKED lockfile counts too.
+          if [ -z "$(git status --porcelain -- uv.lock pnpm-lock.yaml)" ]; then
+            echo "changed=" >> "$GITHUB_OUTPUT"
+            echo "Lockfiles already consistent — nothing to push."
+          else
+            echo "changed=${changed# }" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint App token
+        id: app-token
+        if: steps.regen.outputs.changed != '' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+
+      # ${{ }} values pass via env: as "$VAR" to avoid injection. The push token
+      # authenticates inline (never in .git/config); an App token makes the
+      # push re-trigger the PR's CI, which GITHUB_TOKEN would not.
+      - name: Commit and push to the PR branch
+        if: steps.regen.outputs.changed != ''
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PUSH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CHANGED: ${{ steps.regen.outputs.changed }}
+        run: |
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+          git add uv.lock pnpm-lock.yaml
+          git commit -s -m "chore(deps): regenerate $CHANGED for this Dependabot update"
+          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO}.git" "HEAD:$HEAD_REF"
+
+      - name: Comment the result
+        if: steps.regen.outputs.changed != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          CHANGED: ${{ steps.regen.outputs.changed }}
+          APP_USED: ${{ steps.app-token.conclusion == 'success' }}
+        run: |
+          body="✅ Regenerated \`$CHANGED\` for this update and pushed it to the PR."
+          if [ "$APP_USED" = "true" ]; then
+            body="$body CI will re-run on the new commit."
+          else
+            body="$body ⚠️ No regen App configured, so this push won't re-trigger CI."
+          fi
+          gh pr comment "$PR" --repo "$REPO" --body "$body"
+
+      - name: Comment on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh pr comment "$PR" --repo "$REPO" \
+            --body "❌ Automatic lockfile regeneration failed — see the [workflow run]($RUN_URL). Lockfiles were not changed; a maintainer can retry with \`/regen\`."

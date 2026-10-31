@@ -2,6 +2,7 @@
 # (uv.lock + pnpm-lock.yaml) against public PyPI/npmjs.org and commit them
 # ONTO that PR's branch. Use when the PR itself moved a dependency; complements
 # oss-regenerate-and-smoke.yml (standalone rolling PR on dispatch).
+# Dependabot PRs get the same repair without a comment: dependabot-regen.yml.
 #
 # Two forms:
 #   /regen                      re-resolve BOTH lockfiles, preserving existing pins.
