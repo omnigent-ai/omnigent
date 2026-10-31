@@ -7602,6 +7602,8 @@ def create_runner_app(
                 return await _handle_codex_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "opencode-native":
                 return await _handle_opencode_native_clear(conversation_id)
+            if _session_harness_name(conversation_id) == "claude-sdk":
+                return await _handle_claude_sdk_clear(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":
@@ -7871,6 +7873,10 @@ def create_runner_app(
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
 
+    async def _release_session_harness(session_id: str) -> None:
+        if process_manager is not None:
+            await process_manager.release(session_id)
+
     _native_controls = build_native_controls(
         _active_turns=_active_turns,
         _background_tasks=_background_tasks,
@@ -7894,6 +7900,7 @@ def create_runner_app(
         _opencode_terminal_ensure_locks=_opencode_terminal_ensure_locks,
         _publish_event=_publish_event,
         _publish_turn_status=_publish_turn_status,
+        _release_session_harness=_release_session_harness,
         _resolve_session_agent_spec=_resolve_session_agent_spec,
         _resolve_session_claude_launch_config=_resolve_session_claude_launch_config,
         _run_turn_bg=_run_turn_bg,
@@ -7917,6 +7924,7 @@ def create_runner_app(
     _handle_claude_native_permission_mode_change = (
         _native_controls.handle_claude_native_permission_mode_change
     )
+    _handle_claude_sdk_clear = _native_controls.handle_claude_sdk_clear
     _handle_claude_sdk_compact = _native_controls.handle_claude_sdk_compact
     _handle_codex_native_approval_mode_change = (
         _native_controls.handle_codex_native_approval_mode_change
