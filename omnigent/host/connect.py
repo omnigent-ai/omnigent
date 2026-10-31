@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import concurrent.futures
 import contextlib
 import errno
 import functools
@@ -166,7 +167,6 @@ from omnigent.host.project_setup_runner import (
     prepare_project_env,
     read_setup_log,
     release_unclaimed_gate,
-    release_worktree_claim,
     run_worktree_setup,
 )
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
@@ -1424,6 +1424,11 @@ class HostProcess:
         self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
         self._zygote_disabled = False
         self._env_probe_cache = EnvProbeCache()
+        #: Worktree setups run for minutes; their own threads keep them from
+        #: starving the default pool that every other off-loop host task uses.
+        self._project_setup_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=16, thread_name_prefix="project-setup"
+        )
         #: Env probes started before their launch waited for the lifecycle lock.
         self._early_env_probes: dict[str, asyncio.Future[ProjectSetupOutcome]] = {}
         # Warms the zygote at daemon start so the first launch doesn't pay
@@ -1565,14 +1570,25 @@ class HostProcess:
         finally:
             self._owned_subprocess_ops -= 1
 
-    async def _run_host_subprocess_in_thread(self, operation: Callable[[], _T]) -> _T:
+    async def _run_host_subprocess_in_thread(
+        self,
+        operation: Callable[[], _T],
+        executor: concurrent.futures.Executor | None = None,
+    ) -> _T:
         """Run a subprocess-owning operation off-loop without losing its exit status.
 
         Cancellation stops waiting for the result but cannot stop a worker
         thread. Keep the orphan reaper paused until the worker itself finishes.
+
+        :param executor: Pool to run it on; the loop's default pool if ``None``.
         """
         self._owned_subprocess_ops += 1
-        task = asyncio.create_task(asyncio.to_thread(operation))
+        loop = asyncio.get_running_loop()
+
+        async def run_off_loop() -> _T:
+            return await loop.run_in_executor(executor, operation)
+
+        task = asyncio.create_task(run_off_loop())
         retained_task = cast("asyncio.Task[object]", task)
         self._host_subprocess_tasks.add(retained_task)
 
@@ -2397,7 +2413,7 @@ class HostProcess:
         When no setup starts, a runner waiting on it is released at once.
 
         :param setup: The project's setup, or ``None``.
-        :param session_id: Session that receives the outcome notice.
+        :param session_id: Session that receives the outcome notice, if any.
         :param workspace: The session workspace.
         :param env_delta: The project env delta (e.g. the conda ``PATH``), layered
             onto the host env for the setup commands. The runner env itself is
@@ -2410,11 +2426,8 @@ class HostProcess:
 
         def claim() -> Path | None:
             git_dir = claim_worktree_setup(workspace=str(workspace))
-            if git_dir is None or not session_id:
-                if git_dir is not None:
-                    release_worktree_claim(git_dir)
+            if git_dir is None:
                 release_unclaimed_gate(str(workspace))
-                return None
             return git_dir
 
         try:
@@ -2425,10 +2438,9 @@ class HostProcess:
                 extra=debug_event("project_setup_failed", session_id=session_id),
             )
             return False
-        if git_dir is None or not session_id:
+        if git_dir is None:
             return False
         claimed_git_dir: Path = git_dir
-        report_session_id: str = session_id
         command_env = os.environ.copy()
         apply_env_delta(command_env, env_delta)
 
@@ -2438,14 +2450,17 @@ class HostProcess:
                     commands,
                     git_dir=claimed_git_dir,
                     workspace=str(workspace),
-                    session_id=report_session_id,
+                    session_id=session_id,
                     env=command_env,
                     path_prepend=env_delta.path_prepend,
-                )
+                ),
+                executor=self._project_setup_executor,
             )
+            if not session_id:
+                return
             await self._report_project_setup(
                 HostProjectSetupFinishedFrame(
-                    session_id=report_session_id,
+                    session_id=session_id,
                     warning=result.warning,
                     log_path=display_log_path(result.log_path) if result.log_path else None,
                 )
@@ -5344,6 +5359,7 @@ class HostProcess:
             # Background worktree installs run in their own sessions; stop them
             # with the host rather than leaving them orphaned mid-install.
             kill_running_project_commands()
+            self._project_setup_executor.shutdown(wait=False)
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool

@@ -515,16 +515,12 @@ def claim_worktree_setup(*, workspace: str) -> Path | None:
         return None
     git_dir = marker.parent
     with _running_setups_lock:
-        if git_dir in _running_setups:
+        # Re-checked under the lock: a setup that just finished wrote its marker
+        # before releasing its claim.
+        if git_dir in _running_setups or marker.exists():
             return None
         _running_setups[git_dir] = None
     return git_dir
-
-
-def release_worktree_claim(git_dir: Path) -> None:
-    """Give up a claim from :func:`claim_worktree_setup` without running the setup."""
-    with _running_setups_lock:
-        _running_setups.pop(git_dir, None)
 
 
 def release_unclaimed_gate(workspace: str) -> None:
@@ -541,7 +537,7 @@ def release_unclaimed_gate(workspace: str) -> None:
     if marker is None:
         return
     with _running_setups_lock:
-        if marker.parent not in _running_setups:
+        if marker.parent not in _running_setups and not marker.exists():
             _write_marker_record(
                 marker.parent, {"status": "skipped", "finished_at": int(time.time())}
             )

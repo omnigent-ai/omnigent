@@ -11201,6 +11201,31 @@ async def test_launch_holds_the_runner_on_worktree_setup_unless_parallel(
         runner.proc.kill()
 
 
+async def test_worktree_setup_without_a_session_still_runs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no session to notify, setup still runs rather than being marked skipped."""
+    from omnigent.host.project_setup_runner import EnvDelta, pending_setup_marker
+    from omnigent.project_setup import ProjectSetup
+    from tests._helpers.git_repo import repo_with_worktree
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _, worktree = repo_with_worktree(tmp_path / "src")
+    marker = pending_setup_marker(str(worktree))
+    host = _make_host_process()
+    reports: list[object] = []
+    monkeypatch.setattr(host, "_report_project_setup", reports.append)
+
+    started = await host._start_worktree_setup(
+        ProjectSetup(setup_commands=("touch ran",)), None, worktree, EnvDelta()
+    )
+    await asyncio.gather(*host._watcher_tasks)
+
+    assert started is True and (worktree / "ran").exists()
+    assert marker is not None and json.loads(marker.read_text())["status"] == "succeeded"
+    assert reports == []
+
+
 async def test_launch_with_a_malformed_project_setup_still_launches_and_warns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

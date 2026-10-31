@@ -238,6 +238,20 @@ def test_concurrent_launches_run_setup_once_and_keep_waiting_on_it(worktree: Pat
     assert pending_setup_marker(str(worktree)) is not None
 
 
+def test_a_setup_that_finishes_during_a_claim_is_neither_rerun_nor_overwritten(
+    worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = pending_setup_marker(str(worktree))
+    assert marker is not None
+    assert _run_setup(worktree, ("true",)) is None
+    # A launch that checked for the marker just before the setup recorded it.
+    monkeypatch.setattr(project_setup_runner, "pending_setup_marker", lambda _workspace: marker)
+
+    assert claim_worktree_setup(workspace=str(worktree)) is None
+    release_unclaimed_gate(str(worktree))
+    assert json.loads(marker.read_text())["status"] == "succeeded"
+
+
 def test_a_wait_on_setup_that_will_not_run_is_released(worktree: Path, tmp_path: Path) -> None:
     release_unclaimed_gate(str(worktree))
 
