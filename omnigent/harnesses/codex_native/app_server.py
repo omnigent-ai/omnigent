@@ -109,6 +109,8 @@ from omnigent.inner.databricks_executor import (
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
 from omnigent.native import policy_allow_cache
 from omnigent.process_logging import (
+    DATA_DIR_ENV_VAR,
+    data_dir,
     harness_stderr_capture_enabled,
     log_info_once,
     log_once,
@@ -366,7 +368,8 @@ def _codex_mcp_server_config_section(
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
-        f"args = [{args_toml}]\n\n"
+        f"args = [{args_toml}]\n"
+        f"env = {{ {DATA_DIR_ENV_VAR} = {json.dumps(str(data_dir()))} }}\n\n"
         f"{approvals}"
     )
 
