@@ -22,8 +22,10 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -101,24 +103,30 @@ interface PaletteSession {
   id: string;
   label: string;
   agent: string;
+  archived: boolean;
   snippet: string | null;
 }
 
-/** Flatten list pages into palette rows, dropping archived and repeated ids. */
+/** Flatten list pages into palette rows, dropping repeated ids and, unless
+    `includeArchived`, archived sessions. */
 function paletteSessions(
   pages: readonly ConversationsPage[],
-  excludeIds: ReadonlySet<string> = new Set(),
+  {
+    includeArchived = false,
+    excludeIds = new Set(),
+  }: { includeArchived?: boolean; excludeIds?: ReadonlySet<string> } = {},
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
   const out: PaletteSession[] = [];
   for (const page of pages) {
     for (const c of page.data) {
-      if (c.archived || seen.has(c.id)) continue;
+      if ((c.archived && !includeArchived) || seen.has(c.id)) continue;
       seen.add(c.id);
       out.push({
         id: c.id,
         label: conversationDisplayLabel(c),
         agent: getConversationAgentType(c),
+        archived: c.archived === true,
         // Present only when the match was in chat content (not the title);
         // the server omits it otherwise. Shown as a dimmed second line.
         snippet: c.search_snippet ?? null,
@@ -221,7 +229,20 @@ export function CommandPalette({
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
   const searching = !sessionsOnly && debouncedQuery !== "";
-  const searchOptions = { enabled: open && searching, limit: SEARCH_GROUP_PAGE_SIZE };
+  // Wait briefly for server info so a supporting server never gets the mixed
+  // request; if it stalls, fall back to that request rather than never searching.
+  const serverInfoLoading = serverInfo === "loading";
+  const [serverInfoWaitExpired, setServerInfoWaitExpired] = useState(false);
+  useEffect(() => {
+    if (!serverInfoLoading || !searching || serverInfoWaitExpired) return;
+    const timer = setTimeout(() => setServerInfoWaitExpired(true), BOOT_PROBE_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [serverInfoLoading, searching, serverInfoWaitExpired]);
+  const awaitingServerInfo = serverInfoLoading && !serverInfoWaitExpired;
+  const searchOptions = {
+    enabled: open && searching && !awaitingServerInfo,
+    limit: SEARCH_GROUP_PAGE_SIZE,
+  };
   const titleSearch = useSessionSearch(
     debouncedQuery,
     groupedSearch ? "title" : "all",
@@ -257,7 +278,8 @@ export function CommandPalette({
   ]);
 
   const sessions = useMemo(() => {
-    if (searching) return paletteSessions(titleSearch.data?.pages ?? []);
+    if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
+    // Rows archived after they loaded are still cached here, so drop them.
     const out = paletteSessions(data?.pages ?? []);
     if (sessionsOnly) {
       if (!query.trim()) return out;
@@ -274,7 +296,10 @@ export function CommandPalette({
   const contentSessions = useMemo(
     () =>
       searching
-        ? paletteSessions(contentSearch.data?.pages ?? [], new Set(sessions.map((s) => s.id)))
+        ? paletteSessions(contentSearch.data?.pages ?? [], {
+            includeArchived: true,
+            excludeIds: new Set(sessions.map((s) => s.id)),
+          })
         : [],
     [contentSearch.data, searching, sessions],
   );
@@ -286,7 +311,8 @@ export function CommandPalette({
   const loadMoreError = searching
     ? searchGroups.some((group) => group.isFetchNextPageError)
     : isFetchNextPageError;
-  const searchFetching = searchGroups.some((group) => group.isFetching);
+  const searchFetching =
+    (searching && awaitingServerInfo) || searchGroups.some((group) => group.isFetching);
   const retrying = searching
     ? searchGroups.some((group) => group.isError && group.isFetching)
     : isFetching;
@@ -353,6 +379,11 @@ export function CommandPalette({
           </span>
         )}
       </div>
+      {s.archived && (
+        <Badge variant="outline" className="ml-2 text-muted-foreground">
+          Archived
+        </Badge>
+      )}
       <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
     </CommandItem>
   );

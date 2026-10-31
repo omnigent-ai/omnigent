@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.harness_startup_config import (
+    resolve_codex_app_server_command,
     resolve_harness_args,
     resolve_harness_command,
     resolve_harness_config,
@@ -336,6 +337,66 @@ def test_isaac_wrap_shape_codex_native() -> None:
     assert resolve_harness_command("codex-native", default="codex", cfg=cfg) == "isaac"
     built = ("--remote", "ws://127.0.0.1:9876")
     assert resolve_harness_args("codex-native", built, cfg=cfg) == ["codex", "--", *built]
+
+
+# ── harness.codex-native.app_server ──────────────────────────────────
+
+
+def test_codex_app_server_command_is_separate_from_the_terminal_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The app-server wrapper comes from config even with ``OMNIGENT_CODEX_PATH`` set.
+
+    That env var names the Codex binary the wrapper runs, so it must not
+    replace the wrapper the way it replaces ``harness.codex-native.command``.
+    """
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/opt/codex")
+    cfg = {
+        "harness": {
+            "codex-native": {
+                "command": "isaac",
+                "args": ["codex", "--"],
+                "app_server": {"command": "env", "args": ["MODE=omni", "isaac", "codex", "--"]},
+            }
+        }
+    }
+    assert resolve_codex_app_server_command(cfg) == ("env", "MODE=omni", "isaac", "codex", "--")
+    assert resolve_harness_command("codex-native", default="codex", cfg=cfg) == "/opt/codex"
+    assert resolve_harness_args("codex-native", ("--remote", "ws://x"), cfg=cfg) == [
+        "codex",
+        "--",
+        "--remote",
+        "ws://x",
+    ]
+
+
+def test_codex_app_server_command_unset_runs_codex_directly() -> None:
+    assert resolve_codex_app_server_command({}) == ()
+    cfg = {"harness": {"codex-native": {"command": "isaac"}}}
+    assert resolve_codex_app_server_command(cfg) == ()
+
+
+def test_codex_app_server_command_without_command_warns_and_skips(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = {"harness": {"codex-native": {"app_server": {"args": ["--"]}}}}
+    assert resolve_codex_app_server_command(cfg) == ()
+    assert "harness.codex-native.app_server" in capsys.readouterr().err
+
+
+def test_cyclic_app_server_config_warns_instead_of_recursing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A YAML anchor that nests ``app_server`` in itself is ignored, not recursed into."""
+    import yaml
+
+    cfg = yaml.safe_load("harness:\n  codex-native:\n    app_server: &w\n      app_server: *w\n")
+    assert (
+        cfg["harness"]["codex-native"]["app_server"]["app_server"]
+        is (cfg["harness"]["codex-native"]["app_server"])
+    )
+    assert resolve_codex_app_server_command(cfg) == ()
+    assert "harness.codex-native.app_server" in capsys.readouterr().err
 
 
 # ── CLI persists RAW args; the runner is the single merge point ──────

@@ -1063,6 +1063,71 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_forked_session_replays_tool_history_once(self):
+        """A fresh SDK session (fork, restart) replays each recorded call once with its
+        output behind it; the next turn sends only the new message."""
+
+        def msg(role: str, content: object, call_id: str | None = None) -> dict[str, object]:
+            message: dict[str, object] = {"role": role, "content": content, "session_id": "s1"}
+            if call_id is not None:
+                message["metadata"] = {"call_id": call_id}
+            return message
+
+        sf_call = msg("tool_call", {"tool": "weather", "args": {"city": "SF"}}, "call_sf")
+        # Live history repeats a call per status, interleaves steering, and keeps
+        # calls interrupted before they returned; a direct caller may omit a name.
+        history = [
+            msg("user", "weather in SF and NYC"),
+            sf_call,
+            msg("tool_call", {"tool": "weather", "args": {"city": "NYC"}}, "call_nyc"),
+            msg("tool_call", {"tool": "weather", "args": {"city": "LA"}}, "call_la"),
+            sf_call,
+            msg("user", "metric please"),
+            msg("tool_result", "SF: 61F", "call_sf"),
+            msg("tool_result", "NYC: 45F", "call_nyc"),
+            msg("assistant", "SF 16C, NYC 7C"),
+            msg("tool_call", {"args": {}}, "call_unnamed"),
+            msg("tool_result", "unnamed output", "call_unnamed"),
+            msg("user", "Which was warmer?"),
+        ]
+
+        async def _t():
+            _FakeRunner.last_calls = []
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                _FakeRunner.next_result = _FakeResult(events=[], final_output="SF")
+                _ = [e async for e in executor.run_turn(history, [], "")]
+                _FakeRunner.next_result = _FakeResult(events=[], final_output="ok")
+                follow_up = [*history, msg("assistant", "SF"), msg("user", "second")]
+                _ = [e async for e in executor.run_turn(follow_up, [], "")]
+
+            replayed = _FakeRunner.last_calls[0]["input"]
+            tool_items = [
+                (i["type"], i["call_id"], i.get("output"))
+                for i in replayed
+                if i.get("type") in ("function_call", "function_call_output")
+            ]
+            self.assertEqual(
+                tool_items,
+                [
+                    ("function_call", "call_sf", None),
+                    ("function_call_output", "call_sf", "SF: 61F"),
+                    ("function_call", "call_nyc", None),
+                    ("function_call_output", "call_nyc", "NYC: 45F"),
+                ],
+            )
+            # Each output directly follows its call, so steering lands after the pairs.
+            self.assertEqual(replayed[5]["content"], "metric please")
+            self.assertEqual(replayed[-2]["content"], "[tool result] unnamed output")
+            self.assertEqual(replayed[-1]["content"], "Which was warmer?")
+            self.assertEqual(_FakeRunner.last_calls[1]["input"], "second")
+            self.assertTrue(executor.replays_tool_history())
+
+        _run(_t())
+
     def test_started_session_preserves_structured_user_content(self):
         """Regression: fast path must not json.dumps a structured content list.
 
@@ -3724,3 +3789,404 @@ def test_shell_command_bearer_auth_reports_failed_command(caplog):
             next(_shell_auth_flow("echo 'no cached OAuth token' >&2; exit 3"))
 
     assert "no cached OAuth token" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Gemini on the Databricks gateway: MLflow routing + thought-signature relay
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("gateway_url", "model", "expected"),
+    [
+        (
+            "https://ws.example.com/ai-gateway/codex/v1",
+            "system.ai.gemini-3-8-flash",
+            "https://ws.example.com/ai-gateway/mlflow/v1",
+        ),
+        (
+            "https://ws.example.com/ai-gateway/openai/v1/",
+            "databricks-gemini-3-8-flash",
+            "https://ws.example.com/ai-gateway/mlflow/v1",
+        ),
+        (
+            "https://ws.example.com/ai-gateway/mlflow/v1/",
+            "system.ai.gemini-3-8-flash",
+            "https://ws.example.com/ai-gateway/mlflow/v1/",
+        ),
+        (
+            "https://ws.example.com/ai-gateway/codex/v1",
+            "databricks-gpt-6-astra",
+            "https://ws.example.com/ai-gateway/codex/v1",
+        ),
+        (
+            "https://proxy.example.com/v1",
+            "system.ai.gemini-3-8-flash",
+            "https://proxy.example.com/v1",
+        ),
+    ],
+)
+def test_gateway_base_url_routes_only_gemini_to_mlflow(
+    gateway_url: str, model: str, expected: str
+) -> None:
+    """Gemini leaves the GPT-only gateway surfaces; other models and URLs stay put."""
+    from omnigent.inner.openai_agents_sdk_executor import _gateway_base_url_for_model
+
+    assert _gateway_base_url_for_model(gateway_url, model) == expected
+
+
+@pytest.mark.parametrize("credentials", ["api-key-override", "api-key-env", "env-only"])
+@pytest.mark.parametrize("surface", ["codex", "openai"])
+def test_get_openai_client_routes_gemini_with_api_keys(
+    monkeypatch, credentials: str, surface: str
+) -> None:
+    """Gateway routing works for both explicit API keys and environment auth."""
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    base_url = f"https://workspace.example.com/ai-gateway/{surface}/v1"
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", base_url)
+    kwargs: dict[str, str] = {"model": "system.ai.gemini-3-8-flash"}
+    if credentials != "env-only":
+        kwargs["api_key"] = "explicit-key"
+    if credentials == "api-key-override":
+        kwargs["base_url_override"] = base_url
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://wrong.example.com/v1")
+
+    client = _get_openai_async_client(**kwargs)
+    try:
+        assert str(client.base_url).rstrip("/") == (
+            "https://workspace.example.com/ai-gateway/mlflow/v1"
+        )
+        assert client.api_key == ("env-key" if credentials == "env-only" else "explicit-key")
+    finally:
+        _run(client.close())
+
+
+@pytest.mark.parametrize(
+    ("profile", "model"),
+    [
+        ("dev", "system.ai.gemini-3-8-flash"),
+        (None, "databricks-gemini-3-8-flash"),
+        (None, "system.ai.gemini-3-8-flash"),
+    ],
+    ids=["profile", "ambient-databricks", "ambient-unity-catalog"],
+)
+def test_get_openai_client_routes_gemini_with_databricks_auth(
+    monkeypatch, profile: str | None, model: str
+) -> None:
+    """Profile and ambient Databricks auth both send Gemini to the MLflow surface."""
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    calls: list[str | None] = []
+
+    def _fake_resolve(profile=None, **kwargs):
+        calls.append(profile)
+        return httpx.BasicAuth("token", ""), "https://example.databricks.com"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    client = _get_openai_async_client(profile=profile, model=model)
+    try:
+        assert calls == [profile]
+        assert str(client.base_url).rstrip("/") == (
+            "https://example.databricks.com/ai-gateway/mlflow/v1"
+        )
+    finally:
+        _run(client.close())
+
+
+def test_gateway_thought_signature_messages_moves_google_field() -> None:
+    """The SDK's Google signature becomes the gateway's ``thoughtSignature``."""
+    from omnigent.inner.openai_agents_sdk_executor import _gateway_thought_signature_messages
+
+    signed = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": "{}"},
+        "extra_content": {"google": {"thought_signature": "sig-1"}},
+    }
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": [signed]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "18C"},
+    ]
+
+    rewritten = _gateway_thought_signature_messages(messages)
+
+    tool_call = rewritten[1]["tool_calls"][0]
+    assert tool_call["thoughtSignature"] == "sig-1"
+    assert "extra_content" not in tool_call
+    assert rewritten[0] is messages[0] and rewritten[2] is messages[2]
+    assert "extra_content" in signed, "caller's message must not be mutated"
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize(
+    "client_url",
+    [
+        "https://workspace.example.com/ai-gateway/mlflow/v1",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "https://openrouter.ai/api/v1",
+    ],
+)
+def test_reasoning_filter_relays_only_gateway_thought_signatures(
+    client_url: str, streaming: bool
+) -> None:
+    """Gateway adaptation preserves other providers' Google signature protocol."""
+    from openai.types.chat import ChatCompletion, ChatCompletionChunk
+
+    gateway = "/ai-gateway/" in client_url
+    incoming_signature = (
+        {"thoughtSignature": "sig-2"}
+        if gateway
+        else {"extra_content": {"google": {"thought_signature": "sig-2"}}}
+    )
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "get_weather",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{}"},
+                **incoming_signature,
+            }
+        ],
+    }
+    payload = {
+        "id": "c1",
+        "object": "chat.completion.chunk" if streaming else "chat.completion",
+        "created": 0,
+        "model": "gemini-3.8-flash",
+        "choices": [
+            {
+                "index": 0,
+                "delta" if streaming else "message": message,
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+    result_type = ChatCompletionChunk if streaming else ChatCompletion
+    response = result_type.model_validate(payload)
+    captured: dict[str, Any] = {}
+
+    class _Completions:
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+
+            async def _stream():
+                yield response
+
+            return _stream() if streaming else response
+
+    outgoing = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "prev",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                    "extra_content": {"google": {"thought_signature": "sig-1"}},
+                }
+            ],
+        }
+    ]
+
+    client = types.SimpleNamespace(
+        base_url=client_url, chat=types.SimpleNamespace(completions=_Completions())
+    )
+    _wrap_client_for_reasoning_models(client)
+
+    async def _run_inner() -> Any:
+        result = await client.chat.completions.create(
+            model="gemini-3.8-flash", messages=outgoing, stream=streaming
+        )
+        if streaming:
+            return (await anext(result)).choices[0].delta
+        return result.choices[0].message
+
+    incoming = _run(_run_inner()).tool_calls[0]
+    sent_call = captured["messages"][0]["tool_calls"][0]
+
+    if gateway:
+        assert sent_call["thoughtSignature"] == "sig-1"
+        assert "extra_content" not in sent_call
+        assert incoming.id.startswith("call_")
+    else:
+        assert sent_call["extra_content"] == {"google": {"thought_signature": "sig-1"}}
+        assert "thoughtSignature" not in sent_call
+        assert incoming.id == "get_weather"
+    assert incoming.extra_content == {"google": {"thought_signature": "sig-2"}}
+    assert "extra_content" in outgoing[0]["tool_calls"][0]
+
+
+def test_expose_google_thought_signatures_uniquifies_name_ids() -> None:
+    """Gateway Gemini calls reuse the function name as id; each gets a unique one."""
+    from openai.types.chat.chat_completion_chunk import ChoiceDelta
+
+    from omnigent.inner.openai_agents_sdk_executor import _expose_google_thought_signatures
+
+    def _delta(call_id: str) -> ChoiceDelta:
+        return ChoiceDelta.model_validate(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "sys_os_read", "arguments": "{}"},
+                    }
+                ]
+            }
+        )
+
+    first, second, distinct = _delta("sys_os_read"), _delta("sys_os_read"), _delta("call_abc")
+    for delta in (first, second, distinct):
+        _expose_google_thought_signatures(delta)
+
+    first_id = first.tool_calls[0].id
+    assert first_id != "sys_os_read" and first_id.startswith("call_")
+    assert first_id != second.tool_calls[0].id
+    assert distinct.tool_calls[0].id == "call_abc"
+
+
+def test_gateway_stream_preserves_call_ids_across_deltas() -> None:
+    """Repeated gateway ids must match in the SDK's added and completed tool events."""
+    from agents.models.chatcmpl_stream_handler import ChatCmplStreamHandler
+    from openai.types.chat import ChatCompletionChunk
+    from openai.types.responses import Response
+
+    async def _source():
+        for arguments in ('{"path":"', 'alpha"}'):
+            yield ChatCompletionChunk.model_validate(
+                {
+                    "id": "c1",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "gemini-3.8-flash",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": "sys_os_read",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "sys_os_read",
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                    for index in (0, 1)
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+
+    async def _events():
+        stream = _ReasoningBlockFilterStream(_source(), databricks_gateway=True)
+        return [
+            event
+            async for event in ChatCmplStreamHandler.handle_stream(
+                Response.model_construct(id="response", output=[]),
+                stream,
+                model="gemini-3.8-flash",
+            )
+        ]
+
+    previous_ids: set[str] = set()
+    for _ in range(2):
+        events = _run(_events())
+        started = [
+            event.item.call_id for event in events if event.type == "response.output_item.added"
+        ]
+        done = [
+            event.item.call_id for event in events if event.type == "response.output_item.done"
+        ]
+        assert started == done
+        assert len(set(done)) == 2
+        assert not previous_ids.intersection(done)
+        previous_ids.update(done)
+
+
+def test_gateway_stream_replaces_name_ids_that_precede_the_name() -> None:
+    """A name-shaped id streamed before its function name is still made unique."""
+    from agents.models.chatcmpl_stream_handler import ChatCmplStreamHandler
+    from openai.types.chat import ChatCompletionChunk
+    from openai.types.responses import Response
+
+    def _chunk(tool_calls: list[dict[str, Any]]) -> ChatCompletionChunk:
+        return ChatCompletionChunk.model_validate(
+            {
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gemini-3.8-flash",
+                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}}],
+            }
+        )
+
+    async def _source():
+        # Index 0/1 repeat the tool name as their id; index 2 has a real id.
+        yield _chunk(
+            [
+                {
+                    "index": 0,
+                    "id": "sys_os_read",
+                    "type": "function",
+                    "function": {"arguments": ""},
+                },
+                {
+                    "index": 1,
+                    "id": "sys_os_read",
+                    "type": "function",
+                    "function": {"arguments": ""},
+                },
+                {"index": 2, "id": "call_real", "type": "function", "function": {"arguments": ""}},
+            ]
+        )
+        yield _chunk(
+            [
+                {"index": index, "function": {"name": "sys_os_read", "arguments": "{}"}}
+                for index in (0, 1, 2)
+            ]
+        )
+
+    async def _events():
+        stream = _ReasoningBlockFilterStream(_source(), databricks_gateway=True)
+        return [
+            event
+            async for event in ChatCmplStreamHandler.handle_stream(
+                Response.model_construct(id="response", output=[]),
+                stream,
+                model="gemini-3.8-flash",
+            )
+        ]
+
+    previous_ids: set[str] = set()
+    for _ in range(2):
+        events = _run(_events())
+        started = [
+            event.item.call_id for event in events if event.type == "response.output_item.added"
+        ]
+        done = [
+            event.item.call_id for event in events if event.type == "response.output_item.done"
+        ]
+        assert started == done
+        assert len(done) == 3
+        assert done[2] == "call_real"
+        assert "sys_os_read" not in done
+        assert len(set(done)) == 3
+        assert not previous_ids.intersection(done[:2])
+        previous_ids.update(done[:2])
