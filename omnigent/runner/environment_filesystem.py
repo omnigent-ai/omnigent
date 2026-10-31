@@ -283,7 +283,8 @@ def compare_file_beneath(
     Like :func:`_lstat_beneath`, no component is followed if it is a symlink.
     Only a regular file is opened, without blocking, so a FIFO or device at
     the path cannot stall the caller, and only a file of the expected size
-    is read.
+    is read. Platforms without ``dir_fd`` support never read the file, since a
+    parent swapped for a symlink after the check could redirect the open.
 
     :param root: Absolute directory the path is relative to.
     :param rel: ``/``-separated path relative to *root*, e.g. ``"src/foo.py"``.
@@ -298,20 +299,15 @@ def compare_file_beneath(
         full = root / rel
         if not _parent_resolves_beneath(root, full):
             raise OSError(errno.ELOOP, "Path leaves the workspace", rel)
-        leaf_stat = full.lstat()
+        return full.lstat(), False
+    dir_fd, leaf = _open_parent_beneath(root, rel)
+    try:
+        leaf_stat = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
         if expected is None or not stat.S_ISREG(leaf_stat.st_mode):
             return leaf_stat, False
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        file_fd = os.open(full, flags | getattr(os, "O_NONBLOCK", 0))
-    else:
-        dir_fd, leaf = _open_parent_beneath(root, rel)
-        try:
-            leaf_stat = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
-            if expected is None or not stat.S_ISREG(leaf_stat.st_mode):
-                return leaf_stat, False
-            file_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-        finally:
-            os.close(dir_fd)
+        file_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
     with os.fdopen(file_fd, "rb") as handle:
         file_stat = os.fstat(handle.fileno())
         if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size != len(expected):

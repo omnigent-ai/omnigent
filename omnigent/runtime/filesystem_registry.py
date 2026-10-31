@@ -716,10 +716,13 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # so the diff endpoint can return the true pre-modification state.
         self._snapshots: dict[str, str] = {}
         self._snapshots_lock = threading.Lock()
-        # Per-session snapshots: session_id → {normalized path → content that
-        # session saw first}.  Disk reconciliation compares against these, and
-        # ``unregister_conversation`` evicts the paths a session registered.
-        self._session_snapshots: dict[str, dict[str, str]] = {}
+        # Per-session snapshot ownership: session_id → set of normalized paths
+        # registered by that session.  Used by ``unregister_conversation`` to
+        # evict snapshot entries when a session ends, preventing unbounded growth.
+        self._snapshot_sessions: dict[str, set[str]] = {}
+        # Per-session originals for disk reconciliation: session_id → {normalized
+        # path → content before its first change, or ``None`` if not snapshotted}.
+        self._session_snapshots: dict[str, dict[str, str | None]] = {}
 
     def record_change(
         self,
@@ -766,6 +769,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             bytes=bytes_,
             modified_at=modified_at,
         )
+        with self._snapshots_lock:
+            self._session_snapshots.setdefault(session_id, {}).setdefault(norm, None)
         with self._lock:
             self._session_events.setdefault(session_id, []).append(fe)
 
@@ -778,7 +783,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._lock:
             self._session_events.pop(conversation_id, None)
         with self._snapshots_lock:
-            paths = self._session_snapshots.pop(conversation_id, {})
+            self._session_snapshots.pop(conversation_id, None)
+            paths = self._snapshot_sessions.pop(conversation_id, set())
             for p in paths:
                 self._snapshots.pop(p, None)
 
@@ -930,7 +936,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 
         Must be called **before** writing new content to the file so the
         snapshot captures the original (pre-modification) state.  If a
-        snapshot for *path* already exists this is a no-op.
+        snapshot for *path* already exists this is a no-op.  *session_id*
+        compares the disk only with a snapshot taken before its first change.
 
         :param path: Normalized path relative to the workspace root,
             e.g. ``"src/foo.py"``.
@@ -946,6 +953,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             if norm not in self._snapshots:
                 self._snapshots[norm] = content
             if session_id:
+                self._snapshot_sessions.setdefault(session_id, set()).add(norm)
                 self._session_snapshots.setdefault(session_id, {}).setdefault(norm, content)
 
 

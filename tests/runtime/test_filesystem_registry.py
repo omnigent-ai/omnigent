@@ -404,6 +404,53 @@ def test_disk_check_can_be_skipped_when_the_runner_cannot_see_the_edits(
     assert registry.list_changed_files(conv_id, limit=10) == []
 
 
+def test_a_snapshot_taken_after_the_first_change_never_becomes_the_original(
+    registry: AgentEditFilesystemRegistry,
+) -> None:
+    """Once a session changes a file with no snapshot, its original stays unknown."""
+    conv_id = "conv_late_snapshot"
+    (registry.cwd / "notes.md").write_text("original\n")
+    _inject(registry, "notes.md", "modified", conv_id)
+
+    registry.seed_snapshot("notes.md", "written by a tool call\n", session_id=conv_id)
+    _inject(registry, "notes.md", "modified", conv_id)
+
+    listed = registry.list_changed_files(conv_id, limit=10)
+    assert [(r["path"], r["status"]) for r in listed] == [("notes.md", "modified")]
+    # The diff view still shows the first snapshot any call took.
+    assert registry.get_baseline("notes.md") == "written by a tool call\n"
+
+
+def test_changes_never_compare_content_through_a_parent_swapped_after_the_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without dir-fd support the check and the open cannot be made atomic."""
+    monkeypatch.setattr(environment_filesystem, "_BENEATH_SUPPORTED", False)
+    workspace, outside = tmp_path / "workspace", tmp_path / "outside"
+    (workspace / "docs").mkdir(parents=True)
+    outside.mkdir()
+    (outside / "notes.md").write_text("secret\n")
+    registry = AgentEditFilesystemRegistry(watch_path=workspace)
+    conv_id = "conv_parent_swap"
+    registry.seed_snapshot("docs/notes.md", "secret\n", session_id=conv_id)
+    _inject(registry, "docs/notes.md", "modified", conv_id)
+    parent_resolves_beneath = environment_filesystem._parent_resolves_beneath
+
+    def check_then_swap_parent(root: Path, full: Path) -> bool:
+        resolved = parent_resolves_beneath(root, full)
+        if not (workspace / "docs").is_symlink():
+            shutil.rmtree(workspace / "docs")
+            (workspace / "docs").symlink_to(outside, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(environment_filesystem, "_parent_resolves_beneath", check_then_swap_parent)
+
+    listed = registry.list_changed_files(conv_id, limit=10)
+
+    assert [(r["path"], r["status"]) for r in listed] == [("docs/notes.md", "modified")]
+
+
 @pytest.mark.parametrize("beneath_supported", [True, False], ids=["dir-fd", "path-fallback"])
 @pytest.mark.parametrize(
     ("path", "swapped"),

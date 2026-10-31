@@ -1781,7 +1781,7 @@ def register_resource_routes(
         content_bytes = content_str.encode(encoding)
         try:
             existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
+            if existing.encoding and not existing.truncated and filesystem_registry is not None:
                 filesystem_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
@@ -1831,7 +1831,7 @@ def register_resource_routes(
         fs = CallerProcessFilesystem(env)
         try:
             existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
+            if existing.encoding and not existing.truncated and filesystem_registry is not None:
                 filesystem_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),

@@ -7507,10 +7507,10 @@ async def _seed_os_env_snapshot(
 
     Reads the file via *os_env* and passes the content to
     :meth:`~omnigent.runtime.filesystem_registry.FilesystemRegistry.seed_snapshot`
-    so the before/after diff endpoint can show the original content.
-    Silently skips when the file does not yet exist (new-file creates have no
-    baseline), when it is binary (its content is not returned as text), or
-    when any other read error occurs.
+    so the before/after diff endpoint can show the original content. The
+    byte-capped read keeps line endings as they are on disk. Silently skips
+    when the file does not yet exist (new-file creates have no baseline), when
+    it is binary or too large to read whole, or when any other read error occurs.
 
     :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
         the current tool dispatch — reused to avoid opening a second connection.
@@ -7518,9 +7518,15 @@ async def _seed_os_env_snapshot(
     :param filesystem_registry: Registry that stores the snapshot.
     :param conversation_id: Session scope for the snapshot, e.g. ``"conv_abc123"``.
     """
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
     try:
-        existing = await os_env.read(path=path, offset=1, limit=None)
-        if isinstance(existing, dict) and existing.get("encoding") == "utf-8":
+        existing = await os_env.read(path=path, offset=1, limit=None, max_bytes=_MAX_READ_BYTES)
+        if (
+            isinstance(existing, dict)
+            and existing.get("encoding") == "utf-8"
+            and not existing.get("truncated")
+        ):
             filesystem_registry.seed_snapshot(
                 path, existing["content"], session_id=conversation_id
             )

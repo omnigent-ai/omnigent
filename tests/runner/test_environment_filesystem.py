@@ -1756,6 +1756,26 @@ async def test_changes_drop_a_file_saved_back_to_its_original_content(
 
 
 @pytest.mark.asyncio
+async def test_changes_keep_a_file_saved_as_the_readable_prefix_of_its_original(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capped read is not the whole original, so saving it is still a change."""
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 8)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    (workspace / "big.txt").write_text("AAAAAAAATAIL")
+
+    saved = await client.put(
+        f"{base}/filesystem/big.txt", json={"content": "AAAAAAAA", "encoding": "utf-8"}
+    )
+    assert saved.status_code == 200, saved.text
+
+    listed = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(e["path"], e["status"]) for e in listed] == [("big.txt", "modified")]
+
+
+@pytest.mark.asyncio
 async def test_changes_report_an_edited_file_deleted_outside_the_session(
     client: httpx.AsyncClient,
     workspace: Path,
