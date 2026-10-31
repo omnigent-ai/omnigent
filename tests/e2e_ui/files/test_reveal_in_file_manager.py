@@ -1,8 +1,8 @@
-"""E2E: right-click a local file or folder to show it in the OS file manager.
+"""E2E: right-click a local file or folder in the shared row actions menu.
 
 The action is desktop-only and local-only: it appears when the SPA runs in the
 desktop shell (an injected ``omnigentDesktop`` bridge) and the session's host is
-this machine. A plain browser tab keeps the browser's own context menu.
+this machine. A plain browser tab has the shared menu without Finder actions.
 """
 
 from __future__ import annotations
@@ -110,11 +110,18 @@ def test_reveal_local_file_and_folder(page: Page, workspace: tuple[str, str, str
     ]
 
 
-def test_browser_tab_keeps_native_menu(page: Page, workspace: tuple[str, str, str]) -> None:
+def test_browser_tab_opens_shared_menu_without_finder_action(
+    page: Page, workspace: tuple[str, str, str]
+) -> None:
     base_url, session_id, _root = workspace
     rail = _files_rail(page, base_url, session_id)
 
     row = rail.get_by_text(_FILE, exact=True)
     expect(row).to_be_visible(timeout=30_000)
     row.click(button="right")
-    expect(page.get_by_role("menuitem")).to_have_count(0)
+    menu = page.get_by_role("menu")
+    expect(menu).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="Download", exact=True)).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="Copy relative path", exact=True)).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="File info", exact=True)).to_be_visible()
+    expect(menu.get_by_role("menuitem", name=re.compile(r"^(Show in|Open in) "))).to_have_count(0)
