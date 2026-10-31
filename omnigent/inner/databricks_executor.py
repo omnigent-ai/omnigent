@@ -1182,10 +1182,13 @@ def _get_openai_client(profile: str | None = None) -> OpenAI:
 
     # Direct OpenAI-compatible config takes precedence
     if os.environ.get("OPENAI_BASE_URL"):
+        from omnigent.databricks_ai_gateway import gateway_request_tag_headers
+
         from .open_responses_sdk import _OPENAI_KEY_PLACEHOLDER
 
         return OpenAI(
             base_url=os.environ["OPENAI_BASE_URL"],
+            default_headers=gateway_request_tag_headers(os.environ["OPENAI_BASE_URL"]),
             # See _OPENAI_KEY_PLACEHOLDER docstring in open_responses_sdk.
             api_key=os.environ.get("OPENAI_API_KEY", _OPENAI_KEY_PLACEHOLDER),
         )

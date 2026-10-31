@@ -79,6 +79,77 @@ async def test_close_with_no_process_is_a_noop() -> None:
     await executor.close()  # must not raise
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
+async def test_ci_provider_settings_reach_qwen_spawn(
+    tmp_path, monkeypatch, caplog, context
+) -> None:
+    """The supported settings file carries headers through the actual ACP env boundary."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+    from omnigent.harnesses.qwen_native.credentials import with_qwen_ci_request_tags
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if context is not None:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+    gateway = "https://test.cloud.databricks.com/ai-gateway/mlflow/v1"
+    original = {
+        "theme": "Default",
+        "modelProviders": {
+            "openai": [
+                {
+                    "id": "test-model",
+                    "baseUrl": gateway,
+                    "envKey": "OPENAI_API_KEY",
+                    "generationConfig": {
+                        "temperature": 0.2,
+                        "customHeaders": {
+                            "X-Existing": "kept",
+                            REQUEST_TAGS_HEADER: '{"team":"ci"}',
+                        },
+                    },
+                },
+                {"id": "external", "baseUrl": "https://example.com/v1"},
+                {"id": "legacy", "baseUrl": "https://test.cloud.databricks.com/serving-endpoints"},
+                {"id": "unused", "baseUrl": "https://[invalid"},
+            ],
+        },
+    }
+    path = tmp_path / "ci-settings.json"
+    path.write_text(json.dumps(with_qwen_ci_request_tags(original)))
+    monkeypatch.setenv("QWEN_CODE_SYSTEM_SETTINGS_PATH", str(path))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", gateway)
+    executor = QwenExecutor(model="test-model")
+    env = await executor._build_spawn_env()
+    configured = json.loads(Path(env["QWEN_CODE_SYSTEM_SETTINGS_PATH"]).read_text())
+    assert env["OPENAI_API_KEY"] == "test-key"
+    assert env["OPENAI_BASE_URL"] == gateway
+    models = configured["modelProviders"]["openai"]
+    assert configured["theme"] == original["theme"]
+    assert models[1:] == original["modelProviders"]["openai"][1:]
+    assert models[0]["envKey"] == "OPENAI_API_KEY"
+    assert models[0]["generationConfig"]["temperature"] == 0.2
+    headers = models[0]["generationConfig"]["customHeaders"]
+    assert headers["X-Existing"] == "kept"
+    expected = {"team": "ci"}
+    if context and context != "invalid":
+        expected.update(json.loads(context))
+    assert json.loads(headers[REQUEST_TAGS_HEADER]) == expected
+    assert ("malformed provider URL" in caplog.text) == (context not in (None, "invalid"))
+    assert (
+        original["modelProviders"]["openai"][0]["generationConfig"]["customHeaders"][
+            REQUEST_TAGS_HEADER
+        ]
+        == '{"team":"ci"}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # close() with a live process
 # ---------------------------------------------------------------------------

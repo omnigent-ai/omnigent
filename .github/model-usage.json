@@ -1,0 +1,143 @@
+{
+  "description": "Every workflow must be classified here. Real model workflows use explicit pipeline tags on gateway requests. Mock test lanes retain their own labels but make no paid calls. Review transport and callers when adding or changing a model consumer.",
+  "model_workflows": {
+    "auto-assign-reviewer.yml": {
+      "pipeline": "auto-assign-reviewer",
+      "transport": "urllib chat_request -> mlflow/v1/chat/completions"
+    },
+    "doc-sync.yml": {
+      "pipeline": "doc-sync",
+      "transport": "Claude classifier and drafter -> anthropic/v1/messages"
+    },
+    "draft-release-notes.yml": {
+      "pipeline": "draft-release-notes",
+      "transport": "run-omnigent-agent -> anthropic/v1/messages"
+    },
+    "feature-blog.yml": {
+      "pipeline": "feature-blog",
+      "transport": "run-omnigent-agent selector and native drafter -> anthropic/v1/messages; urllib image chat -> mlflow/v1/chat/completions"
+    },
+    "flake-stress-e2e.yml": {
+      "pipeline": "flake-stress-e2e",
+      "transport": "Live test fixtures; native Claude/Codex, OpenAI Agents SDK, DatabricksExecutor and policy adapters -> protocol-specific gateway"
+    },
+    "issue-prioritization-v2.yml": {
+      "pipeline": "${{ inputs.pipeline }}",
+      "transport": "Authenticated Databricks SDK API client -> mlflow/v1/chat/completions; required caller input keeps issue-triage and needs-info-response separate"
+    },
+    "issue-triage.yml": {
+      "pipeline": "issue-triage",
+      "transport": "Legacy native Claude -> anthropic/v1/messages; reusable triage_v2 -> mlflow/v1/chat/completions"
+    },
+    "needs-info-response.yml": {
+      "pipeline": "needs-info-response",
+      "transport": "Reusable triage_v2 -> mlflow/v1/chat/completions"
+    },
+    "open-code-review.yml": {
+      "pipeline": "open-code-review",
+      "transport": "OCR extra-headers -> anthropic/v1/messages"
+    },
+    "polly-review.yml": {
+      "pipeline": "polly-review",
+      "transport": "Native coordinator and workers -> anthropic/v1/messages and codex/v1/responses; usage-attribution-probe job exercises all three protocols"
+    },
+    "publish-changelog.yml": {
+      "pipeline": "publish-changelog",
+      "transport": "run-omnigent-agent -> anthropic/v1/messages"
+    },
+    "security-triage.yml": {
+      "pipeline": "security-triage",
+      "transport": "Native Claude -> anthropic/v1/messages"
+    },
+    "vscode-release-pr.yml": {
+      "pipeline": "vscode-release-pr",
+      "transport": "urllib chat_request -> mlflow/v1/chat/completions"
+    }
+  },
+  "mock_workflows": {
+    "e2e.yml": "e2e",
+    "e2e-ui.yml": "e2e-ui",
+    "integration.yml": "integration",
+    "server-compat.yml": "server-compat",
+    "flake-stress-ui.yml": "flake-stress-ui"
+  },
+  "non_model_workflows": [
+    "android-bundle.yml",
+    "auto-assign-reviewer-test.yml",
+    "autoformat-pr.yml",
+    "benchmark-host.yml",
+    "benchmark-pr.yml",
+    "benchmark-release.yml",
+    "benchmark-ui.yml",
+    "benchmark.yml",
+    "bump-version.yml",
+    "ci.yml",
+    "close-superseded-pr.yml",
+    "code-coverage.yml",
+    "demo-check-test.yml",
+    "demo-check.yml",
+    "dependabot-automerge.yml",
+    "discord-watch-rotation-maintain.yml",
+    "discord-watch-rotation.yml",
+    "docker-build.yml",
+    "duplicate-prs-test.yml",
+    "duplicate-prs.yml",
+    "finalize-release.yml",
+    "flake-stress.yml",
+    "github-release.yml",
+    "homebrew-tap-pr.yml",
+    "kustomize-validate.yml",
+    "lint.yml",
+    "maintainer-approval-rerun-run.yml",
+    "maintainer-approval-rerun.yml",
+    "maintainer-approval.yml",
+    "merge-ready-sweep.yml",
+    "merge-ready.yml",
+    "needs-info-expiry.yml",
+    "nightly-failure-monitor.yml",
+    "nightly-release.yml",
+    "oss-publish-images.yml",
+    "oss-regen-on-comment.yml",
+    "oss-regenerate-and-smoke.yml",
+    "oss-scorecard.yml",
+    "polly-review-approval-dispatch.yml",
+    "polly-review-on-approval.yml",
+    "pr-hygiene-live.yml",
+    "pr-issue-link-test.yml",
+    "pr-size.yml",
+    "ready-for-review-test.yml",
+    "release-omnigent.yml",
+    "release.yml",
+    "reopen-notice-test.yml",
+    "reopen-notice.yml",
+    "reopen-pr-test.yml",
+    "reopen-pr.yml",
+    "rerun-ci.yml",
+    "rerun-security-gate-run.yml",
+    "rerun-security-gate.yml",
+    "review-sla-test.yml",
+    "review-sla.yml",
+    "security-gate.yml",
+    "security-scan.yml",
+    "setup-harness-cli-pin-test.yml",
+    "setup-harness-cli-test.yml",
+    "setup-uv-test.yml",
+    "stale.yml",
+    "sync-openapi-to-site.yml",
+    "sync-pr-priority-test.yml",
+    "sync-pr-priority.yml",
+    "trivy.yml",
+    "ui-preview.yml",
+    "ui-snapshot-fail-comment.yml",
+    "ui-snapshot-update.yml",
+    "ui-snapshot.yml",
+    "vscode-extension-release.yml",
+    "waiting-on-author-review-run.yml",
+    "waiting-on-author-review.yml",
+    "waiting-on-author-test.yml",
+    "waiting-on-author.yml",
+    "web-tests.yml",
+    "windows.yml"
+  ],
+  "exclusions": "Remaining workflows build, test with mocks, deploy, publish, or manage GitHub state without model credentials. Dispatch-only wrappers (including Polly approval dispatch) are accounted to the workflow they start. Databricks bundle jobs and deployed applications are outside GitHub workflow execution."
+}

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
 from omnigent.llms.adapters.openai import (
     OpenAIAdapter,
     OpenAICompatibleAdapter,
@@ -122,6 +123,172 @@ def test_headers_with_api_key() -> None:
     )
     headers = adapter._build_headers(api_key_override="sk-test-123")
     assert headers["Authorization"] == "Bearer sk-test-123"
+
+
+def _capture_requests(monkeypatch, response_body: bytes) -> list[httpx.Request]:
+    requests = []
+    real_client = httpx.AsyncClient
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, content=response_body)
+
+    def client(**kwargs):
+        return real_client(transport=httpx.MockTransport(respond), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    return requests
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "scenario", ["gateway", "gateway-override", "external-override", "disabled", "malformed"]
+)
+def test_chat_request_adds_only_opted_in_gateway_metadata(monkeypatch, stream, scenario):
+    gateway = "https://dbc-test.cloud.databricks.com/ai-gateway/mlflow/v1"
+    external = "https://provider.example/v1"
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    adapter = OpenAICompatibleAdapter(
+        base_url=external if scenario == "gateway-override" else gateway
+    )
+    connection = {
+        "api_key": "test-api-key",
+        "extra_headers": {
+            "Authorization": "Bearer caller-override",
+            "X-Caller": "policy",
+        },
+    }
+    if scenario == "gateway-override":
+        connection["base_url"] = gateway + "/"
+    elif scenario == "external-override":
+        connection["base_url"] = external + "/"
+    response = {"id": "reply", "choices": []}
+    encoded = json.dumps(response).encode()
+    body = b"data: " + encoded + b"\n\ndata: [DONE]\n\n" if stream else encoded
+    requests = _capture_requests(monkeypatch, body)
+
+    async def send():
+        result = await adapter.chat_completions(
+            messages=[{"role": "user", "content": "Classify this request"}],
+            model="test-policy-model",
+            tools=None,
+            stream=stream,
+            extra={"max_tokens": 17},
+            connection_params=connection,
+            timeout=9,
+        )
+        if stream:
+            assert [chunk async for chunk in result] == [response]
+        else:
+            assert result == response
+
+    asyncio.run(send())
+    tags = {"pipeline": "flake-stress-e2e", "run_id": "123"}
+    if scenario == "malformed":
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", "not-json")
+    elif scenario != "disabled":
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", json.dumps(tags))
+    asyncio.run(send())
+
+    assert len(requests) == 2
+    baseline, attributed = requests
+    target = external if scenario == "external-override" else gateway
+    assert str(attributed.url) == target + "/chat/completions"
+    assert attributed.method == baseline.method == "POST"
+    assert attributed.content == baseline.content
+    assert attributed.extensions == baseline.extensions
+    headers = dict(attributed.headers)
+    actual_tags = headers.pop(REQUEST_TAGS_HEADER.lower(), None)
+    assert headers == dict(baseline.headers)
+    assert headers["authorization"] == "Bearer caller-override"
+    assert headers["x-caller"] == "policy"
+    assert headers["content-type"] == "application/json"
+    assert "user-agent" in headers
+    if scenario in {"gateway", "gateway-override"}:
+        assert json.loads(actual_tags) == tags
+    else:
+        assert actual_tags is None
+
+
+@pytest.mark.parametrize("existing_tags", ['{"team":"platform"}', "not-json", "[]"])
+def test_chat_request_preserves_existing_tag_headers(monkeypatch, existing_tags):
+    monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"flake-stress-e2e"}')
+    extra_headers = {REQUEST_TAGS_HEADER.lower(): existing_tags, "X-Caller": "policy"}
+    requests = _capture_requests(monkeypatch, b'{"choices":[]}')
+    adapter = OpenAICompatibleAdapter(
+        base_url="https://dbc-test.cloud.databricks.com/ai-gateway/mlflow/v1"
+    )
+    asyncio.run(
+        adapter.chat_completions(
+            messages=[],
+            model="test-policy-model",
+            tools=None,
+            stream=False,
+            extra={},
+            connection_params={"api_key": "test-api-key", "extra_headers": extra_headers},
+        )
+    )
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.headers["Authorization"] == "Bearer test-api-key"
+    assert request.headers["X-Caller"] == "policy"
+    values = request.headers.get_list(REQUEST_TAGS_HEADER)
+    assert len(values) == 1
+    if existing_tags.startswith("{"):
+        assert json.loads(values[0]) == {"team": "platform", "pipeline": "flake-stress-e2e"}
+    else:
+        assert values == [existing_tags]
+    assert extra_headers == {REQUEST_TAGS_HEADER.lower(): existing_tags, "X-Caller": "policy"}
+
+
+def test_ci_policy_model_uses_tagged_databricks_chat_transport(monkeypatch):
+    from omnigent.runtime.policies.builder import _build_policy_llm_client
+    from omnigent.spec.types import LLMConfig
+
+    monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"flake-stress-e2e","run_id":"123"}')
+    model = "databricks-policy-test-model"
+    response = {
+        "id": "reply",
+        "model": model,
+        "choices": [
+            {"message": {"role": "assistant", "content": "ALLOW"}, "finish_reason": "stop"}
+        ],
+    }
+    requests = _capture_requests(monkeypatch, json.dumps(response).encode())
+    client = _build_policy_llm_client(
+        LLMConfig(model=model, request_timeout=11),
+        {
+            "base_url": "https://dbc-test.cloud.databricks.com/ai-gateway/mlflow/v1",
+            "api_key": "test-api-key",
+        },
+    )
+    assert client is not None
+    result = asyncio.run(
+        client.create(
+            input=[{"role": "user", "content": "Classify this request"}],
+            instructions="Return ALLOW or DENY",
+            max_tokens=17,
+        )
+    )
+    assert result.output[0].content[0].text == "ALLOW"
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.url.path == "/ai-gateway/mlflow/v1/chat/completions"
+    assert json.loads(request.headers[REQUEST_TAGS_HEADER]) == {
+        "pipeline": "flake-stress-e2e",
+        "run_id": "123",
+    }
+    assert request.headers["Authorization"] == "Bearer test-api-key"
+    assert request.extensions["timeout"] == {"connect": 11, "read": 11, "write": 11, "pool": 11}
+    assert json.loads(request.content) == {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Return ALLOW or DENY"},
+            {"role": "user", "content": "Classify this request"},
+        ],
+        "max_tokens": 17,
+    }
 
 
 # ── SSE parsing ──────────────────────────────────────────
