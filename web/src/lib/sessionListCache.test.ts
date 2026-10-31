@@ -11,9 +11,11 @@ import {
   mergeItemsIntoPages,
   nullsToUndefined,
   overlayArchivedIntoCaches,
+  overlayLabelsIntoCaches,
   overlayTitleIntoCaches,
   removeIdsFromPages,
 } from "./sessionListCache";
+import type { Session } from "@/lib/types";
 
 function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
   return {
@@ -529,6 +531,26 @@ describe("overlayArchivedIntoCaches", () => {
       false,
     ])!;
     expect(folder.pages[0].data.map((c) => c.id)).toEqual([]);
+  });
+});
+
+describe("overlayLabelsIntoCaches", () => {
+  it("replaces the row's labels in the lists, the folder, and the session snapshot", () => {
+    const qc = new QueryClient();
+    const before = { team: "ml", "omnigent.wrapper": "claude" };
+    const after = { env: "prod", "omnigent.wrapper": "claude" };
+    qc.setQueryData(["conversations", "", false], data([conv("a", { labels: before })]));
+    const folderKey = ["project-sessions", "proj", "updated_at", false];
+    qc.setQueryData(folderKey, data([conv("a", { labels: before })]));
+    qc.setQueryData(["session", "a"], { id: "a", labels: before } as unknown as Session);
+
+    overlayLabelsIntoCaches(qc, "a", after);
+
+    const list = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!;
+    expect(list.pages[0].data[0].labels).toEqual(after);
+    const folder = qc.getQueryData<ConversationsInfiniteData>(folderKey)!;
+    expect(folder.pages[0].data[0].labels).toEqual(after);
+    expect(qc.getQueryData<Session>(["session", "a"])!.labels).toEqual(after);
   });
 });
 

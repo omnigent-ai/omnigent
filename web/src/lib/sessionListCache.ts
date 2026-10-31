@@ -487,6 +487,38 @@ export function filtersFromProjectQueryKey(key: readonly unknown[]): Conversatio
 }
 
 /**
+ * Merge a partial wire row into the flat `["conversations"]` lists and the
+ * per-project `["project-sessions"]` lists that hold it.
+ */
+function mergeWireIntoListCaches(queryClient: QueryClient, wire: SessionListWireItem): void {
+  const itemsById = new Map([[wire.id, wire]]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    // activeId only gates `needsRefetch`, which the overlay callers ignore —
+    // they patch in place rather than refetching.
+    const { data: next } = mergeItemsIntoPages(
+      data,
+      itemsById,
+      filtersFromConversationQueryKey(key),
+      undefined,
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["project-sessions"],
+  })) {
+    const { data: next } = mergeItemsIntoPages(
+      data,
+      itemsById,
+      filtersFromProjectQueryKey(key),
+      undefined,
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
  * Overlay a title into every cache that holds a row for one session.
  *
  * Only the fields a rename changes are written — a full session snapshot
@@ -518,31 +550,7 @@ export function overlayTitleIntoCaches(
     title,
     ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
   };
-  const itemsById = new Map([[id, wire]]);
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["conversations"],
-  })) {
-    // activeId only gates `needsRefetch`, which both callers ignore —
-    // they patch in place rather than refetching.
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromConversationQueryKey(key),
-      undefined,
-    );
-    if (next !== data) queryClient.setQueryData(key, next);
-  }
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["project-sessions"],
-  })) {
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromProjectQueryKey(key),
-      undefined,
-    );
-    if (next !== data) queryClient.setQueryData(key, next);
-  }
+  mergeWireIntoListCaches(queryClient, wire);
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
     old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
   );
@@ -573,30 +581,29 @@ export function overlayArchivedIntoCaches(
   id: string,
   archived: boolean,
 ): void {
-  const itemsById = new Map<string, SessionListWireItem>([[id, { id, archived }]]);
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["conversations"],
-  })) {
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromConversationQueryKey(key),
-      undefined,
-    );
-    if (next !== data) queryClient.setQueryData(key, next);
-  }
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["project-sessions"],
-  })) {
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromProjectQueryKey(key),
-      undefined,
-    );
-    if (next !== data) queryClient.setQueryData(key, next);
-  }
+  mergeWireIntoListCaches(queryClient, { id, archived });
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
     old ? { ...old, archived } : old,
   );
+}
+
+/**
+ * Overlay a session's server-confirmed label map onto every cache that holds
+ * its row, after a label edit in the session info popover. Mirrors
+ * {@link overlayTitleIntoCaches}.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - Conversation id whose labels changed.
+ * @param labels - The full label map from the PATCH response.
+ */
+export function overlayLabelsIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  labels: Record<string, string>,
+): void {
+  mergeWireIntoListCaches(queryClient, { id, labels });
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, labels } : old,
+  );
+  queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
 }
