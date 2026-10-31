@@ -139,6 +139,7 @@ class HarnessZygoteClient:
         )
         self._sock.setblocking(True)
         self._lock = asyncio.Lock()
+        self._abandoned_forks: set[asyncio.Task[None]] = set()
 
     @classmethod
     def from_env(cls) -> HarnessZygoteClient | None:
@@ -167,6 +168,21 @@ class HarnessZygoteClient:
         :returns: A shim handle for the forked harness.
         :raises ZygoteHarnessUnavailable: If the zygote is down or errored.
         """
+        # Cancelling to_thread cannot stop its socket read. Retain the exchange
+        # and its lock until the reply arrives, then reap any abandoned child.
+        fork = asyncio.create_task(self._fork_harness(argv, env), name="harness-zygote-fork")
+        try:
+            return await asyncio.shield(fork)
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(
+                self._reap_abandoned_fork(fork), name="harness-zygote-reap-abandoned-fork"
+            )
+            self._abandoned_forks.add(cleanup)
+            cleanup.add_done_callback(self._abandoned_forks.discard)
+            raise
+
+    async def _fork_harness(self, argv: list[str], env: dict[str, str]) -> ZygoteHarnessProc:
+        """Complete one fork exchange with an owner for its returned process."""
         reply = await self._exchange({"cmd": "fork_harness", "argv": argv, "env": env})
         if "error" in reply:
             raise ZygoteHarnessUnavailable(f"zygote harness fork failed: {reply['error']}")
@@ -174,6 +190,21 @@ class HarnessZygoteClient:
         if not isinstance(pid, int):
             raise ZygoteHarnessUnavailable(f"zygote returned no pid: {reply!r}")
         return ZygoteHarnessProc(pid, self)
+
+    async def _reap_abandoned_fork(self, fork: asyncio.Task[ZygoteHarnessProc]) -> None:
+        """Stop a child returned after its launch was cancelled."""
+        try:
+            proc = await asyncio.shield(fork)
+        except ZygoteHarnessUnavailable:  # A rejected fork returned no process to stop.
+            return
+        try:
+            if proc.returncode is None:
+                await asyncio.to_thread(_proc.kill_tree, proc)
+            await proc.wait()
+        except Exception as exc:
+            logger.warning(
+                "Failed to reap cancelled harness fork pid=%s (%s)", proc.pid, type(exc).__name__
+            )
 
     async def poll(self, pid: int) -> int | None:
         """Return a forked harness's exit code, or ``None`` if still running.
