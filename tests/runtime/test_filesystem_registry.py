@@ -421,34 +421,18 @@ def test_a_snapshot_taken_after_the_first_change_never_becomes_the_original(
     assert registry.get_baseline("notes.md") == "written by a tool call\n"
 
 
-def test_changes_never_compare_content_through_a_parent_swapped_after_the_check(
-    tmp_path: Path,
+def test_changes_keep_recorded_entries_where_lookups_cannot_be_confined(
+    registry: AgentEditFilesystemRegistry,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without dir-fd support the check and the open cannot be made atomic."""
+    """Without dir-fd support a parent can be swapped between any check and lookup."""
     monkeypatch.setattr(environment_filesystem, "_BENEATH_SUPPORTED", False)
-    workspace, outside = tmp_path / "workspace", tmp_path / "outside"
-    (workspace / "docs").mkdir(parents=True)
-    outside.mkdir()
-    (outside / "notes.md").write_text("secret\n")
-    registry = AgentEditFilesystemRegistry(watch_path=workspace)
-    conv_id = "conv_parent_swap"
-    registry.seed_snapshot("docs/notes.md", "secret\n", session_id=conv_id)
+    conv_id = "conv_no_dir_fd"
     _inject(registry, "docs/notes.md", "modified", conv_id)
-    parent_resolves_beneath = environment_filesystem._parent_resolves_beneath
+    recorded = registry.list_changed_files(conv_id, limit=10, check_disk=False)
+    shutil.rmtree(registry.cwd / "docs")
 
-    def check_then_swap_parent(root: Path, full: Path) -> bool:
-        resolved = parent_resolves_beneath(root, full)
-        if not (workspace / "docs").is_symlink():
-            shutil.rmtree(workspace / "docs")
-            (workspace / "docs").symlink_to(outside, target_is_directory=True)
-        return resolved
-
-    monkeypatch.setattr(environment_filesystem, "_parent_resolves_beneath", check_then_swap_parent)
-
-    listed = registry.list_changed_files(conv_id, limit=10)
-
-    assert [(r["path"], r["status"]) for r in listed] == [("docs/notes.md", "modified")]
+    assert registry.list_changed_files(conv_id, limit=10) == recorded
 
 
 @pytest.mark.parametrize("beneath_supported", [True, False], ids=["dir-fd", "path-fallback"])
@@ -493,7 +477,7 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
 
     listed = registry.list_changed_files(conv_id, limit=10)
 
-    if swapped == "docs":
+    if swapped == "docs" or not environment_filesystem._BENEATH_SUPPORTED:
         assert listed == recorded
     else:
         link = os.lstat(swapped_path)
@@ -508,8 +492,11 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
+@pytest.mark.parametrize("swapped_at_open", [False, True], ids=["before-listing", "at-open"])
 def test_changes_report_a_fifo_without_waiting_for_a_writer(
     registry: AgentEditFilesystemRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    swapped_at_open: bool,
 ) -> None:
     """A FIFO left where an empty file was edited must not block the Changes listing."""
     conv_id = "conv_fifo"
@@ -517,8 +504,22 @@ def test_changes_report_a_fifo_without_waiting_for_a_writer(
     target.write_text("")
     registry.seed_snapshot("empty.txt", "", session_id=conv_id)
     _inject(registry, "empty.txt", "modified", conv_id)
-    target.unlink()
-    os.mkfifo(target)
+
+    def replace_with_fifo() -> None:
+        target.unlink()
+        os.mkfifo(target)
+
+    if swapped_at_open:
+        open_path = os.open
+
+        def swap_then_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            if path == "empty.txt" and target.is_file():
+                replace_with_fifo()
+            return open_path(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", swap_then_open)
+    else:
+        replace_with_fifo()
     listed: list[dict[str, object]] = []
     worker = threading.Thread(
         target=lambda: listed.extend(registry.list_changed_files(conv_id, limit=10)), daemon=True

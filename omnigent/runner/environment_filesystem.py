@@ -250,7 +250,9 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
     """
     if not _BENEATH_SUPPORTED:
         full = root / rel
-        if not _parent_resolves_beneath(root, full):
+        real_root = os.path.realpath(root)
+        parent = os.path.realpath(full.parent)
+        if parent != real_root and not parent.startswith(real_root.rstrip(os.sep) + os.sep):
             return None
         try:
             return full.lstat()
@@ -268,13 +270,6 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
         os.close(fd)
 
 
-def _parent_resolves_beneath(root: Path, full: Path) -> bool:
-    """Return whether *full*'s parent resolves to *root* or a directory inside it."""
-    real_root = os.path.realpath(root)
-    parent = os.path.realpath(full.parent)
-    return parent == real_root or parent.startswith(real_root.rstrip(os.sep) + os.sep)
-
-
 def compare_file_beneath(
     root: Path, rel: str, expected: bytes | None
 ) -> tuple[os.stat_result, bool]:
@@ -283,8 +278,9 @@ def compare_file_beneath(
     Like :func:`_lstat_beneath`, no component is followed if it is a symlink.
     Only a regular file is opened, without blocking, so a FIFO or device at
     the path cannot stall the caller, and only a file of the expected size
-    is read. Platforms without ``dir_fd`` support never read the file, since a
-    parent swapped for a symlink after the check could redirect the open.
+    is read. Platforms without ``dir_fd`` support raise without looking the
+    path up, since a parent swapped for a symlink after any check could
+    redirect the lookup.
 
     :param root: Absolute directory the path is relative to.
     :param rel: ``/``-separated path relative to *root*, e.g. ``"src/foo.py"``.
@@ -293,13 +289,11 @@ def compare_file_beneath(
         *expected*.
     :raises FileNotFoundError: When the path does not exist.
     :raises NotADirectoryError: When a parent component is not a directory.
-    :raises OSError: When a parent is a symlink or the path cannot be read.
+    :raises OSError: When a parent is a symlink, the path cannot be read, or
+        the platform lacks ``dir_fd`` support.
     """
     if not _BENEATH_SUPPORTED:
-        full = root / rel
-        if not _parent_resolves_beneath(root, full):
-            raise OSError(errno.ELOOP, "Path leaves the workspace", rel)
-        return full.lstat(), False
+        raise OSError(errno.ENOTSUP, "Cannot look up a path without following symlinks", rel)
     dir_fd, leaf = _open_parent_beneath(root, rel)
     try:
         leaf_stat = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)

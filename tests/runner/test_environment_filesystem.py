@@ -1861,7 +1861,8 @@ async def test_changes_keep_edits_made_in_a_forked_copy_of_the_workspace(workspa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "edits_land_in", ["copy-on-write-spec", "forked-spec", "copy-on-write-environment"]
+    "edits_land_in",
+    ["copy-on-write-spec", "forked-spec", "scratch-spec", "copy-on-write-environment"],
 )
 async def test_changes_keep_recorded_edits_the_runner_cannot_see(
     registry: SessionResourceRegistry,
@@ -1869,7 +1870,7 @@ async def test_changes_keep_recorded_edits_the_runner_cannot_see(
     monkeypatch: pytest.MonkeyPatch,
     edits_land_in: str,
 ) -> None:
-    """Overlay and forked writes leave the runner's tree unchanged, so it must not reconcile."""
+    """Overlay, forked and scratch writes miss the runner's tree, so it must not reconcile."""
     from omnigent.inner.datamodel import WritePathSpec
 
     os_env = OSEnvSpec(
@@ -1887,6 +1888,13 @@ async def test_changes_keep_recorded_edits_the_runner_cannot_see(
             cwd=str(workspace),
             fork=True,
             sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    elif edits_land_in == "scratch-spec":
+        os_env = OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            start_in_scratch=True,
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
         )
     else:
         monkeypatch.setitem(

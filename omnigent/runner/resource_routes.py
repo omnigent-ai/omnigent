@@ -1025,13 +1025,18 @@ def register_resource_routes(
     ) -> bool:
         """Whether the session's edits land in the files under *registry*'s root.
 
-        Copy-on-write sessions write into an overlay the runner cannot read, and
-        forked sessions write into a private copy of the workspace.
+        Copy-on-write sessions write into an overlay the runner cannot read,
+        forked sessions write into a private copy of the workspace, and
+        sessions started in scratch write relative paths into the scratch dir.
         """
         from omnigent.sandbox.copy_on_write import has_copy_on_write
 
         os_env_spec = getattr(spec, "os_env", None)
-        if has_copy_on_write(os_env_spec) or getattr(os_env_spec, "fork", False):
+        if (
+            has_copy_on_write(os_env_spec)
+            or getattr(os_env_spec, "fork", False)
+            or getattr(os_env_spec, "start_in_scratch", False)
+        ):
             return False
         if resource_registry.uses_copy_on_write(session_id):
             return False
