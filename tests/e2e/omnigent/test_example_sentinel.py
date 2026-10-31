@@ -111,3 +111,49 @@ def test_sentinel_findings_template_present(sentinel_spec: AgentSpec) -> None:  
     for token in tokens:
         assert token in prompt, ("prompt", token)
         assert token in skill, ("skill", token)
+
+
+def test_sentinel_scopes_self_authored_skills_outside_the_omnigent_repo() -> None:
+    """Self-authored skills must target the active Omnigent checkout or a
+    user-owned location, never an unconditional in-repo path. An unconditional
+    ``examples/sentinel/skills/<dir>/SKILL.md`` directive would write private
+    skills into a package user's Omnigent clone.
+    """
+    config = (_SENTINEL_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    compact = " ".join(config.split())
+
+    # Pins the prompt's exact wording; update these checks when the prompt changes.
+    lowered = compact.lower()
+    describes_checkout_condition = "omnigent checkout" in lowered or "git checkout root" in lowered
+    describes_user_owned_alternative = "user-owned" in lowered
+    unconditional_repo_rule = (
+        "skills directory (`examples/sentinel/skills/<dir>/SKILL.md`)" in compact
+    )
+
+    assert describes_checkout_condition and describes_user_owned_alternative, (
+        "self-authored skills must be scoped to an Omnigent checkout and offer a "
+        "user-owned location when the workspace is not a checkout"
+    )
+    assert not unconditional_repo_rule, (
+        "the unconditional examples/sentinel/skills/<dir>/SKILL.md directive must "
+        "be gone; otherwise a package user's Omnigent clone receives them"
+    )
+
+
+def test_sentinel_does_not_open_unsolicited_prs_on_the_upstream_repo() -> None:
+    """
+    Nothing gates ``gh pr create`` at the policy layer, so a prompt rule is the
+    only restraint. Fails on a prompt that never mentions omnigent-ai/omnigent
+    and so carries no rule against opening PRs/issues there unasked.
+    """
+    config = (_SENTINEL_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    compact = " ".join(config.split())
+    assert "omnigent-ai/omnigent" in compact, (
+        "no restraint on opening PRs/issues against omnigent-ai/omnigent without "
+        "an explicit user request"
+    )
+    lowered = compact.lower()
+    assert "never open a pull request or issue" in lowered and "explicitly asks" in lowered, (
+        "omnigent-ai/omnigent is named, but the prohibition on opening both PRs "
+        "and issues there without an explicit user request is missing"
+    )
