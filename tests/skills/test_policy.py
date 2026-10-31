@@ -159,6 +159,12 @@ def test_repository_key_and_configured_sources() -> None:
     )
     assert policy.is_configured("https://github.com/acme/skills.git", "v1")
     assert not policy.is_configured("https://github.com/acme/skills.git", None)
+    # "HEAD" is how a source names the default branch; the store reports it as None.
+    pinned = SkillsMarketplacePolicy.from_config(
+        {"sources": [{"url": "https://github.com/acme/skills", "ref": "HEAD"}]}
+    )
+    assert pinned.is_configured("https://github.com/acme/skills.git", None)
+    assert pinned.is_configured("https://github.com/acme/skills.git", "HEAD")
 
 
 def test_sources_keep_their_directory_and_accept_the_allowed_sources_form() -> None:
