@@ -261,7 +261,7 @@ import { nestDestinations, nestLabel } from "./nestDestinations";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { consumeProjectRename, useProjectActionStore } from "./projectCommands/projectActionStore";
 import { ProjectRowIcon } from "./ProjectPicker";
-import { ProjectAppearancePicker, ProjectAppearanceTile } from "@/components/ProjectIconPicker";
+import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -7571,7 +7571,7 @@ function ProjectFolderMenuItems({
       </C.Item>
       <C.Item data-testid="rename-project" onSelect={actions.openRename}>
         <PencilIcon className="size-3.5" />
-        Edit project
+        Rename project
       </C.Item>
       <C.Item data-testid="project-settings" onSelect={actions.openSettings}>
         <Settings2Icon className="size-3.5" />
@@ -7659,7 +7659,7 @@ export function useProjectFolderMenu(
   const [renameValue, setRenameValue] = useState(projectName);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const menuOpenedDialogRef = useRef(false);
-  // The mark staged in the edit modal, committed only on Confirm; undefined
+  // The mark staged in the rename modal, committed only on Confirm; undefined
   // while untouched (shows the saved mark). Reset each time the modal opens.
   const [pendingAppearance, setPendingAppearance] = useState<ProjectAppearance | undefined>(
     undefined,
@@ -7761,7 +7761,7 @@ export function useProjectFolderMenu(
           }}
         >
           <DialogHeader>
-            <DialogTitle>Edit project</DialogTitle>
+            <DialogTitle>Rename project</DialogTitle>
           </DialogHeader>
           {/* A <form> so Enter in the input submits natively (Radix Dialog
               doesn't wrap children in one) instead of relying on a manual
@@ -7820,10 +7820,16 @@ export function useProjectFolderMenu(
               setMenuOpen(false);
             }}
           >
-            {/* One combined control: the mark preview (left) + name (right)
-                share a single border, so it reads as a single input. */}
+            {/* One combined control: the mark tile (left) + name (right) share
+                a single border, so it reads as a single input. The tile opens
+                the color / emoji picker; the pick is committed on Confirm. */}
             <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-              <ProjectAppearanceTile appearance={displayAppearance} size="sm" />
+              <ProjectAppearanceButton
+                value={displayAppearance}
+                onChange={setPendingAppearance}
+                disabled={!configReady}
+                testId="rename-project-icon"
+              />
               <input
                 ref={renameInputRef}
                 className="w-full bg-transparent px-3 py-2 text-ui outline-none"
@@ -7831,12 +7837,6 @@ export function useProjectFolderMenu(
                 onChange={(e) => setRenameValue(e.target.value)}
               />
             </div>
-            <ProjectAppearancePicker
-              value={displayAppearance}
-              onChange={setPendingAppearance}
-              excludeProjectId={projectId}
-              disabled={!configReady}
-            />
             {iconConfigError && (
               <p className="text-ui text-destructive" role="alert">
                 Couldn&apos;t load this project&apos;s color and icon. You can still rename it;
