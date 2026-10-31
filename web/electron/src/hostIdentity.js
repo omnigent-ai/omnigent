@@ -9,7 +9,9 @@ const SESSION_HOST_PROTOCOL = 1;
 function isHostThisMachine({ hostId, serverUrl }, cli = omnigentCli) {
   if (!hostId || hostId !== cli.readLocalHostId()) return false;
   const record = cli.liveDaemonRecordFor(serverUrl);
-  return record != null && (!record.host_id || record.host_id === hostId);
+  if (record === null || record === undefined) return false;
+  const recordHostId = record.host_id?.replace(/^host_/, "");
+  return !recordHostId || recordHostId === hostId;
 }
 
 module.exports = { isHostThisMachine, SESSION_HOST_PROTOCOL };

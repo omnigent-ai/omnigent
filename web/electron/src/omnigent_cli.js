@@ -66,9 +66,9 @@ function isLoopbackServer(serverUrl) {
 
 /**
  * True when two URLs refer to the same local server — both loopback hosts on
- * the same port (so ``localhost:6767`` and ``127.0.0.1:6767`` match, but
- * ``localhost:8000`` does not). Used to confirm the CLI's local server is the
- * one a window is actually connected to before showing its controls.
+ * the same endpoint with only the loopback hostname substituted. Used to
+ * confirm the CLI's local server is the one a window is actually connected
+ * to before showing its controls.
  *
  * @param {string} a
  * @param {string} b
@@ -79,7 +79,8 @@ function sameLoopbackServer(a, b) {
     const ua = new URL(a);
     const ub = new URL(b);
     if (!url.LOCAL_HOSTS.has(ua.hostname) || !url.LOCAL_HOSTS.has(ub.hostname)) return false;
-    return ua.port === ub.port;
+    ua.hostname = ub.hostname;
+    return normalizeServerUrl(ua.href) === normalizeServerUrl(ub.href);
   } catch {
     return false;
   }

@@ -267,6 +267,22 @@ describe("matchesServer", () => {
       assert.equal(matchesServer(record, "http://127.0.0.1:6768"), false);
     });
   }
+  for (const [recordUrl, serverUrl, expected] of [
+    ["https://localhost", "http://127.0.0.1", false],
+    ["http://localhost:80", "https://127.0.0.1", false],
+    ["https://localhost:443", "http://[::1]", false],
+    ["http://localhost:6767", "http://127.0.0.1:6767", true],
+    ["http://localhost:80/app", "http://127.0.0.1/app", true],
+    ["https://localhost:443/app", "https://[::1]/app", true],
+    ["http://localhost:6767/app", "http://127.0.0.1:6767/other", false],
+    ["http://localhost:6767/app?a=1", "http://127.0.0.1:6767/app?a=2", false],
+    ["http://alice@localhost:6767", "http://bob@127.0.0.1:6767", false],
+    ["http://localhost:6767/#one", "http://127.0.0.1:6767/#two", false],
+  ]) {
+    it(`${recordUrl} ${expected ? "matches" : "does not match"} ${serverUrl}`, () => {
+      assert.equal(matchesServer({ server_url: recordUrl }, serverUrl), expected);
+    });
+  }
   it("matches on server_url or target, ignoring trailing slashes", () => {
     assert.equal(matchesServer({ server_url: "https://x.com/" }, "https://x.com"), true);
     assert.equal(matchesServer({ target: "https://x.com" }, "https://x.com/"), true);
@@ -533,20 +549,18 @@ describe("liveDaemonRecordFor", () => {
     assert.equal(liveDaemonRecordFor("https://different.example"), null);
   });
 
-  for (const field of ["target", "server_url", "resolved_server_url"]) {
-    it(`matches loopback aliases in ${field}`, () => {
-      const record = {
-        pid: process.pid,
-        target: "local",
-        mode: "local",
-        [field]: "http://127.0.0.1:6767",
-      };
-      mock.method(fs, "readdirSync", () => ["live.json"]);
-      mock.method(fs, "readFileSync", () => JSON.stringify(record));
-      assert.equal(liveDaemonRecordFor("http://localhost:6767").pid, process.pid);
-      assert.equal(liveDaemonRecordFor("http://localhost:6768"), null);
-    });
-  }
+  it("matches a loopback alias through the parsed daemon record", () => {
+    const record = {
+      pid: process.pid,
+      target: "local",
+      mode: "local",
+      resolved_server_url: "http://127.0.0.1:6767",
+    };
+    mock.method(fs, "readdirSync", () => ["live.json"]);
+    mock.method(fs, "readFileSync", () => JSON.stringify(record));
+    assert.equal(liveDaemonRecordFor("http://localhost:6767").pid, process.pid);
+    assert.equal(liveDaemonRecordFor("http://localhost:6768"), null);
+  });
 });
 
 describe("readLocalHostId", () => {

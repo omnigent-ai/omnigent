@@ -12,6 +12,13 @@ describe("isHostThisMachine", () => {
       expected: true,
     },
     {
+      name: "legacy prefixed record identity",
+      hostId: "local",
+      localId: "local",
+      record: { host_id: "host_local" },
+      expected: true,
+    },
+    {
       name: "different session host",
       hostId: "remote",
       localId: "local",
@@ -44,9 +51,11 @@ describe("isHostThisMachine", () => {
     { name: "no local identity", hostId: "local", localId: null, record: {}, expected: false },
   ]) {
     it(name, () => {
+      let enrollmentReads = 0;
       const cli = {
         readLocalHostId: () => localId,
         liveDaemonRecordFor: (serverUrl) => {
+          enrollmentReads++;
           assert.equal(serverUrl, "https://server.example");
           return record;
         },
@@ -55,6 +64,7 @@ describe("isHostThisMachine", () => {
         isHostThisMachine({ hostId, serverUrl: "https://server.example" }, cli),
         expected,
       );
+      assert.equal(enrollmentReads, hostId && hostId === localId ? 1 : 0);
     });
   }
 });
