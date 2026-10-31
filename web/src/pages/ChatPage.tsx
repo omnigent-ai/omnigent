@@ -3009,12 +3009,12 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
-  const showInterruptButton =
-    isWorking &&
-    (!hasDraft ||
-      hasPendingElicitation ||
-      isTempConvId(conversationId) ||
-      hasPendingInitialMessage);
+  // A draft shows Send even while the first message is held: it is
+  // disabled until the real id exists, then queues behind the held message.
+  const showInterruptButton = isWorking && (!hasDraft || hasPendingElicitation);
+  // While a first message is held (session startup or a model switch), a typed
+  // draft must not let Esc cancel it.
+  const holdsFirstMessage = isTempConvId(conversationId) || hasPendingInitialMessage;
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
@@ -3823,8 +3823,9 @@ function ComposerImpl(
     }
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
-    // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isWorking && !isReadOnly) {
+    // dismissing autocomplete suggestions). A draft typed while the first
+    // message is held keeps Esc from cancelling it.
+    if (e.key === "Escape" && isWorking && !isReadOnly && !(hasDraft && holdsFirstMessage)) {
       e.preventDefault();
       onStop();
       return;

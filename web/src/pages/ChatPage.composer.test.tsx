@@ -440,54 +440,94 @@ describe("Composer starting-session cancellation", () => {
     setComposerState({ pendingUserMessages: [] });
   });
 
+  const startingProps = () =>
+    composerProps({
+      status: "streaming",
+      isWorking: true,
+      disabled: true,
+      unreachable: true,
+      permissionLevel: 1,
+      sendDisabledReason: "Starting the session…",
+    });
+
+  function holdFirstMessage() {
+    setComposerState({
+      conversationId: "conv_initial_model_pending",
+      sessionStatus: "idle",
+      pendingUserMessages: [
+        {
+          tempId: "pend_initial",
+          content: [{ type: "input_text", text: "original task" }],
+          initialDraft: { text: "original task", files: [] },
+        },
+      ],
+    });
+  }
+
+  // A typed draft must never turn the button into Stop for the held
+  // first message. Before the real id exists the draft has nowhere to go yet,
+  // so the button is a disabled Send and neither the button nor Esc cancels.
   it.each(["button", "Escape"])(
-    "keeps Interrupt available with a typed draft and cancels using %s",
+    "does not cancel the starting session with a typed draft using %s",
     (trigger) => {
-      const props = composerProps({
-        status: "streaming",
-        isWorking: true,
-        disabled: true,
-        unreachable: true,
-        permissionLevel: 1,
-        sendDisabledReason: "Starting the session…",
-      });
+      const props = startingProps();
       render(<Composer {...props} />);
 
       fireEvent.change(textarea(), { target: { value: "a correction while choosing a model" } });
-      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Interrupt" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
       fireEvent.keyDown(textarea(), { key: "Enter" });
-      expect(props.onSend).not.toHaveBeenCalled();
-      expect(props.onStop).not.toHaveBeenCalled();
 
       if (trigger === "button") {
-        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+        fireEvent.click(screen.getByRole("button", { name: "Send" }));
       } else {
         fireEvent.keyDown(textarea(), { key: "Escape" });
       }
 
-      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onStop).not.toHaveBeenCalled();
       expect(props.onSend).not.toHaveBeenCalled();
       expect(textarea()).toHaveValue("a correction while choosing a model");
     },
   );
 
+  // After real-id promotion the held first message is still pending,
+  // and a typed draft queues behind it (onSend), exactly as it does mid-turn.
+  it("sends a typed draft behind the held first message after real-ID promotion", () => {
+    holdFirstMessage();
+    const props = composerProps({ status: "idle", isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "corrected task" } });
+    expect(screen.queryByRole("button", { name: "Interrupt" })).toBeNull();
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send).toBeEnabled();
+
+    fireEvent.click(send);
+
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(props.onSend).toHaveBeenCalledOnce();
+    expect(props.onSend).toHaveBeenCalledWith("corrected task", undefined);
+  });
+
+  it("does not cancel the held first message on Escape with a typed draft after real-ID promotion", () => {
+    holdFirstMessage();
+    const props = composerProps({ status: "idle", isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "corrected task" } });
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("corrected task");
+  });
+
+  // With an empty composer, Interrupt (button or Esc)
+  // cancels the held first message in both startup phases.
   it.each(["button", "Escape"])(
-    "keeps Interrupt available after real-ID promotion with a typed draft using %s",
+    "cancels the starting session with an empty composer using %s",
     (trigger) => {
-      setComposerState({
-        conversationId: "conv_initial_model_pending",
-        sessionStatus: "idle",
-        pendingUserMessages: [
-          {
-            tempId: "pend_initial",
-            content: [{ type: "input_text", text: "original task" }],
-            initialDraft: { text: "original task", files: [] },
-          },
-        ],
-      });
-      const props = composerProps({ status: "idle", isWorking: true });
+      const props = startingProps();
       render(<Composer {...props} />);
-      fireEvent.change(textarea(), { target: { value: "corrected task" } });
       expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
 
       if (trigger === "button") {
@@ -498,9 +538,40 @@ describe("Composer starting-session cancellation", () => {
 
       expect(props.onStop).toHaveBeenCalledOnce();
       expect(props.onSend).not.toHaveBeenCalled();
-      expect(textarea()).toHaveValue("corrected task");
     },
   );
+
+  it.each(["button", "Escape"])(
+    "cancels the held first message after real-ID promotion with an empty composer using %s",
+    (trigger) => {
+      holdFirstMessage();
+      const props = composerProps({ status: "idle", isWorking: true });
+      render(<Composer {...props} />);
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  // Mid-turn Esc with a draft still interrupts when no first message is held:
+  // only the held-first-message window keeps a draft from cancelling.
+  it("still interrupts a running turn on Escape with a typed draft when nothing is held", () => {
+    setComposerState({ conversationId: "conv_running", pendingUserMessages: [] });
+    const props = composerProps({ status: "streaming", isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "follow-up" } });
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+
+    expect(props.onStop).toHaveBeenCalledOnce();
+  });
 });
 
 describe("Composer growth layout", () => {

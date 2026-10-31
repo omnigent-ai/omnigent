@@ -113,7 +113,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { setSessionDraft } from "@/lib/sessionDrafts";
 import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import {
   isSideChatCommand,
@@ -3216,13 +3216,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!sessionId) return;
     const initialDraft = state.pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
     if (initialDraft) {
-      const draft = getSessionDraft(sessionId) ?? initialDraft;
-      setSessionDraft(sessionId, draft);
+      // The held first message wins over any composer draft; the UI
+      // only offers Interrupt here with an empty composer.
+      setSessionDraft(sessionId, initialDraft);
       setActive({
         pendingUserMessages: [],
         status: "idle",
         sendLatchedAt: null,
-        failedSendDraft: { ...draft, conversationId: sessionId },
+        failedSendDraft: { ...initialDraft, conversationId: sessionId },
       });
       // What was queued behind it must not go first; it waits for an explicit retry.
       suspendQueuedMessages(sessionId);

@@ -3927,10 +3927,11 @@ describe("chatStore — cancel first message during session creation", () => {
     )!;
     const newerFile = new File(["correction"], "correction.txt", { type: "text/plain" });
     const newerDraft = { text: "use these corrected instructions", files: [newerFile] };
-    setSessionDraft(tempConvId, newerDraft);
 
+    // Cancel with an empty composer, then type a newer draft before the create response.
     useChatStore.getState().stop();
-    expect(getSessionDraft(tempConvId)).toEqual(newerDraft);
+    expect(useChatStore.getState().failedSendDraft?.text).toBe("cancel this initial prompt");
+    setSessionDraft(tempConvId, newerDraft);
     await useChatStore.getState().switchTo("conv_other");
     const otherDraft = { text: "unrelated work", files: [] };
     setSessionDraft("conv_other", otherDraft);
@@ -3965,6 +3966,21 @@ describe("chatStore — cancel first message during session creation", () => {
       pendingUserMessages: [],
       failedSendDraft: { conversationId: "conv_cancelled" },
     });
+  });
+
+  it("keeps the held first message recoverable when a different draft is in the composer", () => {
+    const firstFile = new File(["first"], "first.txt", { type: "text/plain" });
+    const { tempConvId } = beginLocalConversation("FIRST message", [firstFile])!;
+    setSessionDraft(tempConvId, { text: "SECOND message", files: [] });
+
+    useChatStore.getState().stop();
+
+    const failed = useChatStore.getState().failedSendDraft;
+    expect(failed?.conversationId).toBe(tempConvId);
+    expect(failed?.text).toContain("FIRST message");
+    expect(failed?.files).toContain(firstFile);
+    expect(getSessionDraft(tempConvId)?.text).toContain("FIRST message");
+    expect(getSessionDraft(tempConvId)?.files).toContain(firstFile);
   });
 });
 
@@ -4120,6 +4136,21 @@ describe("chatStore — first message during native model startup", () => {
         }),
       },
     ]);
+  });
+
+  it("restores the held first message, not the composer draft, when canceled after real-ID promotion", async () => {
+    begin();
+    await settle();
+    setSessionDraft(sessionId, { text: "a second message", files: [] });
+
+    useChatStore.getState().stop();
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      conversationId: sessionId,
+      text: expect.stringContaining(original),
+    });
+    expect(getSessionDraft(sessionId)?.text).toContain(original);
+    expect(eventBodies()).toEqual([]);
   });
 
   it("does not wait for Codex's first-turn model report or own its subsequent sends locally", async () => {
