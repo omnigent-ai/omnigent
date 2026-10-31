@@ -27,6 +27,7 @@ import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
+import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import legacyActions from "../../electron/test/fixtures/browserActions-v0.18.json";
 
 const CONV = "conv_relay";
@@ -966,5 +967,47 @@ describe("useBrowserAgentRelay — privileged reads", () => {
       sessionHostProtocol: 1,
       sourceHostId: "remote-host",
     });
+  });
+});
+
+describe("fetchSessionHostId — concurrent walks", () => {
+  it("shares one ancestry walk, populates every caller's cache, and refetches after completion", async () => {
+    const child = { id: CONV, hostId: null, parentSessionId: "parent" };
+    const parent = { id: "parent", hostId: "local", parentSessionId: null };
+    getSessionSlim.mockImplementation(async (id: string) => (id === CONV ? child : parent));
+    const firstClient = new QueryClient();
+    const secondClient = new QueryClient();
+    expect(
+      await Promise.all([
+        fetchSessionHostId(CONV, { queryClient: firstClient }),
+        fetchSessionHostId(CONV, { queryClient: secondClient }),
+      ]),
+    ).toEqual(["local", "local"]);
+    expect(getSessionSlim.mock.calls).toEqual([[CONV], ["parent"]]);
+    for (const client of [firstClient, secondClient]) {
+      expect(client.getQueryData(["session", CONV])).toEqual(child);
+      expect(client.getQueryData(["session", "parent"])).toEqual(parent);
+    }
+    getSessionSlim.mockResolvedValue({ ...child, hostId: "moved" });
+    expect(await fetchSessionHostId(CONV)).toBe("moved");
+    expect(getSessionSlim).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps different sessions independent and forgets a failed walk", async () => {
+    getSessionSlim.mockImplementation(async (id: string) => {
+      if (id === CONV) throw new Error("unavailable");
+      return { id, hostId: "other-host", parentSessionId: null };
+    });
+    expect(
+      await Promise.all([
+        fetchSessionHostId(CONV),
+        fetchSessionHostId(CONV),
+        fetchSessionHostId("other"),
+      ]),
+    ).toEqual([null, null, "other-host"]);
+    expect(getSessionSlim.mock.calls).toEqual([[CONV], ["other"]]);
+    getSessionSlim.mockResolvedValue({ id: CONV, hostId: "recovered", parentSessionId: null });
+    expect(await fetchSessionHostId(CONV)).toBe("recovered");
+    expect(getSessionSlim).toHaveBeenCalledTimes(3);
   });
 });
