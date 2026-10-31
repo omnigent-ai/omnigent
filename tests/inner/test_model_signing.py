@@ -23,6 +23,7 @@ def _reconstruct(
     target: str = _PATH,
     headers: list[tuple[str, str]] | None = None,
     body: bytes = b'{"model":"test"}',
+    extra_headers: tuple[tuple[str, str], ...] = (),
 ):
     return reconstruct_signed_request(
         route=_ROUTE,
@@ -39,6 +40,7 @@ def _reconstruct(
             ("Content-Type", "application/json"),
         ],
         body=body,
+        extra_headers=extra_headers,
     )
 
 
@@ -188,3 +190,17 @@ def test_body_size_is_checked_before_signing() -> None:
             body=b'{"payload":"too large"}',
             max_body_bytes=8,
         )
+
+
+def test_appends_the_signers_extra_headers_and_drops_client_copies() -> None:
+    request = _reconstruct(
+        headers=[
+            ("Authorization", f"Bearer {_PLACEHOLDER}"),
+            ("Content-Type", "application/json"),
+            ("Databricks-Custom-Client-Surfaces", "spoofed"),
+        ],
+        extra_headers=(("Databricks-Custom-Client-Surfaces", "omnigent, ug"),),
+    )
+
+    assert request.header("Databricks-Custom-Client-Surfaces") == "omnigent, ug"
+    assert [name for name, _ in request.headers].count("Databricks-Custom-Client-Surfaces") == 1
