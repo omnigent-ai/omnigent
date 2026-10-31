@@ -13,11 +13,6 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
-# Sentinel ``Origin`` header for first-party non-browser WebSocket clients.
-# Defined with the client wire schemas so ``omnigent-client`` can send it
-# without importing this package; re-exported for the runner and server.
-from omnigent_client.wire import OMNIGENT_INTERNAL_WS_ORIGIN as OMNIGENT_INTERNAL_WS_ORIGIN
-
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 ORCHESTRATION_SOURCE_HEADER = "X-Omnigent-Orchestration-Source"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
@@ -56,6 +51,18 @@ RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
 # runner uses this exact snapshot for native wrapper terminal declarations.
 RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
+# Sentinel ``Origin`` header that the project's own non-browser WebSocket
+# clients (runner -> server tunnel, host/daemon -> server tunnel,
+# terminal-attach) set on their handshakes so the server's CSWSH origin
+# guard allows them. Lives here, alongside the tunnel token header,
+# because it is part of the same client/server handshake contract and the
+# server imports it from this module (server -> runner, not the reverse).
+# The non-HTTP scheme is deliberate: a browser computes ``Origin`` from
+# the page URL and can never emit this value. ``omnigent_client.wire``
+# carries the same literal so the client can send it without importing
+# this package; this module stays stdlib-only because the sandboxed os_env
+# helper imports it with only the ``omnigent`` package on its path.
+OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # "1" enables per-session workspace isolation so each session
 # gets its own subdirectory. Set by shared-host servers; single-user
 # CLI flows leave it unset (agent sees the project root directly).
