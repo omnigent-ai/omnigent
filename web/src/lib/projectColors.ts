@@ -2,7 +2,7 @@
 // palette's accent for the current mode.
 
 import type { ProjectConfig } from "./projectsApi";
-import { PALETTES, isThemePalette, type ThemePalette } from "./themePalette";
+import { PALETTES, isThemePalette } from "./themePalette";
 
 export const PROJECT_COLORS = PALETTES.map((palette) => ({
   id: palette.id,
@@ -10,10 +10,6 @@ export const PROJECT_COLORS = PALETTES.map((palette) => ({
   light: palette.light.accent,
   dark: palette.dark.accent,
 }));
-
-export type ProjectColor = ThemePalette;
-
-export const isProjectColor = isThemePalette;
 
 export function projectColorValue(
   color: string | null | undefined,
@@ -32,7 +28,7 @@ export interface ProjectAppearance {
 /** An unknown color reads as unset. */
 export function projectAppearance(config: ProjectConfig | undefined): ProjectAppearance {
   const icon = config?.icon || null;
-  return { icon, color: !icon && isProjectColor(config?.color) ? config.color : null };
+  return { icon, color: !icon && isThemePalette(config?.color) ? config.color : null };
 }
 
 /** Store a mark on a config, clearing the other kind so only one is kept. */
