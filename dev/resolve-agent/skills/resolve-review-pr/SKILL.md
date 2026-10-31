@@ -51,7 +51,11 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    `online: false` seen while `OMNIGENT_RUNNER_ID` is still set is your own
    un-stripped env, not a blocker: re-run with the `env -u` prefix from
    `dev/recording-lanes.md` first. A missing upstream before-clip is never that
-   blocker. Never drop it silently.
+   blocker. Never drop it silently. An `api` trigger does not exempt the facet
+   when a UI or CLI caller submits the same request and shows the outcome:
+   search for such callers and film the one that exposes the failure against
+   the PR head. Write `recording_unavailable_reason` as the result of a finished
+   attempt, never as a plan.
 4. **Review the diff** for quality, not just green. Decide whether this is the
    **best practical approach** for the repository, not merely an approach that
    makes the reproduction pass. Identify the plausible alternatives suggested by
