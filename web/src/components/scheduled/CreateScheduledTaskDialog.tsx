@@ -863,6 +863,9 @@ export function CreateScheduledTaskDialog({
                   effort={pickedEffort}
                   permissionMode={pickedPermission}
                   hostId={hostId}
+                  sandboxMode={sandboxMode}
+                  agentId={effectiveAgentId}
+                  harness={modelEffortAgent?.harness ?? null}
                   onModelChange={setPickedModel}
                   onEffortChange={setPickedEffort}
                   onPermissionModeChange={setPickedPermission}

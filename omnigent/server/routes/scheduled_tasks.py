@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
@@ -44,6 +45,11 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
+from omnigent.server.routes.sandbox_inference import (
+    actual_harness,
+    catalog_offers_model,
+    resolve_sandbox_model_options,
+)
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -485,6 +491,47 @@ def create_scheduled_tasks_router(
             f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
         )
 
+    async def _require_offered_sandbox_model(
+        request: Request, *, owner: str, agent: Agent, model_override: str | None
+    ) -> None:
+        """Reject a model the agent cannot run in a fresh sandbox.
+
+        Checked against the same catalog the new-session picker shows. Only a
+        catalog that answers can rule a model out: when it is empty or
+        unavailable the task is kept, and the fire falls back to the default.
+        Claude Code resolves its own family aliases, so those always pass.
+        """
+        if model_override is None or agent_cache is None or agent.bundle_location is None:
+            return
+        sandbox_config = getattr(request.app.state, "sandbox_config", None)
+        if sandbox_config is None:
+            return
+        spec = (
+            await asyncio.to_thread(
+                agent_cache.load,
+                agent.id,
+                agent.bundle_location,
+                expand_env=agent.operator_authored,
+            )
+        ).spec
+        harness = actual_harness(spec)
+        if harness == "claude-native" and model_override.lower() in CLAUDE_MODEL_ALIASES:
+            return
+        catalog = await resolve_sandbox_model_options(
+            request,
+            provider=sandbox_config.default.provider,
+            harness=harness,
+            user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            spec=spec,
+        )
+        if catalog_offers_model(catalog, model_override) is False:
+            offered = ", ".join(row["id"] for row in catalog["models"])
+            raise OmnigentError(
+                f"Model {model_override!r} is not offered for this agent in a new sandbox; "
+                f"choose one of: {offered}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
     @router.post("/scheduled-tasks")
     async def create_scheduled_task(
         request: Request,
@@ -506,6 +553,10 @@ def create_scheduled_tasks_router(
             permission_mode=permission_mode,
             execution_target=body.execution_target,
         )
+        if body.execution_target == "managed_sandbox":
+            await _require_offered_sandbox_model(
+                request, owner=owner, agent=agent, model_override=model_override
+            )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
@@ -826,6 +877,24 @@ def create_scheduled_tasks_router(
             raise OmnigentError(
                 _MANAGED_SANDBOX_WITH_HOST_MSG,
                 code=ErrorCode.INVALID_INPUT,
+            )
+        effective_model = fields.get("model_override", existing.model_override)
+        if (
+            switching_to_managed
+            and effective_model is not None
+            and (agent_changed or {"model_override", "execution_target"}.intersection(fields))
+        ):
+            await _require_offered_sandbox_model(
+                request,
+                owner=owner,
+                agent=await validate_session_agent(
+                    user_id=owner_id,
+                    agent_id=target_agent_id,
+                    agent_store=agent_store,
+                    permission_store=permission_store,
+                    conversation_store=conversation_store,
+                ),
+                model_override=effective_model,
             )
         if agent_changed or {"workspace", "host_id", "execution_target"}.intersection(fields):
             # On a switch this runs the full create-time gauntlet against the NEW
