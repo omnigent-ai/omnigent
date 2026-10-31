@@ -163,20 +163,33 @@ def _capture_injection(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("verdict", "expected_key"),
-    [("allow", APPROVE_KEY), ("deny", DENY_KEY)],
+    ("verdict", "expected_keys"),
+    [
+        # Accept types the "approve once" digit; cancel (web dismiss, no
+        # server Escape) types the "reject" digit to close the menu.
+        ("accept", [APPROVE_KEY]),
+        ("cancel", [DENY_KEY]),
+        # An explicit web decline injects NOTHING: the server-forwarded Escape
+        # already answered kimi's menu, so a second keystroke would race it.
+        ("decline", []),
+    ],
 )
 def test_permission_request_injects_keystroke_for_verdict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     verdict: str,
-    expected_key: str,
+    expected_keys: list[str],
 ) -> None:
-    """A web Approve/Deny verdict is typed into kimi's prompt as the option digit."""
+    """Accept/cancel type an option digit; an explicit decline types nothing."""
     bridge_dir = _governed_bridge(tmp_path)
     _feed_stdin(
         monkeypatch,
-        {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_call_id": "tc_1"},
+        {
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_call_id": "tc_1",
+            "tool_input": {"command": "ls -la /tmp"},
+        },
     )
     posted: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -189,10 +202,71 @@ def test_permission_request_injects_keystroke_for_verdict(
     exit_code = kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
 
     assert exit_code == 0
-    # Routed to the shared elicitation endpoint with the gated tool.
-    assert posted[0]["url"].endswith("/v1/sessions/conv_abc/hooks/permission-request")
-    assert posted[0]["body"]["tool_name"] == "Bash"
-    assert keys == [expected_key]
+    # Routed to the vendor-agnostic native-permission endpoint, labelled Kimi.
+    assert posted[0]["url"].endswith("/v1/sessions/conv_abc/hooks/native-permission-request")
+    body = posted[0]["body"]
+    assert body["agent"] == "Kimi"
+    assert body["policy_name"] == "kimi_native_permission"
+    assert body["message"] == "Kimi wants to call **Bash**"
+    assert body["operation_type"] == "Bash"
+    # Re-attach id was renamed from ``_omnigent_elicitation_id``.
+    assert body["elicitation_id"].startswith("elicit_kimi_")
+    # The gated command reaches the card as the preview.
+    assert "ls -la /tmp" in body["content_preview"]
+    assert keys == expected_keys
+
+
+def test_permission_request_omits_preview_without_tool_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No usable tool_input → the card body carries no content_preview field."""
+    bridge_dir = _governed_bridge(tmp_path)
+    _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    posted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "_request_web_approval",
+        lambda url, headers, body, **kwargs: posted.append({"body": body}) or "accept",
+    )
+    _capture_injection(monkeypatch)
+
+    assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+    assert "content_preview" not in posted[0]["body"]
+
+
+@pytest.mark.parametrize(
+    ("tool_input", "expected"),
+    [
+        # A shell command is the most useful single line.
+        ({"command": "ls -la /tmp"}, "ls -la /tmp"),
+        ({"command": "  echo hi  "}, "echo hi"),
+        # No command → the JSON-encoded input.
+        ({"path": "/etc/hosts", "mode": "r"}, '"path": "/etc/hosts"'),
+        ({}, "{}"),
+        # Blank command falls through to the JSON encoding.
+        ({"command": "   "}, '"command"'),
+        # No usable input → omitted (None), never the bare tool name.
+        (None, None),
+        ("not a dict", None),
+    ],
+)
+def test_content_preview_renders_or_omits(tool_input: object, expected: str | None) -> None:
+    result = kimi_native_hook._content_preview(tool_input)
+    if expected is None:
+        assert result is None
+    else:
+        assert result is not None and expected in result
+
+
+def test_content_preview_truncates_to_limit() -> None:
+    long_command = "a" * (kimi_native_hook._PREVIEW_MAX + 500)
+    result = kimi_native_hook._content_preview({"command": long_command})
+    assert result is not None and len(result) == kimi_native_hook._PREVIEW_MAX
+
+
+def test_content_preview_omits_non_serializable_tool_input() -> None:
+    assert kimi_native_hook._content_preview({"blob": object()}) is None
 
 
 def test_permission_request_no_verdict_injects_nothing(
@@ -214,7 +288,7 @@ def test_permission_request_reparks_after_injection_miss(
 ) -> None:
     bridge_dir = _governed_bridge(tmp_path)
     _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
-    verdicts = iter(["allow", "deny"])
+    verdicts = iter(["accept", "cancel"])
     posted: list[dict[str, object]] = []
     deadlines: list[object] = []
     keys: list[str] = []
@@ -242,7 +316,7 @@ def test_permission_request_reparks_after_injection_miss(
     assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
     assert keys == [APPROVE_KEY, DENY_KEY]
     assert len(posted) == 2
-    assert posted[0]["_omnigent_elicitation_id"] == posted[1]["_omnigent_elicitation_id"]
+    assert posted[0]["elicitation_id"] == posted[1]["elicitation_id"]
     assert deadlines == [
         100.0 + kimi_native_hook._PERMISSION_RETRY_WINDOW_S,
         100.0 + kimi_native_hook._PERMISSION_RETRY_WINDOW_S,
@@ -258,7 +332,7 @@ def test_permission_request_does_not_repark_ambiguous_injection(
     monkeypatch.setattr(
         kimi_native_hook,
         "_request_web_approval",
-        lambda url, headers, body, **kwargs: requests.append(body.copy()) or "allow",
+        lambda url, headers, body, **kwargs: requests.append(body.copy()) or "accept",
     )
     keys: list[str] = []
 
@@ -301,20 +375,76 @@ def test_permission_request_ungoverned_no_request(
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
-        ({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}, "allow"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "deny"}}}, "deny"),
-        ({"hookSpecificOutput": {"permissionDecision": "allow"}}, "allow"),
-        ({"hookSpecificOutput": {"permissionDecision": "deny"}}, "deny"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "allow_always"}}}, "allow"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "reject"}}}, "deny"),
+        # The action is returned verbatim so the caller can treat decline
+        # (server-Escaped) differently from cancel.
+        ({"action": "accept"}, "accept"),
+        ({"action": "decline"}, "decline"),
+        ({"action": "cancel"}, "cancel"),
         ({}, None),
-        ({"hookSpecificOutput": {}}, None),
-        ({"hookSpecificOutput": {"decision": {"behavior": "huh"}}}, None),
+        ({"action": "huh"}, None),
+        ({"action": None}, None),
+        # The old Claude PermissionRequest shape must NOT resolve to a verdict.
+        ({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}, None),
         ("not a dict", None),
     ],
 )
 def test_verdict_from_response(response: object, expected: str | None) -> None:
     assert kimi_native_hook._verdict_from_response(response) == expected
+
+
+def _mock_http_action(monkeypatch: pytest.MonkeyPatch, action: str) -> None:
+    """Patch httpx so the REAL verdict parse runs over ``{"action": action}``."""
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del url, json
+            return httpx.Response(
+                200,
+                json={"action": action},
+                request=httpx.Request("POST", "http://server"),
+            )
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_keys"),
+    [
+        # accept types "approve once"; cancel (no server interrupt) types
+        # "reject"; an explicit decline injects nothing (server Escape rejects).
+        ("accept", [APPROVE_KEY]),
+        ("cancel", [DENY_KEY]),
+        ("decline", []),
+    ],
+)
+def test_permission_request_keystroke_matches_real_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    expected_keys: list[str],
+) -> None:
+    """End-to-end: the real ElicitationResult parse drives the keystroke.
+
+    Only the pty inject and the HTTP transport are stubbed — ``_request_web_approval``
+    and ``_verdict_from_response`` run for real, so inverting or collapsing the
+    decline/cancel discrimination fails this.
+    """
+    bridge_dir = _governed_bridge(tmp_path)
+    _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    _mock_http_action(monkeypatch, action)
+    keys = _capture_injection(monkeypatch)
+
+    assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+    assert keys == expected_keys
 
 
 def test_unknown_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
@@ -328,7 +458,7 @@ def test_request_web_approval_reparks_after_read_timeout(
         httpx.ReadTimeout("poll expired", request=httpx.Request("POST", "http://server")),
         httpx.Response(
             200,
-            json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+            json={"action": "accept"},
             request=httpx.Request("POST", "http://server"),
         ),
     ]
@@ -353,8 +483,8 @@ def test_request_web_approval_reparks_after_read_timeout(
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
-    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "accept"
     assert len(requests) == 2
     assert requests[0]["json"] == requests[1]["json"] == body
 
@@ -366,7 +496,7 @@ def test_request_web_approval_reparks_empty_response(
         httpx.Response(200, content=b"", request=httpx.Request("POST", "http://server")),
         httpx.Response(
             200,
-            json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+            json={"action": "accept"},
             request=httpx.Request("POST", "http://server"),
         ),
     ]
@@ -388,8 +518,8 @@ def test_request_web_approval_reparks_empty_response(
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
-    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "accept"
     assert len(requests) == 2
     assert requests[0]["json"] == requests[1]["json"] == body
 
@@ -422,7 +552,7 @@ def test_request_web_approval_does_not_repark_after_menu_is_gone(
         lambda bridge_dir: probes.append(bridge_dir) or False,
     )
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
     assert (
         kimi_native_hook._request_web_approval("http://server", {}, body, bridge_dir=tmp_path)
         is None
@@ -449,15 +579,15 @@ def test_permission_read_timeout_leaves_global_deadline_margin(
         def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
             return httpx.Response(
                 200,
-                json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+                json={"action": "accept"},
                 request=httpx.Request("POST", url),
             )
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
     monkeypatch.setattr(kimi_native_hook.time, "monotonic", lambda: 0.0)
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
-    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "accept"
     request_budget = (
         kimi_native_hook._PERMISSION_RETRY_WINDOW_S
         - kimi_native_hook._PERMISSION_DEADLINE_MARGIN_S
