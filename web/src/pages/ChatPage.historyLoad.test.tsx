@@ -255,32 +255,49 @@ describe("KeepBottomOnResize", () => {
     expect(metrics.scrollTop).toBe(1270);
   });
 
-  it("leaves transcript growth alone once the reader scrolls up, before the library notices", () => {
-    const { metrics, scrollRoot } = makeScrollRoot();
+  it.each([
+    { change: "the transcript grows", scrollHeight: 2021, clientHeight: 700, scrollTop: 1100 },
+    // Both layouts end at 1300, so the reader is 50px above either end.
+    {
+      change: "the transcript grows as the viewport expands",
+      scrollHeight: 2100,
+      clientHeight: 800,
+      scrollTop: 1250,
+    },
+  ])(
+    "leaves the reader alone once they scroll up, before the library notices, as $change",
+    ({ scrollHeight, clientHeight, scrollTop }) => {
+      const { metrics, scrollRoot } = makeScrollRoot();
+      stickContext.state.isAtBottom = true;
+      stickContext.state.escapedFromLock = false;
+      render(<KeepBottomOnResize />);
+
+      metrics.scrollHeight = scrollHeight;
+      metrics.clientHeight = clientHeight;
+      metrics.scrollTop = scrollTop;
+      fireEvent.scroll(scrollRoot);
+      act(() => resize?.());
+
+      expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+      expect(metrics.scrollTop).toBe(scrollTop);
+    },
+  );
+
+  it("leaves transcript growth alone once the library releases a reader at the end", () => {
+    const { metrics } = makeScrollRoot();
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
     render(<KeepBottomOnResize />);
 
-    metrics.scrollTop = 1100;
-    fireEvent.scroll(scrollRoot);
-    metrics.scrollHeight = 2021;
-    act(() => resize?.());
-
-    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
-    expect(metrics.scrollTop).toBe(1100);
-  });
-
-  it("leaves transcript growth under an escaped reader alone", () => {
-    const { metrics } = makeScrollRoot(800);
-    stickContext.isAtBottom = true;
-    render(<KeepBottomOnResize />);
-
+    // A wheel up releases the lock before any scroll event moves the reader.
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
     metrics.scrollHeight = 2200;
     act(() => resize?.());
 
     expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
     expect(frames.size).toBe(0);
-    expect(metrics.scrollTop).toBe(800);
+    expect(metrics.scrollTop).toBe(1300);
   });
 
   it("holds still while the reader drags a selection in the transcript", () => {
@@ -290,29 +307,32 @@ describe("KeepBottomOnResize", () => {
     document.getSelection()!.selectAllChildren(scrollRoot);
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
-    render(<KeepBottomOnResize />);
+    try {
+      render(<KeepBottomOnResize />);
 
-    fireEvent.pointerDown(scrollRoot);
-    metrics.scrollHeight = 2021;
-    act(() => resize?.());
-    metrics.clientHeight = 650;
-    act(() => resize?.());
-    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
-    expect(metrics.scrollTop).toBe(1300);
+      fireEvent.pointerDown(scrollRoot);
+      metrics.scrollHeight = 2021;
+      act(() => resize?.());
+      metrics.clientHeight = 650;
+      act(() => resize?.());
+      expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+      expect(metrics.scrollTop).toBe(1300);
 
-    // A finished selection stays in place but no longer holds the view.
-    fireEvent.pointerUp(scrollRoot);
-    metrics.scrollHeight = 2042;
-    act(() => resize?.());
-    expect(metrics.scrollTop).toBe(1391);
+      // A finished selection stays in place but no longer holds the view.
+      fireEvent.pointerUp(scrollRoot);
+      metrics.scrollHeight = 2042;
+      act(() => resize?.());
+      expect(metrics.scrollTop).toBe(1391);
 
-    // A drag that starts before the follow-up frame runs holds that frame too.
-    fireEvent.pointerDown(scrollRoot);
-    metrics.scrollHeight = 2063;
-    flushFrames();
-    expect(metrics.scrollTop).toBe(1391);
-    document.getSelection()!.removeAllRanges();
-    scrollRoot.remove();
+      // A drag that starts before the follow-up frame runs holds that frame too.
+      fireEvent.pointerDown(scrollRoot);
+      metrics.scrollHeight = 2063;
+      flushFrames();
+      expect(metrics.scrollTop).toBe(1391);
+    } finally {
+      document.getSelection()!.removeAllRanges();
+      scrollRoot.remove();
+    }
   });
 
   it("disconnects the observer and cancels a queued follow-up frame", () => {

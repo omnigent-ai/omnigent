@@ -1271,7 +1271,7 @@ export function KeepBottomOnResize() {
     // event can arrive after the next line grew the transcript, and a shrink's
     // clamp before its resize callback.
     const isAtEnd = () => {
-      const end = Math.min(scrollHeight, el.scrollHeight) - Math.max(clientHeight, el.clientHeight);
+      const end = Math.min(scrollHeight - clientHeight, el.scrollHeight - el.clientHeight);
       return end - el.scrollTop <= 1;
     };
     let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtEnd();
