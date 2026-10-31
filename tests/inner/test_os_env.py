@@ -15,13 +15,16 @@ from typing import IO
 
 import pytest
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     CallerProcessOSEnvironment,
     _child_shell_env,
     _project_root,
     _read_impl,
+    _shell_argv,
     _shell_impl,
+    _shell_output_decoding,
     build_helper_env,
     create_os_environment,
 )
@@ -179,6 +182,94 @@ def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
     assert result["exit_code"] is None
     assert result["timed_out"] is True
     assert result["error"] == "Command timed out after 1 seconds"
+
+
+# ---------------------------------------------------------------------------
+# _shell_impl — output decoding on Windows
+# ---------------------------------------------------------------------------
+
+_GIT_BASH = r"C:\Program Files\Git\bin\bash.exe"
+
+
+@pytest.mark.parametrize(
+    ("shell_path", "expected"),
+    [
+        (_GIT_BASH, ("utf-8", "replace")),
+        (r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", ("utf-8", "replace")),
+        (r"C:\Windows\System32\cmd.exe", ("oem", "replace")),
+    ],
+)
+def test_shell_output_decoding_on_windows(
+    monkeypatch: pytest.MonkeyPatch, shell_path: str, expected: tuple[str, str]
+) -> None:
+    """Windows output is decoded as each shell writes it, not as the ANSI code page."""
+    monkeypatch.setattr("omnigent.inner.os_env.IS_WINDOWS", True)
+    assert _shell_output_decoding(shell_path) == expected
+
+
+def test_shell_output_decoding_keeps_the_locale_default_on_posix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX hosts keep ``subprocess``'s locale decoding unchanged."""
+    monkeypatch.setattr("omnigent.inner.os_env.IS_WINDOWS", False)
+    assert _shell_output_decoding("/bin/bash") == (None, None)
+
+
+def test_shell_argv_switches_powershell_output_to_utf8_on_windows_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows PowerShell is told to write UTF-8; other hosts get the bare command."""
+    monkeypatch.setattr("omnigent.inner.os_env.IS_WINDOWS", True)
+    argv = _shell_argv("powershell.exe", "Get-Location")
+    assert argv[:3] == ["powershell.exe", "-NoProfile", "-Command"]
+    assert argv[3].startswith("try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }")
+    assert argv[3].endswith("; Get-Location")
+
+    monkeypatch.setattr("omnigent.inner.os_env.IS_WINDOWS", False)
+    assert _shell_argv("pwsh", "Get-Location") == [
+        "pwsh",
+        "-NoProfile",
+        "-Command",
+        "Get-Location",
+    ]
+
+
+def test_shell_impl_passes_the_shell_decoding_to_subprocess(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """UTF-8 output with bytes cp1252 leaves undefined (``Á`` is ``C3 81``) is kept intact."""
+    raw_output = "café Á\n".encode()
+    run_kwargs: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        run_kwargs.update(kwargs)
+        stdout = raw_output.decode(str(kwargs["encoding"]), str(kwargs["errors"]))
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("omnigent.inner.os_env.IS_WINDOWS", True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = _shell_impl(command="cat out.txt", timeout=5, shell_path=_GIT_BASH, cwd=tmp_path)
+
+    assert (run_kwargs["encoding"], run_kwargs["errors"]) == ("utf-8", "replace")
+    assert result["stdout"] == "café Á\n"
+    assert result["exit_code"] == 0
+
+
+@pytest.mark.skipif(
+    not (IS_WINDOWS and Path(_GIT_BASH).exists()), reason="needs Git Bash on Windows"
+)
+def test_shell_impl_decodes_git_bash_utf8_output_on_windows(tmp_path: Path) -> None:
+    """Real Git Bash UTF-8 output survives the Windows ANSI code page."""
+    result = _shell_impl(
+        command=r"printf 'caf\303\251 \303\201\n'",
+        timeout=30,
+        shell_path=_GIT_BASH,
+        cwd=tmp_path,
+    )
+
+    assert result["exit_code"] == 0
+    assert result["stdout"] == "café Á\n"
 
 
 # ---------------------------------------------------------------------------
