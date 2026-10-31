@@ -305,3 +305,41 @@ def test_prompt_returns_none_when_state_unavailable() -> None:
     adapter._host = None  # type: ignore[attr-defined]
     adapter._fmt = None  # type: ignore[attr-defined]
     assert _run(adapter._prompt_schema_fields(schema)) is None
+
+
+def test_resolve_elsewhere_releases_only_its_own_prompt() -> None:
+    state = _FieldInputState()
+
+    async def _run_case() -> tuple[bool, bool, str]:
+        fut = state.begin("answer", "elicit_mine")
+        other = state.resolve_elsewhere("elicit_other")
+        mine = state.resolve_elsewhere("elicit_mine")
+        return other, mine, await fut
+
+    other, mine, value = _run(_run_case())
+    assert (other, mine, value) == (False, True, "")
+    assert state.aborted and not state.pending
+
+
+def test_settle_resolved_elsewhere_releases_an_open_field_prompt() -> None:
+    from types import SimpleNamespace
+
+    from omnigent.repl._repl import _ApprovalState, _settle_resolved_elsewhere
+
+    state = _FieldInputState()
+    approvals = _ApprovalState()
+    recorded: list[str] = []
+    session = SimpleNamespace(note_elicitation_resolved=recorded.append)
+
+    async def _run_case() -> tuple[str | None, str | None]:
+        state.begin("answer", "elicit_q")
+        unrelated = _settle_resolved_elsewhere(
+            session, approvals, state, "elicit_x", "accept", None
+        )
+        mine = _settle_resolved_elsewhere(session, approvals, state, "elicit_q", "accept", None)
+        return unrelated, mine
+
+    assert _run(_run_case()) == (None, "approved elsewhere")
+    # The adapter hears every resolution: the request may still be queued there.
+    assert recorded == ["elicit_x", "elicit_q"]
+    assert not state.pending
