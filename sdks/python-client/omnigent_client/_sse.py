@@ -11,8 +11,7 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-from omnigent.server import schemas as _srv_events
-
+from . import wire as _wire
 from ._events import (
     NATIVE_TOOL_TYPES,
     ClientTaskCancel,
@@ -50,42 +49,42 @@ def _wire_type(cls: type) -> str:
     """
     Extract the wire ``type`` literal from a server event class.
 
-    Each :mod:`omnigent.server.schemas` event class pins its
+    Each :mod:`omnigent_client.wire` event class pins its
     ``type`` field as ``Literal["..."]``; this helper unwraps that
     to a plain string so the SDK's ``str == str`` dispatch table
     stays a ``str`` comparison rather than introducing a class-side
     isinstance check.
 
-    :param cls: A subclass of the server's ``_SSEEventBase``,
-        e.g. :class:`omnigent.server.schemas.OutputTextDeltaEvent`.
+    :param cls: A subclass of ``_SSEEventBase``,
+        e.g. :class:`omnigent_client.wire.OutputTextDeltaEvent`.
     :returns: The wire ``type`` literal, e.g.
         ``"response.output_text.delta"``.
     """
     return cls.model_fields["type"].annotation.__args__[0]  # type: ignore[union-attr]
 
 
-# Wire type literals — pulled from the server's typed source of
-# truth so a rename there is a one-edit change here as well.
-_T_RESPONSE_CREATED = _wire_type(_srv_events.CreatedEvent)
-_T_RESPONSE_QUEUED = _wire_type(_srv_events.QueuedEvent)
-_T_RESPONSE_IN_PROGRESS = _wire_type(_srv_events.InProgressEvent)
-_T_RESPONSE_COMPLETED = _wire_type(_srv_events.CompletedEvent)
-_T_RESPONSE_FAILED = _wire_type(_srv_events.FailedEvent)
-_T_RESPONSE_INCOMPLETE = _wire_type(_srv_events.IncompleteEvent)
-_T_RESPONSE_CANCELLED = _wire_type(_srv_events.CancelledEvent)
-_T_RESPONSE_OUTPUT_TEXT_DELTA = _wire_type(_srv_events.OutputTextDeltaEvent)
-_T_RESPONSE_REASONING_STARTED = _wire_type(_srv_events.ReasoningStartedEvent)
-_T_RESPONSE_REASONING_TEXT_DELTA = _wire_type(_srv_events.ReasoningTextDeltaEvent)
-_T_RESPONSE_REASONING_SUMMARY_TEXT_DELTA = _wire_type(_srv_events.ReasoningSummaryTextDeltaEvent)
-_T_RESPONSE_OUTPUT_ITEM_DONE = _wire_type(_srv_events.OutputItemDoneEvent)
-_T_RESPONSE_OUTPUT_FILE_DONE = _wire_type(_srv_events.OutputFileDoneEvent)
-_T_RESPONSE_RETRY = _wire_type(_srv_events.RetryEvent)
-_T_RESPONSE_ERROR = _wire_type(_srv_events.ErrorEvent)
-_T_RESPONSE_COMPACTION_IN_PROGRESS = _wire_type(_srv_events.CompactionInProgressEvent)
-_T_RESPONSE_COMPACTION_COMPLETED = _wire_type(_srv_events.CompactionCompletedEvent)
-_T_RESPONSE_COMPACTION_FAILED = _wire_type(_srv_events.CompactionFailedEvent)
-_T_RESPONSE_CLIENT_TASK_CANCEL = _wire_type(_srv_events.ClientTaskCancelEvent)
-_T_RESPONSE_ELICITATION_REQUEST = _wire_type(_srv_events.ElicitationRequestEvent)
+# Wire type literals — pulled from the typed wire schemas the server
+# also emits from, so a rename there is a one-edit change here as well.
+_T_RESPONSE_CREATED = _wire_type(_wire.CreatedEvent)
+_T_RESPONSE_QUEUED = _wire_type(_wire.QueuedEvent)
+_T_RESPONSE_IN_PROGRESS = _wire_type(_wire.InProgressEvent)
+_T_RESPONSE_COMPLETED = _wire_type(_wire.CompletedEvent)
+_T_RESPONSE_FAILED = _wire_type(_wire.FailedEvent)
+_T_RESPONSE_INCOMPLETE = _wire_type(_wire.IncompleteEvent)
+_T_RESPONSE_CANCELLED = _wire_type(_wire.CancelledEvent)
+_T_RESPONSE_OUTPUT_TEXT_DELTA = _wire_type(_wire.OutputTextDeltaEvent)
+_T_RESPONSE_REASONING_STARTED = _wire_type(_wire.ReasoningStartedEvent)
+_T_RESPONSE_REASONING_TEXT_DELTA = _wire_type(_wire.ReasoningTextDeltaEvent)
+_T_RESPONSE_REASONING_SUMMARY_TEXT_DELTA = _wire_type(_wire.ReasoningSummaryTextDeltaEvent)
+_T_RESPONSE_OUTPUT_ITEM_DONE = _wire_type(_wire.OutputItemDoneEvent)
+_T_RESPONSE_OUTPUT_FILE_DONE = _wire_type(_wire.OutputFileDoneEvent)
+_T_RESPONSE_RETRY = _wire_type(_wire.RetryEvent)
+_T_RESPONSE_ERROR = _wire_type(_wire.ErrorEvent)
+_T_RESPONSE_COMPACTION_IN_PROGRESS = _wire_type(_wire.CompactionInProgressEvent)
+_T_RESPONSE_COMPACTION_COMPLETED = _wire_type(_wire.CompactionCompletedEvent)
+_T_RESPONSE_COMPACTION_FAILED = _wire_type(_wire.CompactionFailedEvent)
+_T_RESPONSE_CLIENT_TASK_CANCEL = _wire_type(_wire.ClientTaskCancelEvent)
+_T_RESPONSE_ELICITATION_REQUEST = _wire_type(_wire.ElicitationRequestEvent)
 
 
 async def parse_sse_stream(
@@ -155,7 +154,7 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
     :param event_type: Wire name of the SSE ``event:`` field, e.g.
         ``"response.output_text.delta"``. Compared against the
         ``_T_RESPONSE_*`` wire-type constants (sourced from
-        :mod:`omnigent.server.schemas`) to dispatch.
+        :mod:`omnigent_client.wire`) to dispatch.
     :param data: Decoded JSON payload from the SSE ``data:`` field.
     :returns: A typed :class:`StreamEvent` for known event names, or
         ``None`` when the payload is missing required fields or the

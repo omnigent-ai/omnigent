@@ -93,10 +93,12 @@ def packages(root: Path) -> list[Package]:
             root / "pyproject.toml",
             ("omnigent-client", "omnigent-ui-sdk", "omnigent-slack"),
         ),
+        # omnigent-client owns the SSE wire schemas and never imports
+        # ``omnigent``, so remote callers can install it without the server.
         Package(
             "omnigent-client",
             root / "sdks" / "python-client" / "pyproject.toml",
-            ("omnigent",),
+            (),
         ),
         Package(
             "omnigent-ui-sdk",

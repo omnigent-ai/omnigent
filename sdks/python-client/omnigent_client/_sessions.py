@@ -31,14 +31,13 @@ from typing import Any, Literal
 import httpx
 from pydantic import TypeAdapter
 
-from omnigent.harness_availability import harness_launch_availability
-from omnigent.server.schemas import ServerStreamEvent
-
 from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _HOST_LAUNCH_READ_TIMEOUT_S, _SSE_TIMEOUT
 from ._types import PaginatedList
+from .harness_readiness import harness_launch_availability
+from .wire import ServerStreamEvent
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
@@ -50,7 +49,7 @@ _DEFAULT_SUBTREE_DEPTH = 3
 # caches the validator. ``ServerStreamEvent`` is a Pydantic-discriminated
 # union, so the result of ``validate_python`` is one of the concrete
 # event subclasses (CreatedEvent, OutputTextDeltaEvent, …) — see
-# :mod:`omnigent.server.schemas`.
+# :mod:`omnigent_client.wire`.
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
 
 # ── Module-level constants (rule 34) ─────────────────────────────────
@@ -630,6 +629,7 @@ class SessionsNamespace:
         self,
         *,
         harness: str | None = None,
+        canonicalize: Callable[[str], str | None] | None = None,
     ) -> list[LaunchHost]:
         """
         List the caller's connected hosts a runner could be launched on, with readiness.
@@ -638,6 +638,9 @@ class SessionsNamespace:
         matches the server. Unknown readiness counts as launchable.
 
         :param harness: Harness the session needs, e.g. ``"claude-sdk"``.
+        :param canonicalize: Optional harness-name normalizer, so an alias
+            (``"claude"``) is looked up under the canonical key the host
+            reports (``"claude-sdk"``). ``None`` looks *harness* up as given.
         :returns: Online hosts in listing order; empty when there are none.
         :raises OmnigentError: If the listing returns a non-2xx status.
         """
@@ -661,7 +664,7 @@ class SessionsNamespace:
             display = name if isinstance(name, str) and name else host_id
             readiness = item.get("configured_harnesses")
             available, reason = harness_launch_availability(
-                harness, readiness if isinstance(readiness, dict) else None
+                harness, readiness if isinstance(readiness, dict) else None, canonicalize
             )
             result.append(
                 LaunchHost(
@@ -1304,7 +1307,7 @@ class SessionsNamespace:
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
         :yields: :class:`ServerStreamEvent` envelopes whose ``type`` is a
-            :class:`omnigent.server.schemas.ServerStreamEvent`
+            :class:`omnigent_client.wire.ServerStreamEvent`
             member and whose ``data`` is the event-specific payload
             dict.
         :raises OmnigentError: If the server returns a non-2xx
@@ -1419,7 +1422,7 @@ def _try_parse_envelope(raw: str) -> ServerStreamEvent | None:
 
     The server emits each event with a flat shape carrying the
     fields documented on the matching subclass in
-    :mod:`omnigent.server.schemas` (e.g. ``{"type":
+    :mod:`omnigent_client.wire` (e.g. ``{"type":
     "response.output_text.delta", "delta": "Hello",
     "sequence_number": 5}``). The
     :data:`_SERVER_STREAM_EVENT_ADAPTER` dispatches on ``type`` to

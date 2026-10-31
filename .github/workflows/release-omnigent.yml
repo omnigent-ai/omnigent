@@ -102,7 +102,8 @@ jobs:
           # dep is an exact `==tag` pin (the lockstep contract).
           packages = {
               "pyproject.toml": ("omnigent-client", "omnigent-ui-sdk"),
-              "sdks/python-client/pyproject.toml": ("omnigent",),
+              # The client pins no siblings: it must install without the server.
+              "sdks/python-client/pyproject.toml": (),
               "sdks/ui/pyproject.toml": ("omnigent-client",),
           }
           errors = []
