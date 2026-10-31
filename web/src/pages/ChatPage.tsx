@@ -131,6 +131,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  appendReplyDraft,
   appendReplyQuote,
   restoreReplyDraft,
   serializeReplyDraft,
@@ -3049,7 +3050,8 @@ function ComposerImpl(
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
   // case — `submit` clears it optimistically — so only fill it when the user
-  // hasn't already started something new; their in-progress text wins. Files
+  // hasn't already started something new; their in-progress text wins, and
+  // text recovered when the session loaded goes after it. Files
   // are re-validated on the way in: when the upload itself was what failed
   // (a 415 on an unsupported type), re-arming the same file would only fail
   // again, so it's dropped with the same inline reason a fresh attach gives.
@@ -3062,11 +3064,15 @@ function ComposerImpl(
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
     // Re-check live delivery and preserve any newer input before consuming the failure.
-    const failed = takeFailedSendDraft(
-      failedSendDraft.conversationId,
-      valueRef.current.trim() !== "" || filesRef.current.length > 0,
-    );
+    const hasNewerInput = valueRef.current.trim() !== "" || filesRef.current.length > 0;
+    const failed = takeFailedSendDraft(failedSendDraft.conversationId, hasNewerInput, true);
     if (!failed) return;
+    if (hasNewerInput) {
+      const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));
+      replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
+      dirtyRef.current = true;
+      return;
+    }
     pendingFailedSendRestore.current = failed.stableId
       ? { stableId: failed.stableId, draft }
       : null;

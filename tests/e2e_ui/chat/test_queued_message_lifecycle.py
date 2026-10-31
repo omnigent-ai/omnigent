@@ -40,7 +40,11 @@ from __future__ import annotations
 
 import re
 
+import httpx
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
+from tests.e2e_ui.conftest import configure_mock_llm
 
 # Unique sentinels per test so a user bubble is unambiguously locatable
 # and can't collide with the assistant's reply text. Worded so the model
@@ -49,6 +53,8 @@ _NAV_MSG = "sentinel-nav-7f3a remember this exact phrase"
 _PROMOTE_MSG = "sentinel-promote-91b2 keep this bubble"
 _QUEUE_MSG_A = "sentinel-queue-a-4d1e first of two"
 _QUEUE_MSG_B = "sentinel-queue-b-8c6f second of two"
+_RELOAD_MSG_A = "sentinel-reload-a-2b7c hold this turn open"
+_RELOAD_MSG_B = "sentinel-reload-b-6e0d queued behind it"
 
 _COMPOSER_PLACEHOLDER = "Send a message…"
 
@@ -183,3 +189,35 @@ def test_second_message_queued_while_first_streams_both_render(
     expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
     expect(_user_bubble(page, _QUEUE_MSG_A)).to_have_count(1, timeout=60_000)
     expect(_user_bubble(page, _QUEUE_MSG_B)).to_have_count(1, timeout=60_000)
+
+
+def test_queued_message_returns_to_the_composer_after_a_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """A message queued behind a running turn is back in the composer after a reload."""
+    base_url, session_id = seeded_session
+    # Title generation sends the same text and can take a gate of its own.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "done", "block": True}] * 4,
+        key="queued-reload",
+        match=_RELOAD_MSG_A,
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    try:
+        _send(page, _RELOAD_MSG_A)
+        poll_until(
+            lambda: httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0).json()["pending"]
+        )
+        _send(page, _RELOAD_MSG_B)
+        expect(page.get_by_test_id("composer-queued-strip")).to_contain_text(_RELOAD_MSG_B)
+
+        page.reload()
+
+        composer = page.get_by_label("Message the agent")
+        expect(composer).to_have_value(_RELOAD_MSG_B, timeout=30_000)
+    finally:
+        for _ in range(4):
+            httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
