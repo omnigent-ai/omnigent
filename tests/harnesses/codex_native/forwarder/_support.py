@@ -179,17 +179,34 @@ def _status_post(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return ("/v1/sessions/conv_x/events", {"type": "external_session_status", "data": data})
 
 
-def _background_work_post(running: bool) -> tuple[str, dict[str, Any]]:
+def _background_work_post(
+    running: bool | None, tasks: list[dict[str, Any]] | None = None
+) -> tuple[str, dict[str, Any]]:
     """
     Return the recorded post for one ``external_background_work`` event.
 
-    :param running: Flag value, e.g. ``True``.
+    :param running: Flag value, e.g. ``True``; ``None`` when the post omits it.
+    :param tasks: Composer rows the post lists, e.g. from :func:`_terminal_tasks`;
+        ``None`` when the post carries no list.
     :returns: ``(url, json)`` as recorded by :class:`_RecordingClient`.
     """
-    return (
-        "/v1/sessions/conv_x/events",
-        {"type": "external_background_work", "data": {"running": running}},
-    )
+    data: dict[str, Any] = {}
+    if running is not None:
+        data["running"] = running
+    if tasks is not None:
+        data["background_task_count"] = len(tasks)
+        data["background_tasks"] = tasks
+    return ("/v1/sessions/conv_x/events", {"type": "external_background_work", "data": data})
+
+
+def _terminal_tasks(*commands: str) -> list[dict[str, Any]]:
+    """
+    Return the composer rows for terminals listed by ``_terminal_listing``.
+
+    :param commands: Command of each running terminal, e.g. ``"npm run dev"``.
+    :returns: One row per terminal, e.g. ``[{"id": "proc_0", "command": "npm run dev"}]``.
+    """
+    return [{"id": f"proc_{index}", "command": command} for index, command in enumerate(commands)]
 
 
 def _turn_started(turn_id: str) -> dict[str, Any]:

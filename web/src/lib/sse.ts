@@ -55,6 +55,7 @@ import type {
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
+  SessionBackgroundTasksEvent,
   SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
@@ -699,6 +700,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       permissionMode,
     } satisfies SessionPermissionModeEvent;
+  }
+  if (eventType === "session.background_tasks") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const backgroundTaskCount = data.background_task_count;
+    if (
+      typeof backgroundTaskCount !== "number" ||
+      !Number.isInteger(backgroundTaskCount) ||
+      backgroundTaskCount < 0
+    ) {
+      return null;
+    }
+    return {
+      type: "session_background_tasks",
+      conversationId,
+      backgroundTaskCount,
+      backgroundTasks: parseBackgroundTasks(data.background_tasks) ?? [],
+    } satisfies SessionBackgroundTasksEvent;
   }
   if (eventType === "session.codex_approval_mode") {
     const conversationId = data.conversation_id;

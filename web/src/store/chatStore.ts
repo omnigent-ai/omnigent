@@ -8282,6 +8282,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // cannot paint Plan mode onto the newly-opened conversation.
       applyToNamedConversation(event.conversationId, { codexPlanMode: event.mode === "plan" });
       return;
+    case "session_background_tasks":
+      // Tasks that changed between turns (codex-native background terminals).
+      // The count is authoritative, as on a `session.status` edge.
+      applyToNamedConversation(event.conversationId, {
+        backgroundTaskCount: event.backgroundTaskCount,
+        backgroundTasks: event.backgroundTasks,
+      });
+      return;
     case "session_codex_approval_mode":
       // A Codex approval switch made in the web picker or the native TUI's
       // /permissions popup; the server has confirmed it's the live mode.

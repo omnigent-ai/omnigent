@@ -525,6 +525,7 @@ from omnigent.server.routes._sessions.helpers import (
     _seed_missing_title_from_user_message as _seed_missing_title_from_user_message,
     _session_status_from_cache as _session_status_from_cache,
     _session_status_with_child_rollup as _session_status_with_child_rollup,
+    _set_background_tasks as _set_background_tasks,
     _set_background_work_running as _set_background_work_running,
     _set_blocked_on as _set_blocked_on,
     _set_read_state as _set_read_state,
