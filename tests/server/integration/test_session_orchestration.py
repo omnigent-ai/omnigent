@@ -7,19 +7,18 @@ import pytest
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
-from tests.server.integration.test_managed_startup_inputs import (
-    startup_permissions as startup_permissions,
-)
 from tests.server.integration.test_sessions_attribution import _bind_runner
 from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
 from tests.server.integration.test_sessions_permissions import _create_session_as
@@ -28,6 +27,18 @@ from tests.server.integration.test_sessions_subagent_context import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+class LegacyPermissionStore(SqlAlchemyPermissionStore):
+    has_other_write_grants = PermissionStore.has_other_write_grants
+
+
+@pytest.fixture
+def startup_permissions(db_uri, request):
+    store_type = (
+        LegacyPermissionStore if getattr(request, "param", False) else SqlAlchemyPermissionStore
+    )
+    return store_type(db_uri)
 
 
 @pytest.fixture(autouse=True)
@@ -61,14 +72,27 @@ async def _send(client, source, target, message="Please inspect the PR"):
     )
 
 
+@pytest.mark.parametrize(
+    "startup_permissions,read_only",
+    [(False, False), (False, True), (True, False), (True, True)],
+    ids=["sql-private", "sql-read-only", "legacy-private", "legacy-read-only"],
+    indirect=["startup_permissions"],
+)
 @pytest.mark.parametrize("policy_denied", [False, True])
 @pytest.mark.parametrize(
     "orchestration_environment",
     [None, "", "usage_page", "-session_orchestration"],
     indirect=True,
 )
-async def test_private_sender_can_message_shared_receiver(
-    auth_client, peers, db_uri, monkeypatch, policy_denied, orchestration_environment
+async def test_sender_can_message_shared_receiver(
+    auth_client,
+    peers,
+    db_uri,
+    monkeypatch,
+    policy_denied,
+    orchestration_environment,
+    startup_permissions,
+    read_only,
 ):
     from omnigent.server.routes.sessions import routes_events
 
@@ -76,6 +100,8 @@ async def test_private_sender_can_message_shared_receiver(
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     permissions.grant("bob", target["id"], LEVEL_READ)
+    if read_only:
+        permissions.grant("bob", source["id"], LEVEL_READ)
     if policy_denied:
 
         async def deny_task(*args, **kwargs):
@@ -85,6 +111,10 @@ async def test_private_sender_can_message_shared_receiver(
     result = await _send(auth_client, source, target)
     if orchestration_environment == "-session_orchestration":
         assert "Session orchestration is disabled" in result["detail"]
+        assert not captured.get("posts")
+        return
+    if read_only and isinstance(startup_permissions, LegacyPermissionStore):
+        assert "permission store" in result["detail"]
         assert not captured.get("posts")
         return
     if policy_denied:
@@ -111,7 +141,9 @@ async def test_runner_is_trusted_for_other_owned_sessions_it_hosts(auth_client, 
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     permissions.grant("bob", sibling["id"], LEVEL_READ)
-    assert "Shared sessions cannot" in (await _send(auth_client, sibling, target))["detail"]
+    assert (await _send(auth_client, sibling, target)).get("queued") is True
+    permissions.grant("bob", sibling["id"], LEVEL_EDIT)
+    assert "edit sharing" in (await _send(auth_client, sibling, target))["detail"]
 
 
 @pytest.mark.parametrize("batch", [False, True])
@@ -141,7 +173,7 @@ async def test_peer_message_tracks_runner_startup(auth_client, peers, monkeypatc
     "condition",
     [
         "flag_off",
-        "shared_read",
+        "shared_manage",
         "shared_edit",
         "public",
         "other_owner",
@@ -159,11 +191,11 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
     permissions = SqlAlchemyPermissionStore(db_uri)
     if condition == "flag_off":
         auth_app.state.feature_flags = FeatureFlags()
-    if condition in {"shared_read", "shared_edit", "public"}:
+    if condition in {"shared_manage", "shared_edit", "public"}:
         user = "__public__" if condition == "public" else "bob"
         permissions.ensure_user(user)
         permissions.grant(
-            user, source["id"], LEVEL_EDIT if condition == "shared_edit" else LEVEL_READ
+            user, source["id"], LEVEL_MANAGE if condition == "shared_manage" else LEVEL_EDIT
         )
     if condition in {"other_owner", "admin"}:
         other = await _create_session_as(auth_client, "", "bob")
@@ -207,7 +239,7 @@ async def test_sharing_during_receiver_startup_blocks_delivery(
     permissions.ensure_user("bob")
 
     async def share_while_starting(*args, **kwargs):
-        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
 
     monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", share_while_starting)
     result = await _send(auth_client, source, target)
@@ -217,7 +249,8 @@ async def test_sharing_during_receiver_startup_blocks_delivery(
     assert "Please inspect" not in items.text
 
 
-async def test_child_inherits_source_sharing(auth_client, peers, db_uri):
+@pytest.mark.parametrize("share_child", [False, True])
+async def test_child_inherits_source_sharing(auth_client, peers, db_uri, share_child):
     source, target, captured = peers
     response = await auth_client.post(
         "/v1/sessions",
@@ -231,14 +264,17 @@ async def test_child_inherits_source_sharing(auth_client, peers, db_uri):
     assert (await _send(auth_client, child, target)).get("queued") is True
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
-    permissions.grant("bob", source["id"], LEVEL_READ)
+    shared_id = child["id"] if share_child else source["id"]
+    permissions.grant("bob", shared_id, LEVEL_READ)
+    assert (await _send(auth_client, child, target)).get("queued") is True
+    permissions.grant("bob", shared_id, LEVEL_EDIT)
     captured.clear()
-    assert "Shared sessions cannot" in (await _send(auth_client, child, target))["detail"]
+    assert "edit sharing" in (await _send(auth_client, child, target))["detail"]
     assert not captured.get("posts")
 
 
 @pytest.mark.parametrize("descendant", ["side_chat", "nested_side_chat", "child"])
-@pytest.mark.parametrize("share", ["source", "side_chat"])
+@pytest.mark.parametrize("share", ["source", "side_chat", "source_without_display_marker"])
 async def test_side_chat_inherits_sharing_for_new_controls(
     auth_client, peers, db_uri, descendant, share
 ):
@@ -266,13 +302,23 @@ async def test_side_chat_inherits_sharing_for_new_controls(
     assert (await _send(auth_client, manager, target)).get("queued") is True
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
-    shared_id = source["id"] if share == "source" else side["id"]
+    shared_id = side["id"] if share == "side_chat" else source["id"]
     permissions.grant("bob", shared_id, LEVEL_READ)
+    assert (await _send(auth_client, manager, target)).get("queued") is True
+    permissions.grant("bob", shared_id, LEVEL_EDIT)
     store = SqlAlchemyConversationStore(db_uri)
+    if share == "source_without_display_marker":
+        response = await auth_client.patch(
+            f"/v1/sessions/{side['id']}", json={"labels": {SIDE_CHAT_LABEL_KEY: ""}}
+        )
+        assert response.status_code == 200, response.text
+        assert (
+            store.get_conversation(side["id"]).labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source["id"]
+        )
     before_sessions = {s.id for s in store.list_conversations().data}
     before_grants = permissions.list_for_user("alice")
     captured.clear()
-    assert "Shared sessions cannot" in (await _send(auth_client, manager, target))["detail"]
+    assert "edit sharing" in (await _send(auth_client, manager, target))["detail"]
     for placement in ("same_host", "managed"):
         result = json.loads(
             await execute_tool(
@@ -282,7 +328,7 @@ async def test_side_chat_inherits_sharing_for_new_controls(
                 conversation_id=manager["id"],
             )
         )
-        assert "Shared sessions cannot" in result["detail"], result
+        assert "edit sharing" in result["detail"], result
     assert not captured.get("posts")
     assert {s.id for s in store.list_conversations().data} == before_sessions
     assert permissions.list_for_user("alice") == before_grants
@@ -291,6 +337,8 @@ async def test_side_chat_inherits_sharing_for_new_controls(
     assert history.status_code == 200, history.text
     _bind_runner(db_uri, target["id"])
     assert (await _send(auth_client, target, manager)).get("queued") is True
+    permissions.grant("bob", shared_id, LEVEL_READ)
+    assert (await _send(auth_client, manager, target)).get("queued") is True
     permissions.revoke("bob", shared_id)
     assert (await _send(auth_client, manager, target)).get("queued") is True
 
@@ -462,7 +510,7 @@ async def test_creation_refuses_before_launch(
     if condition == "shared":
         permissions = SqlAlchemyPermissionStore(db_uri)
         permissions.ensure_user("bob")
-        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
     elif condition == "binding":
         auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "wrong"
     store = SqlAlchemyConversationStore(db_uri)
@@ -479,7 +527,7 @@ async def test_creation_refuses_before_launch(
     )
     expected = {
         "flag_off": "Session orchestration is disabled",
-        "shared": "Shared sessions cannot",
+        "shared": "edit sharing",
         "binding": "requires the sender's bound runner",
     }[condition]
     assert expected in result["detail"], result
@@ -551,6 +599,9 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
     source, _, captured = peers
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    permissions.grant("bob", source["id"], LEVEL_READ)
     hosts = [uuid4().hex for _ in range(3)]
     for host_id, owner in zip(hosts, ("alice", "alice", "bob"), strict=True):
         _register_online_host(auth_app, host_id, owner)
@@ -742,6 +793,9 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
     from omnigent.server.sharing_settings import DefaultPublicSessions
 
     source, _, _ = peers
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    permissions.grant("bob", source["id"], LEVEL_READ)
     deployment = parse_sandbox_config(
         {
             "server_url": "https://managed-test.example.com",
@@ -867,7 +921,7 @@ async def test_startup_queue_admission_and_replay(
         result = await accepts(*args)
         assert result is True
         if share_before_admission:
-            permissions.grant("bob", source["id"], LEVEL_READ)
+            permissions.grant("bob", source["id"], LEVEL_EDIT)
         return result
 
     monkeypatch.setattr(startup, "accepts", check_startup)
@@ -875,19 +929,19 @@ async def test_startup_queue_admission_and_replay(
     pending = store.list_pending_inputs(target["id"])
     assert not captured.get("posts")
     if share_before_admission:
-        assert "Shared sessions cannot" in result["detail"]
+        assert "edit sharing" in result["detail"]
         assert pending == []
     else:
         assert result["queued"] is True
         assert len(pending) == 1
-        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
         await startup._deliver(auth_app, target["id"], pending[0])
         await startup._deliver(auth_app, target["id"], pending[0])
         delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
         assert len(delivered) == 1
         assert f"[Message from session {source['id']}]" in json.dumps(delivered)
         assert store.list_pending_inputs(target["id"]) == []
-        assert "Shared sessions cannot" in (await _send(auth_client, source, target))["detail"]
+        assert "edit sharing" in (await _send(auth_client, source, target))["detail"]
 
 
 @pytest.mark.parametrize("two_replica_stack", ["authenticated"], indirect=True)

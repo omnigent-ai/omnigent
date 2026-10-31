@@ -938,7 +938,7 @@ class SysSessionCreateTool(Tool):
             "using the server's configured default provider. Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
-            "and a private sending session, including its side-chat source chain. "
+            "and a sending session without edit sharing, including its side-chat source chain. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
