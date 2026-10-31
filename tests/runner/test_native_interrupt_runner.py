@@ -74,6 +74,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        confirmed_cancellation: bool = False,
     ) -> _FakeAck:
         if only_if_work_id is not None and only_if_work_id != captured["current_work_id"]:
             # A newer dispatch replaced the entry: drop the delayed op untouched.
@@ -86,6 +87,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
                 "status": status,
                 "output": output,
                 "only_if_work_id": only_if_work_id,
+                "confirmed_cancellation": confirmed_cancellation,
             }
         )
         return _FakeAck()
@@ -525,6 +527,7 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
     assert captured["wakes"] == [("conv_c", "cancelled", None)]
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
@@ -604,6 +607,7 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert captured["wakes"] == [("conv_cn", "cancelled", None)]
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
