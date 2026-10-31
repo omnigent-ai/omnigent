@@ -2826,21 +2826,47 @@ describe("managed server preference wiring", () => {
 });
 
 describe("Databricks-internal local-host CLI wiring", () => {
-  it("selects isaac omni only behind the internal flag and Databricks server gate", () => {
+  it("selects isaac omni only on a Databricks server, behind the internal flag or the page's hint", () => {
     assert.match(
       liveCode,
-      /function hostCliCommand\(serverUrl\)[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
+      /function usesIsaacHost\(serverUrl, connectHostCommand\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\) &&[\s\S]{0,80}\(isIsaacHostHint\(connectHostCommand\) \|\| databricksInternalFeaturesEnabled\(\)\)/,
+    );
+    assert.match(
+      liveCode,
+      /function hostCliCommand\(serverUrl, connectHostCommand\)[\s\S]{0,120}usesIsaacHost\(serverUrl, connectHostCommand\)\) return resolvedCliPath\(\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
+    );
+  });
+
+  it("accepts only the exact `isaac omni` hint and runs it as the page shows it", () => {
+    assert.match(
+      liveCode,
+      /function isIsaacHostHint\(connectHostCommand\)[\s\S]{0,150}typeof connectHostCommand === "string"[\s\S]{0,120}=== "isaac omni"/,
+    );
+    assert.match(
+      liveCode,
+      /isIsaacHostHint\(connectHostCommand\) \? \{ \.\.\.command, backgroundConnect: true \} : command/,
     );
   });
 
   it("uses the selected command for identity availability and every host action", () => {
     assert.match(
       liveCode,
-      /host-get-identity[\s\S]{0,350}Boolean\(hostCliCommand\(senderServerUrl\(event\)\)\)/,
+      /host-get-identity", \(event, options\)[\s\S]{0,350}Boolean\(hostCliCommand\(senderServerUrl\(event\), options\?\.connectHostCommand\)\)/,
     );
     assert.match(
       liveCode,
-      /host-control[\s\S]{0,450}const cliCommand = hostCliCommand\(serverUrl\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, serverUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, serverUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, serverUrl\)/,
+      /host-control", async \(event, action, options\)[\s\S]{0,450}const cliCommand = hostCliCommand\(serverUrl, connectHostCommand\)[\s\S]{0,200}missingHostCliError\(serverUrl, connectHostCommand\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, hostServerUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, hostServerUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, hostServerUrl\)/,
+    );
+  });
+
+  it("runs the page's command against the URL the page shows, only on the window's origin", () => {
+    assert.match(
+      liveCode,
+      /const hostServerUrl = cliCommand\.backgroundConnect\s*\?\s*\(sameOriginServerUrl\(options\?\.serverUrl, serverUrl\) \?\? serverUrl\)\s*:\s*serverUrl;/,
+    );
+    assert.match(
+      liveCode,
+      /function sameOriginServerUrl\(pageServerUrl, windowServerUrl\)[\s\S]{0,300}url\.username \|\| url\.password\) return null;[\s\S]{0,80}url\.origin === originOf\(windowServerUrl\) \? pageServerUrl\.trim\(\) : null/,
     );
   });
 
