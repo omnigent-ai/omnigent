@@ -296,6 +296,7 @@ class SqlAlchemySkillStore(SkillStore):
                         installed_count=0,
                         enabled_bytes=0,
                         enabled_entries=0,
+                        revision=0,
                         created_at=now_epoch(),
                     )
                 )
@@ -447,6 +448,7 @@ class SqlAlchemySkillStore(SkillStore):
             lock.installed_count += len(adding)
             lock.enabled_bytes = after
             lock.enabled_entries = entries_after
+            lock.revision += 1
             session.flush()
             return results
 
@@ -513,6 +515,15 @@ class SqlAlchemySkillStore(SkillStore):
                 found.extend(_skill_entity(row) for row in session.scalars(stmt))
         return found
 
+    def installed_revision(self, user_id: str | None) -> str:
+        """The org's and *user_id*'s principal revisions: two primary-key reads."""
+        with self._session("read_installed_skills_revision") as session:
+            revisions = []
+            for principal in _visible_principals(user_id):
+                lock = session.get(SqlSkillPrincipal, (current_workspace_id(), principal))
+                revisions.append(0 if lock is None else lock.revision)
+            return ".".join(str(revision) for revision in revisions)
+
     def count_installed(self, scope: SkillScope, owner_user_id: str | None) -> int:
         """Rows of one principal, from the total its lock row keeps."""
         with self._session("count_installed_skills") as session:
@@ -561,6 +572,7 @@ class SqlAlchemySkillStore(SkillStore):
                 )
                 lock.enabled_bytes = after
                 lock.enabled_entries = entries_after
+            lock.revision += 1
             row.commit = commit
             row.bundle_location = bundle_location
             row.bundle_bytes = bundle_bytes
@@ -607,6 +619,8 @@ class SqlAlchemySkillStore(SkillStore):
             elif row.enabled and not enabled:
                 lock.enabled_bytes -= row.bundle_bytes
                 lock.enabled_entries -= row.bundle_entries
+            if row.enabled != enabled:
+                lock.revision += 1
             row.enabled = enabled
             row.updated_at = now_epoch()
             session.flush()
@@ -622,6 +636,7 @@ class SqlAlchemySkillStore(SkillStore):
             lock, row = locked
             entity = _skill_entity(row)
             lock.installed_count -= 1
+            lock.revision += 1
             if row.enabled:
                 lock.enabled_bytes -= row.bundle_bytes
                 lock.enabled_entries -= row.bundle_entries

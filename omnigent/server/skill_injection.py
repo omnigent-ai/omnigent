@@ -9,13 +9,15 @@ caller sees rather than a skill silently missing from the menu.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 
-from omnigent.entities import Agent, InstalledSkill
+from omnigent.entities import Agent, Conversation, InstalledSkill
+from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.skills.git_source import ancestor_paths
 from omnigent.skills.limits import (
@@ -35,7 +37,7 @@ from omnigent.skills.overlay import (
 from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
 from omnigent.spec.types import AgentSpec
 from omnigent.spec.validator import is_valid_skill_name
-from omnigent.stores import ArtifactStore
+from omnigent.stores import ArtifactStore, ConversationStore
 from omnigent.stores.skill_store import SkillStore
 
 _logger = logging.getLogger(__name__)
@@ -60,6 +62,31 @@ class SessionTarget:
 
     spec: AgentSpec | None
     prefix: str
+
+
+async def session_agent_revision(
+    bundle_location: str,
+    conv: Conversation,
+    *,
+    skill_store: SkillStore | None,
+    conversation_store: ConversationStore,
+) -> str:
+    """The revision a session's turn carries, including its owner's installed skills.
+
+    The runner rebuilds a session's spec when the revision changes, so a
+    marketplace change reaches a warm session's next turn instead of its
+    menu listing a skill its spec lacks. Without the marketplace this is the
+    bundle-and-selection revision alone.
+    """
+    base = mcp_selection_revision(bundle_location, conv.labels)
+    if skill_store is None:
+        return base
+
+    def installed() -> str:
+        owner = conversation_store.get_session_owner(conv.id, owner_only=True)
+        return skill_store.installed_revision(owner)
+
+    return f"{base}+skills.{await asyncio.to_thread(installed)}"
 
 
 def bundle_spec(agent_cache: AgentCache | None, agent: Agent) -> AgentSpec | None:

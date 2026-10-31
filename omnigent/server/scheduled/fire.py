@@ -76,7 +76,6 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -94,6 +93,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.skill_injection import session_agent_revision
 from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
 if TYPE_CHECKING:
@@ -1265,8 +1265,13 @@ async def _own_task_agent(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
 async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
     """The bundle the kickoff runs, so the runner can tell when it later changes."""
     agent = await asyncio.to_thread(deps.agent_store.get, conv.agent_id) if conv.agent_id else None
-    return (
-        mcp_selection_revision(agent.bundle_location, conv.labels) if agent is not None else None
+    if agent is None:
+        return None
+    return await session_agent_revision(
+        agent.bundle_location,
+        conv,
+        skill_store=getattr(deps.app_state, "skill_store", None),
+        conversation_store=deps.conversation_store,
     )
 
 
