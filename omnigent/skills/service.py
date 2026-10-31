@@ -23,6 +23,8 @@ from omnigent.skills.git_source import (
     SparseCheckout,
     checkout_commit,
     clone_github_source,
+    directory_pattern,
+    literal_pattern,
     normalize_source_path,
     parse_github_source,
     repository_path,
@@ -144,8 +146,11 @@ def resolve_source(
 
 
 def catalog_patterns(path: str) -> tuple[str, ...]:
-    """Sparse patterns for indexing *path*: its ``SKILL.md`` files and marketplace manifest."""
-    lead = f"/{path}" if path else ""
+    """Sparse patterns for indexing *path*: its ``SKILL.md`` files and marketplace manifest.
+
+    *path* is matched literally (see :func:`literal_pattern`).
+    """
+    lead = literal_pattern(path)
     return (f"{lead}/**/SKILL.md", f"{lead}/{MARKETPLACE_MANIFEST}")
 
 
@@ -290,7 +295,7 @@ class SkillFetcher:
                 for entry in _index(checkout, directory, None):
                     if entry.name in names:
                         by_name.setdefault(entry.name, entry)
-            return [f"/{by_name[name].path}/" for name in names if name in by_name]
+            return [directory_pattern(by_name[name].path) for name in names if name in by_name]
 
         patterns = tuple(dict.fromkeys(p for d in search for p in catalog_patterns(d)))
 
