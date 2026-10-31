@@ -105,3 +105,88 @@ async def test_a_sandboxed_shell_runs_a_bundle_skills_script() -> None:
         # Granted read-only: the sandbox cannot rewrite the skill.
         wrote = await env.shell(f"echo x > {shlex.quote(str(script))}", timeout=30)
         assert wrote.get("exit_code") not in (None, 0), wrote
+
+
+def test_a_terminal_sandbox_gets_the_read_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Terminals built their own environment from the parent os_env spec, so
+    # only the primary environment had the skill directories granted.
+    from omnigent.inner import terminal as terminal_mod
+    from omnigent.inner.datamodel import TerminalEnvSpec
+
+    _bundle, skill = _bundle_with_skill(tmp_path)
+    granted: list[list[Path]] = []
+    real_create = terminal_mod.create_os_environment
+
+    def capture(spec: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        granted.append(list(kwargs.get("additional_read_roots", ())))  # type: ignore[arg-type]
+        return real_create(spec, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr(terminal_mod, "create_os_environment", capture)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    result = terminal_mod.create_terminal_instance(
+        name="bash",
+        session_key="s1",
+        spec=TerminalEnvSpec(command="bash"),
+        parent_os_env_spec=OSEnvSpec(type="caller_process", cwd=str(workspace)),
+        additional_read_roots=[skill.skill_dir],  # type: ignore[list-item]
+    )
+    try:
+        assert granted == [[skill.skill_dir]]
+    finally:
+        import shutil
+
+        shutil.rmtree(result.instance.private_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_sys_terminal_and_native_terminals_pass_the_agents_skill_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import json
+
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runner.native.orchestration import _agent_skill_roots
+    from omnigent.terminals import TerminalRegistry
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.sys_terminal import SysTerminalLaunchTool
+
+    _bundle, skill = _bundle_with_skill(tmp_path)
+    seen: list[object] = []
+
+    async def capture(*_args: object, **kwargs: object) -> object:
+        seen.append(kwargs.get("additional_read_roots"))
+        raise RuntimeError("stop after the launch arguments are known")
+
+    registry = TerminalRegistry()
+    monkeypatch.setattr(registry, "launch", capture)
+    agent = AgentSpec(
+        spec_version=1,
+        name="skills",
+        terminals={"bash": TerminalEnvSpec(command="bash")},
+        skills=[skill],
+    )
+    tool = SysTerminalLaunchTool(spec=agent, registry=registry)
+    ctx = ToolContext(task_id="t", agent_id="a", workspace=tmp_path, conversation_id="c" * 32)
+    raw = await asyncio.to_thread(
+        tool.invoke, json.dumps({"terminal": "bash", "session": "s1"}), ctx
+    )
+    assert "launch failed" in json.loads(raw)["error"]
+    assert seen == [[skill.skill_dir]]
+
+    # The runner's native terminals forward the agent's skill directories too.
+    assert _agent_skill_roots(agent) == [skill.skill_dir]
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    with pytest.raises(RuntimeError, match="stop after"):
+        await resources.launch_auxiliary_terminal(
+            session_id="s1",
+            terminal_name="bash",
+            session_key="main",
+            spec=TerminalEnvSpec(command="bash"),
+            additional_read_roots=_agent_skill_roots(agent),
+        )
+    assert seen[-1] == [skill.skill_dir]
