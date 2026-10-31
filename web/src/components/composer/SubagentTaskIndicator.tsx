@@ -8,6 +8,7 @@ import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSession
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import { cn } from "@/lib/utils";
+import { childPrimaryLabel } from "@/shell/subagentLabel";
 import { useOpenSubagentInPanel } from "@/shell/subagentPanelOpener";
 import { childStatus } from "@/shell/subagentStatus";
 
@@ -25,16 +26,6 @@ interface IndicatorChild {
   child: ChildSessionInfo;
   state: IndicatorState;
   statusLabel: string;
-}
-
-function subagentLabel(child: ChildSessionInfo): string {
-  const summary = child.task_summary?.trim();
-  if (summary) return summary;
-  const name = child.session_name?.trim();
-  if (name) return name;
-  const title = child.title?.trim();
-  if (title) return title;
-  return "Sub-agent";
 }
 
 function indicatorChild(child: ChildSessionInfo): IndicatorChild | null {
@@ -109,7 +100,7 @@ function SubagentNavigationRow({
 }) {
   const search = sessionNavigationSearch(useLocation().search);
   const openInPanel = useOpenSubagentInPanel();
-  const label = subagentLabel(child);
+  const label = childPrimaryLabel(child, "Sub-agent");
   const tool = child.tool?.trim();
   const showTool = !!tool && tool !== label;
 

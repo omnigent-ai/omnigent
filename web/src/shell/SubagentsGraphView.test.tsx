@@ -545,13 +545,14 @@ describe("buildTree", () => {
     expect(tree.children[0].children[0].children[0].children).toHaveLength(0);
   });
 
-  it("uses session_name, then title, then tool, then id as label", () => {
+  it("uses summary with handle, then session_name, title, tool and id as label", () => {
     const map = new Map<string, ChildSessionInfo[]>();
     map.set("root", [
       childInfo({ id: "c1", session_name: "named" }),
       childInfo({ id: "c2", title: "titled" }),
       childInfo({ id: "c3", tool: "tooled" }),
       childInfo({ id: "c4" }),
+      childInfo({ id: "c5", task_summary: "Investigate auth", session_name: "auth-sweep" }),
     ]);
 
     const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
@@ -560,6 +561,8 @@ describe("buildTree", () => {
     expect(tree.children[1].label).toBe("titled");
     expect(tree.children[2].label).toBe("tooled");
     expect(tree.children[3].label).toBe("c4");
+    // The graph names a summarized worker like the rail: summary, then handle.
+    expect(tree.children[4].label).toBe("Investigate auth · auth-sweep");
   });
 
   it("prefers the server-resolved tool label over session_name for native sub-agent children", () => {
