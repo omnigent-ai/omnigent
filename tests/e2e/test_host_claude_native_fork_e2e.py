@@ -51,6 +51,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.polling import poll_until
 from tests.e2e.conftest import (
     _CLAUDE_CODER_DIR,
     configure_mock_llm,
@@ -61,6 +62,7 @@ from tests.e2e.conftest import (
 )
 from tests.e2e.helpers import POLL_INTERVAL_S
 from tests.e2e.test_host_claude_native_e2e import (
+    _assistant_text,
     _claude_native_agent_id,
     _online_host_id,
     _poll_for_assistant_marker,
@@ -887,3 +889,100 @@ def test_fork_native_source_into_sdk_carries_history(
                 f"SDK clone did not recall {marker!r} (got {text!r}) — the native "
                 "source's transcript was not replayed as context into the SDK clone"
             )
+
+
+def _plant_code_words(client: httpx.Client, *, session_id: str, words: list[str]) -> None:
+    """Plant each code word in its own turn and wait for Claude's ACK."""
+    for index, word in enumerate(words):
+        ack = f"ACK{index}"
+        _send_user_message(
+            client,
+            session_id=session_id,
+            text=f"Remember this code word for later: {word}. Reply with exactly: {ack}",
+        )
+        _poll_for_assistant_marker(client, session_id=session_id, marker=ack, timeout=180.0)
+
+
+def _wait_until_idle(client: httpx.Client, *, session_id: str) -> None:
+    """Wait for *session_id*'s turn to end; the turn-end edge can trail the reply."""
+    poll_until(
+        lambda: (
+            client.get(f"/v1/sessions/{session_id}", timeout=30.0).json()["status"] != "running"
+        ),
+        timeout_s=60.0,
+    )
+
+
+def _create_sdk_session_on_host(client: httpx.Client, *, host_id: str, workspace: Path) -> str:
+    """Create a ``sdk-chat-builtin`` claude-sdk session on *host_id*.
+
+    The built-in pins a dated model; the ``sonnet`` alias resolves on any
+    Claude login.
+    """
+    created = client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": _builtin_agent_id(client, "sdk-chat-builtin"),
+            "host_id": host_id,
+            "workspace": str(workspace),
+            "model_override": "sonnet",
+        },
+        timeout=60.0,
+    )
+    created.raise_for_status()
+    return str(created.json()["id"])
+
+
+def test_clear_claude_sdk_continues_empty_on_the_same_host(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    claude-sdk ``/clear`` continues in an empty session on the same host and runner.
+
+    The SDK replays the Omnigent transcript into a fresh client, so a cleared
+    session that still recalled the planted word would mean the history came
+    along. The original keeps a notice linking to the new session.
+    """
+    workspace = tmp_path / "clear_sdk_ws"
+    workspace.mkdir()
+    word = f"CLEARWORD_{uuid.uuid4().hex[:6].upper()}"
+
+    with _host_daemon(tmp_path, live_server):
+        host_id = _online_host_id(http_client, timeout=30.0)
+        source_id = _create_sdk_session_on_host(http_client, host_id=host_id, workspace=workspace)
+        _plant_code_words(http_client, session_id=source_id, words=[word])
+        # /clear refuses a running turn.
+        _wait_until_idle(http_client, session_id=source_id)
+
+        cleared = http_client.post(
+            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}, timeout=60.0
+        )
+        assert cleared.status_code == 202, cleared.text
+        cleared_id = str(cleared.json()["session_id"])
+        source = http_client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
+        new = http_client.get(f"/v1/sessions/{cleared_id}", timeout=30.0).json()
+        assert (new["runner_id"], new["host_id"], new["workspace"], new["model_override"]) == (
+            source["runner_id"],
+            source["host_id"],
+            source["workspace"],
+            "sonnet",
+        )
+        items = http_client.get(
+            f"/v1/sessions/{source_id}/items", params={"limit": 5, "order": "desc"}, timeout=30.0
+        ).json()["data"]
+        assert any(f"/c/{cleared_id}" in _assistant_text(item) for item in items), items
+
+        _send_user_message(
+            http_client,
+            session_id=cleared_id,
+            text=(
+                "Reply with the code word I gave you earlier, or exactly NOCODEWORD if I "
+                "have not given you one."
+            ),
+        )
+        reply = _poll_for_assistant_marker(
+            http_client, session_id=cleared_id, marker="NOCODEWORD", timeout=180.0
+        )
+        assert word not in reply, f"cleared claude-sdk session recalled {word!r}: {reply!r}"
