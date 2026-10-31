@@ -695,27 +695,15 @@ async def test_interrupted_turn_tally_adds_launches_to_last_stop_count(tmp_path:
     ]
 
 
-def test_background_launch_from_an_ended_turn_is_already_in_stop_count() -> None:
-    dedupe = forwarder._ForwardDedupeState()
-    launch = ClaudeTranscriptItem(
-        source_id="r1:0:function_call_output",
-        item_type="function_call_output",
-        data={"call_id": "toolu_bg", "output": "Command running in background"},
-        response_id="resp_ended",
-        background_task_id="bh5h2361s",
-    )
-
-    forwarder._note_background_shell_signals(
-        launch, dedupe, ended_response_ids=("resp_ended", None)
-    )
-
-    assert (dedupe.background_task_count, dedupe.background_tally_changed) == (0, False)
-
-
 @pytest.mark.parametrize(
     "stop",
-    [None, "after-launch", "before-launch-delivery"],
-    ids=["no-stop", "stop-after-launch", "launch-delivered-after-its-stop"],
+    [None, "after-launch", "before-launch-delivery", "before-older-response-launch"],
+    ids=[
+        "no-stop",
+        "stop-after-launch",
+        "launch-delivered-after-its-stop",
+        "launch-from-older-response-after-stop",
+    ],
 )
 def test_background_finish_lowers_count_only_for_counted_shells(
     monkeypatch: pytest.MonkeyPatch, stop: str | None
@@ -724,7 +712,8 @@ def test_background_finish_lowers_count_only_for_counted_shells(
     earlier = {**_LONG_JOB_SHELL, "id": "earlier"}
     dedupe = forwarder._ForwardDedupeState()
     forwarder._reset_background_tally(dedupe, count=1, tasks=[earlier], task_ids=["earlier"])
-    if stop == "before-launch-delivery":
+    stop_counted_launch = stop in ("before-launch-delivery", "before-older-response-launch")
+    if stop_counted_launch:
         forwarder._reset_background_tally(
             dedupe, count=2, tasks=[earlier], task_ids=["earlier", "bh5h2361s"]
         )
@@ -737,6 +726,7 @@ def test_background_finish_lowers_count_only_for_counted_shells(
     )
     ended_response_ids = ("resp_1",) if stop == "before-launch-delivery" else ()
     forwarder._note_background_shell_signals(launch, dedupe, ended_response_ids=ended_response_ids)
+    assert dedupe.background_tally_changed is not stop_counted_launch
     if stop == "after-launch":
         forwarder._reset_background_tally(
             dedupe, count=2, tasks=[earlier], task_ids=["earlier", "bh5h2361s"]

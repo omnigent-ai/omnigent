@@ -160,6 +160,7 @@ class _MockRequestLog:
 
     def refresh(self) -> list[str]:
         response = httpx.get(f"{self._mock_url}/mock/requests", timeout=10.0)
+        response.raise_for_status()
         captured = response.json()["requests"]
         self.bodies.extend(json.dumps(body) for body in captured[len(self.bodies) :])
         return self.bodies
@@ -486,20 +487,25 @@ def test_background_shell_count_after_turn_ends(
                     "pill": pill.get_attribute("aria-label") if pill.count() else None,
                 }
             )
-            if samples[-1]["pill"]:
-                break
             time.sleep(0.5)
 
         _report("background-shell", {"session_id": session_id, "samples": samples})
-        assert samples[-1]["pill"] == "1 background task still running", (
+        expected = "1 background task still running"
+        labels = [sample["pill"] for sample in samples]
+        assert expected in labels, (
             f"no background-task count {_SHELL_OBSERVE_S}s after the turn ended while "
             f"`sleep 120` still runs; CLI:\n{cli_screen}"
+        )
+        assert set(labels[labels.index(expected) :]) == {expected}, (
+            f"the background-task count did not stay shown while `sleep 120` still runs: "
+            f"{labels}; CLI:\n{cli_screen}"
         )
 
 
 _CLEAR_PARENT = "CLI_DRIFT_CLEAR_PARENT: start the background check agent."
 _CLEAR_CHILD = "CLI_DRIFT_CLEAR_CHILD_TASK: run the twenty second background check and report."
 _CLEAR_REPLY = "Started the background check before clearing."
+_CLEAR_SLEEP_CALL = "toolu_cli_drift_clear_sleep"
 # Covers the child's 20 s sleep plus settle time, measured from /clear.
 _CLEAR_SETTLE_S = 90
 
@@ -510,6 +516,17 @@ def _session_ids(base_url: str) -> set[str]:
     )
     response.raise_for_status()
     return {session["id"] for session in response.json()["data"]}
+
+
+def _has_function_call(base_url: str, session_id: str, call_id: str) -> bool:
+    response = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/items", params={"limit": 100}, timeout=10.0
+    )
+    response.raise_for_status()
+    return any(
+        item.get("type") == "function_call" and item.get("call_id") == call_id
+        for item in response.json()["data"]
+    )
 
 
 def _rotated_session(base_url: str, existing: set[str], agent_id: str) -> str | None:
@@ -553,7 +570,7 @@ def test_background_subagent_settles_after_clear(
         mock_url,
         [
             _bash_call(
-                "toolu_cli_drift_clear_sleep",
+                _CLEAR_SLEEP_CALL,
                 {"command": "sleep 20; echo ok", "description": "Background check"},
             ),
             {"text": "The background check passed."},
@@ -569,6 +586,7 @@ def test_background_subagent_settles_after_clear(
         page,
     ):
         composer = _open_chat(page, base_url, old_id)
+        requests_log = _MockRequestLog(mock_url)
         _send(page, composer, _CLEAR_PARENT)
         expect(_assistant_reply(page, _CLEAR_REPLY)).to_be_visible(timeout=120_000)
         child = _wait_for(
@@ -580,9 +598,16 @@ def test_background_subagent_settles_after_clear(
         agent_id = _session(base_url, old_id)["agent_id"]
         existing = _session_ids(base_url)
         _wait_for(
-            lambda: next(c for c in _children(base_url, old_id) if c["id"] == child_id)["busy"],
+            lambda: (
+                _has_function_call(base_url, child_id, _CLEAR_SLEEP_CALL)
+                and next(c for c in _children(base_url, old_id) if c["id"] == child_id)["busy"]
+            ),
             timeout=30,
-            what="the background sub-agent to be working before /clear",
+            what="the background sub-agent to be working in its Bash call before /clear",
+        )
+        requests_log.refresh()
+        assert not requests_log.contains(f'"tool_use_id": "{_CLEAR_SLEEP_CALL}"'), (
+            "the sub-agent's Bash call returned before /clear"
         )
         _type_into_cli(page, "/clear")
         cleared_at = time.time()

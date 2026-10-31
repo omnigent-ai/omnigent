@@ -5282,7 +5282,11 @@ def _note_background_shell_signals(
     if item.item_type == "function_call_output":
         arguments = dedupe.background_bash_calls.pop(str(item.data.get("call_id")), {})
         task_id = item.background_task_id
-        if task_id is None or item.response_id in ended_response_ids:
+        if (
+            task_id is None
+            or item.response_id in ended_response_ids
+            or task_id in dedupe.background_task_ids
+        ):
             return
         dedupe.background_task_count += 1
         dedupe.background_task_ids |= {task_id}

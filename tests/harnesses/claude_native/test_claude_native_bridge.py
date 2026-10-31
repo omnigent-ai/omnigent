@@ -1620,12 +1620,36 @@ def test_task_notification_reports_finished_task_ids(
     assert item.interrupts_turn is False
 
 
+_FINAL_REPLY = {
+    "type": "assistant",
+    "message": {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "Done."}],
+        "stop_reason": "end_turn",
+    },
+}
+_NEW_PROMPT = {"type": "user", "message": {"role": "user", "content": "go"}}
+_TOOL_CALL = {
+    "type": "assistant",
+    "message": {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "Checking."},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+        ],
+        "stop_reason": "tool_use",
+    },
+}
+
+
 @pytest.mark.parametrize(
     "entries,turn_completed",
     [
         ([], None),
         ([{"type": "custom-title", "customTitle": "Renamed"}], None),
-        ([{"type": "user", "message": {"role": "user", "content": "go"}}], False),
+        ([_NEW_PROMPT], False),
+        ([_FINAL_REPLY, _NEW_PROMPT], False),
+        ([_FINAL_REPLY, _TOOL_CALL], False),
         (
             [
                 {
@@ -1640,30 +1664,16 @@ def test_task_notification_reports_finished_task_ids(
             ],
             True,
         ),
+        ([_FINAL_REPLY], True),
+        ([_TOOL_CALL], False),
         (
             [
                 {
                     "type": "assistant",
                     "message": {
                         "role": "assistant",
-                        "content": [{"type": "text", "text": "Done."}],
-                        "stop_reason": "end_turn",
-                    },
-                }
-            ],
-            True,
-        ),
-        (
-            [
-                {
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [
-                            {"type": "text", "text": "Checking."},
-                            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
-                        ],
-                        "stop_reason": "tool_use",
+                        "content": [{"type": "text", "text": "Searching."}],
+                        "stop_reason": "pause_turn",
                     },
                 }
             ],
@@ -1695,20 +1705,7 @@ def test_task_notification_reports_finished_task_ids(
             ],
             True,
         ),
-        (
-            [
-                {
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "Done."}],
-                        "stop_reason": "end_turn",
-                    },
-                },
-                {"type": "custom-title", "customTitle": "Renamed"},
-            ],
-            True,
-        ),
+        ([_FINAL_REPLY, {"type": "custom-title", "customTitle": "Renamed"}], True),
     ],
 )
 def test_transcript_read_reports_whether_latest_turn_completed(
