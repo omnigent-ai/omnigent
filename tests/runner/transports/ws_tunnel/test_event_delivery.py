@@ -471,16 +471,21 @@ async def test_reconnect_to_old_server_retries_pending_item_over_http() -> None:
     async def old_server_send(_text: str) -> None:
         raise AssertionError("old server must never receive an event batch")
 
+    assert not dispatcher.is_connected
     dispatcher.ready(first_send)
     async with _client(dispatcher, http_posts) as client:
         pending = asyncio.create_task(client.post(_URL, json=_ITEM))
         await started.wait()
+        assert not dispatcher.is_connected
         dispatcher.connected(old_server_send)
+        assert dispatcher.is_connected
         response = await asyncio.wait_for(pending, timeout=2)
         # Unsupported is cached for this generation; no second negotiation delay.
         second = await asyncio.wait_for(client.post(_URL, json=_ITEM), timeout=0.35)
     assert response.status_code == second.status_code == 202
     assert http_posts == [_ITEM, _ITEM]
+    # An old server without event support is still a connected tunnel.
+    assert dispatcher.is_connected
 
 
 async def test_cancelled_delivery_does_not_send_stale_item_after_reconnect() -> None:
