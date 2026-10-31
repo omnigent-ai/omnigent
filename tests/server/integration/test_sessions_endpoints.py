@@ -48,6 +48,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.types import SkillSpec
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -4304,26 +4305,56 @@ async def test_list_sessions_exposes_pending_elicitations_count(
     pending_elicitations.reset_for_tests()
 
 
-async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
+@pytest.mark.parametrize(
+    ("prompt_holder", "runner_stamp_age_s", "tunnel_on_this_replica", "expected_count"),
+    [
+        pytest.param("row", 0, False, 2, id="row-runner-live-on-another-replica"),
+        pytest.param("row", None, False, 0, id="row-runner-disconnected"),
+        pytest.param("row", RUNNER_LIVENESS_TTL_S + 1, False, 0, id="row-runner-stamp-expired"),
+        pytest.param(
+            "row", RUNNER_LIVENESS_TTL_S + 1, True, 2, id="row-runner-tunnel-here-stamp-expired"
+        ),
+        pytest.param("index", None, False, 0, id="index-runner-disconnected"),
+    ],
+)
+async def test_list_sessions_pending_count_for_bound_session_follows_runner_liveness(
+    app: Any,
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_holder: str,
+    runner_stamp_age_s: int | None,
+    tunnel_on_this_replica: bool,
+    expected_count: int,
 ) -> None:
-    """A runner-bound session surfaces its persisted pending count when the
-    local in-memory index is empty (the cross-replica fallback).
+    """A runner-bound session surfaces its pending count only while its
+    runner is live, whether the count is on the row or in the local index.
 
     The tunnel-holding replica writes ``pending_elicitation_count`` to the
     row; a replica that does NOT hold the tunnel has an empty
     ``pending_elicitations`` index for that session and must fall back to
-    the row so a parked approval isn't hidden. ``_build_session_list_item``
-    only consults the row when the session is runner-bound — this pins that
-    fallback fires for a bound session, complementing
+    the row so a parked approval isn't hidden. A runner that is gone left no
+    prompt to list, so its count reads as zero from either source (the rule
+    the WS stream applies) instead of badging an empty inbox. Complements
     ``test_list_sessions_exposes_pending_elicitations_count`` (which covers
     the index-authoritative, unbound path).
 
+    :param app: The app whose tunnel registry the liveness lookup consults.
     :param client: Test HTTP client backed by the real app.
     :param db_uri: The app's DB, opened directly to seed the row the way a
         different replica's live-state write would have.
+    :param monkeypatch: Drops the row-mirror write for the ``"index"`` case and
+        fakes a tunnel on this replica.
+    :param prompt_holder: ``"row"`` to seed the persisted count, or
+        ``"index"`` to seed only this replica's in-memory index.
+    :param runner_stamp_age_s: Age of the ``runner_last_seen`` stamp in
+        seconds, or ``None`` when the disconnect cleared it.
+    :param tunnel_on_this_replica: Whether this replica's tunnel registry
+        still holds the runner, which outranks a stale stamp.
+    :param expected_count: The list row's expected pending count.
     """
+    import time
+
     from omnigent.runtime import pending_elicitations
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
@@ -4333,22 +4364,38 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     session = await _create_session(client, agent["id"])
     session_id = session["id"]
 
-    # Bind a runner and seed the persisted count directly — simulating the
-    # tunnel-holding replica's row write. THIS replica's index stays empty
-    # (no record_publish here), so a correct read falls back to the row.
+    # A "row" prompt simulates the tunnel-holding replica's row write while
+    # THIS replica's index stays empty, so a correct read falls back to the row.
     pending_elicitations.reset_for_tests()
     store = SqlAlchemyConversationStore(db_uri)
-    assert store.set_runner_id(session_id, "runner_other_replica")
-    store.set_pending_elicitation_count(session_id, 2)
+    runner_id = "runner_bound"
+    assert store.set_runner_id(session_id, runner_id)
+    if prompt_holder == "row":
+        store.set_pending_elicitation_count(session_id, 2)
+    else:
+        # A dropped row-mirror write leaves the prompt only in this replica's index.
+        monkeypatch.setattr(pending_elicitations, "_count_persist_hook", None)
+        pending_elicitations.record_publish(
+            session_id,
+            {"type": "response.elicitation_request", "elicitation_id": "elicit_offline"},
+        )
+    if runner_stamp_age_s is not None:
+        store.touch_runner_liveness([runner_id], int(time.time()) - runner_stamp_age_s)
+    if tunnel_on_this_replica:
+        registry = app.state.tunnel_registry
+        real_get = registry.get
+        monkeypatch.setattr(
+            registry, "get", lambda rid: object() if rid == runner_id else real_get(rid)
+        )
 
     resp = await client.get("/v1/sessions")
     assert resp.status_code == 200
     row = next((r for r in resp.json()["data"] if r["id"] == session_id), None)
     assert row is not None
-    # Index empty + row=2 + runner-bound → fallback surfaces the row's count.
-    assert row["pending_elicitations_count"] == 2
+    assert row["pending_elicitations_count"] == expected_count
 
     store.set_pending_elicitation_count(session_id, 0)
+    pending_elicitations.reset_for_tests()
 
 
 async def test_get_session_includes_runner_online(
