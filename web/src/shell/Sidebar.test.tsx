@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  readSidebarViewPreferences,
+  removeSidebarCustomOrderIds,
+} from "@/lib/sidebarViewPreferences";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
@@ -3780,36 +3784,102 @@ describe("Sidebar view options", () => {
     ).toEqual(["conv_done_new", "conv_done_old", "conv_running"]);
   });
 
-  it.each(["default", "status", "created", "updated"])(
-    "uses Created for saved %s grouping and project folders",
-    (grouping) => {
-      localStorage.setItem(
-        "omnigent:sidebar-view",
-        JSON.stringify({ ordering: "created", grouping }),
-      );
-      projectsMock.push("Customer X");
+  it.each(
+    ["default", "status", "harness", "created", "updated"].flatMap((grouping) =>
+      ["created", "custom"].map((ordering) => [grouping, ordering]),
+    ),
+  )("uses saved %s grouping with %s ordering, including project folders", (grouping, ordering) => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({
+        ordering,
+        grouping,
+        customOrder: {
+          baseOrdering: "created",
+          startedAt: 100,
+          ids: ["conv_project_old", "conv_project_new", "conv_old", "conv_new"],
+        },
+      }),
+    );
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_old", "Codex", { created_at: 1, updated_at: 200 }),
+      conv("conv_new", "Codex", { created_at: 2, updated_at: 100 }),
+      conv("conv_project_old", "Codex", {
+        created_at: 3,
+        updated_at: 400,
+        labels: { omni_project: "Customer X" },
+      }),
+      conv("conv_project_new", "Codex", {
+        created_at: 4,
+        updated_at: 300,
+        labels: { omni_project: "Customer X" },
+      }),
+    ]);
+    renderGroupingSidebar();
+    if (grouping === "default")
+      fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    expect(screen.getAllByRole("link", { name: /^conv_/ }).map((link) => link.textContent)).toEqual(
+      ordering === "custom"
+        ? ["conv_project_old", "conv_project_new", "conv_old", "conv_new"]
+        : ["conv_project_new", "conv_project_old", "conv_new", "conv_old"],
+    );
+  });
+
+  it.each(["created", "updated"])(
+    "initializes Custom from %s and restores it after selecting automatic ordering",
+    (ordering) => {
+      localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering }));
       mockConversations([
-        conv("conv_old", "Codex", { created_at: 1, updated_at: 200 }),
-        conv("conv_new", "Codex", { created_at: 2, updated_at: 100 }),
-        conv("conv_project_old", "Codex", {
-          created_at: 3,
-          updated_at: 400,
-          labels: { omni_project: "Customer X" },
-        }),
-        conv("conv_project_new", "Codex", {
-          created_at: 4,
-          updated_at: 300,
-          labels: { omni_project: "Customer X" },
-        }),
+        conv("conv_a", "Codex", { created_at: 1, updated_at: 200 }),
+        conv("conv_b", "Codex", { created_at: 2, updated_at: 100 }),
       ]);
       renderGroupingSidebar();
-      if (grouping === "default")
-        fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
-      expect(
-        screen.getAllByRole("link", { name: /^conv_/ }).map((link) => link.textContent),
-      ).toEqual(["conv_project_new", "conv_project_old", "conv_new", "conv_old"]);
+      const ids = () =>
+        screen.getAllByRole("link", { name: /^conv_/ }).map((link) => link.textContent);
+      const initial = ids();
+      openViewSubmenu("session-ordering-menu");
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "Custom" }));
+      expect(ids()).toEqual(initial);
+      openViewSubmenu("session-ordering-menu");
+      fireEvent.click(
+        screen.getByTestId(`session-ordering-${ordering === "created" ? "updated" : "created"}`),
+      );
+      expect(ids()).toEqual([...initial].reverse());
+      openViewSubmenu("session-ordering-menu");
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "Custom" }));
+      expect(ids()).toEqual(initial);
     },
   );
+
+  it("keeps Custom order when Show more reveals a project's independently loaded rows", () => {
+    projectsMock.push("Customer X");
+    mockConversations([]);
+    const ids = Array.from({ length: 6 }, (_, index) => `conv_${index}`);
+    projectSessionsMock.current["Customer X"] = ids.map((id, index) =>
+      conv(id, "Codex", {
+        created_at: index + 1,
+        updated_at: index + 1,
+        labels: { omni_project: "Customer X" },
+      }),
+    );
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({
+        ordering: "custom",
+        customOrder: { baseOrdering: "updated", startedAt: 100, ids },
+      }),
+    );
+    renderGroupingSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    expect(screen.getAllByRole("link", { name: /^conv_/ }).map((link) => link.textContent)).toEqual(
+      ids.slice(0, 5),
+    );
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(screen.getAllByRole("link", { name: /^conv_/ }).map((link) => link.textContent)).toEqual(
+      ids,
+    );
+  });
 
   it("shows the toggled metadata under the title and the updated time in the trailing slot", () => {
     useHostsMock.mockReturnValue({
@@ -4549,7 +4619,16 @@ describe("sidebar_grouping_ui release flag", () => {
       });
       mockConversations([live, archived, unfiled, shared]);
       // Folder pages can contain members outside the global archived window.
-      const older = conv("older_archived_filed", "Claude Code", { ...filed, archived: true });
+      const older = conv("older_archived_filed", "Claude Code", {
+        ...filed,
+        archived: true,
+        updated_at: 20,
+      });
+      const oldest = conv("oldest_archived_filed", "Claude Code", {
+        ...filed,
+        archived: true,
+        updated_at: 10,
+      });
       const original = useConvMock.getMockImplementation()!;
       useConvMock.mockImplementation((...args) =>
         args[4] === "archived"
@@ -4567,7 +4646,7 @@ describe("sidebar_grouping_ui release flag", () => {
       fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
       expect(screen.getByText("live_filed")).toBeInTheDocument();
 
-      projectSessionsMock.current.Alpha = [archived, older, shared];
+      projectSessionsMock.current.Alpha = [archived, older, oldest, shared];
       selectSessionFilter("archived");
       const folder = screen.getByRole("button", { name: "Alpha" }).closest("section")!;
       const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
@@ -4577,6 +4656,29 @@ describe("sidebar_grouping_ui release flag", () => {
       expect(screen.queryByText("live_filed")).toBeNull();
       expect(within(sessions).getByText("archived_unfiled")).toBeInTheDocument();
       expect(within(sessions).queryByText("archived_filed")).toBeNull();
+      const folderOrder = () =>
+        within(folder)
+          .getAllByRole("link", { name: /archived_filed$/ })
+          .map((link) => link.textContent);
+      expect(folderOrder()).toEqual([older.id, oldest.id, archived.id]);
+      fireEvent.pointerDown(
+        within(folder)
+          .getByRole("link", { name: oldest.id })
+          .closest("li")!
+          .querySelector('[data-testid="conversation-actions"]')!,
+        { button: 0 },
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Move up" }));
+      expect(folderOrder()).toEqual([oldest.id, older.id, archived.id]);
+      const saved = readSidebarViewPreferences();
+      expect(saved.ordering).toBe("custom");
+      expect(saved.customOrder!.ids.indexOf(oldest.id)).toBeLessThan(
+        saved.customOrder!.ids.indexOf(older.id),
+      );
+      projectSessionsMock.current.Alpha = [archived, older, shared];
+      act(() => removeSidebarCustomOrderIds([oldest.id]));
+      expect(folderOrder()).toEqual([older.id, archived.id]);
+      expect(readSidebarViewPreferences().customOrder?.ids).not.toContain(oldest.id);
       fireEvent.click(screen.getByRole("button", { name: "Empty" }));
       expect(screen.getByText("No archived sessions")).toBeInTheDocument();
       expect(

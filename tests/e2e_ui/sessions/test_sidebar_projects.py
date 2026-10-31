@@ -30,6 +30,7 @@ import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -81,20 +82,16 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
 
 def test_move_session_into_new_project(
     page: Page,
-    seeded_session: tuple[str, str],
+    seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Filing a session into a freshly-created project moves the row into it.
-
-    The session starts under "Sessions"; after creating the project (+ button)
-    and picking it from "Add to project", a project folder with that name
-    appears under the "Projects" group and the row lives under it (once
-    expanded) and no longer under "Sessions".
-    """
-    base_url, session_id = seeded_session
+    """Menu and row drops file sessions; a same-place drag never navigates."""
+    base_url, session_id, other_id = seeded_session_pair
     title = f"e2e-proj-{uuid.uuid4().hex[:8]}"
     _set_title(base_url, session_id, title)
+    _set_title(base_url, other_id, f"{title}-other")
     project = f"Project {uuid.uuid4().hex[:6]}"
 
+    enable_grouping_ui(page)
     page.goto(f"{base_url}/c/{session_id}")
 
     row = _row(page, session_id)
@@ -111,6 +108,52 @@ def test_move_session_into_new_project(
 
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+    # Release a non-current row back onto itself. The browser must not follow
+    # its anchor, even though dnd-kit intercepts the click before React sees it.
+    other = _row(page, other_id)
+    other.hover()
+    source = other.bounding_box()
+    assert source
+    x, y = source["x"] + 30, source["y"] + source["height"] / 2
+    page_origin = page.evaluate("performance.timeOrigin")
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 12, y)
+    expect(other).to_have_class(re.compile("opacity-40"))
+    page.mouse.move(x, y)
+    page.mouse.up()
+    page.wait_for_timeout(100)
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    assert page.evaluate("performance.timeOrigin") == page_origin
+
+    # Drop onto an existing member's row, rather than the project header.
+    # Filing has priority over custom ordering when the source is outside it.
+    page.mouse.down()
+    page.mouse.move(x + 12, y)
+    expect(other).to_have_class(re.compile("opacity-40"))
+    target = _row(page, session_id).bounding_box()
+    assert target
+    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith(f"/v1/sessions/{other_id}")
+        )
+    ) as moved:
+        page.mouse.up()
+    assert moved.value.ok
+    expect(_section(page, project).locator(f'a[href="/c/{other_id}"]')).to_be_visible()
+    expect(_section(page, "Sessions").locator(f'a[href="/c/{other_id}"]')).to_have_count(0)
+    view = page.evaluate('JSON.parse(localStorage.getItem("omnigent:sidebar-view"))') or {}
+    assert view.get("ordering", "updated") == "updated"
+    stored = httpx.get(f"{base_url}/v1/sessions/{other_id}", timeout=10.0)
+    stored.raise_for_status()
+    assert stored.json()["project_id"] == moved.value.json()["project_id"]
+
+    # A fresh click still opens the session normally after the drop.
+    _row(page, other_id).get_by_role("link").click()
+    expect(page).to_have_url(f"{base_url}/c/{other_id}")
 
 
 def test_fork_of_filed_session_joins_the_folder_without_reload(

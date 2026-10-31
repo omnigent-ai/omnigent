@@ -14,6 +14,7 @@ import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
 import {
   type ComponentType,
+  type ContextType,
   type CSSProperties,
   type KeyboardEvent,
   type MouseEvent,
@@ -227,6 +228,7 @@ import {
 import {
   SIDEBAR_GROUPINGS,
   SIDEBAR_SHOW_FIELDS,
+  sidebarBaseOrdering,
   type SidebarGrouping,
   type SidebarOrdering,
   type SidebarShowField,
@@ -248,6 +250,7 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
+  extendSidebarCustomOrder,
   getConversationAgentType,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   groupConversations,
@@ -376,6 +379,10 @@ const PinOrderContext = createContext<{
   draggingId: string | null;
   overId: string | null;
 } | null>(null);
+const SessionOrderContext = createContext<{
+  groups: ReadonlyMap<string, readonly string[]>;
+  move: (fromId: string, toId: string) => void;
+} | null>(null);
 // Rows report an in-progress inline-rename edit here so ConversationList can
 // hold the sort order for the edit's whole duration — the pointer often
 // leaves the list while typing, and a reorder then would shuffle rows around
@@ -400,6 +407,7 @@ function SidebarRowDataProvider({
   viewerId,
   serverInfo,
   onActivate,
+  sessionOrder,
   children,
 }: {
   projectNamesById: Map<string, string>;
@@ -410,6 +418,7 @@ function SidebarRowDataProvider({
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
   onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
+  sessionOrder: ContextType<typeof SessionOrderContext>;
   children: ReactNode;
 }) {
   return (
@@ -421,7 +430,9 @@ function SidebarRowDataProvider({
               <ViewerIdContext.Provider value={viewerId}>
                 <ServerInfoContext.Provider value={serverInfo}>
                   <RowActivationContext.Provider value={onActivate}>
-                    {children}
+                    <SessionOrderContext.Provider value={sessionOrder}>
+                      {children}
+                    </SessionOrderContext.Provider>
                   </RowActivationContext.Provider>
                 </ServerInfoContext.Provider>
               </ViewerIdContext.Provider>
@@ -1510,7 +1521,8 @@ function ProjectFolder({
     visibleCount: number,
   ) => void;
 }) {
-  const { registerFolder, sortBy } = useSidebarData();
+  const { registerFolder, sortBy, view } = useSidebarData();
+  const customOrder = view.ordering === "custom" ? view.customOrder : undefined;
   const viewerId = useViewerId();
   const query = useProjectSessions(name, expanded, sortBy, archived);
   const watchedRows = useMemo(
@@ -1541,6 +1553,7 @@ function ProjectFolder({
       activeOverride,
       frozenSortKeys,
       sortBy,
+      customOrder,
     );
   }, [
     query.data,
@@ -1549,6 +1562,7 @@ function ProjectFolder({
     activeOverride,
     frozenSortKeys,
     sortBy,
+    customOrder,
     archived,
     projectId,
     name,
@@ -1905,18 +1919,8 @@ function ConversationList({
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
   const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
-  const { view, updateView: saveView, sortBy } = useSidebarData();
-  const updateView = useCallback(
-    (patch: Partial<SidebarViewPreferences>) => {
-      // Regrouping swaps which sections (and selection scopes) exist, so leave
-      // selection the way a Display switch does.
-      if (patch.grouping !== undefined && patch.grouping !== view.grouping && selectionMode) {
-        onExitSelectionMode();
-      }
-      saveView(patch);
-    },
-    [view.grouping, saveView, selectionMode, onExitSelectionMode],
-  );
+  const { view, updateView: saveView, sortBy, loadedRows } = useSidebarData();
+  const customOrder = view.ordering === "custom" ? view.customOrder : undefined;
   const grouped = view.grouping !== "default";
   const harnessLabels = useHarnessLabels(view.grouping === "harness");
   const harnessLabel = useCallback(
@@ -1958,6 +1962,13 @@ function ConversationList({
   const dragOrigin = useRef<{ left: number; top: number; width: number } | undefined>(undefined);
   const [overProject, setOverProject] = useState<string | null>(null);
   const [overPin, setOverPin] = useState<string | null>(null);
+  const [activeDrag, setActiveDrag] = useState<{
+    id: string;
+    label: string;
+    project: string | null;
+    isPinned: boolean;
+    canGrid: boolean;
+  } | null>(null);
   const { mutateAsync: pinAt } = useTogglePinnedConversation();
   // Pin writes don't overlap (the hooks refuse one while another saves), so the
   // pinned rows stop taking drops until the current write settles.
@@ -2045,7 +2056,7 @@ function ConversationList({
       return next;
     });
   }, []);
-  const orderFrozen = pointerInside || editingIds.size > 0;
+  const orderFrozen = pointerInside || editingIds.size > 0 || activeDrag !== null;
   const frozenKeys = orderFrozen ? frozenKeysRef.current : null;
   const frozenStatus = orderFrozen ? frozenStatusRef.current : null;
   useEffect(() => {
@@ -2112,7 +2123,13 @@ function ConversationList({
         id,
         name,
         icon,
-        conversations: sortConversations(inProject, activeOverride, frozenKeys, sortBy),
+        conversations: sortConversations(
+          inProject,
+          activeOverride,
+          frozenKeys,
+          sortBy,
+          customOrder,
+        ),
       };
     });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
@@ -2128,6 +2145,7 @@ function ConversationList({
       activeOverride,
       frozenKeys,
       sortBy,
+      customOrder,
     );
     const statusOf = (c: Conversation): StatusBucket => {
       const frozen = frozenStatus?.get(c.id);
@@ -2189,6 +2207,7 @@ function ConversationList({
     harnessLabel,
     view.grouping,
     sortBy,
+    customOrder,
     unseenTick,
     draftIds,
     startingId,
@@ -2325,6 +2344,126 @@ function ConversationList({
     });
   }, []);
 
+  // Each folder's loaded rows and how many it lists above "Show more", by name.
+  // Projects-scope selection resolves against these, so a member the global
+  // window hasn't loaded isn't dropped from a bulk action.
+  const [folderConversations, setFolderConversations] = useState<
+    Map<string, { conversations: Conversation[]; visibleCount: number }>
+  >(() => new Map());
+  const handleFolderConversationsLoaded = useCallback(
+    (name: string, conversations: Conversation[], visibleCount: number) => {
+      setFolderConversations((prev) => {
+        const existing = prev.get(name);
+        // Skip the update when the id set is unchanged, so a background refetch
+        // that returns the same rows doesn't churn state (and re-render).
+        if (
+          existing &&
+          existing.visibleCount === visibleCount &&
+          existing.conversations.length === conversations.length &&
+          existing.conversations.every((c, i) => c.id === conversations[i]?.id)
+        ) {
+          return prev;
+        }
+        const next = new Map(prev);
+        next.set(name, { conversations, visibleCount });
+        return next;
+      });
+    },
+    [],
+  );
+  // An expanded folder's rows above "Show more", in render order; the
+  // window-derived membership stands in until the folder first reports.
+  const folderVisibleRows = useCallback(
+    (group: { name: string; conversations: Conversation[] }) => {
+      const folder = folderConversations.get(group.name);
+      return folder ? folder.conversations.slice(0, folder.visibleCount) : group.conversations;
+    },
+    [folderConversations],
+  );
+
+  // Folder pages include members outside the global window, including archives.
+  // Selection and order capture must use the same complete membership pool.
+  const projectSessionPool = useMemo(
+    () =>
+      dedupeConversationsById([
+        ...[...folderConversations.values()].flatMap((folder) => folder.conversations),
+        ...sections.projectGroups.flatMap((group) => group.conversations),
+      ]),
+    [sections.projectGroups, folderConversations],
+  );
+  const orderingRows = useMemo(
+    () =>
+      sortConversations(
+        dedupeConversationsById([...allConversations, ...loadedRows, ...projectSessionPool]).filter(
+          (row) => !row.provisional,
+        ),
+        activeOverride,
+        frozenKeys,
+        sortBy,
+      ),
+    [allConversations, loadedRows, projectSessionPool, activeOverride, frozenKeys, sortBy],
+  );
+  const captureCustomOrder = () =>
+    extendSidebarCustomOrder(
+      { baseOrdering: sidebarBaseOrdering(view), ids: [], startedAt: 0 },
+      orderingRows,
+    );
+  const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
+    if (patch.grouping !== undefined && patch.grouping !== view.grouping && selectionMode) {
+      onExitSelectionMode();
+    }
+    saveView(
+      patch.ordering === "custom"
+        ? { ...patch, customOrder: view.customOrder ?? captureCustomOrder() }
+        : patch,
+    );
+  });
+  const observedOrderIds = useRef<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    const previous = observedOrderIds.current;
+    observedOrderIds.current = new Set(customOrder ? orderingRows.map((row) => row.id) : []);
+    if (!customOrder) return;
+    // Capture arrivals once; a stale folder snapshot must not re-add a confirmed removal.
+    const next = extendSidebarCustomOrder(
+      customOrder,
+      orderingRows.filter((row) => !previous.has(row.id)),
+    );
+    if (next !== customOrder) saveView({ customOrder: next });
+  }, [customOrder, orderingRows, saveView]);
+
+  const sessionOrderGroups = useMemo(() => {
+    const groups = new Map<string, readonly string[]>();
+    if (!groupingUi || selectionMode) return groups;
+    const lists = [
+      ...sections.projectGroups.map(folderVisibleRows),
+      sections.shared,
+      ...(sessionGroups ? sessionGroups.map((group) => group.conversations) : [sections.sessions]),
+    ];
+    for (const rows of lists) {
+      const ids = rows
+        .filter((row) => !row.provisional && !pinnedSet.has(row.id))
+        .map((row) => row.id);
+      for (const id of ids) groups.set(id, ids);
+    }
+    return groups;
+  }, [groupingUi, selectionMode, sections, sessionGroups, folderVisibleRows, pinnedSet]);
+  const reorderSessions = useStableCallback((fromId: string, toId: string) => {
+    if (fromId === toId || !sessionOrderGroups.get(fromId)?.includes(toId)) return;
+    const order = extendSidebarCustomOrder(customOrder ?? captureCustomOrder(), orderingRows);
+    const from = order.ids.indexOf(fromId);
+    const to = order.ids.indexOf(toId);
+    if (from < 0 || to < 0) return;
+    saveView({
+      ordering: "custom",
+      customOrder: { ...order, ids: arrayMove([...order.ids], from, to) },
+    });
+  });
+  const sessionOrder = useMemo(
+    () =>
+      groupingUi && !selectionMode ? { groups: sessionOrderGroups, move: reorderSessions } : null,
+    [groupingUi, selectionMode, sessionOrderGroups, reorderSessions],
+  );
+
   // ── Drag-and-drop: file sessions into / out of projects ────────────────────
   // A session row can be dragged onto a project folder (file it there), onto the
   // "Chats" list / a fallback strip (unfile it), or onto "Pinned" (pin it, which
@@ -2332,16 +2471,6 @@ function ConversationList({
   // target — you can't file sessions there. The kebab "Move session" menu + the
   // pin button remain the keyboard-accessible session actions.
   const moveToProject = useMoveToProject();
-  // The session currently being dragged (id + source project + pinned state), or
-  // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
-  // preview and which drop zones light up (ungroup only for a filed session, pin
-  // only for an unpinned one).
-  const [activeDrag, setActiveDrag] = useState<{
-    id: string;
-    label: string;
-    project: string | null;
-    isPinned: boolean;
-  } | null>(null);
   // Mouse: a small drag threshold so a plain click still navigates / opens the
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
   // into a drag. Project headers also support keyboard sorting.
@@ -2350,7 +2479,28 @@ function ConversationList({
     useSensor(MouseSensor, MOUSE_SENSOR_OPTIONS),
     useSensor(TouchSensor, TOUCH_SENSOR_OPTIONS),
   );
+  // dnd-kit stops clicks before React sees them, but leaves native link navigation intact.
+  const dragClickPending = useRef(false);
+  useEffect(() => {
+    const reset = () => {
+      dragClickPending.current = false;
+    };
+    const preventDragClick = (event: globalThis.MouseEvent) => {
+      if (dragClickPending.current && event.detail > 0) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      reset();
+    };
+    document.addEventListener("pointerdown", reset, true);
+    document.addEventListener("click", preventDragClick, true);
+    return () => {
+      document.removeEventListener("pointerdown", reset, true);
+      document.removeEventListener("click", preventDragClick, true);
+    };
+  }, []);
   const handleDragStart = useCallback((event: DragStartEvent) => {
+    dragClickPending.current = true;
     const isProject = event.active.data.current?.type === "project-order";
     // New drop zones can shift the source row; preserve its position before rendering them.
     const target = event.activatorEvent.target;
@@ -2367,12 +2517,14 @@ function ConversationList({
       return;
     }
     const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
+      | { label?: string; project?: string | null; isPinned?: boolean; canGrid?: boolean }
+      | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
       project: data?.project ?? null,
       isPinned: data?.isPinned ?? false,
+      canGrid: data?.canGrid !== false,
     });
   }, []);
   const handleDragEnd = useCallback(
@@ -2392,7 +2544,11 @@ function ConversationList({
       if (!dragged) return;
       const gridTarget = event.over?.data.current as GridDropTarget | undefined;
       if (gridTarget?.type === "session-grid") {
-        grids?.split(gridTarget.targetId, dragged.id, gridTarget.edge);
+        if (dragged.canGrid) grids?.split(gridTarget.targetId, dragged.id, gridTarget.edge);
+        return;
+      }
+      if (event.over?.data.current?.type === "session-order") {
+        reorderSessions(dragged.id, event.over.data.current.id as string);
         return;
       }
       if (event.active.data.current?.canManage === false) return;
@@ -2459,6 +2615,7 @@ function ConversationList({
       sections.pinned,
       pinAt,
       reorderPins,
+      reorderSessions,
     ],
   );
 
@@ -2474,59 +2631,6 @@ function ConversationList({
       return [];
     });
   }, []);
-
-  // Each folder's loaded rows and how many it lists above "Show more", by name.
-  // Projects-scope selection resolves against these, so a member the global
-  // window hasn't loaded isn't dropped from a bulk action.
-  const [folderConversations, setFolderConversations] = useState<
-    Map<string, { conversations: Conversation[]; visibleCount: number }>
-  >(() => new Map());
-  const handleFolderConversationsLoaded = useCallback(
-    (name: string, conversations: Conversation[], visibleCount: number) => {
-      setFolderConversations((prev) => {
-        const existing = prev.get(name);
-        // Skip the update when the id set is unchanged, so a background refetch
-        // that returns the same rows doesn't churn state (and re-render).
-        if (
-          existing &&
-          existing.visibleCount === visibleCount &&
-          existing.conversations.length === conversations.length &&
-          existing.conversations.every((c, i) => c.id === conversations[i]?.id)
-        ) {
-          return prev;
-        }
-        const next = new Map(prev);
-        next.set(name, { conversations, visibleCount });
-        return next;
-      });
-    },
-    [],
-  );
-  // An expanded folder's rows above "Show more", in render order; the
-  // window-derived membership stands in until the folder first reports.
-  const folderVisibleRows = useCallback(
-    (group: { name: string; conversations: Conversation[] }) => {
-      const folder = folderConversations.get(group.name);
-      return folder ? folder.conversations.slice(0, folder.visibleCount) : group.conversations;
-    },
-    [folderConversations],
-  );
-
-  // The projects-scope selection pool: the folders' own rendered rows (the
-  // authoritative, possibly-out-of-window set) unioned with the global-derived
-  // membership as a fallback for folders that haven't reported yet. Deduped by
-  // id. This backs the bulk-action bar, the shift-select range, and the
-  // stranding guard so all three agree on what's selectable.
-  const projectSessionPool = useMemo(() => {
-    const byId = new Map<string, Conversation>();
-    for (const group of sections.projectGroups) {
-      for (const c of group.conversations) byId.set(c.id, c);
-    }
-    for (const { conversations } of folderConversations.values()) {
-      for (const c of conversations) byId.set(c.id, c);
-    }
-    return [...byId.values()];
-  }, [sections.projectGroups, folderConversations]);
 
   // The bulk-action bar lives under the header of the section it targets, so it
   // unmounts when that section empties (e.g. every selected session
@@ -2784,6 +2888,7 @@ function ConversationList({
       viewerId={viewerId}
       serverInfo={serverInfo}
       onActivate={activateRow}
+      sessionOrder={sessionOrder}
     >
       <DndContext
         sensors={sensors}
@@ -2792,16 +2897,29 @@ function ConversationList({
           const droppableContainers = args.droppableContainers.filter(
             (container) => (container.data.current?.type === "project-order") === ordering,
           );
-          if (!ordering)
-            return pointerWithin({
+          if (!ordering) {
+            const orderGroup = sessionOrderGroups.get(String(args.active.id));
+            const collisions = pointerWithin({
               ...args,
-              droppableContainers:
-                args.active.data.current?.canManage === false
-                  ? droppableContainers.filter(
-                      (container) => container.data.current?.type === "session-grid",
-                    )
-                  : droppableContainers,
+              droppableContainers: droppableContainers.filter((container) => {
+                const target = container.data.current;
+                // Other groups' rows leave the drop to their enclosing project/list.
+                if (target?.type === "session-order")
+                  return (
+                    orderGroup &&
+                    target.id !== args.active.id &&
+                    sessionOrderGroups.get(target.id) === orderGroup
+                  );
+                return target?.type === "session-grid"
+                  ? args.active.data.current?.canGrid !== false
+                  : args.active.data.current?.canManage !== false;
+              }),
             });
+            const row = collisions.find(
+              (hit) => hit.data?.droppableContainer.data.current?.type === "session-order",
+            );
+            return row ? [row] : collisions;
+          }
           // Restrict project drops to the project list inside the sidebar.
           if (args.pointerCoordinates) {
             const rects = droppableContainers
@@ -2837,7 +2955,7 @@ function ConversationList({
           setOverProject(null);
         }}
       >
-        {activeDrag && <GridDropTargets sessionId={activeDrag.id} />}
+        {activeDrag?.canGrid && <GridDropTargets sessionId={activeDrag.id} />}
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <PinSavingContext.Provider value={pinWriting}>
             <div
@@ -3454,7 +3572,11 @@ const GROUPING_LABELS: Record<SidebarGrouping, string> = {
   created: "Created",
   updated: "Updated",
 };
-const ORDERING_LABELS: Record<SidebarOrdering, string> = { updated: "Updated", created: "Created" };
+const ORDERING_LABELS: Record<SidebarOrdering, string> = {
+  updated: "Updated",
+  created: "Created",
+  custom: "Custom",
+};
 const SHOW_LABELS: Record<SidebarShowField, string> = {
   updated: "Updated",
   environment: "Environment",
@@ -4123,6 +4245,8 @@ function ConversationMenuItems({
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
+  const sessionOrder = useContext(SessionOrderContext);
+  const orderGroup = sessionOrder?.groups.get(conversation.id);
   const grids = useGridSessions();
   const gridLayout = grids?.enabled
     ? (grids.activeGrid?.layout ?? grids.conversationId)
@@ -4315,6 +4439,25 @@ function ConversationMenuItems({
           Mark as read
         </C.Item>
       )}
+      {orderGroup &&
+        orderGroup.length > 1 &&
+        (["up", "down"] as const).map((direction) => {
+          const target =
+            orderGroup[orderGroup.indexOf(conversation.id) + (direction === "up" ? -1 : 1)];
+          return (
+            <C.Item
+              key={direction}
+              disabled={target === undefined}
+              onSelect={() => {
+                if (target !== undefined) sessionOrder!.move(conversation.id, target);
+                setMenuOpen(false);
+              }}
+            >
+              <ArrowUpDownIcon className="size-3.5" />
+              Move {direction}
+            </C.Item>
+          );
+        })}
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
       {isOwner &&
@@ -5003,44 +5146,42 @@ function ConversationRowImpl({
       ? "top-4 md:top-3.5"
       : "top-1/2";
 
-  // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
-  // owner-only, like the Move-to-project kebab item), outside selection /
-  // archive / rename modes. Dragging it onto a project folder files it there;
-  // onto "Chats" unfiles it; onto "Pinned" pins it. The list-level <DndContext>
-  // routes the drop; the row only advertises itself and its source project +
-  // pinned state via the draggable `data`.
+  const sessionOrder = useContext(SessionOrderContext);
+  const orderGroup = sessionOrder?.groups.get(conversation.id);
+  // Personal ordering also applies to shared/archived rows; filing and pinning
+  // still require ownership in the list's drop handler.
   const {
     listeners: dragListeners,
     setNodeRef: setDragNodeRef,
     isDragging,
   } = useDraggable({
     id: conversation.id,
-    data: { type: "session", label, project: currentProject, isPinned, canManage: isOwner },
+    data: {
+      type: "session",
+      label,
+      project: currentProject,
+      isPinned,
+      canManage: isOwner && !isArchived,
+      canGrid: !isArchived,
+    },
     disabled:
-      (!isOwner && !gridsEnabled) || selectionMode || isArchived || isEditing || isProvisionalRow,
+      (!isOwner && !gridsEnabled && !orderGroup) ||
+      selectionMode ||
+      (isArchived && !orderGroup) ||
+      isEditing ||
+      isProvisionalRow,
   });
-  // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
-  // on the same anchor still fires a click); swallow that one click so a drag
-  // doesn't also navigate into the session. Flagged when a drag finishes,
-  // cleared on the next tick (after the click that follows pointer-up).
-  const justDraggedRef = useRef(false);
-  const wasDraggingRef = useRef(false);
-  useEffect(() => {
-    const was = wasDraggingRef.current;
-    wasDraggingRef.current = isDragging;
-    if (!was || isDragging) return undefined;
-    justDraggedRef.current = true;
-    const timer = setTimeout(() => {
-      justDraggedRef.current = false;
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [isDragging]);
   // In the Pinned section each row is also a reorder target for other pins.
   const pinOrder = useContext(PinOrderContext);
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
     id: `pin-order:${conversation.id}`,
     data: { type: "pin-order", id: conversation.id },
     disabled: !pinOrder || !isPinned,
+  });
+  const { setNodeRef: setOrderNodeRef, isOver: isOrderOver } = useDroppable({
+    id: `session-order:${conversation.id}`,
+    data: { type: "session-order", id: conversation.id },
+    disabled: !orderGroup || isPinned || selectionMode || isEditing || isProvisionalRow,
   });
   // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
   let pinInsertion: "before" | "after" | undefined;
@@ -5054,8 +5195,9 @@ function ConversationRowImpl({
       rowRef.current = node;
       setDragNodeRef(node);
       setPinOrderNodeRef(node);
+      setOrderNodeRef(node);
     },
-    [setDragNodeRef, setPinOrderNodeRef],
+    [setDragNodeRef, setPinOrderNodeRef, setOrderNodeRef],
   );
   // Timestamps of the last two clicks this row received, for the dblclick
   // rename guard: the list can reorder between the two clicks of a
@@ -5200,12 +5342,14 @@ function ConversationRowImpl({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
-      draggable={gridsEnabled ? false : undefined}
-      onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
+      draggable={gridsEnabled || orderGroup ? false : undefined}
+      onDragStart={gridsEnabled || orderGroup ? (event) => event.preventDefault() : undefined}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
-        SIDEBAR_HOVER_HIGHLIGHT,
+        isOrderOver
+          ? "outline-2 -outline-offset-2 outline-dashed outline-brand-accent/40"
+          : SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
@@ -5241,11 +5385,6 @@ function ConversationRowImpl({
       )}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        // Swallow the click that trails a drag so it doesn't navigate.
-        if (justDraggedRef.current) {
-          e.preventDefault();
-          return;
-        }
         if (selectionMode) {
           e.preventDefault();
           e.stopPropagation();
@@ -5312,6 +5451,7 @@ function ConversationRowImpl({
     <li
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
+      data-session-order-over={isOrderOver || undefined}
       onMouseDown={(event) => {
         // Portaled dialogs bubble through this row but must not start a drag.
         if (event.currentTarget.contains(event.target as Node)) {

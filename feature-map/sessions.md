@@ -156,14 +156,27 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
-  (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
+  (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
-  clears the cached rows and shows loading while session timestamps refresh,
-  including project folders, pins, and Archived. With the flag off,
-  sessions always use Updated regardless of the saved preference. Shared sessions
-  get their own section above Sessions. Status groups are Needs attention, Unread,
+  between Created and Updated clears the cached rows and shows loading while
+  session timestamps refresh, including project folders, pins, and Archived.
+  With the flag off, sessions always use Updated regardless of the saved
+  preference. Custom starts from the current order and keeps
+  existing sessions fixed as updates arrive, with new sessions at the top and
+  older sessions added by Load more at the bottom. It retains Created/Updated
+  for fetching pages. Equal timestamps do not lift history above the saved order.
+  Deleting a session removes its saved position; paging or collapsing folders preserves it.
+  Choosing an automatic order preserves the saved Custom
+  order for later. Drag within a group, or use a row's Move up/down menu actions,
+  to switch to Custom. Hover marks valid reorder targets with a faint brand-colored
+  dashed border; dropping commits the move.
+  Cancelled, outside, self, and cross-group drops do not change the order.
+  Pinned keeps its own ordering. Archived project members can be reordered even
+  before the global list reaches them; archived sessions cannot be dropped into grids.
+  Shared sessions support personal ordering too
+  and get their own section above Sessions. Status groups are Needs attention, Unread,
   Working, Draft, and Done. Working stays visible with muted “No sessions” text
   when empty. Starting or running sessions enter Working immediately; idle must
   last 10 seconds before they leave it. Errors and approvals bypass that delay.
@@ -323,6 +336,15 @@ PR while offline; linking needs the host. Reconnect and verify live checks and
 merge controls return. Unlink the last PR and verify it stays absent after refresh.
 A session not yet imported to the server says so. Older servers retain their
 host-dependent unlink behavior.
+
+**Custom session order:** select Ordering → Custom to keep the current order,
+or drag a session onto another row in the same group to enter Custom and move it
+into that position. Rows stay put while hovering. The row's menu and right-click
+menu also offer Move up and Move down. The saved order is device-local and is
+honored inside project folders, Status, Harness, and date groups. Dropping into a
+project folder, including onto a member row, files the session there; dragging
+within that folder reorders its sessions. Dropping back onto the same row keeps
+the current page open. Pinned keeps its existing behavior.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
@@ -606,6 +628,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
   Repeat from the header menu's Add to project by hand and expect the row to
   regroup under that project.
+- **`project`, drops onto a folder's session rows:**
+  `tests/e2e_ui/sessions/test_sidebar_projects.py::test_move_session_into_new_project`
+  enables sidebar grouping and checks filing over an existing member, dropping
+  a non-current session back onto itself without navigation, and clicking after a drop.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
 - **`project-rename`, project header right-click and three-dot menus:**
@@ -1000,8 +1026,11 @@ plain `uv run pytest`, which starts a private server for the test.
   (desktop and narrow-browser navigation),
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
-  (enable the flag by patching `GET /v1/info`). Unit tests in
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`,
+  (enable the flag by patching `GET /v1/info`).
+  `tests/browser_ui/test_sessions_appearance.py::test_custom_order_commits_on_drop_and_survives_grouping_and_reload`
+  uses the built SPA with mocked backend contracts to check real pointer drops,
+  the faint 2px dashed outline, grouping, and reload persistence. Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
 - **`project-show-more`:** no browser test drives it. Component tests in
@@ -1087,3 +1116,5 @@ plain `uv run pytest`, which starts a private server for the test.
 - Grouping and ordering apply to the loaded pages only: an older session joins
   its group once it is paged in. Grouped views hide Projects, so dragging a
   session onto the list never removes it from its project there.
+- Custom retains saved positions for unloaded sessions, but an older session
+  moved upward can still require Load more after reload before it appears.
