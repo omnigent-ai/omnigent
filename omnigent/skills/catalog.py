@@ -31,7 +31,7 @@ from omnigent.skills.limits import (
     MAX_PATH_CHARS,
     MAX_SKILL_MD_BYTES,
 )
-from omnigent.spec.parser import _parse_skill
+from omnigent.spec.parser import parse_untrusted_skill
 from omnigent.spec.validator import is_valid_skill_name
 
 MARKETPLACE_MANIFEST = ".claude-plugin/marketplace.json"
@@ -203,7 +203,7 @@ def _entry(
         skipped.append(f"{rel}: SKILL.md is missing, not a regular file, or too large")
         return None
     try:
-        spec = _parse_skill(manifest)
+        spec = parse_untrusted_skill(manifest)
     except Exception as exc:  # noqa: BLE001 — a bad SKILL.md drops one entry, not the catalog
         skipped.append(f"{rel}: {exc}")
         return None

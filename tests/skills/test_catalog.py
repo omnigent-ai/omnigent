@@ -49,10 +49,10 @@ def test_a_catalog_stops_reading_at_its_entry_cap(
 
     write_skill(plain_repo / "skills", "zzz", "Never read")
     parsed: list[str] = []
-    real_parse = catalog._parse_skill
+    real_parse = catalog.parse_untrusted_skill
     monkeypatch.setattr(
         catalog,
-        "_parse_skill",
+        "parse_untrusted_skill",
         lambda manifest: (parsed.append(manifest.parent.name), real_parse(manifest))[1],
     )
     monkeypatch.setattr(catalog, "MAX_CATALOG_ENTRIES", 1)

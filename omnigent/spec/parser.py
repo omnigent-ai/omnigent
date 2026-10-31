@@ -2736,7 +2736,18 @@ def _with_legacy_skill_names(skills: list[SkillSpec]) -> list[SkillSpec]:
     ]
 
 
-def _parse_skill(skill_md: Path) -> SkillSpec:
+def parse_untrusted_skill(skill_md: Path) -> SkillSpec:
+    """Parse a ``SKILL.md`` from a repository the server does not own.
+
+    Like :func:`_parse_skill`, with YAML anchors refused and a non-scalar
+    ``name`` or ``description`` rejected, so a small manifest cannot expand
+    into a large structure. Only the skills marketplace uses it; skills the
+    agent author or host provides keep the permissive parse.
+    """
+    return _parse_skill(skill_md, untrusted=True)
+
+
+def _parse_skill(skill_md: Path, *, untrusted: bool = False) -> SkillSpec:
     """
     Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
 
@@ -2748,6 +2759,8 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
 
     :param skill_md: Path to the ``SKILL.md`` file, e.g.
         ``skills/code-review/SKILL.md``.
+    :param untrusted: Refuse anchors and non-scalar metadata (see
+        :func:`parse_untrusted_skill`).
     :returns: A populated :class:`SkillSpec`.
     :raises OmnigentError: If the file cannot be read, or the
         frontmatter is missing, malformed, or lacks required fields.
@@ -2774,12 +2787,13 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
             code=ErrorCode.INVALID_INPUT,
         )
     frontmatter_str, content = match.groups()
+    load = load_skill_frontmatter if untrusted else yaml.safe_load
     try:
-        frontmatter = load_skill_frontmatter(frontmatter_str)
+        frontmatter = load(frontmatter_str)
     except yaml.YAMLError as exc:
         # Retry prose containing colons; diagnostics must not include file contents.
         try:
-            frontmatter = load_skill_frontmatter(_quote_description_with_colon(frontmatter_str))
+            frontmatter = load(_quote_description_with_colon(frontmatter_str))
         except yaml.YAMLError:
             raise OmnigentError(
                 f"SKILL.md has invalid YAML frontmatter: {skill_md} ({type(exc).__name__})",
@@ -2805,10 +2819,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     # ``user-invocable: false`` marks an internal orchestration skill that
     # the user should not invoke directly; absent/true ⇒ invocable.
     user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
-    label = _scalar_metadata(name, "name", skill_md)
+    label = _scalar_metadata(name, "name", skill_md) if untrusted else str(name)
     return SkillSpec(
         name=skill_md.parent.name,
-        description=_scalar_metadata(description, "description", skill_md),
+        description=(
+            _scalar_metadata(description, "description", skill_md)
+            if untrusted
+            else str(description)
+        ),
         content=content.strip(),
         skill_dir=skill_md.parent,
         user_invocable=user_invocable,
