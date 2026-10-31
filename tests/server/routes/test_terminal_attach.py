@@ -48,7 +48,7 @@ from omnigent.server.auth import (
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
-from omnigent.terminals.ws_common import WS_CLOSE_WRONG_REPLICA
+from omnigent.terminals.ws_common import WS_CLOSE_INTERNAL_ERROR, WS_CLOSE_WRONG_REPLICA
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -564,20 +564,25 @@ async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:
 
 
 @pytest.mark.parametrize(
-    ("host_live_elsewhere", "expected_code"),
-    [(True, WS_CLOSE_WRONG_REPLICA), (False, 1013)],
-    ids=["wrong_replica", "runner_tunnel_not_connected"],
+    ("runner_id", "host_live_elsewhere", "expected_code"),
+    [
+        ("runner_reconnecting", True, WS_CLOSE_WRONG_REPLICA),
+        ("runner_reconnecting", False, 1013),
+        (None, False, WS_CLOSE_INTERNAL_ERROR),
+    ],
+    ids=["wrong_replica", "runner_tunnel_not_connected", "no_runner_pinned"],
 )
-async def test_attach_terminal_absent_runner_tunnel_closes_with_retry_code(
-    app: FastAPI, host_live_elsewhere: bool, expected_code: int
+async def test_attach_terminal_tunnel_factory_failure_close_code(
+    app: FastAPI, runner_id: str | None, host_live_elsewhere: bool, expected_code: int
 ) -> None:
     """
-    A pinned runner whose tunnel is absent closes with a code the browser
-    retries instead of the dead-end internal error: 4400 re-dials without the
-    slice key when the host lives on another replica, and 1013 re-dials with
-    backoff while the runner reconnects.
+    A tunnel-factory failure closes with a code matching its cause: 4400
+    re-dials without the slice key when the host lives on another replica,
+    1013 re-dials with backoff while the pinned runner reconnects, and any
+    other failure, such as an unpinned session, keeps the internal error.
 
     :param app: The FastAPI app fixture.
+    :param runner_id: The session's pinned runner, or ``None`` when unpinned.
     :param host_live_elsewhere: Whether the session's host is live on
         another replica.
     :param expected_code: The close code the browser must receive.
@@ -588,7 +593,7 @@ async def test_attach_terminal_absent_runner_tunnel_closes_with_retry_code(
             return host_live_elsewhere
 
     conversations = _StubConversationStore()
-    conversations.add("conv_ws", runner_id="runner_reconnecting", host_id="host_ws")
+    conversations.add("conv_ws", runner_id=runner_id, host_id="host_ws")
     tunnels = TunnelRegistry()
     router = RunnerRouter(
         registry=tunnels,
