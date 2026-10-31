@@ -714,7 +714,11 @@ async def test_subagent_idle_observation_preserves_timing_and_deduplication(
             await tick()
             if supports_idle or cycle == 0:
                 count += 1
-                assert status_events[-1] == {"type": "subagent.status", "data": {"idle": True}}
+                # The child's last message has no turn-ending stop reason.
+                assert status_events[-1] == {
+                    "type": "subagent.status",
+                    "data": {"idle": True, "turn_completed": False},
+                }
             await tick()
             state = forwarder._read_subagent_forward_state(bridge_dir)
             await tick()
@@ -875,6 +879,234 @@ async def test_subagent_idle_observation_retries_and_resumes_existing_checkpoint
         else [{"type": "subagent.status", "data": {"idle": True}}] * 2
     )
     assert state.subagents["idle-worker"].last_status == "idle"
+
+
+_CHILD_TOOL_CALL = {
+    "isSidechain": True,
+    "type": "assistant",
+    "uuid": "child-call",
+    "message": {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_sleep",
+                "name": "Bash",
+                "input": {"command": "sleep 45"},
+            }
+        ],
+        "stop_reason": "tool_use",
+    },
+}
+_CHILD_TOOL_RESULT = {
+    "isSidechain": True,
+    "type": "user",
+    "uuid": "child-result",
+    "message": {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "toolu_sleep", "content": "ok"}],
+    },
+}
+_CHILD_FINAL_REPLY = {
+    "isSidechain": True,
+    "type": "assistant",
+    "uuid": "child-reply",
+    "message": {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "The check passed."}],
+        "stop_reason": "end_turn",
+    },
+}
+_CHILD_INTERRUPT = {
+    "isSidechain": True,
+    "type": "user",
+    "uuid": "child-interrupt",
+    "message": {
+        "role": "user",
+        "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}],
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("phases", "idle_reports"),
+    [
+        pytest.param([[_CHILD_TOOL_CALL]], [False], id="waiting-on-tool-call"),
+        pytest.param(
+            [[_CHILD_TOOL_CALL, _CHILD_TOOL_RESULT]], [False], id="tool-result-pending-reply"
+        ),
+        pytest.param(
+            [[_CHILD_TOOL_CALL, _CHILD_TOOL_RESULT, _CHILD_FINAL_REPLY]], [True], id="final-reply"
+        ),
+        pytest.param(
+            [[_CHILD_TOOL_CALL], [_CHILD_INTERRUPT]],
+            [False, True],
+            id="interrupted-after-tool-call-lull",
+        ),
+    ],
+)
+async def test_subagent_idle_observation_reports_whether_child_turn_ended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phases: list[list[dict[str, Any]]],
+    idle_reports: list[bool],
+) -> None:
+    now = 1000.0
+    monkeypatch.setattr(
+        forwarder, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic)
+    )
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    child_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="worker",
+        agent_type="general-purpose",
+        description="slow check",
+        tool_use_id="toolu_worker",
+        transcript_records=phases[0],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "worker": forwarder.SubagentEntry(
+                subagent_id="worker", child_conversation_id="conv_child"
+            )
+        }
+    )
+    status_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": "item"} for _ in body])
+        status_events.append(body)
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for phase_index, phase in enumerate(phases):
+            if phase_index:
+                with child_transcript.open("a", encoding="utf-8") as handle:
+                    handle.writelines(json.dumps(record) + "\n" for record in phase)
+            for _tick in range(2):
+                state = await forwarder._forward_available_subagents(
+                    client=client,
+                    parent_session_id="conv_parent",
+                    bridge_dir=bridge_dir,
+                    transcript_path=transcript_path,
+                    state=state,
+                    agent_name="claude-native-ui",
+                    start_retry_tracker=forwarder._PostRetryTracker(),
+                    item_retry_tracker=forwarder._PostRetryTracker(),
+                    status_retry_tracker=forwarder._PostRetryTracker(),
+                )
+                now += forwarder._SUBAGENT_IDLE_THRESHOLD_S + 0.001
+
+    idle_events = [event["data"] for event in status_events if event["data"].get("idle")]
+    assert idle_events == [{"idle": True, "turn_completed": ended} for ended in idle_reports]
+    restored = forwarder._read_subagent_forward_state(bridge_dir)
+    assert restored.subagents["worker"].turn_completed is idle_reports[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotation", ["clear", "fork"])
+async def test_session_rotation_settles_children_still_marked_working(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rotation: str
+) -> None:
+    """After ``/clear`` or a fork the old children are no longer read, so none may stay working."""
+    bridge_dir = tmp_path / "bridge"
+    entries = [
+        forwarder.SubagentEntry(
+            subagent_id="running", child_conversation_id="conv_running", last_status="running"
+        ),
+        forwarder.SubagentEntry(
+            subagent_id="mid-tool",
+            child_conversation_id="conv_mid_tool",
+            last_status="idle",
+            turn_completed=False,
+        ),
+        forwarder.SubagentEntry(
+            subagent_id="done",
+            child_conversation_id="conv_done",
+            last_status="idle",
+            turn_completed=True,
+        ),
+        forwarder.SubagentEntry(
+            subagent_id="older-idle", child_conversation_id="conv_older_idle", last_status="idle"
+        ),
+        forwarder.SubagentEntry(
+            subagent_id="failed", child_conversation_id="conv_failed", last_status="failed"
+        ),
+        forwarder.SubagentEntry(subagent_id="undiscovered", child_conversation_id=""),
+    ]
+    forwarder._write_subagent_forward_state(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={entry.subagent_id: entry for entry in entries}),
+    )
+    posted: list[tuple[str, dict[str, Any]]] = []
+    retried = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)))
+        if "conv_running" not in request.url.path:
+            return httpx.Response(202)
+        if len([path for path, _body in posted if "conv_running" in path]) == 1:
+            return httpx.Response(503)
+        retried.set()
+        return httpx.Response(202)
+
+    rotations = ["conv_rotated"]
+
+    async def rotate_once(**_kwargs: Any) -> str | None:
+        return rotations.pop() if rotations else None
+
+    async def no_rotation(**_kwargs: Any) -> None:
+        return None
+
+    async def skip_supersession(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    selected, other = ("clear", "fork") if rotation == "clear" else ("fork", "clear")
+    monkeypatch.setattr(forwarder, f"_maybe_rotate_session_on_{selected}", rotate_once)
+    monkeypatch.setattr(forwarder, f"_maybe_rotate_session_on_{other}", no_rotation)
+    monkeypatch.setattr(forwarder, "_post_clear_supersession", skip_supersession)
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(retried.wait(), timeout=10.0)
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    idle = {"type": "subagent.status", "data": {"idle": True}}
+    assert posted == [
+        ("/v1/sessions/conv_running/events", idle),
+        ("/v1/sessions/conv_mid_tool/events", idle),
+        ("/v1/sessions/conv_running/events", idle),
+    ]
+    # The rotation dropped the old checkpoint; the failed settle outlived it.
+    assert forwarder._read_subagent_forward_state(bridge_dir).subagents == {}
 
 
 @pytest.mark.asyncio

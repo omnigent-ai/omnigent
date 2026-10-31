@@ -2,8 +2,9 @@
 
 Drive the real forwarder/server/runner/UI chain using Claude-shaped transcript
 files. A child with an intermediate message and no completion record stays
-unfinished after the five-second idle observation. The parent must not receive
-a "finished (completed)" inbox notification.
+unfinished after the five-second idle observation: the parent's Agents tab keeps
+it working, and the parent must not receive a "finished (completed)" inbox
+notification.
 
 Run: pytest tests/e2e_ui/agents/test_subagent_inactivity.py
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -187,6 +189,12 @@ def _session_items(base_url: str, session_id: str) -> list[dict[str, Any]]:
     resp.raise_for_status()
     items = resp.json().get("items", [])
     return items if isinstance(items, list) else []
+
+
+def _child_session_entry(base_url: str, parent_id: str, child_id: str) -> dict[str, Any]:
+    response = httpx.get(f"{base_url}/v1/sessions/{parent_id}/child_sessions", timeout=10.0)
+    response.raise_for_status()
+    return next(child for child in response.json()["data"] if child["id"] == child_id)
 
 
 def _item_text(item: dict[str, Any]) -> str:
@@ -406,6 +414,20 @@ def test_midtask_lull_must_not_deliver_false_completion(
         "forwarder did not report idle over the lull; "
         f"last_status={idle_entry.last_status if idle_entry else None!r}"
     )
+    child_entry = _child_session_entry(base_url, session_id, child_id)
+    settle_deadline = time.monotonic() + 5.0
+    while child_entry.get("busy") and time.monotonic() < settle_deadline:
+        time.sleep(0.5)
+        child_entry = _child_session_entry(base_url, session_id, child_id)
+    assert child_entry.get("current_task_status") != "completed", (
+        f"the idle observation marked the still-running sub-agent completed: {child_entry!r}"
+    )
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Agents")).click()
+    avatar = rail.locator(
+        f'[data-testid="subagent-row"][data-child-session-id="{child_id}"]'
+    ).get_by_test_id("subagent-status-avatar")
+    expect(avatar).to_have_attribute("data-activity", "working")
 
     # 6. Keep the parent working, exactly as the reported orchestrators were:
     # drive a follow-up turn through the composer. The runner hands over any

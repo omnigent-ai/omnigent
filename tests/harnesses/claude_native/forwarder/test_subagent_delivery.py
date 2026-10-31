@@ -1130,7 +1130,7 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
     assert set(attempts.values()) == {2}
     assert sorted(child_id for child_id, _ in statuses) == [f"conv_recover_{i}" for i in range(5)]
     assert [body for _, body in statuses] == [
-        {"type": "subagent.status", "data": {"idle": True}}
+        {"type": "subagent.status", "data": {"idle": True, "turn_completed": False}}
     ] * 5
     assert all(entry.delivery_error is None for entry in state.subagents.values())
 
