@@ -1570,7 +1570,7 @@
         "type": "object"
       },
       "CompletedEvent": {
-        "description": "Terminal event for a successfully completed turn.\n\nCarries the final\n`omnigent.server.schemas.ResponseObject`.",
+        "description": "Terminal event for a successfully completed turn.\n\nCarries the final\n`ResponseObject`.",
         "properties": {
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
@@ -1882,7 +1882,7 @@
         "type": "object"
       },
       "CreatedEvent": {
-        "description": "Initial event emitted at the start of every streaming response.\n\nCarries the freshly-allocated\n`omnigent.server.schemas.ResponseObject` (status will\nbe `\"queued\"` or `\"in_progress\"` depending on whether the\ntask started immediately).",
+        "description": "Initial event emitted at the start of every streaming response.\n\nCarries the freshly-allocated\n`ResponseObject` (status will\nbe `\"queued\"` or `\"in_progress\"` depending on whether the\ntask started immediately).",
         "properties": {
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
@@ -2707,7 +2707,7 @@
         "type": "object"
       },
       "FailedEvent": {
-        "description": "Terminal event for a turn that ended with an error.\n\nCarries a `omnigent.server.schemas.FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
+        "description": "Terminal event for a turn that ended with an error.\n\nCarries a `FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
         "properties": {
           "response": {
             "anyOf": [
