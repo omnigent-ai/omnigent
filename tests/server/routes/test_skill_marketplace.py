@@ -1069,7 +1069,11 @@ async def test_server_policy_binds_sources_url_installs_and_delivery(
     # Single-user mode is all-admin, so every refusal below is one an admin gets.
     config = {
         "skills_marketplace": {
-            "sources": [{"url": "https://github.com/acme/skills", "name": "Acme"}],
+            "sources": [
+                {"url": "https://github.com/acme/skills", "name": "Acme"},
+                # git's name for the default branch, written out by the operator.
+                {"url": "https://github.com/acme/pinned", "ref": "HEAD", "name": "Pinned"},
+            ],
             "allowed_sources": ["github.com/acme/*"],
             "allow_url_install": False,
         }
@@ -1090,9 +1094,14 @@ async def test_server_policy_binds_sources_url_installs_and_delivery(
 
         # The config's source is seeded at startup, labelled, and not removable here.
         listed = (await client.get("/v1/skill-sources")).json()["data"]
-        assert [(s["url"], s["name"], s["managed"]) for s in listed] == [(REPO_URL, "Acme", True)]
-        source_id = listed[0]["id"]
+        assert sorted((s["url"], s["name"], s["managed"]) for s in listed) == [
+            ("https://github.com/acme/pinned.git", "Pinned", True),
+            (REPO_URL, "Acme", True),
+        ]
+        source_id = next(s["id"] for s in listed if s["url"] == REPO_URL)
+        pinned_id = next(s["id"] for s in listed if s["url"] != REPO_URL)
         assert (await client.delete(f"/v1/skill-sources/{source_id}")).status_code == 403
+        assert (await client.delete(f"/v1/skill-sources/{pinned_id}")).status_code == 403
         assert (await client.get(f"/v1/skill-sources/{source_id}/catalog")).status_code == 200
 
         # allowed_sources binds the admin too.

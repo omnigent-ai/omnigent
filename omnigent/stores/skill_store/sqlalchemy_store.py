@@ -36,6 +36,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import InstalledSkill, SkillSource
 from omnigent.entities.skill import SkillScope
+from omnigent.skills.policy import DEFAULT_BRANCH_REF
 from omnigent.stores.skill_store import (
     DEFAULT_PAGE,
     MAX_DELIVERY_BYTES_PER_SCOPE,
@@ -63,7 +64,7 @@ from omnigent.stores.skill_store import (
 ORG_PRINCIPAL = "org"
 LOCAL_PRINCIPAL = "local"
 # git's own name for the remote's default branch: what a source without a ref fetches.
-DEFAULT_REF = "HEAD"
+DEFAULT_REF = DEFAULT_BRANCH_REF
 # Names per IN-list, under every supported engine's parameter limit.
 _NAMES_PER_QUERY = 100
 # A page cursor: the last row's ordering epoch and its id, so the next page

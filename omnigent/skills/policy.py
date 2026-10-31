@@ -68,6 +68,15 @@ class SourceCredential:
     token_env: str
 
 
+# git's name for a remote's default branch; a source written with it means no ref.
+DEFAULT_BRANCH_REF = "HEAD"
+
+
+def default_ref(ref: str | None) -> str | None:
+    """*ref* with ``"HEAD"`` read as ``None``, the default branch, as the store reports it."""
+    return None if ref == DEFAULT_BRANCH_REF else ref
+
+
 def repository_key(clone_url: str) -> str | None:
     """``host/owner/repo`` (lower-cased) for an HTTPS clone URL, else ``None``."""
     parts = urlsplit(clone_url)
@@ -119,6 +128,7 @@ class SkillsMarketplacePolicy:
 
     def is_configured(self, url: str, ref: str | None, path: str = "") -> bool:
         """Whether the operator listed this exact repository, ref and directory."""
+        ref = default_ref(ref)
         return any(s.url == url and s.ref == ref and s.path == path for s in self.sources)
 
     def token_for(self, clone_url: str) -> str | None:
@@ -214,7 +224,7 @@ def _parse_sources(raw: Any) -> list[ConfiguredSource]:
         sources.append(
             ConfiguredSource(
                 url=parsed.clone_url,
-                ref=(str(ref).strip() or None) if ref is not None else parsed.ref,
+                ref=default_ref(str(ref).strip() or None if ref is not None else parsed.ref),
                 name=name.strip() or None if isinstance(name, str) else None,
                 path=path,
             )
