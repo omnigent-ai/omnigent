@@ -1013,6 +1013,62 @@ def test_served_bundle_carries_the_owners_enabled_skills(db_uri: str, tmp_path: 
     )
 
 
+def test_a_skill_dropped_by_a_failed_read_is_served_once_the_read_recovers(
+    db_uri: str, tmp_path: Path
+) -> None:
+    # A merge that had to drop a skill is not cached, so the next fetch retries it.
+    store = SqlAlchemySkillStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    failures = {"skills/flaky.tar.gz": 1}
+    real_get = artifacts.get
+
+    def flaky_get(location: str) -> bytes | None:
+        if failures.get(location, 0) > 0:
+            failures[location] -= 1
+            raise OSError("artifact store unavailable")
+        return real_get(location)
+
+    artifacts.get = flaky_get  # type: ignore[method-assign]
+    for name in ("steady", "flaky"):
+        artifacts.put(
+            f"skills/{name}.tar.gz",
+            skill_tarball({"SKILL.md": f"---\nname: {name}\n---\n".encode()}),
+        )
+        store.install(
+            name=name,
+            display_name=None,
+            description=name,
+            source_url=REPO_URL,
+            ref=None,
+            commit=None,
+            path=f"skills/{name}",
+            scope="user",
+            owner_user_id="alice",
+            bundle_location=f"skills/{name}.tar.gz",
+            bundle_bytes=1,
+            installed_by="alice",
+        )
+    bundle = skill_tarball({"config.yaml": b"name: flaky-read\n"})
+
+    def served() -> list[str]:
+        return _names(
+            with_installed_skills(
+                bundle, owner_id="alice", skill_store=store, artifact_store=artifacts
+            )
+        )
+
+    first = served()
+    assert "skills/steady/SKILL.md" in first and "skills/flaky/SKILL.md" not in first
+    assert failures["skills/flaky.tar.gz"] == 0
+    second = served()
+    assert "skills/flaky/SKILL.md" in second and "skills/steady/SKILL.md" in second
+    # A clean merge is cached: a further fetch reads no tarball.
+    reads: list[str] = []
+    artifacts.get = lambda location: reads.append(location) or real_get(location)  # type: ignore[method-assign]
+    assert served() == second
+    assert reads == []
+
+
 @pytest.mark.parametrize("org_first", [True, False])
 def test_a_users_install_wins_over_the_orgs_whatever_the_order(
     db_uri: str, org_first: bool

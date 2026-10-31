@@ -217,7 +217,8 @@ def with_installed_skills(
     skill would fail the whole spec. When the agent's own files leave too
     little room under what a runner unpacks, the skills that do not fit are
     left out with a warning rather than failing the session. The result is
-    cached per input set (see :class:`_OverlayCache`).
+    cached per input set (see :class:`_OverlayCache`), unless a skill's
+    tarball could not be read.
 
     :param target: The spec the session runs and its directory in the bundle;
         ``None`` means the root agent with no filter.
@@ -259,6 +260,7 @@ def with_installed_skills(
     if cached is not None:
         return cached
     accepted: list[tuple[str, bytes]] = []
+    unreadable = False
     for skill in selected:
         try:
             tarball = artifact_store.get(skill.bundle_location)
@@ -270,6 +272,7 @@ def with_installed_skills(
                 skill.id,
                 exc_info=True,
             )
+            unreadable = True
             continue
         accepted.append((skill.name, tarball))
     try:
@@ -289,7 +292,10 @@ def with_installed_skills(
             RUNNER_UNPACK_BYTES // (1024 * 1024),
             RUNNER_UNPACK_ENTRIES,
         )
-    _overlay_cache.put(key, merged)
+    # A read can fail transiently, so a merge that dropped a skill is rebuilt next time.
+    # A skill left out for size is not: the key fixes every input that decided it.
+    if not unreadable:
+        _overlay_cache.put(key, merged)
     return merged
 
 
