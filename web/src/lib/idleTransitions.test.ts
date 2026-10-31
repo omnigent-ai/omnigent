@@ -194,42 +194,82 @@ describe("computeUnreadBadgeIds", () => {
     return (id: string) => set.has(id);
   }
 
+  /** No session explicitly marked unread (the common case). */
+  const noneExplicit = () => false;
+
   it("counts a session the unseen predicate flags", () => {
-    const next = computeUnreadBadgeIds([convB("a")], undefined, true, unseenIds("a"));
+    const next = computeUnreadBadgeIds([convB("a")], undefined, true, unseenIds("a"), noneExplicit);
     expect([...next]).toEqual(["a"]);
   });
 
   it("counts a session awaiting input even when not unseen", () => {
     // Pending elicitation alone (sidebar "awaiting" badge) puts the session
     // on the dock badge — the user owes it a response.
-    const next = computeUnreadBadgeIds([convB("a", { pending: 1 })], undefined, true, unseenIds());
+    const next = computeUnreadBadgeIds(
+      [convB("a", { pending: 1 })],
+      undefined,
+      true,
+      unseenIds(),
+      noneExplicit,
+    );
     expect([...next]).toEqual(["a"]);
   });
 
   it("excludes a seen session with no pending elicitations", () => {
     // Neither unseen nor awaiting -> contributes nothing. A failure here
     // means the badge would count every listed session.
-    const next = computeUnreadBadgeIds([convB("a")], undefined, true, unseenIds());
+    const next = computeUnreadBadgeIds([convB("a")], undefined, true, unseenIds(), noneExplicit);
     expect(next.size).toBe(0);
   });
 
   it("suppresses the actively-viewed session (focused + active)", () => {
     // Focused AND viewing 'a' -> the user is looking at it, so not unread,
     // even though the predicate flags it and it has a pending elicitation.
-    const next = computeUnreadBadgeIds([convB("a", { pending: 2 })], "a", true, unseenIds("a"));
+    const next = computeUnreadBadgeIds(
+      [convB("a", { pending: 2 })],
+      "a",
+      true,
+      unseenIds("a"),
+      noneExplicit,
+    );
+    expect(next.size).toBe(0);
+  });
+
+  it("counts the actively-viewed session once it's explicitly marked unread", () => {
+    // Mark as unread on the open session lifts the focus suppression, as it
+    // does for the sidebar dot.
+    const next = computeUnreadBadgeIds(
+      [convB("a"), convB("b")],
+      "a",
+      true,
+      unseenIds("a", "b"),
+      (id) => id === "a",
+    );
+    expect([...next].sort()).toEqual(["a", "b"]);
+  });
+
+  it("does not count an explicitly-unread active session with nothing unseen", () => {
+    // Explicit unread lifts suppression but doesn't count a session on its own.
+    const next = computeUnreadBadgeIds([convB("a")], "a", true, unseenIds(), (id) => id === "a");
     expect(next.size).toBe(0);
   });
 
   it("counts the open session when the window is blurred", () => {
     // Active conversation is 'a' but the window is blurred -> the user isn't
     // looking, so 'a' still counts. Suppression requires focus AND active.
-    const next = computeUnreadBadgeIds([convB("a")], "a", false, unseenIds("a"));
+    const next = computeUnreadBadgeIds([convB("a")], "a", false, unseenIds("a"), noneExplicit);
     expect([...next]).toEqual(["a"]);
   });
 
   it("counts a non-active unseen session while focused elsewhere", () => {
     // Window focused but viewing 'b' -> 'a' is unread.
-    const next = computeUnreadBadgeIds([convB("a"), convB("b")], "b", true, unseenIds("a"));
+    const next = computeUnreadBadgeIds(
+      [convB("a"), convB("b")],
+      "b",
+      true,
+      unseenIds("a"),
+      noneExplicit,
+    );
     expect([...next]).toEqual(["a"]);
   });
 
@@ -247,6 +287,7 @@ describe("computeUnreadBadgeIds", () => {
       "e",
       true,
       unseenIds("a", "c", "e"),
+      noneExplicit,
     );
     expect([...next].sort()).toEqual(["a", "b", "c"]);
   });
@@ -263,6 +304,7 @@ describe("computeUnreadBadgeIds", () => {
         calls.push({ id, updatedAt, status });
         return false;
       },
+      noneExplicit,
     );
     expect(calls).toEqual([{ id: "a", updatedAt: 42, status: "failed" }]);
   });
@@ -274,11 +316,12 @@ describe("computeUnreadBadgeIds", () => {
       undefined,
       true,
       unseenIds("a", "b"),
+      noneExplicit,
     );
     expect([...next]).toEqual(["b"]);
   });
 
   it("returns an empty set for an empty list", () => {
-    expect(computeUnreadBadgeIds([], undefined, true, unseenIds("a")).size).toBe(0);
+    expect(computeUnreadBadgeIds([], undefined, true, unseenIds("a"), noneExplicit).size).toBe(0);
   });
 });
