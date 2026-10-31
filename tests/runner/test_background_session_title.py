@@ -1352,8 +1352,23 @@ async def test_background_title_skips_unsupported_harness_without_spawning(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "failure", "category"),
+    [
+        ("codex", "Codex authentication expired.", "harness_error"),
+        (
+            "claude-sdk",
+            "API Error: Claude's response exceeded the 32 output token maximum.",
+            "output_token_limit",
+        ),
+    ],
+)
 async def test_background_title_surfaces_harness_failure_and_releases_process(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    harness: str,
+    failure: str,
+    category: str,
 ) -> None:
     class FailedClient(_FakeHarnessClient):
         def stream(
@@ -1369,13 +1384,14 @@ async def test_background_title_surfaces_harness_failure_and_releases_process(
             self.requests.append((url, json))
             return _FakeHarnessStream(
                 [
+                    {"type": "response.output_text.delta", "delta": "private title fragment"},
                     {
                         "type": "response.failed",
                         "response": {
                             "status": "failed",
-                            "error": {"message": "Codex authentication expired."},
+                            "error": {"message": failure},
                         },
-                    }
+                    },
                 ]
             )
 
@@ -1383,7 +1399,7 @@ async def test_background_title_surfaces_harness_failure_and_releases_process(
     process_manager = _FakeProcessManager(harness_client)
 
     async def resolve_harness_config(**_kwargs: Any) -> tuple[str, None]:
-        return "codex", None
+        return harness, None
 
     monkeypatch.setattr(
         "omnigent.runner.app._resolve_harness_config",
@@ -1403,7 +1419,7 @@ async def test_background_title_surfaces_harness_failure_and_releases_process(
     assert response.status_code == 502
     assert response.json() == {
         "error": "title_harness_failed",
-        "detail": "Codex authentication expired.",
+        "detail": failure,
     }
     # The economy-tier attempt fails, then the session-model retry fails
     # identically; both synthetic processes are released.
@@ -1412,8 +1428,26 @@ async def test_background_title_surfaces_harness_failure_and_releases_process(
     for process_key in process_manager.released:
         assert uuid.UUID(process_key).hex == process_key
     [(_, first_body), (_, second_body)] = harness_client.requests
-    assert first_body["model_override"] == "gpt-5.6-luna"
+    assert first_body["model_override"] == background_title_model(harness)
     assert "model_override" not in second_body
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "background_title_harness_failed"
+    ]
+    assert len(records) == 2
+    for record, process_key, source in zip(
+        records, process_manager.released, ("title_override", "session"), strict=True
+    ):
+        assert record.attributes == {
+            "process_key": process_key,
+            "harness": harness,
+            "model_source": source,
+            "max_output_tokens": first_body["max_output_tokens"],
+            "received_text_chars": len("private title fragment"),
+            "failure_category": category,
+        }
+        assert "private" not in repr(record.attributes)
 
 
 @pytest.mark.asyncio
