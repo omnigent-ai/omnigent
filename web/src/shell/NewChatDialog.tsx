@@ -64,7 +64,7 @@ import {
   type SandboxProfileSelection,
 } from "@/components/SandboxProfilePicker";
 import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
   CircleHelpIcon,
@@ -386,7 +386,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { createBundledSession, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
@@ -2018,6 +2018,7 @@ export function AgentHarnessPicker({
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
 interface LandingDraft {
+  siblingSourceId?: string | null;
   mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
@@ -2069,6 +2070,41 @@ export function resetLandingDraft(): void {
 }
 
 export function NewChatLandingScreen() {
+  const [params] = useSearchParams();
+  const siblingSourceId = params.get("sibling");
+  const source = useQuery({
+    queryKey: ["sibling-source", siblingSourceId],
+    queryFn: () => getSessionSlim(siblingSourceId!),
+    enabled: siblingSourceId !== null,
+  });
+  if (siblingSourceId && source.isPending)
+    return (
+      <div role="status" className="p-6">
+        Loading source session…
+      </div>
+    );
+  if (siblingSourceId && source.isError)
+    return (
+      <div role="alert" className="p-6">
+        Source session is unavailable.
+      </div>
+    );
+  return (
+    <NewChatLandingContent
+      key={siblingSourceId ?? "standalone"}
+      siblingSourceId={siblingSourceId}
+      siblingSource={source.data}
+    />
+  );
+}
+
+function NewChatLandingContent({
+  siblingSourceId,
+  siblingSource,
+}: {
+  siblingSourceId: string | null;
+  siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
+}) {
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -2101,7 +2137,10 @@ export function NewChatLandingScreen() {
       cancelled = true;
     };
   }, [cacheUser]);
-  const pickerCacheKey = getNewChatPickerCacheKey(projectParam, cacheUser);
+  const pickerCacheKey = getNewChatPickerCacheKey(
+    siblingSourceId ? `sibling:${siblingSourceId}` : projectParam,
+    cacheUser,
+  );
   // Snapshot once per scope: editing a cached menu changes the saved preferences.
   const cachedPickerOptions = useMemo(
     () => readNewChatPickerOptionsCache(pickerCacheKey),
@@ -2199,7 +2238,7 @@ export function NewChatLandingScreen() {
     data: hosts,
     isLoading: hostsLoading,
     isError: hostsError,
-  } = useHosts({ refetchOnFocus: true });
+  } = useHosts({ refetchOnFocus: true, sourceHostId: siblingSource?.hostId });
 
   // Offer an import affordance on the empty landing: a brand-new user with no
   // Omnigent sessions can pull in their existing local CLI history. Same query
@@ -2258,27 +2297,29 @@ export function NewChatLandingScreen() {
   // strip them so the prefill machine (fill-empty-only) can seed. Read once
   // per mount; only the lazy state initializers below consume it.
   const restoredDraft: LandingDraft | null =
-    landingDraft === null || landingDraft.project === projectParam
-      ? landingDraft
-      : {
-          ...landingDraft,
-          pickedAgentId: null,
-          pickedHarness: null,
-          selectedHostId: null,
-          sandboxSelected: false,
-          sandboxProvider: null,
-          sandboxProfile: null,
-          // The repo inputs compose the managed create's workspace string, so
-          // they are location state too — keeping them would clone another
-          // project's repository into this project's sandbox.
-          sandboxRepoSelections: [],
-          workspace: "",
-          branchName: "",
-          // The branch may be the worktree-default's auto-seed, generated for
-          // the other visit's workspace — drop the marker with it so the
-          // seed/retract machinery starts clean for this visit.
-          autoSeededBranch: "",
-        };
+    (landingDraft?.siblingSourceId ?? null) !== siblingSourceId
+      ? null
+      : landingDraft === null || landingDraft.project === projectParam
+        ? landingDraft
+        : {
+            ...landingDraft,
+            pickedAgentId: null,
+            pickedHarness: null,
+            selectedHostId: null,
+            sandboxSelected: false,
+            sandboxProvider: null,
+            sandboxProfile: null,
+            // The repo inputs compose the managed create's workspace string, so
+            // they are location state too — keeping them would clone another
+            // project's repository into this project's sandbox.
+            sandboxRepoSelections: [],
+            workspace: "",
+            branchName: "",
+            // The branch may be the worktree-default's auto-seed, generated for
+            // the other visit's workspace — drop the marker with it so the
+            // seed/retract machinery starts clean for this visit.
+            autoSeededBranch: "",
+          };
 
   const [message, setMessage] = useState<string>(() =>
     linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
@@ -2404,7 +2445,7 @@ export function NewChatLandingScreen() {
   );
   const agentExplicitlySelectedRef = useRef(false);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
-    () => restoredDraft?.selectedHostId ?? null,
+    () => restoredDraft?.selectedHostId ?? siblingSource?.hostId ?? null,
   );
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
@@ -2494,7 +2535,9 @@ export function NewChatLandingScreen() {
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
   const sandboxRepoPopoverRef = useRef<HTMLDivElement>(null);
-  const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  const [workspace, setWorkspace] = useState<string>(
+    () => restoredDraft?.workspace ?? siblingSource?.workspace ?? "",
+  );
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
   // the config. ANY other write — a picker selection, browsing, a host
@@ -2663,6 +2706,7 @@ export function NewChatLandingScreen() {
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    siblingSourceId,
     mcpRegistryServices,
     project: projectParam,
     message,
@@ -2844,6 +2888,7 @@ export function NewChatLandingScreen() {
   // already in state (or restored from the in-memory draft) is never
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
+    if (siblingSourceId && siblingSource?.hostId) return;
     if (!prefillSettled) return;
     if (!onboardingHostSettled.current) {
       if (onboardingHost.pending) return;
@@ -2905,6 +2950,8 @@ export function NewChatLandingScreen() {
     defaultSandboxProvider,
     onboardingHost.pending,
     onboardingHost.hostId,
+    siblingSourceId,
+    siblingSource?.hostId,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -5596,6 +5643,7 @@ export function NewChatLandingScreen() {
     // after the user has navigated elsewhere while this component is still
     // mounted in the outgoing transition tree.
     const createLocation = window.location.href;
+    if (siblingSourceId && (!siblingSource || info === "loading" || !info.sibling_sessions)) return;
     const returnToCanvas = searchParams.has(CANVAS_QUERY_PARAM) && isFeatureEnabled(info, "canvas");
     let createdCanvasId = selectedProject
       ? (configProjectId ?? `name:${selectedProject}`)
@@ -5846,7 +5894,10 @@ export function NewChatLandingScreen() {
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
         // Custom agents upload their bundle with the session, then launch on the host below.
         const bundle = await buildAgentBundle(pendingAgent);
-        const metadata: Record<string, unknown> = { labels: createLabels };
+        const metadata: Record<string, unknown> = {
+          labels: createLabels,
+          ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
+        };
         if (mcpServicesForLaunch.length) {
           metadata.mcp_registry_services = mcpServicesForLaunch;
         }
@@ -5921,6 +5972,7 @@ export function NewChatLandingScreen() {
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const createPayload = JSON.stringify({
+          ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
           // Config-seeded agent on a `project_id` create: omitted so the
           // server default-fills it from the project config.
@@ -6255,9 +6307,11 @@ export function NewChatLandingScreen() {
     }
   }
 
-  const placeholderText = selectedProject
-    ? `Start a new session in ${selectedProject}`
-    : "Describe a task to start a new session…";
+  const placeholderText = siblingSourceId
+    ? "What should this agent work on?"
+    : selectedProject
+      ? `Start a new session in ${selectedProject}`
+      : "Describe a task to start a new session…";
 
   const isCloudHostEntry = (host: Host) =>
     !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
@@ -6388,7 +6442,13 @@ export function NewChatLandingScreen() {
           viewport edges on phones. */}
       <div className="flex min-h-0 w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-[max(20px,env(safe-area-inset-bottom))] md:pb-16 md:select-none">
         <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 md:flex-none">
-          {selectedProject ? (
+          {siblingSourceId ? (
+            <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
+              <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">
+                <PlusIcon className="size-6 text-brand-accent" />
+              </span>
+            </div>
+          ) : selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
             // icon — the default pink folder, or a chosen emoji — and name the
             // project. Sized to Otto's h-16 box so the centered composer doesn't
@@ -6409,11 +6469,22 @@ export function NewChatLandingScreen() {
           ) : (
             <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
           )}
-          {selectedProject || heading ? (
+          {siblingSourceId || selectedProject || heading ? (
             <h1 className="min-w-0 break-words text-center text-[24px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-              {selectedProject || heading}
+              {siblingSourceId ? "Add an agent" : selectedProject || heading}
             </h1>
           ) : null}
+          {siblingSourceId && (
+            <p
+              className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
+              data-testid="sibling-composer-context"
+            >
+              A new conversation alongside{" "}
+              <span className="font-medium text-foreground">
+                {siblingSource?.title?.trim() || "Untitled"}
+              </span>
+            </p>
+          )}
         </div>
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}

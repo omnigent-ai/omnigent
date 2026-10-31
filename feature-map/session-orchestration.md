@@ -1,13 +1,13 @@
 # Session orchestration
 
-An agent in a private session can send work to another session owned by the
-same user, then read its status/history. It can also create private top-level
-workers on its host or a new managed sandbox. This is enabled by default, with
+An owner-controlled agent in a private or read-only-shared session can send work to another session owned by the
+same user, then read its status/history. It can also create private sibling
+workers grouped in the left sidebar on its host or a new managed sandbox. This is enabled by default, with
 `-session_orchestration` in `OMNIGENT_FEATURES` as a server kill switch.
 
 ## Sub-features
 
-- `message`: private sender, same owner and workspace; shared destinations are
+- `message`: owner-controlled private or read-only-shared sender, same owner and workspace; shared destinations are
   allowed and their readers see the message. Normal queue/steering applies.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
@@ -23,9 +23,11 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
-  and `managed` placements create independent, initially private sessions.
+  and `managed` placements create independent, initially private sibling sessions.
+  Siblings share one sidebar family and do not appear as child agents.
   Managed creation uses the server's configured default sandbox provider.
-- `sharing`: sharing the sender blocks subsequent sends and independent creates.
+- `sharing`: giving another principal edit/manage/owner access to the sender
+  blocks subsequent sends and sibling creates; read-only sharing is allowed.
   Side chats and their children also inherit restrictions from the source chain.
   Accepted work, including tasks saved while a worker starts, continues. Making
   the sender private restores eligibility.
@@ -34,7 +36,7 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
-- `refusal`: disabled flag, another owner, shared sender or wrong runner binding
+- `refusal`: disabled flag, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
   acknowledgements are uncertain and must not auto-retry. After uncertain

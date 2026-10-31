@@ -1079,6 +1079,27 @@ def register_core_routes(
                         "Sender host/workspace is invalid for independent creation",
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
+        if source is not None:
+            body.sibling_source_id = source.root_conversation_id
+        if body.sibling_source_id is not None:
+            from omnigent.server.session_families import authorize_sibling_source
+
+            sibling_source = await asyncio.to_thread(
+                authorize_sibling_source,
+                request,
+                body.sibling_source_id,
+                user_id,
+                conversation_store,
+                permission_store,
+                parent_id=body.parent_session_id,
+                host_id=body.host_id,
+            )
+            if body.initial_items:
+                raise OmnigentError(
+                    "Siblings start a fresh conversation", code=ErrorCode.INVALID_INPUT
+                )
+            body.sibling_source_id = sibling_source.id
+            body.project_id = sibling_source.project_id
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -1244,7 +1265,12 @@ def register_core_routes(
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
         # children follow their parent's grants instead.
-        if user_id is not None and body.parent_session_id is None and orchestration_source is None:
+        if (
+            user_id is not None
+            and body.parent_session_id is None
+            and orchestration_source is None
+            and body.sibling_source_id is None
+        ):
             await _grant_default_public(
                 request.app.state,
                 permission_store,
@@ -1253,6 +1279,13 @@ def register_core_routes(
                 workspace=conv.workspace if conv is not None else None,
                 host_id=launch_host_id,
             )
+        if body.sibling_source_id is not None and conv is not None:
+            from omnigent.server.session_families import project_families
+
+            _, families = await asyncio.to_thread(
+                project_families, conversation_store, permission_store, [conv], user_id
+            )
+            resp.family = families.get(conv.id)
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
         return resp
 
@@ -1296,6 +1329,21 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        if parsed_metadata.sibling_source_id is not None:
+            from omnigent.server.session_families import authorize_sibling_source
+
+            sibling_source = await asyncio.to_thread(
+                authorize_sibling_source,
+                request,
+                parsed_metadata.sibling_source_id,
+                user_id,
+                conversation_store,
+                permission_store,
+                parent_id=parsed_metadata.parent_session_id,
+                host_id=parsed_metadata.host_id,
+            )
+            parsed_metadata.sibling_source_id = sibling_source.id
+            parsed_metadata.project_id = sibling_source.project_id
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -1453,6 +1501,15 @@ def register_core_routes(
                 created_by=user_id,
                 agent_store=agent_store,
             )
+        if parsed_metadata.sibling_source_id is not None:
+            from omnigent.server.session_families import complete_sibling_creation
+
+            await complete_sibling_creation(
+                conversation_store,
+                parsed_metadata.sibling_source_id,
+                result.session_id,
+                user_id=user_id,
+            )
         await record_profile(request, result.session_id, sandbox_profile, conversation_store)
         session_created(
             result.session_id,
@@ -1526,7 +1583,11 @@ def register_core_routes(
         # Default-public grant only after the launch steps were accepted (see the
         # JSON path). Sub-agent children follow their parent's grants, whether or
         # not they inherited its runner.
-        if user_id is not None and parsed_metadata.parent_session_id is None:
+        if (
+            user_id is not None
+            and parsed_metadata.parent_session_id is None
+            and parsed_metadata.sibling_source_id is None
+        ):
             await _grant_default_public(
                 request.app.state,
                 permission_store,
@@ -1964,6 +2025,18 @@ def register_core_routes(
         # side-chat-labeled fork from the sidebar list (it is still a normal
         # session, just not listed as a top-level one here).
         page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+        from omnigent.server.session_families import project_families
+
+        page.data, family_info = await asyncio.to_thread(
+            project_families,
+            conversation_store,
+            permission_store,
+            page.data,
+            user_id,
+            expand=True,
+            include_archived=include_archived_param,
+            archived_only=archived_only_param,
+        )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
         conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
@@ -2085,6 +2158,10 @@ def register_core_routes(
             for conv in page.data
             if conv.agent_id is not None
         ]
+        for item in items:
+            item.family = family_info.get(item.id)
+            if item.family and item.family.pinned and item.family.representative_id == item.id:
+                item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
         # Apart from the bounded orphan-suspect probe above, the list does not
         # compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the
@@ -2230,6 +2307,15 @@ def register_core_routes(
         convs = await asyncio.to_thread(_load_sessions, accessible)
         if not convs:
             return []
+        from omnigent.server.session_families import project_families
+
+        convs, family_info = await asyncio.to_thread(
+            project_families, conversation_store, permission_store, convs, user_id, expand=True
+        )
+        if permission_store is not None:
+            perms_by_conv = await asyncio.to_thread(
+                permission_store.list_for_sessions, [conv.id for conv in convs]
+            )
         conv_ids = [c.id for c in convs]
         (
             agent_metadata,
@@ -2264,6 +2350,10 @@ def register_core_routes(
             )
             for conv in convs
         ]
+        for item in items:
+            item.family = family_info.get(item.id)
+            if item.family and item.family.pinned and item.family.representative_id == item.id:
+                item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
         await _apply_liveness_to_items(items, liveness_lookup)
         # Full-row dumps (every field, nulls included) — NOT exclude_none. The
         # stream is a diff source: the client overlays these onto its cached
@@ -2963,7 +3053,72 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_codex_approval_mode = body.approval_mode
+        if body.family_pinned is not None:
+            from omnigent.server.session_orchestration import require_owned_session
+
+            if user_id is None or permission_store is None:
+                raise OmnigentError("Family pins require ownership", code=ErrorCode.FORBIDDEN)
+            await asyncio.to_thread(
+                require_owned_session, session_id, user_id, conversation_store, permission_store
+            )
+            await asyncio.to_thread(
+                conversation_store.set_family_pin,
+                session_id,
+                str(int(time.time() * 1000)) if body.family_pinned else "",
+                user_id=user_id,
+            )
         labels_to_set = dict(body.labels or {})
+        if PROJECT_LABEL_KEY in labels_to_set and not set_project:
+            from omnigent.stores.conversation_store import SESSION_FAMILY_LABEL_KEY
+
+            project_source = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if project_source and SESSION_FAMILY_LABEL_KEY in project_source.labels:
+                raise OmnigentError(
+                    "Move a session family through its representative's project action",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if PINNED_LABEL_KEY in labels_to_set:
+            from omnigent.stores.conversation_store import (
+                FAMILY_PIN_LABEL_PREFIX,
+                SESSION_FAMILY_LABEL_KEY,
+            )
+
+            pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                pin_source is not None
+                and SESSION_FAMILY_LABEL_KEY in pin_source.labels
+                and (
+                    permission_store is None
+                    or (
+                        user_id is not None
+                        and (owner_grant := permission_store.get(user_id, session_id)) is not None
+                        and owner_grant.level == LEVEL_OWNER
+                    )
+                )
+            ):
+                members = await asyncio.to_thread(
+                    conversation_store.get_session_family, session_id
+                )
+                active = [member for member in members if not member.archived]
+                family_pin_key = FAMILY_PIN_LABEL_PREFIX + pinned_label_key(user_id).removeprefix(
+                    PINNED_LABEL_KEY + "."
+                )
+                if (
+                    active
+                    and active[0].id == session_id
+                    and (
+                        family_pin_key in pin_source.labels
+                        or pinned_label_key(user_id) not in pin_source.labels
+                    )
+                ):
+                    await asyncio.to_thread(
+                        conversation_store.set_family_pin,
+                        session_id,
+                        labels_to_set.pop(PINNED_LABEL_KEY),
+                        user_id=user_id,
+                    )
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
@@ -3370,6 +3525,51 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
+        # File into a first-class project (owner-only, gated above). ``""``
+        # unfiles; a non-empty id must name a project the caller owns. Filing
+        # into another owner's (or a missing) project is rejected as NOT_FOUND
+        # — the same 404 the projects API returns, so we don't leak existence.
+        if set_project:
+            members = await asyncio.to_thread(conversation_store.get_session_family, session_id)
+            for member in members:
+                await _require_access(
+                    user_id, member.id, LEVEL_OWNER, permission_store, conversation_store
+                )
+            # ``""`` unfiles; a non-empty id files. Explicit JSON ``null`` is
+            # not a valid value here (omitting the field is how you leave
+            # membership unchanged), so reject it rather than treating it as a
+            # destructive unfile.
+            if body.project_id is None:
+                raise OmnigentError(
+                    'project_id must be a project id or "" to unfile; '
+                    "omit the field to leave membership unchanged",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            target_project_id = body.project_id
+            if target_project_id == "":
+                unfiled = await asyncio.to_thread(
+                    conversation_store.set_conversation_project, session_id, None
+                )
+                if not unfiled:
+                    raise _session_not_found()
+            else:
+                if project_store is None:
+                    raise OmnigentError(
+                        "Filing a session into a project is not supported by this server",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                owned = await asyncio.to_thread(
+                    project_store.get, target_project_id, user_id=user_id
+                )
+                if owned is None:
+                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+                filed = await asyncio.to_thread(
+                    conversation_store.set_conversation_project,
+                    session_id,
+                    target_project_id,
+                )
+                if not filed:
+                    raise _session_not_found()
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
             session_id,
@@ -3429,6 +3629,7 @@ def register_core_routes(
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
                 delete_worktree=body.delete_worktree,
+                host_store=getattr(request.app.state, "host_store", None),
             )
         elif body.archived is False:
             # Unarchive (including Undo, which re-PATCHes archived=false within
@@ -3744,46 +3945,6 @@ def register_core_routes(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # File into a first-class project (owner-only, gated above). ``""``
-        # unfiles; a non-empty id must name a project the caller owns. Filing
-        # into another owner's (or a missing) project is rejected as NOT_FOUND
-        # — the same 404 the projects API returns, so we don't leak existence.
-        if set_project:
-            # ``""`` unfiles; a non-empty id files. Explicit JSON ``null`` is
-            # not a valid value here (omitting the field is how you leave
-            # membership unchanged), so reject it rather than treating it as a
-            # destructive unfile.
-            if body.project_id is None:
-                raise OmnigentError(
-                    'project_id must be a project id or "" to unfile; '
-                    "omit the field to leave membership unchanged",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            target_project_id = body.project_id
-            if target_project_id == "":
-                unfiled = await asyncio.to_thread(
-                    conversation_store.set_conversation_project, session_id, None
-                )
-                if not unfiled:
-                    raise _session_not_found()
-            else:
-                if project_store is None:
-                    raise OmnigentError(
-                        "Filing a session into a project is not supported by this server",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-                owned = await asyncio.to_thread(
-                    project_store.get, target_project_id, user_id=user_id
-                )
-                if owned is None:
-                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-                filed = await asyncio.to_thread(
-                    conversation_store.set_conversation_project,
-                    session_id,
-                    target_project_id,
-                )
-                if not filed:
-                    raise _session_not_found()
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the

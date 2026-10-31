@@ -104,7 +104,9 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
   const queryClient = new QueryClient();
   return (
     <QueryClientProvider client={queryClient}>
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true }}>
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true, sibling_sessions: true }}
+      >
         <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
           <HeaderConversationMenu
             conversation={CONVERSATION}
@@ -141,6 +143,22 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("HeaderConversationMenu", () => {
+  it.each([false, true])(
+    "offers sibling creation but prevents independent project moves (mobile=%s)",
+    (mobile) => {
+      mocks.isMobile = mobile;
+      renderMenu({
+        conversation: {
+          ...CONVERSATION,
+          family: { id: "family", representative_id: "another", pinned: false },
+        },
+      });
+      openMenu();
+      expect(screen.getByTestId("add-sibling-session")).toBeVisible();
+      expect(screen.queryByTestId("header-move-to-project")).not.toBeInTheDocument();
+    },
+  );
+
   it("keeps an unsupported Fork visible without opening its dialog", () => {
     renderMenu({ forkDisabledReason: "Forking this sandbox session is not supported yet." });
     openMenu();
@@ -173,6 +191,7 @@ describe("HeaderConversationMenu", () => {
       "Fork",
       "Export",
       "Rename",
+      "Add Agent",
       "Mark as unread",
       "Add to project",
       "Archive",
@@ -536,6 +555,7 @@ describe("HeaderConversationMenu", () => {
       "Fork",
       "Export",
       "Rename",
+      "Add Agent",
       "Mark as unread",
       "Add to project",
       "Archive",
@@ -558,6 +578,7 @@ describe("HeaderConversationMenu", () => {
       "Fork",
       "Export",
       "Rename",
+      "Add Agent",
       "Mark as unread",
       "Add to project",
       "Files",

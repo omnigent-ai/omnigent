@@ -69,7 +69,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
-import type { Session } from "@/lib/types";
+import type { Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -154,6 +154,7 @@ export class BulkConversationMutationError extends Error {
 
 /** Mirrors the server's `SessionListItem` / `ConversationObject` shape. */
 export interface Conversation {
+  family?: SessionFamily | null;
   id: string;
   object: "conversation";
   title: string | null;
@@ -508,6 +509,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
+    family: wire.family,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
@@ -1672,6 +1674,7 @@ export const PINNED_CONVERSATIONS_KEY = ["pinned-conversations"] as const;
  * `?pinned=true` filter (see {@link fetchPinnedConversations}).
  */
 export interface PinnedConversationsResult {
+  familyMembers?: Conversation[];
   conversations: Conversation[];
   /**
    * False when the server ignored the `pinned` query param — i.e. a
@@ -1729,9 +1732,11 @@ async function fetchPinnedScope(
   // (not cleared) — so no pin is lost even in this corner. Closing the window
   // fully would need a server capability flag; deferred since pins haven't
   // shipped yet.
-  const filterHonored = rows.length === 0 || conversations.length === rows.length;
+  const filterHonored =
+    rows.length === 0 ||
+    rows.every((row) => row.labels?.[PINNED_LABEL_KEY] != null || !!row.family);
   // Keep ownership-dependent filtering in the reactive query selector.
-  return { conversations, filterHonored };
+  return { conversations, filterHonored, familyMembers: rows.filter((row) => row.family?.pinned) };
 }
 
 export async function fetchPinnedConversations(
@@ -1746,6 +1751,7 @@ export async function fetchPinnedConversations(
     [...mine.conversations, ...(shared?.conversations ?? [])].map((row) => [row.id, row]),
   );
   return {
+    familyMembers: mine.familyMembers,
     conversations: [...byId.values()].sort(
       (a, b) =>
         Number(b.labels[PINNED_LABEL_KEY]) - Number(a.labels[PINNED_LABEL_KEY]) ||
@@ -2052,7 +2058,7 @@ export function useTogglePinnedConversation() {
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
-      patch(id, labels, pinned);
+      if (!existing?.family) patch(id, labels, pinned);
       return { prevPinned, prevPin: base[PINNED_LABEL_KEY] };
     },
     onError: (_err, { id, pinned }, ctx) => {
@@ -2068,6 +2074,12 @@ export function useTogglePinnedConversation() {
       showToast(pinned ? "Couldn't pin the session." : "Couldn't unpin the session.");
     },
     onSuccess: (updated, { pinned }) => {
+      if (updated.family || findRow(updated.id)?.family) {
+        void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        void queryClient.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
+        return;
+      }
+
       // No `markConversationSeen` here: a pin PATCH writes only the label row,
       // never conversations.updated_at (unlike rename/archive/move, which bump
       // it and need the anchor to suppress that self-bump). Anchoring here would
@@ -2477,7 +2489,7 @@ export function useMoveToProject() {
         queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
       ]);
       const row = findCachedConversationRow(queryClient, id);
-      if (!row) return undefined;
+      if (!row || row.family) return undefined;
       // Wholesale snapshots for rollback: the overlay also drops the row from
       // other folders' pages, which a field-level revert couldn't restore.
       const previous = {
@@ -2541,8 +2553,8 @@ export function useMoveToProject() {
  * server-side `?project=` filter (archived included). Used by "Delete project"
  * so it removes ALL members, not just those in the loaded sidebar window.
  */
-async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
-  const ids: string[] = [];
+async function fetchAllProjectSessions(project: string): Promise<Conversation[]> {
+  const members = new Map<string, Conversation>();
   let after: string | undefined;
   for (;;) {
     const params = new URLSearchParams({
@@ -2561,11 +2573,11 @@ async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     // eslint-disable-next-line no-await-in-loop
     const page = (await res.json()) as ConversationsPage;
-    for (const conv of page.data) ids.push(conv.id);
+    for (const conv of page.data) members.set(conv.id, conv);
     if (!page.has_more || !page.last_id) break;
     after = page.last_id;
   }
-  return ids;
+  return [...members.values()];
 }
 
 /**
@@ -2687,8 +2699,27 @@ export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({ id, name }: ProjectSummary) => {
-      const ids = await fetchAllProjectSessionIds(name);
-      const results = await Promise.allSettled(ids.map((sid) => archiveAndUnfileConversation(sid)));
+      const members = await fetchAllProjectSessions(name);
+      const ids = members.map((member) => member.id);
+      const representatives = new Map(
+        members
+          .filter(
+            (member) =>
+              !member.family?.representative_id || member.family.representative_id === member.id,
+          )
+          .map((member) => [member.id, archiveAndUnfileConversation(member.id)]),
+      );
+      const results = await Promise.allSettled(
+        members.map(async (member) => {
+          const representativeId = member.family?.representative_id ?? member.id;
+          const unfile = representatives.get(representativeId);
+          if (!unfile) throw new Error("Family representative is unavailable");
+          const representative = await unfile;
+          return member.id === representativeId
+            ? representative
+            : archiveConversation(member.id, true);
+        }),
+      );
       const succeeded: string[] = [];
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
@@ -2782,21 +2813,26 @@ export function useRenameProject() {
       // omni_project label; re-file each onto project_id and clear that label so
       // the rename is coherent for both membership representations and nothing
       // is left behind in an oldName folder.
-      const memberIds = await fetchAllProjectSessionIds(oldName);
+      const members = await fetchAllProjectSessions(oldName);
       await Promise.all(
-        memberIds.map(async (sid) => {
-          const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              project_id: projectId,
-              labels: { [PROJECT_LABEL_KEY]: "" },
-            }),
-          });
-          // Surface a failed re-file: a resolved-but-4xx/5xx response would
-          // otherwise report success while leaving members behind.
-          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-        }),
+        members
+          .filter(
+            (member) =>
+              !member.family?.representative_id || member.family.representative_id === member.id,
+          )
+          .map(async ({ id: sid }) => {
+            const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                project_id: projectId,
+                labels: { [PROJECT_LABEL_KEY]: "" },
+              }),
+            });
+            // Surface a failed re-file: a resolved-but-4xx/5xx response would
+            // otherwise report success while leaving members behind.
+            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+          }),
       );
       // Return the resolved id so a caller promoting a label-only folder can
       // target the just-created row for a follow-up write instead of passing

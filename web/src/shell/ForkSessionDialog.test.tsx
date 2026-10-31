@@ -2122,7 +2122,7 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     });
 
-    it("offers an Arclet source only a fresh Arclet and forks onto it", async () => {
+    it("offers the source Arclet or a fresh Arclet and forks onto fresh compute", async () => {
       useSessionMock.mockReturnValue({
         session: {
           hostId: "host_1",
@@ -2134,29 +2134,33 @@ describe("ForkSessionDialog", () => {
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
-      // Both the source Arclet and another machine are online; neither is a target.
+      // The source Arclet is reusable; unrelated machines remain excluded.
       setHosts([host({ sandbox_provider: "arclet" }), host({ host_id: "host_2", name: "laptop" })]);
       forkSessionMock.mockResolvedValue({
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       renderDialog({
         ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_providers: ["lakebox", "arclet"],
+          sibling_sessions: true,
+        },
       });
 
       await act(async () => {});
       expect(screen.getByTestId("fork-session-sandbox-only-hint")).toHaveTextContent(
-        "This session can only be cloned onto a new Arclet Sandbox.",
+        "Clone onto this session’s sandbox or a new Arclet Sandbox.",
       );
-      expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
       expect(screen.queryByTestId("fork-session-connect-host-toggle")).not.toBeInTheDocument();
-      // The only target is preselected, so the default state is submittable.
-      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Arclet Sandbox");
       openHostSelect();
-      expect(screen.getAllByRole("option")).toHaveLength(1);
+      expect(screen.getAllByRole("option")).toHaveLength(2);
+      expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-host-option-host_2")).not.toBeInTheDocument();
       expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Arclet Sandbox");
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
       expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+      await waitFor(() => expect(screen.getByTestId("fork-session-submit")).toBeEnabled());
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 

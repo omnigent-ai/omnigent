@@ -2382,4 +2382,4 @@ async def _terminate_run_sandbox(deps: FireDeps, host_id: str | None) -> None:
     # Only a server-managed sandbox is torn down, never a user's own host.
     if host is None or host.sandbox_provider is None:
         return
-    await terminate_managed_host(host, deps.host_store, deps.sandbox_config)
+    await terminate_managed_host(host, deps.host_store, deps.sandbox_config, only_if_unused=True)

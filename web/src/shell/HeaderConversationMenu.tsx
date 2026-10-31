@@ -20,6 +20,7 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlusIcon,
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -47,6 +48,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isIndentedSibling } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
@@ -110,6 +113,7 @@ export function HeaderConversationMenu({
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
+  const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
@@ -306,6 +310,16 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
+      {!isArchived && info !== "loading" && info.sibling_sessions && (
+        <DropdownMenuItem
+          data-testid="add-sibling-session"
+          className={itemClass}
+          onSelect={() => navigate(`/?sibling=${encodeURIComponent(conversation.id)}`)}
+        >
+          <PlusIcon className="size-3.5" />
+          Add Agent
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}
@@ -317,36 +331,37 @@ export function HeaderConversationMenu({
       {/* Move to project is also reachable on desktop via the breadcrumb's
           folder tag (HeaderProjectTag); on mobile the native shells hide the
           breadcrumb, so this menu is the sole entry point. */}
-      {isMobile ? (
-        // Mobile has no room for a side flyout, so this item swaps the menu body
-        // to the project picker in place (see the `projectPickerOpen` branch).
-        <DropdownMenuItem
-          data-testid="header-move-to-project"
-          className={cn("whitespace-nowrap", itemClass)}
-          onSelect={(event) => {
-            event.preventDefault();
-            setProjectPickerOpen(true);
-          }}
-        >
-          <FolderInputIcon className="size-3.5" />
-          {currentProject ? "Move session" : "Add to project"}
-        </DropdownMenuItem>
-      ) : (
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger
+      {!isIndentedSibling(conversation) &&
+        (isMobile ? (
+          // Mobile has no room for a side flyout, so this item swaps the menu body
+          // to the project picker in place (see the `projectPickerOpen` branch).
+          <DropdownMenuItem
             data-testid="header-move-to-project"
-            className="whitespace-nowrap"
+            className={cn("whitespace-nowrap", itemClass)}
+            onSelect={(event) => {
+              event.preventDefault();
+              setProjectPickerOpen(true);
+            }}
           >
             <FolderInputIcon className="size-3.5" />
             {currentProject ? "Move session" : "Add to project"}
-          </DropdownMenuSubTrigger>
-          {/* A native submenu flyout — no separate popover layer, so no
+          </DropdownMenuItem>
+        ) : (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger
+              data-testid="header-move-to-project"
+              className="whitespace-nowrap"
+            >
+              <FolderInputIcon className="size-3.5" />
+              {currentProject ? "Move session" : "Add to project"}
+            </DropdownMenuSubTrigger>
+            {/* A native submenu flyout — no separate popover layer, so no
               open/dismiss race with the parent menu. */}
-          <DropdownMenuSubContent className="min-w-56">
-            <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-      )}
+            <DropdownMenuSubContent className="min-w-56">
+              <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ))}
       {workspaceItems && (
         <>
           <DropdownMenuSeparator />

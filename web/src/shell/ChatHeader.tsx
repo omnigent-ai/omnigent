@@ -1,3 +1,4 @@
+import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
   ArrowLeftIcon,
   BotIcon,
@@ -517,7 +518,11 @@ export function ChatHeader({
           /
         </span>
       </div>
-    ) : !pending && !isMobile && actionConversation && !isChildSession ? (
+    ) : !pending &&
+      !isMobile &&
+      actionConversation &&
+      !isChildSession &&
+      !isIndentedSibling(actionConversation) ? (
       <HeaderProjectTag
         conversationId={actionConversation.id}
         projectName={projectName}
