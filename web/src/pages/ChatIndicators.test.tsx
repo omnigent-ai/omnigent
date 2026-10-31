@@ -1,9 +1,10 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type { SandboxStatus } from "@/lib/types";
 import { bindConversationForTest, handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { McpStartupIndicator, SandboxActionBanner } from "./ChatIndicators";
+import { ConnectionIndicator, McpStartupIndicator, SandboxActionBanner } from "./ChatIndicators";
 
 const conversationId = "indicator-test-session";
 
@@ -213,5 +214,81 @@ describe("SandboxActionBanner", () => {
     report("conv_a", "provisioning");
     report("conv_a", "action_required");
     expect(screen.getByRole("status")).toHaveTextContent(DETAILS);
+  });
+});
+
+describe("ConnectionIndicator asleep notice", () => {
+  function renderIndicator(
+    liveness: SessionLiveness,
+    composerReadOnly?: boolean,
+    asleepConfirmed?: boolean,
+  ) {
+    return render(
+      <ConnectionIndicator
+        liveness={liveness}
+        onShowReconnectHelp={() => undefined}
+        composerReadOnly={composerReadOnly}
+        asleepConfirmed={asleepConfirmed}
+      />,
+    );
+  }
+
+  it("shows the agent-asleep notice for runner_asleep", () => {
+    renderIndicator({ kind: "runner_asleep" });
+    expect(screen.getByTestId("asleep-indicator")).toHaveTextContent(
+      "Agent is asleep — your next message will restart it.",
+    );
+    expect(screen.queryByTestId("disconnected-indicator")).toBeNull();
+  });
+
+  it("shows the sandbox-asleep notice for host_asleep", () => {
+    renderIndicator({ kind: "host_asleep" });
+    expect(screen.getByTestId("asleep-indicator")).toHaveTextContent(
+      "Sandbox is asleep — your next message will start it.",
+    );
+  });
+
+  it.each([{ kind: "online" }, { kind: "unknown" }] as const)(
+    "renders nothing for %o",
+    (liveness) => {
+      const { container } = renderIndicator(liveness);
+      expect(container).toBeEmptyDOMElement();
+    },
+  );
+
+  it("withholds the runner-asleep notice until the poll sample is confirmed fresh", () => {
+    const { container, rerender } = renderIndicator({ kind: "runner_asleep" }, false, false);
+    expect(container).toBeEmptyDOMElement();
+    rerender(
+      <ConnectionIndicator
+        liveness={{ kind: "runner_asleep" }}
+        onShowReconnectHelp={() => undefined}
+        asleepConfirmed
+      />,
+    );
+    expect(screen.getByTestId("asleep-indicator")).toBeInTheDocument();
+  });
+
+  it("does not gate the sandbox-asleep notice or the host-offline banner", () => {
+    renderIndicator({ kind: "host_asleep" }, false, false);
+    expect(screen.getByTestId("asleep-indicator")).toHaveTextContent("Sandbox is asleep");
+    cleanup();
+    renderIndicator({ kind: "local_stranded" }, false, false);
+    expect(screen.getByTestId("disconnected-indicator")).toBeInTheDocument();
+  });
+
+  it("renders nothing when the composer is read-only", () => {
+    const { container } = renderIndicator({ kind: "runner_asleep" }, true);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("swaps to Connecting… once a send flips liveness to starting", () => {
+    const { rerender } = renderIndicator({ kind: "runner_asleep" });
+    expect(screen.getByTestId("asleep-indicator")).toBeInTheDocument();
+    rerender(
+      <ConnectionIndicator liveness={{ kind: "starting" }} onShowReconnectHelp={() => undefined} />,
+    );
+    expect(screen.queryByTestId("asleep-indicator")).toBeNull();
+    expect(screen.getByTestId("connecting-indicator")).toHaveTextContent("Connecting…");
   });
 });

@@ -29,3 +29,11 @@ export const Starting: Story = {
 export const UnseenMessages: Story = {
   args: { state: { kind: "unseen" } },
 };
+
+export const Asleep: Story = {
+  args: { state: { kind: "asleep" } },
+};
+
+export const AsleepReadOnly: Story = {
+  args: { state: { kind: "asleep", readOnly: true } },
+};

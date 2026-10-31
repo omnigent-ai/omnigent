@@ -5,10 +5,16 @@
 // "is the runner asleep vs. is the host down vs. is this not host-bound"
 // inline at every render site.
 
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import {
+  announceTurnEnded,
+  markTurnEnded,
+  useRequestRunnerHealthRefresh,
+  useTurnEndedAt,
+} from "@/hooks/runnerHealthFreshness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 
 /**
@@ -227,6 +233,37 @@ export function useSessionLiveness(
   return raw;
 }
 
+/** Outcomes of {@link classifyRunnerLiveness}; `null` means "not decidable from these signals". */
+export type RunnerLivenessKind = "online" | "runner_asleep" | "host_asleep" | "host_offline";
+
+/**
+ * Pure classifier for the signal-only part of the truth table (rows 1, 3, 5):
+ * the outcome when no turn is active and no startup/launch grace applies.
+ * Shared by {@link useSessionLiveness} and the sidebar row so the composer and
+ * the sidebar cannot disagree about "asleep" vs "offline".
+ *
+ * - `runnerOnline === true` -> `online`
+ * - `hostOnline === false` (host-bound, host down) -> `host_asleep` when
+ *   `hostResumable`, else `host_offline` (regardless of `runnerOnline`
+ *   being unseen, matching row 3 preceding row 4)
+ * - `runnerOnline === false` with `hostOnline === true` -> `runner_asleep`
+ * - anything else -> `null` (unobserved, or no host binding: the caller
+ *   decides `unknown` / `local_stranded` from `host_id`)
+ *
+ * Callers must only pass `hostOnline === false` for host-bound sessions.
+ */
+export function classifyRunnerLiveness(signals: {
+  runnerOnline: boolean | undefined;
+  hostOnline: boolean | null | undefined;
+  hostResumable?: boolean;
+}): RunnerLivenessKind | null {
+  const { runnerOnline, hostOnline, hostResumable } = signals;
+  if (runnerOnline === true) return "online";
+  if (hostOnline === false) return hostResumable ? "host_asleep" : "host_offline";
+  if (runnerOnline === false && hostOnline === true) return "runner_asleep";
+  return null;
+}
+
 /** Structural equality for the small `SessionLiveness` union. */
 function livenessEqual(a: SessionLiveness, b: SessionLiveness): boolean {
   if (a.kind !== b.kind) return false;
@@ -241,6 +278,19 @@ function useSessionLivenessRaw(
 ): SessionLiveness {
   const runnerOnline = useSessionRunnerOnline(sessionId);
   const hostOnline = useSessionHostOnline(sessionId);
+
+  // A turn ending can leave the poll holding a sample from before the runner
+  // came up (e.g. a short reply that finished between polls). Record when the
+  // turn ended and re-poll now; the asleep UI withholds itself via
+  // `useRunnerAsleepConfirmed`. The liveness kind itself is unaffected.
+  const turnEndedAt = useTurnEndedAt(sessionId, opts?.turnActive === true);
+  const requestHealthRefresh = useRequestRunnerHealthRefresh();
+  useEffect(() => {
+    if (turnEndedAt === undefined || !sessionId) return;
+    markTurnEnded(sessionId, turnEndedAt);
+    announceTurnEnded();
+    requestHealthRefresh();
+  }, [sessionId, turnEndedAt, requestHealthRefresh]);
 
   // Track whether this session's runner tunnel has *ever* been observed
   // registered. The startup grace below only stands in for the INITIAL
@@ -305,10 +355,15 @@ function useSessionLivenessRaw(
   // wake isn't a blank screen; idle (no turn) stays `host_asleep` (composer
   // open, no banner). Either way it's NOT the host_offline dead-end.
   // Otherwise (non-resumable) it's genuinely stuck: `host_offline`.
-  if (hostId && hostOnline === false) {
-    if (conv?.host_resumable) {
-      return opts?.turnActive ? { kind: "starting" } : { kind: "host_asleep" };
-    }
+  const idle = classifyRunnerLiveness({
+    runnerOnline,
+    hostOnline,
+    hostResumable: conv?.host_resumable,
+  });
+  if (hostId && idle === "host_asleep") {
+    return opts?.turnActive ? { kind: "starting" } : { kind: "host_asleep" };
+  }
+  if (hostId && idle === "host_offline") {
     return { kind: "host_offline", isOwner: isOwner(conv) };
   }
 
@@ -325,7 +380,7 @@ function useSessionLivenessRaw(
   // silent gap. Otherwise the session is idle-asleep: the open view
   // renders nothing and the composer stays open, and the next send flips
   // it to `starting`.
-  if (hostOnline === true) {
+  if (idle === "runner_asleep") {
     return opts?.turnActive ? { kind: "starting" } : { kind: "runner_asleep" };
   }
 

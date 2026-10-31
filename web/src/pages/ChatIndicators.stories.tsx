@@ -131,6 +131,35 @@ export const Connecting: Story = {
   ),
 };
 
+export const RunnerAsleep: Story = {
+  decorators: [
+    (Story) => (
+      <ChatStoreSeed seed={{ sandboxStatus: null }}>
+        <Story />
+      </ChatStoreSeed>
+    ),
+  ],
+  render: () => (
+    <ConnectionIndicator
+      liveness={{ kind: "runner_asleep" }}
+      onShowReconnectHelp={() => undefined}
+    />
+  ),
+};
+
+export const HostAsleep: Story = {
+  decorators: [
+    (Story) => (
+      <ChatStoreSeed seed={{ sandboxStatus: null }}>
+        <Story />
+      </ChatStoreSeed>
+    ),
+  ],
+  render: () => (
+    <ConnectionIndicator liveness={{ kind: "host_asleep" }} onShowReconnectHelp={() => undefined} />
+  ),
+};
+
 export const McpServersStarting: Story = {
   decorators: [
     (Story) => (
