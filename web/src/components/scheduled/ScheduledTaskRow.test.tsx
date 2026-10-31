@@ -5,7 +5,7 @@
 // object — no hook mocking needed. The ⋯ menu is a Radix dropdown; opening it
 // uses pointerDown on the trigger (matching the TasksPage tests).
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScheduledTaskRow } from "./ScheduledTaskRow";
@@ -103,6 +103,20 @@ describe("next-run text (server-sourced, relative delta)", () => {
   it("renders NO next-run text when nextRunAt is null (paused / unarmed)", () => {
     renderRow(task({ nextRunAt: null }));
     expect(screen.queryByTestId("task-next-run")).toBeNull();
+  });
+});
+
+describe("Project chip", () => {
+  it("renders the resolved project's name and emoji", () => {
+    renderRow(task({ projectId: "p_a" }), { project: { name: "Project A", icon: "📊" } });
+    const chip = screen.getByTestId("task-project-chip");
+    expect(chip).toHaveTextContent("Project A");
+    expect(within(chip).getByTestId("project-icon")).toHaveTextContent("📊");
+  });
+
+  it("renders no chip without a resolved project", () => {
+    renderRow(task({ projectId: "deleted" }));
+    expect(screen.queryByTestId("task-project-chip")).toBeNull();
   });
 });
 

@@ -7,7 +7,7 @@
 // stubbed to a marker so we assert the page opens it without exercising its
 // internals (covered by its own tests).
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TasksPage } from "./TasksPage";
@@ -16,6 +16,8 @@ import * as hooks from "@/hooks/useScheduledTasks";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import * as conversationHooks from "@/hooks/useConversations";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
@@ -26,6 +28,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
 }));
+vi.mock("@/hooks/useConversations", () => ({ useProjects: vi.fn() }));
 
 // Stub the create dialog — its internals are covered separately; here we only
 // need to know it opened and WHICH prefill (initialName/initialPrompt) TasksPage
@@ -37,6 +40,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialPrompt,
     initialTrigger,
     sessionLink,
+    initialProject,
     editingTask,
   }: {
     open: boolean;
@@ -44,6 +48,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialPrompt?: string;
     initialTrigger?: string | null;
     sessionLink?: string;
+    initialProject?: { id: string; name: string };
     editingTask?: ScheduledTask | null;
   }) =>
     open ? (
@@ -53,6 +58,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-initial-prompt={initialPrompt ?? ""}
         data-initial-trigger={initialTrigger ?? ""}
         data-session-link={sessionLink ?? ""}
+        data-initial-project-id={initialProject?.id ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
       />
@@ -107,6 +113,7 @@ function setTasks(
 beforeEach(() => {
   localStorage.clear();
   vi.mocked(useViewerId).mockReturnValue(null);
+  setProjects([]);
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
@@ -143,6 +150,37 @@ function renderPage(path = "/tasks", basename = "") {
       </RoutingProvider>
     </MemoryRouter>,
   );
+}
+
+const PROJECTS_INFO = { ...FALLBACK_SERVER_INFO, scheduled_task_projects: true };
+
+function renderWithProjects(info = PROJECTS_INFO) {
+  const ui = () => (
+    <CapabilitiesProvider info={info}>
+      <MemoryRouter>
+        <TasksPage />
+      </MemoryRouter>
+    </CapabilitiesProvider>
+  );
+  const view = render(ui());
+  return { ...view, rerenderPage: () => view.rerender(ui()) };
+}
+
+function setProjects(
+  data: conversationHooks.ProjectSummary[] | undefined,
+  state: { isLoading?: boolean; isError?: boolean; refetch?: () => void } = {},
+) {
+  vi.mocked(conversationHooks.useProjects).mockReturnValue({
+    data,
+    isLoading: state.isLoading ?? false,
+    isError: state.isError ?? false,
+    refetch: state.refetch ?? vi.fn(),
+  } as unknown as ReturnType<typeof conversationHooks.useProjects>);
+}
+
+async function chooseProjectFilter(name: string) {
+  fireEvent.keyDown(screen.getByTestId("tasks-project-filter"), { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name }));
 }
 
 describe("TasksPage list", () => {
@@ -343,6 +381,129 @@ describe("filtering + search", () => {
     const rows = screen.getAllByTestId("scheduled-task-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("PR sweep")).toBeInTheDocument();
+  });
+});
+
+describe("Project filtering", () => {
+  const inA = task({ id: "a", name: "In A", projectId: "p_a" });
+  const inB = task({ id: "b", name: "In B", projectId: "p_b" });
+  const unfiled = task({ id: "u", name: "Unfiled one", projectId: null });
+  const dangling = task({ id: "d", name: "Dangling", projectId: "deleted" });
+
+  beforeEach(() => {
+    setProjects([
+      { id: "p_a", name: "Project A", icon: "📊" },
+      { id: "p_b", name: "Project B" },
+      { id: null, name: "Legacy only" },
+    ]);
+  });
+
+  it("hides the filter and chips when the server does not file runs into projects", () => {
+    setTasks([inA]);
+    renderWithProjects({ ...FALLBACK_SERVER_INFO, scheduled_task_projects: false });
+    expect(screen.queryByTestId("tasks-project-filter")).toBeNull();
+    expect(screen.queryByTestId("task-project-chip")).toBeNull();
+    expect(vi.mocked(conversationHooks.useProjects)).toHaveBeenCalledWith({ enabled: false });
+  });
+
+  it("names the current selection in the filter's accessible name", async () => {
+    setTasks([inA, inB]);
+    renderWithProjects();
+    expect(screen.getByRole("combobox", { name: "Filter by project: All projects" })).toBeTruthy();
+    await chooseProjectFilter("Project A");
+    expect(screen.getByRole("combobox", { name: "Filter by project: Project A" })).toBeTruthy();
+    await chooseProjectFilter("All projects");
+    expect(screen.getByText("In B")).toBeInTheDocument();
+  });
+
+  it("disables Unfiled while the project list is unavailable", async () => {
+    setTasks([inA, dangling]);
+    setProjects(undefined, { isError: true });
+    renderWithProjects();
+    fireEvent.keyDown(screen.getByTestId("tasks-project-filter"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Unfiled" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("stops filtering once the last automation is gone", async () => {
+    setTasks([inA]);
+    const { rerenderPage } = renderWithProjects();
+    await chooseProjectFilter("Project A");
+    setTasks([]);
+    rerenderPage();
+    expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-project-id", "");
+  });
+
+  it("filters to the selected project, or to unfiled and deleted-project tasks", async () => {
+    setTasks([inA, inB, unfiled, dangling]);
+    renderWithProjects();
+
+    await chooseProjectFilter("Project A");
+    expect(screen.getByText("In A")).toBeInTheDocument();
+    expect(screen.queryByText("In B")).toBeNull();
+    expect(screen.queryByTestId("task-project-chip")).toBeNull();
+
+    await chooseProjectFilter("Unfiled");
+    expect(screen.getByText("Unfiled one")).toBeInTheDocument();
+    expect(screen.getByText("Dangling")).toBeInTheDocument();
+    expect(screen.queryByText("In A")).toBeNull();
+  });
+
+  it("shows a chip only for tasks whose project resolves", () => {
+    setTasks([inA, unfiled, dangling]);
+    renderWithProjects();
+    const chips = screen.getAllByTestId("task-project-chip");
+    expect(chips).toHaveLength(1);
+    expect(chips[0]).toHaveTextContent("Project A");
+    expect(within(chips[0]).getByTestId("project-icon")).toHaveTextContent("📊");
+  });
+
+  it("starts a new automation in the selected project", async () => {
+    setTasks([inA]);
+    renderWithProjects();
+    await chooseProjectFilter("Project A");
+    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-project-id",
+      "p_a",
+    );
+  });
+
+  it("hides Suggestions while a project or Unfiled is selected", async () => {
+    setTasks([inA, unfiled]);
+    renderWithProjects();
+    expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
+    await chooseProjectFilter("Project A");
+    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
+    await chooseProjectFilter("Unfiled");
+    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
+  });
+
+  it("offers a retry when projects fail to load", () => {
+    setTasks([inA]);
+    const refetch = vi.fn();
+    setProjects(undefined, { isError: true, refetch });
+    renderWithProjects();
+    expect(screen.getByTestId("tasks-projects-error")).toHaveTextContent("Couldn’t load projects.");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to All projects when the selected project is deleted", async () => {
+    setTasks([inA]);
+    const { rerenderPage } = renderWithProjects();
+    await chooseProjectFilter("Project A");
+    setProjects([{ id: "p_b", name: "Project B" }]);
+    rerenderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("tasks-project-filter")).toHaveTextContent("All projects"),
+    );
   });
 });
 
