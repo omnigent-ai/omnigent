@@ -6364,6 +6364,53 @@ def test_fork_conversation_up_to_unknown_response_raises(
         conversation_store.fork_conversation(source.id, up_to_response_id="resp_nope")
 
 
+def test_fork_conversation_before_item_drops_the_item_and_later_history(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """``before_item_id`` copies only the items positioned before that item.
+
+    The fork keeps everything before the item, drops the item and the turns
+    after it, and never resumes the source's full native transcript. The
+    first item leaves nothing to copy; unknown or combined cutoffs fail.
+    """
+    from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+
+    agent_store.create(
+        agent_id="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b",
+        name="fork-before-item",
+        bundle_location="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b")
+    conversation_store.set_external_session_id(source.id, "claude-uuid-before")
+    _append_three_responses(conversation_store, source.id)
+    source_items = conversation_store.list_items(source.id).data
+    second_prompt, first_prompt = source_items[2], source_items[0]
+
+    def fork_texts(fork_id: str) -> list[str]:
+        return [
+            part["text"]
+            for item in conversation_store.list_items(fork_id).data
+            for part in item.data.content  # type: ignore[union-attr]
+        ]
+
+    fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
+    assert fork_texts(fork.id) == ["Q1", "A1"]
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
+    assert fork_texts(first.id) == []
+    assert len(conversation_store.list_items(source.id).data) == 6
+
+    missing_item_id = "f" * 32
+    with pytest.raises(ValueError, match=missing_item_id):
+        conversation_store.fork_conversation(source.id, before_item_id=missing_item_id)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        conversation_store.fork_conversation(
+            source.id, up_to_response_id="resp_001", before_item_id=second_prompt.id
+        )
+
+
 def test_fork_clone_agent_is_session_scoped(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

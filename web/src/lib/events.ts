@@ -936,9 +936,8 @@ export interface SessionPresenceEvent {
  * `session.superseded` — this conversation was superseded and the client
  * should follow to `targetConversationId`.
  *
- * Emitted when a Claude `/clear` rotates a session away: the old
- * conversation keeps its history but the live terminal moves to a fresh
- * conversation. A client actively viewing the old conversation
+ * Emitted when `/clear` or `/rewind` moves a session's work to another
+ * conversation; the old one keeps its history. A client actively viewing the old conversation
  * auto-redirects. Live-only (no SSE replay): a client connecting after
  * the rotation instead renders the persisted notice message appended to
  * the old conversation.
@@ -949,8 +948,8 @@ export interface SessionSupersededEvent {
   conversationId: string;
   /** The conversation id to redirect to. */
   targetConversationId: string;
-  /** Why the session was superseded. Currently always `"clear"`. */
-  reason: "clear";
+  /** Why the session was superseded. */
+  reason: "clear" | "rewind";
 }
 
 /**

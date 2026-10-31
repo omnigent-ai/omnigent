@@ -120,11 +120,21 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
-  chat shows no menu and sends slash text to the vendor TUI. Claude Code and
-  Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
-  `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
-  States: loading, error/retry, unavailable while disconnected, and an
-  incomplete catalog.
+  chat shows no menu and sends slash text to the vendor TUI. Claude Code,
+  Codex native and claude-sdk sessions offer `/clear` only when `/v1/info` lists
+  `clear` in `session_event_types`; otherwise a typed `/clear` goes to the
+  harness as text. A claude-sdk `/clear` continues in a new, empty session on
+  the same machine and the view follows it. States: loading, error/retry,
+  unavailable while disconnected, and an incomplete catalog.
+- `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
+  a searchable list of the session's prompts, newest first. Choosing one
+  continues the conversation in a new session holding only the history before
+  that prompt, on the same host, workspace and runner, with the prompt back in
+  the composer to edit; the original session keeps everything and links to the
+  new one. Offered only when `/v1/info` reports `session_rewind`; otherwise a
+  typed `/rewind` is sent as text. Files are not restored. States: loading
+  prompts, prompts failed to load, no prompts, refused while a turn runs or the
+  runner and host are offline (error under the composer).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited

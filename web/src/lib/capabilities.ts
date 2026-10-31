@@ -252,6 +252,8 @@ export interface ServerInfo {
   agent_config_edit?: boolean;
   /** Types the session events route accepts; empty on older servers. */
   session_event_types?: readonly string[];
+  /** True when `POST /v1/sessions/{id}/rewind` exists; absent on older servers (off). */
+  session_rewind?: boolean;
   /**
    * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
    * and ``Conversation.pull_request``); absent on older servers (off).
@@ -532,6 +534,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_event_types: Array.isArray(data.session_event_types)
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
+          session_rewind: data.session_rewind === true,
           session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,

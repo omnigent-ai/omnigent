@@ -40,6 +40,7 @@ import {
 } from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { ApiError } from "@/lib/sessionsApi";
+import * as sessionsApi from "@/lib/sessionsApi";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
@@ -1040,14 +1041,14 @@ describe("Composer slash-command menu", () => {
   });
 
   function renderClearComposer(
-    harness: "claude-native" | "codex-native",
+    harness: "claude-native" | "codex-native" | "claude-sdk",
     advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
   ) {
     const { sessionHarness } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness }));
     useChatStore.setState({ sessionHarness: harness });
     const clearContext = vi.spyOn(useChatStore.getState(), "clearContext").mockResolvedValue();
-    const props = composerProps({ isNativeWrapper: true });
+    const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
     render(
       <CapabilitiesProvider
         info={advertised === "loading" ? "loading" : { ...FALLBACK_SERVER_INFO, ...advertised }}
@@ -1059,7 +1060,7 @@ describe("Composer slash-command menu", () => {
     return { clearContext, onSend: props.onSend };
   }
 
-  it.each(["claude-native", "codex-native"] as const)(
+  it.each(["claude-native", "codex-native", "claude-sdk"] as const)(
     "%s /clear runs the clear control when the server accepts it",
     (harness) => {
       const { clearContext, onSend } = renderClearComposer(harness, {
@@ -1075,6 +1076,7 @@ describe("Composer slash-command menu", () => {
     ["claude-native", {}],
     ["claude-native", { session_event_types: ["message"] }],
     ["codex-native", {}],
+    ["claude-sdk", { session_event_types: ["message"] }],
     ["claude-native", "loading"],
   ] as const)("%s sends a typed /clear as text when server info is %o", (harness, advertised) => {
     const { clearContext, onSend } = renderClearComposer(harness, advertised);
@@ -1083,6 +1085,83 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(clearContext).not.toHaveBeenCalled();
     expect(onSend).toHaveBeenCalledExactlyOnceWith("/clear", undefined);
+  });
+
+  function renderRewindComposer(
+    harness: "claude-native" | "claude-sdk" | "codex-native",
+    advertised: Partial<typeof FALLBACK_SERVER_INFO>,
+  ) {
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    useChatStore.setState({ sessionHarness: harness });
+    const prompts = vi.spyOn(sessionsApi, "fetchRewindPrompts").mockResolvedValue([
+      { itemId: "msg_second", text: "Add parser tests" },
+      { itemId: "msg_first", text: "Write the parser" },
+    ]);
+    const rewindToPrompt = vi.spyOn(useChatStore.getState(), "rewindToPrompt");
+    const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
+    render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...advertised }}>
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    return { prompts, rewindToPrompt, onSend: props.onSend };
+  }
+
+  it.each(["claude-sdk", "claude-native"] as const)(
+    "%s /rewind lists the prompts and rewinds to the chosen one",
+    async (harness) => {
+      const { prompts, rewindToPrompt, onSend } = renderRewindComposer(harness, {
+        session_rewind: true,
+      });
+      rewindToPrompt.mockResolvedValue();
+      fireEvent.change(textarea(), { target: { value: "/rew" } });
+      fireEvent.click(screen.getByTestId("slash-menu-item-rewind"));
+
+      const picker = await screen.findByTestId("rewind-picker");
+      expect(prompts).toHaveBeenCalledWith("conv_test", expect.any(AbortSignal));
+      const rows = await within(picker).findAllByTestId("rewind-prompt");
+      expect(rows.map((row) => row.textContent)).toEqual(["Add parser tests", "Write the parser"]);
+      fireEvent.click(rows[1]);
+
+      expect(rewindToPrompt).toHaveBeenCalledExactlyOnceWith("msg_first");
+      await waitFor(() => expect(screen.queryByTestId("rewind-picker")).toBeNull());
+      expect(textarea()).toHaveValue("");
+      expect(onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it("/rewind shows a failed rewind under the composer", async () => {
+    const { rewindToPrompt } = renderRewindComposer("claude-sdk", { session_rewind: true });
+    rewindToPrompt.mockRejectedValue(new Error("Stop the current turn before running /rewind."));
+    fireEvent.change(textarea(), { target: { value: "/rewind" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.click((await screen.findAllByTestId("rewind-prompt"))[0]);
+
+    expect(await screen.findByText("Stop the current turn before running /rewind.")).toBeTruthy();
+  });
+
+  it("/rewind shows a prompt list that failed to load", async () => {
+    renderRewindComposer("claude-sdk", { session_rewind: true });
+    vi.mocked(sessionsApi.fetchRewindPrompts).mockRejectedValue(new Error("Session not found"));
+    fireEvent.change(textarea(), { target: { value: "/rewind" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Session not found");
+  });
+
+  it.each([
+    ["claude-sdk", {}],
+    ["codex-native", { session_rewind: true }],
+  ] as const)("%s sends a typed /rewind as text when server info is %o", (harness, advertised) => {
+    const { prompts, onSend } = renderRewindComposer(harness, advertised);
+    fireEvent.change(textarea(), { target: { value: "/rew" } });
+    expect(screen.queryByTestId("slash-menu-item-rewind")).toBeNull();
+    fireEvent.change(textarea(), { target: { value: "/rewind" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.queryByTestId("rewind-picker")).toBeNull();
+    expect(prompts).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledExactlyOnceWith("/rewind", undefined);
   });
 
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {

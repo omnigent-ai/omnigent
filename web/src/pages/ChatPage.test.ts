@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
-import type { ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -13,6 +13,8 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
+  composerOffersClear,
+  composerOffersRewind,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
@@ -1397,8 +1399,35 @@ describe("collectBubbleMarkdown", () => {
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
+describe("composer /clear and /rewind gating", () => {
+  const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
+
+  it.each([
+    ["claude-sdk", true],
+    ["claude-native", true],
+    ["codex-native", true],
+    ["openai-agents", false],
+    [null, false],
+  ] as const)("offers /clear for %s when the server accepts the control", (harness, offered) => {
+    expect(composerOffersClear(harness, info({ session_event_types: ["clear"] }))).toBe(offered);
+    expect(composerOffersClear(harness, info({ session_event_types: ["message"] }))).toBe(false);
+    expect(composerOffersClear(harness, "loading")).toBe(false);
+  });
+
+  it.each([
+    ["claude-sdk", true],
+    ["claude-native", true],
+    ["codex-native", false],
+    ["openai-agents", false],
+  ] as const)("offers /rewind for %s when the server has the endpoint", (harness, offered) => {
+    expect(composerOffersRewind(harness, info({ session_rewind: true }))).toBe(offered);
+    expect(composerOffersRewind(harness, info({}))).toBe(false);
+    expect(composerOffersRewind(harness, "loading")).toBe(false);
+  });
+});
+
 describe("buildSlashCommandMap", () => {
-  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind"];
 
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
@@ -1435,6 +1464,32 @@ describe("buildSlashCommandMap", () => {
     expect(
       buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
     ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
+  });
+
+  it("includes /rewind only when showRewind is true", () => {
+    expect(buildSlashCommandMap([], true, true)["/rewind"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap(
+        [],
+        true,
+        true,
+        true,
+        false,
+        false,
+        "/",
+        false,
+        false,
+        false,
+        false,
+        true,
+      )["/rewind"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/rewind"]);
+    // The /permissions slot right before it doesn't turn on /rewind.
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/rewind"
+      ],
+    ).toBeUndefined();
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {

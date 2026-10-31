@@ -8,7 +8,7 @@ import dataclasses
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -44,10 +44,12 @@ from omnigent.entities import (
     StoredFile,
     synthesize_conversation_title,
 )
+from omnigent.entities.conversation import MessageData
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.models.model_override import validate_model_override
+from omnigent.native._native_supersession import supersession_notice_text
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -121,6 +123,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _logger,
     get_server_runner_router,
     set_server_runner_router,
@@ -146,6 +149,7 @@ from omnigent.server.routes._sessions.helpers import (
     _LiveSettingsChange,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
+    _native_coding_agent_for_session,
     _note_settings_write,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
@@ -157,6 +161,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_collaboration_mode,
     _publish_permission_mode,
     _publish_sandbox_status,
+    _publish_session_superseded,
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
@@ -169,6 +174,7 @@ from omnigent.server.routes._sessions.helpers import (
     _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
+    _session_status_from_cache,
     _set_read_state,
     _start_managed_launch_task,
     _surface_model_change_forward_failure,
@@ -191,6 +197,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
+    _persist_external_conversation_item,
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
@@ -217,6 +224,9 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionPullRequestSummary,
     SessionResponse,
+    SessionRewindRequest,
+    SessionRewindResponse,
+    SupersessionReason,
     UpdateSessionRequest,
 )
 from omnigent.server.session_orchestration import require_orchestration_source
@@ -251,7 +261,14 @@ from omnigent.util.reasoning_effort import (
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
+from omnigent.util.uuid import uuid_to_bytes
 from omnigent.version import VERSION
+
+# Harnesses whose sessions offer ``/rewind``.
+_REWIND_HARNESSES = frozenset({"claude-sdk", "claude-native"})
+
+# Continues a claude-sdk session in a fresh session on ``/clear``; returns its id.
+ClearSessionIntoFreshSession = Callable[[Request, Conversation], Awaitable[str]]
 
 
 def _require_attachment_compatible_history(
@@ -432,8 +449,11 @@ def register_core_routes(
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
-) -> None:
-    """Register the core session routes on router."""
+) -> ClearSessionIntoFreshSession:
+    """Register the core session routes on router.
+
+    :returns: The claude-sdk ``/clear`` rotation the events route calls.
+    """
 
     async def _check_initial_input(request: Request, event: SessionEventInput | None) -> None:
         """Refuse a malformed first input before the session exists."""
@@ -3882,6 +3902,20 @@ def register_core_routes(
             source's agent was removed or a required bundle copy finds
             its source missing.
         """
+        return await _fork_session(request, source_id, body)
+
+    async def _fork_session(
+        request: Request,
+        source_id: str,
+        body: SessionForkRequest,
+        *,
+        before_item_id: str | None = None,
+    ) -> SessionResponse:
+        """Fork *source_id* as :func:`fork_session` documents.
+
+        :param before_item_id: Internal cutoff for rewind and clear: copy only
+            the items before this one, e.g. ``"msg_abc123"``.
+        """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, source_id, LEVEL_READ, permission_store, conversation_store
@@ -4335,6 +4369,7 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                before_item_id=before_item_id,
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
@@ -4501,3 +4536,229 @@ def register_core_routes(
                 "Fork the session into another agent instead."
             ),
         )
+
+    # ── Continuing a session's work in another session ──────────
+
+    async def _continue_session_in_fork(
+        request: Request,
+        source: Conversation,
+        *,
+        before_item_id: str | None,
+        command: str,
+        title: str,
+        notice: Callable[[str], str],
+        reason: SupersessionReason,
+    ) -> str:
+        """
+        Continue *source* in a fork on the same placement, superseding it.
+
+        The fork keeps the source's agent, labels and run settings and only
+        the history before *before_item_id*. It is bound to the source's host
+        and workspace and to its live runner, and the source gets a notice
+        linking to it plus a ``session.superseded`` redirect for live viewers.
+
+        :param request: The incoming request, whose caller must own *source*.
+        :param source: Session to supersede.
+        :param before_item_id: First item the fork drops, e.g. ``"msg_abc"``;
+            ``None`` keeps the whole history.
+        :param command: The slash command being run, e.g. ``"/clear"``, for errors.
+        :param title: The fork's title; ``""`` lets its first message name it.
+        :param notice: Builds the source's notice from the fork's id.
+        :param reason: ``session.superseded`` reason, e.g. ``"clear"``.
+        :returns: The fork's session id.
+        :raises OmnigentError: When the caller does not own *source*, it is a
+            sub-agent or running a turn, or no runner or host can take the fork.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, source.id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        if source.kind == "sub_agent":
+            raise OmnigentError(
+                f"{command} is only available in a top-level session.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if _session_status_from_cache(source.id, source.live_status) == "running":
+            raise OmnigentError(
+                f"Stop the current turn before running {command}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        runner_online = (
+            source.runner_id is not None
+            and runner_router is not None
+            and runner_router.runner_is_online(source.runner_id)
+        )
+        host_bound = source.host_id is not None and source.workspace is not None
+        if not runner_online and not host_bound:
+            raise OmnigentError(
+                f"Can't run {command} while this session's runner is offline. "
+                "Reconnect the session (send a message to wake it), then try again.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+
+        fork = await _fork_session(
+            request,
+            source.id,
+            SessionForkRequest(title=title),
+            before_item_id=before_item_id,
+        )
+        if source.host_id is not None and source.workspace is not None:
+            await asyncio.to_thread(
+                conversation_store.set_host_id,
+                fork.id,
+                source.host_id,
+                source.workspace,
+                source.git_branch,
+            )
+        if runner_online:
+            assert source.runner_id is not None
+            await _update_session(
+                request,
+                fork.id,
+                UpdateSessionRequest(runner_id=source.runner_id),
+                include_usage=False,
+            )
+
+        await _persist_external_conversation_item(
+            source.id,
+            source,
+            SessionEventInput(
+                type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
+                data={
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": fork.agent_name or "assistant",
+                        "content": [{"type": "output_text", "text": notice(fork.id)}],
+                    },
+                },
+            ),
+            conversation_store,
+        )
+        _publish_session_superseded(source.id, fork.id, reason=reason)
+        _logger.info(
+            "Session superseded by %s",
+            command,
+            extra=debug_event(
+                "session_superseded",
+                session_id=source.id,
+                target_session_id=fork.id,
+                command=command,
+                runner_bound=runner_online,
+            ),
+        )
+        return fork.id
+
+    async def clear_session_into_fresh_session(request: Request, source: Conversation) -> str:
+        """
+        Continue *source* in a fresh session on the same placement.
+
+        Used for claude-sdk ``/clear``: the SDK replays the Omnigent
+        transcript whenever its client restarts, so clearing in place would
+        bring the old context back.
+
+        :param request: The incoming request, whose caller must own *source*.
+        :param source: Session being cleared.
+        :returns: The new session's id.
+        """
+        first = await asyncio.to_thread(
+            conversation_store.list_items, source.id, limit=1, order="asc"
+        )
+        return await _continue_session_in_fork(
+            request,
+            source,
+            before_item_id=first.data[0].id if first.data else None,
+            command="/clear",
+            # Untitled, so the first message names it like any new chat.
+            title="",
+            notice=supersession_notice_text,
+            reason="clear",
+        )
+
+    # ── POST /sessions/{session_id}/rewind ──────────────────────
+
+    @router.post("/sessions/{session_id}/rewind", response_model=SessionRewindResponse)
+    async def rewind_session(
+        request: Request,
+        session_id: str,
+        body: SessionRewindRequest,
+    ) -> SessionRewindResponse:
+        """
+        Rewind a Claude session to just before one of its prompts.
+
+        Forks the session with the history before ``body.item_id`` onto the
+        same host, workspace and runner, links the source to the fork, and
+        redirects live viewers there. The source keeps its full history. A
+        claude-native fork rebuilds Claude's transcript from the kept items.
+        Advertised by ``GET /v1/info`` ``session_rewind``.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session to rewind, e.g. ``"conv_abc123"``.
+        :param body: The prompt to rewind to.
+        :returns: The new session id and the chosen prompt's text.
+        :raises OmnigentError: 400 for a harness without ``/rewind``, an item
+            that is not one of the session's prompts, a sub-agent, or a
+            running turn; 403/404 when the caller does not own the session;
+            503 when neither its runner nor its host can take the fork.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        native = _native_coding_agent_for_session(conv)
+        if harness not in _REWIND_HARNESSES and (
+            native is None or native.harness not in _REWIND_HARNESSES
+        ):
+            raise OmnigentError(
+                "/rewind is not available for this session type.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        prompt = await asyncio.to_thread(_rewind_prompt_text, conv.id, body.item_id)
+        new_session_id = await _continue_session_in_fork(
+            request,
+            conv,
+            before_item_id=body.item_id,
+            command="/rewind",
+            # The rewound chat keeps its name.
+            title=conv.title or "",
+            notice=lambda new_id: supersession_notice_text(
+                new_id,
+                outcome="This conversation was rewound with `/rewind`.",
+                link_text="the rewound chat",
+            ),
+            reason="rewind",
+        )
+        return SessionRewindResponse(session_id=new_session_id, prompt=prompt)
+
+    def _rewind_prompt_text(session_id: str, item_id: str) -> str:
+        """
+        Return the text of *session_id*'s user prompt *item_id*.
+
+        :raises OmnigentError: 400 when the item is not a user prompt there.
+        """
+        not_a_prompt = OmnigentError(
+            "/rewind needs one of this session's prompts.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+        try:
+            uuid_to_bytes(item_id)
+        except ValueError as exc:
+            raise not_a_prompt from exc
+        item = conversation_store.get_item(session_id, item_id)
+        if item is None or not isinstance(item.data, MessageData) or item.data.role != "user":
+            raise not_a_prompt
+        return "\n".join(
+            part["text"]
+            for part in item.data.content
+            if part.get("type") == "input_text" and isinstance(part.get("text"), str)
+        )
+
+    return clear_session_into_fresh_session

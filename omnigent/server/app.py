@@ -285,6 +285,8 @@ class ServerInfoResponse(BaseModel):
     agent_config_edit: bool = False
     # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
     session_event_types: list[str] = []
+    # POST /v1/sessions/{id}/rewind and GET .../items?type=; absent on older servers.
+    session_rewind: bool = False
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
@@ -3628,6 +3630,7 @@ def create_app(
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
+                "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "filesystem_attachments": {

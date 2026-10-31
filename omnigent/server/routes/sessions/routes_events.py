@@ -846,8 +846,15 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
+    clear_session_into_fresh_session: Callable[[Request, Conversation], Awaitable[str]]
+    | None = None,
 ) -> None:
-    """Register the events, stream, and delete routes on router."""
+    """Register the events, stream, and delete routes on router.
+
+    :param clear_session_into_fresh_session: Continues a claude-sdk session in
+        a fresh session on ``/clear`` and returns its id; ``None`` leaves
+        claude-sdk ``/clear`` unsupported.
+    """
 
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
@@ -2129,6 +2136,35 @@ def register_events_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         if body.type == _CLEAR_TYPE:
+            if (
+                clear_session_into_fresh_session is not None
+                and isinstance(request, Request)
+                and await asyncio.to_thread(
+                    _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                == "claude-sdk"
+            ):
+                # The runner drops the old session's live SDK client and
+                # history (an older runner no-ops with 204); the work then
+                # moves to a fresh session on the same placement.
+                release = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {"type": _CLEAR_TYPE},
+                    timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                )
+                if release is not None and release.status_code == 409:
+                    raise OmnigentError(
+                        "Stop the current turn before running /clear.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if release is not None and release.status_code not in (200, 204):
+                    raise OmnigentError(
+                        f"Clear failed: runner returned {release.status_code}",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    )
+                new_session_id = await clear_session_into_fresh_session(request, conv)
+                return {"queued": False, "session_id": new_session_id}
             # Like /compact, /clear runs in the vendor TUI: the runner types the
             # harness's own /clear, and the harness rotates the terminal onto a
             # fresh session that viewers follow via ``session.superseded``.

@@ -1002,7 +1002,13 @@ Request body matches `SessionEventInput`:
                                   in place); the harness then moves the
                                   terminal onto a fresh session that live
                                   viewers follow via `session.superseded`.
-                                  Other harnesses get a 400. Payload: `{}`.
+                                  For claude-sdk the runner drops the old
+                                  session's live SDK client (409 while a
+                                  turn runs) and the server continues the
+                                  work in an empty session on the same
+                                  host, workspace and runner, returning
+                                  its id as `session_id`. Other harnesses
+                                  get a 400. Payload: `{}`.
       - "stop_session"          — terminate the live session without
                                   deleting the conversation (owner-only;
                                   requires LEVEL_OWNER). Forwarded
@@ -1328,6 +1334,37 @@ The response is a full `SessionResponse` snapshot of the fork — same
 shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
+
+### Rewind Session
+
+```
+POST /v1/sessions/{session_id}/rewind
+Content-Type: application/json
+
+{"item_id": "msg_abc123"}
+
+200 OK — {"session_id": "conv_new", "prompt": "<the prompt's text>"}
+
+400 Bad Request — the session's harness is not claude-sdk or
+  claude-native, item_id is not one of its user prompts, it is a
+  sub-agent session, or a turn is running
+403/404 — the caller does not own the session
+503 Service Unavailable — neither its runner nor its host can take
+  the new session
+```
+
+Continues a Claude session from just before one of its prompts. The
+server forks the session with only the items positioned before
+`item_id` (rewinding to the first prompt keeps none), binds the fork to
+the source's host, workspace and live runner (host only when the runner
+is offline, so the next message relaunches it there), and keeps the
+source's title, labels, model, effort and launch arguments. A
+claude-native fork rebuilds Claude's transcript from the kept items.
+The source keeps its full history and gets a notice linking to the fork;
+live viewers follow via `session.superseded` with `reason: "rewind"`.
+Clients put `prompt` back in the composer. `GET /v1/info` reports
+`session_rewind: true`, which also means
+`GET /v1/sessions/{id}/items?type=message` filters items by type.
 
 ### Read Fork Repository Branch Suggestions
 
