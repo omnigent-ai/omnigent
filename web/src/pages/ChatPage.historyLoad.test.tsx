@@ -289,6 +289,8 @@ describe("KeepBottomOnResize", () => {
     fireEvent.pointerDown(scrollRoot);
     metrics.scrollHeight = 2021;
     act(() => resize?.());
+    metrics.clientHeight = 650;
+    act(() => resize?.());
     expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
     expect(metrics.scrollTop).toBe(1300);
 
@@ -296,7 +298,7 @@ describe("KeepBottomOnResize", () => {
     fireEvent.pointerUp(scrollRoot);
     metrics.scrollHeight = 2042;
     act(() => resize?.());
-    expect(metrics.scrollTop).toBe(1341);
+    expect(metrics.scrollTop).toBe(1391);
     document.getSelection()!.removeAllRanges();
     scrollRoot.remove();
   });
