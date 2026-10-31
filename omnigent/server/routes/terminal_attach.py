@@ -82,7 +82,7 @@ from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
-from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
+from omnigent.server._runner_ws_tunnel import RunnerUnavailableWSError, WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
@@ -99,6 +99,7 @@ _logger = logging.getLogger(__name__)
 _WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = WS_CLOSE_TERMINAL_NOT_FOUND
 _WS_CLOSE_INTERNAL_ERROR: Final[int] = WS_CLOSE_INTERNAL_ERROR
 _WS_CLOSE_WRONG_REPLICA: Final[int] = WS_CLOSE_WRONG_REPLICA
+_WS_CLOSE_TRY_AGAIN_LATER: Final[int] = 1013
 
 
 def create_terminal_attach_router(
@@ -196,6 +197,14 @@ def create_terminal_attach_router(
                 await websocket.close(
                     code=_WS_CLOSE_WRONG_REPLICA,
                     reason="host on another replica; retry without slice key",
+                )
+                return
+            except RunnerUnavailableWSError:
+                # The bound runner's tunnel is not connected yet; a transient
+                # session state, so ask the client to re-dial with backoff.
+                await websocket.close(
+                    code=_WS_CLOSE_TRY_AGAIN_LATER,
+                    reason="session runner is not connected",
                 )
                 return
             except Exception:  # noqa: BLE001
