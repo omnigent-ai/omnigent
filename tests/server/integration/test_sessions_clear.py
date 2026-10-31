@@ -82,7 +82,7 @@ async def _post_clear(
     :param clear_status: Status the fake runner returns for the control.
     :param monkeypatch: Pins the session's resolved harness.
     :param harness: Harness the session resolves to. claude-sdk ``clear``
-        moves to a fresh session instead (``test_sessions_rewind.py``).
+        moves to a fresh session instead (the ``test_claude_sdk_clear_*`` tests below).
     :returns: The server response and the forwarded clear bodies.
     """
     from omnigent.runtime import set_runner_client
