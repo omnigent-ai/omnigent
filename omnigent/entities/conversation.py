@@ -270,6 +270,8 @@ class Conversation:
     # seconds, None = no live stamp) — carried on the row so a session list
     # can judge runner liveness without a second connectivity query.
     live_status: str | None = None
+    # Epoch ms the writer observed ``live_status``; None = no stamped write.
+    live_status_at: int | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
     project_id: str | None = None

@@ -905,10 +905,10 @@ async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
     entered, release = threading.Event(), threading.Event()
     write_status = store.set_session_live_status
 
-    def blocked_write(session_id, status):
+    def blocked_write(session_id, status, *, observed_at=None):
         entered.set()
         assert release.wait(timeout=10), "test did not release the pending status write"
-        write_status(session_id, status)
+        write_status(session_id, status, observed_at=observed_at)
 
     monkeypatch.setattr(store, "set_session_live_status", blocked_write)
     session_live_state.configure(store)
