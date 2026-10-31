@@ -114,11 +114,18 @@ object NativeBridgeScript {
               if (typeof payload.currentOrigin !== "string" || !payload.currentOrigin) return;
               const cleanList = (value) =>
                 Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+              const debugActions = Array.isArray(payload.debugActions)
+                ? payload.debugActions
+                    .filter((entry) => entry && Number.isInteger(entry.id) && typeof entry.label === "string")
+                    .map((entry) => ({ id: entry.id, label: entry.label }))
+                : [];
               const info = {
                 currentOrigin: payload.currentOrigin,
                 managedServers: cleanList(payload.managedServers),
                 recentServers: cleanList(payload.recentServers),
                 canSignOut: payload.canSignOut === true,
+                offersReload: payload.offersReload === true,
+                debugActions,
               };
               for (const resolve of serverPickerWaiters) { try { resolve(info); } catch (_) {} }
               serverPickerWaiters.clear();
@@ -301,6 +308,9 @@ object NativeBridgeScript {
             },
             openServerSetup() {
               post({ method: "openServerSetup" });
+            },
+            runAuthDebugAction(id) {
+              if (Number.isInteger(id)) post({ method: "runAuthDebugAction", id });
             },
           });
         })();

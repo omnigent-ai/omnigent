@@ -3,6 +3,7 @@ package ai.omnigent.android
 import android.view.View
 import android.widget.PopupMenu
 import androidx.test.core.app.ApplicationProvider
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -20,7 +21,11 @@ class OidcAuthDebugMenuTest {
 
         OidcAuthDebugMenu.addItems(popup.menu)
 
-        assertTrue(OidcAuthDebugMenu.IS_AVAILABLE)
+        // The sidebar server picker offers the same faults as the native menu.
+        assertEquals(
+            listOf(OidcAuthDebugMenu.CLEAR_SESSION_COOKIE, OidcAuthDebugMenu.CLEAR_REFRESH_TOKEN),
+            OidcAuthDebugMenu.ACTIONS.map { it.id },
+        )
         assertNotNull(popup.menu.findItem(OidcAuthDebugMenu.CLEAR_SESSION_COOKIE))
         assertNotNull(popup.menu.findItem(OidcAuthDebugMenu.CLEAR_REFRESH_TOKEN))
         assertTrue(OidcAuthDebugMenu.handles(OidcAuthDebugMenu.CLEAR_REFRESH_TOKEN))
