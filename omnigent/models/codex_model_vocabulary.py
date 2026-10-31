@@ -112,6 +112,23 @@ def comparable_model_id(model: str) -> str:
     return bare_model_id(model).replace(".", "-")
 
 
+def codex_upgrade_target(row: Mapping[str, Any]) -> str | None:  # type: ignore[explicit-any]
+    """The successor model a Codex catalog row declares, if any.
+
+    :param row: A ``model/list`` row (``upgradeInfo`` or ``upgrade``) or a
+        ``codex debug models`` entry (``upgrade`` object).
+    :returns: The successor's id, e.g. ``"gpt-5.6-terra"``, or ``None``.
+    """
+    upgrade_info = row.get("upgradeInfo")
+    if isinstance(upgrade_info, Mapping):
+        target = upgrade_info.get("model") or upgrade_info.get("id")
+    else:
+        target = row.get("upgrade")
+        if isinstance(target, Mapping):
+            target = target.get("model") or target.get("id")
+    return target if isinstance(target, str) and target else None
+
+
 def codex_spawn_model(model: str) -> str | None:
     """Translate a servable model id into codex's ``spawn_agent`` slug.
 
