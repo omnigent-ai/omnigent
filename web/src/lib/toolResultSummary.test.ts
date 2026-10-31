@@ -120,6 +120,37 @@ describe("fileEditLineCounts", () => {
   });
 });
 
+describe("fileEditLineCounts for full-file writes", () => {
+  const write = (name: string, args: Record<string, unknown>, output: string): ToolCall => ({
+    name,
+    args,
+    output,
+    state: "output-available",
+  });
+
+  it("counts every line of a write that created its file", () => {
+    const args = { file_path: "/repo/a.py", content: "one\ntwo\nthree\n" };
+    expect(
+      fileEditLineCounts(write("Write", args, "File created successfully at: /repo/a.py")),
+    ).toEqual({ additions: 3, removals: 0 });
+    const record = '{"path": "/repo/a.py", "bytes_written": 14, "created": true}';
+    expect(
+      fileEditLineCounts(write("sys_os_write", { path: "/repo/a.py", content: "x\n" }, record)),
+    ).toEqual({ additions: 1, removals: 0 });
+  });
+
+  it.each([
+    ["Write", "The file /repo/a.py has been updated successfully."],
+    ["sys_os_write", '{"path": "/repo/a.py", "bytes_written": 2, "created": false}'],
+    ["write", "Successfully wrote 2 bytes to /repo/a.py"],
+    ["Write", "<tool_use_error>File has not been read yet.</tool_use_error>"],
+    ["sys_os_write", '{"error": "permission denied"}'],
+  ])("has none for a %s that did not say it created its file: %j", (name, output) => {
+    const args = { file_path: "/repo/a.py", path: "/repo/a.py", content: "x\n" };
+    expect(fileEditLineCounts(write(name, args, output))).toBeNull();
+  });
+});
+
 describe("editApplied", () => {
   it.each([
     ["Edit", "The file /repo/a.py has been updated successfully."],
@@ -133,6 +164,11 @@ describe("editApplied", () => {
     ["edit", "Created new file: /repo/a.py with provided content."],
     ["mcp__omnigent__sys_os_edit", '{"path": "/repo/a.py", "replacements": 1, "bytes_written": 9}'],
     ["apply_patch", "File change applied.\nupdate /repo/a.py"],
+    ["Write", "File created successfully at: /repo/a.py (file state is current in your context)"],
+    ["mcp__omnigent__sys_os_write", '{"path": "/repo/a.py", "bytes_written": 9, "created": false}'],
+    ["write", "Successfully wrote 9 bytes to /repo/a.py"],
+    ["write", "Wrote file successfully."],
+    ["write", "Created file successfully: /repo/a.py"],
     // SDK Pi stores its own tools' results whole.
     [
       "edit",
@@ -147,6 +183,7 @@ describe("editApplied", () => {
     ["edit", "Could not find the exact text in a.py."],
     ["sys_os_edit", '{"path": "/repo/a.py", "replacements": 0}'],
     ["sys_os_edit", "Replaced 1 occurrence(s) in /repo/a.py"],
+    ["sys_os_write", '{"error": "permission denied"}'],
     ["apply_patch", "update /repo/a.py"],
     ["apply_patch", "Successfully replaced text in a.py."],
     [

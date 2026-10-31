@@ -29,6 +29,7 @@
  *   Unarchive opens the restored session.
  */
 
+import { toast } from "sonner";
 import {
   type ComponentType,
   lazy,
@@ -212,6 +213,10 @@ import {
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
+  readOpenSubagentsInPanel,
+  writeOpenSubagentsInPanel,
+} from "@/lib/subagentPanelPreferences";
+import {
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
 } from "@/lib/composerSendShortcutPreferences";
@@ -231,6 +236,10 @@ import {
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "@/lib/pickerEntryVisibility";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -248,7 +257,7 @@ import {
   type CustomTheme,
   writeCustomTheme,
 } from "@/lib/customTheme";
-import { useIsEmbedded } from "@/lib/embedded";
+import { useHostTheme } from "@/lib/embedded";
 import { getOmnigentThemeSettingsUrl } from "@/lib/host";
 import {
   applyImportedSettings,
@@ -274,6 +283,7 @@ import {
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
+import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -470,15 +480,32 @@ function ThemeSubsection({
 function ModeControl() {
   const { theme, setTheme } = useTheme();
   const mode = normalizeThemeMode(theme);
+  const followsHost = useHostTheme() !== undefined;
+  const themeSettingsUrl = followsHost ? getOmnigentThemeSettingsUrl() : undefined;
   const labelId = useId();
   return (
     <div className="flex items-center justify-between gap-4">
-      <SettingsLabel
-        label="Mode"
-        labelId={labelId}
-        description="Follow your system, or force light or dark."
-        className="flex-1"
-      />
+      <div className="flex-1">
+        <SettingsLabel
+          label="Mode"
+          labelId={labelId}
+          description={
+            followsHost
+              ? "Follow Databricks, or force light or dark."
+              : "Follow your system, or force light or dark."
+          }
+        />
+        {themeSettingsUrl && (
+          <a
+            href={themeSettingsUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="text-sm font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+          >
+            Databricks appearance settings
+          </a>
+        )}
+      </div>
       <IconSegmentedControl<ThemeMode>
         labelledBy={labelId}
         value={mode}
@@ -487,7 +514,7 @@ function ModeControl() {
         items={themeCards.map((card) => ({
           value: card.mode,
           testId: `theme-${card.mode}`,
-          label: card.label,
+          label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
           icon: card.icon,
         }))}
       />
@@ -940,14 +967,6 @@ function FoldAssistantNarrationControl() {
 }
 
 function AppearanceSection() {
-  // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
-  // replace it with a note (plus a link to the host's own theme settings when
-  // one is provided). The color palette, terminal theme, and font controls are
-  // per-device prefs that don't conflict with host light/dark, so they stay.
-  // The link opens a new tab: in place, it would replace the app with the
-  // host page, and desktop windows have no Back control.
-  const isEmbedded = useIsEmbedded();
-  const themeSettingsUrl = getOmnigentThemeSettingsUrl();
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
@@ -1003,12 +1022,15 @@ function AppearanceSection() {
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
       } catch {
         // localStorage access errors are non-fatal.
       }
+      // As with import: a same-tab write fires no storage event.
+      notifyHiddenPickerAgentsChanged();
     }
     applyStoredUiFontSize();
 
@@ -1058,45 +1080,7 @@ function AppearanceSection() {
       <div className="flex flex-col gap-6">
         <div key={resetKey} className="flex flex-col gap-6">
           <SettingsGroup title="Theme" testId="settings-group-theme">
-            {isEmbedded ? (
-              <div className="flex flex-col gap-3">
-                <SettingsLabel
-                  label="Theme"
-                  tooltipDescription="Light and dark mode are configured in Databricks preferences."
-                  description={
-                    <>
-                      Light and dark mode are configured in Databricks preferences.
-                      {themeSettingsUrl ? (
-                        <>
-                          {" "}
-                          <a
-                            href={themeSettingsUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
-                          >
-                            Click to open Databricks user preferences page.
-                          </a>
-                          .
-                        </>
-                      ) : null}
-                    </>
-                  }
-                />
-                {themeSettingsUrl && (
-                  <a
-                    href={themeSettingsUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-sm font-medium text-primary underline underline-offset-2 md:hidden"
-                  >
-                    Open Databricks preferences
-                  </a>
-                )}
-              </div>
-            ) : (
-              <ModeControl />
-            )}
+            <ModeControl />
             <div className="mt-4 border-t border-border pt-4">
               <TerminalThemeControl />
             </div>
@@ -1109,6 +1093,7 @@ function AppearanceSection() {
             <TranscriptViewDefaultControl />
             <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
+              <PickerVisibilitySetting />
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <FoldAssistantNarrationControl />
@@ -1636,7 +1621,7 @@ function DatabricksIntegrationControl() {
 }
 
 /**
- * Opt-in dispatch for messages sent while the agent is working.
+ * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());
@@ -1774,6 +1759,40 @@ function BackgroundSessionTitlesControl() {
   );
 }
 
+function OpenSubagentsInPanelControl() {
+  const [enabled, setEnabled] = useState(readOpenSubagentsInPanel);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    // Sub-agent clicks read the stored value, so only show what was saved.
+    if (writeOpenSubagentsInPanel(next)) setEnabled(next);
+    else toast.error("Couldn't save this setting. Check that your browser allows site storage.");
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Open sub-agents in the Workspace panel"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Show a sub-agent's chat as a tab beside the main chat instead of replacing it. On phones, sub-agents still open full screen."
+        descriptionClassName="text-ui"
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-subagents-in-panel-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_subagents_in_panel"
+      />
+    </div>
+  );
+}
+
 function TerminalClipboardControl() {
   const labelId = useId();
   const descriptionId = useId();
@@ -1858,6 +1877,9 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <OpenSubagentsInPanelControl />
+          </div>
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
