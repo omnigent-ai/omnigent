@@ -382,6 +382,97 @@ describe("index.css native tablet layout", () => {
   );
 });
 
+const nativeScrollFadeContracts = [
+  {
+    platform: "iOS/iPadOS",
+    selector: "[data-ios-native] .chat-scroll-fade",
+    transparentStop: "transparent calc(48px + var(--omnigent-inset-top))",
+    opaqueStop: "black calc(80px + var(--omnigent-inset-top))",
+  },
+  {
+    platform: "Android",
+    selector: "[data-android-native] .chat-scroll-fade",
+    transparentStop: "transparent var(--fade-start)",
+    opaqueStop: "black calc(var(--fade-start) + 32px)",
+  },
+] as const;
+
+describe("index.css native status-bar scroll fades", () => {
+  it.each(nativeScrollFadeContracts)(
+    "keeps the %s top fade inset-aware at every viewport width",
+    ({ selector, transparentStop, opaqueStop }) => {
+      const rule = cssBlocks.find(([block]) => selectorOf(block).replace(/\s+/g, " ") === selector);
+      expect(rule, `missing native scroll fade for ${selector}`).toBeDefined();
+      expect(rule![0]).toContain(transparentStop);
+      expect(rule![0]).toContain(opaqueStop);
+
+      const before = cssSource.slice(0, rule!.index!);
+      const opens = (before.match(/\{/g) ?? []).length;
+      const closes = (before.match(/\}/g) ?? []).length;
+      expect(opens - closes, `${selector} must not sit inside a width media query`).toBe(0);
+    },
+  );
+});
+
+describe("index.css native header glass", () => {
+  it("reaches the glass up over the status bar at every width", () => {
+    const glass = cssBlocks.find(
+      ([block]) =>
+        selectorOf(block).replace(/\s+/g, " ") ===
+        ":is([data-ios-native], [data-android-native]) .session-header-glass::before",
+    );
+    expect(glass).toBeDefined();
+    expect(glass![0]).toContain(
+      "--status-bar-extension: max(0px, calc(var(--omnigent-safe-top) - 0.5rem))",
+    );
+    expect(glass![0]).toContain("top: calc(-1 * var(--status-bar-extension))");
+    // The 55% fade stop stays relative to the header box, not the taller glass.
+    expect(glass![0]).toContain(
+      "black calc(var(--status-bar-extension) + (100% - var(--status-bar-extension)) * 0.55)",
+    );
+    const before = cssSource.slice(0, glass!.index!);
+    expect((before.match(/\{/g) ?? []).length - (before.match(/\}/g) ?? []).length).toBe(0);
+  });
+});
+
+describe("index.css native transcript top padding", () => {
+  it("pads only unpinned transcripts so a pinned plan gets no extra gap", () => {
+    const padded = cssBlocks.filter(([block]) =>
+      block.includes(
+        "padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top))",
+      ),
+    );
+    expect(padded.map(([block]) => selectorOf(block).replace(/\s+/g, " "))).toEqual([
+      ":is([data-ios-native], [data-android-native]) .chat-scroll-fade .chat-conversation-content",
+    ]);
+  });
+});
+
+describe("index.css native Settings status bar", () => {
+  const ruleFor = (selector: string) =>
+    cssBlocks.find(([block]) => selectorOf(block).replace(/\s+/g, " ") === selector);
+  const mediaOf = (index: number) => {
+    const before = cssSource.slice(0, index);
+    return before.slice(before.lastIndexOf("@media")).split("{")[0];
+  };
+
+  it("extends the phone header backdrop over the status bar instead of masking", () => {
+    const backdrop = ruleFor(
+      ":is([data-ios-native], [data-android-native]) .settings-mobile-header::before",
+    );
+    expect(backdrop).toBeDefined();
+    expect(backdrop![0]).toContain("top: calc(-1 * var(--header-offset))");
+    expect(mediaOf(backdrop!.index!)).toContain("width < 48rem");
+  });
+
+  it("masks the status bar on wide settings pages only", () => {
+    const mask = ruleFor(":is([data-ios-native], [data-android-native]) .settings-page-scroll");
+    expect(mask).toBeDefined();
+    expect(mask![0]).toContain("transparent var(--omnigent-safe-top)");
+    expect(mediaOf(mask!.index!)).toContain("width >= 48rem");
+  });
+});
+
 /* The unified native-panel rule: one ungated :is() list covering the
  * Workspace rail, the conversations sidebar, and every push panel / rail-tab
  * drawer. The assertions below apply it verbatim — media-stripping a gated

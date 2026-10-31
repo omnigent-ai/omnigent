@@ -344,7 +344,7 @@ export function SettingsPage() {
       extraBottom="2.5rem"
       // Reserve the scrollbar's width so the centered column doesn't shift when
       // switching between a page or tab that scrolls and one that doesn't.
-      className="[scrollbar-gutter:stable]"
+      className="settings-page-scroll [scrollbar-gutter:stable]"
     >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
