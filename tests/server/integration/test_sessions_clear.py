@@ -243,18 +243,23 @@ def message_texts(store: SqlAlchemyConversationStore, session_id: str) -> list[s
     ]
 
 
+@pytest.mark.parametrize("runner_status", [200, 204])
 async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
+    runner_status: int,
 ) -> None:
     """``clear`` frees the old SDK client, then continues in an empty bound session.
 
-    The new session keeps the source's host, workspace, branch, runner and run
+    The runner gets a marked request, so only a server that continues the work
+    makes it release the client; an older runner's 204 still continues. The new
+    session keeps the source's host, workspace, branch, runner and run
     settings; the source keeps its history and gets a notice plus a redirect.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
+    live_runner.clear_status = runner_status
     store = SqlAlchemyConversationStore(db_uri)
     source_id, _items = await create_placed_session(client, store)
 
@@ -264,11 +269,13 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
 
     assert resp.status_code == 202, resp.text
     new_id = resp.json()["session_id"]
-    sent = [(path, body.get("type") or body.get("session_id")) for path, body in live_runner.posts]
-    # The old session's client is freed before the new session is initialized.
-    assert sent.index((f"/v1/sessions/{source_id}/events", "clear")) < sent.index(
-        ("/v1/sessions", new_id)
+    release = (
+        f"/v1/sessions/{source_id}/events",
+        {"type": "clear", "continue_in_new_session": True},
     )
+    # The old session's client is freed before the new session is initialized.
+    initialized = [(path, body.get("session_id")) for path, body in live_runner.posts]
+    assert live_runner.posts.index(release) < initialized.index(("/v1/sessions", new_id))
     assert message_texts(store, new_id) == []
     fork = store.get_conversation(new_id)
     assert fork is not None
