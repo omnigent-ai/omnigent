@@ -11552,6 +11552,7 @@ async def _create_session_from_existing_agent(
     body, related_source = await resolve_related_session_create(
         body, request, user_id, conversation_store, permission_store
     )
+    managed_peer = related_source is not None and body.host_type == "managed"
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
@@ -11665,7 +11666,9 @@ async def _create_session_from_existing_agent(
         request,
         body,
         user_id=user_id,
-        inherited_session_id=related_source.id
+        inherited_session_id=None
+        if managed_peer
+        else related_source.id
         if related_source is not None
         else body.parent_session_id,
     )
@@ -11870,7 +11873,9 @@ async def _create_session_from_existing_agent(
         if selection_spec is not None:
             inference_snapshot, model_override = await prepare_create_inference(
                 request,
-                body.model_copy(update={"parent_session_id": related_source.id})
+                body.model_copy(
+                    update={"parent_session_id": None if managed_peer else related_source.id}
+                )
                 if related_source is not None
                 else body,
                 selection_spec,
@@ -11891,7 +11896,7 @@ async def _create_session_from_existing_agent(
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
-    if body.parent_session_id is not None:
+    if body.parent_session_id is not None and not managed_peer:
         parent_conv = related_source or _parent_for_routing
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
@@ -11963,12 +11968,12 @@ async def _create_session_from_existing_agent(
     await validate_create_harness_readiness(
         harness=selected_harness,
         host_id=body.host_id,
-        parent_session_id=body.parent_session_id,
+        parent_session_id=body.parent_session_id if not managed_peer else None,
         inherited_runner_id=inherited_runner_id,
         user_id=user_id,
         conversation_store=conversation_store,
         host_store=getattr(request.app.state, "host_store", None),
-        parent=related_source or _parent_for_routing,
+        parent=(related_source or _parent_for_routing) if not managed_peer else None,
     )
     require_codex_plan_launch_support(
         harness=selected_harness,

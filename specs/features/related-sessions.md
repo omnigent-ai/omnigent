@@ -13,8 +13,8 @@ runner affinity and child discovery. The original conversation remains the root.
 Full peers are direct children of that root, identified by a protected server-owned
 role, rather than a title convention. No new group table is needed.
 
-This PR is an opt-in interactive draft. It uses existing same-environment execution
-and leaves remote placement and expanded orchestration unavailable. Enable only the
+This is an opt-in interactive draft. The UI reuses the source environment; MCP
+creation can also provision a managed sandbox for a full peer. Enable only the
 server's `related_sessions` release feature to try it; old components do not need
 to recognize a new feature or advertise new protocol fields.
 
@@ -53,8 +53,8 @@ to recognize a new feature or advertise new protocol fields.
 
 - The root is a real, visible Main conversation and retains group lifecycle
   ownership. Full peers are not reparented, adopted or detached.
-- Machine placement and session relationships are separate. This draft supports
-  the source's existing runner only; it does not treat equal missing host IDs as
+- Machine placement and session relationships are separate. The UI uses
+  the source's existing runner; it does not treat equal missing host IDs as
   proof that two sessions share an execution environment.
 - Existing public read permissions are inherited. This draft does not expand who
   can control sessions, what an agent token can access, or preapproved MCP tool
@@ -67,7 +67,7 @@ to recognize a new feature or advertise new protocol fields.
 - Group archive retains shared worktrees. With this draft enabled, bulk archive
   also retains worktrees and tells the user instead of offering cleanup.
 - Related forks use the existing history and cross-harness compatibility rules.
-  New sandbox placement remains unavailable in this draft.
+  New sandbox placement is available through MCP creation; the UI stays on the source.
 - The inline composer shows the source environment and fixes its destination. Other hosts
   need a trusted placement capability before they can be offered; a host name or
   provider label cannot establish permission to control it. New custom-agent
@@ -91,8 +91,9 @@ to recognize a new feature or advertise new protocol fields.
 - **AC5 (R6):** GIVEN an already archived peer and active group members, WHEN the
   group is archived and then undone, THEN only members changed by that archive
   return to active state.
-- **AC6 (R5):** GIVEN a source on a sandbox, WHEN a request supplies a different
-  external host or requests managed provisioning, THEN creation is rejected;
+- **AC6 (R5):** GIVEN a source on a sandbox, WHEN an ordinary UI create supplies a
+  different external host or requests managed provisioning, THEN it is rejected.
+  Authenticated MCP creation may explicitly request a new managed sandbox;
   existing standalone managed provisioning is unchanged.
 - **AC7 (R7):** GIVEN a peer centered in the main conversation, THEN its exact
   name appears above the composer with Back to Main. Dragging its Agents row
@@ -107,12 +108,39 @@ state. Keep internal research and demo media out of commits.
 
 ## Out of Scope
 
-Cross-environment related-session creation, managed sandbox provisioning for a
-related session, new MCP worker discovery/dispatch/completion semantics, expanded
-cross-harness copying, and moving existing sessions between groups. Hard delegated
-credential confinement is required before enabling cross-environment control; a
-capability picker alone does not provide that isolation.
+Arbitrary personal-host placement, automatic reply broadcasting, new completion
+subscriptions, expanded cross-harness copying, and moving existing sessions
+between groups. MCP authorization restricts dispatch destinations; it does not
+confine arbitrary code already holding owner credentials.
 
+## MCP orchestration
+
+- `sys_session_create` accepts optional `related_session=true` with `same_host`
+  or `managed` placement and an existing `agent_id`. The caller remains the
+  recorded creator; the new full peer attaches to its root. Managed placement
+  uses the existing provider/profile/startup path with a separate runner.
+- `sys_session_list` includes full peers even without colon-delimited titles,
+  with role, creator, status, busy state, host and pending approvals. A peer
+  also discovers Main and its siblings through the existing bounded child view.
+  `sys_session_get_info` supplies root and role metadata.
+- Main and peers use `sys_session_message` to exchange tasks and explicit
+  completion reports. This preserves ordinary native approvals. Read-only-public
+  groups are allowed for their owner-run agents; viewers cannot dispatch and
+  editable sharing is rejected. Outside-group private-sender checks remain.
+- A peer can dispatch on its own machine, or to a connected host authenticated
+  with a managed launch token. Host names, provider labels and stale provisioning
+  records do not establish this authority. A cross-replica request re-addresses
+  before this live check. Wait for a new sandbox to connect before subsequent
+  messages; its initial task is durably queued during creation.
+- A laptop manager can launch a managed peer, but that peer cannot send an
+  executing message back to the laptop. The manager can read status/history.
+  Explicit completion replies are available within a machine and between
+  verified sandboxes. Reports are ordinary messages that can start a turn;
+  they are never automatically broadcast.
+- Delete All cleans up each descendant managed host when no surviving session
+  uses it. Shared hosts remain alive. No migration or new host/runner/provider
+  handshake is required. Older servers reject grouped creation without falling
+  back to an independent session; omitted arguments retain legacy behavior.
 ## Plan
 
 1. Add the release gate, owner-checked related create and protected peer role.

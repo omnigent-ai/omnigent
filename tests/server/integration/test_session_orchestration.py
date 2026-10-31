@@ -8,7 +8,7 @@ import pytest
 from omnigent.entities import NewConversationItem
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
@@ -215,6 +215,134 @@ async def _send(client, source, target, message="Please inspect the PR"):
             conversation_id=source["id"],
         )
     )
+
+
+async def test_read_only_group_create_discover_message_and_report_completion(
+    auth_client, auth_app, peers, db_uri
+):
+    source, unrelated, captured = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.RELATED_SESSIONS, Feature.SESSION_ORCHESTRATION})
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("__public__")
+    permissions.grant("__public__", source["id"], LEVEL_READ)
+    manual = await auth_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source["agent_id"],
+            "related_to_session_id": source["id"],
+            "title": "Manual reviewer",
+        },
+    )
+    assert manual.status_code == 201, manual.text
+    reviewer = manual.json()
+    worker = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": source["agent_id"],
+                    "placement": "same_host",
+                    "related_session": True,
+                    "title": "Implementation",
+                    "message": "Implement the review",
+                }
+            ),
+            server_client=auth_client,
+            conversation_id=reviewer["id"],
+        )
+    )
+    assert "error" not in worker, worker
+    assert worker["parent_session_id"] == source["id"]
+    assert worker["created_by_session_id"] == reviewer["id"]
+    assert worker["initial_message"]["queued"] is True
+    for caller in (source, reviewer):
+        listing = json.loads(
+            await execute_tool(
+                tool_name="sys_session_list",
+                arguments="{}",
+                server_client=auth_client,
+                conversation_id=caller["id"],
+            )
+        )
+        listed = {row["conversation_id"]: row for row in listing["sub_agents"]}
+        assert listed[worker["conversation_id"]]["session_role"] == "peer"
+        if caller is source:
+            assert listed[reviewer["id"]]["title"] == "Manual reviewer"
+        else:
+            assert listed[source["id"]]["agent"] == "main"
+    for caller, destination in ((source, reviewer), (reviewer, {"id": worker["conversation_id"]})):
+        assert (await _send(auth_client, caller, destination))["queued"] is True
+    assert (await _send(auth_client, reviewer, source, "Completed: review passed"))[
+        "queued"
+    ] is True
+    assert "Completed: review passed" in str(captured["posts"])
+    assert "error" in await _send(auth_client, reviewer, unrelated)
+    for user in ("bob", "__public__"):
+        auth_client.headers["X-Forwarded-Email"] = user
+        assert "error" in await _send(auth_client, reviewer, source)
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    auth_app.state.feature_flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
+    assert "Shared sessions cannot" in (await _send(auth_client, reviewer, source))["detail"]
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.RELATED_SESSIONS, Feature.SESSION_ORCHESTRATION})
+    )
+    for index in range(101):
+        user = f"reader-{index:03}"
+        permissions.ensure_user(user)
+        permissions.grant(user, source["id"], LEVEL_READ)
+    assert (await _send(auth_client, reviewer, source))["queued"] is True
+    permissions.ensure_user("zz-editor")
+    permissions.grant("zz-editor", source["id"], LEVEL_EDIT)
+    assert "Shared sessions cannot" in (await _send(auth_client, reviewer, source))["detail"]
+
+
+@pytest.mark.parametrize(
+    "destination", ["same_runner", "same_host", "sandbox", "personal", "spoofed", "remote"]
+)
+async def test_group_messages_require_a_proven_destination(
+    auth_client, auth_app, peers, db_uri, monkeypatch, destination
+):
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, captured = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.RELATED_SESSIONS, Feature.SESSION_ORCHESTRATION})
+    )
+    response = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": source["agent_id"], "related_to_session_id": source["id"]},
+    )
+    assert response.status_code == 201, response.text
+    target = response.json()
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(source["id"], "a" * 32, workspace="/source")
+    target_host = ("a" if destination == "same_host" else "b") * 32
+    store.set_host_id(target["id"], target_host, workspace="/target")
+    if destination != "same_runner":
+        store.replace_runner_id(target["id"], "other-runner")
+    _register_online_host(auth_app, target_host, "alice")
+    auth_app.state.host_registry.get(target_host).registered_with_managed_token = (
+        destination == "sandbox"
+    )
+    if destination == "spoofed":
+        store.set_labels(target["id"], {"sandbox_provider": "modal"})
+    router = auth_app.state.runner_router
+    monkeypatch.setattr(router, "host_is_on_another_replica", lambda _: destination == "remote")
+    captured.clear()
+    response = await auth_client.post(
+        f"/v1/sessions/{target['id']}/events",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"type": "session_message", "data": {"message": "Review"}},
+    )
+    if destination in {"personal", "spoofed", "remote"}:
+        assert response.status_code in {400, 403}, response.text
+        assert not captured.get("posts")
+        assert ("wrong_replica" if destination == "remote" else "personal hosts") in response.text
+    else:
+        assert response.status_code == 202, response.text
+        assert captured.get("posts")
 
 
 @pytest.mark.parametrize("policy_denied", [False, True])
@@ -600,17 +728,24 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize("related", [False, True])
 @pytest.mark.parametrize(
     "condition,orchestration_environment",
     [("flag_off", "-session_orchestration"), ("shared", None), ("binding", None)],
     indirect=["orchestration_environment"],
 )
 async def test_creation_refuses_before_launch(
-    auth_client, auth_app, peers, db_uri, placement, condition
+    auth_client, auth_app, peers, db_uri, placement, condition, related
 ):
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
     source, _, captured = peers
+    if related:
+        auth_app.state.feature_flags = FeatureFlags(
+            frozenset({Feature.RELATED_SESSIONS})
+            if condition == "flag_off"
+            else frozenset({Feature.RELATED_SESSIONS, Feature.SESSION_ORCHESTRATION}),
+        )
     host_id = uuid4().hex
     _register_online_host(auth_app, host_id, "alice")
     SqlAlchemyConversationStore(db_uri).set_host_id(source["id"], host_id, workspace="/tmp")
@@ -618,17 +753,23 @@ async def test_creation_refuses_before_launch(
     if condition == "shared":
         permissions = SqlAlchemyPermissionStore(db_uri)
         permissions.ensure_user("bob")
-        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.grant("bob", source["id"], LEVEL_EDIT if related else LEVEL_READ)
     elif condition == "binding":
         auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "wrong"
     store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
-    before_sessions = {s.id for s in store.list_conversations().data}
+    before_sessions = {s.id for s in store.list_conversations(kind=None).data}
     before_grants = permissions.list_for_user("alice")
     result = json.loads(
         await execute_tool(
             tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": source["agent_id"], "placement": placement}),
+            arguments=json.dumps(
+                {
+                    "agent_id": source["agent_id"],
+                    "placement": placement,
+                    "related_session": related,
+                }
+            ),
             server_client=auth_client,
             conversation_id=source["id"],
         )
@@ -651,7 +792,7 @@ async def test_creation_refuses_before_launch(
         assert response.status_code == 403 and expected in response.text
     assert not captured.get("posts")
     assert auth_app.state.host_registry.get(host_id).outbound_queue.empty()
-    assert {s.id for s in store.list_conversations().data} == before_sessions
+    assert {s.id for s in store.list_conversations(kind=None).data} == before_sessions
     assert permissions.list_for_user("alice") == before_grants
 
 
@@ -886,9 +1027,10 @@ async def test_independent_creation_rejects_child_or_bundle_shape(auth_client, p
     assert expected in response.text
 
 
+@pytest.mark.parametrize("related", [False, True])
 @pytest.mark.parametrize("provider", ["modal", "daytona", "embedding"])
 async def test_managed_creation_uses_default_provider_and_saves_private_first_task(
-    auth_client, auth_app, peers, db_uri, monkeypatch, provider
+    auth_client, auth_app, peers, db_uri, monkeypatch, provider, related
 ):
     import asyncio
     from dataclasses import replace
@@ -896,8 +1038,27 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.server.routes.sessions import routes_core
     from omnigent.server.sharing_settings import DefaultPublicSessions
+    from tests.server.test_sandbox_inference_routes import _Catalog
 
     source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    if related:
+        auth_app.state.feature_flags = FeatureFlags(
+            frozenset({Feature.RELATED_SESSIONS, Feature.SESSION_ORCHESTRATION})
+        )
+        permissions = SqlAlchemyPermissionStore(db_uri)
+        catalog = _Catalog()
+        parent = store.create_conversation(
+            agent_id=source["agent_id"],
+            inference_snapshot=await catalog.prepare(provider, "claude-sdk", "alice"),
+        )
+        permissions.grant("alice", parent.id, LEVEL_OWNER)
+        source = {"id": parent.id, "agent_id": parent.agent_id}
+        auth_client.headers.update(_bind_runner(db_uri, parent.id))
+        catalog.revision = "destination-revision"
+        auth_app.state.inference_catalog = catalog
+        permissions.ensure_user("__public__")
+        permissions.grant("__public__", source["id"], LEVEL_READ)
     deployment = parse_sandbox_config(
         {
             "server_url": "https://managed-test.example.com",
@@ -930,6 +1091,7 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
                     {
                         "agent_id": source["agent_id"],
                         "placement": "managed",
+                        "related_session": related,
                         "message": "First task",
                     }
                 ),
@@ -943,8 +1105,15 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         assert captured["provider"] is None
         assert captured["sandbox_config"].for_provider(None).provider == provider
         assert captured["owner"] == "alice"
-        store = SqlAlchemyConversationStore(db_uri)
-        assert store.get_conversation(session_id).parent_conversation_id is None
+        worker = store.get_conversation(session_id)
+        assert worker.parent_conversation_id == (source["id"] if related else None)
+        assert worker.runner_id is None
+        if related:
+            assert worker.root_conversation_id == source["id"]
+            assert worker.labels[SESSION_ROLE_LABEL_KEY] == "peer"
+            assert result["created_by_session_id"] == source["id"]
+            assert result["session_role"] == "peer"
+            assert worker.inference_snapshot["configuration_revision"] == "destination-revision"
         assert (
             store.get_conversation(session_id).labels[CREATED_BY_SESSION_LABEL_KEY] == source["id"]
         )
@@ -1047,7 +1216,7 @@ async def test_startup_queue_admission_and_replay(
 
 
 @pytest.mark.parametrize("two_replica_stack", ["authenticated"], indirect=True)
-@pytest.mark.parametrize("target_kind", ["root", "child", "side_chat"])
+@pytest.mark.parametrize("target_kind", ["root", "child", "side_chat", "peer"])
 @pytest.mark.parametrize("legacy_host", [False, True])
 async def test_peer_message_readdresses_across_replicas(
     two_replica_stack, db_uri, monkeypatch, target_kind, legacy_host
@@ -1077,7 +1246,22 @@ async def test_peer_message_readdresses_across_replicas(
         return await _get_runner_client_impl(session_id, router, **kwargs)
 
     monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
-    if target_kind == "child":
+    if target_kind == "peer":
+        for app in (stack.keyless_replica, stack.tunnel_replica):
+            app.state.feature_flags = FeatureFlags(
+                frozenset({Feature.RELATED_SESSIONS, Feature.SESSION_ORCHESTRATION})
+            )
+        response = await stack.keyless_client.post(
+            "/v1/sessions",
+            headers=source_headers,
+            json={"agent_id": source["agent_id"], "related_to_session_id": source["id"]},
+        )
+        assert response.status_code == 201, response.text
+        target = response.json()
+        stack.conv_store.set_host_id(target["id"], host_id, workspace="/worker")
+        stack.conv_store.replace_runner_id(target["id"], "managed-peer-runner")
+        stack.tunnel_replica.state.host_registry.get(host_id).registered_with_managed_token = True
+    elif target_kind == "child":
         response = await stack.tunnel_client.post(
             "/v1/sessions",
             headers={"X-Forwarded-Email": "alice"},
@@ -1129,8 +1313,9 @@ async def test_peer_message_readdresses_across_replicas(
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("related", [False, True])
 async def test_managed_create_is_addressed_before_provisioning(
-    two_replica_stack, db_uri, monkeypatch
+    two_replica_stack, db_uri, monkeypatch, related
 ):
     import asyncio
 
@@ -1141,6 +1326,11 @@ async def test_managed_create_is_addressed_before_provisioning(
     from omnigent.server.routes.sessions import routes_core
 
     stack = two_replica_stack
+    if related:
+        for app in (stack.keyless_replica, stack.tunnel_replica):
+            app.state.feature_flags = FeatureFlags(
+                frozenset({Feature.RELATED_SESSIONS, Feature.SESSION_ORCHESTRATION})
+            )
     source = await _create_session_as(stack.keyless_client, "", "alice")
     headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, source["id"])}
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
@@ -1181,6 +1371,7 @@ async def test_managed_create_is_addressed_before_provisioning(
                     {
                         "agent_id": source["agent_id"],
                         "placement": "managed",
+                        "related_session": related,
                         "message": "First task",
                     }
                 ),
@@ -1193,6 +1384,8 @@ async def test_managed_create_is_addressed_before_provisioning(
     assert reserved == [captured["host_id"]]
     assert captured["host_registry"] is stack.tunnel_replica.state.host_registry
     worker = stack.conv_store.get_conversation(result["conversation_id"])
+    assert worker.parent_conversation_id == (source["id"] if related else None)
+    assert worker.runner_id is None
     assert worker.labels["omnigent.sandbox.requested_host_id"] == reserved[0]
     pending = stack.conv_store.list_pending_inputs(worker.id)
     assert len(pending) == 1

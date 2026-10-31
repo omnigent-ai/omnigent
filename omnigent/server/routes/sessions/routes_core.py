@@ -1012,10 +1012,15 @@ def register_core_routes(
                 user_id,
                 conversation_store,
                 permission_store,
+                related_create=body.related_to_session_id is not None,
             )
-            if body.parent_session_id is not None or body.related_to_session_id is not None:
+            if body.parent_session_id is not None:
                 raise OmnigentError(
                     "Orchestration creates independent sessions", code=ErrorCode.INVALID_INPUT
+                )
+            if body.related_to_session_id is not None and body.related_to_session_id != source.id:
+                raise OmnigentError(
+                    "Related creation must use the sender", code=ErrorCode.FORBIDDEN
                 )
             if body.host_type == "managed":
                 deployment = getattr(request.app.state, "sandbox_config", None)
@@ -1039,6 +1044,7 @@ def register_core_routes(
                 user_id,
                 conversation_store,
                 permission_store,
+                related_create=body.related_to_session_id is not None,
             )
             if body.initial_items:
                 raise OmnigentError(
@@ -1061,7 +1067,7 @@ def register_core_routes(
                         "The first task must be text", code=ErrorCode.INVALID_INPUT
                     )
                 body.initial_input = orchestration_message(source.id, content[0].get("text"))
-            if body.host_type == "external":
+            if body.host_type == "external" and body.related_to_session_id is None:
                 placement = await asyncio.to_thread(
                     routing_host_session, source, conversation_store
                 )

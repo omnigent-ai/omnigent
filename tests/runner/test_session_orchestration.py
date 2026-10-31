@@ -20,6 +20,7 @@ def test_native_message_schema(spec):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("related", [False, True])
 @pytest.mark.parametrize(
     ("placement", "profile", "capability"),
     [
@@ -58,7 +59,7 @@ def test_native_message_schema(spec):
         ],
     ],
 )
-async def test_create_placement(placement, monkeypatch, profile, capability):
+async def test_create_placement(placement, monkeypatch, profile, capability, related):
     from omnigent.runner import subagent_work
 
     register = Mock()
@@ -77,7 +78,7 @@ async def test_create_placement(placement, monkeypatch, profile, capability):
             info = {"request_managed_sandbox_host_id": True}
             if capability != "missing":
                 info["features"] = {
-                    "enabled": {"sandbox_profiles": True},
+                    "enabled": {"sandbox_profiles": True, "related_sessions": True},
                     "disabled": {"sandbox_profiles": False},
                     "malformed": [],
                     "non_bool": {"sandbox_profiles": "true"},
@@ -97,6 +98,7 @@ async def test_create_placement(placement, monkeypatch, profile, capability):
                     {
                         "agent_id": "worker",
                         "placement": placement,
+                        "related_session": related,
                         "message": "Start",
                         "title": "Worker task",
                         **(profile or {}),
@@ -106,6 +108,10 @@ async def test_create_placement(placement, monkeypatch, profile, capability):
                 conversation_id="manager",
             )
         )
+    if related and placement == "child":
+        assert "Related sessions require" in result["error"]
+        assert requests == []
+        return
     if profile and placement != "managed":
         assert "requires placement='managed'" in result["error"]
         assert requests == []
@@ -117,6 +123,11 @@ async def test_create_placement(placement, monkeypatch, profile, capability):
     if profile and "sandbox_profile_revision" in profile and "sandbox_profile_id" not in profile:
         assert "requires sandbox_profile_id" in result["error"]
         assert requests == []
+        return
+    if related and capability != "enabled":
+        assert "error" in result, result
+        assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
+        register.assert_not_called()
         return
     if profile and profile.get("sandbox_profile_id") and capability != "enabled":
         assert "error" in result, result
@@ -137,6 +148,7 @@ async def test_create_placement(placement, monkeypatch, profile, capability):
         assert requests[0].url.path == "/v1/sessions/orchestrated"
         assert "parent_session_id" not in body
         assert requests[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
+        assert body.get("related_to_session_id") == ("manager" if related else None)
         assert result["agent_id"] == "worker"
         assert result["title"] == "Worker task"
         register.assert_not_called()
@@ -158,14 +170,17 @@ async def test_create_placement(placement, monkeypatch, profile, capability):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("related", [False, True])
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
 @pytest.mark.parametrize("status", [404, 405])
-async def test_independent_creation_does_not_fall_back_on_unsupported_server(placement, status):
+async def test_independent_creation_does_not_fall_back_on_unsupported_server(
+    placement, status, related
+):
     requests = []
 
     def unsupported(request):
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={})
+            return httpx.Response(200, json={"features": {"related_sessions": True}})
         requests.append(request)
         return httpx.Response(status, json={"detail": "Unsupported route"})
 
@@ -175,7 +190,9 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
         result = json.loads(
             await execute_tool(
                 tool_name="sys_session_create",
-                arguments=json.dumps({"agent_id": "worker", "placement": placement}),
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": placement, "related_session": related}
+                ),
                 server_client=client,
                 conversation_id="manager",
             )

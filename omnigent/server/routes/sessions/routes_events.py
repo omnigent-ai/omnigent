@@ -3804,6 +3804,10 @@ def register_events_routes(
             raise _session_not_found()
         # Capture relay IDs before subtree deletion removes parent links.
         descendant_ids = await _best_effort_stop(session_id, conversation_store, runner_router)
+        descendants = await asyncio.to_thread(conversation_store.get_conversations, descendant_ids)
+        deleted_host_ids = {
+            row.host_id for row in [conv, *descendants.values()] if row.host_id is not None
+        }
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -3899,33 +3903,15 @@ def register_events_routes(
         # A relay still inside an offline runner's reconnect grace must not
         # fail the deleted turns when that grace expires.
         _cancel_runner_relays([session_id, *descendant_ids])
-        # The session is gone, so is its launch-progress state. Failed
-        # launches are retained in the cache for reload visibility while
-        # the session exists; without this eviction every deleted
-        # failed-launch session would leak one entry for the process
-        # lifetime.
-        _session_sandbox_status_cache.pop(session_id, None)
-        # Same for MCP startup state: failed/cancelled maps are retained
-        # for reload visibility while the session exists, so a session
-        # whose MCP startup never settled clean would leak its entry.
-        _session_mcp_startup_cache.pop(session_id, None)
-        # Same for the extension-pushed model catalog: kept across reloads
-        # while the session exists (the extension only pushes on start), so a
-        # deleted session would otherwise leak its entry for the process life.
-        _pushed_model_options_cache.pop(session_id, None)
-        # Drop the deleted session's per-user read-state from every user's
-        # caches so they don't accumulate orphan entries for the process
-        # lifetime.
-        _prune_session_read_state(session_id)
-        # Same for the tracker's entry — a deleted session's launch can
-        # never be rendezvoused again (access checks 404 first), so a
-        # retained failure is dead weight. ``finish`` also settles a
-        # still-in-flight entry, releasing any parked message POST into
-        # its session re-read (which now correctly 404s); the background
-        # task's later ``fail`` on the popped entry is a no-op.
+        # Evict the whole deleted tree, including peers provisioning on other hosts.
         managed_launches_for_delete = getattr(request.app.state, "managed_launches", None)
-        if managed_launches_for_delete is not None:
-            managed_launches_for_delete.finish(session_id)
+        for deleted_id in [session_id, *descendant_ids]:
+            _session_sandbox_status_cache.pop(deleted_id, None)
+            _session_mcp_startup_cache.pop(deleted_id, None)
+            _pushed_model_options_cache.pop(deleted_id, None)
+            _prune_session_read_state(deleted_id)
+            if managed_launches_for_delete is not None:
+                managed_launches_for_delete.finish(deleted_id)
         # Managed-host cleanup: when the session's host is backed by a
         # server-provisioned sandbox (host_type="managed"), terminate
         # the sandbox and delete the host row — which also revokes its
@@ -3933,10 +3919,12 @@ def register_events_routes(
         # cap reaps stragglers. External (laptop) hosts have no
         # sandbox_id and are never touched.
         host_store_for_managed = getattr(request.app.state, "host_store", None)
-        if conv.host_id is not None and host_store_for_managed is not None:
-            bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
+        for host_id in deleted_host_ids:
+            if host_store_for_managed is None:
+                break
+            bound_host = await asyncio.to_thread(host_store_for_managed.get_host, host_id)
             remaining_host_sessions = await asyncio.to_thread(
-                conversation_store.list_host_conversation_ids, conv.host_id, limit=1
+                conversation_store.list_host_conversation_ids, host_id, limit=1
             )
             if (
                 bound_host is not None

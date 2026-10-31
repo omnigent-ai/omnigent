@@ -1561,7 +1561,8 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         conversation. ``None`` for top-level sessions.
     :param related_to_session_id: Opt-in full peer creation. The source's owner
         creates a child of its root on the source's existing runner, host and
-        workspace. Requires the ``related_sessions`` feature; fresh context only.
+        workspace, or in a fresh managed sandbox through authenticated orchestration.
+        Requires the ``related_sessions`` feature; fresh context only.
     :param sub_agent_name: For sub-agent sessions, the sub-agent
         type name within the parent's spec tree, e.g.
         ``"summarizer"``. The runner uses this to load the correct
@@ -1802,7 +1803,11 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
                 raise ValueError(
                     "host_type 'managed' takes a host_id of 32 lowercase hex characters"
                 )
-            if self.requested_host_id is not None and self.parent_session_id is not None:
+            if (
+                self.requested_host_id is not None
+                and self.parent_session_id is not None
+                and self.related_to_session_id is None
+            ):
                 raise ValueError(
                     "host_id does not apply to a managed child session; "
                     "it runs on its parent's host"

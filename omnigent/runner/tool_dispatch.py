@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
-from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY, SESSION_ROLE_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -3514,6 +3514,13 @@ async def _execute_session_create(
     placement = args.get("placement", "child")
     if placement not in ("child", "same_host", "managed"):
         return json.dumps({"error": "placement must be child, same_host or managed"})
+    related_session = args.get("related_session", False)
+    if not isinstance(related_session, bool):
+        return json.dumps({"error": "related_session must be a boolean"})
+    if related_session and (placement == "child" or not has_agent_id):
+        return json.dumps(
+            {"error": "Related sessions require agent_id and same_host or managed placement"}
+        )
     if placement != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
     message = args.get("message")
@@ -3563,6 +3570,8 @@ async def _execute_session_create(
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
         body.pop("parent_session_id")
+        if related_session:
+            body["related_to_session_id"] = conversation_id
         # The server derives the same host/workspace from this bound source.
         headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
         if placement == "managed":
@@ -3584,12 +3593,26 @@ async def _execute_session_create(
     create_requested = False
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
-        if placement == "managed":
-            from omnigent.runner.session_requests import post_on_host
-
+        info_data = None
+        if related_session:
             info = await server_client.get("/v1/info")
             info.raise_for_status()
             info_data = info.json()
+            features = info_data.get("features") if isinstance(info_data, dict) else None
+            if not isinstance(features, dict) or features.get("related_sessions") is not True:
+                return json.dumps(
+                    {
+                        "error": "Related sessions are unavailable on this server; "
+                        "no session was created"
+                    }
+                )
+        if placement == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
+            if info_data is None:
+                info = await server_client.get("/v1/info")
+                info.raise_for_status()
+                info_data = info.json()
             if selection.get("sandbox_profile_id"):
                 features = info_data.get("features") if isinstance(info_data, dict) else None
                 if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:
@@ -3657,11 +3680,18 @@ async def _execute_session_create(
     if placement != "child":
         handle: dict[str, object] = {
             "conversation_id": data["id"],
-            "kind": "default",
+            "kind": "sub_agent" if related_session else "default",
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
         }
+        if related_session:
+            handle.update(
+                session_role="peer",
+                parent_session_id=data.get("parent_session_id"),
+                root_conversation_id=data.get("root_conversation_id"),
+                created_by_session_id=conversation_id,
+            )
         if placement == "same_host" and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 
@@ -5336,6 +5366,10 @@ async def _session_get_info_via_rest(
             "host_id": snap.get("host_id"),
             "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
+            "root_conversation_id": snap.get("root_conversation_id"),
+            "session_role": (_string_mapping(snap.get("labels")) or {}).get(
+                SESSION_ROLE_LABEL_KEY
+            ),
             "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
                 CREATED_BY_SESSION_LABEL_KEY
             ),
@@ -6346,13 +6380,13 @@ async def _rename_current_session_via_rest(
 async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
-) -> list[dict[str, str | None]]:
+) -> list[_JsonObject]:
     """
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
 
-    Returns ``[{"agent", "title", "conversation_id"}, ...]``, skipping
-    closed and titleless/colonless rows so they never re-surface to the
-    LLM. Includes the caller's own children and, when the caller is
+    Returns named children and full peers, including peers without a title.
+    Closed sessions and untyped legacy rows are skipped. Includes the caller's
+    own children and, when the caller is
     itself a child (e.g. a user-added agent), its parent (surfaced as
     ``agent="main"``) and its siblings — so an added agent can still
     discover ``main`` and its session-mates. Best-effort: a failed
@@ -6516,21 +6550,40 @@ async def _collect_global_sessions(
 
 def _child_rows_to_entries(
     rows: list[_JsonObject],
-) -> list[dict[str, str | None]]:
+) -> list[_JsonObject]:
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
 
-    Skips closed and titleless/colonless rows. The server already
+    Full peers include their status and role. Other closed and titleless/colonless
+    rows are skipped. The server already
     parses ``tool``/``session_name`` from the title (including the
     ``"ui:<agent>:<label>"`` form), so those are reused.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
     """
-    entries: list[dict[str, str | None]] = []
+    entries: list[_JsonObject] = []
     for row in rows:
         title = _optional_string(row.get("title"))
         labels = _string_mapping(row.get("labels"))
+        if row.get("session_role") == "peer":
+            if row.get("archived") or is_session_closed(labels, title):
+                continue
+            entries.append(
+                {
+                    "conversation_id": row.get("id"),
+                    "agent": public_agent_name(_optional_string(row.get("agent_name"))),
+                    "title": title,
+                    "session_role": "peer",
+                    "parent_session_id": row.get("parent_session_id"),
+                    "created_by_session_id": (labels or {}).get(CREATED_BY_SESSION_LABEL_KEY),
+                    "busy": row.get("busy") is True,
+                    "status": row.get("current_task_status"),
+                    "host_id": row.get("host_id"),
+                    "pending_elicitations_count": row.get("pending_elicitations_count", 0),
+                }
+            )
+            continue
         if not title or ":" not in title or is_session_closed(labels, title):
             continue
         entries.append(
