@@ -494,41 +494,41 @@ sequenceDiagram
     S-->>A: result JSON (or clean timeout)
 ```
 
-### Manual previews with Companion
+### Browser previews on this machine
 
-To preview an app running on a remote development host (such as Arca), use
-Companion or another external forwarding tool to make its port available on
-your desktop machine. Companion is an external prerequisite for the Arca-to-Mac
-workflow; Omnigent does not establish or verify forwarding or resolve local
-port collisions.
+Sessions running on this desktop machine can open HTTP(S) `localhost`,
+`127.0.0.1`, and `[::1]` through the address bar, opted-in chat/file links,
+and the agent's browser tools. Start the app locally, open **+** > **Browser**,
+and enter its URL. `localhost` always names the desktop machine.
 
-1. Ask the agent to start the app on the remote host and report its URL.
-2. Use Companion to forward the app's port to your Mac. Check the actual
-   forwarded address: the local port may differ from the remote port.
-3. In the Omnigent desktop app, open the session's Workspace **+** menu and
-   choose **Browser**. Type the forwarded URL, for example
-   `http://localhost:5273/`, in the address bar and press Enter. Here
-   `localhost` is the desktop machine, not the agent's remote host.
-4. Hide and reopen the Workspace, or switch tabs or sessions and return.
-   The existing page is retained without navigating or reloading it. Closing
-   the Browser tab destroys that view; opening a new tab does not restore it.
+Main verifies this machine's current host identity and a live host daemon
+record enrolled with the window's server. That enrollment is the trust boundary:
+the server can already launch code here. The session host ID only routes the
+request. Both an updated desktop and web bundle are required; older web bundles
+remain public-only without destroying existing public views.
 
-If the page is unreachable, check that the app is still running and that the
-forwarded URL reaches the intended app in your Mac's regular browser. Check
-Companion's forwarding and local port selection separately. Normal TLS, CORS,
-authentication, and local-network permission rules still apply. This pane is
-desktop-only; it is not available in the plain web UI.
+Eligibility is granted at navigation and re-checked at every navigation and agent
+read/action. A failed check revokes access before clearing the previous document;
+access stays revoked if clearing fails. Request and redirect checks use the
+in-memory grant and window trust gates, keeping disk reads off the request path.
 
-For local or unrecognized hosts, `browser_navigate` keeps its restrictions on
-localhost and private addresses, even after you open a page manually.
-A manually opened page in the session's
-agent browser view remains available to existing agent inspection and
-interaction, including navigation caused by interacting with the page. Manual
-opening is therefore not a read-only boundary for that view. The user-created
-Browser tab opened through **+** > **Browser** is separate from the agent relay
-and is not targeted by the session's agent browser actions.
+Other remote and unknown sessions have public-only **document** access. Use a
+public preview URL or your regular browser.
+
+Eligibility is per view: a public page in an eligible view can frame loopback
+documents too. Private networks, link-local/metadata addresses, `*.localhost`,
+`0.0.0.0`, and DNS aliases resolving to loopback remain blocked. Normal TLS,
+CORS, authentication, and local-network permission rules still apply.
+
+Hide/reopen the Workspace or switch tabs to retain a page without reloading.
+Closing the tab destroys it. User-created Browser tabs are separate from the
+session's agent browser view and are not targeted by the agent relay.
 
 ### Agent previews on Arca
+
+The verified Arca exception also applies to the address bar and chat/file links.
+Companion or another external tool must forward the remote app's port to the
+desktop first.
 
 On a Databricks-managed server with internal desktop features enabled, an
 Arca session's agent can open and inspect an app through Companion forwarding
@@ -555,10 +555,10 @@ a mismatch requires consent and is offered only when the host list identifies
 the source as Arca, so an incorrect remembered host can be recaptured and
 corrected without prompting from sandbox sessions. Both paths verify that the
 captured host ID matches the source session. Consent or auto-connect opt-in, the
-captured identity check, and the agent-context gate remain the trust boundaries. A decline briefly
-suppresses repeat prompts, while failed runs remain retryable. **Run on Arca** is
-hidden for an online remembered host only when the desktop advertises preview
-recovery; older shells keep the action visible.
+captured identity check, and the agent-context gate remain the trust boundaries.
+A decline briefly suppresses repeat prompts, while failed runs remain retryable.
+**Run on Arca** is hidden for an online remembered host only when the desktop
+advertises preview recovery; older shells keep the action visible.
 
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
 redirects and links that would open a new window (which stay in the same pane).
@@ -602,7 +602,7 @@ other browser permissions remain denied.
 This controls Chromium's local-network permission answers, **not a network
 firewall**: Electron versions may not gate every local-network fetch on this
 permission. Approval does not bypass CORS, TLS certificate validation, or the
-agent navigation policy. A helper that rejects this origin through its own CORS
+browser navigation policy. A helper that rejects this origin through its own CORS
 policy must be configured to allow it; the pane does not rewrite those headers.
 
 ### Browser implementation
@@ -610,7 +610,8 @@ policy must be configured to allow it; the pane does not rewrite those headers.
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
 which may run on a different host — drives it purely by messages: an action
 request fans out over the session stream, the renderer claims and executes it
-against its local Chromium, and the result is posted back.
+against its local Chromium, and the result is posted back. Every renderer navigation,
+including the address bar, chat links, and agent actions, enforces this policy.
 
 **Pieces:**
 
@@ -622,25 +623,35 @@ against its local Chromium, and the result is posted back.
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
-  an agent-locked view), and right-click offers "Open Link in Browser" /
+  a policy-enforced view), and right-click offers "Open Link in Browser" /
   "Copy Link Address".
-- `src/browserUrlPolicy.js` — the agent navigation policy: http(s) only, and
-  no loopback, private, link-local, metadata, or other non-public address in
-  any literal form (including IPv4-mapped and other IPv6 spellings). A
+- `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
+  no private, link-local, metadata, or other non-public address in
+  any literal form, except exact loopback hosts for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
-  policy to every document request (frames, `<object>`/`<embed>`) of an
-  agent-locked view through `webRequest`, covering redirects and in-place
-  window opens. Scripts, images, fetch/XHR, and WebSockets are outside this
-  guard and can still reach internal addresses; Electron 42 does not enforce
-  Chromium's Local Network Access checks here.
-  Those requests skip HTTP-cache reads so every response reports
-  the address Chromium connected to, and a response whose address is missing
+  policy to every HTTP(S) and WebSocket request of a policy-enforced view through
+  `webRequest`, including frames, `<object>`/`<embed>`, scripts, styles, images,
+  media, and fetch/XHR. Worker network requests use the owning view's policy;
+  requests without a registered view use the most restrictive owner in the
+  partition, or public-only access if no owners remain. A never-navigated blank
+  tab makes sibling service-worker requests public-only until it navigates
+  with an eligible context. Every guarded request to a named host resolves DNS
+  through its partition before sending, including GET/HEAD subresources and
+  WebSockets. IP literals use the URL check without DNS. Exact loopback hosts
+  remain available to eligible Arca and this-machine sessions. Enforcement cancels requests and
+  keeps the view open.
+  Guarded HTTP requests skip cache reads to obtain connected-address metadata;
+  a response whose address is missing
   or non-public (a DNS answer that changed after the check) is cancelled,
-  unless that address belongs to a configured proxy. Limits: that response
-  check runs after the request was sent, so it keeps the response from the
-  page but does not stop the request reaching the server. Pages restored from
-  the back-forward cache and navigations answered by a service worker make no
+  unless that address belongs to a configured proxy. Skipping cache reads adds
+  network round trips and may increase latency and bandwidth. WebSocket upgrades
+  can omit the connected IP; those repeat the partition DNS check at the 101
+  response. This is not connected-IP verification and cannot rule out a DNS
+  change between check and connection. Limits: a DNS
+  change between preflight and connection can still send a request to a private
+  address; the HTTP response check prevents the page from reading its response.
+  Pages restored from the back-forward cache and navigations answered by a service worker make no
   request these hooks see. Electron reports the connected IP but not its port
   or whether a proxy was used, so when an internal proxy with a `DIRECT`
   fallback is down and the destination rebinds to that proxy's IP, a direct
@@ -648,8 +659,8 @@ against its local Chromium, and the result is posted back.
   agent browsing through such proxies. For a proxied request, the reported IP
   belongs to the proxy, not the destination it fetched; destination enforcement
   therefore also depends on the proxy's own policy. Preflight still requires
-  successful local destination DNS, so proxy-only DNS configurations are not
-  supported. Classification conservatively excludes all of `2001::/23`,
+  successful local destination DNS for every named host,
+  so proxy-only DNS configurations are not supported. Classification conservatively excludes all of `2001::/23`,
   including the global exceptions recognized by the Python policy.
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
@@ -739,9 +750,10 @@ the native view); no server flag.
 
 All renderer IPC navigation uses the same URL policy, including the URL bar.
 A renderer's `agent: false` flag does not exempt a tab from address checks.
-Main-owned Arca preview eligibility still applies. Other internal sites must be
-opened in a separate browser; this also keeps later redirects in these tabs
-under the same policy.
+Main-owned eligibility for sessions on this machine and verified Arca sessions
+applies to exact loopback hosts. Other internal sites must be opened in a
+separate browser; this also keeps later redirects in these tabs under the same
+policy.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the

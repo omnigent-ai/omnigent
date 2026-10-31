@@ -10002,8 +10002,8 @@ describe("NewChatLandingScreen attachments", () => {
 });
 
 // Paste mirrors the in-session composer exactly: files on the clipboard
-// attach instead of inserting as text, while a plain-text paste is left to
-// the browser. Keep these assertions in lockstep with the "Composer paste"
+// attach instead of inserting as text, while plain text is inserted as typed
+// input. Keep these assertions in lockstep with the "Composer paste"
 // suite in pages/ChatPage.composer.test.tsx — the one recorded divergence is
 // the open slash menu's fate (landing keeps it open; live closes it once an
 // attachment exists).
@@ -10033,15 +10033,16 @@ describe("NewChatLandingScreen paste", () => {
     for (const file of files) {
       items.push({ kind: "file", type: file.type, getAsFile: () => file });
     }
-    return { clipboardData: { items } };
+    const getData = (type: string) => (type === "text/plain" ? (text ?? "") : "");
+    return { clipboardData: { items, getData } };
   }
 
-  it("leaves a text-only paste to the browser", () => {
+  it("inserts a text-only paste as typed input", () => {
     renderLanding();
     const input = screen.getByTestId("new-chat-landing-input");
-    expect(fireEvent.paste(input, pastePayload({ text: "hello world" }))).toBe(true);
+    expect(fireEvent.paste(input, pastePayload({ text: "hello world" }))).toBe(false);
     expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
-    expect((input as HTMLTextAreaElement).value).toBe("");
+    expect((input as HTMLTextAreaElement).value).toBe("hello world");
   });
 
   it("attaches a pasted file instead of inserting it as text", () => {
