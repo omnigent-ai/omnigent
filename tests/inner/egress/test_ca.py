@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import datetime
+import io
 import ssl
+import threading
 from pathlib import Path
+from typing import Any
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -150,3 +154,58 @@ def test_system_ca_bundle_skips_non_pem_in_capath(tmp_path: Path, monkeypatch) -
 
     assert real_ca in bundle
     assert b"not a certificate" not in bundle
+
+
+def test_rewriting_ca_bundle_never_exposes_partial_bundle_to_concurrent_loader(
+    tmp_path: Path,
+) -> None:
+    cert_path, _ = ensure_ca(cache_dir=tmp_path)
+    bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    first_load_done = threading.Event()
+    stop = threading.Event()
+    load_errors: list[str] = []
+
+    def load_bundle_until_stopped() -> None:
+        while not stop.is_set():
+            try:
+                ssl.create_default_context(cafile=str(bundle_path))
+            except (ssl.SSLError, OSError) as exc:
+                load_errors.append(str(exc))
+            first_load_done.set()
+
+    loader = threading.Thread(target=load_bundle_until_stopped, daemon=True)
+    loader.start()
+    try:
+        assert first_load_done.wait(timeout=30)
+        for _ in range(20):
+            ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    finally:
+        stop.set()
+        loader.join(timeout=30)
+
+    assert load_errors == []
+
+
+def test_rewriting_ca_bundle_keeps_previous_bundle_while_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cert_path, _ = ensure_ca(cache_dir=tmp_path)
+    bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    previous = bundle_path.read_bytes()
+    real_open = io.open
+    published_during_writes: list[bytes] = []
+
+    def open_and_read_published_bundle(
+        file: Any, mode: str = "r", *args: Any, **kwargs: Any
+    ) -> Any:
+        handle = real_open(file, mode, *args, **kwargs)
+        if "w" in mode:
+            published_during_writes.append(bundle_path.read_bytes())
+        return handle
+
+    monkeypatch.setattr(io, "open", open_and_read_published_bundle)
+    ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    monkeypatch.undo()
+
+    assert published_during_writes == [previous]
+    assert bundle_path.read_bytes() == previous

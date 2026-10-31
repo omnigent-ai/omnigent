@@ -26,6 +26,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     )
     from omnigent.inner import _proc
     from omnigent.inner.codex_executor import (
+        CODEX_NATIVE_FEATURES_OFF,
         _codex_home_config_source_from_env,
         _populate_codex_home_config,
         materialize_codex_provider_config,
@@ -83,19 +84,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         ]
         for override in native_server.config_overrides:
             args.extend(("--config", override))
-        for override in (
-            'approval_policy="never"',
-            "features.unified_exec=false",
-            "features.shell_tool=false",
-            'web_search="disabled"',
-            "features.apps=false",
-            "features.browser_use=false",
-            "features.computer_use=false",
-            "features.image_generation=false",
-            "features.multi_agent=false",
-            "features.plugins=false",
-            "features.tool_search=false",
-        ):
+        for override in ('approval_policy="never"', *CODEX_NATIVE_FEATURES_OFF):
             args.extend(("--config", override))
         if launch.model:
             args.extend(("--model", launch.model))
