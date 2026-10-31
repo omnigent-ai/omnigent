@@ -31,6 +31,7 @@ from pathlib import Path
 import click
 import psutil  # type: ignore[import-untyped]
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.config import global_config_path
 from omnigent.inner import _proc
 from omnigent.process_logging import (
@@ -888,7 +889,9 @@ def pick_local_port(preferred: int = _DEFAULT_LOCAL_PORT) -> int:
         # it, a fast server restart sees EADDRINUSE on macOS/BSD because
         # recently closed connections are still in TIME_WAIT even though
         # the listening socket is gone and uvicorn could successfully bind.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # On Windows it lets the probe bind a port another server listens on.
+        if not IS_WINDOWS:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("127.0.0.1", preferred))
         except OSError:
