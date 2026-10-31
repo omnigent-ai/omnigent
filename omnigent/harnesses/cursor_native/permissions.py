@@ -27,8 +27,8 @@ detection ever fails. Sessions launched with ``--yolo`` / ``--force`` / ``-f``
 auto-accept lingering tool gates in-pane (no web card) because cursor's Run
 Everything mode still sometimes leaves a pending marker long enough to stall a
 piloted parent. The accept only fires while the pane shows cursor's accept
-hint, with bounded retries before a still-visible gate falls back to a web
-card. Stale markers without a visible gate never produce a yolo approval. See
+hint, with bounded retries before an unrecoverable gate fails the turn. Stale
+markers without a visible gate never produce a yolo approval. See
 ``docs/cursor-native-elicitation.md`` (and the
 superseded ``docs/cursor-native-tui-mirror-plan.md`` for the original pane-scrape
 design and why the transcript channel replaced it).
@@ -47,16 +47,28 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cursor_pane_keys
+from omnigent.harnesses.cursor_native.bridge import (
+    capture_cursor_pane,
+    inject_interrupt,
+    send_cursor_pane_keys,
+)
 
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
 # (one chat per workspace) and reads the live ``-wal`` state correctly.
 from omnigent.harnesses.cursor_native.forwarder import (
     _discover_store,
+    _get_current_rowid,
+    _post_external_session_status,
     _read_blob_rows,
     _read_state,
 )
+from omnigent.harnesses.cursor_native.status import (
+    CursorTurnFailure,
+    count_turn_ends,
+    read_current_generation,
+)
+from omnigent.native._native_post_delivery import post_may_have_been_delivered
 
 _logger = logging.getLogger(__name__)
 
@@ -64,6 +76,9 @@ _POLL_INTERVAL_S = 0.3
 # The approval hook parks server-side until a human answers; allow a day, well
 # past any realistic wait, so the runner's POST never abandons a live prompt.
 _POST_TIMEOUT_S = 86400.0
+_YOLO_FAILURE_POST_ATTEMPTS = 3
+_YOLO_FAILURE_POST_TIMEOUT_S = 10.0
+_YOLO_FAILURE_RETRY_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -149,7 +164,7 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
-        except RuntimeError:
+        except (RuntimeError, OSError):
             _logger.exception(
                 "failed to send cursor keystroke %r (of %r); session=%s", key, keys, session_id
             )
@@ -705,9 +720,6 @@ class _YoloAccept(enum.Enum):
     """Nothing to do this pass — pacing, no prompt rendered yet, or another
     call was already answered (cursor shows one prompt at a time)."""
 
-    SURFACE_CARD = "surface_card"
-    """Auto-accept is not clearing this gate; fall back to the web card."""
-
 
 @dataclass
 class _YoloAcceptRetry:
@@ -715,6 +727,41 @@ class _YoloAcceptRetry:
     last_attempt_at: float
     retry_s: float
     attempts: int
+    reason: str
+
+
+class _YoloAutoAcceptError(RuntimeError):
+    """Raised when a YOLO tool gate cannot be accepted within its deadline."""
+
+
+def _defer_yolo_auto_accept(
+    call: CursorPendingToolCall,
+    *,
+    now: float,
+    attempts_by_call: dict[str, _YoloAcceptRetry],
+    reason: str,
+) -> _YoloAccept:
+    retry = attempts_by_call.get(call.tool_call_id)
+    if retry is not None and now - retry.started_at >= _YOLO_ACCEPT_TIMEOUT_S:
+        raise _YoloAutoAcceptError(
+            f"Cursor YOLO could not accept {call.tool_name} after "
+            f"{now - retry.started_at:.1f}s and {retry.attempts} attempts: "
+            f"{retry.reason}"
+        )
+    if retry is None:
+        _logger.warning("cursor YOLO recovery deferred: %s; tool=%s", reason, call.tool_name)
+    attempts_by_call[call.tool_call_id] = _YoloAcceptRetry(
+        started_at=retry.started_at if retry is not None else now,
+        last_attempt_at=now,
+        retry_s=(
+            min(retry.retry_s * 2, _YOLO_ACCEPT_MAX_RETRY_S)
+            if retry is not None
+            else _YOLO_ACCEPT_RETRY_S
+        ),
+        attempts=retry.attempts + 1 if retry is not None else 1,
+        reason=reason,
+    )
+    return _YoloAccept.SKIP
 
 
 async def _yolo_auto_accept(
@@ -726,16 +773,7 @@ async def _yolo_auto_accept(
     attempts_by_call: dict[str, _YoloAcceptRetry],
     allow_send: bool,
 ) -> _YoloAccept:
-    """Try to answer one gated call in-pane, or hand it back to the card path.
-
-    Retry visible prompts with backoff for ``_YOLO_ACCEPT_TIMEOUT_S`` after
-    the first send, allowing the final send its full backoff interval. A pending
-    checkpoint without an on-screen prompt can be stale or still rendering;
-    it neither consumes retries nor surfaces a card.
-
-    :param attempts_by_call: In-memory retry state, keyed by tool_call_id.
-    :param allow_send: Whether the pane is available for another approval.
-    """
+    """Retry capture or approval failures; a stale marker without a gate is harmless."""
     if not allow_send:
         return _YoloAccept.SKIP
     retry = attempts_by_call.get(call.tool_call_id)
@@ -743,34 +781,21 @@ async def _yolo_auto_accept(
         return _YoloAccept.SKIP
     pane = await asyncio.to_thread(capture_cursor_pane, bridge_dir)
     if pane is None:
-        # No advertised tmux target, or the pane exited: a keystroke cannot
-        # land, and recording it as delivered would spin here forever.
-        _logger.warning(
-            "cursor elicitation: no live cursor pane to auto-accept %s; surfacing a card; "
-            "session=%s tool_call_id=%s",
-            call.tool_name,
-            session_id,
-            call.tool_call_id.splitlines()[0],
+        return _defer_yolo_auto_accept(
+            call,
+            now=now,
+            attempts_by_call=attempts_by_call,
+            reason="the Cursor pane could not be captured",
         )
-        return _YoloAccept.SURFACE_CARD
-    if not pane.strip():
-        # Capture failures return an empty frame; only a usable capture can
-        # confirm that the prompt disappeared and reset its retry deadline.
-        return _YoloAccept.SKIP
     if not _pane_shows_accept_prompt(pane):
         attempts_by_call.pop(call.tool_call_id, None)
         return _YoloAccept.SKIP
     if retry is not None and now - retry.started_at >= _YOLO_ACCEPT_TIMEOUT_S:
-        _logger.warning(
-            "cursor elicitation: yolo auto-accept did not clear visible %s after %.1fs "
-            "and %d attempts; surfacing a card; session=%s tool_call_id=%s",
-            call.tool_name,
-            now - retry.started_at,
-            retry.attempts,
-            session_id,
-            call.tool_call_id.splitlines()[0],
+        raise _YoloAutoAcceptError(
+            f"Cursor YOLO accept did not clear {call.tool_name} after "
+            f"{now - retry.started_at:.1f}s and {retry.attempts} attempts: "
+            f"{retry.reason}"
         )
-        return _YoloAccept.SURFACE_CARD
     # A call nobody ever sees needs its arguments in the record, or an operator
     # has no way to tell an auto-approved ``ls`` from an auto-approved ``rm``.
     _logger.info(
@@ -783,7 +808,12 @@ async def _yolo_auto_accept(
         _preview_for_args(call.args),
     )
     if not await _send_cursor_keys(bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY):
-        return _YoloAccept.SURFACE_CARD
+        return _defer_yolo_auto_accept(
+            call,
+            now=now,
+            attempts_by_call=attempts_by_call,
+            reason="tmux rejected the accept keystroke",
+        )
     attempts_by_call[call.tool_call_id] = _YoloAcceptRetry(
         started_at=retry.started_at if retry is not None else now,
         last_attempt_at=now,
@@ -791,8 +821,100 @@ async def _yolo_auto_accept(
         if retry is not None
         else _YOLO_ACCEPT_RETRY_S,
         attempts=retry.attempts + 1 if retry is not None else 1,
+        reason="accept prompt remained visible after the keystroke",
     )
     return _YoloAccept.SENT
+
+
+async def _fail_yolo_turn(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    store_path: Path | None,
+    active: dict[str, dict[str, object]],
+    failure: CursorTurnFailure,
+    output: str,
+) -> None:
+    """Interrupt the gated turn and suppress its stop only after acknowledged failure."""
+    tasks = [task for entry in active.values() if isinstance(task := entry["task"], asyncio.Task)]
+    elicitations = [str(entry["elicitation_id"]) for entry in active.values()]
+    active.clear()
+    for task in tasks:
+        task.cancel()
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+        async with failure.lock:
+            generation = await asyncio.to_thread(read_current_generation, bridge_dir)
+            after_stop = await asyncio.to_thread(count_turn_ends, bridge_dir)
+            before_rowid = (
+                await asyncio.to_thread(_get_current_rowid, store_path) if store_path else 0
+            )
+            failure.after_stop = None
+            try:
+                await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=2.0)
+            except (RuntimeError, OSError):
+                _logger.exception(
+                    "cursor YOLO turn interruption failed; bridge_dir=%s", bridge_dir
+                )
+                output += "; Cursor turn interruption also failed"
+            observed_stops = await asyncio.to_thread(count_turn_ends, bridge_dir)
+            stopped_turns = range(after_stop + 1, observed_stops + 1)
+            for attempt in range(_YOLO_FAILURE_POST_ATTEMPTS):
+                try:
+                    async with asyncio.timeout(_YOLO_FAILURE_POST_TIMEOUT_S):
+                        await _post_external_session_status(
+                            client,
+                            session_id=session_id,
+                            status="failed",
+                            turn_outcome="failed",
+                            output=output,
+                        )
+                    if generation is not None:
+                        failure.generations.add(generation)
+                    failure.after_stop = after_stop
+                    failure.before_rowid = before_rowid
+                    failure.suppressed_stops.update(stopped_turns)
+                    break
+                except (httpx.HTTPError, TimeoutError) as exc:
+                    if isinstance(exc, TimeoutError) or post_may_have_been_delivered(exc):
+                        if generation is not None:
+                            failure.uncertain_generations.add(generation)
+                        failure.uncertain_stops.update(dict.fromkeys(stopped_turns, generation))
+                        failure.before_rowid = before_rowid
+                        _logger.warning(
+                            "cursor YOLO failure diagnostic delivery uncertain; session=%s",
+                            session_id,
+                        )
+                        break
+                    permanent = (
+                        isinstance(exc, httpx.HTTPStatusError)
+                        and 400 <= exc.response.status_code < 500
+                        and exc.response.status_code not in (408, 429)
+                    )
+                    if permanent or attempt + 1 == _YOLO_FAILURE_POST_ATTEMPTS:
+                        _logger.error(
+                            "cursor YOLO failure diagnostic delivery abandoned; session=%s",
+                            session_id,
+                        )
+                        break
+                    _logger.warning(
+                        "cursor YOLO failure diagnostic delivery will retry; session=%s",
+                        session_id,
+                    )
+                    await asyncio.sleep(_YOLO_FAILURE_RETRY_S * 2**attempt)
+    finally:
+        if elicitations:
+            try:
+                async with asyncio.timeout(_YOLO_FAILURE_POST_TIMEOUT_S):
+                    await asyncio.gather(
+                        *(
+                            _post_external_elicitation_resolved(client, session_id, elicitation_id)
+                            for elicitation_id in elicitations
+                        )
+                    )
+            except TimeoutError:
+                _logger.warning("cursor YOLO card cleanup timed out; session=%s", session_id)
 
 
 def _resolve_elicitation_store(
@@ -822,6 +944,7 @@ async def supervise_cursor_transcript_elicitations(
     poll_interval_s: float = _POLL_INTERVAL_S,
     settle_s: float = _ELICITATION_SETTLE_S,
     auto_accept_approvals: bool = False,
+    turn_failure: CursorTurnFailure | None = None,
 ) -> None:
     """Mirror cursor's gated tool calls to web elicitations via the chat store.
 
@@ -842,9 +965,9 @@ async def supervise_cursor_transcript_elicitations(
     ``--force`` / ``-f``), tool-approval gates are accepted in-pane without a
     web card. Cursor's Run Everything mode still sometimes leaves a pending
     marker long enough to otherwise stall a piloted parent on mirrored
-    ApprovalCards. ``AskQuestion`` still surfaces — that is intentional human
-    input, not a tool gate. A visible gate that survives bounded retries falls
-    back to the usual card; stale markers without a prompt remain silent.
+    ApprovalCards. ``AskQuestion`` still surfaces because it requires human
+    input. A tool gate that cannot be accepted after bounded retries fails the
+    turn through the native status path instead of parking an unattended card.
 
     Store discovery reuses the forwarder's logic, so this binds to the same chat
     the forwarder mirrors. Detection is keyed by ``toolCallId`` (stable across
@@ -870,6 +993,9 @@ async def supervise_cursor_transcript_elicitations(
     first_seen: dict[str, float] = {}
     auto_accept_attempts: dict[str, _YoloAcceptRetry] = {}
     next_auto_accept_at = 0.0
+    failure = turn_failure if turn_failure is not None else CursorTurnFailure()
+    failed_call_ids: set[str] = set()
+    seen_ids: set[str] = set()
     store_path: Path | None = None
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
@@ -887,6 +1013,9 @@ async def supervise_cursor_transcript_elicitations(
                     if store_path is not None
                     else []
                 )
+                pending_calls = [
+                    call for call in pending_calls if call.tool_call_id not in failed_call_ids
+                ]
                 seen_ids = {call.tool_call_id for call in pending_calls}
                 now = loop.time()
                 # Surfaced calls whose pending entry vanished → answered in the
@@ -919,7 +1048,13 @@ async def supervise_cursor_transcript_elicitations(
                     isinstance(task := entry["task"], asyncio.Task) and not task.done()
                     for entry in active.values()
                 )
-                auto_accept_available = not approval_waiting and now >= next_auto_accept_at
+                question_waiting = any(_is_question_call(call) for call in pending_calls)
+                if approval_waiting or question_waiting:
+                    auto_accept_attempts.clear()
+                    next_auto_accept_at = 0.0
+                auto_accept_available = (
+                    not (approval_waiting or question_waiting) and now >= next_auto_accept_at
+                )
                 # Surface calls that have now stayed pending past the settle window.
                 for call in pending_calls:
                     if call.tool_call_id in active:
@@ -955,8 +1090,7 @@ async def supervise_cursor_transcript_elicitations(
                             next_auto_accept_at = (
                                 loop.time() + auto_accept_attempts[call.tool_call_id].retry_s
                             )
-                        if outcome is not _YoloAccept.SURFACE_CARD:
-                            continue
+                        continue
                     elicitation_id = cursor_tool_call_elicitation_id(session_id, call.tool_call_id)
                     _logger.debug(
                         "cursor elicitation: surfacing %s; session=%s tool_call_id=%s",
@@ -988,7 +1122,34 @@ async def supervise_cursor_transcript_elicitations(
                     auto_accept_available = False
                     first_seen.pop(call.tool_call_id, None)
             except asyncio.CancelledError:
+                tasks = [
+                    task
+                    for entry in active.values()
+                    if isinstance(task := entry["task"], asyncio.Task)
+                ]
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
                 raise
+            except _YoloAutoAcceptError as exc:
+                failed_call_ids.update(seen_ids)
+                auto_accept_attempts.clear()
+                first_seen.clear()
+                next_auto_accept_at = 0.0
+                _logger.error(
+                    "cursor elicitation: %s; failing YOLO turn; session=%s",
+                    exc,
+                    session_id,
+                )
+                await _fail_yolo_turn(
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    store_path=store_path,
+                    active=active,
+                    failure=failure,
+                    output=f"Error: {exc}",
+                )
             except Exception:
                 _logger.exception(
                     "cursor transcript elicitation poll failed; session=%s bridge_dir=%s",

@@ -118,7 +118,11 @@ class TestRecordUsageCli:
         assert capsys.readouterr().out == "{}"
         assert not (tmp_path / usage.USAGE_FILE).exists()
 
-    def test_module_main_entrypoint(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("command", "payload"),
+        [("record-usage", _TURN1), ("record-turn-start", _TURN1), ("record-turn-start", {})],
+    )
+    def test_module_main_entrypoint(self, tmp_path: Path, command: str, payload: dict) -> None:
         # End-to-end through the real CLI the hooks.json command invokes. ``-I``
         # is dropped here (the worktree isn't pip-installed); PYTHONPATH makes it
         # importable, mirroring the installed-package resolution in production.
@@ -128,18 +132,61 @@ class TestRecordUsageCli:
                 sys.executable,
                 "-m",
                 "omnigent.harnesses.cursor_native.usage",
-                "record-usage",
+                command,
                 "--bridge-dir",
                 str(tmp_path),
             ],
-            input=json.dumps(_TURN1),
+            input=json.dumps(payload),
             capture_output=True,
             text=True,
             env=env,
         )
         assert proc.returncode == 0, proc.stderr
-        assert proc.stdout == "{}"
-        assert (tmp_path / usage.USAGE_FILE).read_text().strip()
+        if command == "record-usage":
+            assert proc.stdout == "{}"
+            assert (tmp_path / usage.USAGE_FILE).read_text().strip()
+        else:
+            from omnigent.harnesses.cursor_native import status
+
+            assert json.loads(proc.stdout) == {"continue": True}
+            assert status.read_current_generation(tmp_path) == payload.get("generation_id")
+            if payload:
+                assert (tmp_path / status._TURN_START_FILE).read_text() == payload["generation_id"]
+
+    @pytest.mark.parametrize("failure_kind", ["none", "missing-id", "write", "malformed", "type"])
+    def test_turn_start_never_blocks_prompt_submission(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+        failure_kind: str,
+    ) -> None:
+        import io
+
+        from omnigent.harnesses.cursor_native import status
+
+        status.record_turn_start(tmp_path, {"generation_id": "previous-turn"})
+        payload = {"generation_id": "turn-1", "prompt": "prompt content", "attachments": []}
+        if failure_kind == "missing-id":
+            payload.pop("generation_id")
+        if failure_kind in ("write", "type"):
+
+            def fail_write(*args):
+                raise OSError if failure_kind == "write" else TypeError
+
+            monkeypatch.setattr(status, "record_turn_start", fail_write)
+        raw = "not json" if failure_kind == "malformed" else json.dumps(payload)
+        monkeypatch.setattr("sys.stdin", io.StringIO(raw))
+        assert usage._cli_record_turn_start(tmp_path) == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out) == {"continue": True}
+        assert bool(captured.err) is (failure_kind != "none")
+        assert "prompt content" not in captured.err
+        assert status.read_current_generation(tmp_path) == (
+            "turn-1" if failure_kind == "none" else None
+        )
+        if failure_kind == "none":
+            assert (tmp_path / status._TURN_START_FILE).read_text() == "turn-1"
 
 
 class TestUsageAccumulator:
