@@ -204,6 +204,28 @@ describe("useRunnerHealth", () => {
     expect(heard).toHaveBeenCalledOnce();
   });
 
+  it("still reports a poll to later listeners when an earlier one throws", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failure = new Error("listener broke");
+    const unsubscribeThrowing = onRunnerHealthPolled(() => {
+      throw failure;
+    });
+    const heard = vi.fn();
+    const unsubscribeHeard = onRunnerHealthPolled(heard);
+    fetchMock.mockResolvedValue(
+      mockHealth({ conv_a: { runner_online: false, host_online: false } }),
+    );
+    const sessions = [input("conv_a")];
+    renderHook(() => useRunnerHealth(sessions));
+    await waitFor(() => expect(heard).toHaveBeenCalledOnce());
+    expect(warn).toHaveBeenCalledWith("[runner-health] poll listener failed", failure);
+
+    act(() => refreshRunnerHealth());
+    await waitFor(() => expect(heard).toHaveBeenCalledTimes(2));
+    unsubscribeThrowing();
+    unsubscribeHeard();
+  });
+
   it("ignores a stale poll that finishes after a desktop-triggered refresh", async () => {
     let notify!: () => void;
     vi.spyOn(nativeBridge, "onHostStatusChanged").mockImplementation((callback) => {

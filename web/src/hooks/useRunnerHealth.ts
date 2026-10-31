@@ -62,6 +62,17 @@ export function onRunnerHealthPolled(
   };
 }
 
+/** A throwing listener mustn't hide the poll from the others or read as a failed poll. */
+function notifyPollListeners(liveness: Map<string, SessionLiveness>): void {
+  for (const listener of pollListeners) {
+    try {
+      listener(liveness);
+    } catch (err) {
+      console.warn("[runner-health] poll listener failed", err);
+    }
+  }
+}
+
 interface BatchHealthResponse {
   sessions?: Record<
     string,
@@ -142,7 +153,7 @@ export function useRunnerHealth(
             }
             setStatusMap(next);
             success = true;
-            for (const listener of pollListeners) listener(next);
+            notifyPollListeners(next);
           }
         }
       } catch {
