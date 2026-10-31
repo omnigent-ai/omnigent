@@ -416,12 +416,9 @@ def test_composer_interrupts_running_turn(
             assert metadata_route_intercepted, "session metadata response was not intercepted"
             expect(interrupt_button).to_be_visible(timeout=30_000)
             expect(interrupt_button).to_be_enabled()
-            expected_placeholder = (
-                "Send a message…"
-                if harness == "hermes"
-                else "Send a follow-up (queued) — Esc to stop"
+            expect(composer).to_have_attribute(
+                "placeholder", "Send a follow-up (queued) — Esc to stop"
             )
-            expect(composer).to_have_attribute("placeholder", expected_placeholder)
             composer.fill("Keep this unfinished follow-up")
             composer.press("Escape")
             expect(composer).to_have_value("Keep this unfinished follow-up")
