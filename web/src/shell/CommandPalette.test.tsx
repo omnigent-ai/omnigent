@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
+import type * as ConversationsModule from "@/hooks/useConversations";
 
 import { CommandPalette } from "./CommandPalette";
 
@@ -15,10 +16,14 @@ const serverInfo = vi.fn();
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => serverInfo(),
 }));
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof ConversationsModule>()),
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
 }));
+
+const TIMED_OUT = "Search timed out. Try a more specific search.";
+const LOAD_ERROR = "Couldn't load sessions.";
 
 function conv(
   id: string,
@@ -182,6 +187,83 @@ describe("CommandPalette — sessions", () => {
       expect(refetch).toHaveBeenCalledOnce();
     },
   );
+
+  it("shows timeout guidance while keeping other search failures generic", () => {
+    vi.useFakeTimers();
+    try {
+      const refetch = vi.fn();
+      // Content search is the slow substring scan, so it is the group that times out.
+      useSessionSearch.mockImplementation((searchQuery: string, scope: string) =>
+        searchQuery && scope === "content"
+          ? {
+              isError: true,
+              isFetching: false,
+              error: new DOMException("search deadline", "TimeoutError"),
+              refetch,
+            }
+          : { isFetching: false },
+      );
+      renderPalette();
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "rare term" },
+      });
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(screen.getByRole("status").textContent).toContain(TIMED_OUT);
+      expect(screen.queryByText(LOAD_ERROR)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(refetch).toHaveBeenCalledOnce();
+      useSessionSearch.mockReturnValue({
+        isError: true,
+        isFetching: false,
+        error: new Error("500 Internal Server Error"),
+        refetch,
+      });
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "another term" },
+      });
+      act(() => vi.advanceTimersByTime(300));
+      expect(screen.getByRole("status").textContent).toContain(LOAD_ERROR);
+      expect(screen.queryByText(TIMED_OUT)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    new Error("500 Internal Server Error"),
+    new DOMException("search deadline", "TimeoutError"),
+  ])("hides a superseded search error during debounce (%s)", (error) => {
+    vi.useFakeTimers();
+    try {
+      useSessionSearch.mockImplementation((searchQuery: string) =>
+        searchQuery === "slow"
+          ? {
+              isError: true,
+              isFetching: false,
+              error,
+            }
+          : { isFetching: Boolean(searchQuery) },
+      );
+      renderPalette();
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "slow" },
+      });
+      act(() => vi.advanceTimersByTime(300));
+      expect(screen.getByRole("status")).toBeTruthy();
+
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "faster" },
+      });
+      expect(screen.queryByText(LOAD_ERROR)).toBeNull();
+      expect(screen.queryByText(TIMED_OUT)).toBeNull();
+      act(() => vi.advanceTimersByTime(300));
+      expect(screen.queryByText(LOAD_ERROR)).toBeNull();
+      expect(screen.queryByText(TIMED_OUT)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("shows only one loading message during the initial session fetch", () => {
     setSessions([], true);
