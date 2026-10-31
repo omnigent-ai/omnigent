@@ -1444,7 +1444,7 @@ def create_hosts_router(
                     if profile_binding is not None and profile_binding.runner_id is not None
                     else ()
                 ),
-                project_setup=project_setup.wire,
+                project_setup=project_setup.setup,
             )
         )
         try:
@@ -1507,16 +1507,9 @@ def create_hosts_router(
         # path); the middleware promotes a bag session_id to the audit row's
         # session_id column. Host is an attribute.
         add_audit_attrs(session_id=body.session_id, host_id=host_id, runner_id=runner_id)
-        from omnigent.server.routes._sessions.helpers import note_project_setup_on_launch
+        from omnigent.server.routes._sessions.helpers import note_launch_project_setup
 
-        await note_project_setup_on_launch(
-            target.conv,
-            conversation_store,
-            unsupported=project_setup.unsupported,
-            warnings=result.get("project_setup_warnings", ()),
-            running=result.get("project_setup_running", False),
-            agent_waits=project_setup.agent_waits,
-        )
+        await note_launch_project_setup(target.conv, conversation_store, project_setup, result)
         return {
             "runner_id": runner_id,
             "status": "launching",

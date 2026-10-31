@@ -2,11 +2,14 @@
 
 A project's ``config`` may carry two command lists that prepare its sessions:
 
-- ``env_commands`` run in the user's shell on every runner launch; the
-  environment changes they make (``conda activate``, ``nvm use``) are applied
-  to the agent.
-- ``setup_commands`` run once per git worktree (copying ``.env``, installs).
-  The agent's turns wait for them unless ``parallel_setup`` is set.
+- ``env_commands`` are a shell script sourced in the user's login shell on
+  every runner launch; the environment changes it makes (``conda activate``,
+  ``nvm use``) are applied to the agent.
+- ``setup_commands`` are a shell script run once per git worktree (copying
+  ``.env``, installs), stopping at the first failing command. The agent
+  waits for it unless ``parallel_setup`` is set.
+
+Each list entry is one line of its script.
 
 The server validates them when a project is saved and sends them to the host
 with each runner launch; the host executes them (see
@@ -27,13 +30,12 @@ PARALLEL_SETUP_KEY = "parallel_setup"
 #: Set on a runner whose environment carries a project's ``env_commands``
 #: changes, so harnesses keep tool shells from rebuilding ``PATH``.
 PROJECT_ENV_APPLIED_ENV_VAR = "OMNIGENT_PROJECT_ENV_APPLIED"
-#: JSON ``{"set": {...}, "unset": [...]}`` of project env changes the runner
-#: applies to itself only after starting: Python-runtime variables such as
-#: ``PYTHONPATH`` would otherwise change how the runner's own interpreter starts.
-PROJECT_DEFERRED_ENV_ENV_VAR = "OMNIGENT_PROJECT_DEFERRED_ENV"
+#: Path of the worktree setup marker a runner waits for before its first
+#: turn and native agent start.
+PROJECT_SETUP_MARKER_ENV_VAR = "OMNIGENT_PROJECT_SETUP_MARKER"
 
 #: Upper bounds that keep a project config and its launch frame small.
-MAX_COMMANDS_PER_LIST = 20
+MAX_COMMANDS_PER_LIST = 200
 MAX_COMMAND_CHARS = 4096
 #: Total seconds a host spends on one worktree's ``setup_commands``.
 SETUP_BUDGET_S = 600.0
@@ -45,7 +47,7 @@ def _validated_commands(value: object, key: str) -> tuple[str, ...]:
 
     :param value: Raw value, e.g. ``["conda activate proj"]``. ``None`` means unset.
     :param key: Config key for error messages, e.g. ``"env_commands"``.
-    :returns: The commands with surrounding whitespace stripped.
+    :returns: The commands with trailing whitespace stripped.
     :raises ValueError: If the value is not a list of bounded, non-blank strings.
     """
     if value is None:
@@ -60,7 +62,8 @@ def _validated_commands(value: object, key: str) -> tuple[str, ...]:
             raise ValueError(f"{key} entries must be non-empty strings")
         if len(command) > MAX_COMMAND_CHARS:
             raise ValueError(f"{key} entries must be at most {MAX_COMMAND_CHARS} characters")
-        commands.append(command.strip())
+        # Indentation is kept: a heredoc body may depend on it.
+        commands.append(command.rstrip())
     return tuple(commands)
 
 

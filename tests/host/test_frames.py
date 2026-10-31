@@ -84,6 +84,7 @@ from omnigent.host.frames import (
     encode_import_local_session_frames,
     workspace_missing_message,
 )
+from omnigent.project_setup import ProjectSetup
 
 
 def test_import_local_frames_round_trip() -> None:
@@ -968,12 +969,9 @@ def test_launch_runner_project_setup_round_trips_and_is_absent_for_older_peers()
         binding_token="tok",
         workspace="/w",
         session_id="conv_p",
-        project_setup={
-            "env_commands": ["conda activate proj"],
-            "setup_commands": ["npm ci"],
-            "parallel_setup": True,
-        },
-        force_project_setup=True,
+        project_setup=ProjectSetup(
+            env_commands=("conda activate proj",), setup_commands=("npm ci",), parallel_setup=True
+        ),
     )
     assert decode_host_frame(encode_host_frame(frame)) == frame
     legacy = HostLaunchRunnerFrame(request_id="req_l", binding_token="tok", workspace="/w")
@@ -996,28 +994,21 @@ def test_launch_runner_drops_malformed_project_setup_without_failing_the_launch(
     assert decoded.project_setup_invalid is True
 
 
-def test_launch_result_and_setup_finished_report_round_trip() -> None:
-    """Project setup outcomes survive the trip back to the server."""
-    result = HostLaunchRunnerResultFrame(
-        request_id="req_r",
-        status="launched",
-        runner_id="runner_1",
-        project_setup_warnings=("conda env missing",),
-        project_setup_running=True,
-    )
-    assert decode_host_frame(encode_host_frame(result)) == result
-    report = HostProjectSetupFinishedFrame(
-        session_id="conv_1", warning="npm ci failed", log_path="/logs/setup.log"
-    )
-    assert decode_host_frame(encode_host_frame(report)) == report
+def test_project_setup_frames_round_trip() -> None:
+    """Launch outcomes, re-run requests and log reads survive the wire."""
     for frame in (
+        HostLaunchRunnerResultFrame(
+            request_id="req_r",
+            status="launched",
+            runner_id="runner_1",
+            project_setup_warnings=("conda env missing",),
+            project_setup_running=True,
+        ),
+        HostProjectSetupFinishedFrame(session_id="conv_1", warning="failed", log_path="/l.log"),
         HostRerunProjectSetupFrame(
-            session_id="conv_1",
-            workspace="/w",
-            project_setup={"env_commands": [], "setup_commands": ["x"], "parallel_setup": False},
+            session_id="conv_1", workspace="/w", project_setup=ProjectSetup(setup_commands=("x",))
         ),
         HostReadProjectSetupLogFrame(request_id="req_log", workspace="/w"),
-        HostReadProjectSetupLogResultFrame(request_id="req_log", content="log text"),
         HostReadProjectSetupLogResultFrame(request_id="req_log", content=None),
     ):
         assert decode_host_frame(encode_host_frame(frame)) == frame

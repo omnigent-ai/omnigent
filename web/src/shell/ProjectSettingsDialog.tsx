@@ -82,18 +82,18 @@ function trimOrUndef(value: string): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
-/** One command per line; blank lines are dropped. */
+/**
+ * Script lines as stored entries; the backend re-joins them into one script.
+ * Blank lines are dropped, but indentation inside a line is kept (heredocs).
+ */
 function commandsFromText(text: string): string[] {
-  return text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line !== "");
+  return text.split("\n").filter((line) => line.trim() !== "");
 }
 
 /** The stored command list as editable text, ignoring a malformed value. */
 function commandsToText(commands: unknown): string {
   return Array.isArray(commands)
-    ? commands.filter((c): c is string => typeof c === "string").join("\n")
+    ? commands.filter((command): command is string => typeof command === "string").join("\n")
     : "";
 }
 
@@ -210,19 +210,21 @@ export function ProjectSettingsDialog({
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed) return;
-    const c: ProjectConfig = projectConfigWithLaunch(stored ?? {}, launch);
-    setHostId(c.host_id ?? NONE);
-    setWorkspace(c.workspace ?? "");
-    setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
-    setBaseBranch(c.base_branch ?? "");
-    setAgentId(c.agent_id ?? null);
-    setModel(c.model ?? NONE);
+    const storedConfig: ProjectConfig = projectConfigWithLaunch(stored ?? {}, launch);
+    setHostId(storedConfig.host_id ?? NONE);
+    setWorkspace(storedConfig.workspace ?? "");
+    setUseWorktree(storedConfig.use_worktree ?? readAlwaysUseWorktree());
+    setBaseBranch(storedConfig.base_branch ?? "");
+    setAgentId(storedConfig.agent_id ?? null);
+    setModel(storedConfig.model ?? NONE);
     // The server stores config untyped, so ignore a malformed effort.
-    setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
+    setEffort(
+      typeof storedConfig.effort === "string" && storedConfig.effort ? storedConfig.effort : NONE,
+    );
     setWorkspaceOpen(false);
-    setEnvCommands(commandsToText(c.env_commands));
-    setSetupCommands(commandsToText(c.setup_commands));
-    setParallelSetup(c.parallel_setup === true);
+    setEnvCommands(commandsToText(storedConfig.env_commands));
+    setSetupCommands(commandsToText(storedConfig.setup_commands));
+    setParallelSetup(storedConfig.parallel_setup === true);
   }, [open, stored, loadFailed, launch]);
 
   const onSubmit = (e: FormEvent) => {
@@ -696,7 +698,7 @@ export function ProjectSettingsDialog({
 
           <Field
             label="Environment commands"
-            hint="Run in your shell before every session starts; their environment reaches the agent (e.g. conda activate). One per line."
+            hint="Shell script run before every session starts; the environment it sets reaches the agent (e.g. conda activate)."
             htmlFor="project-settings-env-commands"
           >
             <Textarea
@@ -712,7 +714,7 @@ export function ProjectSettingsDialog({
 
           <Field
             label="Worktree setup"
-            hint="Run once per new git worktree (e.g. installs). $OMNIGENT_ROOT_PATH is the main checkout. One per line."
+            hint="Shell script run once per new git worktree (e.g. installs); stops at the first failing command. $OMNIGENT_ROOT_PATH is the main checkout."
             htmlFor="project-settings-setup-commands"
           >
             <Textarea

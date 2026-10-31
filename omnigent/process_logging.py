@@ -302,6 +302,25 @@ def process_log_dir(destination: str, *, root: str | Path | None = None) -> Path
     return base / destination
 
 
+def read_log_tail(path: Path, max_bytes: int) -> str:
+    """
+    Read the last *max_bytes* of a log file for diagnostics.
+
+    :param path: Log file, e.g. ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
+    :param max_bytes: Most bytes to read from the end, e.g. ``4096``.
+    :returns: The decoded tail (lossy UTF-8), or ``""`` when the file is
+        missing or unreadable: diagnostics must not fail their caller.
+    """
+    try:
+        with path.open("rb") as log_file:
+            log_file.seek(0, os.SEEK_END)
+            size = log_file.tell()
+            log_file.seek(max(0, size - max_bytes))
+            return log_file.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def display_log_path(path: Path) -> str:
     """Format a log path for display, collapsing the home prefix to ``~``.
 

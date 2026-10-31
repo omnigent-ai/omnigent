@@ -2,9 +2,10 @@
 
 ``env_commands`` call a function from the user's ``.bashrc`` (as ``conda
 activate`` relies on ``conda init``); the agent's shell tool must see the
-environment it sets. ``setup_commands`` run once per worktree in the
-background and are not re-run by a relaunch. A broken env command is reported
-in the transcript without blocking the turn.
+environment it sets. The first turn waits for ``setup_commands``, which run
+once per worktree, are not re-run by a relaunch, can be re-run on request
+while the runner keeps going, and whose log is readable through the session.
+A broken env command is reported without blocking the turn.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ import json
 import os
 import shutil
 import signal
-import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
+from tests._helpers.git_repo import repo_with_worktree
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.polling import poll_until
 from tests._helpers.session import bind_session_runner
@@ -46,23 +47,6 @@ _PROBE = (
     'echo "FAKEENV=$FAKEENV_NAME PATH=$PATH SETUP=$(cat setup-done 2>/dev/null)'
     ' APPLIED=$OMNIGENT_PROJECT_ENV_APPLIED"'
 )
-
-
-def _repo_with_worktree(root: Path) -> tuple[Path, Path]:
-    """Create a repo with one linked worktree.
-
-    :returns: ``(main checkout, worktree)``.
-    """
-    repo, worktree = root / "repo", root / "repo-worktrees" / "feature"
-    repo.mkdir(parents=True)
-    identity = ["-c", "user.email=e2e@test", "-c", "user.name=e2e"]
-    for args in (
-        ["init", "-q", "-b", "main"],
-        [*identity, "commit", "-q", "--allow-empty", "-m", "init"],
-        ["worktree", "add", "-q", "-b", "feature", str(worktree)],
-    ):
-        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
-    return repo, worktree
 
 
 def _register_shell_agent(client: httpx.Client, mock_llm_server_url: str) -> tuple[str, str]:
@@ -129,20 +113,25 @@ def _kill_session_runner(client: httpx.Client, host: Host, session_id: str) -> N
     poll_until(lambda: not _runner_online(client, runner_id), timeout_s=15)
 
 
-def _notice(client: httpx.Client, session_id: str, code: str) -> dict[str, Any] | None:
+def _notices(client: httpx.Client, session_id: str, code: str) -> list[dict[str, Any]]:
     items = client.get(f"/v1/sessions/{session_id}/items").json()["data"]
-    return next((i for i in items if i.get("type") == "error" and i["code"] == code), None)
+    return [item for item in items if item.get("type") == "error" and item["code"] == code]
+
+
+def _notice(client: httpx.Client, session_id: str, code: str) -> dict[str, Any] | None:
+    return next(iter(_notices(client, session_id, code)), None)
 
 
 def test_project_setup_applies_to_a_real_host_session(
     live_server: str, http_client: httpx.Client, tmp_path: Path, mock_llm_server_url: str
 ) -> None:
-    repo, worktree = _repo_with_worktree(tmp_path / "src")
+    _, worktree = repo_with_worktree(tmp_path / "src")
     agent_id, model = _register_shell_agent(http_client, mock_llm_server_url)
     setup_commands = [
-        'echo "$OMNIGENT_ROOT_PATH" > setup-root.txt',
+        "echo installing-deps",
         "echo ran >> setup-runs.txt",
-        "sleep 3 && echo yes > setup-done",
+        "sleep 1",
+        "echo yes > setup-done",
     ]
     project = http_client.post(
         "/v1/projects",
@@ -194,7 +183,8 @@ def test_project_setup_applies_to_a_real_host_session(
             lambda: _notice(http_client, session_id, "project_setup_finished"), timeout_s=60
         )
         assert _notice(http_client, session_id, "project_setup_running") is not None
-        assert (worktree / "setup-root.txt").read_text().strip() == str(repo)
+        log = http_client.get(f"/v1/sessions/{session_id}/project-setup/log")
+        assert log.status_code == 200 and "installing-deps" in log.json()["content"], log.text
 
         # Relaunch: the env still applies and the worktree setup does not re-run.
         _kill_session_runner(http_client, host, session_id)
@@ -214,11 +204,8 @@ def test_project_setup_applies_to_a_real_host_session(
         ).raise_for_status()
         _kill_session_runner(http_client, host, session_id)
         stdout = _probe_env(http_client, mock_llm_server_url, model, session_id)
-        assert "FAKEENV= " in stdout, stdout
-        failed = _notice(http_client, session_id, "project_setup_failed")
-        assert failed is not None and failed["level"] == "error", failed
-        # The notice names the exit code and host log, never the command output.
-        assert "exit 127" in failed["message"] and "log:" in failed["message"], failed
+        assert "FAKEENV=proj-e2e" not in stdout, stdout
+        assert _notice(http_client, session_id, "project_env_failed") is not None
 
         # "Re-run setup" runs it again on the host while the same runner keeps going.
         runner_before = http_client.get(f"/v1/sessions/{session_id}").json()["runner_id"]
@@ -226,6 +213,10 @@ def test_project_setup_applies_to_a_real_host_session(
         assert rerun.status_code == 202, rerun.text
         poll_until(
             lambda: (worktree / "setup-runs.txt").read_text().split() == ["ran", "ran"],
+            timeout_s=60,
+        )
+        poll_until(
+            lambda: len(_notices(http_client, session_id, "project_setup_finished")) == 2,
             timeout_s=60,
         )
         assert http_client.get(f"/v1/sessions/{session_id}").json()["runner_id"] == runner_before

@@ -11,6 +11,8 @@ import {
   derivePermissionLevel,
   getSessionOwner,
   grantPermission,
+  isEditorLevel,
+  isOwnerLevel,
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
@@ -77,24 +79,36 @@ export function useRevokePermission(sessionId: string) {
 }
 
 /**
- * Returns whether the current user has edit access (level >= 2) to a session.
- * `null` permission level (single-user mode) is treated as unrestricted.
+ * The current user's effective permission level on a session, or `null` when
+ * unrestricted (single-user mode) or still loading.
  */
-export function useCanEdit(conversationId: string): boolean {
+function useSessionPermissionLevel(conversationId: string): number | null {
   const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);
     const activeConv = conversations?.find((c) => c.id === conversationId) ?? null;
-    const permissionLevel = derivePermissionLevel(
+    return derivePermissionLevel(
       activeSession,
       sessionLoading,
       activeConv,
       conversationId,
       conversationsData !== undefined,
     );
-    return permissionLevel == null || permissionLevel >= 2;
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
+}
+
+/**
+ * Returns whether the current user has edit access (level >= 2) to a session.
+ * `null` permission level (single-user mode) is treated as unrestricted.
+ */
+export function useCanEdit(conversationId: string): boolean {
+  return isEditorLevel(useSessionPermissionLevel(conversationId));
+}
+
+/** Returns whether the current user owns a session; `null` level is treated as owner. */
+export function useIsSessionOwner(conversationId: string): boolean {
+  return isOwnerLevel(useSessionPermissionLevel(conversationId));
 }
 
 export type { Permission };

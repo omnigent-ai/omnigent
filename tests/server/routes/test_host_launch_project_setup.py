@@ -45,7 +45,7 @@ async def test_single_user_projects_resolve_under_either_local_owner(
 
     setup = await resolve_launch_project_setup(_SESSION, _host(RESERVED_USER_LOCAL))
 
-    assert setup.wire is not None and setup.wire["setup_commands"] == ["npm ci"]
+    assert setup.setup is not None and setup.setup.setup_commands == ("npm ci",)
 
 
 @pytest.mark.parametrize(
@@ -64,5 +64,5 @@ async def test_hosts_that_must_not_run_the_commands_get_none(
 
     setup = await resolve_launch_project_setup(_SESSION, host)
 
-    assert setup.wire is None
+    assert setup.setup is None
     assert setup.unsupported is unsupported

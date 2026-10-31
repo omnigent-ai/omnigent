@@ -194,11 +194,11 @@ def create_host_tunnel_router(
         :func:`log_runner_exited`) so rows carry the bound session.
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
+    :param on_host_update: Optional async callback fired when a connected
+        host reports changed harness readiness. Receives ``host_id`` and owner.
     :param on_project_setup_finished: Optional async callback fired when a
         host reports a session's background project setup finished. Receives
         the ``host_id`` and the report.
-    :param on_host_update: Optional async callback fired when a connected
-        host reports changed harness readiness. Receives ``host_id`` and owner.
     :param local_single_user: When ``True``, allow a host to re-own a
         ``host_id`` already registered under a different owner — needed
         only for the single-user loopback local server, where the owner

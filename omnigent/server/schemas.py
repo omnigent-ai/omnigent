@@ -5422,6 +5422,27 @@ class SessionProjectSummary(BaseModel):
     icon: str | None = None
 
 
+class ProjectSetupRerunResponse(BaseModel):
+    """
+    Response for ``POST /v1/sessions/{id}/project-setup/rerun``.
+
+    :param status: ``"started"``; the outcome arrives as session notices.
+    """
+
+    status: Literal["started"]
+
+
+class ProjectSetupLogResponse(BaseModel):
+    """
+    Response for ``GET /v1/sessions/{id}/project-setup/log``.
+
+    :param content: The end of the worktree's latest setup log, credentials
+        redacted, or ``None`` when it has none.
+    """
+
+    content: str | None
+
+
 class CreateProjectRequest(BaseModel):
     """
     Request body for ``POST /v1/projects``.

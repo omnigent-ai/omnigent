@@ -58,14 +58,14 @@ export interface ProjectConfig {
    */
   effort?: string;
   /**
-   * Commands run in the user's shell before every session in this project
-   * starts; the environment changes they make (e.g. `conda activate`) reach
+   * Script lines sourced as one shell script before every session in this
+   * project starts; the environment it sets (e.g. `conda activate`) reaches
    * the agent. Validated and executed by the server and host.
    */
   env_commands?: string[];
   /**
-   * Commands run once per new git worktree (e.g. installs). The agent's turns
-   * wait for them unless `parallel_setup` is set.
+   * Script lines run as one `set -e` shell script once per new git worktree
+   * (e.g. installs). The agent's turns wait for it unless `parallel_setup` is set.
    */
   setup_commands?: string[];
   /** Let the agent start while `setup_commands` still run. Unset = wait. */
@@ -185,28 +185,4 @@ export async function saveProjectOrder(ids: string[] | null): Promise<ProjectOrd
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as ProjectOrder;
-}
-
-/**
- * Run a session's worktree setup again (after a failed install). The agent keeps
- * running; the outcome arrives as the session's project-setup notices.
- */
-export async function rerunProjectSetup(sessionId: string): Promise<void> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/project-setup/rerun`,
-    { method: "POST" },
-  );
-  if (!res.ok) throw new Error(await readError(res));
-}
-
-/**
- * The end of a session worktree's latest project setup log (owner only), or
- * `null` when the worktree has none.
- */
-export async function getProjectSetupLog(sessionId: string): Promise<string | null> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/project-setup/log`,
-  );
-  if (!res.ok) throw new Error(await readError(res));
-  return ((await res.json()) as { content: string | null }).content;
 }

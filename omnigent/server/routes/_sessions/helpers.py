@@ -142,7 +142,7 @@ from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._host_launch import (
-    PROJECT_SETUP_UNSUPPORTED_NOTICE,
+    LaunchProjectSetup,
     resolve_launch_project_setup,
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
@@ -6248,8 +6248,11 @@ def _spawn_superseded_runner_stop(
 #: session workspace deleted and the host recreated it empty.
 _WORKSPACE_RECREATED_NOTICE_CODE = "workspace_recreated"
 
-#: Codes of the notices that report a project's setup commands.
-PROJECT_SETUP_NOTICE_CODE = "project_setup_failed"
+#: Codes of the notices that report a project's setup. The web UI offers its
+#: actions by code: re-run on a failed setup, the log on any setup notice.
+PROJECT_ENV_FAILED_NOTICE_CODE = "project_env_failed"
+PROJECT_SETUP_UNSUPPORTED_NOTICE_CODE = "project_setup_unsupported"
+PROJECT_SETUP_FAILED_NOTICE_CODE = "project_setup_failed"
 PROJECT_SETUP_RUNNING_NOTICE_CODE = "project_setup_running"
 PROJECT_SETUP_FINISHED_NOTICE_CODE = "project_setup_finished"
 
@@ -6326,56 +6329,81 @@ async def _note_workspace_recreated_on_host(
     )
 
 
-async def note_project_setup_on_launch(
+async def note_launch_project_setup(
     conv: Conversation,
     conversation_store: ConversationStore,
+    project_setup: LaunchProjectSetup,
+    launch_result: HostLaunchResult,
     *,
-    unsupported: bool,
-    warnings: Sequence[str],
-    running: bool = False,
-    agent_waits: bool = True,
+    notify_unsupported: bool = True,
 ) -> None:
     """
-    Tell the user how a launch applied the project's setup.
+    Tell the user how a successful launch applied the session's project setup.
 
     :param conv: The launched session.
     :param conversation_store: Store used for the durable append.
-    :param unsupported: The host is too old to run project setup.
-    :param warnings: Failures the host reported, e.g. a conda env that is missing.
-    :param running: Worktree setup commands started on the host.
-    :param agent_waits: The agent's turns wait for the setup to finish
-        (the project did not opt into ``parallel_setup``).
+    :param project_setup: What the launch sent.
+    :param launch_result: The host's launch result.
+    :param notify_unsupported: Say that the host is too old. Launches that start
+        a session do; relaunches don't repeat it.
     """
-    messages = [PROJECT_SETUP_UNSUPPORTED_NOTICE] if unsupported else []
+    if project_setup.unsupported and notify_unsupported:
+        await _append_launch_notice(
+            conv,
+            conversation_store,
+            code=PROJECT_SETUP_UNSUPPORTED_NOTICE_CODE,
+            message=(
+                "This session's project has setup commands, but its host is too old "
+                "to run them. Update Omnigent on the host to apply them."
+            ),
+            level="error",
+        )
+    warnings = launch_result.get("project_setup_warnings", ())
     env_failure = "\n".join(warnings)
     # A broken env command fails every relaunch; say so again only when it changes.
     if env_failure and _last_env_failure.get(conv.id) != env_failure:
         _last_env_failure[conv.id] = env_failure
-        messages.extend(f"Project env commands did not apply: {warning}" for warning in warnings)
+        for warning in warnings:
+            await _append_launch_notice(
+                conv,
+                conversation_store,
+                code=PROJECT_ENV_FAILED_NOTICE_CODE,
+                message=f"Project env commands did not apply: {warning}",
+                level="error",
+            )
     elif not env_failure:
         _last_env_failure.pop(conv.id, None)
-    for message in messages:
-        await _append_launch_notice(
+    if launch_result.get("project_setup_running", False):
+        await note_project_setup_running(
             conv,
             conversation_store,
-            code=PROJECT_SETUP_NOTICE_CODE,
-            message=message,
-            level="error",
-        )
-    if running:
-        await _append_launch_notice(
-            conv,
-            conversation_store,
-            code=PROJECT_SETUP_RUNNING_NOTICE_CODE,
             message=(
                 "Project setup commands are running for this worktree. The agent "
                 "will start when they finish."
-                if agent_waits
+                if project_setup.agent_waits
                 else "Project setup commands are running for this worktree. The agent "
                 "can start now; installs may still be in progress."
             ),
-            level="info",
         )
+
+
+async def note_project_setup_running(
+    conv: Conversation, conversation_store: ConversationStore, *, message: str
+) -> None:
+    """
+    Tell the user a worktree's setup commands started.
+
+    :param conv: The session the setup runs for.
+    :param conversation_store: Store used for the durable append.
+    :param message: User-facing text.
+    """
+    await _append_launch_notice(
+        conv,
+        conversation_store,
+        code=PROJECT_SETUP_RUNNING_NOTICE_CODE,
+        message=message,
+        level="info",
+    )
 
 
 async def note_project_setup_finished(
@@ -6406,7 +6434,7 @@ async def note_project_setup_finished(
     await _append_launch_notice(
         conv,
         conversation_store,
-        code=PROJECT_SETUP_NOTICE_CODE,
+        code=PROJECT_SETUP_FAILED_NOTICE_CODE,
         message=f"Project setup failed: {warning}{log_hint}",
         level="error",
     )
@@ -6564,7 +6592,7 @@ async def _launch_runner_on_host_locked(
                 # Only the binding we just replaced: an unbound session's old
                 # runner may now serve its /clear or /switch successor.
                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
-                project_setup=project_setup.wire,
+                project_setup=project_setup.setup,
             )
         )
         try:
@@ -6642,14 +6670,8 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             await _note_workspace_recreated_on_host(conv, conversation_store)
-        await note_project_setup_on_launch(
-            conv,
-            conversation_store,
-            # Said once, when the session starts; repeating it on every relaunch is noise.
-            unsupported=False,
-            warnings=result.get("project_setup_warnings", ()),
-            running=result.get("project_setup_running", False),
-            agent_waits=project_setup.agent_waits,
+        await note_launch_project_setup(
+            conv, conversation_store, project_setup, result, notify_unsupported=False
         )
         return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 

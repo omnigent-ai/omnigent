@@ -138,7 +138,7 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true });
   });
 
-  it("round-trips env and worktree setup commands, one per line", async () => {
+  it("round-trips env and worktree setup scripts, one entry per line", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
@@ -152,16 +152,16 @@ describe("ProjectSettingsDialog", () => {
     );
     expect(screen.getByTestId("project-settings-setup-commands")).toHaveValue("npm ci");
 
-    // Blank lines and surrounding spaces are not stored as commands.
+    // Blank lines are dropped; indentation inside the script (heredocs, if/fi) is kept.
     fireEvent.change(screen.getByTestId("project-settings-setup-commands"), {
-      target: { value: "  cp ../.env .env  \n\nnpm ci\n" },
+      target: { value: "if [ -f x ]; then\n\n  npm ci\nfi\n  \n" },
     });
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
         env_commands: ["conda activate proj"],
-        setup_commands: ["cp ../.env .env", "npm ci"],
+        setup_commands: ["if [ -f x ]; then", "  npm ci", "fi"],
       }),
     );
   });

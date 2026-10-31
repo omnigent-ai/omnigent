@@ -326,4 +326,3 @@ def test_project_env_keeps_codex_tool_shells_off_login_shells(
     )
 
     assert ("allow_login_shell=false" in argv) is project_env_applied
-    assert argv.index("app-server") > argv.index("a=1")

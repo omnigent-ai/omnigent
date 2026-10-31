@@ -2246,9 +2246,6 @@ def main() -> None:
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()
-    from omnigent.runner.project_setup_gate import apply_deferred_project_env
-
-    apply_deferred_project_env()
     _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())

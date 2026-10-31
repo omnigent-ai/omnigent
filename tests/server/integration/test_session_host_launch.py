@@ -58,6 +58,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
+from omnigent.project_setup import ProjectSetup
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
@@ -5046,7 +5047,8 @@ async def test_project_setup_reaches_the_host_and_its_outcome_reaches_the_sessio
     client: httpx.AsyncClient, app: FastAPI
 ) -> None:
     """A capable host gets the project's commands; its warnings and the
-    background setup's completion appear in the session as notices."""
+    background setup's completion appear in the session as notices, and a host
+    cannot post results into a session that is not bound to it."""
     comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
     config = {"env_commands": ["conda activate proj"], "setup_commands": ["npm ci"]}
 
@@ -5060,53 +5062,32 @@ async def test_project_setup_reaches_the_host_and_its_outcome_reaches_the_sessio
         },
     )
 
-    assert launch_frame.project_setup == {**config, "parallel_setup": False}
+    assert launch_frame.project_setup == ProjectSetup(
+        env_commands=("conda activate proj",), setup_commands=("npm ci",)
+    )
     notices = await _notices(client, session_id)
     assert [(n["code"], n["level"]) for n in notices] == [
-        ("project_setup_failed", "error"),
+        ("project_env_failed", "error"),
         ("project_setup_running", "info"),
     ]
-    assert "exit 1" in str(notices[0]["message"])
-    assert "will start when they finish" in str(notices[1]["message"])
 
-    await comm.send_input(
-        {
-            "type": "websocket.receive",
-            "text": encode_host_frame(
-                HostProjectSetupFinishedFrame(
-                    session_id=session_id, warning="setup command `npm ci` failed (exit 1)"
-                )
-            ),
-        }
-    )
-    deadline = time.monotonic() + budget(5.0)
-    while len(notices) < 3 and time.monotonic() < deadline:
-        await asyncio.sleep(0.02)
-        notices = await _notices(client, session_id)
-    assert notices[-1]["code"] == "project_setup_failed"
-    assert "npm ci" in str(notices[-1]["message"])
-
-
-async def test_setup_report_for_a_session_on_another_host_is_ignored(
-    client: httpx.AsyncClient, app: FastAPI
-) -> None:
-    """A host can only post setup results into sessions bound to itself."""
-    comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
     agent = await create_test_agent(client)
-    unbound = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
-    assert unbound.status_code == 201, unbound.text
+    other = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert other.status_code == 201, other.text
+    for report in (
+        HostProjectSetupFinishedFrame(session_id=other.json()["id"], warning="spoofed"),
+        HostProjectSetupFinishedFrame(session_id=session_id, warning="setup commands failed"),
+    ):
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(report)})
 
-    await comm.send_input(
-        {
-            "type": "websocket.receive",
-            "text": encode_host_frame(
-                HostProjectSetupFinishedFrame(session_id=unbound.json()["id"], warning="spoofed")
-            ),
-        }
-    )
-    await asyncio.sleep(0.2)
+    async def setup_failed_notice() -> bool:
+        return (await _notices(client, session_id))[-1]["code"] == "project_setup_failed"
 
-    assert await _notices(client, unbound.json()["id"]) == []
+    deadline = Deadline(5.0)
+    while not await setup_failed_notice():
+        await asyncio.sleep(deadline.next_wait(0.02))
+    # Frames are handled in order, so the spoofed report was already ignored.
+    assert await _notices(client, other.json()["id"]) == []
 
 
 async def test_older_host_gets_no_project_setup_and_the_user_is_told(
@@ -5121,8 +5102,9 @@ async def test_older_host_gets_no_project_setup_and_the_user_is_told(
 
     assert launch_frame.project_setup is None
     notices = await _notices(client, session_id)
-    assert [n["code"] for n in notices] == ["project_setup_failed"]
-    assert "too old" in str(notices[0]["message"])
+    assert [n["code"] for n in notices] == ["project_setup_unsupported"]
+    rerun = await client.post(f"/v1/sessions/{session_id}/project-setup/rerun")
+    assert rerun.status_code == 409, rerun.text
 
 
 async def test_project_without_setup_sends_nothing(
@@ -5134,15 +5116,6 @@ async def test_project_without_setup_sends_nothing(
 
     assert launch_frame.project_setup is None
     assert await _notices(client, session_id) == []
-
-
-async def test_malformed_project_setup_is_rejected_when_saved(client: httpx.AsyncClient) -> None:
-    response = await client.post(
-        "/v1/projects", json={"name": "bad", "config": {"setup_commands": "npm ci"}}
-    )
-
-    assert response.status_code in (400, 422), response.text
-    assert "setup_commands" in response.text
 
 
 async def test_rerun_project_setup_asks_the_host_without_relaunching_the_runner(
@@ -5163,7 +5136,7 @@ async def test_rerun_project_setup_asks_the_host_without_relaunching_the_runner(
             break
     assert frame.session_id == session_id
     assert frame.workspace == _WORKSPACE
-    assert frame.project_setup["setup_commands"] == ["npm ci"]
+    assert frame.project_setup.setup_commands == ("npm ci",)
     notices = await _notices(client, session_id)
     assert notices[-1]["code"] == "project_setup_running"
 
@@ -5176,7 +5149,7 @@ async def test_rerun_project_setup_is_refused_without_setup_commands(
 
     response = await client.post(f"/v1/sessions/{session_id}/project-setup/rerun")
 
-    assert response.status_code == 400, response.text
+    assert response.status_code == 409, response.text
     assert "no setup commands" in response.text
 
 
@@ -5210,3 +5183,17 @@ async def test_project_setup_log_is_read_from_the_sessions_host(
     assert response.json() == {"content": "npm ERR! boom"}
     # The host picks the log from its own records; the server only names the workspace.
     assert frame.workspace == _WORKSPACE
+
+
+async def test_project_setup_log_times_out_when_the_host_is_silent(
+    client: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_core
+
+    comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
+    session_id, _ = await _create_project_session(client, comm, {"setup_commands": ["npm ci"]})
+    monkeypatch.setattr(routes_core, "_PROJECT_SETUP_LOG_TIMEOUT_S", 0.2)
+
+    response = await client.get(f"/v1/sessions/{session_id}/project-setup/log")
+
+    assert response.status_code == 503, response.text

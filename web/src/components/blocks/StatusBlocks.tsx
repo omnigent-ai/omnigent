@@ -14,11 +14,11 @@ import {
   ChevronRightIcon,
   CopyIcon,
   ExternalLinkIcon,
+  FileTextIcon,
   FolderOpenIcon,
   Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
-  FileTextIcon,
   ShieldXIcon,
   ShrinkIcon,
   SplitIcon,
@@ -26,21 +26,21 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { getProjectSetupLog, rerunProjectSetup } from "@/lib/projectsApi";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { ReactNode } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
+import { useIsSessionOwner } from "@/hooks/usePermissions";
 import { copyText } from "@/lib/clipboard";
-import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { getProjectSetupLog, getSessionSignInLink, rerunProjectSetup } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
@@ -291,33 +291,62 @@ function ErrorForkAction({
   );
 }
 
-/** Notices about a worktree's setup, which offer its log. */
-const PROJECT_SETUP_LOG_CODES = new Set([
-  "project_setup_failed",
-  "project_setup_running",
-  "project_setup_finished",
+/** Project setup notice codes; env and unsupported-host notices offer no actions. */
+export const PROJECT_SETUP_NOTICE_CODES = {
+  envFailed: "project_env_failed",
+  unsupported: "project_setup_unsupported",
+  failed: "project_setup_failed",
+  running: "project_setup_running",
+  finished: "project_setup_finished",
+} as const;
+
+/** Worktree setup notices that offer the setup log. */
+const PROJECT_SETUP_LOG_CODES: ReadonlySet<string> = new Set([
+  PROJECT_SETUP_NOTICE_CODES.failed,
+  PROJECT_SETUP_NOTICE_CODES.running,
+  PROJECT_SETUP_NOTICE_CODES.finished,
 ]);
 
-/** Opens the end of the session worktree's project setup log, read from its host. */
-function ProjectSetupLogAction({ className }: { className?: string }) {
+function errorText(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason);
+}
+
+/** Owner-only actions on a worktree setup notice: re-run (on failure) and view its log. */
+function ProjectSetupActions({ code, className }: { code: string; className?: string }) {
   const conversationId = useScopedConversationId();
+  const isOwner = useIsSessionOwner(conversationId ?? "");
+  if (!conversationId || !isOwner) return null;
+  return (
+    <div
+      className={cn("flex flex-wrap items-start gap-2", className)}
+      onClick={(event) => event.stopPropagation()}
+    >
+      {code === PROJECT_SETUP_NOTICE_CODES.failed ? (
+        <RerunProjectSetupAction conversationId={conversationId} />
+      ) : null}
+      <ProjectSetupLogAction conversationId={conversationId} />
+    </div>
+  );
+}
+
+/** Opens the end of the session worktree's project setup log, read from its host. */
+function ProjectSetupLogAction({ conversationId }: { conversationId: string }) {
   const [open, setOpen] = useState(false);
   const [log, setLog] = useState<{ content: string | null } | { error: string } | null>(null);
-  if (!conversationId) return null;
   return (
-    <div className={className} onClick={(event) => event.stopPropagation()}>
+    <>
       <Button
         type="button"
         variant="outline"
         size="sm"
         data-testid="error-project-setup-log"
+        componentId="diagnostics.status.project_setup_log"
         onClick={() => {
           setOpen(true);
           setLog(null);
           getProjectSetupLog(conversationId).then(
             (content) => setLog({ content }),
-            (reason: unknown) =>
-              setLog({ error: reason instanceof Error ? reason.message : String(reason) }),
+            (reason: unknown) => setLog({ error: errorText(reason) }),
           );
         }}
       >
@@ -329,35 +358,46 @@ function ProjectSetupLogAction({ className }: { className?: string }) {
           <DialogHeader>
             <DialogTitle>Project setup log</DialogTitle>
           </DialogHeader>
-          <pre
-            data-testid="project-setup-log-content"
-            className="max-h-[60vh] overflow-auto rounded-md bg-muted p-3 font-mono text-sm whitespace-pre-wrap"
-          >
-            {log === null
-              ? "Loading…"
-              : "error" in log
-                ? log.error
-                : (log.content ?? "This worktree has no setup log yet.")}
-          </pre>
+          {log === null ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : "error" in log ? (
+            <p
+              role="alert"
+              data-testid="project-setup-log-error"
+              className="text-sm text-destructive"
+            >
+              {log.error}
+            </p>
+          ) : log.content === null ? (
+            <p className="text-sm text-muted-foreground">This worktree has no setup log yet.</p>
+          ) : (
+            <div className="max-h-[60vh] overflow-auto">
+              <CodeBlock
+                code={log.content}
+                language="ansi"
+                wrap
+                data-testid="project-setup-log-content"
+              />
+            </div>
+          )}
         </DialogContent>
       </Dialog>
-    </div>
+    </>
   );
 }
 
 /** A failed worktree setup's "Re-run setup" action; the agent keeps running. */
-function RerunProjectSetupAction({ className }: { className?: string }) {
-  const conversationId = useScopedConversationId();
+function RerunProjectSetupAction({ conversationId }: { conversationId: string }) {
   const [state, setState] = useState<"idle" | "pending" | "started">("idle");
   const [error, setError] = useState<string | null>(null);
-  if (!conversationId) return null;
   return (
-    <div className={className} onClick={(event) => event.stopPropagation()}>
+    <div>
       <Button
         type="button"
         variant="outline"
         size="sm"
         data-testid="error-rerun-project-setup"
+        componentId="diagnostics.status.project_setup_rerun"
         disabled={state !== "idle"}
         onClick={() => {
           setState("pending");
@@ -366,7 +406,7 @@ function RerunProjectSetupAction({ className }: { className?: string }) {
             () => setState("started"),
             (reason: unknown) => {
               setState("idle");
-              setError(reason instanceof Error ? reason.message : String(reason));
+              setError(errorText(reason));
             },
           );
         }}
@@ -675,13 +715,8 @@ export function ErrorBanner({
             <XIcon className="size-4" aria-hidden="true" />
           </Button>
         </div>
-        {code === "project_setup_failed" && message.startsWith("Project setup failed") ? (
-          <RerunProjectSetupAction className="mx-[4px] mt-[8px]" />
-        ) : null}
-        {code &&
-        PROJECT_SETUP_LOG_CODES.has(code) &&
-        !message.startsWith("Project env commands") ? (
-          <ProjectSetupLogAction className="mx-[4px] mt-[8px]" />
+        {code && PROJECT_SETUP_LOG_CODES.has(code) ? (
+          <ProjectSetupActions code={code} className="mx-[4px] mt-[8px]" />
         ) : null}
         {workspaceMissing ? (
           <ErrorForkAction
