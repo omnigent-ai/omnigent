@@ -531,9 +531,9 @@ async def test_new_turn_recovers_stopped_backend_behind_live_codex_pane(
             await client.close()
 
 
-@pytest.mark.parametrize("combined", [False, True], ids=["model", "model-and-effort"])
+@pytest.mark.parametrize("selection", ["model", "model-and-effort", "model-options"])
 async def test_model_change_recovers_dead_backend_while_codex_pane_is_alive(
-    client: httpx.AsyncClient, native_session: _NativeSession, combined: bool
+    client: httpx.AsyncClient, native_session: _NativeSession, selection: str
 ) -> None:
     session = native_session
     pane = session.terminals.get(session.session_id, "codex", "main")
@@ -541,20 +541,36 @@ async def test_model_change_recovers_dead_backend_while_codex_pane_is_alive(
     await session.codex.close()
     assert native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] is session.codex
     assert bridge.read_bridge_state(session.codex.bridge_dir) is not None
-    selection = {"model_override": _REQUESTED_MODEL}
-    if combined:
-        selection["reasoning_effort"] = "low"
-
-    response = await asyncio.wait_for(
-        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=budget(5)
-    )
-
-    session.assert_applied(response, effort="low" if combined else "high")
+    if selection == "model-options":
+        response = await asyncio.wait_for(
+            session.runner.get(f"/v1/sessions/{session.session_id}/codex-model-options"),
+            timeout=budget(5),
+        )
+        assert response.status_code == 200, response.text
+        assert [row["id"] for row in response.json()["models"]] == [
+            _PREVIOUS_MODEL,
+            _REQUESTED_MODEL,
+            _LATEST_MODEL,
+        ]
+        assert session.codex.applied_updates == []
+        session.assert_settings(_PREVIOUS_MODEL)
+    else:
+        settings = {"model_override": _REQUESTED_MODEL}
+        if selection == "model-and-effort":
+            settings["reasoning_effort"] = "low"
+        response = await asyncio.wait_for(
+            client.patch(f"/v1/sessions/{session.session_id}", json=settings), timeout=budget(5)
+        )
+        session.assert_applied(
+            response, effort="low" if selection == "model-and-effort" else "high"
+        )
     assert session.codex.launches == 2
+    assert session.terminals.get(session.session_id, "codex", "main") is not pane
 
 
+@pytest.mark.parametrize("model_options", [False, True], ids=["settings", "model-options"])
 async def test_codex_listener_refusal_preserves_a_live_backend_connection(
-    client: httpx.AsyncClient, native_session: _NativeSession
+    client: httpx.AsyncClient, native_session: _NativeSession, model_options: bool
 ) -> None:
     session = native_session
     accepted = app_server.CodexAppServerClient(ws_url=session.codex.transport)
@@ -566,10 +582,8 @@ async def test_codex_listener_refusal_preserves_a_live_backend_connection(
         await asyncio.sleep(0)
 
     try:
-        response = await client.patch(
-            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
-        )
-        _assert_codex_refusal(session, response)
+        response = await _request_codex_control(session, client, model_options=model_options)
+        _assert_codex_refusal(session, response, model_options=model_options)
         assert session.codex.stops == 0
         assert session.codex.launches == 1
         result = await accepted.request("thread/list/loaded", {})
@@ -581,8 +595,12 @@ async def test_codex_listener_refusal_preserves_a_live_backend_connection(
         await accepted.close()
 
 
+@pytest.mark.parametrize("model_options", [False, True], ids=["settings", "model-options"])
 async def test_codex_refused_connection_does_not_close_a_replacement_backend(
-    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    model_options: bool,
 ) -> None:
     session = native_session
     await session.codex.close()
@@ -603,38 +621,34 @@ async def test_codex_refused_connection_does_not_close_a_replacement_backend(
         await connect(rpc)
 
     monkeypatch.setattr(app_server.CodexAppServerClient, "connect", replace_before_refusal)
-    response = await client.patch(
-        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
-    )
-    _assert_codex_refusal(session, response)
+    response = await _request_codex_control(session, client, model_options=model_options)
+    _assert_codex_refusal(session, response, model_options=model_options)
     replacement.close.assert_not_awaited()
     assert native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] is replacement
-    assert session.codex.launches == 2
+    assert session.codex.launches == (1 if model_options else 2)
 
 
+@pytest.mark.parametrize("model_options", [False, True], ids=["settings", "model-options"])
 async def test_codex_unregistered_backend_is_not_restarted_after_connection_refusal(
-    client: httpx.AsyncClient, native_session: _NativeSession
+    client: httpx.AsyncClient, native_session: _NativeSession, model_options: bool
 ) -> None:
     session = native_session
     await session.codex.close()
     native_runtime._AUTO_CODEX_APP_SERVERS.pop(session.session_id)
-    response = await client.patch(
-        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
-    )
-    _assert_codex_refusal(session, response)
+    response = await _request_codex_control(session, client, model_options=model_options)
+    _assert_codex_refusal(session, response, model_options=model_options)
     assert session.codex.launches == 1
     assert session.session_id not in native_runtime._AUTO_CODEX_APP_SERVERS
 
 
+@pytest.mark.parametrize("model_options", [False, True], ids=["settings", "model-options"])
 async def test_codex_live_handshake_refusal_does_not_restart_backend(
-    client: httpx.AsyncClient, native_session: _NativeSession
+    client: httpx.AsyncClient, native_session: _NativeSession, model_options: bool
 ) -> None:
     session = native_session
     session.codex.refuse_handshake = True
-    response = await client.patch(
-        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
-    )
-    _assert_codex_refusal(session, response)
+    response = await _request_codex_control(session, client, model_options=model_options)
+    _assert_codex_refusal(session, response, model_options=model_options)
     assert session.codex.launches == 1
     assert session.codex.stops == 0
     assert session.codex.requests == []
@@ -673,23 +687,26 @@ async def test_codex_connection_refused_after_settings_send_is_not_replayed(
     assert session.codex.stops == 0
 
 
+@pytest.mark.parametrize("model_options", [False, True], ids=["settings", "model-options"])
 async def test_unowned_codex_pane_is_not_restarted_after_connection_refusal(
-    client: httpx.AsyncClient, native_session: _NativeSession
+    client: httpx.AsyncClient, native_session: _NativeSession, model_options: bool
 ) -> None:
     session = native_session
     await session.codex.close()
     session.resources._terminal_roles.pop(
         (session.session_id, terminal_resource_id("codex", "main"))
     )
-    response = await client.patch(
-        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
-    )
-    _assert_codex_refusal(session, response)
+    response = await _request_codex_control(session, client, model_options=model_options)
+    _assert_codex_refusal(session, response, model_options=model_options)
     assert session.codex.launches == 1
 
 
+@pytest.mark.parametrize("model_options", [False, True], ids=["settings", "model-options"])
 async def test_codex_replacement_connection_refusal_is_not_retried_again(
-    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    model_options: bool,
 ) -> None:
     session = native_session
     await session.codex.close()
@@ -702,18 +719,20 @@ async def test_codex_replacement_connection_refusal_is_not_retried_again(
 
     monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", launch_without_listener)
     response = await asyncio.wait_for(
-        client.patch(
-            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
-        ),
+        _request_codex_control(session, client, model_options=model_options),
         timeout=budget(5),
     )
-    _assert_codex_refusal(session, response)
+    _assert_codex_refusal(session, response, model_options=model_options)
     assert session.codex.launches == 2
     assert session.codex.requests == []
 
 
+@pytest.mark.parametrize("model_options", [False, True], ids=["settings", "model-options"])
 async def test_codex_dead_backend_recovery_startup_timeout_keeps_settings(
-    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    model_options: bool,
 ) -> None:
     session = native_session
     await session.codex.close()
@@ -721,12 +740,13 @@ async def test_codex_dead_backend_recovery_startup_timeout_keeps_settings(
     monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_TIMEOUT_S", 0.1)
     monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_POLL_S", 0.005)
     response = await asyncio.wait_for(
-        client.patch(
-            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
-        ),
+        _request_codex_control(session, client, model_options=model_options),
         timeout=budget(2),
     )
-    _assert_codex_unconfirmed(session, response)
+    if model_options:
+        _assert_codex_refusal(session, response, model_options=True)
+    else:
+        _assert_codex_unconfirmed(session, response)
     assert session.codex.launches == 2
     assert session.codex.requests == []
 
@@ -778,20 +798,40 @@ def _observe_missing_bridge(
     return observed
 
 
+async def _request_codex_control(
+    session: _NativeSession, client: httpx.AsyncClient, *, model_options: bool
+) -> httpx.Response:
+    if model_options:
+        return await session.runner.get(f"/v1/sessions/{session.session_id}/codex-model-options")
+    return await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+
+
 def _assert_codex_refusal(
-    session: _NativeSession, response: httpx.Response, *, combined: bool = False
+    session: _NativeSession,
+    response: httpx.Response,
+    *,
+    combined: bool = False,
+    model_options: bool = False,
 ) -> None:
     assert response.status_code == 503, response.text
-    assert session.runner_replies[0].status_code == 503
-    assert session.runner_replies[0].json()["error"] == "codex_native_settings_update_failed"
-    if combined:
-        assert "model and reasoning effort changes" in response.text
-        assert "previous selections have been restored" in response.text
+    if model_options:
+        assert response.json()["error"] == "codex_native_model_options_failed"
+        assert not any(event.get("type") == "response.error" for event in session.events)
     else:
-        errors = [event["error"] for event in session.events if event["type"] == "response.error"]
-        assert len(errors) == 1
-        assert errors[0]["code"] == "model_change_not_applied"
-        assert _REQUESTED_MODEL in errors[0]["message"]
+        assert session.runner_replies[0].status_code == 503
+        assert session.runner_replies[0].json()["error"] == "codex_native_settings_update_failed"
+        if combined:
+            assert "model and reasoning effort changes" in response.text
+            assert "previous selections have been restored" in response.text
+        else:
+            errors = [
+                event["error"] for event in session.events if event["type"] == "response.error"
+            ]
+            assert len(errors) == 1
+            assert errors[0]["code"] == "model_change_not_applied"
+            assert _REQUESTED_MODEL in errors[0]["message"]
     saved = session.store.get_conversation(session.session_id)
     assert saved.model_override == _PREVIOUS_MODEL
     assert saved.reasoning_effort == "high"
