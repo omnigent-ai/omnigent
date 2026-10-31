@@ -3712,6 +3712,118 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
     assert options.stderr is None
 
 
+@pytest.mark.asyncio
+async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    status_file = tmp_path / "mcp-auth-status.json"
+    monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 0.05)
+
+    def report(**statuses: str) -> None:
+        entries = [{"harness": "claude", "name": n, "status": s} for n, s in statuses.items()]
+        entries.append({"harness": "codex", "name": "codex-docs", "status": "connected"})
+        status_file.write_text(json.dumps({"servers": entries}))
+
+    live = {
+        "notes": "failed",
+        "wiki": "needs-auth",
+        "docs": "pending",
+        "slow": "failed",
+        "stuck": "failed",
+        "linear": "connected",
+        "jira": "failed",
+        "codex-docs": "failed",
+    }
+    status_unavailable = False
+    fail_once = {"notes"}
+    reconnects: list[str] = []
+    hanging: set[str] = set()
+    hung_together: list[set[str]] = []
+
+    class _StubClient:
+        def __init__(self, options) -> None:
+            self.options = options
+            self._query = None
+            self._transport = None
+
+        async def connect(self) -> None:
+            pass
+
+        async def disconnect(self) -> None:
+            pass
+
+        async def get_mcp_status(self) -> dict[str, object]:
+            if status_unavailable:
+                raise RuntimeError("control channel busy")
+            return {"mcpServers": [{"name": n, "status": s} for n, s in live.items()]}
+
+        async def reconnect_mcp_server(self, server_name: str) -> None:
+            reconnects.append(server_name)
+            if server_name in ("slow", "stuck"):
+                hanging.add(server_name)
+                hung_together.append(set(hanging))
+                try:
+                    await asyncio.sleep(5)
+                finally:
+                    hanging.discard(server_name)
+            if server_name in fail_once:
+                fail_once.discard(server_name)
+                raise RuntimeError("still unauthorized")
+            live[server_name] = "connected"
+
+    class _StubSDK:
+        ClaudeSDKClient = _StubClient
+
+    executor = ClaudeSDKExecutor()
+
+    async def start_turn() -> object:
+        return await executor._get_or_create_client(
+            _StubSDK,  # type: ignore[arg-type]
+            session_key="test-session",
+            options=SimpleNamespace(),
+            model=None,
+        )
+
+    pending = "sign_in_required"
+    report(
+        notes=pending, wiki=pending, docs=pending, slow=pending, stuck=pending, jira="connected"
+    )
+    client = await start_turn()
+    assert await start_turn() is client
+    assert reconnects == []
+
+    report(
+        notes="connected",
+        wiki="connected",
+        docs="connected",
+        slow="connected",
+        stuck="connected",
+        linear="connected",
+        jira="connected",
+    )
+    status_unavailable = True
+    assert await start_turn() is client
+    assert reconnects == []
+
+    # A failed reconnect neither fails the turn nor stops the remaining servers.
+    status_unavailable = False
+    assert await start_turn() is client
+    assert reconnects == ["notes", "wiki", "slow", "stuck"]
+    # Hung reconnects overlap, so together they delay the turn by one timeout.
+    assert {"slow", "stuck"} in hung_together
+
+    # The failed and still-pending servers are checked again; the timed-out ones are not.
+    live["docs"] = "failed"
+    assert await start_turn() is client
+    assert reconnects == ["notes", "wiki", "slow", "stuck", "notes", "docs"]
+
+    assert await start_turn() is client
+    assert reconnects == ["notes", "wiki", "slow", "stuck", "notes", "docs"]
+
+
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd
