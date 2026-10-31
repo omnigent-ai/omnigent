@@ -17,6 +17,20 @@ from __future__ import annotations
 
 import importlib
 import sys
+from collections.abc import Iterator
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules() -> Iterator[None]:
+    """Undo ``_purge`` so later tests keep the class identities they imported."""
+    saved = dict(sys.modules)
+    yield
+    for name in list(sys.modules):
+        if name not in saved:
+            del sys.modules[name]
+    sys.modules.update(saved)
 
 
 def _purge(prefix: str) -> None:
