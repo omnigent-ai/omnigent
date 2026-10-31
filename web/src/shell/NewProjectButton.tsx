@@ -13,8 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
-  ProjectAppearancePicker,
-  ProjectAppearanceTile,
+  ProjectAppearanceButton,
   useRecommendedProjectColor,
 } from "@/components/ProjectIconPicker";
 import { useCreateProject, useProjects } from "@/hooks/useConversations";
@@ -409,10 +408,15 @@ export function NewProjectButton({
           </DialogDescription>
         </DialogHeader>
         <fieldset disabled={repositorySubmitting} className="contents">
-          {/* One combined control: the mark preview (left) + name (right) share
-            a single border, so it reads as a single input. */}
+          {/* One combined control: the mark tile (left) + name (right) share a
+            single border, so it reads as a single input. The tile opens the
+            color / emoji picker. */}
           <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-            <ProjectAppearanceTile appearance={appearance} size="sm" />
+            <ProjectAppearanceButton
+              value={appearance}
+              onChange={setPicked}
+              testId="new-project-icon"
+            />
             <input
               autoFocus
               className="w-full bg-transparent px-3 py-2 text-ui outline-none"
@@ -434,7 +438,6 @@ export function NewProjectButton({
               }}
             />
           </div>
-          <ProjectAppearancePicker value={appearance} onChange={setPicked} />
           {repositoryCreation && (
             <div className="flex flex-col gap-1.5">
               <label htmlFor="new-project-run-on" className="font-medium text-ui">
