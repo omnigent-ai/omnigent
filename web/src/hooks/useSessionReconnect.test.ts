@@ -18,6 +18,7 @@ import type { ArcaConnectResult, HostActionResult, HostIdentity } from "@/lib/na
 import { retrySession } from "@/lib/sessionsApi";
 import type { PostEventResponse } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { SANDBOX_WAKE_ONLINE_GRACE_POLLS, useSessionReconnect } from "./useSessionReconnect";
 
 const healthPollListeners = vi.hoisted(
@@ -96,6 +97,7 @@ beforeEach(() => {
   vi.mocked(fetchHosts).mockResolvedValue([hostRow("arca-host", "online")]);
   writeArcaHostId(null);
   useChatStore.setState({ conversationId: null, sandboxStatus: null });
+  conversationRegistry.clear();
 });
 afterEach(() => {
   cleanup();
@@ -708,6 +710,34 @@ describe("useSessionReconnect", () => {
     expect(refreshRunnerHealth).not.toHaveBeenCalled();
     expect(toast.error).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["failure", timedOut],
+    ["user action", approve],
+  ] as const)(
+    "keeps a pending sandbox wake when a snapshot rebuilds the earlier %s",
+    async (_stop, before) => {
+      const pending = deferred<PostEventResponse>();
+      vi.mocked(retrySession).mockReturnValue(pending.promise);
+      useChatStore.setState({ conversationId: "session", sandboxStatus: before });
+      const { result } = renderHook(() =>
+        useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+      );
+      let reconnect!: Promise<void>;
+      await act(async () => {
+        reconnect = result.current.reconnect();
+      });
+      act(() => useChatStore.setState({ sandboxStatus: { ...before } }));
+      expect(result.current.sandboxStarting).toBe(true);
+
+      await act(async () => {
+        pending.resolve({ queued: false, recovered: true });
+        await reconnect;
+      });
+      expect(result.current.sandboxStarting).toBe(true);
+      expect(refreshRunnerHealth).toHaveBeenCalledOnce();
+    },
+  );
 
   it("shows why a sandbox wake failed and lets the next action retry it", async () => {
     vi.mocked(retrySession).mockRejectedValueOnce(new Error("managed host wake timed out"));
