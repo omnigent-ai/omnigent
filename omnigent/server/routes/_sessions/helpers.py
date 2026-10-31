@@ -261,6 +261,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     set_server_runner_router,
     user_session_stream,
 )
+from omnigent.server.sandbox_launch_diagnostics import sandbox_launch_failure_attributes
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
@@ -5395,6 +5396,7 @@ def _publish_sandbox_status_impl(
     *,
     provider: str | None = None,
     details: str | None = None,
+    exception: Exception | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionSandboxStatusEvent` and update the
@@ -5420,6 +5422,7 @@ def _publish_sandbox_status_impl(
         ``None`` for non-terminal stages.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``.
         Later stages keep the cached launch's provider when omitted.
+    :param exception: Optional launch exception for safe type and HTTP status diagnostics.
     :param details: What the user needs to do when *stage* is
         ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None`` for
         other stages.
@@ -5447,6 +5450,11 @@ def _publish_sandbox_status_impl(
             stage=(previous.stage if previous else "unknown") if stage == "failed" else stage,
             # Every stage row names the sandbox, even when the launch's host never connects.
             provider=status.provider,
+            **(
+                sandbox_launch_failure_attributes(error, exception=exception)
+                if stage == "failed"
+                else {}
+            ),
         ),
     )
     if status.stage == "ready":
@@ -6714,9 +6722,9 @@ async def _provision_managed_sandbox(
             extra={"session_id": session_id},
         )
         tracker.fail(session_id, str(exc.detail))
-        _publish_sandbox_status(session_id, "failed", str(exc.detail))
+        _publish_sandbox_status(session_id, "failed", str(exc.detail), exception=exc)
         return None
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         # Broad on purpose: this is a fire-and-forget task — an
         # unexpected error must settle the tracker (or a waiting
         # message POST hangs until its timeout) and must not escape
@@ -6728,7 +6736,7 @@ async def _provision_managed_sandbox(
         )
         tracker.fail(session_id, "internal error during managed sandbox launch")
         _publish_sandbox_status(
-            session_id, "failed", "internal error during managed sandbox launch"
+            session_id, "failed", "internal error during managed sandbox launch", exception=exc
         )
         return None
 
