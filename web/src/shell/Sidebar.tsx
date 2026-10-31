@@ -9,7 +9,12 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
-import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
+import {
+  useSidebarData,
+  useSidebarMembershipHold,
+  useSidebarView,
+  type SidebarListQuery,
+} from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
 import {
@@ -2053,6 +2058,7 @@ function ConversationList({
     });
   }, []);
   const orderFrozen = pointerInside || editingIds.size > 0;
+  useSidebarMembershipHold(orderFrozen);
   const frozenKeys = orderFrozen ? frozenKeysRef.current : null;
   const frozenStatus = orderFrozen ? frozenStatusRef.current : null;
   useEffect(() => {

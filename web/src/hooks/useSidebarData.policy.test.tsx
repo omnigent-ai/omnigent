@@ -21,7 +21,12 @@ import {
   useProjectSessions,
   type Conversation,
 } from "./useConversations";
-import { SidebarDataProvider, useSidebarData, useSidebarView } from "./useSidebarData";
+import {
+  SidebarDataProvider,
+  useSidebarData,
+  useSidebarMembershipHold,
+  useSidebarView,
+} from "./useSidebarData";
 import { useArchivedSessions } from "./useScopeCache";
 import { useDirectorySessions } from "./useDirectorySessions";
 
@@ -565,6 +570,49 @@ it("keeps the lists when Updated is picked while a stored Name ordering lists by
   expect(result.current.mine.data).toBeDefined();
   expect(result.current.shared.data).toBeDefined();
   expect(fetchMock).not.toHaveBeenCalled();
+});
+
+it("keeps a held All row listed when a rename sorts it past the loaded Name prefix", async () => {
+  localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+  groupingUi = true;
+  view = "all";
+  fetchMock.mockImplementation(async (url: string) => {
+    const p = params(url);
+    if (p.has("pinned")) return response([]);
+    return p.get("visibility") === "shared"
+      ? response([row("bravo", true)])
+      : response([row("alpha"), row("mike")], true);
+  });
+  let held = true;
+  const { result, rerender } = renderHook(
+    () => {
+      useSidebarMembershipHold(held);
+      return useSidebarData();
+    },
+    { wrapper },
+  );
+  const listed = () => result.current.all.data?.pages[0]?.data.map((session) => session.id);
+  await waitFor(() => expect(listed()).toEqual(["alpha", "bravo", "mike"]));
+  act(() =>
+    client.setQueryData<ScopeCacheData>(
+      ["conversations", "", false, null, "mine", "title"],
+      (data) =>
+        data && {
+          ...data,
+          pages: data.pages.map((page) => ({
+            ...page,
+            data: page.data.map((session) =>
+              session.id === "alpha" ? { ...session, title: "zulu" } : session,
+            ),
+          })),
+        },
+    ),
+  );
+  await waitFor(() => expect(result.current.mine.data?.pages[0]?.data[0]?.title).toBe("zulu"));
+  expect(listed()).toEqual(["bravo", "mike", "alpha"]);
+  held = false;
+  rerender();
+  expect(listed()).toEqual(["bravo", "mike"]);
 });
 
 it.each([false, true])(

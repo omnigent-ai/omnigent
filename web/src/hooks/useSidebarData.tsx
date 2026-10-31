@@ -5,6 +5,7 @@ import {
   useContext,
   useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -167,28 +168,41 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
-  const merged = useMemo(
-    () =>
-      mergeScopeRows(
-        mineRows,
-        sharedRows,
-        mine.hasNextPage,
-        sharedActive && shared.hasNextPage,
-        mineCursor,
-        sharedCursor,
-        sortBy,
-      ),
-    [
+  // While the sidebar holds its order, rows it already lists stay listed; the
+  // complete-prefix rule applies again once the hold ends.
+  const [membershipHeld, holdMembership] = useState(false);
+  const heldRef = useRef<{ sortBy: SessionSortBy; ids: Set<string> }>({
+    sortBy,
+    ids: new Set(),
+  });
+  const merged = useMemo(() => {
+    if (!membershipHeld || heldRef.current.sortBy !== sortBy) {
+      heldRef.current = { sortBy, ids: new Set() };
+    }
+    const heldIds = heldRef.current.ids;
+    const result = mergeScopeRows(
       mineRows,
       sharedRows,
       mine.hasNextPage,
-      shared.hasNextPage,
-      sharedActive,
+      sharedActive && shared.hasNextPage,
       mineCursor,
       sharedCursor,
       sortBy,
-    ],
-  );
+      membershipHeld ? heldIds : undefined,
+    );
+    if (membershipHeld) for (const row of result.rows) heldIds.add(row.id);
+    return result;
+  }, [
+    mineRows,
+    sharedRows,
+    mine.hasNextPage,
+    shared.hasNextPage,
+    sharedActive,
+    mineCursor,
+    sharedCursor,
+    sortBy,
+    membershipHeld,
+  ]);
   const hasNextPage = mine.hasNextPage || (sharedActive && shared.hasNextPage);
   const { fetchNextPage: fetchMinePage } = mine;
   const { fetchNextPage: fetchSharedPage } = shared;
@@ -249,6 +263,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     watchedIds,
     registerFolder,
     watermark: merged.watermark,
+    holdMembership,
   };
 }
 
@@ -302,6 +317,19 @@ export function useSidebarData() {
 export function useLoadedConversations() {
   const { loadedData: data, all } = useSidebarData();
   return { data, isLoading: data === undefined && all.isLoading };
+}
+
+/**
+ * Keep the merged list's rows listed while the sidebar holds its order. Only a
+ * rename can move a listed row past the complete prefix, so only Name holds.
+ */
+export function useSidebarMembershipHold(held: boolean) {
+  const { holdMembership, sortBy } = useSidebarData();
+  const holds = held && sortBy === "title";
+  useLayoutEffect(() => {
+    holdMembership(holds);
+    return () => holdMembership(false);
+  }, [holds, holdMembership]);
 }
 
 /** Register the mounted sidebar's persisted selection; unmount releases its demand. */

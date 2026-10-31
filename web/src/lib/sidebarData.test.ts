@@ -40,6 +40,22 @@ describe("scope merge", () => {
     ).toEqual(["s", "m"]);
     expect(mergeScopeRows([row("m", 20)], [], false, false).rows).toHaveLength(1);
   });
+  it("keeps the given ids listed past the shallower tail", () => {
+    const mine = [row("m1", 100), row("m2", 20)];
+    const shared = [row("s1", 90)];
+    const merged = mergeScopeRows(
+      mine,
+      shared,
+      true,
+      true,
+      "m2",
+      "s1",
+      "updated_at",
+      new Set(["m2"]),
+    );
+    expect(merged.rows.map((r) => r.id)).toEqual(["m1", "s1", "m2"]);
+    expect(merged.watermark?.id).toBe("s1");
+  });
   it("deduplicates overlapping sources and picks the newest row", () => {
     expect(dedupeSessionRows([row("same", 10), row("same", 20)])).toEqual([row("same", 20)]);
   });

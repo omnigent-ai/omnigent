@@ -3160,6 +3160,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
 
+        # Every listed row carries a grant for this viewer, so a cursor without
+        # one can't come from a page and must not expose its sort key.
+        cursor_viewer = accessible_by if accessible_by is not None else owned_by
+        if cursor_viewer is not None:
+            for cursor_id in (after, before):
+                if cursor_id:
+                    self._require_cursor_grant(cursor_id, cursor_viewer)
+
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
             # LOCAL scopes to this transaction and reverts on commit, so it
@@ -3470,6 +3478,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             last_id=convs[-1].id if convs else None,
             has_more=has_more,
         )
+
+    def _require_cursor_grant(self, cursor_id: str, viewer: str) -> None:
+        """
+        Reject a list cursor naming a session the viewer has no grant on.
+
+        The failure matches a deleted cursor, so it doesn't reveal whether the
+        session exists.
+
+        :param cursor_id: The ``after`` or ``before`` session ID.
+        :param viewer: The user whose listing the cursor pages.
+        :raises StaleCursorError: If the viewer has no grant on the session.
+        """
+        with self._session("authorize_session_list_cursor") as meta_sess:
+            granted = meta_sess.execute(
+                select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == cursor_id,
+                    SqlSessionPermission.user_id == viewer,
+                )
+            ).first()
+        if granted is None:
+            raise StaleCursorError(cursor_id)
 
     def _resolve_sort_columns(self, sort_by: str) -> tuple[ColumnElement[Any], ColumnElement[Any]]:
         """

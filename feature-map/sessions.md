@@ -160,7 +160,8 @@ the header menu), and each place is a separate entry point.
   submenus, saved per device. Created ordering keeps sessions newest-created first as
   messages arrive; Name orders by title A to Z, ignoring case, with untitled
   sessions (“New session”) last, and holds a hovered or renamed row in place;
-  requests, pagination, and project folders use that order too. Switching order
+  requests, pagination, and project folders use that order too. A server that
+  can't sort by title lists Name as Updated and keeps the saved choice. Switching order
   clears the cached rows and shows loading while session timestamps refresh,
   including project folders, pins, and Archived. With the flag off,
   sessions always use Updated regardless of the saved preference. Shared sessions

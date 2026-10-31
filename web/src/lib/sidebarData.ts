@@ -104,7 +104,10 @@ export function compareSessionRows(
   return b[sortBy] - a[sortBy] || b.id.localeCompare(a.id);
 }
 
-/** Only the merged prefix above both unfinished scopes' tails is complete. */
+/**
+ * Only the merged prefix above both unfinished scopes' tails is complete.
+ * `keepIds` stay listed past that prefix, so a held row renamed beyond it isn't dropped.
+ */
 export function mergeScopeRows(
   mine: Conversation[],
   shared: Conversation[],
@@ -113,6 +116,7 @@ export function mergeScopeRows(
   mineCursor?: string | null,
   sharedCursor?: string | null,
   sortBy: SessionSortBy = "updated_at",
+  keepIds?: ReadonlySet<string>,
 ): { rows: Conversation[]; watermark: Conversation | undefined } {
   const compare = (a: Conversation, b: Conversation) => compareSessionRows(a, b, sortBy);
   const mineTail = mine.find((row) => row.id === mineCursor) ?? mine.at(-1);
@@ -123,7 +127,9 @@ export function mergeScopeRows(
   const watermark = tails[0];
   const rows = dedupeSessionRows([...mine, ...shared]).sort(compare);
   return {
-    rows: watermark ? rows.filter((row) => compare(row, watermark) <= 0) : rows,
+    rows: watermark
+      ? rows.filter((row) => compare(row, watermark) <= 0 || keepIds?.has(row.id) === true)
+      : rows,
     watermark,
   };
 }
