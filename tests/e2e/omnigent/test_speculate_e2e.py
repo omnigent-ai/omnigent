@@ -139,7 +139,7 @@ def test_signal_kills_the_replicas_and_exits_128_plus_the_signal(
     assert cli.wait(10) == 128 + sig, err.read_text()[-2000:]
     assert _exits(int(pid.read_text()))
     last = beat.read_text()
-    time.sleep(0.2)
+    time.sleep(0.2)  # custom-lint: disable=sleep-then-assert -- no write in window
     assert beat.read_text() == last
     assert "omnigent-speculate-" not in _git(repo, env, "worktree", "list")
 
