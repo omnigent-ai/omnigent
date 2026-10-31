@@ -1733,6 +1733,51 @@ async def test_diff_endpoint_returns_404_when_file_not_in_registry(
 
 
 @pytest.mark.asyncio
+async def test_changes_drop_a_file_saved_back_to_its_original_content(
+    client: httpx.AsyncClient,
+) -> None:
+    """Saving a file's original content again leaves nothing to review."""
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    edited = await client.put(
+        f"{base}/filesystem/hello.txt", json={"content": "edited", "encoding": "utf-8"}
+    )
+    assert edited.status_code == 200, edited.text
+    listed = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
+
+    reverted = await client.put(
+        f"{base}/filesystem/hello.txt", json={"content": "hello world", "encoding": "utf-8"}
+    )
+    assert reverted.status_code == 200, reverted.text
+
+    assert (await client.get(f"{base}/changes")).json()["data"] == []
+    assert (await client.get(f"{base}/diff/hello.txt")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_changes_report_an_edited_file_deleted_outside_the_session(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """A file removed from a shell after an edit shows as deleted, not modified."""
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    edited = await client.put(
+        f"{base}/filesystem/src/main.py", json={"content": "print('edited')", "encoding": "utf-8"}
+    )
+    assert edited.status_code == 200, edited.text
+
+    (workspace / "src" / "main.py").unlink()
+
+    listed = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(e["path"], e["status"]) for e in listed] == [("src/main.py", "deleted")]
+    diff = await client.get(f"{base}/diff/src/main.py")
+    assert diff.status_code == 200, diff.text
+    assert diff.json()["before"] == "print('hi')"
+    assert diff.json()["after"] is None
+
+
+@pytest.mark.asyncio
 async def test_diff_endpoint_returns_full_after_for_large_file(
     registry: SessionResourceRegistry,
     workspace: Path,

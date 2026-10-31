@@ -7,8 +7,8 @@ Covers the ``list_changed_files`` merge logic for :class:`AgentEditFilesystemReg
 Also covers ``seed_snapshot``, ``get_baseline`` for both implementations, and
 ``_normalize_path``.
 
-Events are injected via :func:`_inject`, which calls :meth:`record_change` on
-the registry so tests exercise the same code path as real tool calls.
+Events are injected via :func:`_inject`, which applies the operation to disk and
+calls :meth:`record_change` so tests exercise the same path as real tool calls.
 """
 
 import logging
@@ -38,10 +38,10 @@ def _inject(
     operation: str,
     conv_id: str,
 ) -> None:
-    """Inject a synthetic file-change event into *registry* via :meth:`record_change`.
+    """Apply *operation* to *path* on disk, then record it via :meth:`record_change`.
 
-    Uses the public API so tests exercise the same recording path as real
-    tool calls, rather than writing directly to internal state.
+    Mirrors a real tool call, which changes the file before the handler
+    records the event, rather than writing directly to internal state.
 
     :param registry: The registry to inject into.
     :param path: Relative file path, e.g. ``"src/foo.py"``.
@@ -49,6 +49,12 @@ def _inject(
     :param conv_id: The session to attribute the event to,
         e.g. ``"conv_abc123"``.
     """
+    target = registry.cwd / path
+    if operation == "deleted":
+        target.unlink(missing_ok=True)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("written by a tool call\n")
     registry.record_change(path, operation, conv_id)
 
 
@@ -279,6 +285,77 @@ def test_limit_parameter_caps_results(registry: AgentEditFilesystemRegistry) -> 
         f"Expected at most 3 results with limit=3, got {len(results)}. "
         "The limit parameter is not being respected."
     )
+
+
+@pytest.mark.parametrize(
+    ("operation", "baseline", "outside_edit", "expected_status"),
+    [
+        pytest.param("modified", "original\n", b"original\n", None, id="edit-reverted"),
+        pytest.param("modified", None, b"original\n", "modified", id="revert-without-baseline"),
+        pytest.param("modified", "original\n", b"other\n", "modified", id="edited-again"),
+        pytest.param("modified", "original\n", None, "deleted", id="edited-file-deleted"),
+        pytest.param("created", None, None, None, id="new-file-deleted"),
+        pytest.param("deleted", "original\n", b"original\n", None, id="deleted-file-restored"),
+        pytest.param("deleted", "original\n", b"other\n", "modified", id="deleted-file-replaced"),
+    ],
+)
+def test_changes_follow_edits_made_outside_tool_calls(
+    registry: AgentEditFilesystemRegistry,
+    operation: str,
+    baseline: str | None,
+    outside_edit: bytes | None,
+    expected_status: str | None,
+) -> None:
+    """A revert or delete outside a tool call records no event, so Changes must match the disk.
+
+    ``outside_edit`` is the file's final content, or ``None`` when it is deleted.
+    """
+    conv_id = "conv_outside_edit"
+    target = registry.cwd / "notes.md"
+    if operation != "created":
+        target.write_bytes(b"original\n")
+    if baseline is not None:
+        registry.seed_snapshot("notes.md", baseline, session_id=conv_id)
+    _inject(registry, "notes.md", operation, conv_id)
+    if outside_edit is None:
+        target.unlink()
+    else:
+        target.write_bytes(outside_edit)
+
+    listed = registry.list_changed_files(conv_id, limit=10)
+    single = registry.get_changed_file(conv_id, "notes.md")
+
+    if expected_status is None:
+        assert listed == []
+        assert single is None
+        return
+    expected_bytes = None if outside_edit is None else len(outside_edit)
+    assert [(r["path"], r["status"], r["bytes"]) for r in listed] == [
+        ("notes.md", expected_status, expected_bytes)
+    ]
+    assert single == listed[0]
+
+
+def test_disk_check_can_be_skipped_when_the_runner_cannot_see_the_edits(
+    registry: AgentEditFilesystemRegistry,
+) -> None:
+    """Copy-on-write sessions write into an overlay, leaving the runner's view unchanged."""
+    conv_id = "conv_overlay"
+    (registry.cwd / "notes.md").write_text("original\n")
+    registry.seed_snapshot("notes.md", "original\n", session_id=conv_id)
+    registry.record_change("notes.md", "modified", conv_id)
+    registry.record_change("new.md", "created", conv_id)
+
+    listed = registry.list_changed_files(conv_id, limit=10, check_disk=False)
+
+    assert sorted((r["path"], r["status"]) for r in listed) == [
+        ("new.md", "created"),
+        ("notes.md", "modified"),
+    ]
+    assert registry.get_changed_file(conv_id, "notes.md", check_disk=False) == next(
+        r for r in listed if r["path"] == "notes.md"
+    )
+    assert registry.list_changed_files(conv_id, limit=10) == []
 
 
 # ── seed_snapshot / get_baseline ─────────────────────────────────────────────

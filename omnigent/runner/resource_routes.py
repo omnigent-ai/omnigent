@@ -1020,6 +1020,15 @@ def register_resource_routes(
             )
         return spec
 
+    def _changes_visible_on_disk(session_id: str, spec: AgentSpec | None) -> bool:
+        """Copy-on-write sessions write into an overlay the runner cannot read."""
+        from omnigent.sandbox.copy_on_write import has_copy_on_write
+
+        return not (
+            has_copy_on_write(getattr(spec, "os_env", None))
+            or resource_registry.uses_copy_on_write(session_id)
+        )
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem")
     async def list_environment_root(
         session_id: str,
@@ -1206,7 +1215,7 @@ def register_resource_routes(
     ) -> JSONResponse:
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
-        await _require_os_env(session_id)
+        agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
         try:
@@ -1217,6 +1226,7 @@ def register_resource_routes(
                     session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
+                    check_disk=_changes_visible_on_disk(session_id, agent_spec),
                 )
                 if session_registry is not None
                 else []
@@ -1289,7 +1299,12 @@ def register_resource_routes(
             # Offloaded like list_filesystem_changes: get_changed_file shells out
             # to git (status + show) synchronously, so keep it off the loop.
             record = (
-                await run_slow_io(session_registry.get_changed_file, session_id, relative_path)
+                await run_slow_io(
+                    session_registry.get_changed_file,
+                    session_id,
+                    relative_path,
+                    check_disk=_changes_visible_on_disk(session_id, agent_spec),
+                )
                 if session_registry is not None
                 else None
             )
