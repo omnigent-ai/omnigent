@@ -2298,6 +2298,12 @@ def main() -> None:
     if not argv:
         argv = ["start"] if sys.stdin.isatty() else ["--help"]
 
+    # Shorthand: ``omnigent --server <url>`` → ``start --server <url>``, the
+    # same host start as bare ``omnigent`` but on that server. Only ``start``'s
+    # own options qualify; any other leading flag stays the run shorthand below.
+    if _is_start_shorthand(argv):
+        argv = ["start", *argv]
+
     # Shorthand: ``omnigent --harness claude [opts]`` →
     # ``run --harness claude [opts]``. Click group-level options are
     # intentionally tiny (currently only help/version); runner flags live on
@@ -2417,6 +2423,37 @@ def main() -> None:
         log_cli_error_hint(exc)
         handle_crash(exc)
         raise SystemExit(1) from exc
+
+
+# ``omnigent start``'s value-less options; see :func:`_is_start_shorthand`.
+_START_SHORTHAND_FLAGS = frozenset({"--no-open", "--open-in-desktop", "--non-interactive"})
+
+
+def _is_start_shorthand(argv: list[str]) -> bool:
+    """Return True when *argv* holds only ``omnigent start`` options.
+
+    Used by :func:`main` to run ``omnigent --server <url>`` as
+    ``omnigent start --server <url>``: it connects this machine as a host for
+    that server and opens its web UI, like bare ``omnigent`` does, instead of
+    launching the default agent. A ``--server`` without a value, or any flag
+    ``start`` doesn't take, returns False.
+
+    :param argv: CLI arguments without the program name, e.g.
+        ``["--server", "https://example.com", "--no-open"]``.
+    :returns: ``True`` when every argument is a ``start`` option.
+    """
+    if not argv:
+        return False
+    tokens = iter(argv)
+    for token in tokens:
+        if token in _START_SHORTHAND_FLAGS or token.startswith("--server="):
+            continue
+        if token != "--server":
+            return False
+        value = next(tokens, None)
+        if value is None or value.startswith("-"):
+            return False
+    return True
 
 
 def _is_run_shorthand(argv: list[str]) -> bool:

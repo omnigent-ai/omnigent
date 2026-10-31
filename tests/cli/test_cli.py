@@ -6743,6 +6743,81 @@ def test_bare_omnigent_tty_dispatches_to_start(
     assert dispatched["args"] == ["start"]
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--server", "https://ws.example/omnigent?o=1"],
+        ["--server=https://ws.example"],
+        ["--server", "https://ws.example", "--no-open", "--open-in-desktop", "--non-interactive"],
+    ],
+)
+def test_omnigent_server_flag_dispatches_to_start(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    """``omnigent --server <url>`` hosts on that server instead of launching the default agent.
+
+    It is the same host start as bare ``omnigent``, so it is rewritten to
+    ``start`` even without a terminal.
+    """
+    from omnigent import cli as cli_module
+
+    monkeypatch.setattr(sys, "argv", ["omnigent", *argv])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    dispatched: dict[str, list[str]] = {}
+
+    def fake_cli(*, args: list[str], standalone_mode: bool = True) -> None:
+        dispatched["args"] = args
+
+    monkeypatch.setattr(cli_module, "cli", fake_cli)
+
+    cli_module.main()
+
+    assert dispatched["args"] == ["start", *argv]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--server", "https://ws.example", "-p", "hi"],
+        ["--server", "https://ws.example", "--harness", "claude"],
+        ["--server"],
+        ["--server", "--no-open"],
+    ],
+)
+def test_omnigent_server_with_other_options_stays_run(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    """A ``--server`` with a run option, or with no value, keeps the run shorthand."""
+    from omnigent import cli as cli_module
+
+    monkeypatch.setattr(sys, "argv", ["omnigent", *argv])
+    dispatched: dict[str, list[str]] = {}
+
+    def fake_cli(*, args: list[str], standalone_mode: bool = True) -> None:
+        dispatched["args"] = args
+
+    monkeypatch.setattr(cli_module, "cli", fake_cli)
+
+    cli_module.main()
+
+    assert dispatched["args"] == ["run", *argv]
+
+
+def test_start_shorthand_flags_match_start_options() -> None:
+    """The shorthand accepts exactly the options ``omnigent start`` defines."""
+    import click
+
+    from omnigent import cli as cli_module
+
+    start_options = {
+        opt
+        for param in cli_module.start.params
+        if isinstance(param, click.Option)
+        for opt in param.opts
+    }
+    assert start_options == {"--server", *cli_module._START_SHORTHAND_FLAGS}
+
+
 def test_bare_omnigent_rejects_positional_server_url(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
