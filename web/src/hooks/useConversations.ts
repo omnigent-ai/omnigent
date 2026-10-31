@@ -2444,6 +2444,9 @@ export interface ProjectSummary {
   icon?: string | null;
   /** Whether the viewer muted every session in the project (`config.muted`). */
   muted?: boolean;
+  /** Chosen color (a theme palette id), or null/absent for the muted folder.
+      Sourced from the project's `config.color`. */
+  color?: string | null;
 }
 
 /**
@@ -3216,10 +3219,13 @@ export function useRenameProject() {
       id,
       oldName,
       newName,
+      config,
     }: {
       id: string | null;
       oldName: string;
       newName: string;
+      /** Initial config for a promoted label-only folder; ignored when `id` is set. */
+      config?: ProjectConfig;
     }) => {
       // The target project id: rename the existing row (first-class), or
       // create one on demand (label-only folder being promoted).
@@ -3228,7 +3234,7 @@ export function useRenameProject() {
         await apiRenameProject(id, newName);
         projectId = id;
       } else {
-        projectId = (await apiCreateProject(newName)).id;
+        projectId = (await apiCreateProject(newName, config)).id;
       }
       // Reconcile the folder's members either way. During the dual-read
       // transition a member can still sit in the oldName folder via the legacy
@@ -3310,8 +3316,10 @@ export function useUpdateProjectConfig() {
       name: string;
       config: ProjectConfig;
     }) => {
-      const projectId = id ?? (await apiCreateProject(name)).id;
-      return apiUpdateProjectConfig(projectId, config);
+      // Promote with the config in the create itself: a follow-up PATCH would
+      // replace the config the create stored (including its auto-assigned color).
+      if (id === null) return apiCreateProject(name, config);
+      return apiUpdateProjectConfig(id, config);
     },
     onSuccess: (project) => {
       // Seed the fresh config into the cache (not just invalidate) so the
@@ -3330,6 +3338,7 @@ export function useUpdateProjectConfig() {
           id: project.id,
           name: project.name,
           icon: project.config?.icon,
+          color: project.config?.color,
           muted: project.config?.muted === true,
         };
         return prev.some((p) => p.name === project.name)

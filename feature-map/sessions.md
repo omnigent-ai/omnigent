@@ -580,7 +580,7 @@ Sessions outside the project, such as one coordinating it, still notify.
 The item appears only on servers that advertise `project_mute` in `/v1/info`.
 
 **Project folder:** right-click its header or open its three-dot menu, then
-choose Rename project. Start typing as soon as the dialog opens. Or double-click
+choose Edit project. Start typing as soon as the dialog opens. Or double-click
 the folder's name (not its chevron) to edit it in place: Enter or blur saves,
 Escape cancels, and the dialog remains the place to change its emoji. Delete project
 archives every session in the folder; when any of them has an agent working,
@@ -592,6 +592,16 @@ Type "move project" there for the folder menu's Move choices (greyed at the
 list's edges and while the order loads or saves), or "sort projects", "expand
 all projects", "collapse all projects" and "select sessions" for the Projects
 header's actions, which ⌘K offers whenever the header does.
+
+**Project color or emoji:** a project shows either an emoji or a folder in one
+of the theme palette colors. New project and Edit project show the palette
+swatches and an Emoji button under the name; a new project starts on the
+recommended color (the one least like the colors other projects use), and
+clicking it again resets to the default. Projects created any other way (a
+session moved to a new project name, an agent, the API) get the same color.
+The color also tints the project folder in the session header, breadcrumb,
+project pickers and pinned-session flyout. The project's new-chat landing tile
+opens the same picker from its pencil and saves each pick immediately.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from

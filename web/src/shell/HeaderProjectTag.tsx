@@ -24,11 +24,14 @@ export function HeaderProjectTag({
   conversationId,
   projectName,
   projectIcon,
+  projectColor,
 }: {
   conversationId: string;
   projectName: string | null;
   /** The filed project's emoji icon, or `null`/absent for the folder glyph. */
   projectIcon?: string | null;
+  /** The filed project's palette color, or `null`/absent for a muted folder. */
+  projectColor?: string | null;
 }) {
   const moveToProject = useMoveToProject();
   const [open, setOpen] = useState(false);
@@ -55,7 +58,11 @@ export function HeaderProjectTag({
                   className="breadcrumb-folder flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-100 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none"
                 >
                   {projectName ? (
-                    <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
+                    <ProjectRowIcon
+                      icon={projectIcon}
+                      color={projectColor}
+                      className="size-4 text-[16px]"
+                    />
                   ) : (
                     <FolderPlusIcon className="size-4" />
                   )}
