@@ -77,6 +77,23 @@
             </intent-filter>
         </activity>
 
+        <!-- Share-dialog conversation links. No task affinity; the NEW_TASK handoff re-enters
+             the shell's task. -->
+        <activity
+            android:name=".DeepLinkActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Omnigent.Translucent">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="omnigent" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".ConnectActivity"
             android:exported="false"
