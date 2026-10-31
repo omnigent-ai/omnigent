@@ -14,10 +14,12 @@ import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 from sqlalchemy import update
+from sqlalchemy.exc import DataError, OperationalError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
@@ -50,13 +52,15 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import HostStore, _HostOwnershipError
 from tests.budgets import budget
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "1444b179a19322377dcc75cf7fcd1bd2"
 _TUNNEL_PATH = f"/v1/hosts/{_HOST_ID}/tunnel"
+_OTHER_HOST_ID = "5b7d5b2c6a2e4f1e9b0c3d4e5f6a7b8c"
+_OTHER_TUNNEL_PATH = f"/v1/hosts/{_OTHER_HOST_ID}/tunnel"
 
 
 def _websocket_scope(
@@ -893,6 +897,151 @@ async def test_host_tunnel_reports_registration_failure(
     assert registry.get(_HOST_ID) is None
 
 
+async def _expect_connection_error(
+    communicator: ApplicationCommunicator,
+) -> HostConnectionErrorFrame:
+    """Receive the error frame and the 4005 close that end a failed tunnel."""
+    sent = await communicator.receive_output(timeout=budget(1.0))
+    assert sent["type"] == "websocket.send"
+    error = decode_host_frame(sent["text"])
+    assert isinstance(error, HostConnectionErrorFrame), error
+    close = await communicator.receive_output(timeout=budget(1.0))
+    assert close["type"] == "websocket.close"
+    assert close["code"] == 4005
+    return error
+
+
+async def test_renamed_host_colliding_with_registered_name_is_not_retryable(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """The real store's name collision is reported as non-retryable."""
+    app, registry, store = host_app
+    holder = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(holder, registry)
+
+    renamed = await _connect_route(app, _OTHER_TUNNEL_PATH)
+    await _send_hello_and_wait(renamed, registry, host_id=_OTHER_HOST_ID, name="build-box")
+    await renamed.send_input({"type": "websocket.disconnect", "code": 1000})
+    await asyncio.wait_for(_wait_offline(store, _OTHER_HOST_ID), timeout=budget(2.0))
+
+    retry = await _connect_route(app, _OTHER_TUNNEL_PATH)
+    await retry.send_input({"type": "websocket.receive", "text": _make_hello("test-laptop")})
+
+    error = await _expect_connection_error(retry)
+    assert error.stage == "registration"
+    assert "name" in error.error
+    assert error.retryable is False
+    assert registry.get(_OTHER_HOST_ID) is None
+    renamed_host = store.get_host(_OTHER_HOST_ID)
+    assert renamed_host is not None
+    assert renamed_host.name == "build-box"
+    assert renamed_host.status == "offline"
+    # The host that legitimately holds the name is untouched.
+    assert registry.get(_HOST_ID) is not None
+    await holder.send_input({"type": "websocket.disconnect", "code": 1000})
+    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
+
+
+# Messages mirror what upsert_on_connect and require_active_account raise.
+@pytest.mark.parametrize(
+    ("failure", "retryable"),
+    [
+        pytest.param(
+            _HostOwnershipError(
+                "host_id already owned by a different user",
+                params={},
+                orig=Exception("UNIQUE constraint failed: hosts.host_id"),
+            ),
+            False,
+            id="host-id-owned-by-another-user",
+        ),
+        pytest.param(ValueError("host has been deleted"), False, id="deleted-host"),
+        pytest.param(
+            DataError(
+                "UPDATE hosts",
+                params={},
+                orig=Exception("value too long for column name"),
+            ),
+            False,
+            id="column-data-refused",
+        ),
+        pytest.param(
+            OmnigentError("account authority has been revoked", code=ErrorCode.UNAUTHORIZED),
+            False,
+            id="revoked-account",
+        ),
+        pytest.param(
+            OperationalError("UPDATE hosts", params={}, orig=Exception("database is locked")),
+            True,
+            id="locked-database",
+        ),
+        pytest.param(
+            OmnigentError("target account authority has been revoked", code=ErrorCode.CONFLICT),
+            True,
+            id="stale-target-generation",
+        ),
+    ],
+)
+async def test_registration_failure_retryability_follows_the_error(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    retryable: bool,
+) -> None:
+    """A registration failure is retryable only when reconnecting can recover it."""
+    app, registry, store = host_app
+
+    def _fail_upsert(*args: object, **kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(store, "upsert_on_connect", _fail_upsert)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input({"type": "websocket.receive", "text": _make_hello()})
+
+    error = await _expect_connection_error(comm)
+    assert error.stage == "registration"
+    assert error.error == str(failure)
+    assert error.retryable is retryable
+    assert registry.get(_HOST_ID) is None
+
+
+async def test_binary_hello_frame_is_refused_without_retry(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A failure before registration never asks the host to reconnect."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input({"type": "websocket.receive", "bytes": b"\x00"})
+
+    error = await _expect_connection_error(comm)
+    assert error.stage == "hello"
+    assert error.retryable is False
+    assert registry.get(_HOST_ID) is None
+
+
+async def test_fault_after_connect_stays_retryable(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once registered, even a normally fatal exception class keeps the backoff."""
+    from omnigent.server.routes import host_tunnel
+
+    app, registry, store = host_app
+
+    async def _explode(*args: object, **kwargs: object) -> None:
+        raise ValueError("receive loop crashed")
+
+    monkeypatch.setattr(host_tunnel, "_receive_loop", _explode)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input({"type": "websocket.receive", "text": _make_hello()})
+
+    error = await _expect_connection_error(comm)
+    assert error.stage == "connected"
+    assert error.retryable is True
+    assert registry.get(_HOST_ID) is None
+    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
+
+
 async def test_registry_failure_marks_persisted_host_offline(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
@@ -1656,10 +1805,9 @@ async def test_managed_token_is_revalidated_after_websocket_accept(
     await communicator.send_input(
         {"type": "websocket.receive", "text": _make_hello(name=f"managed-{_HOST_ID}")},
     )
-    response = await communicator.receive_output(timeout=budget(1.0))
-    if response["type"] == "websocket.send":
-        response = await communicator.receive_output(timeout=budget(1.0))
-    assert response["type"] == "websocket.close"
+    error = await _expect_connection_error(communicator)
+    assert error.stage == "registration"
+    assert error.retryable is False
     assert registry.get(_HOST_ID) is None
     detached = store.get_host(_HOST_ID)
     assert detached is not None
