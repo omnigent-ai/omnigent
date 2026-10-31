@@ -300,6 +300,9 @@ async def test_lists_paginate_with_a_continuation_cursor(market) -> None:
     again = (await client.get(f"/v1/installed-skills?limit=1&after={first['last_id']}")).json()
     assert [s["name"] for s in again["data"]] == [second["data"][0]["name"]]
     assert (await client.get("/v1/installed-skills?after=" + "0" * 32)).status_code == 400
+    overflow = "9" * 19 + "." + "0" * 32
+    assert (await client.get(f"/v1/installed-skills?after={overflow}")).status_code == 400
+    assert (await client.get(f"/v1/skill-sources?after={overflow}")).status_code == 400
     assert (await client.get("/v1/installed-skills?limit=0")).status_code == 422
 
 

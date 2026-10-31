@@ -15,8 +15,9 @@ import contextlib
 import re
 import uuid
 from collections.abc import Collection, Iterable, Sequence
+from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import ColumnElement, and_, literal, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -74,15 +75,39 @@ def _encode_cursor(sort_value: int, row_id: str) -> str:
     return f"{sort_value}.{row_id}"
 
 
+# Epochs are stored as signed 64-bit integers.
+_MAX_EPOCH = 2**63 - 1
+
+
 def _decode_cursor(after: str) -> tuple[int, str]:
     """``(sort_value, row_id)`` from a cursor this store produced.
 
     :raises SkillValueError: When *after* is not one of ours.
     """
     match = _CURSOR.match(after)
-    if match is None:
+    if match is None or int(match.group(1)) > _MAX_EPOCH:
         raise SkillValueError("invalid cursor")
     return int(match.group(1)), match.group(2)
+
+
+def _after_cursor(
+    dialect: str, sort_column: Any, id_column: Any, cursor: tuple[int, str]
+) -> ColumnElement[bool]:
+    """``(sort, id) > cursor`` in a form the dialect turns into an index range.
+
+    Row values bound with each column's type (the id is 16 raw bytes) let
+    SQLite and PostgreSQL seek to the cursor instead of filtering every
+    earlier row; MySQL only seeks on scalar ranges, so it gets those.
+    """
+    sort_value, row_id = cursor
+    if dialect == "mysql":
+        return or_(
+            sort_column > sort_value,
+            and_(sort_column == sort_value, id_column > row_id),
+        )
+    return tuple_(sort_column, id_column) > tuple_(
+        literal(sort_value, sort_column.type), literal(row_id, id_column.type)
+    )
 
 
 def principal_for(scope: SkillScope, owner_user_id: str | None) -> str:
@@ -181,6 +206,7 @@ class SqlAlchemySkillStore(SkillStore):
 
     def __init__(self, storage_location: str) -> None:
         engine = get_or_create_engine(storage_location)
+        self._dialect = engine.dialect.name
         self._session = make_named_managed_session_maker(engine, query_name_prefix="skill_store")
         self._session_immediate = make_named_managed_session_maker(
             engine, query_name_prefix="skill_store", immediate=True
@@ -251,13 +277,12 @@ class SqlAlchemySkillStore(SkillStore):
                 .limit(limit + 1)
             )
             if after is not None:
-                created_at, row_id = _decode_cursor(after)
-                # Compared column by column so each bind takes the column's type
-                # (the id is 16 raw bytes, not its hex spelling).
                 stmt = stmt.where(
-                    or_(
-                        SqlSkillSource.created_at > created_at,
-                        and_(SqlSkillSource.created_at == created_at, SqlSkillSource.id > row_id),
+                    _after_cursor(
+                        self._dialect,
+                        SqlSkillSource.created_at,
+                        SqlSkillSource.id,
+                        _decode_cursor(after),
                     )
                 )
             rows = session.scalars(stmt).all()
@@ -483,14 +508,12 @@ class SqlAlchemySkillStore(SkillStore):
                     .limit(limit + 1)
                 )
                 if cursor is not None:
-                    installed_at, row_id = cursor
                     stmt = stmt.where(
-                        or_(
-                            SqlInstalledSkill.installed_at > installed_at,
-                            and_(
-                                SqlInstalledSkill.installed_at == installed_at,
-                                SqlInstalledSkill.id > row_id,
-                            ),
+                        _after_cursor(
+                            self._dialect,
+                            SqlInstalledSkill.installed_at,
+                            SqlInstalledSkill.id,
+                            cursor,
                         )
                     )
                 rows.extend(session.scalars(stmt).all())

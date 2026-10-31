@@ -296,10 +296,14 @@ def test_visibility_reads_stay_on_the_principal_indexes(
         _install(store, f"s{index}")
         _install(store, f"o{index}", scope="org", owner=None)
     store.add_source(url=URL, ref=None, name="a", created_by=None)
+    store.add_source(url=URL, ref="v2", name="b", created_by=None)
+    first_sources = store.list_sources(limit=1)
     event.listen(engine, "before_cursor_execute", capture)
     try:
         page = store.list_for_user("alice", limit=2)
         store.list_for_user("alice", limit=2, after=page.last_id)
+        continuations = len(plans)
+        store.list_sources(limit=1, after=first_sources.last_id)
         store.find_for_user("alice", ["s1", "o2"])
         store.count_installed("user", "alice")
         store.find_source(URL, None)
@@ -313,6 +317,13 @@ def test_visibility_reads_stay_on_the_principal_indexes(
     assert any("ix_installed_skills_principal_order" in plan for plan in plans)
     assert any("ux_installed_skills_identity" in plan for plan in plans)
     assert any("ux_skill_sources_identity" in plan for plan in plans)
+    # A continuation seeks to its cursor: the cursor columns bound the index
+    # range, so later pages do not walk the rows before them.
+    assert all(
+        "(installed_at,id)>(?,?)" in plan for plan in plans[continuations - 2 : continuations]
+    ), plans
+    assert "ix_skill_sources_order" in plans[continuations]
+    assert "(created_at,id)>(?,?)" in plans[continuations], plans
 
 
 def test_reinstall_replaces_in_place_and_reports_the_old_tarball(
@@ -440,7 +451,8 @@ def test_list_pages_continue_without_omissions_or_duplicates(store: SqlAlchemySk
     assert first.has_more and not rest.has_more
     assert len(first.data) + len(rest.data) == 4
     assert len({s.id for s in first.data + rest.data}) == 4
-    for bad in ("0" * 32, "1.zz", "x", "-1." + "0" * 32):
+    # The last is a 19-digit epoch past signed 64-bit, which overflowed the bind.
+    for bad in ("0" * 32, "1.zz", "x", "-1." + "0" * 32, "9" * 19 + "." + "0" * 32):
         with pytest.raises(SkillValueError, match="invalid cursor"):
             store.list_sources(after=bad)
         with pytest.raises(SkillValueError, match="invalid cursor"):
