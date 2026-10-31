@@ -35,6 +35,7 @@ when the credentials file is absent — see ``ambient._claude_login_detected``.)
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
@@ -43,9 +44,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Protocol, cast
 
 from packaging.version import InvalidVersion, Version
 
@@ -1110,11 +1110,18 @@ def harness_install_display(key: str) -> str:
     return " ".join(harness_install_command(key))
 
 
-# Lines of installer stderr kept for diagnosis. The output is teed straight to
-# this process as it arrives, so this buffer only has to be long enough to hold
+# Installer stderr kept for diagnosis. The output is teed straight to this
+# process as it arrives, so this buffer only has to be long enough to hold
 # npm's error block — not the whole install log, which must not grow the host
-# daemon's memory.
-_INSTALLER_STDERR_TAIL_LINES = 80
+# daemon's memory. Bounded in bytes rather than lines because a line has no
+# length limit: an installer drawing a progress bar emits carriage returns, so
+# its whole run of output can arrive as one unterminated "line".
+_INSTALLER_STDERR_TAIL_BYTES = 16 * 1024
+
+# Read size for the tee. Chunked rather than line-iterated so peak buffering
+# stays bounded too — waiting for a newline would accumulate that progress-bar
+# output in full before there was anything to trim.
+_INSTALLER_STDERR_CHUNK_BYTES = 4 * 1024
 
 # Grace for the tee thread to drain after the installer exits. Bounded so a
 # pipe that never reaches EOF cannot hang the install call.
@@ -1160,6 +1167,21 @@ def _installer_failure_reason(returncode: int, stderr_tail: str) -> str:
     return f"installer exited with code {returncode}"
 
 
+class _ChunkedPipe(Protocol):
+    """A binary pipe read in bounded chunks.
+
+    ``Popen`` types ``stderr`` as ``IO[bytes]``, which does not declare
+    ``read1`` — the read that returns what has arrived rather than blocking
+    for a full chunk, as a plain ``read(n)`` would.
+    """
+
+    def read1(self, size: int, /) -> bytes: ...
+
+    def __enter__(self) -> object: ...
+
+    def __exit__(self, *exc_info: object) -> bool | None: ...
+
+
 def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
     """Run an installer, teeing its stderr so it is both shown and readable.
 
@@ -1174,6 +1196,9 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
     drain wait is bounded rather than closing the pipe here, which would block
     until that child exits.
 
+    The pipe is read in bounded chunks, so neither the retained tail nor the
+    peak buffering depends on the installer emitting newlines.
+
     :param cmd: The installer argv, e.g. ``["npm", "install", "-g", pkg]``.
     :param timeout: Seconds to wait before killing the installer.
     :returns: ``(returncode, stderr_tail)``.
@@ -1181,27 +1206,28 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
         installer and its child processes are killed before this propagates.
     :raises OSError: If the installer cannot be executed at all.
     """
-    tail: deque[str] = deque(maxlen=_INSTALLER_STDERR_TAIL_LINES)
+    tail = bytearray()
     tail_lock = threading.Lock()
+    # Binary, so the tee can read whatever is available instead of blocking for
+    # a full chunk the way a TextIOWrapper read would; decoded incrementally
+    # below so a multi-byte character split across chunks still renders.
     # Not _proc.spawn_kwargs(): a new session would cut the setup wizard's
     # installers off from the terminal (prompts, /dev/tty, Ctrl-C).
-    proc = subprocess.Popen(
-        cmd,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        bufsize=1,
-    )
-    stream = proc.stderr
-    assert stream is not None  # stderr=PIPE above
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    assert proc.stderr is not None  # stderr=PIPE above
+    stream = cast(_ChunkedPipe, proc.stderr)
 
     def _tee() -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         with stream:
-            for line in stream:
+            while chunk := stream.read1(_INSTALLER_STDERR_CHUNK_BYTES):
                 with tail_lock:
-                    tail.append(line)
-                sys.stderr.write(line)
+                    tail.extend(chunk)
+                    del tail[:-_INSTALLER_STDERR_TAIL_BYTES]
+                sys.stderr.write(decoder.decode(chunk))
                 sys.stderr.flush()
+            sys.stderr.write(decoder.decode(b"", final=True))
+            sys.stderr.flush()
 
     # A reader thread, so a wedged installer still hits the timeout below
     # instead of blocking forever on a read that never reaches EOF.
@@ -1218,7 +1244,7 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
     finally:
         pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
     with tail_lock:
-        return returncode, "".join(tail)
+        return returncode, bytes(tail).decode("utf-8", errors="replace")
 
 
 class HarnessInstallResult(NamedTuple):
@@ -1247,8 +1273,8 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
 
     A failing installer's stderr is teed rather than merely passed through, so
     the reason can name what the user has to fix — a permission problem and an
-    unreachable registry are both exit code 1 and were previously reported
-    identically.
+    unreachable registry are both exit code 1, so stderr is the only thing that
+    distinguishes them.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI

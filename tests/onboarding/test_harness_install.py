@@ -84,13 +84,13 @@ class FakeInstaller:
 
     :param argv: The argv the installer was asked to run.
     :param returncode: Exit status :meth:`wait` reports.
-    :param stderr: Text the installer writes to stderr, teed line by line.
+    :param stderr: Text the installer writes to stderr, teed in chunks.
     """
 
     def __init__(self, argv: list[str], *, returncode: int = 0, stderr: str = "") -> None:
         self.args = argv
         self.returncode = returncode
-        self.stderr = io.StringIO(stderr)
+        self.stderr = io.BytesIO(stderr.encode())
         self.killed = False
 
     def wait(self, timeout: float | None = None) -> int:
@@ -115,7 +115,14 @@ def fake_installer(
     :param on_call: Side effect per invocation, e.g. marking a binary present.
     """
 
-    def _popen(argv: list[str], **_kwargs: object) -> FakeInstaller:
+    def _popen(argv: list[str], **kwargs: object) -> FakeInstaller:
+        # Pins the subprocess boundary the tee depends on: stderr piped so it
+        # can be read, stdout/stdin absent so they keep inheriting this
+        # process's, and no text mode so chunked reads stay available.
+        assert kwargs == {"stderr": subprocess.PIPE}, (
+            f"installer Popen kwargs changed: {kwargs!r} — the tee needs stderr "
+            "piped and stdout inheriting, so update this assertion deliberately"
+        )
         if calls is not None:
             calls.append(argv)
         if on_call is not None:
@@ -955,6 +962,49 @@ def test_installer_stderr_still_reaches_this_process(
     hi.try_install_harness_cli(OPENAI_FAMILY)
 
     assert NPM_EACCES in capsys.readouterr().err
+
+
+def test_installer_tail_stays_bounded_against_newline_free_output(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A newline-free run of output must not grow the retained tail.
+
+    An installer drawing a progress bar emits carriage returns, so its whole
+    run can arrive as one unterminated line — which a line-keyed tail would
+    hold in full. The cause still has to be found in what is kept, and the
+    output still has to be displayed in full.
+    """
+    progress = "fetching \r" * hi._INSTALLER_STDERR_TAIL_BYTES
+    monkeypatch.setattr(
+        hi.subprocess, "Popen", fake_installer(returncode=1, stderr=progress + NPM_EACCES)
+    )
+
+    returncode, stderr_tail = hi._run_installer(["npm", "install", "-g", "pkg"], timeout=5)
+
+    assert returncode == 1
+    assert len(progress) > hi._INSTALLER_STDERR_TAIL_BYTES, "the fake must overflow the tail"
+    assert len(stderr_tail) <= hi._INSTALLER_STDERR_TAIL_BYTES
+    assert hi._installer_failure_reason(returncode, stderr_tail) == (
+        "permission denied writing the global install directory (npm EACCES)"
+    )
+    assert progress in capsys.readouterr().err, "trimming the tail also truncated the display"
+
+
+def test_installer_tee_decodes_a_character_split_across_chunks(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Chunked reads must not mangle a multi-byte character on the boundary.
+
+    Reading bytes rather than lines means a chunk can end mid-character, so the
+    tee decodes incrementally instead of per chunk.
+    """
+    # Lands a multi-byte character astride the first chunk boundary.
+    padded = "a" * (hi._INSTALLER_STDERR_CHUNK_BYTES - 1) + "é" + "b" * 8
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1, stderr=padded))
+
+    hi._run_installer(["npm", "install", "-g", "pkg"], timeout=5)
+
+    assert capsys.readouterr().err == padded
 
 
 def test_installer_timeout_kills_children_holding_stderr(
