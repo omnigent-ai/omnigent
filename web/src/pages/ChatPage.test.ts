@@ -15,6 +15,7 @@ import {
   buildPendingBubbles,
   buildSlashCommandMap,
   composerOffersClear,
+  composerOffersRewind,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
@@ -1448,7 +1449,7 @@ describe("collectBubbleMarkdown", () => {
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
-describe("composer /clear gating", () => {
+describe("composer /clear and /rewind gating", () => {
   const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
 
   it.each([
@@ -1473,10 +1474,21 @@ describe("composer /clear gating", () => {
     // An older server lists "clear" for native sessions only.
     expect(composerOffersClear("claude-sdk", info({ session_event_types: ["clear"] }))).toBe(false);
   });
+
+  it.each([
+    ["claude-sdk", true],
+    ["claude-native", true],
+    ["codex-native", false],
+    ["openai-agents", false],
+  ] as const)("offers /rewind for %s when the server has the endpoint", (harness, offered) => {
+    expect(composerOffersRewind(harness, info({ session_rewind: true }))).toBe(offered);
+    expect(composerOffersRewind(harness, info({}))).toBe(false);
+    expect(composerOffersRewind(harness, "loading")).toBe(false);
+  });
 });
 
 describe("buildSlashCommandMap", () => {
-  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind"];
 
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
@@ -1513,6 +1525,32 @@ describe("buildSlashCommandMap", () => {
     expect(
       buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
     ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
+  });
+
+  it("includes /rewind only when showRewind is true", () => {
+    expect(buildSlashCommandMap([], true, true)["/rewind"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap(
+        [],
+        true,
+        true,
+        true,
+        false,
+        false,
+        "/",
+        false,
+        false,
+        false,
+        false,
+        true,
+      )["/rewind"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/rewind"]);
+    // The /permissions slot right before it doesn't turn on /rewind.
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/rewind"
+      ],
+    ).toBeUndefined();
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
