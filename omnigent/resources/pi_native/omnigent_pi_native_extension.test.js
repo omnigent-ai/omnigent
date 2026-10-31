@@ -727,9 +727,117 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   }
 }
 
+async function testContextTokensReportedForRing() {
+  // Regression coverage: pi-native posted only cumulative_* + model, so the
+  // server never wrote omnigent.last_context_tokens and the web context ring
+  // stayed gated off (tokensUsed == null) for every pi-native session.
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  await h.handlers.session_start({}, ctx);
+  await h.handlers.agent_start({}, ctx);
+  await h.handlers.turn_start({ turnIndex: 1 }, ctx);
+
+  const usagePosts = () =>
+    h.postedEvents.filter((e) => e && e.type === "external_session_usage");
+
+  await h.handlers.message_end(
+    {
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        timestamp: 1000,
+        content: [{ type: "text", text: "hi" }],
+        model: "gateway-model",
+        usage: {
+          input: 100,
+          output: 20,
+          cacheRead: 5000,
+          cacheWrite: 0,
+          totalTokens: 5120,
+          cost: { total: 0.01 },
+        },
+      },
+    },
+    ctx,
+  );
+
+  const first = usagePosts();
+  assert(
+    "usage post reports context_tokens so the ring can render",
+    first.length === 1 && first[0].data.context_tokens === 5120,
+    JSON.stringify(first.map((e) => e.data)),
+  );
+  assert(
+    "cumulative fields still accompany context_tokens",
+    first.length === 1 &&
+      first[0].data.cumulative_input_tokens === 5100 &&
+      first[0].data.cumulative_output_tokens === 20,
+    JSON.stringify(first.map((e) => e.data)),
+  );
+
+  // A later, *smaller* fill (post-compaction) is a gauge update, not an
+  // increase: the POST must not be swallowed as "unchanged".
+  await h.handlers.message_end(
+    {
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        timestamp: 2000,
+        content: [{ type: "text", text: "again" }],
+        model: "gateway-model",
+        usage: {
+          input: 50,
+          output: 10,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 60,
+          cost: { total: 0.002 },
+        },
+      },
+    },
+    ctx,
+  );
+
+  const second = usagePosts();
+  assert(
+    "a shrinking context fill still reports (gauge, not monotonic counter)",
+    second.length === 2 && second[1].data.context_tokens === 60,
+    JSON.stringify(second.map((e) => e.data)),
+  );
+
+  // Pi can omit ``totalTokens``; fall back to the component sum, matching the
+  // in-process pi executor's context_tokens derivation.
+  await h.handlers.message_end(
+    {
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        timestamp: 3000,
+        content: [{ type: "text", text: "fallback" }],
+        model: "gateway-model",
+        usage: {
+          input: 7,
+          output: 3,
+          cacheRead: 90,
+          cacheWrite: 0,
+          cost: { total: 0.001 },
+        },
+      },
+    },
+    ctx,
+  );
+
+  const third = usagePosts();
+  assert(
+    "context_tokens falls back to input+output+cache when totalTokens is absent",
+    third.length === 3 && third[2].data.context_tokens === 100,
+    JSON.stringify(third.map((e) => e.data)),
+  );
+}
+
 (async () => {
   try {
-    await testSessionStartupDoesNotCompleteATurn();
+    await testContextTokensReportedForRing();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     await testRunningIdleShareResponseId();

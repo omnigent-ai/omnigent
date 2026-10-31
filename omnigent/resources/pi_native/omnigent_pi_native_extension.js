@@ -1983,6 +1983,12 @@ module.exports = function (pi) {
   let completeCost = true;
   let usageModel = null;
   let lastPostedUsageKey = "";
+  // How full the context window is going into the NEXT request: the LAST
+  // completed call's total tokens. A gauge, not a counter — reporting the sum
+  // across calls would double-count the re-sent history. Mirrors the in-process
+  // pi executor's ``context_tokens`` (``_aggregate_pi_turn_usage``), which is
+  // what makes the web context ring render for relay pi sessions.
+  let lastContextTokens = 0;
 
   // Build a stable fingerprint for one assistant message so the same message
   // arriving on multiple lifecycle events is only counted once. Pi's
@@ -2026,6 +2032,10 @@ module.exports = function (pi) {
     cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
     cumulativeOutputTokens += usage.output;
     cumulativeCacheReadTokens += usage.cacheRead;
+    // Recompute from components when the provider omits ``totalTokens``, the
+    // same fallback the in-process pi executor uses.
+    lastContextTokens =
+      usage.total || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
     if (usage.cost === null) completeCost = false;
     else cumulativeCostUsd += usage.cost;
     if (usage.model) usageModel = usage.model;
@@ -2033,7 +2043,10 @@ module.exports = function (pi) {
   }
 
   function usagePostKey() {
-    return `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${completeCost ? cumulativeCostUsd : "unknown"}-${usageModel || ""}`;
+    // ``lastContextTokens`` is part of the key: it advances even when the
+    // cumulative totals do not (a re-run of the same prompt), and the server
+    // treats an unchanged key as "nothing to report".
+    return `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${completeCost ? cumulativeCostUsd : "unknown"}-${usageModel || ""}-${lastContextTokens}`;
   }
 
   // Persist before reporting; unchanged totals need no additional POST.
@@ -2051,6 +2064,13 @@ module.exports = function (pi) {
       cumulative_output_tokens: cumulativeOutputTokens,
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
     };
+    // The context-occupancy ring's numerator. The server stores it in the
+    // ``omnigent.last_context_tokens`` label and broadcasts it on
+    // ``session.usage``; without it the web ring stays gated off for pi-native
+    // sessions even though cost and cumulative tokens render fine. Omitted
+    // until a turn reports usage, so the label keeps its last value instead of
+    // being pinned to 0.
+    if (lastContextTokens > 0) data.context_tokens = lastContextTokens;
     if (completeCost) data.cumulative_cost_usd = cumulativeCostUsd;
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
