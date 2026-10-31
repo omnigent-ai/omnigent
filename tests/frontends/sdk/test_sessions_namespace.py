@@ -44,6 +44,7 @@ from omnigent_client._sessions import (
     SessionsNamespace,
 )
 
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.server.routes._host_launch import _MAX_LAUNCH_TIMEOUT_S
 from omnigent.server.schemas import (
     CompletedEvent,
@@ -1631,9 +1632,20 @@ async def test_list_launch_hosts_matches_server_canonical_key(
     listed = await _launch_hosts(
         {"hosts": hosts},
         harness="claude",
+        canonicalize=canonicalize_harness,
     )
 
     assert [(h, ok) for h, _, ok, _ in listed] == [("h1", launchable)]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_without_canonicalize_looks_up_harness_as_given() -> None:
+    """The client has no alias table of its own; callers inject one."""
+    hosts = [_host("h1", harnesses={"claude": True})]
+
+    listed = await _launch_hosts({"hosts": hosts}, harness="claude")
+
+    assert [(h, ok) for h, _, ok, _ in listed] == [("h1", True)]
 
 
 @pytest.mark.asyncio

@@ -58,9 +58,9 @@ def test_set_version_rewrites_every_location(repo_copy: Path) -> None:
     # Four pyprojects and omnigent/version.py.
     assert len(changed) == 5
     # root: version line + three sibling pins (client, ui-sdk, slack);
-    # client/ui SDKs: version line + one pin; slack: version line only.
+    # ui SDK: version line + one pin; client and slack: version line only.
     assert (repo_copy / "pyproject.toml").read_text().count("9.9.9") == 4
-    assert (repo_copy / "sdks/python-client/pyproject.toml").read_text().count("9.9.9") == 2
+    assert (repo_copy / "sdks/python-client/pyproject.toml").read_text().count("9.9.9") == 1
     assert (repo_copy / "sdks/ui/pyproject.toml").read_text().count("9.9.9") == 2
     assert (repo_copy / "integrations/slack/pyproject.toml").read_text().count("9.9.9") == 1
     # The runtime constant is stamped too.
@@ -123,8 +123,8 @@ def test_check_detects_version_drift(repo_copy: Path) -> None:
 def test_check_detects_missing_pin(repo_copy: Path) -> None:
     update_versions.set_version(repo_copy, "9.9.9")
     # Break the sibling pin while leaving the version intact.
-    client = repo_copy / "sdks/python-client/pyproject.toml"
-    client.write_text(client.read_text().replace('"omnigent==9.9.9"', '"omnigent==9.9.8"'))
+    ui = repo_copy / "sdks/ui/pyproject.toml"
+    ui.write_text(ui.read_text().replace('"omnigent-client==9.9.9"', '"omnigent-client==9.9.8"'))
     with pytest.raises(ValueError, match="missing exact pin"):
         update_versions.check(repo_copy)
 
