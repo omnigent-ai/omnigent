@@ -11,7 +11,7 @@ const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 
 const cli = require("../src/omnigent_cli");
-const { ensureServerAuth } = require("../src/server_manager");
+const { ensureServerAuth, ensureHostConnected } = require("../src/server_manager");
 
 const SERVER = "https://app.example.com";
 const CLI_PATH = "/bin/omnigent";
@@ -136,5 +136,59 @@ describe("ensureServerAuth", () => {
     assert.equal(res.ok, false);
     assert.equal(res.authError, true);
     assert.match(res.error, /omnigent login https:\/\/app\.example\.com/);
+  });
+});
+
+describe("ensureHostConnected with a background connect command", () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  // A stand-in for `isaac omni`: prints its argv, then exits with EXIT_CODE.
+  const fakeConnectCommand = (exitCode, output = "") => ({
+    executable: process.execPath,
+    prefixArgs: [
+      "-e",
+      `console.log(${JSON.stringify(output)} || JSON.stringify(process.argv.slice(1))); process.exit(${exitCode});`,
+      "--",
+    ],
+    displayName: "isaac omni",
+    backgroundConnect: true,
+  });
+
+  it("runs `<cli> --server <url>` and adopts the background host it starts", async () => {
+    const server = "https://bg-ok.example.com/omnigent?o=1";
+    let checks = 0;
+    mock.method(cli, "getHostConnectionFast", async () => ({ connected: checks++ > 0 }));
+    const res = await ensureHostConnected(fakeConnectCommand(0), server);
+    assert.deepEqual(res, { ok: true, ownedByDesktop: false, adopted: true });
+    assert.equal(checks, 2);
+  });
+
+  it("adopts an already-connected host without running the command", async () => {
+    const server = "https://bg-connected.example.com";
+    mock.method(cli, "getHostConnectionFast", async () => ({ connected: true }));
+    const res = await ensureHostConnected(fakeConnectCommand(1, "must not run"), server);
+    assert.deepEqual(res, { ok: true, ownedByDesktop: false, adopted: true });
+  });
+
+  it("reports the command's output and flags sign-in failures", async () => {
+    const server = "https://bg-auth.example.com";
+    mock.method(cli, "getHostConnectionFast", async () => ({ connected: false }));
+    const res = await ensureHostConnected(
+      fakeConnectCommand(1, "Not signed in. Run `isaac omni login https://bg-auth.example.com`."),
+      server,
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.authError, true);
+    assert.match(res.error, /isaac omni login/);
+  });
+
+  it("passes --server <url> --non-interactive after the launcher", async () => {
+    const server = "https://bg-argv.example.com";
+    mock.method(cli, "getHostConnectionFast", async () => ({ connected: false }));
+    const res = await ensureHostConnected(fakeConnectCommand(3), server);
+    assert.equal(res.ok, false);
+    assert.equal(res.error, JSON.stringify(["--server", server, "--non-interactive"]));
   });
 });
