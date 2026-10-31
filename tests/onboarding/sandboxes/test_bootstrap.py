@@ -15,6 +15,10 @@ import click
 import httpx
 import pytest
 
+from omnigent.onboarding.databricks_login import (
+    extract_oauth_url,
+    loopback_port_from_authorize_url,
+)
 from omnigent.onboarding.sandboxes import bootstrap as bootstrap_mod
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
@@ -25,8 +29,6 @@ from omnigent.onboarding.sandboxes.base import (
 from omnigent.onboarding.sandboxes.bootstrap import (
     DEFAULT_SANDBOX_NAME,
     DerivedWorkspace,
-    _extract_oauth_url,
-    _loopback_port_from_authorize_url,
     _read_login_url,
     bootstrap_sandbox_host,
     build_wheels,
@@ -220,26 +222,26 @@ _AUTHORIZE_URL = (
 def test_extract_oauth_url_pulls_url_from_pty_line() -> None:
     """A PTY line wrapped in ANSI codes still yields the bare URL."""
     line = f"\x1b[2m{_AUTHORIZE_URL}\x1b[0m\r\n"
-    assert _extract_oauth_url(line) == _AUTHORIZE_URL
+    assert extract_oauth_url(line) == _AUTHORIZE_URL
 
 
 def test_extract_oauth_url_ignores_non_authorize_lines() -> None:
     """Banner / prose lines (no authorize URL) yield ``None``."""
-    assert _extract_oauth_url("Please continue in your browser:\r\n") is None
+    assert extract_oauth_url("Please continue in your browser:\r\n") is None
     # A different https URL without the authorize path must not match —
     # otherwise we'd forward against a port that isn't the callback.
-    assert _extract_oauth_url("https://example.databricks.com/login\r\n") is None
+    assert extract_oauth_url("https://example.databricks.com/login\r\n") is None
 
 
 def test_loopback_port_parsed_from_authorize_url() -> None:
     """The dynamic callback port is read from the encoded redirect_uri."""
-    assert _loopback_port_from_authorize_url(_AUTHORIZE_URL) == 8022
+    assert loopback_port_from_authorize_url(_AUTHORIZE_URL) == 8022
 
 
 def test_loopback_port_raises_when_redirect_uri_absent() -> None:
     """A URL missing redirect_uri must fail loud, not guess a port."""
     with pytest.raises(click.ClickException) as exc:
-        _loopback_port_from_authorize_url(
+        loopback_port_from_authorize_url(
             "https://example.databricks.com/oidc/v1/authorize?client_id=databricks-cli"
         )
     assert "callback port" in str(exc.value)
