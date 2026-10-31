@@ -36,10 +36,12 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
   }, []);
 
   return (
+    // Size to the tabs, not the free space: the no-drag box would otherwise
+    // cover the empty title bar and block macOS window dragging there.
     <div
       ref={viewportRef}
       data-workspace-tabs-viewport
-      className="no-drag min-w-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      className="no-drag min-w-0 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
     >
       <div ref={contentRef} className="flex w-max items-center gap-0.5">
         {children}
