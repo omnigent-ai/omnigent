@@ -1043,6 +1043,18 @@ Request body matches `SessionEventInput`:
                                   publishes a `session.status` event with
                                   data `{status: "running" | "waiting" |
                                   "idle" | "failed"}`
+      - "external_background_work"
+                                — internal runner report of work that
+                                  outlives a turn; publishes no status edge.
+                                  Payload: at least one of `{running: bool,
+                                  background_task_count: int}`, with optional
+                                  `background_tasks` detail for the count.
+                                  `running` sets the session list's
+                                  `background_work_running`. The count
+                                  publishes a `session.background_tasks`
+                                  event for the composer; `0` clears it. A
+                                  runner the session is no longer bound to
+                                  gets 403.
       - "subagent.status"        — internal transcript-inactivity observation.
                                   Payload: `{idle: true}`; only literal `true`
                                   is accepted. Uses the existing idle publisher
@@ -1415,6 +1427,7 @@ stream and surface queue/interrupt semantics.
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
 | `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |
+| `session.background_tasks` | `SessionBackgroundTasksEvent` | `{type, conversation_id, background_task_count: int, background_tasks: BackgroundTaskInfo[]}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |
