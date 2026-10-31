@@ -764,6 +764,25 @@ export function VirtualBubbleList({
     },
   });
 
+  // A row mounted mid-scroll is only measured by its ResizeObserver, after the layout
+  // has recorded its shift. Measuring it right after the commit corrects the scroll first.
+  const measureRow = useCallback(
+    (node: HTMLDivElement | null) => {
+      virtualizer.measureElement(node);
+      if (node === null) return;
+      queueMicrotask(() => {
+        const key = node.dataset.bubbleKey;
+        if (!node.isConnected || key === undefined || virtualizer.itemSizeCache.has(key)) return;
+        // The cached offset lags scroll writes until the next scroll event, and the
+        // correction below writes an absolute position built from it.
+        const scroller = virtualizer.scrollElement;
+        if (scroller) virtualizer.scrollOffset = scroller.scrollTop;
+        virtualizer.resizeItem(Number(node.dataset.index), node.getBoundingClientRect().height);
+      });
+    },
+    [virtualizer],
+  );
+
   // An assistant bubble is keyed by its first item, so a history page that
   // continues the top turn renames it. Keep rendering it under the key its row
   // already has: React keeps the node (a remount replays the action row's hover
@@ -1086,7 +1105,7 @@ export function VirtualBubbleList({
             key={rowKey(bubble)}
             data-index={item.index}
             data-bubble-key={rowKey(bubble)}
-            ref={virtualizer.measureElement}
+            ref={measureRow}
             className="relative"
           >
             <BubbleView
