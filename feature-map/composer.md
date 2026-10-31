@@ -120,11 +120,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
-  chat shows no menu and sends slash text to the vendor TUI. Claude Code,
-  Codex native and claude-sdk sessions offer `/clear` only when `/v1/info` lists
-  `clear` in `session_event_types`; otherwise a typed `/clear` goes to the
-  harness as text. A claude-sdk `/clear` continues in a new, empty session on
-  the same machine and the view follows it. States: loading, error/retry,
+  chat shows no menu and sends slash text to the vendor TUI. Claude Code and
+  Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
+  `session_event_types`; claude-sdk sessions only when it reports
+  `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the harness
+  as text. A claude-sdk `/clear` continues in a new, empty session on the same
+  machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
