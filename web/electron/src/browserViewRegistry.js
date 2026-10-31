@@ -81,7 +81,7 @@ function createBrowserViewRegistry({
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
-  isArcaAgentContext = () => false,
+  allowsLocalhost: contextAllowsLocalhost = () => false,
   // (hostname, partition) => Promise<string[]> for the agent DNS check, and
   // (url, partition) => Promise<string> ("DIRECT" or a PAC-style proxy list).
   resolveHost = lookupHostAddresses,
@@ -98,6 +98,35 @@ function createBrowserViewRegistry({
     const generation = Symbol();
     pendingNavigations.set(conversationId, generation);
     return () => pendingNavigations.get(conversationId) === generation;
+  }
+  const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
+
+  function needsAgentViewRevocation(entry, nextContext) {
+    const context = entry?.agentContext;
+    return (
+      context?.hostIsThisMachine === true &&
+      (context.revoked ||
+        !nextContext?.hostIsThisMachine ||
+        nextContext.sourceHostId !== context.sourceHostId)
+    );
+  }
+
+  async function revokeAgentView(conversationId, isCurrent = beginAgentNavigation(conversationId)) {
+    const entry = get(conversationId);
+    const context = entry?.agentContext;
+    if (!context) return { ok: true };
+    context.revoked = true;
+    try {
+      await entry.view.webContents.loadURL("about:blank");
+      if (!isCurrent() || get(conversationId) !== entry || entry.agentContext !== context) {
+        return { ok: false, error: "navigation superseded or closed" };
+      }
+      entry.agentContext = null;
+      entry.lastRequestedUrl = "about:blank";
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Unable to clear the previous browser page" };
+    }
   }
   let activeConversationId = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
@@ -218,7 +247,7 @@ function createBrowserViewRegistry({
       }
       if (entry.agentNavLocked) {
         const verdict = isAgentNavigationAllowed(url, {
-          allowLocalhost: isArcaAgentContext(entry.agentContext),
+          allowLocalhost: allowsLocalhost(entry.agentContext),
         });
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
@@ -285,7 +314,7 @@ function createBrowserViewRegistry({
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
       const verdict = isAgentNavigationAllowed(targetUrl, {
-        allowLocalhost: isArcaAgentContext(entry.agentContext),
+        allowLocalhost: allowsLocalhost(entry.agentContext),
       });
       if (!verdict.ok) {
         try {
@@ -391,7 +420,7 @@ function createBrowserViewRegistry({
   function checkAgentNavigationFor(conversationId, url, agentContext) {
     const partition = agentPartition(partitionScope, conversationId);
     return checkAgentNavigation(url, {
-      allowLocalhost: isArcaAgentContext(agentContext),
+      allowLocalhost: allowsLocalhost(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
     });
   }
@@ -457,7 +486,7 @@ function createBrowserViewRegistry({
     const entry = agentLockedEntryFor(webContentsId);
     if (!entry) return false;
     const verdict = isAgentConnectionAllowed(url, ip, {
-      allowLocalhost: isArcaAgentContext(entry.agentContext),
+      allowLocalhost: allowsLocalhost(entry.agentContext),
     });
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
@@ -479,6 +508,9 @@ function createBrowserViewRegistry({
 
   function openOrNavigate(conversationId, url, bounds, opts) {
     const force = !!(opts && opts.force);
+    if (needsAgentViewRevocation(get(conversationId), opts?.agentContext)) {
+      return { ok: false, error: "Previous browser page must be cleared before navigating" };
+    }
     // Agent-driven nav (opts.agent) is gated by an allowlist (see
     // browserUrlPolicy) so the model can't point the view at file:// /
     // metadata / loopback / private hosts and exfiltrate via screenshot. URL-bar
@@ -486,7 +518,7 @@ function createBrowserViewRegistry({
     // rejected nav creates no blank view.
     if (opts && opts.agent && url) {
       const verdict = isAgentNavigationAllowed(url, {
-        allowLocalhost: isArcaAgentContext(opts.agentContext),
+        allowLocalhost: allowsLocalhost(opts.agentContext),
       });
       if (!verdict.ok) {
         return { ok: false, error: verdict.error };
@@ -661,6 +693,8 @@ function createBrowserViewRegistry({
     getOrCreate,
     openOrNavigate,
     beginAgentNavigation,
+    needsAgentViewRevocation,
+    revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
     shouldCancelAgentRequest,
     agentRequestHeaders,
