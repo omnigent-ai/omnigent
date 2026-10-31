@@ -298,6 +298,90 @@ def test_subagent_in_long_tool_call_stays_working(
         )
 
 
+_ESC_PARENT = "CLI_DRIFT_ESC_PARENT: delegate the slow check to a general-purpose agent."
+_ESC_CHILD = "CLI_DRIFT_ESC_CHILD_TASK: run the slow twenty second check in the shell and report."
+_ESC_SLEEP_RESULT = '"tool_use_id": "toolu_cli_drift_esc_sleep"'
+
+
+@pytest.mark.timeout(420)
+def test_subagent_settles_after_esc_interrupts_its_tool_call(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+    claude_managed_settings: None,
+) -> None:
+    """Esc during a sub-agent's long tool call must not leave the child working forever."""
+    _require_real_claude()
+    mock_url = mock_llm_server_url
+    reset_mock_llm(mock_url)
+    configure_mock_llm(
+        mock_url,
+        [
+            _agent_call("toolu_cli_drift_esc_child", _ESC_CHILD, background=False),
+            {"text": "The slow check is running in a sub-agent."},
+        ],
+        match=_ESC_PARENT,
+        required_tools=["Agent"],
+    )
+    configure_mock_llm(
+        mock_url,
+        [
+            _bash_call(
+                "toolu_cli_drift_esc_sleep",
+                {"command": "sleep 20; echo slow-check-ok", "description": "Slow check"},
+            ),
+            {"text": "Slow check finished after the wait."},
+        ],
+        match=_ESC_CHILD,
+        required_tools=["Bash"],
+    )
+    _scripted_fallbacks(mock_url)
+
+    with _session_page(request, live_server, mock_url, tmp_path_factory) as (
+        base_url,
+        parent_id,
+        page,
+    ):
+        composer = _open_chat(page, base_url, parent_id)
+        requests_log = _MockRequestLog(mock_url)
+        _send(page, composer, _ESC_PARENT)
+        child_id = _wait_for(
+            lambda: next(iter(_children(base_url, parent_id)), None),
+            timeout=120,
+            what="the Claude sub-agent child session",
+        )["id"]
+        _wait_for(
+            lambda: requests_log.refresh() and requests_log.contains(_ESC_CHILD),
+            timeout=120,
+            what="the sub-agent's Bash call",
+        )
+        _open_terminal(page)
+        page.keyboard.press("Escape")
+        requests_log.refresh()
+        assert not requests_log.contains(_ESC_SLEEP_RESULT), "Esc landed after the sleep ended"
+
+        def esc_screen() -> str | None:
+            screen = _cli_screen(base_url, parent_id)
+            return screen if re.search(r"Backgrounded agent|Interrupted", screen) else None
+
+        cli_screen = str(_wait_for(esc_screen, timeout=30, what="Esc to reach the CLI"))
+        _select_view_mode(page, "Chat")
+        avatar = _agents_row(_open_agents_tab(page), child_id).get_by_test_id(
+            "subagent-status-avatar"
+        )
+        try:
+            expect(avatar).to_have_attribute(
+                "data-activity", re.compile("^(done|idle)$"), timeout=60_000
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                f"the sub-agent still shows {avatar.get_attribute('data-activity')!r} 60s after "
+                f"Esc; CLI:\n{cli_screen}"
+            ) from error
+        assert _session(base_url, child_id).get("status") == "idle"
+
+
 _SHELL_RESULT = '"tool_use_id": "toolu_cli_drift_background_shell"'
 _SHELL_OBSERVE_S = 20
 
@@ -539,7 +623,7 @@ def test_background_subagent_settles_after_clear(
             },
         )
         final = samples[-1]
-        assert final["ui_activity"] != "working" and final["old_status"] == "idle", (
+        assert final["ui_activity"] in ("done", "idle") and final["old_status"] == "idle", (
             f"{_CLEAR_SETTLE_S}s after /clear the cleared chat still shows its background "
             f"sub-agent as {final['ui_activity']!r} and the chat as {final['old_status']!r}; "
             f"CLI:\n{cli_screen}"

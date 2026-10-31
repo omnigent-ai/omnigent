@@ -709,14 +709,14 @@ def test_background_launch_from_an_ended_turn_is_already_in_stop_count() -> None
     assert (dedupe.background_task_count, dedupe.background_tally_changed) == (0, False)
 
 
+@pytest.mark.parametrize("stop_with_truncated_detail", [False, True], ids=["no-stop", "stop"])
 def test_background_finish_lowers_count_only_for_counted_shells(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, stop_with_truncated_detail: bool
 ) -> None:
     monkeypatch.setattr(forwarder, "_BACKGROUND_TASK_FORWARD_LIMIT", 1)
+    earlier = {**_LONG_JOB_SHELL, "id": "earlier"}
     dedupe = forwarder._ForwardDedupeState()
-    forwarder._reset_background_tally(
-        dedupe, count=1, tasks=[{**_LONG_JOB_SHELL, "id": "earlier"}]
-    )
+    forwarder._reset_background_tally(dedupe, count=1, tasks=[earlier])
     launch = ClaudeTranscriptItem(
         source_id="r1:0:function_call_output",
         item_type="function_call_output",
@@ -725,6 +725,8 @@ def test_background_finish_lowers_count_only_for_counted_shells(
         background_task_id="bh5h2361s",
     )
     forwarder._note_background_shell_signals(launch, dedupe, ended_response_ids=())
+    if stop_with_truncated_detail:
+        forwarder._reset_background_tally(dedupe, count=2, tasks=[earlier])
     assert (dedupe.background_task_count, len(dedupe.background_tasks)) == (2, 1)
 
     counts = []
@@ -799,6 +801,7 @@ async def test_turn_end_hook_replaces_transcript_background_tally(
     dedupe = forwarder._ForwardDedupeState(
         background_task_count=1,
         background_tasks=(_LONG_JOB_SHELL,),
+        background_task_ids=frozenset({_LONG_JOB_SHELL["id"]}),
         background_tally_changed=True,
         interrupted_turn_pending=True,
     )
@@ -824,6 +827,7 @@ async def test_turn_end_hook_replaces_transcript_background_tally(
         )
 
     assert (dedupe.background_task_count, dedupe.background_tasks) == (count, tasks)
+    assert dedupe.background_task_ids == {task["id"] for task in tasks}
     assert (dedupe.background_tally_changed, dedupe.interrupted_turn_pending) == (False, False)
 
 

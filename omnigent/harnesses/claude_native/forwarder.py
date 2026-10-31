@@ -5315,9 +5315,13 @@ def _reset_background_tally(
     """Adopt the count and detail a turn-end hook edge delivered."""
     dedupe.background_task_count = count
     dedupe.background_tasks = tuple(tasks or ())
-    dedupe.background_task_ids = frozenset(
+    detail_ids = frozenset(
         task_id for task in dedupe.background_tasks if isinstance(task_id := task.get("id"), str)
     )
+    # Ids counted earlier may be the shells a truncated detail list leaves out.
+    if count > len(detail_ids):
+        detail_ids |= dedupe.background_task_ids
+    dedupe.background_task_ids = detail_ids
     dedupe.background_tally_changed = False
     dedupe.interrupted_turn_pending = False
 
