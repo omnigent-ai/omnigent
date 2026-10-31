@@ -85,6 +85,35 @@ def test_system_prompt_preset_is_scoped_to_the_agent(monkeypatch, preset) -> Non
     assert env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] == (preset or "")
 
 
+def test_session_persistence_is_off_unless_the_spec_opts_in() -> None:
+    """
+    Claude Code writes no transcript unless the agent asks for one.
+
+    The default keeps ``--no-session-persistence``, so a deployment that
+    never opted in gains no disk writes under ``~/.claude/projects``.
+    """
+    env = _build_claude_sdk_spawn_env(_make_spec(), workdir=None)
+    assert "HARNESS_CLAUDE_SDK_SESSION_PERSISTENCE" not in env
+
+
+@pytest.mark.parametrize("value", [True, "true", "yes", "1"])
+def test_session_persistence_opt_in_reaches_the_harness(value) -> None:
+    """A truthy ``session_persistence`` is forwarded, bool or YAML string."""
+    spec = _make_spec()
+    spec.executor.config["session_persistence"] = value
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+    assert env["HARNESS_CLAUDE_SDK_SESSION_PERSISTENCE"] == "true"
+
+
+@pytest.mark.parametrize("value", [False, "false", "no", "", None])
+def test_session_persistence_falsey_values_stay_off(value) -> None:
+    """Anything falsey leaves the flag unset rather than opting in by accident."""
+    spec = _make_spec()
+    spec.executor.config["session_persistence"] = value
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+    assert "HARNESS_CLAUDE_SDK_SESSION_PERSISTENCE" not in env
+
+
 def test_databricks_auth_sets_databricks_env_vars() -> None:
     """
     ``executor.auth: {type: databricks, profile: …}`` sets
