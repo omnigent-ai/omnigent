@@ -1,7 +1,7 @@
 """Browser e2e: a project rename must reach other connected clients live.
 
 Renaming a project folder in one client (sidebar folder context menu ->
-"Edit project" -> ``PATCH /v1/projects/{id}``) updates that client through
+"Rename project" -> ``PATCH /v1/projects/{id}``) updates that client through
 its own mutation's cache invalidation, but nothing pushes the change to OTHER
 connected clients: the sidebar's folder names come from
 ``GET /v1/sessions/projects`` (react-query key ``["projects"]``, no refetch
@@ -67,7 +67,7 @@ def _create_project(page: Page, name: str) -> None:
 
 
 def _rename_project(page: Page, old: str, new: str) -> None:
-    """Rename a project via the folder context menu's "Edit project" dialog.
+    """Rename a project via the folder context menu's "Rename project" dialog.
 
     Asserts the renaming client itself shows the new name afterwards -- that
     half works via the local mutation's invalidation and is the sanity check,
