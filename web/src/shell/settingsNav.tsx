@@ -9,6 +9,7 @@
 import { useEffect } from "react";
 import {
   ArchiveIcon,
+  BellIcon,
   ArrowLeftIcon,
   BlocksIcon,
   BotIcon,
@@ -30,11 +31,12 @@ import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { customAgentsSettingsEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
-import { isElectronShell } from "@/lib/nativeBridge";
+import { isElectronShell, isMacElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
+  | "notifications"
   | "appearance"
   | "harnesses"
   | "custom-agents"
@@ -53,6 +55,7 @@ export type SettingsSectionId =
   | "updates";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
+  "notifications",
   "appearance",
   "harnesses",
   "custom-agents",
@@ -101,6 +104,7 @@ export function settingsNavGroups(
   integrationsEnabled = false,
   customAgentsEnabled = false,
   mcpEnabled = false,
+  isMacDesktop = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "harnesses",
@@ -143,6 +147,9 @@ export function settingsNavGroups(
     groups.push({
       title: "Desktop",
       items: [
+        ...(isMacDesktop
+          ? [{ id: "notifications" as const, label: "Notifications", icon: BellIcon }]
+          : []),
         { id: "cli", label: "Local CLI", icon: TerminalIcon },
         { id: "updates", label: "Updates", icon: DownloadIcon },
       ],
@@ -266,6 +273,7 @@ export function SettingsSidebarBody({
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
     mcpEnabled,
+    isMacElectronShell(),
   );
 
   return (
