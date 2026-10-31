@@ -77,7 +77,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
-const { isHostThisMachine, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -125,6 +125,8 @@ const omnigentCli = require("./omnigent_cli");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
+
+const isHostThisMachine = createHostThisMachineChecker();
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -3928,7 +3930,7 @@ function createBrowserRegistryForWindow(win) {
       const target = windowArcaServerUrl(win);
       return (
         isArcaAgentContext(arcaIdentities.get(target), context, {
-          enabled: !win.isDestroyed() && !!pinnedOrigin(win) && databricksInternalFeaturesEnabled(),
+          enabled: databricksInternalFeaturesEnabled(),
           managed:
             isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
             isDatabricksManagedServerUrl(target),
@@ -5075,7 +5077,7 @@ function registerIpc() {
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
-      // Main derives the server target and local-machine eligibility; the page only routes.
+      // Page supplies the session host ID; main verifies this machine's identity and live enrollment.
       return {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         sourceHostId,

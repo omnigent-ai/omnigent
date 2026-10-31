@@ -1,7 +1,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
-const { isHostThisMachine } = require("../src/hostIdentity");
+const { createHostThisMachineChecker, isHostThisMachine } = require("../src/hostIdentity");
 
 it("imports browser IPC and checks injected identities without desktop js-yaml", () => {
   execFileSync(process.execPath, [
@@ -90,4 +90,55 @@ describe("isHostThisMachine", () => {
       assert.equal(enrollmentReads, hostId && hostId === localId ? 1 : 0);
     });
   }
+});
+
+describe("cached host eligibility", () => {
+  it("reuses reads within one second, isolates host/server pairs, and expires grants and denials", () => {
+    let now = 0;
+    let localId = "local";
+    let live = true;
+    let identityReads = 0;
+    let enrollmentReads = 0;
+    const check = createHostThisMachineChecker({
+      now: () => now,
+      cli: {
+        readLocalHostId: () => {
+          identityReads++;
+          return localId;
+        },
+        liveDaemonRecordFor: () => {
+          enrollmentReads++;
+          return live ? { host_id: localId } : null;
+        },
+      },
+    });
+    const context = { hostId: "local", serverUrl: "https://server.example" };
+    assert.equal(check(context), true);
+    assert.equal(check(context), true);
+    now = 999;
+    live = false;
+    assert.equal(check(context), true);
+    assert.equal(identityReads, 1);
+    assert.equal(enrollmentReads, 1);
+    assert.equal(check({ ...context, serverUrl: "https://other.example" }), false);
+    assert.equal(check({ ...context, hostId: "remote" }), false);
+    assert.equal(identityReads, 3);
+    assert.equal(enrollmentReads, 2);
+    now = 1000;
+    assert.equal(check(context), false);
+    assert.equal(identityReads, 4);
+    assert.equal(enrollmentReads, 3);
+    live = true;
+    now = 1999;
+    assert.equal(check(context), false);
+    now = 2000;
+    assert.equal(check(context), true);
+    localId = "changed";
+    now = 3000;
+    assert.equal(check(context), false);
+    assert.equal(identityReads, 6);
+    assert.equal(enrollmentReads, 4);
+    assert.equal(check({ ...context, hostId: null }), false);
+    assert.equal(identityReads, 6);
+  });
 });
