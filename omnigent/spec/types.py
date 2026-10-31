@@ -1654,3 +1654,14 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
+
+    @property
+    def loads_user_settings(self) -> bool:
+        """Whether a claude-sdk run loads the user's Claude settings and user-scope MCP servers.
+
+        ``skills_filter: "none"`` runs the CLI with ``setting_sources=[]``, so only
+        managed (enterprise) servers load; every other filter keeps the user source.
+
+        :returns: ``False`` only for ``skills_filter == "none"``.
+        """
+        return self.skills_filter != "none"

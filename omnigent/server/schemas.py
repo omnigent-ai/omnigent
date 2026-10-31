@@ -356,6 +356,10 @@ class AgentObject(BaseModel):
         built-in template and native agents are read-only.
     :param mcp_registry_editable: Whether this caller owns the session and can
         select managed MCP services independently of agent ownership.
+    :param loads_user_settings: Whether a claude-sdk session for this agent loads
+        the user's Claude settings and user-scope MCP servers. ``False`` when the
+        spec's ``skills: none`` runs the CLI with no setting sources; ``True``
+        when the bundle cannot be loaded.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -397,6 +401,7 @@ class AgentObject(BaseModel):
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
+    loads_user_settings: bool = True
     mcp_registry_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
