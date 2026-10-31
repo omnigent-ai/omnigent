@@ -10,17 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
 
+from omnigent.db.db_models import LABEL_KEY_MAX_LEN, LABEL_VALUE_MAX_LEN
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+from omnigent.stores.conversation_store import is_internal_label_key
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.project_store import ProjectStore
 from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
@@ -34,6 +37,48 @@ class ProjectCreateResolution:
 
     body: Any
     project_id: str | None = None
+
+
+def project_default_labels(config: Mapping[str, Any]) -> dict[str, str]:
+    """Return the user labels a project's opaque config stamps on new sessions.
+
+    The config is client-owned JSON, so a malformed ``labels`` value or entry
+    (non-string, over the column width, or an internal key) is ignored.
+
+    :param config: The stored project config, e.g.
+        ``{"labels": {"team": "ml"}}``.
+    :returns: The usable labels, e.g. ``{"team": "ml"}``.
+    """
+    raw_labels = config.get("labels")
+    if not isinstance(raw_labels, Mapping):
+        return {}
+    return {
+        key: value
+        for key, value in raw_labels.items()
+        if isinstance(key, str)
+        and isinstance(value, str)
+        and 0 < len(key) <= LABEL_KEY_MAX_LEN
+        and len(value) <= LABEL_VALUE_MAX_LEN
+        and not is_internal_label_key(key)
+    }
+
+
+def create_labels(body: Any, project_defaults: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return a create body's labels with the project's defaults under them.
+
+    A ``null`` request value leaves that default off the new session, mirroring
+    the ``null`` delete on PATCH; for any other key it is simply ignored, so
+    after :func:`resolve_project_session_create` the result is the body's own
+    labels, typed without the nulls it dropped.
+
+    :param body: A session-create body, e.g. one with ``labels={"team": None}``.
+    :param project_defaults: The project's usable default labels, if any.
+    """
+    merged: dict[str, str | None] = {
+        **(project_defaults or {}),
+        **(getattr(body, "labels", None) or {}),
+    }
+    return {key: value for key, value in merged.items() if value is not None}
 
 
 async def resolve_project_session_create(
@@ -53,6 +98,8 @@ async def resolve_project_session_create(
     if "project_id" not in fields_set or project_id is None:
         if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
             raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
+        if "labels" in body.__class__.model_fields:
+            body = body.model_copy(update={"labels": create_labels(body)})
         return ProjectCreateResolution(body=body)
     if project_store is None:
         raise OmnigentError(
@@ -68,6 +115,8 @@ async def resolve_project_session_create(
     for field in ("agent_id", "workspace", "git"):
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
+    if "labels" in body.__class__.model_fields:
+        updates["labels"] = create_labels(body, project_default_labels(config))
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as

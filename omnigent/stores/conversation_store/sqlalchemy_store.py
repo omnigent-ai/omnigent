@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
@@ -1562,6 +1562,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str,
         updates: dict[str, str],
         updated_at: int | None = None,
+        *,
+        delete_keys: Iterable[str] = (),
     ) -> None:
         """
         Upsert guardrails labels on a conversation.
@@ -1571,25 +1573,41 @@ class SqlAlchemyConversationStore(ConversationStore):
         path dispatches to ``INSERT ... ON CONFLICT`` on
         SQLite / PostgreSQL; other dialects fall back to
         SELECT-then-INSERT/UPDATE inside the same transaction.
-        Empty updates is a no-op.
+        *delete_keys* are removed first, in that transaction.
+        Empty updates and no deletes is a no-op.
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
         :param updates: Mapping from label key to new value.
-            Example: ``{"integrity": "0"}``. Empty dict
-            returns immediately without opening a transaction.
+            Example: ``{"integrity": "0"}``. Empty dict with
+            no *delete_keys* returns immediately without
+            opening a transaction.
         :param updated_at: Caller-supplied timestamp
             (``None`` → current wall-clock). See the abstract
             method docstring for why callers may want to
             pass their own.
+        :param delete_keys: Label keys to delete before the
+            upsert, e.g. ``["team"]``; missing keys are ignored.
         """
-        if not updates:
+        stable_deletes = tuple(delete_keys)
+        if not updates and not stable_deletes:
             return
+        # Deletes bypass the upsert's guard, so check them like delete_label does.
+        reject_profile_labels(dict.fromkeys(stable_deletes, ""))
         stamp = updated_at if updated_at is not None else now_epoch()
         stable_updates = dict(updates)
 
         def write(session: Session) -> None:
-            _upsert_labels(session, conversation_id, stable_updates, stamp)
+            if stable_deletes:
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key.in_(stable_deletes),
+                    )
+                )
+            if stable_updates:
+                _upsert_labels(session, conversation_id, stable_updates, stamp)
 
         run_write_transaction(self._conv_session_immediate, "set_labels", write)
 

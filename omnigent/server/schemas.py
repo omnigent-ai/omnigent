@@ -1550,7 +1550,9 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         single user ``"message"``.
     :param title: Optional human-readable title for the session,
         e.g. ``"debugging auth flow"``.
-    :param labels: Initial guardrails labels to set on the session.
+    :param labels: Initial guardrails labels to set on the session. In a
+        project, its default labels fill in under these; a ``null`` value
+        leaves that default off the new session.
     :param parent_session_id: Parent session for sub-agent spawns.
         When set, the server inherits the parent's ``runner_id``
         affinity and sets ``parent_conversation_id`` on the child
@@ -1696,7 +1698,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     initial_input: SessionStartupInput | None = None
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
-    labels: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str | None] = Field(default_factory=dict)
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
@@ -1889,7 +1891,9 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     :param title: Optional human-readable title for the session,
         e.g. ``"debugging auth flow"``.
     :param labels: Initial guardrails labels to set on the
-        session. Empty dict (the default) starts with no labels.
+        session. Empty dict (the default) starts with no labels. In a
+        project, its default labels fill in under these; a ``null``
+        value leaves that default off the new session.
     :param reasoning_effort: Optional per-session reasoning-effort
         hint. Accepted metadata values are ``"none"``,
         ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``,
@@ -1938,7 +1942,7 @@ class SessionCreateMetadata(_SandboxProfileSelection):
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
-    labels: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str | None] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     host_id: str | None = None
     workspace: str | None = None
@@ -2508,7 +2512,9 @@ class UpdateSessionRequest(BaseModel):
     :param title: New title, e.g. ``"debugging auth flow"``.
         ``None`` leaves unchanged.
     :param labels: Guardrails labels to upsert. Merges with existing
-        labels; keys not present are left untouched.
+        labels; keys not present are left untouched. A ``null`` value
+        deletes that label. Server-internal keys stay rejected whether
+        set or deleted.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
@@ -2610,7 +2616,7 @@ class UpdateSessionRequest(BaseModel):
 
     runner_id: str | None = None
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
-    labels: dict[str, str] | None = None
+    labels: dict[str, str | None] | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
     collaboration_mode: str | None = None
@@ -5380,7 +5386,10 @@ class ProjectObject(BaseModel):
         workspace, harness, model, reasoning effort, git base-branch, …). Empty
         when the project stores no defaults. The key vocabulary is owned by the
         client; the server persists and returns it whole. Values are hints the
-        new-chat dialog pre-fills, not enforced requirements.
+        new-chat dialog pre-fills, not enforced requirements, except that
+        session create reads ``agent_id``, ``workspace``, ``git`` and
+        ``labels`` (default labels, e.g. ``{"team": "ml"}``) from it. They are
+        not validated on write; a malformed entry is skipped at create time.
     """
 
     id: str
