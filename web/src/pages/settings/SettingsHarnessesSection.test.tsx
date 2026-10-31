@@ -449,7 +449,9 @@ describe("Harness details", () => {
     expect(screen.getByRole("tab", { name: "MCP servers · 2" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Skills · 1" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Plugins · 1" })).toBeTruthy();
-    expect(screen.getByTestId("catalog-row-github")).toBeTruthy();
+    // Known servers show their brand spelling, as on the tool-call rows.
+    expect(within(screen.getByTestId("catalog-row-github")).getByText("GitHub")).toBeTruthy();
+    expect(within(screen.getByTestId("catalog-row-linear")).getByText("Linear")).toBeTruthy();
     expect(screen.queryByTestId("catalog-row-docs")).toBeNull();
 
     // The credential lives under the Settings tab.
@@ -1226,9 +1228,9 @@ it("uses the same lazy tools accordion on plugin pages", () => {
 
 it.each([
   [501, "Update my-laptop to list tools."],
-  [502, "Couldn't reach github."],
+  [502, "Couldn't reach GitHub."],
   [503, "Host is busy probing other MCP servers. Collapse and reopen to retry."],
-  [504, "Couldn't reach github."],
+  [504, "Couldn't reach GitHub."],
 ])("shows the MCP error for %s", (status, message) => {
   hosts = [ONLINE];
   mcpResult = { error: new ApiError("private", status, null), isPending: false };
@@ -1245,7 +1247,10 @@ it("hides MCP expansion on old-server 404", () => {
   fireEvent.click(screen.getByTestId("catalog-row-github"));
   expect(screen.getByTestId("catalog-row-github").tagName).not.toBe("BUTTON");
   expect(screen.getByTestId("catalog-row-linear").tagName).not.toBe("BUTTON");
-  expect(screen.queryByText("Couldn't reach github.")).toBeNull();
+  // The fallback rows use the same display names as the expandable ones.
+  expect(within(screen.getByTestId("catalog-row-github")).getByText("GitHub")).toBeTruthy();
+  expect(within(screen.getByTestId("catalog-row-linear")).getByText("Linear")).toBeTruthy();
+  expect(screen.queryByText("Couldn't reach GitHub.")).toBeNull();
 });
 
 it.each([

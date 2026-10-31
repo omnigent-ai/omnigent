@@ -10,6 +10,7 @@ from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
@@ -317,9 +318,10 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
 
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
 @pytest.mark.parametrize("full_fork", [False, True])
-async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_reads(
-    auth_client, auth_app, peers, db_uri, execution_target, full_fork
+async def test_scheduled_origin_allows_new_controls_children_and_reads(
+    auth_client, auth_app, peers, db_uri, monkeypatch, execution_target, full_fork
 ):
+    from omnigent.server.routes.sessions import routes_core
     from omnigent.server.scheduled.fire import FireDeps, build_on_fire
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
     from tests._helpers.polling import poll_until_async
@@ -372,12 +374,22 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
             == task.id
         )
 
+    # Managed creation succeeds now; record its launch instead of provisioning.
+    launched_by = []
+
+    async def launch(**kwargs):
+        launched_by.append(kwargs["owner"])
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
     scheduled = {"id": scheduled_id}
     auth_client.headers.update(_bind_runner(db_uri, scheduled_id))
     for depth in range(3):
         captured.clear()
+        # A scheduled run, its forks and children message the owner's sessions
+        # like any private session they own.
         result = await _send(auth_client, scheduled, target)
-        assert "Scheduled sessions cannot" in result["detail"], result
+        assert result.get("queued") is True, result
+        assert "Please inspect the PR" in json.dumps(captured)
         for placement in ("same_host", "managed"):
             result = json.loads(
                 await execute_tool(
@@ -387,8 +399,12 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
                     conversation_id=scheduled["id"],
                 )
             )
-            assert result.get("error") == "access_denied", result
-        assert not captured.get("posts")
+            if placement == "managed":
+                assert result.get("conversation_id"), result
+            else:
+                # Same-host placement needs a live host this test does not
+                # register; it must not fail on the scheduled origin.
+                assert result.get("error") != "access_denied", result
         history = json.loads(
             await execute_tool(
                 tool_name="sys_session_get_history",
@@ -407,6 +423,8 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
             assert response.status_code == 201, response.text
             scheduled = response.json()
 
+    await poll_until_async(lambda: len(launched_by) == 3, timeout_s=5)
+    assert launched_by == ["alice"] * 3
     for labels in (
         {SCHEDULED_TASK_ORIGIN_LABEL_KEY: ""},
         {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "other"},
@@ -615,12 +633,55 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     expected_workspace = "/moved" if move_before_recheck else "/original"
     assert checks == 2
     assert created.parent_conversation_id is None
+    assert created.labels[CREATED_BY_SESSION_LABEL_KEY] == manager["id"]
     assert (created.host_id, created.workspace) == (expected_host, expected_workspace)
     assert frames and all(host == expected_host for host, _ in frames)
     launches = [frame for _, frame in frames if isinstance(frame, HostLaunchRunnerFrame)]
     assert len(launches) == 1 and launches[0].workspace == expected_workspace
     grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(created.id)
     assert [grant.user_id for grant in grants] == ["alice"]
+
+    assert CREATED_BY_SESSION_LABEL_KEY not in store.get_conversation(manager["id"]).labels
+    # Discovery and label-write rules are independent of the routing variants above.
+    if child_manager or move_before_recheck or policy_denied:
+        return
+
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": created_id}),
+            server_client=auth_client,
+            conversation_id=manager["id"],
+        )
+    )
+    assert info["created_by_session_id"] == manager["id"]
+    listing = json.loads(
+        await execute_tool(
+            tool_name="sys_session_list",
+            arguments="{}",
+            server_client=auth_client,
+            conversation_id=manager["id"],
+        )
+    )
+    worker = next(row for row in listing["sessions"] if row["session_id"] == created_id)
+    assert worker["created_by_session_id"] == manager["id"]
+    assert worker["parent_session_id"] is None
+    for value in ("", source["id"]):
+        labels = {CREATED_BY_SESSION_LABEL_KEY: value}
+        response = await auth_client.patch(f"/v1/sessions/{created_id}", json={"labels": labels})
+        assert response.status_code == 400, response.text
+        response = await auth_client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], "labels": labels}
+        )
+        assert response.status_code == 400, response.text
+    response = await auth_client.patch(f"/v1/sessions/{created_id}", json={"labels": {}})
+    assert response.status_code == 200, response.text
+    assert (
+        SqlAlchemyConversationStore(db_uri)
+        .get_conversation(created_id)
+        .labels[CREATED_BY_SESSION_LABEL_KEY]
+        == manager["id"]
+    )
 
 
 @pytest.mark.parametrize("shape", ["parent", "multipart", "initial_items", "skill"])
@@ -728,6 +789,9 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         assert captured["owner"] == "alice"
         store = SqlAlchemyConversationStore(db_uri)
         assert store.get_conversation(session_id).parent_conversation_id is None
+        assert (
+            store.get_conversation(session_id).labels[CREATED_BY_SESSION_LABEL_KEY] == source["id"]
+        )
         assert "First task" in str(store.list_pending_inputs(session_id))
         assert f"[Message from session {source['id']}]" in str(
             store.list_pending_inputs(session_id)

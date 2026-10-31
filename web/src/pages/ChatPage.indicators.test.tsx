@@ -505,6 +505,25 @@ describe("BubbleView dispatch", () => {
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });
 
+  it("spans the prose width for tool rows beside a short reply", () => {
+    // WHY: shrink-wrapped to "Done.", the rows above it would cut their titles off mid-column.
+    render(
+      <BubbleView
+        bubble={{
+          ...foldOnlyBubble([
+            toolItem("c5"),
+            { kind: "text", itemId: "t5", text: "Done.", final: true },
+          ]),
+          continued: false,
+        }}
+      />,
+    );
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble.firstElementChild).not.toHaveClass("w-fit");
+  });
+
   it("keeps the copy action on a folded turn that answers for itself", () => {
     // WHY: the suppression must stop at bubbles with a visible answer —
     // that trailing prose is exactly what copy/fork act on.

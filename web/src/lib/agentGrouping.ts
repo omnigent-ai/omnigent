@@ -5,7 +5,7 @@
  * two surfaces group and order agents identically.
  */
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
-import { nativeAgentSortRank } from "@/lib/nativeCodingAgents";
+import { isNativeCodingAgent, nativeAgentSortRank } from "@/lib/nativeCodingAgents";
 
 // Built-in agents (by name slug) — the long-lived agents the server ships
 // out of the box. Pickers group these first, then a divider, then custom
@@ -135,5 +135,26 @@ export function partitionAgentsByKind<T extends AvailableAgent>(
   return {
     builtins: sorted.filter(isBuiltin),
     customs: sorted.filter((a) => !isBuiltin(a)),
+  };
+}
+
+/**
+ * Split agents the way the new-session picker's groups do: "Harnesses" are
+ * harness-backed picks (native CLIs and generic-ACP harness agents), "agents"
+ * are composed agents plus the user's own, which stay under "Agents" even on a
+ * native harness. Settings' per-entry visibility list shares this so an ACP
+ * harness can't sit under a different heading there than in the picker.
+ *
+ * @param agents - Agents to split (e.g. the picker's candidate list).
+ * @returns ``{ harnesses, agents }`` in the given order.
+ */
+export function partitionPickerEntries<T extends AvailableAgent>(
+  agents: readonly T[],
+): { harnesses: T[]; agents: T[] } {
+  const harnessBacked = (a: T): boolean =>
+    !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a));
+  return {
+    harnesses: agents.filter(harnessBacked),
+    agents: agents.filter((a) => !harnessBacked(a)),
   };
 }

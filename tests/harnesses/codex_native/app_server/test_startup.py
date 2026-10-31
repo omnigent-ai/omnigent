@@ -29,6 +29,7 @@ from omnigent.harnesses.codex_native.bridge import (
     record_certificate_failure,
 )
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+from tests.budgets import budget
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _fake_trust_policy_hooks,
@@ -679,7 +680,8 @@ async def test_wait_until_ready_releases_stalled_initialize(
     """A stalled initialize cannot outlive its startup deadline or caller cancellation."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
-    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 0.2)
+    # Scaled: on a loaded runner, connecting alone can outlast an unscaled 0.2s deadline.
+    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", budget(0.2))
     initialize_received = asyncio.Event()
     connection_closed = asyncio.Event()
 
@@ -707,16 +709,16 @@ async def test_wait_until_ready_releases_stalled_initialize(
         server.listen_url = f"ws://127.0.0.1:{port}"
         task = asyncio.create_task(server._wait_until_ready())
         try:
-            await asyncio.wait_for(initialize_received.wait(), timeout=2)
+            await asyncio.wait_for(initialize_received.wait(), timeout=budget(2))
             if outcome == "cancelled":
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
             else:
                 with pytest.raises(CodexAppServerSilentStartTimeout) as excinfo:
-                    await asyncio.wait_for(task, timeout=2)
+                    await asyncio.wait_for(task, timeout=budget(2))
                 assert excinfo.value.last_error_type == "TimeoutError"
-            await asyncio.wait_for(connection_closed.wait(), timeout=2)
+            await asyncio.wait_for(connection_closed.wait(), timeout=budget(2))
             assert len(clients) == 1
             assert clients[0]._pending_requests == {}
             assert clients[0]._reader_task is None
@@ -896,6 +898,52 @@ async def test_wait_until_ready_fails_at_once_when_the_process_exited(tmp_path: 
 
     assert type(excinfo.value) is RuntimeError
     assert not isinstance(excinfo.value, codex_native_app_server.CodexAppServerSilentStartTimeout)
+
+
+async def test_wait_until_ready_names_a_missing_model_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exit over an undefined model provider is a config error naming its table."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "user-codex"
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=1)
+    server.recent_stderr = ["Error: Model provider `Databricks` not found"]
+
+    with pytest.raises(codex_native_app_server.CodexModelProviderMissingError) as excinfo:
+        await server._wait_until_ready()
+
+    assert isinstance(excinfo.value, RuntimeError)
+    assert excinfo.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert excinfo.value.provider == "Databricks"
+    assert "[model_providers.Databricks]" in excinfo.value.message
+    assert str(source_home / "config.toml") in excinfo.value.message
+    assert "`omnigent setup`" in excinfo.value.message
+
+
+async def test_wait_until_ready_keeps_legacy_profile_provider_errors_generic(
+    tmp_path: Path,
+) -> None:
+    """The legacy-profile form of the message has another remedy, so it stays generic."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=1)
+    server.recent_stderr = [
+        "Error: error loading default config after config error: "
+        "Model provider `Databricks` not found"
+    ]
+
+    with pytest.raises(RuntimeError, match="exited early") as excinfo:
+        await server._wait_until_ready()
+
+    assert not isinstance(excinfo.value, codex_native_app_server.CodexModelProviderMissingError)
 
 
 async def test_standalone_hook_trust_closes_client_when_connect_fails(
@@ -1081,3 +1129,53 @@ async def test_readiness_failure_records_app_server_state_before_cleanup(
     assert snapshot["stderr_reader_state"] == "running"
     assert snapshot["codex_version"] == "0.158.0"
     assert "--listen" not in repr(snapshot)
+
+
+async def test_session_app_server_launches_through_the_configured_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured wrapper replaces the Codex executable; Omnigent's argv follows its args."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    spawned: dict[str, object] = {}
+
+    async def _fake_create_subprocess_exec(*args: object, **kwargs: object) -> object:
+        spawned["argv"] = args
+        spawned["executable"] = kwargs["executable"]
+        stderr = asyncio.StreamReader()
+        stderr.feed_eof()
+        proc = AsyncMock()
+        proc.stderr = stderr
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        codex_native_app_server, "acquire_codex_native_process_owner_lock", lambda: None
+    )
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.app_server_command = ("env", "MODE=omni", "isaac", "codex", "--")
+    server.config_overrides = ['model_provider="p"', 'model="m"']
+
+    await server._spawn_app_server_process("unix:///tmp/codex.sock")
+    if server.stderr_task is not None:
+        await server.stderr_task
+
+    assert spawned["executable"] == "env"
+    # Wrapper args, then Omnigent's -c (joining the wrapper's top-level group), then app-server.
+    assert spawned["argv"][1:] == (
+        "MODE=omni",
+        "isaac",
+        "codex",
+        "--",
+        "-c",
+        'model_provider="p"',
+        "-c",
+        'model="m"',
+        "app-server",
+        "--listen",
+        "unix:///tmp/codex.sock",
+    )
+    # The terminal keeps attaching through Codex itself, not the wrapper.
+    assert server.codex_path == sys.executable
