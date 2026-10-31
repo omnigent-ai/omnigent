@@ -94,6 +94,19 @@ describe("ProjectLandingIcon", () => {
     expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1", color: "nord" });
   });
 
+  it("shows the picked mark while the save is in flight, without a spinner", async () => {
+    updateMock.mockReturnValue(new Promise(() => {}));
+    renderIcon({ config: { icon: "🔥" } });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-color-nord"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    const tile = screen.getByTestId("project-icon-tile");
+    expect(tile).not.toHaveTextContent("🔥");
+    expect(tile.querySelector("svg")).toHaveStyle({ color: "#5e81ac" });
+  });
+
   it("does not write before the config has loaded (guards the data-loss race)", async () => {
     renderIcon({ config: undefined, configReady: false });
 
