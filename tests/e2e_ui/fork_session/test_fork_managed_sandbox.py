@@ -17,7 +17,7 @@ into the clone. It asserts the three things the UI is responsible for:
    those prefill from the repository the SOURCE session recorded — so cloning
    a sandbox session lands in the same checkout.
 3. The fork request carries ``host_type`` / ``sandbox_provider`` / the
-   composed ``workspace``, and no ``POST /v1/hosts/{id}/runners`` follows
+   composed ``workspaces``, and no ``POST /v1/hosts/{id}/runners`` follows
    (the server provisions the host, so a host-bind would target a host that
    does not exist).
 
@@ -73,6 +73,7 @@ def _managed_info_body() -> str:
             "needs_setup": False,
             "databricks_features": False,
             "managed_sandboxes_enabled": True,
+            "session_fork_workspaces": True,
             "sandbox_provider": "modal",
             "sandbox_providers": ["modal"],
             "server_version": "0.0.0-e2e",
@@ -143,7 +144,7 @@ def test_fork_onto_managed_sandbox_with_no_host_online(
       a clone silently lands in an empty sandbox and its copied transcript
       references files that aren't there.
     - The fork request omits ``host_type`` / ``sandbox_provider`` / the
-      composed ``workspace``, so the server creates an unbound clone that
+      composed ``workspaces``, so the server creates an unbound clone that
       never starts.
     - The dialog still fires the host-bind ``POST /v1/hosts/{id}/runners``,
       which would target a host that does not exist.
@@ -175,7 +176,7 @@ def test_fork_onto_managed_sandbox_with_no_host_online(
         forwarded = {
             key: value
             for key, value in body.items()
-            if key not in {"host_type", "sandbox_provider", "workspace"}
+            if key not in {"host_type", "sandbox_provider", "workspace", "workspaces"}
         }
         response = route.fetch(post_data=json.dumps(forwarded))
         route.fulfill(response=response)
@@ -217,9 +218,10 @@ def test_fork_onto_managed_sandbox_with_no_host_online(
     # (2) Picking the sandbox swaps in the repository chrome, prefilled from
     # the source's own repository.
     expect(page.get_by_test_id("fork-session-sandbox-hint")).to_be_visible()
-    page.get_by_test_id("fork-session-advanced-toggle").click()
-    expect(page.get_by_test_id("fork-session-sandbox-repo-input")).to_have_value(_SOURCE_REPO_URL)
-    expect(page.get_by_test_id("fork-session-sandbox-branch-input")).to_have_value(
+    repository = dialog.get_by_test_id("fork-session-sandbox-repo-row")
+    expect(repository).to_have_count(1)
+    expect(repository).to_contain_text("fixture-repo")
+    expect(repository.get_by_role("textbox", name="Branch for fixture-repo")).to_have_value(
         _SOURCE_REPO_BRANCH
     )
     # The host-directory chrome is gone: a sandbox has no path to browse yet.
@@ -242,6 +244,6 @@ def test_fork_onto_managed_sandbox_with_no_host_online(
     body = fork_bodies[0]
     assert body["host_type"] == "managed", body
     assert body["sandbox_provider"] == "modal", body
-    assert body["workspace"] == _SOURCE_REPO, body
+    assert body["workspaces"] == [_SOURCE_REPO], body
     # The server provisions the host, so the dialog must not also bind one.
     assert runner_launches == [], runner_launches
