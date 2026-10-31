@@ -258,6 +258,9 @@ _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 # only in the pane, so a web-driven session shows an unanswerable prompt —
 # often with nobody attached to the terminal at all.
 _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
+# Set for a terminal nobody is watching. ucode then never waits on a person: no
+# sudo password prompt, and a browser sign-in is printed as a link instead.
+_UCODE_NONINTERACTIVE_ENV = "UG_NONINTERACTIVE"
 # Gateway catalogs can reject Claude's canonical refusal fallback.
 # Keep the original model and refusal instead of switching to an unservable id.
 _CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
@@ -1643,6 +1646,8 @@ def claude_tool_env_file() -> str:
 
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    unattended: bool = False,
 ) -> dict[str, str]:
     """
     Build env overrides for a native Claude Code terminal process.
@@ -1660,6 +1665,8 @@ def build_native_claude_terminal_env(
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
         ``None`` means use Claude Code's own native auth.
+    :param unattended: ``True`` for a terminal the runner launches with no
+        CLI client attached, so ucode must not wait for a person.
     :returns: Environment overrides for the terminal process, e.g.
         ``{"ENABLE_TOOL_SEARCH": "true"}``.
     """
@@ -1668,6 +1675,8 @@ def build_native_claude_terminal_env(
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
         _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
     }
+    if unattended:
+        terminal_env[_UCODE_NONINTERACTIVE_ENV] = "1"
     if claude_config is not None:
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
