@@ -12,7 +12,7 @@ from __future__ import annotations
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -25,6 +25,7 @@ from omnigent.skills.git_source import (
     clone_github_source,
     normalize_source_path,
     parse_github_source,
+    repository_path,
     tar_untrusted_dir,
 )
 from omnigent.skills.limits import (
@@ -110,11 +111,21 @@ class PackagedSkill:
     tarball: bytes
 
 
-def resolve_source(source: str, ref: str | None = None, path: str | None = None) -> ResolvedSource:
+def resolve_source(
+    source: str,
+    ref: str | None = None,
+    path: str | None = None,
+    *,
+    path_check: Callable[[str | None], str] = normalize_source_path,
+) -> ResolvedSource:
     """Normalize ``owner/repo`` or a GitHub URL into the repository, ref and directory.
 
     A ``/tree/<ref>/<dir>`` link keeps its directory as the catalog root; an
     explicit *path* wins over it, as an explicit *ref* wins over the link's.
+
+    :param path_check: Validates the directory: a source's by default, or
+        :func:`repository_path` for an installed skill's stored one, which may
+        be longer and use any directory name the catalog indexed.
 
     :raises GitSourceError: When the source is not a GitHub repository or the
         directory is not one inside it.
@@ -128,7 +139,7 @@ def resolve_source(source: str, ref: str | None = None, path: str | None = None)
     return ResolvedSource(
         url=parsed.clone_url,
         ref=ref or parsed.ref,
-        path=normalize_source_path(path if path is not None else parsed.subpath),
+        path=path_check(path if path is not None else parsed.subpath),
     )
 
 
@@ -177,13 +188,18 @@ class SkillFetcher:
             return len(self._catalogs)
 
     def resolve(
-        self, source: str, ref: str | None = None, path: str | None = None
+        self,
+        source: str,
+        ref: str | None = None,
+        path: str | None = None,
+        *,
+        path_check: Callable[[str | None], str] = normalize_source_path,
     ) -> ResolvedSource:
         """The repository, ref and directory for a source the policy allows.
 
         :raises GitSourceError: When the source is not GitHub or the policy refuses it.
         """
-        resolved = resolve_source(source, ref, path)
+        resolved = resolve_source(source, ref, path, path_check=path_check)
         self._policy.require_allowed(resolved.url)
         return resolved
 
@@ -261,8 +277,10 @@ class SkillFetcher:
         :returns: The checkout's commit and the packaged skills in *names* order.
         :raises GitSourceError: On a clone failure, an unknown name, or an unsafe file.
         """
-        resolved = self.resolve(source, ref, path)
-        search = [resolved.path, *(normalize_source_path(p) for p in fallback_paths)]
+        # An installed skill's stored directory (an update) may be any path the
+        # catalog indexed, hidden roots such as .agents included.
+        resolved = self.resolve(source, ref, path, path_check=repository_path)
+        search = [resolved.path, *(repository_path(p) for p in fallback_paths)]
         by_name: dict[str, CatalogEntry] = {}
 
         def expand(checkout: Path) -> list[str]:

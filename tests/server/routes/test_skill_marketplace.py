@@ -221,6 +221,26 @@ async def test_a_source_directory_is_browsed_installed_and_updated(
         assert moved.json()["path"] == "team-a/skills/ops/lint"
         (mono / "team-a" / "skills" / "ops" / "lint").rename(mono / "team-a" / "skills" / "lint")
 
+        # Skills in the hidden-root layouts install from the root and update:
+        # their stored paths start with a dot, which source paths refused.
+        write_skill(mono / ".agents" / "skills", "agents-review", "Agents layout")
+        write_skill(mono / ".claude" / "skills", "claude-review", "Claude layout")
+        for name, stored in (
+            ("agents-review", ".agents/skills/agents-review"),
+            ("claude-review", ".claude/skills/claude-review"),
+        ):
+            hidden = await client.post(
+                "/v1/installed-skills",
+                json={"source": "acme/mono", "ref": "main", "names": [name]},
+            )
+            assert hidden.status_code == 201, hidden.text
+            assert hidden.json()["data"][0]["path"] == stored
+            (mono / stored / "notes.txt").write_text("changed upstream\n")
+            refreshed = await client.post(
+                f"/v1/installed-skills/{hidden.json()['data'][0]['id']}/update"
+            )
+            assert refreshed.status_code == 200, refreshed.text
+            assert refreshed.json()["path"] == stored
         # A link straight to the skills folder, the one people paste, lists its skills.
         folder = await client.post(
             "/v1/skill-catalog",
