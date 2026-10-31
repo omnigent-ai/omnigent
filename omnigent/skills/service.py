@@ -247,21 +247,34 @@ class SkillFetcher:
         names: Sequence[str],
         *,
         path: str | None = None,
+        fallback_paths: Sequence[str] = (),
     ) -> tuple[str | None, list[PackagedSkill]]:
         """Clone once and package each named skill; a name the repo lacks raises.
 
-        The clone first checks out the manifests under *path*, indexes them,
-        then adds only the named skills' directories.
+        The clone first checks out the manifests under *path* (and under each
+        of *fallback_paths*), indexes them, then adds only the named skills'
+        directories.
 
+        :param fallback_paths: Further directories to look in, in order, for a
+            name *path* lacks; an update passes the directories above a skill's
+            stored one, so a skill that moved within its repository is found.
         :returns: The checkout's commit and the packaged skills in *names* order.
         :raises GitSourceError: On a clone failure, an unknown name, or an unsafe file.
         """
         resolved = self.resolve(source, ref, path)
+        search = [resolved.path, *(normalize_source_path(p) for p in fallback_paths)]
         by_name: dict[str, CatalogEntry] = {}
 
         def expand(checkout: Path) -> list[str]:
-            by_name.update((e.name, e) for e in _index(checkout, resolved.path, None))
+            for directory in search:
+                if all(name in by_name for name in names):
+                    break
+                for entry in _index(checkout, directory, None):
+                    if entry.name in names:
+                        by_name.setdefault(entry.name, entry)
             return [f"/{by_name[name].path}/" for name in names if name in by_name]
+
+        patterns = tuple(dict.fromkeys(p for d in search for p in catalog_patterns(d)))
 
         with tempfile.TemporaryDirectory(prefix="omnigent-skill-install-") as tmp:
             checkout = Path(tmp) / "repo"
@@ -269,7 +282,7 @@ class SkillFetcher:
                 resolved.url,
                 resolved.ref,
                 checkout,
-                SparseCheckout(catalog_patterns(resolved.path), expand),
+                SparseCheckout(patterns, expand),
             )
             missing = [name for name in names if name not in by_name]
             if missing:

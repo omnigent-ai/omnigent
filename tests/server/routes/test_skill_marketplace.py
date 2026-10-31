@@ -213,6 +213,13 @@ async def test_a_source_directory_is_browsed_installed_and_updated(
         assert row["path"] == "team-a/skills/lint"
         updated = await client.post(f"/v1/installed-skills/{row['id']}/update")
         assert updated.status_code == 200, updated.text
+        # The skill moves within the repository: the update follows it by name.
+        (mono / "team-a" / "skills" / "ops").mkdir()
+        (mono / "team-a" / "skills" / "lint").rename(mono / "team-a" / "skills" / "ops" / "lint")
+        moved = await client.post(f"/v1/installed-skills/{row['id']}/update")
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["path"] == "team-a/skills/ops/lint"
+        (mono / "team-a" / "skills" / "ops" / "lint").rename(mono / "team-a" / "skills" / "lint")
 
         # A link straight to the skills folder, the one people paste, lists its skills.
         folder = await client.post(
@@ -714,9 +721,11 @@ async def test_installs_and_delivery_hold_to_what_a_runner_unpacks(
         trimmed = await client.get(url)
     assert trimmed.status_code == 200
     names = _names(trimmed.content)
-    assert "config.yaml" in names and "skills/review/SKILL.md" in names
-    assert "skills/triage/SKILL.md" not in names
-    assert any("left installed skills triage out" in r.getMessage() for r in caplog.records)
+    # Room for the agent's file and one two-file skill; which one is row order.
+    kept = [n for n in ("review", "triage") if f"skills/{n}/SKILL.md" in names]
+    assert "config.yaml" in names and len(kept) == 1
+    left_out = ({"review", "triage"} - set(kept)).pop()
+    assert any(f"left installed skills {left_out} out" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
