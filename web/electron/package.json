@@ -34,7 +34,7 @@
   },
   "devDependencies": {
     "electron": "^42.11.16",
-    "electron-builder": "^26.0.0",
+    "electron-builder": "^26.17.0",
     "jsdom": "^29.1.1",
     "playwright": "^1.62.1"
   },
