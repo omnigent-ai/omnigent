@@ -848,6 +848,58 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     },
   );
 
+  it.each(["screenshot", "snapshot", "click", "type"])(
+    "retries %s once with fresh host options if the view becomes local after the probe",
+    async (action) => {
+      const error = "Current session host is required to read this browser view";
+      const call = vi.fn().mockResolvedValueOnce({ ok: false, error }).mockResolvedValue({
+        ok: true,
+        result: "{}",
+        dataUrl: "data:image/png;base64,AAA",
+      });
+      installBridge({ browserScreenshot: call, browserPerformAction: call });
+      getSessionSlim.mockResolvedValue({ id: CONV, hostId: "fresh-host", parentSessionId: null });
+      await runAction(actionEvent(action));
+      expect(call).toHaveBeenCalledTimes(2);
+      expect(call.mock.calls[0]).toEqual(
+        action === "screenshot" ? [CONV] : [CONV, action, action === "snapshot" ? undefined : {}],
+      );
+      expect(call.mock.calls[1].at(-1)).toEqual({
+        sessionHostProtocol: 1,
+        sourceHostId: "fresh-host",
+      });
+      expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
+      expect(postedResult().result).toHaveProperty("ok", true);
+    },
+  );
+
+  it.each([
+    {
+      privileged: false,
+      error: "Current session host is required to read this browser view",
+      calls: 2,
+    },
+    {
+      privileged: true,
+      error: "Current session host is required to read this browser view",
+      calls: 1,
+    },
+    { privileged: false, error: "different error", calls: 1 },
+  ])(
+    "does not loop or retry unrelated/already validated failures: %j",
+    async ({ privileged, error, calls }) => {
+      const browserScreenshot = vi.fn().mockResolvedValue({ ok: false, error });
+      installBridge({
+        browserScreenshot,
+        browserHasView: vi.fn().mockResolvedValue({ exists: true, hostIsThisMachine: privileged }),
+      });
+      await runAction(actionEvent("screenshot"));
+      expect(browserScreenshot).toHaveBeenCalledTimes(calls);
+      expect(getSessionSlim).toHaveBeenCalledTimes(privileged || calls === 2 ? 1 : 0);
+      expect(postedResult().result).toEqual({ ok: false, error });
+    },
+  );
+
   it("omits host options when a navigation lookup fails", async () => {
     const bridge = installBridge();
     setSessionHost(CONV, "stale-local-host");
