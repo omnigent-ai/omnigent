@@ -153,6 +153,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `rich-paste`: pasting formatted chat output or external HTML keeps links,
+  headings, lists, tables, quotes, and code as editable Markdown and opens a
+  live preview. Plain text and Markdown source keep their native paste behavior;
+  Preview shows the rendered draft while writing. Attachment paste takes priority.
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
   terminal or code editor. While listening, Enter keeps the dictated text and
@@ -250,6 +254,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
+- Paste formatted text into the message box, or into text beside a reply quote,
+  then edit its Markdown source and watch the preview update. Hide preview
+  collapses it; Preview opens it for an existing Markdown draft.
 - Select `/mcp` to replace the suggestions with the MCP servers enabled for the
   session. A registry service that needs sign-in shows **Sign in**; click it
   and finish the popup, or follow **Sign in from Settings** for a token or
@@ -650,6 +657,15 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_landing_rejects_unsupported_type_and_keeps_message`
+- **`rich-paste`, new-session, in-session, and side-chat composers:** component
+  coverage in `web/src/lib/pasteMarkdown.test.ts` and
+  `web/src/components/composer/ChatComposer.test.tsx`. Manually copy a rendered
+  heading, link, list, and code block from a chat turn or web page, then paste
+  into each composer. Expect editable Markdown and an open preview. Edit the
+  source and check that the preview changes; send and confirm the transcript
+  keeps the link URL. Repeat beside a reply quote, and paste a screenshot to
+  check that it still attaches. Plain Markdown paste stays unchanged; click
+  Preview to render it. Native terminals are outside this feature.
 - **`dictation`, in-session composer (own environment):**
   `tests/e2e_ui/chat/test_dictation.py` streams a fake microphone through the
   server's fake transcription engine, which only the test's own server enables;
@@ -784,6 +800,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 
 ## Gotchas
+
+- Rich paste and draft preview apply to the new-session, in-session, and
+  side-chat composers, including text beside reply quotes. The preview is
+  read-only; edit the Markdown source above it. Native terminal paste is owned
+  by the terminal and does not use the chat composer.
 
 - The Arclet dbcert preflight needs both the updated desktop shell and web UI,
   with Databricks-internal features enabled for the managed server. Browsers,
