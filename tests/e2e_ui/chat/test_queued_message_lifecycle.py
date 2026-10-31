@@ -243,6 +243,8 @@ def test_reply_actions_stay_hidden_while_a_queued_follow_up_sends(
     )
     # No title generation, so turn A is the only request that can take the gate.
     page.add_init_script("localStorage.setItem('omnigent:background-session-titles', 'off')")
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     page.goto(f"{base_url}/c/{session_id}")
     try:
         _send(page, _FLUSH_MSG_A)
