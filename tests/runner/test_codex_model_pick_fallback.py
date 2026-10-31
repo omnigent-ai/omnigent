@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -51,6 +51,7 @@ class _LaunchHarness:
     resets: list[dict[str, Any]]
     probe: AsyncMock
     response_status: dict[str, int]
+    workspace_models: Mock
 
     async def launch(self) -> SessionResourceView:
         """Run the production launch path, including snapshot and catalog reads."""
@@ -103,6 +104,18 @@ async def codex_launch_harness(
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
         lambda _path: None,
+    )
+    databrickscfg = tmp_path / "databrickscfg"
+    databrickscfg.write_text("[session-provider]\nhost = https://workspace.example.com\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(databrickscfg))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        lambda _profile: SimpleNamespace(token="workspace-token"),
+    )
+    workspace_models = Mock(return_value=())
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+        workspace_models,
     )
 
     def resolve_launch(
@@ -218,6 +231,7 @@ async def codex_launch_harness(
             resets=resets,
             probe=probe,
             response_status=response_status,
+            workspace_models=workspace_models,
         )
     await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
     runner_native._AUTO_CODEX_APP_SERVERS.pop(_SESSION_ID, None)
@@ -245,6 +259,88 @@ async def test_equivalent_gateway_pick_launches_without_reset(
     assert harness.app_server.env["OMNIGENT_CLIENT_SURFACE"] == "desktop"
     assert harness.resets == []
     harness.probe.assert_not_awaited()
+    harness.workspace_models.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("live_listing", "cached_listing", "kept"),
+    [
+        pytest.param(
+            ("system.ai.gpt-5-6-sol", "system.ai.gpt-6-1-sol"), None, True, id="live-serves"
+        ),
+        pytest.param(
+            OSError("listing failed"), ["system.ai.gpt-6-1-sol"], True, id="cache-serves"
+        ),
+        pytest.param(
+            ("system.ai.gpt-5-6-sol",), ["system.ai.gpt-6-1-sol"], False, id="live-lacks"
+        ),
+        pytest.param(OSError("listing failed"), None, False, id="no-listing"),
+    ],
+)
+async def test_profile_workspace_listing_decides_a_pick_codex_omits(
+    live_listing: tuple[str, ...] | Exception,
+    cached_listing: list[str] | None,
+    kept: bool,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The profile's workspace listing, else ucode's cached copy, decides a pick Codex omits."""
+    harness = codex_launch_harness
+    pick = "gpt-6.1-sol"
+    harness.snapshot["model_override"] = pick
+    harness.seed_catalog(
+        [{"id": "system.ai.gpt-5-6-sol", "model": "system.ai.gpt-5-6-sol", "isDefault": True}]
+    )
+    if isinstance(live_listing, Exception):
+        harness.workspace_models.side_effect = live_listing
+    else:
+        harness.workspace_models.return_value = live_listing
+    cached_state = None if cached_listing is None else SimpleNamespace(codex_models=cached_listing)
+    read_cached_state = Mock(return_value=cached_state)
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", read_cached_state)
+
+    await harness.launch()
+
+    if kept:
+        assert harness.builds[0]["model"] == pick
+        assert harness.resets == []
+        assert harness.snapshot["model_override"] == pick
+    else:
+        assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
+        assert harness.resets == [{"expected_model_override": pick}]
+        assert harness.snapshot["model_override"] is None
+    harness.workspace_models.assert_called_once_with(
+        "https://workspace.example.com", "workspace-token"
+    )
+    if isinstance(live_listing, Exception):
+        read_cached_state.assert_called_once_with("https://workspace.example.com")
+    else:
+        read_cached_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_profile_host_falls_back_instead_of_failing_launch(
+    codex_launch_harness: _LaunchHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace probe that cannot resolve the profile's host treats the pick as unserved."""
+    harness = codex_launch_harness
+    pick = "gpt-6.1-sol"
+    harness.snapshot["model_override"] = pick
+    harness.seed_catalog(
+        [{"id": "system.ai.gpt-5-6-sol", "model": "system.ai.gpt-5-6-sol", "isDefault": True}]
+    )
+    monkeypatch.setattr(
+        codex_app,
+        "_databricks_gateway_host",
+        Mock(side_effect=ConnectionError("token endpoint unreachable")),
+    )
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
+    assert harness.resets == [{"expected_model_override": pick}]
+    harness.workspace_models.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -504,6 +600,7 @@ async def test_generic_provider_fallback_rebuilds_model_config_overrides(
 
     monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_launch)
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+    harness.workspace_models.return_value = (f"system.ai.{pick}",)
 
     await harness.launch()
 
@@ -511,6 +608,7 @@ async def test_generic_provider_fallback_rebuilds_model_config_overrides(
     assert f'model="{_PROVIDER_DEFAULT}"' in harness.builds[0]["extra_config_overrides"]
     assert all(pick not in override for override in harness.builds[0]["extra_config_overrides"])
     assert harness.resets == [{"expected_model_override": pick}]
+    harness.workspace_models.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -96,7 +96,7 @@ def test_build_codex_native_server_reuses_catalog_model(
         ("missing-model", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
         ("blank-model", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
         ("invalid-model", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("missing", "gpt-1.2-test", "gpt-1.2-test"),
+        ("missing", "gpt-1.2-test", "system.ai.gpt-1-2-test"),
         ("fresh", "unknown-model", "unknown-model"),
         ("fresh", None, "system.ai.gpt-1-2-test"),
     ],

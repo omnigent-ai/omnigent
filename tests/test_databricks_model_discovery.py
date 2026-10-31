@@ -412,10 +412,11 @@ def test_discover_codex_models_empty_listing_is_authoritative() -> None:
 
 
 def test_select_servable_model_matches_legacy_spelling() -> None:
-    """A legacy ``databricks-`` request resolves to the served ``system.ai.`` id."""
+    """A legacy ``databricks-`` or codex-slug request resolves to the served ``system.ai.`` id."""
     from omnigent.models.databricks_model_discovery import select_servable_model
 
     servable = ("system.ai.gpt-5-6-luna", "system.ai.gpt-5-5")
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
+    assert select_servable_model("gpt-5.6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
