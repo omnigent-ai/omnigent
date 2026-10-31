@@ -782,7 +782,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(blocked[0].payload.conversationId, "conv_1");
   });
 
-  it("guards all subresource types with URL and connected-IP rules without resolving DNS", async () => {
+  it("guards all subresource types with DNS and connected-IP rules", async () => {
     const { registry, lookups, idOf } = makeNetworkGuardRegistry();
     const entry = registry.openOrNavigate("conv_1", "https://example.com/", undefined, {
       agent: true,
@@ -814,6 +814,11 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
             `${resourceType}: public URL ${url}`,
           );
           assert.equal(
+            await registry.shouldCancelAgentRequest({ ...request, url: "https://93.184.215.14/x" }),
+            false,
+            `${resourceType}: public IP literals need no DNS lookup`,
+          );
+          assert.equal(
             await registry.shouldCancelAgentResponse({ ...request, ip: "93.184.215.14" }),
             false,
             `${resourceType}: public connected IP for ${url}`,
@@ -830,7 +835,14 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         },
       ),
     );
-    assert.deepEqual(lookups, [], "public subresources do not add DNS lookups");
+    assert.deepEqual(
+      lookups,
+      Array.from({ length: 8 }, () => ({
+        hostname: "example.com",
+        partition: agentPartition("w-test", "conv_1"),
+      })),
+      "each subresource resolves through its owning partition before sending",
+    );
     assert.equal(registry.get("conv_1"), entry);
   });
 
@@ -890,38 +902,44 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(await registry.shouldCancelAgentResponse(local, partition), true);
     assert.equal(await registry.shouldCancelAgentRequest(publicRequest, partition), false);
     assert.equal(await registry.shouldCancelAgentResponse(publicRequest, partition), false);
-    assert.deepEqual(lookups, []);
+    assert.deepEqual(lookups, [
+      { hostname: "example.com", partition },
+      { hostname: "example.com", partition },
+    ]);
   });
 
-  it("preflights unsafe methods and WebSockets to private-resolving names in the owning partition", async () => {
+  it("preflights every method and WebSocket to private-resolving names in the owning partition", async () => {
     const { registry, lookups, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
-    const aliases = ["localtest.me", "127.0.0.1.nip.io", "169-254-169-254.nip.io"];
+    const aliases = ["lvh.me", "localtest.me", "127.0.0.1.nip.io", "169-254-169-254.nip.io"];
     const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+    const requests = [
+      ...methods.flatMap((method) =>
+        ["xhr", "ping"].map((resourceType) => ({ method, resourceType })),
+      ),
+      { method: "GET", resourceType: "webSocket" },
+    ];
     const expectedLookups = [];
     await Promise.all(
       aliases.flatMap((hostname) =>
-        methods.flatMap((method) =>
-          ["xhr", "ping", "webSocket"].map(async (resourceType) => {
-            const preflighted = resourceType === "webSocket" || !["GET", "HEAD"].includes(method);
-            if (preflighted) expectedLookups.push(hostname);
-            const url = `${resourceType === "webSocket" ? "ws" : "http"}://${hostname}/request`;
-            const request = { webContentsId: idOf("conv_1"), url, method, resourceType };
-            assert.equal(
-              await registry.shouldCancelAgentRequest(request),
-              preflighted,
-              `${method} ${resourceType} ${hostname}`,
-            );
-            assert.equal(
-              await registry.shouldCancelAgentResponse({
-                ...request,
-                ip: hostname.startsWith("169") ? "169.254.169.254" : "127.0.0.1",
-              }),
-              true,
-              `${method} ${resourceType} ${hostname}: private response`,
-            );
-          }),
-        ),
+        requests.map(async ({ method, resourceType }) => {
+          expectedLookups.push(hostname);
+          const url = `${resourceType === "webSocket" ? "ws" : "http"}://${hostname}/request`;
+          const request = { webContentsId: idOf("conv_1"), url, method, resourceType };
+          assert.equal(
+            await registry.shouldCancelAgentRequest(request),
+            true,
+            `${method} ${resourceType} ${hostname}`,
+          );
+          assert.equal(
+            await registry.shouldCancelAgentResponse({
+              ...request,
+              ip: hostname.startsWith("169") ? "169.254.169.254" : "127.0.0.1",
+            }),
+            true,
+            `${method} ${resourceType} ${hostname}: private response`,
+          );
+        }),
       ),
     );
     assert.deepEqual(lookups.map((lookup) => lookup.hostname).sort(), expectedLookups.sort());
@@ -1045,7 +1063,13 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
   });
 
   it("exempts an internal connected address only when it is the configured proxy's IP", async () => {
-    const { registry, idOf } = makeNetworkGuardRegistry({ proxy: "PROXY proxy.corp:3128; DIRECT" });
+    const proxyLookups = [];
+    const { registry, idOf, lookups } = makeNetworkGuardRegistry({
+      resolveProxy: async (url, partition) => {
+        proxyLookups.push({ url, partition });
+        return "PROXY proxy.corp:3128; DIRECT";
+      },
+    });
     registry.openOrNavigate("conv_1", "http://rebind.example/", undefined, { agent: true });
     const response = (ip) =>
       registry.shouldCancelAgentResponse({
@@ -1055,6 +1079,30 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       });
     // The endpoint metadata cannot distinguish this direct connection from the configured proxy.
     assert.deepEqual(await Promise.all(["10.0.0.2", "127.0.0.1"].map(response)), [false, true]);
+    const partition = agentPartition("w-test", "conv_1");
+    const socket = {
+      webContentsId: idOf("conv_1"),
+      url: "wss://rebind.example/live",
+      resourceType: "webSocket",
+      statusCode: 101,
+      ip: "10.0.0.2",
+    };
+    assert.equal(await registry.shouldCancelAgentResponse(socket, partition), false);
+    assert.equal(
+      await registry.shouldCancelAgentResponse({ ...socket, webContentsId: 0 }, partition),
+      false,
+      "an unattributed worker resolves its proxy in the owning partition",
+    );
+    assert.deepEqual(proxyLookups, [
+      { url: "http://rebind.example/", partition },
+      { url: "http://rebind.example/", partition },
+      { url: "https://rebind.example/live", partition },
+      { url: "https://rebind.example/live", partition },
+    ]);
+    assert.deepEqual(
+      lookups,
+      Array.from({ length: 4 }, () => ({ hostname: "proxy.corp", partition })),
+    );
   });
 
   it("forces agent-locked network requests past the HTTP cache", () => {
@@ -1086,16 +1134,29 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
   });
 
-  it("leaves user-driven and unattributed requests alone without resolving", async () => {
+  it("leaves direct unenforced views and unattributed requests without a partition alone", async () => {
     const { registry, lookups, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv_1", "http://intranet.example/", undefined, { force: true });
     const webContentsId = idOf("conv_1");
+    const partition = agentPartition("w-test", "conv_1");
     const request = { webContentsId, url: "http://lvh.me:8899/", ip: "127.0.0.1" };
-    assert.equal(await registry.shouldCancelAgentRequest(request), false);
-    assert.equal(await registry.shouldCancelAgentResponse(request), false);
+    assert.equal(await registry.shouldCancelAgentRequest(request, partition), false);
+    assert.equal(await registry.shouldCancelAgentResponse(request, partition), false);
     const stray = { ...request, webContentsId: 999 };
     assert.equal(await registry.shouldCancelAgentRequest(stray), false);
+    assert.equal(await registry.shouldCancelAgentResponse(stray), false);
     assert.deepEqual(lookups, []);
+  });
+
+  it("guards unattributed requests with a partition even when its direct owner is unenforced", async () => {
+    const { registry, lookups, idOf } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv_1", "http://intranet.example/", undefined, { force: true });
+    const partition = agentPartition("w-test", "conv_1");
+    const request = { webContentsId: 999, url: "http://lvh.me:8899/", ip: "127.0.0.1" };
+    assert.notEqual(request.webContentsId, idOf("conv_1"));
+    assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
+    assert.equal(await registry.shouldCancelAgentResponse(request, partition), true);
+    assert.deepEqual(lookups, [{ hostname: "lvh.me", partition }]);
   });
 
   it("keeps the Arca loopback exception for exact hosts but not DNS aliases", async () => {
@@ -1119,13 +1180,6 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         const request = { webContentsId, url, ip, resourceType: "other" };
         assert.equal(await registry.shouldCancelAgentRequest(request), false, url);
         assert.equal(await registry.shouldCancelAgentResponse(request), false, url);
-      }),
-    );
-    await Promise.all(
-      ["192.168.1.1", "169.254.169.254"].map(async (ip) => {
-        const request = { webContentsId, url: `http://${ip}/x`, ip, resourceType: "xhr" };
-        assert.equal(await registry.shouldCancelAgentRequest(request), true);
-        assert.equal(await registry.shouldCancelAgentResponse(request), true);
       }),
     );
     const alias = { webContentsId, url: "http://lvh.me:5173/", ip: "127.0.0.1" };

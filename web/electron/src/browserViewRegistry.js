@@ -26,7 +26,6 @@ const {
 } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
-const DOCUMENT_RESOURCE_TYPES = new Set(["mainFrame", "subFrame", "object"]);
 
 // Map WebSocket handshakes onto the HTTP URL rules.
 function httpUrlForWebSocket(url) {
@@ -471,24 +470,13 @@ function createBrowserViewRegistry({
     };
   }
 
-  // Documents, unsafe methods, and WebSockets resolve DNS before sending.
-  // Safe subresources use URL rules, then the connected-IP response check.
-  // Missing resource metadata gets document preflight as a fail-safe.
-  async function shouldCancelAgentRequest(
-    { webContentsId, url, resourceType = "mainFrame", method = "GET" },
-    partition,
-  ) {
+  // Resolve named hosts in the owning partition before any request is sent.
+  // IP literals and eligible exact-loopback hosts need only the URL check.
+  async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
-    const needsDns =
-      DOCUMENT_RESOURCE_TYPES.has(resourceType) ||
-      resourceType === "webSocket" ||
-      policyUrl !== url ||
-      !["GET", "HEAD"].includes(method.toUpperCase());
-    const verdict = needsDns
-      ? await checkAgentNavigationWithPolicy(policyUrl, policy)
-      : isAgentNavigationAllowed(policyUrl, policy);
+    const verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
     if (verdict.ok) return false;
     if (policy.conversationId) {
       sendToRenderer("browser-nav-blocked", {

@@ -2620,11 +2620,8 @@ describe("browser permission wiring", () => {
           ["sendHeaders", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
           ["headers", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
         ],
-        "installed once per partition, for all network request types",
+        "installed once per partition, with every resource type reaching each network hook",
       );
-      for (const [, filter] of ses.installs) {
-        assert.equal(filter.types, undefined, "all resource types reach each network hook");
-      }
       // Round-trip through JSON so objects from main.js's vm realm compare.
       const decide = (kind, details, session = ses, view = agent) =>
         new Promise((resolve) => {
@@ -2655,14 +2652,17 @@ describe("browser permission wiring", () => {
       assert.deepEqual(await decide("headers", { ...worker, url: next, ip: "127.0.0.1" }), {
         cancel: true,
       });
-      assert.deepEqual(
-        await decide("request", { url: "ws://localhost/live", resourceType: "webSocket" }),
-        { cancel: true },
-      );
       assert.deepEqual(await decide("request", { url: next, resourceType: "xhr" }), {
         cancel: false,
       });
-      assert.deepEqual(ses.lookups, [], "subresource hooks do not resolve DNS");
+      assert.deepEqual(ses.lookups, ["example.com"], "subresources resolve DNS before sending");
+      ses.lookups.length = 0;
+      assert.deepEqual(
+        await decide("request", { url: "ws://lvh.me/live", resourceType: "webSocket" }),
+        { cancel: true },
+      );
+      assert.deepEqual(ses.lookups, ["lvh.me"], "WebSocket handshakes resolve DNS first");
+      ses.lookups.length = 0;
       ses.resolveProxy = async () => {
         throw new Error("proxy lookup failed");
       };

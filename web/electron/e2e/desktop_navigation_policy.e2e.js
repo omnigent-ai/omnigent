@@ -28,7 +28,9 @@ it(
       process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
       fs.mkdtempSync(path.join(os.tmpdir(), "omni-navigation-recordings-"));
     const evidence = {};
+    const privateRequests = [];
     const fixture = http.createServer((req, res) => {
+      if (req.url.startsWith("/private")) privateRequests.push(req.url);
       if (req.url === "/policy-worker.js") {
         res.setHeader("Content-Type", "application/javascript");
         res.end(
@@ -99,6 +101,7 @@ it(
       server = await spawnServer(scratch);
       desktop = await launchDesktop({ serverUrl: server.serverUrl, recordDir, preload: [preload] });
       const { electronApp, window } = desktop;
+      evidence.electronVersion = await electronApp.evaluate(() => process.versions.electron);
       await window.getByText("What should we build?").waitFor({ timeout: 30_000 });
       const phase = async (message) => {
         console.log(message);
@@ -296,6 +299,8 @@ it(
           const privateUrl = "http://127.0.0.1:" + port + "/private";
           await entry.view.webContents.executeJavaScript(`
           void fetch(${JSON.stringify(privateUrl + "?kind=fetch")}).catch(() => {});
+          void fetch("http://lvh.me:" + ${port} + "/private?kind=private-name-fetch").catch(() => {});
+          void fetch("http://lvh.me:" + ${port} + "/private?kind=private-name-head", { method: "HEAD" }).catch(() => {});
           const xhr = new XMLHttpRequest();
           xhr.open("GET", ${JSON.stringify(privateUrl + "?kind=xhr")}); xhr.send();
           const image = new Image();
@@ -315,6 +320,8 @@ it(
         `);
           const kinds = [
             "fetch",
+            "private-name-fetch",
+            "private-name-head",
             "xhr",
             "image",
             "websocket",
@@ -339,16 +346,22 @@ it(
             kinds.some((kind) => request.url.endsWith("?kind=" + kind)),
           );
           const alive = !entry.view.webContents.isDestroyed();
+          const registeredViewIds = [];
+          global.omnigentTestBrowserRegistries[0].forEach((view) => {
+            registeredViewIds.push(view.view.webContents.id);
+          });
           entry.agentContext = { trustedPreviewFixture: true };
           await entry.view.webContents.executeJavaScript(
             "navigator.serviceWorker.getRegistrations().then((registrations) => Promise.all(registrations.map((registration) => registration.unregister())))",
           );
-          return { requests, alive };
+          return { requests, alive, registeredViewIds };
         },
         { port: fixture.address().port },
       );
       for (const kind of [
         "fetch",
+        "private-name-fetch",
+        "private-name-head",
         "xhr",
         "image",
         "websocket",
@@ -364,6 +377,19 @@ it(
           JSON.stringify(evidence.subresources),
         );
       }
+      const serviceWorker = evidence.subresources.requests.find((request) =>
+        request.url.endsWith("?kind=service-worker"),
+      );
+      assert.equal(
+        evidence.subresources.registeredViewIds.includes(serviceWorker.webContentsId),
+        false,
+        "the service-worker request uses partition fallback, not a registered view",
+      );
+      assert.deepEqual(
+        privateRequests,
+        [],
+        "private requests are cancelled before reaching the server",
+      );
       assert.ok(
         evidence.subresources.requests.some(
           (request) => request.url.endsWith("?kind=public-subresource") && !request.cancel,
