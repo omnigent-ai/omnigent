@@ -3926,11 +3926,15 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
   const unreachable = "Check your network connection.";
   const blocked = "Databricks blocked this network. Connect from a network the workspace allows.";
   for (const event of ["resume", "unlock-screen"]) {
-    // [renewal failure, overlay hint before the wake, then after it]
-    for (const [failure, before, after] of [
-      [() => new TypeError("fetch failed"), unreachable, unreachable],
+    // [renewal failure, overlay hint before the wake, overlay hints shown from the wake on]
+    for (const [failure, hint, sinceWake] of [
+      [() => new TypeError("fetch failed"), unreachable, [unreachable, unreachable]],
       // Refusals after wake wait again before saying the network is blocked.
-      [() => Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }), blocked, ""],
+      [
+        () => Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+        blocked,
+        ["", "", blocked],
+      ],
     ]) {
       it(`starts the fast retries over on ${event} after "${failure().message}"`, async (t) => {
         const h = browserHarness(t, [20], {
@@ -3939,16 +3943,23 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
           },
         });
         h.api.setReconnectSlowDelayMs(60_000);
-        h.api.setBlockedHintDelayMs(10);
+        h.api.setBlockedHintDelayMs(100);
         await assert.rejects(h.api.loadServerUrl(h.win, workspace));
         await until(() => h.calls.auth.length === 2, "the fast retry");
         // The next retry is a minute away.
-        await wait(60);
+        await wait(150);
         assert.equal(h.calls.auth.length, 2);
-        assert.equal(h.overlay.hint, before);
+        assert.equal(h.overlay.hint, hint);
+        const wakeShows = h.overlay.shows.length;
         h.powerMonitor.emit(event);
-        assert.equal(h.overlay.hint, after);
+        assert.equal(h.overlay.hint, sinceWake[0]);
         await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
+        // The fast retry falls within any restarted wait; the hint returns once it ends.
+        await until(
+          () => h.overlay.shows.length >= wakeShows + sinceWake.length,
+          "the overlay after the retry",
+        );
+        assert.deepEqual(h.overlay.shows.slice(wakeShows), sinceWake);
         assert.deepEqual(h.calls.loadFile, []);
       });
     }
@@ -4116,8 +4127,12 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       assert.equal(h.api.windows.get(h.win).origin, null);
       assert.deepEqual(h.calls.loadFile, []);
       // Connect, the blocked renewal, then blocked background retries outlasting the wait.
+      // The first refusal's wait holds across them, so the hint comes during the fast retries.
       await until(() => h.overlay.hint === `${blocked}.`, "the blocked-network hint");
-      assert.ok(network.sessionCreates >= 3);
+      assert.ok(
+        network.sessionCreates >= 3 && network.sessionCreates < 8,
+        `${network.sessionCreates} session-creates before the hint`,
+      );
       network.verdict = "allow";
       await until(() => h.calls.loadURL.length === 2, "the reconnect");
       // Back on the page the user was on; setup never showed.
