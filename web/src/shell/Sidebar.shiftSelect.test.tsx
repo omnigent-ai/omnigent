@@ -56,7 +56,7 @@ const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock, bu
     },
     projectSessionsMock: { current: {} as Record<string, unknown[]> },
     bulkArchiveMock: { mutate: vi.fn() },
-    bulkMoveMock: { mutate: vi.fn() },
+    bulkMoveMock: { mutateAsync: vi.fn((_variables: unknown) => Promise.resolve([])) },
   }));
 
 vi.mock("@/hooks/useConversations", async () => {
@@ -68,7 +68,11 @@ vi.mock("@/hooks/useConversations", async () => {
       isPending: false,
       isError: false,
     }),
-    useBulkMoveToProject: () => ({ mutate: bulkMoveMock.mutate, isPending: false, isError: false }),
+    useBulkMoveToProject: () => ({
+      mutateAsync: bulkMoveMock.mutateAsync,
+      isPending: false,
+      isError: false,
+    }),
     useProjects: () => ({ data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })) }),
     useProjectSessions: (project: string, enabled: boolean) => {
       const override = projectSessionsMock.current[project];
@@ -133,7 +137,7 @@ function mockConversations(convs: Conversation[]) {
 beforeEach(() => {
   useConvMock.mockReset();
   bulkArchiveMock.mutate.mockReset();
-  bulkMoveMock.mutate.mockReset();
+  bulkMoveMock.mutateAsync.mockClear();
   localStorage.clear();
   projectsMock.length = 0;
   projectSessionsMock.current = {};
@@ -361,9 +365,6 @@ describe("Sidebar shift-click selection", () => {
     fireEvent.click(screen.getByRole("link", { name: "old1" }));
     fireEvent.click(screen.getByRole("link", { name: "old2" }));
     // The move succeeds; filing keeps updated_at, so both sort below Alpha's six.
-    bulkMoveMock.mutate.mockImplementation(
-      (_variables: unknown, options?: { onSuccess?: () => void }) => options?.onSuccess?.(),
-    );
     mockConversations([
       ...alpha,
       ...older.map((c) => ({ ...c, labels: { omni_project: "Alpha" } })),
@@ -374,7 +375,7 @@ describe("Sidebar shift-click selection", () => {
     });
     fireEvent.click(await screen.findByRole("menuitem", { name: "Alpha" }));
 
-    expect(bulkMoveMock.mutate.mock.calls[0]?.[0]).toEqual({
+    expect(bulkMoveMock.mutateAsync.mock.calls[0]?.[0]).toEqual({
       ids: ["old1", "old2"],
       project: "Alpha",
     });

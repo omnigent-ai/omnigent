@@ -1,5 +1,5 @@
 import { type CSSProperties, useState } from "react";
-import { PlusIcon, SmilePlusIcon } from "lucide-react";
+import { Loader2Icon, PlusIcon, SmilePlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -12,13 +12,13 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
-import { useCreateProject } from "@/hooks/useConversations";
+import { useCreateProject, useProjectWriting } from "@/hooks/useConversations";
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that
  * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
- * the legacy label model can't express. On success the new folder is expanded
- * (via `onCreated`) so the user can immediately file sessions into it.
+ * the legacy label model can't express. The dialog closes on submit; on success
+ * the new folder is expanded (via `onCreated`) so the user can file sessions into it.
  */
 export function NewProjectButton({ onCreated }: { onCreated: (name: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -26,19 +26,21 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
   const [icon, setIcon] = useState<string | undefined>(undefined);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const createProject = useCreateProject();
+  const projectWriting = useProjectWriting();
 
   const submit = () => {
     const trimmed = name.trim();
     if (trimmed === "") return;
-    createProject.mutate(
-      { name: trimmed, icon },
-      {
-        onSuccess: (project) => {
-          setOpen(false);
-          setName("");
-          setIcon(undefined);
-          onCreated(project.name);
-        },
+    setOpen(false);
+    setName("");
+    setIcon(undefined);
+    // The hook toasts failures; restoring the draft lets a reopen fix the name.
+    // The trigger stays disabled until then, so no newer draft can be overwritten.
+    createProject.mutateAsync({ name: trimmed, icon }).then(
+      (project) => onCreated(project.name),
+      () => {
+        setName(trimmed);
+        setIcon(icon);
       },
     );
   };
@@ -54,14 +56,17 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             aria-label="New project"
             data-testid="new-project"
             className="text-muted-foreground"
+            disabled={projectWriting}
             onClick={(e) => {
               e.stopPropagation();
-              setName("");
-              setIcon(undefined);
               setOpen(true);
             }}
           >
-            <PlusIcon className="size-3.5" />
+            {projectWriting ? (
+              <Loader2Icon className="size-3.5 animate-spin" />
+            ) : (
+              <PlusIcon className="size-3.5" />
+            )}
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">New project</TooltipContent>
@@ -152,24 +157,13 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
               }}
             />
           </div>
-          {createProject.isError && (
-            <p className="text-ui text-destructive" role="alert">
-              {(createProject.error as Error).message}
-            </p>
-          )}
           <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setOpen(false)}
-              disabled={createProject.isPending}
-            >
+            <Button type="button" variant="ghost" onClick={() => setOpen(false)}>
               Cancel
             </Button>
             <Button
               type="button"
               data-testid="new-project-confirm"
-              loading={createProject.isPending}
               disabled={name.trim() === ""}
               onClick={submit}
             >

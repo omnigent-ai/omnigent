@@ -2577,10 +2577,9 @@ describe("Sidebar project sections", () => {
     // delete with the folder's { id, name }.
     expect(screen.getByText(/all of its sessions/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
-    expect(deleteProjectSpy).toHaveBeenCalledWith(
-      { id: "p_Customer X", name: "Customer X" },
-      expect.anything(),
-    );
+    expect(deleteProjectSpy).toHaveBeenCalledWith({ id: "p_Customer X", name: "Customer X" });
+    // The delete runs in the background; the confirmation closes on submit.
+    await waitFor(() => expect(screen.queryByText(/all of its sessions/i)).toBeNull());
   });
 
   it("offers a desktop New session shortcut while keeping the touch menu accessible", async () => {
