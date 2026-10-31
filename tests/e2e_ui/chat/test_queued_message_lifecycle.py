@@ -205,6 +205,8 @@ def test_queued_message_returns_to_the_composer_after_a_reload(
         key="queued-reload",
         match=_RELOAD_MSG_A,
     )
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     page.goto(f"{base_url}/c/{session_id}")
     try:
         _send(page, _RELOAD_MSG_A)
