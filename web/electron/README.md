@@ -640,14 +640,14 @@ against its local Chromium, and the result is posted back.
   WebSockets. IP literals use the URL check without DNS. Exact loopback hosts
   remain available to eligible Arca and this-machine sessions. Enforcement cancels requests and
   keeps the view open.
-  Those requests skip HTTP-cache reads so every response reports
-  the address Chromium connected to, and a response whose address is missing
+  Guarded HTTP requests skip cache reads to obtain connected-address metadata;
+  a response whose address is missing
   or non-public (a DNS answer that changed after the check) is cancelled,
   unless that address belongs to a configured proxy. Skipping cache reads adds
   network round trips and may increase latency and bandwidth. WebSocket upgrades
   can omit the connected IP; those repeat the partition DNS check at the 101
-  response. The actual WebSocket endpoint cannot be verified without that IP,
-  so a rapid DNS rebind between checks may escape detection. Limits: a DNS
+  response. This is not connected-IP verification and cannot rule out a DNS
+  change between check and connection. Limits: a DNS
   change between preflight and connection can still send a request to a private
   address; the HTTP response check prevents the page from reading its response.
   Pages restored from the back-forward cache and navigations answered by a service worker make no

@@ -284,8 +284,20 @@ it(
 
       await phase("Subresources and workers: private requests cancel without closing the view.");
       assert.equal((await navigate("preview-fixture", localUrl, true)).ok, true);
+      const privateProbeIds = [
+        "fetch",
+        "private-name-fetch",
+        "private-name-head",
+        "xhr",
+        "image",
+        "websocket",
+        "private-name-websocket",
+        "dedicated-worker",
+        "shared-worker",
+        "service-worker",
+      ];
       evidence.subresources = await electronApp.evaluate(
-        async (_electron, { port }) => {
+        async (_electron, { port, privateProbeIds: deniedProbeIds }) => {
           const entry = global.omnigentTestBrowserRegistries[0].get("preview-fixture");
           // Install a same-origin service worker while this preview has loopback access.
           await entry.view.webContents.executeJavaScript(`
@@ -318,19 +330,7 @@ it(
           void fetch("https://example.com/?kind=public-subresource", { mode: "no-cors" }).catch(() => {});
           void 0;
         `);
-          const kinds = [
-            "fetch",
-            "private-name-fetch",
-            "private-name-head",
-            "xhr",
-            "image",
-            "websocket",
-            "private-name-websocket",
-            "dedicated-worker",
-            "shared-worker",
-            "service-worker",
-            "public-subresource",
-          ];
+          const kinds = [...deniedProbeIds, "public-subresource"];
           const deadline = Date.now() + 10000;
           await new Promise((resolve) => {
             const check = () => {
@@ -356,20 +356,9 @@ it(
           );
           return { requests, alive, registeredViewIds };
         },
-        { port: fixture.address().port },
+        { port: fixture.address().port, privateProbeIds },
       );
-      for (const kind of [
-        "fetch",
-        "private-name-fetch",
-        "private-name-head",
-        "xhr",
-        "image",
-        "websocket",
-        "private-name-websocket",
-        "dedicated-worker",
-        "shared-worker",
-        "service-worker",
-      ]) {
+      for (const kind of privateProbeIds) {
         assert.ok(
           evidence.subresources.requests.some(
             (request) => request.url.endsWith("?kind=" + kind) && request.cancel,
@@ -707,7 +696,7 @@ it(
           (response) =>
             response.url === socketUrl && response.statusCode === 101 && !response.cancel,
         ),
-        "allowed WebSocket upgrade completes even when Electron omits its IP",
+        "eligible loopback WebSocket upgrade completes",
       );
       const getResponses = responses.filter((response) => response.url === corsUrl + "?method=get");
       assert.equal(getResponses.length, 2, "both cacheable fetches complete the response guard");

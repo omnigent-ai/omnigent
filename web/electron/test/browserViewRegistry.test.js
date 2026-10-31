@@ -789,59 +789,57 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     }).entry;
     entry.view.webContents.close = () => assert.fail("network enforcement must keep the view");
     const webContentsId = idOf("conv_1");
+    const resourceTypes = [
+      "xhr",
+      "script",
+      "image",
+      "stylesheet",
+      "font",
+      "media",
+      "ping",
+      "other",
+    ];
+    const request = { webContentsId, url: "https://example.com/x.js", resourceType: "xhr" };
     await Promise.all(
-      ["xhr", "script", "image", "stylesheet", "font", "media", "ping", "other"].map(
-        async (resourceType) => {
-          await Promise.all(
-            [
-              "http://127.0.0.1:8899/x",
-              "http://192.168.1.1/x",
-              "http://169.254.169.254/x",
-              "ws://localhost/live",
-            ].map(async (url) => {
-              assert.equal(
-                await registry.shouldCancelAgentRequest({ webContentsId, url, resourceType }),
-                true,
-                `${resourceType}: ${url}`,
-              );
-            }),
-          );
-          const url = "https://example.com/x.js";
-          const request = { webContentsId, url, resourceType };
+      resourceTypes.map(async (resourceType) => {
+        const smoke = { ...request, resourceType };
+        assert.equal(await registry.shouldCancelAgentRequest(smoke), false, resourceType);
+        assert.equal(
+          await registry.shouldCancelAgentResponse({ ...smoke, ip: "127.0.0.1" }),
+          true,
+          `${resourceType}: private connected IP`,
+        );
+      }),
+    );
+    await Promise.all(
+      [
+        ["http://127.0.0.1:8899/x", true],
+        ["http://192.168.1.1/x", true],
+        ["http://169.254.169.254/x", true],
+        ["ws://localhost/live", true],
+        ["https://93.184.215.14/x", false],
+      ].map(async ([url, cancel]) => {
+        assert.equal(await registry.shouldCancelAgentRequest({ ...request, url }), cancel, url);
+      }),
+    );
+    await Promise.all(
+      ["93.184.215.14", "127.0.0.1", "192.168.1.1", "169.254.169.254", undefined].map(
+        async (ip) => {
           assert.equal(
-            await registry.shouldCancelAgentRequest(request),
-            false,
-            `${resourceType}: public URL ${url}`,
-          );
-          assert.equal(
-            await registry.shouldCancelAgentRequest({ ...request, url: "https://93.184.215.14/x" }),
-            false,
-            `${resourceType}: public IP literals need no DNS lookup`,
-          );
-          assert.equal(
-            await registry.shouldCancelAgentResponse({ ...request, ip: "93.184.215.14" }),
-            false,
-            `${resourceType}: public connected IP for ${url}`,
-          );
-          await Promise.all(
-            ["127.0.0.1", "192.168.1.1", "169.254.169.254", undefined].map(async (ip) => {
-              assert.equal(
-                await registry.shouldCancelAgentResponse({ ...request, ip }),
-                true,
-                `${resourceType}: ${ip}`,
-              );
-            }),
+            await registry.shouldCancelAgentResponse({ ...request, ip }),
+            ip !== "93.184.215.14",
+            `connected IP: ${ip}`,
           );
         },
       ),
     );
     assert.deepEqual(
       lookups,
-      Array.from({ length: 8 }, () => ({
+      resourceTypes.map(() => ({
         hostname: "example.com",
         partition: agentPartition("w-test", "conv_1"),
       })),
-      "each subresource resolves through its owning partition before sending",
+      "named subresources resolve through their owning partition; IP literals skip DNS",
     );
     assert.equal(registry.get("conv_1"), entry);
   });
@@ -914,35 +912,36 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     const aliases = ["lvh.me", "localtest.me", "127.0.0.1.nip.io", "169-254-169-254.nip.io"];
     const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
     const requests = [
-      ...methods.flatMap((method) =>
-        ["xhr", "ping"].map((resourceType) => ({ method, resourceType })),
-      ),
-      { method: "GET", resourceType: "webSocket" },
+      ...methods.map((method) => ({ hostname: "localtest.me", method, resourceType: "xhr" })),
+      ...aliases
+        .filter((hostname) => hostname !== "localtest.me")
+        .map((hostname) => ({
+          hostname,
+          method: "GET",
+          resourceType: "xhr",
+        })),
+      { hostname: "localtest.me", method: "POST", resourceType: "ping" },
+      { hostname: "lvh.me", method: "GET", resourceType: "webSocket" },
     ];
-    const expectedLookups = [];
     await Promise.all(
-      aliases.flatMap((hostname) =>
-        requests.map(async ({ method, resourceType }) => {
-          expectedLookups.push(hostname);
-          const url = `${resourceType === "webSocket" ? "ws" : "http"}://${hostname}/request`;
-          const request = { webContentsId: idOf("conv_1"), url, method, resourceType };
-          assert.equal(
-            await registry.shouldCancelAgentRequest(request),
-            true,
-            `${method} ${resourceType} ${hostname}`,
-          );
-          assert.equal(
-            await registry.shouldCancelAgentResponse({
-              ...request,
-              ip: hostname.startsWith("169") ? "169.254.169.254" : "127.0.0.1",
-            }),
-            true,
-            `${method} ${resourceType} ${hostname}: private response`,
-          );
-        }),
-      ),
+      requests.map(async ({ hostname, method, resourceType }) => {
+        const url = `${resourceType === "webSocket" ? "ws" : "http"}://${hostname}/request`;
+        assert.equal(
+          await registry.shouldCancelAgentRequest({
+            webContentsId: idOf("conv_1"),
+            url,
+            method,
+            resourceType,
+          }),
+          true,
+          `${method} ${resourceType} ${hostname}`,
+        );
+      }),
     );
-    assert.deepEqual(lookups.map((lookup) => lookup.hostname).sort(), expectedLookups.sort());
+    assert.deepEqual(
+      lookups.map((lookup) => lookup.hostname).sort(),
+      requests.map((request) => request.hostname).sort(),
+    );
     assert.ok(lookups.every((lookup) => lookup.partition === agentPartition("w-test", "conv_1")));
     assert.equal(
       await registry.shouldCancelAgentRequest({

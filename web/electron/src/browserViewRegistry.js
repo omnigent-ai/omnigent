@@ -510,8 +510,8 @@ function createBrowserViewRegistry({
     return { requestHeaders: { ...headers, "Cache-Control": [...directives.values()].join(", ") } };
   }
 
-  // Electron 42 supplies HTTP details.ip despite stale typings. WebSocket
-  // upgrades omit it, so their DNS preflight is repeated at the response.
+  // IP-less WebSocket upgrades repeat the partition DNS check, not endpoint
+  // verification; DNS may change between the check and connection.
   async function shouldCancelAgentResponse(
     { webContentsId, url, ip, resourceType, statusCode },
     partition,
