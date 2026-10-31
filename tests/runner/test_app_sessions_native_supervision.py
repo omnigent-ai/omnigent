@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
 import uuid
 from typing import Any
 
@@ -29,6 +31,70 @@ from tests.runner.conftest import (
     _sse,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["interrupt", "delete", "shutdown", "unknown"])
+async def test_background_cancellation_records_request_and_state(
+    origin: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate = asyncio.Event()
+    app, _pm, harness = _build_interrupt_app(gate)
+    conv_id = "cancellation-evidence-session"
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_int_test",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "private message"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert response.status_code == 202
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5)
+        if origin == "interrupt":
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"}
+            )
+            assert response.status_code == 204
+        elif origin == "delete":
+            response = await client.delete(f"/v1/sessions/{conv_id}")
+            assert response.status_code == 200
+        else:
+            if origin == "shutdown":
+                app.state.shutting_down.set()
+            task = app.state.active_turns[conv_id]
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    [observed] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_turn_cancelled"
+    ]
+    requested = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_turn_cancel_requested"
+    ]
+    assert observed.levelno == logging.ERROR
+    assert observed.session_id == conv_id
+    assert observed.attributes["runner_shutting_down"] == (origin == "shutdown")
+    assert observed.attributes["interrupt_marked"] == (origin == "interrupt")
+    assert observed.attributes["task_cancel_count"] >= 1
+    assert "private" not in json.dumps(observed.attributes)
+    if origin in {"interrupt", "delete"}:
+        [request] = requested
+        assert request.attributes["cancel_origin"] == (
+            "interrupt_or_stop" if origin == "interrupt" else "session_delete"
+        )
+        assert request.attributes["turn_epoch"] == observed.attributes["turn_epoch"]
+    else:
+        assert not requested
 
 
 @pytest.mark.asyncio
