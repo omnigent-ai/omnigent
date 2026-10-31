@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { rerunProjectSetup } from "@/lib/projectsApi";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
@@ -9,6 +10,7 @@ import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
+vi.mock("@/lib/projectsApi", () => ({ rerunProjectSetup: vi.fn(() => Promise.resolve()) }));
 
 afterEach(cleanup);
 
@@ -1398,5 +1400,28 @@ describe("ErrorBanner — info level", () => {
     render(<ErrorBanner message="boom" source="execution" code="runner_error" />);
     expect(screen.getByTestId("error-pill")).toHaveAttribute("data-level", "error");
     expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
+  });
+});
+
+describe("project setup notices", () => {
+  it("offers a re-run on a failed worktree setup, not on a failed env command", async () => {
+    const renderNotice = (message: string) =>
+      render(
+        <ConversationScopeContext.Provider value="sess-setup">
+          <ErrorBanner message={message} source="execution" code="project_setup_failed" />
+        </ConversationScopeContext.Provider>,
+      );
+
+    renderNotice("Project env commands did not apply: project env commands failed (exit 1)");
+    expect(screen.queryByTestId("error-rerun-project-setup")).toBeNull();
+    cleanup();
+
+    renderNotice("Project setup failed: setup command 2 of 3 failed (exit 3)");
+    fireEvent.click(screen.getByTestId("error-rerun-project-setup"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("error-rerun-project-setup")).toHaveTextContent("Setup re-running"),
+    );
+    expect(vi.mocked(rerunProjectSetup)).toHaveBeenCalledWith("sess-setup");
   });
 });

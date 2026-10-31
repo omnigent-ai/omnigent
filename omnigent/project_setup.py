@@ -24,6 +24,10 @@ ENV_COMMANDS_KEY = "env_commands"
 SETUP_COMMANDS_KEY = "setup_commands"
 PARALLEL_SETUP_KEY = "parallel_setup"
 
+#: Set on a runner whose environment carries a project's ``env_commands``
+#: changes, so harnesses keep tool shells from rebuilding ``PATH``.
+PROJECT_ENV_APPLIED_ENV_VAR = "OMNIGENT_PROJECT_ENV_APPLIED"
+
 #: Upper bounds that keep a project config and its launch frame small.
 MAX_COMMANDS_PER_LIST = 20
 MAX_COMMAND_CHARS = 4096

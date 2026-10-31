@@ -42,7 +42,10 @@ pytestmark = [
 _SHELL_RC = (
     'fakeenv_activate() { export FAKEENV_NAME="$1"; export PATH="$HOME/fakeenv/bin:$PATH"; }\n'
 )
-_PROBE = 'echo "FAKEENV=$FAKEENV_NAME PATH=$PATH SETUP=$(cat setup-done 2>/dev/null)"'
+_PROBE = (
+    'echo "FAKEENV=$FAKEENV_NAME PATH=$PATH SETUP=$(cat setup-done 2>/dev/null)'
+    ' APPLIED=$OMNIGENT_PROJECT_ENV_APPLIED"'
+)
 
 
 def _repo_with_worktree(root: Path) -> tuple[Path, Path]:
@@ -136,17 +139,18 @@ def test_project_setup_applies_to_a_real_host_session(
 ) -> None:
     repo, worktree = _repo_with_worktree(tmp_path / "src")
     agent_id, model = _register_shell_agent(http_client, mock_llm_server_url)
+    setup_commands = [
+        'echo "$OMNIGENT_ROOT_PATH" > setup-root.txt',
+        "echo ran >> setup-runs.txt",
+        "sleep 3 && echo yes > setup-done",
+    ]
     project = http_client.post(
         "/v1/projects",
         json={
             "name": f"setup-e2e-{uuid.uuid4().hex[:6]}",
             "config": {
                 "env_commands": ["fakeenv_activate proj-e2e"],
-                "setup_commands": [
-                    'echo "$OMNIGENT_ROOT_PATH" > setup-root.txt',
-                    "echo ran >> setup-runs.txt",
-                    "sleep 3 && echo yes > setup-done",
-                ],
+                "setup_commands": setup_commands,
             },
         },
     )
@@ -185,7 +189,7 @@ def test_project_setup_applies_to_a_real_host_session(
         # First launch: the env reaches the agent, whose turn waits for setup.
         stdout = _probe_env(http_client, mock_llm_server_url, model, session_id)
         assert "FAKEENV=proj-e2e" in stdout and f"{home}/fakeenv/bin:" in stdout, stdout
-        assert "SETUP=yes" in stdout, stdout
+        assert "SETUP=yes" in stdout and "APPLIED=1" in stdout, stdout
         poll_until(
             lambda: _notice(http_client, session_id, "project_setup_finished"), timeout_s=60
         )
@@ -201,7 +205,12 @@ def test_project_setup_applies_to_a_real_host_session(
         # A broken env command is reported and the turn still runs, without the env.
         http_client.patch(
             f"/v1/projects/{project_id}",
-            json={"config": {"env_commands": ["fakeenv_missing proj-e2e"]}},
+            json={
+                "config": {
+                    "env_commands": ["fakeenv_missing proj-e2e"],
+                    "setup_commands": setup_commands,
+                }
+            },
         ).raise_for_status()
         _kill_session_runner(http_client, host, session_id)
         stdout = _probe_env(http_client, mock_llm_server_url, model, session_id)
@@ -210,3 +219,13 @@ def test_project_setup_applies_to_a_real_host_session(
         assert failed is not None and failed["level"] == "error", failed
         # The notice names the exit code and host log, never the command output.
         assert "exit 127" in failed["message"] and "log:" in failed["message"], failed
+
+        # "Re-run setup" runs it again on the host while the same runner keeps going.
+        runner_before = http_client.get(f"/v1/sessions/{session_id}").json()["runner_id"]
+        rerun = http_client.post(f"/v1/sessions/{session_id}/project-setup/rerun")
+        assert rerun.status_code == 202, rerun.text
+        poll_until(
+            lambda: (worktree / "setup-runs.txt").read_text().split() == ["ran", "ran"],
+            timeout_s=60,
+        )
+        assert http_client.get(f"/v1/sessions/{session_id}").json()["runner_id"] == runner_before

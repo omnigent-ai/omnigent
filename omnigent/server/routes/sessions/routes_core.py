@@ -4500,6 +4500,66 @@ def register_core_routes(
             agent_name=base_agent.name,
         )
 
+    # ── POST /sessions/{session_id}/project-setup/rerun ──────────
+    @router.post("/sessions/{session_id}/project-setup/rerun", status_code=202)
+    async def rerun_project_setup(request: Request, session_id: str) -> dict[str, str]:
+        """Run the session's worktree setup again, without restarting its agent.
+
+        The outcome arrives as the usual project-setup notices.
+
+        :raises OmnigentError: 404 for an unknown session, 400 when it has no
+            setup to run, 503 when its host is offline.
+        """
+        from omnigent.host.frames import HostRerunProjectSetupFrame, encode_host_frame
+        from omnigent.project_setup import SETUP_COMMANDS_KEY
+        from omnigent.server.routes._host_launch import resolve_launch_project_setup
+        from omnigent.server.routes._sessions.helpers import note_project_setup_on_launch
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.host_id is None or conv.workspace is None:
+            raise OmnigentError(
+                "This session does not run on a host", code=ErrorCode.INVALID_INPUT
+            )
+        registry = getattr(request.app.state, "host_registry", None)
+        conn = registry.get(conv.host_id) if registry is not None else None
+        if registry is None or conn is None:
+            raise OmnigentError("The session's host is offline", code=ErrorCode.HOST_OFFLINE)
+        project_setup = await resolve_launch_project_setup(conv, conn)
+        if project_setup.unsupported:
+            raise OmnigentError(
+                "The session's host is too old to run project setup",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if project_setup.wire is None or not project_setup.wire.get(SETUP_COMMANDS_KEY):
+            raise OmnigentError(
+                "The session's project has no setup commands", code=ErrorCode.INVALID_INPUT
+            )
+        registry.send_text(
+            conn,
+            encode_host_frame(
+                HostRerunProjectSetupFrame(
+                    session_id=session_id,
+                    workspace=conv.workspace,
+                    project_setup=project_setup.wire,
+                )
+            ),
+        )
+        await note_project_setup_on_launch(
+            conv,
+            conversation_store,
+            unsupported=False,
+            warnings=(),
+            running=True,
+            agent_waits=False,
+        )
+        return {"status": "started"}
+
     # ── POST /sessions/{session_id}/switch-agent (reserved) ──────
     # Placeholder: in-place agent switching was retired and will return with a
     # new request shape in a future release, so the path stays reserved.

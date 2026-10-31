@@ -25,6 +25,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { rerunProjectSetup } from "@/lib/projectsApi";
 import type { ReactNode } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
@@ -284,6 +285,44 @@ function ErrorForkAction({
           {label}
         </Button>
       </DisabledActionTooltip>
+    </div>
+  );
+}
+
+/** A failed worktree setup's "Re-run setup" action; the agent keeps running. */
+function RerunProjectSetupAction({ className }: { className?: string }) {
+  const conversationId = useScopedConversationId();
+  const [state, setState] = useState<"idle" | "pending" | "started">("idle");
+  const [error, setError] = useState<string | null>(null);
+  if (!conversationId) return null;
+  return (
+    <div className={className} onClick={(event) => event.stopPropagation()}>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        data-testid="error-rerun-project-setup"
+        disabled={state !== "idle"}
+        onClick={() => {
+          setState("pending");
+          setError(null);
+          rerunProjectSetup(conversationId).then(
+            () => setState("started"),
+            (reason: unknown) => {
+              setState("idle");
+              setError(reason instanceof Error ? reason.message : String(reason));
+            },
+          );
+        }}
+      >
+        <RotateCwIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        {state === "started" ? "Setup re-running" : "Re-run setup"}
+      </Button>
+      {error ? (
+        <p role="alert" className="mt-1 text-sm text-destructive">
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -580,6 +619,9 @@ export function ErrorBanner({
             <XIcon className="size-4" aria-hidden="true" />
           </Button>
         </div>
+        {code === "project_setup_failed" && message.startsWith("Project setup failed") ? (
+          <RerunProjectSetupAction className="mx-[4px] mt-[8px]" />
+        ) : null}
         {workspaceMissing ? (
           <ErrorForkAction
             label="Continue in another directory…"

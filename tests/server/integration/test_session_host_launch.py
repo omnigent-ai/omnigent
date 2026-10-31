@@ -44,6 +44,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostProjectSetupFinishedFrame,
+    HostRerunProjectSetupFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -5140,3 +5141,38 @@ async def test_malformed_project_setup_is_rejected_when_saved(client: httpx.Asyn
 
     assert response.status_code in (400, 422), response.text
     assert "setup_commands" in response.text
+
+
+async def test_rerun_project_setup_asks_the_host_without_relaunching_the_runner(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
+    session_id, _ = await _create_project_session(client, comm, {"setup_commands": ["npm ci"]})
+
+    response = await client.post(f"/v1/sessions/{session_id}/project-setup/rerun")
+
+    assert response.status_code == 202, response.text
+    deadline = Deadline(10.0)
+    while True:
+        output = await comm.receive_output(timeout=deadline.next_wait(10.0))
+        frame = decode_host_frame(output["text"]) if output["type"] == "websocket.send" else None
+        assert not isinstance(frame, HostLaunchRunnerFrame), "a re-run must not relaunch"
+        if isinstance(frame, HostRerunProjectSetupFrame):
+            break
+    assert frame.session_id == session_id
+    assert frame.workspace == _WORKSPACE
+    assert frame.project_setup["setup_commands"] == ["npm ci"]
+    notices = await _notices(client, session_id)
+    assert notices[-1]["code"] == "project_setup_running"
+
+
+async def test_rerun_project_setup_is_refused_without_setup_commands(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
+    session_id, _ = await _create_project_session(client, comm, {"env_commands": ["true"]})
+
+    response = await client.post(f"/v1/sessions/{session_id}/project-setup/rerun")
+
+    assert response.status_code == 400, response.text
+    assert "no setup commands" in response.text

@@ -163,6 +163,7 @@ class HostFrameKind(str, Enum):
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
     PROJECT_SETUP_FINISHED = "host.project_setup_finished"
+    RERUN_PROJECT_SETUP = "host.rerun_project_setup"
     RUNNER_STATUS = "host.runner_status"
     RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
@@ -445,6 +446,24 @@ class HostRunnerExitedFrame:
     runner_id: str
     error: str
     had_connected: bool | None = None
+
+
+@dataclass
+class HostRerunProjectSetupFrame:
+    """Server → host: run a session's worktree setup again, on request.
+
+    One-way; the host reports with :class:`HostProjectSetupFinishedFrame`.
+    The running agent is not restarted or held.
+
+    :param session_id: Session asking for the re-run, e.g. ``"conv_abc"``.
+    :param workspace: The session's workspace on the host.
+    :param project_setup: The project's current setup
+        (:meth:`omnigent.project_setup.ProjectSetup.to_wire`).
+    """
+
+    session_id: str
+    workspace: str
+    project_setup: dict[str, Any]
 
 
 @dataclass
@@ -1497,6 +1516,7 @@ HostFrame = (
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
     | HostProjectSetupFinishedFrame
+    | HostRerunProjectSetupFrame
     | HostRunnerStatusFrame
     | HostRunnerStatusResultFrame
     | HostStatFrame
@@ -1671,6 +1691,15 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostRerunProjectSetupFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RERUN_PROJECT_SETUP.value,
+                "session_id": frame.session_id,
+                "workspace": frame.workspace,
+                "project_setup": frame.project_setup,
             }
         )
     if isinstance(frame, HostProjectSetupFinishedFrame):
@@ -2477,6 +2506,16 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.RERUN_PROJECT_SETUP:
+            raw_setup = msg.get("project_setup")
+            setup = ProjectSetup.from_mapping(raw_setup) if isinstance(raw_setup, dict) else None
+            if setup is None:
+                raise ValueError("rerun_project_setup frame requires a project_setup")
+            return HostRerunProjectSetupFrame(
+                session_id=_required_str(msg, "session_id"),
+                workspace=_required_str(msg, "workspace"),
+                project_setup=setup.to_wire(),
+            )
         case HostFrameKind.PROJECT_SETUP_FINISHED:
             return HostProjectSetupFinishedFrame(
                 session_id=_required_str(msg, "session_id"),

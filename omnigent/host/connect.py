@@ -124,6 +124,7 @@ from omnigent.host.frames import (
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
+    HostRerunProjectSetupFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -204,7 +205,7 @@ from omnigent.process_logging import (
     redact_log_text,
     should_log_to_stderr,
 )
-from omnigent.project_setup import ProjectSetup
+from omnigent.project_setup import PROJECT_ENV_APPLIED_ENV_VAR, ProjectSetup
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
@@ -2275,7 +2276,10 @@ class HostProcess:
         # Installs can take minutes, longer than any launch wait, so they run
         # after the runner is up and report back with host.project_setup_finished.
         project_setup_running = await self._start_worktree_setup(
-            frame, workspace, project_env_delta
+            ProjectSetup.from_mapping(frame.project_setup) if frame.project_setup else None,
+            frame.session_id,
+            workspace,
+            project_env_delta,
         )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
@@ -2315,6 +2319,8 @@ class HostProcess:
             crash = f"project env commands crashed on the host ({type(exc).__name__})"
             return [crash], EnvDelta()
         apply_env_delta(env, outcome.env_delta)
+        if outcome.env_delta.set_vars or outcome.env_delta.unset_vars:
+            env[PROJECT_ENV_APPLIED_ENV_VAR] = "1"
         for warning in outcome.warnings:
             _logger.warning("Project env for session %s: %s", frame.session_id, warning)
         return outcome.warnings, outcome.env_delta
@@ -2353,23 +2359,23 @@ class HostProcess:
 
     async def _start_worktree_setup(
         self,
-        frame: HostLaunchRunnerFrame,
+        setup: ProjectSetup | None,
+        session_id: str | None,
         workspace: Path,
         env_delta: EnvDelta,
     ) -> bool:
         """Start the project's worktree ``setup_commands`` in the background.
 
-        :param frame: The launch request carrying ``project_setup``.
+        :param setup: The project's setup, or ``None``.
+        :param session_id: Session that receives the outcome notice.
         :param workspace: The session workspace.
         :param env_delta: The project env delta (e.g. the conda ``PATH``), layered
             onto the host env for the setup commands. The runner env itself is
             not reused: it carries the runner's auth tokens.
         :returns: Whether a setup run started.
         """
-        setup = ProjectSetup.from_mapping(frame.project_setup) if frame.project_setup else None
-        if setup is None or not setup.setup_commands or not frame.session_id:
+        if setup is None or not setup.setup_commands or not session_id:
             return False
-        session_id = frame.session_id
         commands = setup.setup_commands
 
         try:
@@ -2413,6 +2419,37 @@ class HostProcess:
         self._watcher_tasks.add(task)
         task.add_done_callback(self._watcher_tasks.discard)
         return True
+
+    async def _handle_rerun_project_setup(self, frame: HostRerunProjectSetupFrame) -> None:
+        """Run a worktree's setup again on the user's request, without touching its runner.
+
+        :param frame: The re-run request; its outcome is reported like a launch's.
+        """
+        setup = ProjectSetup.from_mapping(frame.project_setup)
+        workspace = Path(frame.workspace).expanduser()
+
+        def prepare() -> EnvDelta:
+            clear_setup_marker(str(workspace))
+            if setup is None:
+                return EnvDelta()
+            return prepare_project_env(
+                setup, workspace=str(workspace), cache=self._env_probe_cache
+            ).env_delta
+
+        try:
+            env_delta = await self._run_host_subprocess_in_thread(prepare)
+            started = workspace.is_dir() and await self._start_worktree_setup(
+                setup, frame.session_id, workspace, env_delta
+            )
+        except Exception as exc:
+            _logger.exception("Project setup re-run failed for %s", workspace)
+            started, reason = False, f"project setup could not start ({type(exc).__name__})"
+        else:
+            reason = "project setup is already running, or the workspace is not a git worktree"
+        if not started:
+            await self._report_project_setup(
+                HostProjectSetupFinishedFrame(session_id=frame.session_id, warning=reason)
+            )
 
     async def _report_project_setup(self, report: HostProjectSetupFinishedFrame) -> None:
         """Send a setup report, parking it for the next connection if offline."""
@@ -5969,6 +6006,8 @@ class HostProcess:
                 # records the traceback, which is the only diagnostic an
                 # unexpected fault leaves behind.
                 raise launch_fault
+        elif isinstance(frame, HostRerunProjectSetupFrame):
+            await self._handle_rerun_project_setup(frame)
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
                 stop_result = await self._handle_stop(frame)

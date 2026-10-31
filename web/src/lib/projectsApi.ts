@@ -186,3 +186,15 @@ export async function saveProjectOrder(ids: string[] | null): Promise<ProjectOrd
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as ProjectOrder;
 }
+
+/**
+ * Run a session's worktree setup again (after a failed install). The agent keeps
+ * running; the outcome arrives as the session's project-setup notices.
+ */
+export async function rerunProjectSetup(sessionId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/project-setup/rerun`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw new Error(await readError(res));
+}
