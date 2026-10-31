@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.db.utils import get_or_create_engine
+from omnigent.db.utils import get_or_create_engine, installed_agent_id
 from omnigent.entities import Agent, PagedList
 from omnigent.errors import StaleCursorError
 from omnigent.stores.agent_store import AgentStore
@@ -706,10 +706,10 @@ def test_list_user_agents_skips_copies_and_keeps_legacy_originals(
     assert {a.id for a in agent_store.list_user_agents(_OWNER).data} == {orion.id, legacy.id}
 
 
-def test_list_user_agents_lists_every_original_by_id_even_when_names_repeat(
+def test_list_user_agents_prefers_shared_id_to_legacy_duplicates(
     agent_store: SqlAlchemyAgentStore, clock: None
 ) -> None:
-    """Nothing is hidden by name, so every agent stays manageable by its id."""
+    """Shared IDs hide legacy duplicates across pages without changing those rows."""
     agent_store.create(uuid.uuid4().hex, "polly", "x/y")
     uploaded = _user_agent(agent_store, "orion")
     installed = _user_agent(agent_store, "orion")
@@ -722,6 +722,25 @@ def test_list_user_agents_lists_every_original_by_id_even_when_names_repeat(
         installed.id,
         uploaded.id,
     ]
+    shared_id = installed_agent_id(_OWNER, "orion")
+    shared = agent_store.create_user_agent(shared_id, "orion", f"{shared_id}/{_SHA}", _OWNER)
+    upper = _user_agent(agent_store, "Orion")
+    late_legacy = _user_agent(agent_store, "orion")
+    other_owner = _user_agent(agent_store, "orion", owner="bob@example.com")
+    agent_store.update(uploaded.id, f"{uploaded.id}/new")
+    expected = [upper.id, shared.id, polly.id, edited_fork.id]
+    assert [a.id for a in agent_store.list_user_agents(_OWNER).data] == expected
+    assert agent_store.list_user_agents("bob@example.com").data == [other_owner]
+    assert all(agent_store.get(a.id) is not None for a in (uploaded, installed, late_legacy))
+    after = None
+    seen = []
+    while True:
+        page = agent_store.list_user_agents(_OWNER, limit=1, after=after)
+        seen.extend(a.id for a in page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+    assert seen == expected
 
 
 def test_list_user_agents_reads_a_bounded_window(

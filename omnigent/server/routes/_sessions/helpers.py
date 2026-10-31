@@ -10979,12 +10979,12 @@ def _persist_session_for_uploaded_agent(
     inference_model: str | None = None,
 ) -> CreatedSessionResponse:
     """
-    Persist a top-level session bound to the agent row of an earlier, identical upload.
+    Persist a session bound to the owner/name identity of its upload.
 
     Other sessions may use the row and its bundle, so a failure here leaves both.
 
     :param conversation_store: Store for the new conversation.
-    :param metadata: Validated top-level session metadata.
+    :param metadata: Validated session metadata, including an authorized parent.
     :param agent: The upload's agent (:func:`omnigent.server.bundles.uploaded_agent_for`).
     :param runner_id: Optional runner binding, e.g. ``"runner_abc123"``.
     :returns: Response with the new session id.
@@ -10995,6 +10995,9 @@ def _persist_session_for_uploaded_agent(
     try:
         conversation = conversation_store.create_conversation(
             agent_id=agent.id,
+            parent_conversation_id=metadata.parent_session_id,
+            kind="sub_agent" if metadata.parent_session_id else "default",
+            check_duplicate_title=False,
             title=metadata.title,
             runner_id=runner_id,
             host_id=metadata.host_id,
@@ -11006,6 +11009,8 @@ def _persist_session_for_uploaded_agent(
             reasoning_effort=metadata.reasoning_effort,
             model_override=inference_model,
         )
+    except ConversationNotFoundError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.NOT_FOUND) from exc
     except IntegrityError as exc:
         raise OmnigentError(
             f"session write failed integrity checks: {exc.orig}",

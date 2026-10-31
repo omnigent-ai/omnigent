@@ -12110,17 +12110,14 @@ async def _create_session_from_existing_agent(
     )
     from omnigent.stores.conversation_store.overrides import encode_session_overrides
 
-    # A new session from another user's agent runs on the caller's own copy, so
-    # that user can never change code running here. A child reusing its parent's
-    # agent stays on it: collaborators act in the owner's session. A failed create
-    # below keeps the copy: it is listed to its owner from the start, so another of
-    # their requests may already be using it.
-    if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
-        agent = await asyncio.to_thread(
-            agent_for_user, agent_store, artifact_store, agent, user_id
-        )
-
     try:
+        # Copy conflicts roll back the new worktree. Retain shared agents because
+        # another request may already use them; children sharing their parent's stay bound.
+        if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
+            agent = await asyncio.to_thread(
+                agent_for_user, agent_store, artifact_store, agent, user_id
+            )
+
         # Include spec-seeded defaults before create; overflow must not leave a session.
         encode_session_overrides(
             {
@@ -12409,9 +12406,8 @@ def _create_session_from_bundle(
     """
     Validate, store, and persist a bundled session request.
 
-    Top-level uploads reuse the uploader's row with the same name and bundle
-    contents (:func:`~omnigent.server.bundles.uploaded_agent_for`), never a row
-    matched by name alone. Child uploads receive separate rows.
+    All uploads share the uploader's owner/name identity. Children reuse identical
+    files or conflict; explicit top-level uploads update existing sessions.
 
     :param conversation_store: Store that owns the atomic
         conversation-plus-agent transaction.
@@ -12487,13 +12483,14 @@ def _create_session_from_bundle(
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
-    if agent_store is not None and metadata.parent_session_id is None:
+    if agent_store is not None:
         agent = uploaded_agent_for(
             agent_store,
             artifact_store,
             owner=created_by,
             spec=spec,
             bundle_bytes=bundle_bytes,
+            replace_existing=metadata.parent_session_id is None,
         )
         if agent is not None:
             return _persist_session_for_uploaded_agent(

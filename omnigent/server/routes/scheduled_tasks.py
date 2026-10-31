@@ -561,16 +561,12 @@ def create_scheduled_tasks_router(
                 project_id=project_id,
                 execution_target=body.execution_target,
             )
-        except Exception as exc:
-            if bound.id != agent.id:
-                agent_store.delete(bound.id)
-            if isinstance(exc, RRuleSearchError):
-                raise OmnigentError(
-                    "Could not calculate the next run time for this schedule. "
-                    "The task was not created.",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            raise
+        except RRuleSearchError as exc:
+            raise OmnigentError(
+                "Could not calculate the next run time for this schedule. "
+                "The task was not created.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False
@@ -778,7 +774,6 @@ def create_scheduled_tasks_router(
             fields["session_id"] = None
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
-        new_copy: Agent | None = None
         if agent_changed:
             # A harness switch invalidates the per-agent settings stored beside
             # it: a model id is provider-bound and permission_mode is Claude-only.
@@ -860,7 +855,6 @@ def create_scheduled_tasks_router(
             if agent_changed and fields.get("session_id") is None:
                 bound = await _bind_agent(agent, owner_id)
                 fields["agent_id"] = bound.id
-                new_copy = bound if bound.id != agent.id else None
         if "session_id" not in fields and any(
             name in fields and fields[name] != getattr(existing, name)
             for name in _SESSION_BOUND_FIELDS
@@ -898,17 +892,12 @@ def create_scheduled_tasks_router(
             updated = store.update(scheduled_task_id, **fields)
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
-        except Exception as exc:
-            # The task never bound the copy, so nothing else uses it.
-            if new_copy is not None:
-                agent_store.delete(new_copy.id)
-            if isinstance(exc, RRuleSearchError):
-                raise OmnigentError(
-                    "Could not calculate the next run time for this schedule. "
-                    "Your changes were not saved.",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            raise
+        except RRuleSearchError as exc:
+            raise OmnigentError(
+                "Could not calculate the next run time for this schedule. "
+                "Your changes were not saved.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False

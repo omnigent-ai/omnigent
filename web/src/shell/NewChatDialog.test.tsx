@@ -7,6 +7,7 @@ vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
   fetchSandboxProfiles: vi.fn(),
 }));
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+import type * as AvailableAgentsModule from "@/hooks/useAvailableAgents";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   ...(await importOriginal<typeof SandboxModelOptionsModule>()),
@@ -27,7 +28,10 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => useTestConversations(),
+  useSidebarData: () => ({ mine: useTestConversations() }),
+}));
 import { useSkills } from "@/hooks/useSkills";
 
 vi.mock("@/hooks/useSkills", () => ({ useSkills: vi.fn() }));
@@ -10560,6 +10564,71 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
     expect(fetchUserAgents).toHaveBeenCalled();
     await waitFor(() => expect(agentPicker).toHaveAccessibleName(/Orion/));
+  });
+
+  it("refreshes a replaced agent's harness even when the bundled session fails to launch", async () => {
+    const bundleBuilder = vi
+      .spyOn(await import("@/lib/agentBundle"), "buildAgentBundle")
+      .mockResolvedValue(new File([], "orion.tar.gz"));
+    onTestFinished(() => bundleBuilder.mockRestore());
+    const actual = await vi.importActual<typeof AvailableAgentsModule>(
+      "@/hooks/useAvailableAgents",
+    );
+    useAvailableAgentsMock.mockImplementation(actual.useAvailableAgents);
+    const owned = { id: "ag_orion", name: "orion", harness: "claude-native", created_at: 1 };
+    authenticatedFetchMock.mockImplementation(async (url, init) => {
+      if (url === "/v1/agents") return Response.json({ data: DEFAULT_LANDING_AGENTS });
+      if (String(url).startsWith("/v1/agents?scope=user")) {
+        return Response.json({ data: [owned], has_more: false });
+      }
+      if (url === "/v1/sessions" && init?.body instanceof FormData) {
+        owned.harness = "codex";
+        return Response.json({ session_id: "created_orion", agent_id: owned.id });
+      }
+      if (url === "/v1/hosts/host_1/runners") {
+        return Response.json({ detail: "Host disconnected" }, { status: 503 });
+      }
+      return Response.json({ data: [] });
+    });
+    renderLanding({ agent_install: true });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-agent-select")).toBeEnabled());
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(await screen.findByTestId(`new-chat-landing-agent-${owned.id}`));
+    closeMenu();
+    openPermissions();
+    expect(screen.getByTestId("new-chat-landing-permission-option-plan")).toBeVisible();
+    closeMenu();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await screen.findByTestId("create-agent-dialog");
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "orion" } });
+    await userEvent.click(screen.getByTestId("create-agent-harness"));
+    await userEvent.click(await screen.findByRole("option", { name: "Codex" }));
+    fireEvent.change(screen.getByTestId("create-agent-model"), {
+      target: { value: "configured-model" },
+    });
+    fireEvent.click(screen.getByTestId("create-agent-submit"));
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Use the updated agent" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    expect(await screen.findByTestId("new-chat-landing-error")).toBeVisible();
+    expect(authenticatedFetchMock).toHaveBeenCalledWith(
+      "/v1/hosts/host_1/runners",
+      expect.objectContaining({ method: "POST" }),
+    );
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    const refreshedAgent = await screen.findByTestId(`new-chat-landing-agent-${owned.id}`);
+    await waitFor(() => expect(refreshedAgent).toHaveTextContent("Codex"));
+    fireEvent.click(refreshedAgent);
+    closeMenu();
+    expect(screen.queryByTestId("new-chat-landing-permission-chip")).toBeNull();
   });
 
   it("says so when an imported agent is missing from the picker list", async () => {

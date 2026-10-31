@@ -27,17 +27,16 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile
 from starlette.types import Message
 
-from omnigent.db.utils import builtin_agent_id, installed_agent_id
+from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
 from omnigent.server.auth import AuthProvider
-from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
+from omnigent.server.bundles import content_bundle_location, save_user_agent, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -237,63 +236,41 @@ def _config_headers(response: Response, agent: Agent) -> None:
 def install_user_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
-    agent_cache: AgentCache,
     *,
     owner: str | None,
     name: str,
     bundle_bytes: bytes,
+    description: str | None = None,
+    allow_server_name_collision: bool = False,
 ) -> Agent:
     """
     Create or update *owner*'s user agent named *name* from a validated bundle.
 
-    The id comes from owner and name (:func:`installed_agent_id`), so a
-    reinstall updates the same row in place (stable id, bumped version) and
-    the primary key keeps that identity atomic under concurrent installs.
+    All creation paths share owner/name identity. Reinstall updates the same
+    row, including an earlier session or child upload (stable id, bumped version).
     Sessions using the agent pick up the new bundle on their next turn.
 
     :param owner: Installing user, or ``None`` on an auth-less server.
     :param name: Agent name from the bundle's spec, e.g. ``"orion"``.
     :param bundle_bytes: Gzipped tarball already checked by
         :func:`validate_agent_bundle`.
+    :param allow_server_name_collision: Caller can select distinct server and owned IDs;
+        older clients retain the server-name conflict response.
     :returns: The created or updated agent.
-    :raises OmnigentError: ``CONFLICT`` when a server agent uses the name.
     """
-    if agent_store.get_by_name(name) is not None:
-        # A same-named user agent would be hidden behind the server agent.
+    if not allow_server_name_collision and agent_store.get_by_name(name) is not None:
         raise OmnigentError(
-            f"{name!r} is a server agent; rename your agent to install it.",
+            f"{name!r} is a server agent. Update your client or use a different name.",
             code=ErrorCode.CONFLICT,
         )
-    agent_id = installed_agent_id(owner, name)
-    # Named by content, so reinstalling the same files is a no-op however the
-    # client tarred them.
-    location = content_bundle_location(agent_id, bundle_bytes)
-    existing = agent_store.get(agent_id)
-    if existing is None:
-        artifact_store.put(location, bundle_bytes)
-        try:
-            # No stored description: the listing reads it from the current
-            # bundle's spec, so a reinstall never shows a stale one.
-            return agent_store.create_user_agent(agent_id, name, location, owner=owner)
-        except IntegrityError:
-            # A concurrent install of the same agent won; update that row instead.
-            existing = agent_store.get(agent_id)
-            if existing is None:
-                raise
-    if existing.bundle_location == location:
-        # Same files: restore the blob if it vanished while the row survived.
-        if not artifact_store.exists(location):
-            artifact_store.put(location, bundle_bytes)
-        return existing
-    artifact_store.put(location, bundle_bytes)
-    if agent_store.supports_config_edit:
-        updated = agent_store.update(agent_id, location, description=None)
-    else:
-        updated = agent_store.update(agent_id, location)
-    agent_cache.evict(agent_id)
-    if updated is None:  # removed concurrently
-        raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
-    return updated
+    return save_user_agent(
+        agent_store,
+        artifact_store,
+        owner=owner,
+        name=name,
+        bundle_bytes=bundle_bytes,
+        description=description,
+    )
 
 
 def create_builtin_agents_router(
@@ -539,6 +516,8 @@ def create_builtin_agents_router(
         Multipart form with one ``bundle`` part: a gzipped tarball, the same
         shape multipart ``POST /v1/sessions`` accepts. The bundle is validated
         like any tenant upload and never executed here.
+        Clients that distinguish owned and server names send the form field
+        ``allow_server_name_collision=true``; older clients retain a 409 on collision.
 
         :param request: The incoming request carrying the ``bundle`` part.
         :returns: The installed agent as an :class:`AgentObject`.
@@ -550,7 +529,8 @@ def create_builtin_agents_router(
         length = request.headers.get("content-length", "")
         if length.isdigit() and int(length) > MAX_INSTALL_BUNDLE_BYTES + _MULTIPART_OVERHEAD_BYTES:
             raise _too_large()
-        bundle = (await _body_capped(request).form()).get("bundle")
+        form = await _body_capped(request).form()
+        bundle = form.get("bundle")
         if not isinstance(bundle, UploadFile):
             raise HTTPException(status_code=422, detail="multipart part 'bundle' is required")
         if bundle.size is not None and bundle.size > MAX_INSTALL_BUNDLE_BYTES:
@@ -567,10 +547,11 @@ def create_builtin_agents_router(
             install_user_agent,
             agent_store,
             artifact_store,
-            agent_cache,
             owner=user_id,
             name=spec.name,
             bundle_bytes=bundle_bytes,
+            description=spec.description,
+            allow_server_name_collision=form.get("allow_server_name_collision") == "true",
         )
         # Loads (extracts) the just-written bundle; keep it off the event loop.
         return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
