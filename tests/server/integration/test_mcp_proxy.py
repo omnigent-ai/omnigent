@@ -1,26 +1,143 @@
 """Integration tests for the MCP proxy endpoint ``POST /v1/sessions/{id}/mcp``.
 
-Covers JSON-RPC validation, method routing, and error paths that do
-not require a live runner connection.  The MCP endpoint proxies
-JSON-RPC requests to the runner's MCP servers; these tests exercise
-the validation layer and error handling on the AP server side.
-
-Uses the shared ``client`` fixture from ``tests/server/conftest.py``
-which wires a real ``RunnerRouter`` with an empty tunnel registry,
-so the endpoint is reachable and runner-dependent methods return the
-"no runner bound" application error.
+Covers JSON-RPC validation, routing and error handling with the shared server
+client. Background-shell cases connect the real runner MCP routes and execute
+a local shell; other cases need no runner.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import shlex
+import sys
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+import yaml
 
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runtime import get_caps, get_conversation_store
+from omnigent.server.routes import sessions as sessions_mod
+from omnigent.spec.parser import parse
+from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+from tests._helpers.runner_mcp import RunnerMcpHarness
+from tests._helpers.session import bundle_files, post_session_bundle
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize(("result_action", "times_out"), [("ALLOW", False), ("DENY", True)])
+async def test_background_shell_keeps_execution_and_policies_across_http(
+    app,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result_action: str,
+    times_out: bool,
+) -> None:
+    monkeypatch.setattr(app.state, "_shell_result_signing_key", b"test-shell-key".ljust(32, b"_"))
+    script = (
+        "import time; from pathlib import Path; "
+        "Path('starts').open('a').write('started\\n'); "
+        "deadline = time.monotonic() + 10\n"
+        "while not Path('release').exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        "print('PRIVATE OUTPUT')"
+    )
+    approved = {
+        "command": f"exec {shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+        "timeout": 1 if times_out else 15,
+    }
+    shell_events = []
+
+    def policy(event: dict[str, Any]) -> dict[str, Any]:
+        if event.get("target") == "sys_os_shell":
+            shell_events.append(event)
+            if event["type"] == "tool_call":
+                return {"result": "ALLOW", "data": approved}
+            return {"result": result_action, "data": "redacted output", "reason": "private"}
+        return {"result": "ALLOW"}
+
+    monkeypatch.setattr(sys.modules[__name__], "_shell_policy", policy, raising=False)
+    caps = replace(
+        get_caps(),
+        default_policies=[
+            FunctionPolicySpec(
+                name="shell-policy",
+                on=None,
+                function=FunctionRef(path=f"{__name__}._shell_policy"),
+            )
+        ],
+    )
+    monkeypatch.setattr(sessions_mod, "get_caps", lambda: caps)
+    config = yaml.safe_dump(
+        {
+            "spec_version": 1,
+            "name": "shell-yield",
+            "executor": {"config": {"harness": "claude-sdk"}},
+            "os_env": {"shell_yield_after": 0.01, "sandbox": {"type": "none"}},
+        }
+    ).encode()
+    (tmp_path / "config.yaml").write_bytes(config)
+    created = await post_session_bundle(
+        client.post,
+        "/v1/sessions",
+        bundle_files({"config.yaml": config}),
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["session_id"]
+    binding = "test-shell-runner-binding"
+    get_conversation_store().set_runner_id(sid, token_bound_runner_id(binding))
+    client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding
+    runner = RunnerMcpHarness(session_id=sid, workspace=tmp_path, server_client=client)
+    runner.spec_cache[sid] = parse(tmp_path)
+    runner.inboxes[sid] = asyncio.Queue()
+    runner.async_tasks[sid] = {}
+    async with runner.client() as runner_client:
+
+        async def get_runner(*args):
+            return runner_client
+
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
+        try:
+            async with asyncio.timeout(2):
+                response = await _post_mcp(
+                    client,
+                    sid,
+                    _jsonrpc(
+                        "tools/call",
+                        params={
+                            "name": "sys_os_shell",
+                            "arguments": {"command": "must be rewritten"},
+                            "_omnigent_operation_id": "shell-once",
+                        },
+                    ),
+                )
+            handle = json.loads(response.json()["result"]["content"][0]["text"])
+            collection = runner.async_tasks[sid][handle["handle_id"]][0]
+            assert [event["type"] for event in shell_events] == ["tool_call"]
+        finally:
+            if not times_out:
+                (tmp_path / "release").touch()
+        raw_output = json.loads(await asyncio.wait_for(collection, timeout=5))
+        assert raw_output["timed_out"] is times_out
+        result = await _post_mcp(
+            client, sid, _jsonrpc("tools/call", params={"name": "sys_read_inbox"})
+        )
+    delivered = result.json()["result"]["content"][0]["text"]
+    assert "PRIVATE OUTPUT" not in delivered
+    assert (
+        "redacted output" if result_action == "ALLOW" else "suppressed by policy: private"
+    ) in delivered
+    assert [event["type"] for event in shell_events] == ["tool_call", "tool_result"]
+    assert shell_events[1]["request_data"] == {"name": "sys_os_shell", "arguments": approved}
+    assert (tmp_path / "starts").read_text() == "started\n"
+    assert runner.inboxes[sid].empty() and runner.async_tasks[sid] == {}
 
 
 # ── Helpers ───────────────────────────────────────────────

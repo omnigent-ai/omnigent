@@ -12643,6 +12643,7 @@ async def _handle_mcp_tools_call(
         return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
     operation_id = cast("str | None", operation_id_value)
     is_retry = request_state_str is not None
+    delayed_context: dict[str, Any] | None = None
 
     def _runner_execute_body(
         execute_params: dict[str, Any],
@@ -12650,6 +12651,9 @@ async def _handle_mcp_tools_call(
         step: str,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        if delayed_context is not None:
+            # Older peers retain foreground execution.
+            body["_omnigent_background_shell"] = delayed_context
         if operation_id is not None:
             body["_omnigent_operation"] = {"id": operation_id, "step": step}
         return body
@@ -12896,6 +12900,21 @@ async def _handle_mcp_tools_call(
             return _mcp_error_response(
                 rpc_id, -32000, f"No runner bound for session {session_id!r}"
             )
+        if (
+            namespaced_name == "sys_os_shell"
+            and request is not None
+            and spec.os_env is not None
+            and spec.os_env.shell_yield_after is not None
+            and spec.async_enabled
+        ):
+            from omnigent.server.mcp_identity import shell_result_context
+
+            try:
+                delayed_context = shell_result_context(
+                    request, conv, actor, {"name": namespaced_name, "arguments": arguments}
+                )
+            except ValueError as exc:
+                return _mcp_error_response(rpc_id, -32000, str(exc))
         try:
             exec_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
@@ -13016,6 +13035,16 @@ async def _handle_mcp_tools_call(
             )
 
     output: str = exec_data.get("result", {}).get("output", "")
+    if (
+        namespaced_name == "sys_os_shell"
+        and delayed_context is not None
+        and execute_tool is None
+        and registry_config is None
+        and exec_data.get("result", {}).get("deferred") is True
+    ):
+        # The original shell's TOOL_RESULT policy runs when its output is read
+        # from the inbox, not against this temporary handle.
+        return _mcp_ok_response(rpc_id, {"content": [{"type": "text", "text": output}]})
     _logger.debug(
         "MCP tools/call execute: session=%r tool=%r output_len=%d",
         session_id,

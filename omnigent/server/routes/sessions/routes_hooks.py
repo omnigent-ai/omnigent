@@ -889,6 +889,34 @@ def register_hooks_routes(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
+        delayed_result = "_omnigent_shell_result_context" in payload
+        delayed_actor = None
+        if delayed_result:
+            from omnigent.server.mcp_identity import shell_result_actor
+
+            try:
+                if (
+                    phase != Phase.TOOL_RESULT
+                    or not isinstance(data, dict)
+                    or data.get("name") != "sys_os_shell"
+                ):
+                    raise ValueError("Invalid delayed shell result phase or tool")
+                delayed_actor = shell_result_actor(
+                    request,
+                    conv,
+                    payload["_omnigent_shell_result_context"],
+                    payload.get("_omnigent_shell_result_handle"),
+                    event.get("request_data"),
+                )
+            except ValueError as exc:
+                raise OmnigentError(
+                    "Unverified shell result context.", code=ErrorCode.INVALID_INPUT
+                ) from exc
+        verified_context = (
+            {"_omnigent_shell_result_handle": payload["_omnigent_shell_result_handle"]}
+            if delayed_result
+            else {}
+        )
         # Dedup the native request-phase gate. A native session's
         # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*
         # prompt, but a web-UI prompt was already gated server-side by
@@ -909,7 +937,7 @@ def register_hooks_routes(
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
             return Response(
-                content=json.dumps({"result": "POLICY_ACTION_UNSPECIFIED"}),
+                content=json.dumps({"result": "POLICY_ACTION_UNSPECIFIED", **verified_context}),
                 media_type="application/json",
             )
 
@@ -941,7 +969,9 @@ def register_hooks_routes(
             conversation=conv,
         ):
             return Response(
-                content=json.dumps(_no_policy_allow_body(_caps, session_id, policy_store)),
+                content=json.dumps(
+                    {**_no_policy_allow_body(_caps, session_id, policy_store), **verified_context}
+                ),
                 media_type="application/json",
             )
 
@@ -994,7 +1024,10 @@ def register_hooks_routes(
         # built from, so it is necessarily read first.)
         turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
         ctx = _build_evaluation_context(
-            phase, data, event, actor=_build_actor(turn_actor or user_id)
+            phase,
+            data,
+            event,
+            actor=delayed_actor if delayed_result else _build_actor(turn_actor or user_id),
         )
         result = await engine.evaluate(ctx, read_only=is_read_only)
 
@@ -1107,6 +1140,7 @@ def register_hooks_routes(
 
         resp_body: dict[str, Any] = {
             "result": _PHASE_TO_PROTO_ACTION.get(result.action, "POLICY_ACTION_UNSPECIFIED"),
+            **verified_context,
         }
         if result.reason:
             resp_body["reason"] = result.reason
