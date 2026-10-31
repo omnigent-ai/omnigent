@@ -17,9 +17,11 @@ from omnigent.harnesses.opencode_native.app_server import (
     check_opencode_version,
     filtered_server_env,
     find_opencode_cli,
+    loopback_no_proxy_env,
     opencode_terminal_env,
     parse_opencode_version,
 )
+from tests._helpers.proxy_env import dead_proxy_url, loopback_json_stub, set_proxy_env
 
 
 def test_parse_opencode_version() -> None:
@@ -146,6 +148,44 @@ def test_filtered_server_env_drops_global_opencode_config(
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
 
 
+@pytest.mark.parametrize(
+    ("base_env", "expected"),
+    [
+        ({"NO_PROXY": "corp.example, 127.0.0.1"}, "corp.example,127.0.0.1,localhost"),
+        ({"no_proxy": "corp.example"}, "corp.example,127.0.0.1,localhost"),
+        (
+            {"NO_PROXY": "corp.example", "no_proxy": "other.example"},
+            "corp.example,other.example,127.0.0.1,localhost",
+        ),
+    ],
+    ids=["uppercase-only", "lowercase-only", "differing"],
+)
+def test_loopback_no_proxy_env_merges_existing_exceptions(
+    base_env: dict[str, str], expected: str
+) -> None:
+    # Both spellings carry the union so neither can un-exempt the other's hosts.
+    assert loopback_no_proxy_env("127.0.0.1", base_env) == {
+        "NO_PROXY": expected,
+        "no_proxy": expected,
+    }
+
+
+def test_filtered_server_env_exempts_loopback_from_proxy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("NO_PROXY", "corp.example")
+    monkeypatch.delenv("no_proxy", raising=False)
+    env = filtered_server_env(
+        bridge_dir=tmp_path, auth_secret="pw", extra_env={"NO_PROXY": "gateway.example"}
+    )
+    # Remote traffic keeps the proxy; loopback (the runner relay) bypasses it even
+    # when a caller's extra_env supplies its own NO_PROXY.
+    assert env["HTTPS_PROXY"] == "http://proxy.example:3128"
+    assert env["NO_PROXY"] == "gateway.example,127.0.0.1,localhost"
+    assert env["no_proxy"] == env["NO_PROXY"]
+
+
 def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeServer:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     return OpenCodeNativeServer(
@@ -171,10 +211,15 @@ def test_base_url_and_auth_headers(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 
 def test_terminal_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("NO_PROXY", "corp.example")
+    monkeypatch.delenv("no_proxy", raising=False)
     server = _server(monkeypatch, tmp_path)
     env = opencode_terminal_env(server)
     assert env["OPENCODE_SERVER_PASSWORD"] == server.auth_secret
     assert env["XDG_DATA_HOME"] == str(server.xdg_data_home)
+    # The attach pane inherits the runner's proxy env; the serve host must be exempt.
+    assert env["NO_PROXY"] == "corp.example,127.0.0.1,localhost"
+    assert env["no_proxy"] == env["NO_PROXY"]
 
 
 async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -410,3 +455,34 @@ def test_list_opencode_cli_model_options(monkeypatch: pytest.MonkeyPatch) -> Non
         "opencode-go/kimi-k2.7-code",
     ]
     assert captured["env"] == {"XDG_DATA_HOME": "/xdg/data", "XDG_CONFIG_HOME": "/xdg/config"}
+
+
+async def test_wait_until_ready_bypasses_proxy_env_for_loopback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A proxy that cannot route 127.0.0.1 must not black-hole the readiness
+    # probe; the loopback opencode serve is reachable without any proxy.
+    with loopback_json_stub(b"[]") as stub, dead_proxy_url() as proxy:
+        set_proxy_env(monkeypatch, proxy)
+        server = _server(monkeypatch, tmp_path)
+        server.port = stub.port
+        await server._wait_until_ready(attempts=5, delay=0.05)
+
+
+async def test_wait_until_ready_keeps_proxy_env_for_remote_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A remote server is still probed through the configured proxy: the stub
+    # plays the proxy and must receive the absolute-form readiness request.
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        hostname="opencode.internal.test",
+        port=4096,
+        verify_version=False,
+    )
+    with loopback_json_stub(b"[]") as proxy:
+        set_proxy_env(monkeypatch, proxy.url)
+        await server._wait_until_ready(attempts=1, delay=0)
+    assert proxy.paths == ["http://opencode.internal.test:4096/session"]

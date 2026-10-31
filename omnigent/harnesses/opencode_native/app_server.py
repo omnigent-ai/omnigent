@@ -37,6 +37,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import httpx
+from omnigent_client._http import is_loopback_url
 from packaging.version import InvalidVersion, Version
 
 from omnigent.harnesses.opencode_native.bridge import (
@@ -82,6 +83,9 @@ _ENV_PASSTHROUGH_KEYS = (
     "https_proxy",
 )
 _RUNNER_ENV_PASSTHROUGH_ENV_VAR = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
+# opencode is a Bun binary: its fetch honors HTTP(S)_PROXY for every request,
+# including loopback targets, unless NO_PROXY exempts the host.
+_LOOPBACK_NO_PROXY_HOSTS = ("127.0.0.1", "localhost")
 # OpenCode env vars that point the server at the user's GLOBAL config — they
 # would defeat the per-session XDG isolation by re-introducing whatever
 # config/model/permission settings the parent shell has set. Dropped from
@@ -324,11 +328,43 @@ def build_opencode_attach_args(
     return args
 
 
+def loopback_no_proxy_env(
+    hostname: str, base_env: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """
+    Build ``NO_PROXY`` / ``no_proxy`` values that exempt the loopback server.
+
+    Unions the exceptions already present under either spelling in *base_env*,
+    appends *hostname* and the loopback names, and returns that one list under
+    both spellings, so an inherited proxy still carries remote traffic while
+    ``opencode`` reaches loopback endpoints directly.
+
+    :param hostname: Bind host of ``opencode serve``, e.g. ``"127.0.0.1"``.
+    :param base_env: Environment whose exceptions are preserved; ``None``
+        reads ``os.environ``.
+    :returns: Both spellings set to the merged list, e.g.
+        ``"corp.example,127.0.0.1,localhost"``.
+    """
+    source = os.environ if base_env is None else base_env
+    entries: list[str] = []
+    for key in ("NO_PROXY", "no_proxy"):
+        for raw in source.get(key, "").split(","):
+            entry = raw.strip()
+            if entry and entry not in entries:
+                entries.append(entry)
+    for host in (hostname, *_LOOPBACK_NO_PROXY_HOSTS):
+        if host not in entries:
+            entries.append(host)
+    merged = ",".join(entries)
+    return {"NO_PROXY": merged, "no_proxy": merged}
+
+
 def filtered_server_env(
     *,
     bridge_dir: Path,
     auth_secret: str,
     extra_env: Mapping[str, str] | None = None,
+    hostname: str = "127.0.0.1",
 ) -> dict[str, str]:
     """
     Build the launch environment for ``opencode serve``.
@@ -336,11 +372,13 @@ def filtered_server_env(
     Per-session XDG dirs isolate OpenCode's state from the user's global
     config; ``OPENCODE_SERVER_PASSWORD`` secures the loopback server. Only
     provider/proxy env and operator-declared runner passthrough vars from the
-    parent are passed through.
+    parent are passed through, with loopback exempted from that proxy so the
+    bundled plugin reaches the runner's relay directly.
 
     :param bridge_dir: Native OpenCode bridge directory.
     :param auth_secret: Server password for basic auth.
     :param extra_env: Additional provider env (e.g. from Omnigent setup).
+    :param hostname: Loopback bind host added to ``NO_PROXY``.
     :returns: The environment mapping for the server subprocess.
     """
     extra_names = {
@@ -361,6 +399,7 @@ def filtered_server_env(
         ):
             env[key] = value
     env.update(extra_env or {})
+    env.update(loopback_no_proxy_env(hostname, env))
     env["XDG_DATA_HOME"] = str(xdg_data_home_for_bridge_dir(bridge_dir))
     env["XDG_CONFIG_HOME"] = str(xdg_config_home_for_bridge_dir(bridge_dir))
     env[OPENCODE_SERVER_PASSWORD_ENV_VAR] = auth_secret
@@ -373,7 +412,9 @@ def opencode_terminal_env(server: OpenCodeNativeServer) -> dict[str, str]:
     Build terminal-process env for the native OpenCode TUI (``attach``).
 
     Keeping the password in the environment avoids leaking it on argv
-    (``--password`` defaults to ``OPENCODE_SERVER_PASSWORD``).
+    (``--password`` defaults to ``OPENCODE_SERVER_PASSWORD``). The pane
+    inherits the runner's proxy env, so the server host is exempted via
+    ``NO_PROXY`` or the TUI would never reach loopback.
 
     :param server: The running server wrapper.
     :returns: Environment variables for the attach terminal process.
@@ -383,6 +424,7 @@ def opencode_terminal_env(server: OpenCodeNativeServer) -> dict[str, str]:
         OPENCODE_SERVER_USERNAME_ENV_VAR: OPENCODE_DEFAULT_USERNAME,
         "XDG_DATA_HOME": str(server.xdg_data_home),
         "XDG_CONFIG_HOME": str(server.xdg_config_home),
+        **loopback_no_proxy_env(server.hostname),
     }
 
 
@@ -447,6 +489,7 @@ class OpenCodeNativeServer:
             bridge_dir=self.bridge_dir,
             auth_secret=self.auth_secret,
             extra_env=self._extra_env,
+            hostname=self.hostname,
         )
 
     def build_argv(self) -> list[str]:
@@ -523,6 +566,7 @@ class OpenCodeNativeServer:
             base_url=self.base_url,
             headers=self.auth_headers,
             timeout=httpx.Timeout(5.0, connect=2.0),
+            trust_env=not is_loopback_url(self.base_url),
         ) as client:
             for _ in range(attempts):
                 if self.process is not None and self.process.poll() is not None:
