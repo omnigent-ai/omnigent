@@ -57,6 +57,26 @@ _CONTROL_TIMEOUT_S = 30.0
 _ZYGOTE_LOST_EXIT_CODE = 254
 
 
+def _zygote_exit_cause(returncode: int | None) -> str:
+    """Describe how a lost runner's zygote parent exited, for its exit report.
+
+    :param returncode: The zygote's ``Popen`` return code, e.g. ``-1`` for
+        SIGHUP, or ``None`` when it was not collected.
+    :returns: A sentence naming the signal or exit code, e.g.
+        ``"The runner's parent process (the host's runner zygote) was killed by SIGHUP."``.
+    """
+    subject = "The runner's parent process (the host's runner zygote)"
+    if returncode is None:
+        return f"{subject} is gone; its exit status is unknown."
+    if returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"{subject} was killed by {name}."
+    return f"{subject} exited with code {returncode}."
+
+
 class ZygoteUnavailable(RuntimeError):
     """The zygote could not be started or stopped responding.
 
@@ -85,6 +105,8 @@ class ZygoteRunnerProc:
             manager._generation if zygote_generation is None else zygote_generation
         )
         self.returncode: int | None = None
+        # How the zygote exited when this runner was lost with it, else None.
+        self.parent_exit_cause: str | None = None
 
     def poll(self) -> int | None:
         """Return the exit code if the runner has exited, else ``None``.
@@ -95,6 +117,8 @@ class ZygoteRunnerProc:
         if self.returncode is not None:
             return self.returncode
         code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
+        if code == _ZYGOTE_LOST_EXIT_CODE:
+            self.parent_exit_cause = self._manager.lost_exit_cause(self._zygote_generation)
         if code is not None:
             self.returncode = code
         return self.returncode
@@ -155,6 +179,8 @@ class ZygoteManager:
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
         self._generation = 0
+        # Return codes of zygotes that died on their own, by generation.
+        self._lost_returncodes: dict[int, int] = {}
         self._lock = threading.RLock()
 
     @property
@@ -189,6 +215,8 @@ class ZygoteManager:
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return
+            if self._proc is not None and self._proc.returncode is not None:
+                self._lost_returncodes[self._generation] = self._proc.returncode
             if self._sock is not None:
                 self._sock.close()
                 self._sock = None
@@ -313,6 +341,22 @@ class ZygoteManager:
         code = reply.get("returncode")
         return code if isinstance(code, int) else None
 
+    def lost_exit_cause(self, generation: int) -> str | None:
+        """Describe how a zygote generation died on its own, for a lost runner.
+
+        :param generation: The forkserver generation that owned the runner.
+        :returns: A sentence naming the zygote's signal or exit code, or
+            ``None`` while that generation is still running or was stopped by
+            this manager.
+        """
+        with self._lock:
+            if generation in self._lost_returncodes:
+                return _zygote_exit_cause(self._lost_returncodes[generation])
+            if generation != self._generation or self._proc is None:
+                return None
+            returncode = self._proc.poll()
+            return None if returncode is None else _zygote_exit_cause(returncode)
+
     def stop(self) -> None:
         """Terminate the zygote and close the control socket.
 
@@ -326,7 +370,10 @@ class ZygoteManager:
                 finally:
                     self._sock = None
             if self._proc is not None:
-                if self._proc.poll() is None:
+                exited = self._proc.poll()
+                if exited is not None:
+                    self._lost_returncodes[self._generation] = exited
+                else:
                     self._proc.terminate()
                     try:
                         self._proc.wait(timeout=5.0)

@@ -2198,6 +2198,19 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     assert "code 3" in error
 
 
+def test_runner_exit_error_names_a_lost_zygote_parent(tmp_path: Path) -> None:
+    """A runner lost with its zygote names how the zygote died, above its log tail."""
+    log = tmp_path / "runner-x.log"
+    log.write_text("plugin load finished\n", encoding="utf-8")
+    cause = "The runner's parent process (the host's runner zygote) was killed by SIGHUP."
+
+    lines = _runner_exit_error(254, log, parent_exit_cause=cause).splitlines()
+
+    assert lines[0].startswith("runner process exited with code 254 (log on host: ")
+    assert lines[1] == cause
+    assert lines[-1] == "plugin load finished"
+
+
 @pytest.mark.parametrize("console_closed", [False, True])
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,

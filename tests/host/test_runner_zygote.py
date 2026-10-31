@@ -586,6 +586,41 @@ def test_old_runner_exit_is_detected_after_zygote_restart(
         proc.kill()
 
 
+@pytest.mark.parametrize("restart_after_loss", [False, True])
+def test_lost_runner_names_how_its_zygote_died(
+    manager: ZygoteManager, tmp_path: Path, restart_after_loss: bool
+) -> None:
+    """A runner lost with its zygote reports the zygote's signal, even after a restart."""
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    zygote_pid = manager.pid
+    assert zygote_pid is not None
+    try:
+        os.kill(zygote_pid, signal.SIGHUP)
+        deadline = time.monotonic() + 10
+        while manager.is_running():
+            assert time.monotonic() < deadline, "zygote did not exit"
+            time.sleep(0.01)
+        if restart_after_loss:
+            manager.start()
+        proc.kill()
+        assert _wait_exit(proc) == _ZYGOTE_LOST_EXIT_CODE
+        assert proc.parent_exit_cause is not None
+        assert "killed by SIGHUP" in proc.parent_exit_cause
+    finally:
+        proc.kill()
+
+
+def test_runner_lost_to_a_manager_stop_names_no_zygote_cause(
+    manager: ZygoteManager, tmp_path: Path
+) -> None:
+    """The host's own zygote stop is not reported as the zygote dying."""
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    manager.stop()
+    proc.kill()
+    assert _wait_exit(proc) == _ZYGOTE_LOST_EXIT_CODE
+    assert proc.parent_exit_cause is None
+
+
 def test_cached_runner_exit_survives_zygote_restart(manager: ZygoteManager, tmp_path) -> None:
     proc = manager.fork_runner(_fork_env(3), str(tmp_path / "old.log"), str(tmp_path))
     assert _wait_exit(proc) == 3
