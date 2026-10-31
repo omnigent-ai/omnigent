@@ -1050,6 +1050,10 @@ class SqlConversationLabel(ConversationBase):
     value: Mapped[str] = mapped_column(String(LABEL_VALUE_MAX_LEN))
     updated_at: Mapped[int] = mapped_column(Integer)
 
+    __table_args__ = (
+        Index("ix_conversation_labels_lookup", "workspace_id", "key", "value", "conversation_id"),
+    )
+
 
 class SqlComment(OmnigentBase):
     """SQLAlchemy model for the ``comments`` table.
