@@ -18,7 +18,7 @@ from omnigent.harnesses.claude_native.main import resolve_native_claude_config
 from omnigent.harnesses.codex_native.app_server import resolve_native_codex_launch
 from omnigent.harnesses.opencode_native.provider import resolve_bound_opencode_gateway
 from omnigent.harnesses.pi_native.credentials import (
-    _live_family_model_entries,
+    _with_live_family_models,
     pi_native_model_options,
     resolve_pi_native_provider,
 )
@@ -289,9 +289,8 @@ def test_pi_single_model_policy_preserves_literal_ids_and_stays_curated(
         assert provider is not None
         assert provider.model == model
         assert provider.curated_models
-        assert [row["id"] for row in _live_family_model_entries(provider, transport=None)] == [
-            model
-        ]
+        listed = _with_live_family_models(provider, transport=None)
+        assert [row["id"] for row in listed.extra_models] == [model]
         prefix = str(option["model"]).split("/", 1)[0]
         for unlisted in ("unlisted", f"{prefix}/unlisted"):
             with pytest.raises(OmnigentError, match="configured model list"):
@@ -314,6 +313,49 @@ def test_pi_picker_preserves_models_with_colliding_ids() -> None:
             provider = resolve_pi_native_provider(model=str(option["model"]))
             assert provider is not None
             assert provider.model == model
+
+
+def test_pi_binding_routes_each_allowed_model_to_its_gateway_surface() -> None:
+    models = ["system.ai.claude-opus-5", "system.ai.gemini-3-5-flash"]
+    profile = {
+        "providers": {
+            "unity": {
+                "kind": "gateway",
+                "anthropic": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/anthropic",
+                    "api_key_ref": "env:UNITY_TEST_KEY",
+                    "models": {"default": models[0]},
+                },
+            }
+        },
+        "inference": {
+            "harnesses": {
+                "pi-native": {
+                    "provider": "unity",
+                    "default_model": models[0],
+                    "model_allowlist": models,
+                }
+            }
+        },
+    }
+    with inference_config_scope(profile):
+        provider = resolve_pi_native_provider()
+        switched = resolve_pi_native_provider(model=models[1])
+    assert provider is not None and switched is not None
+    rendered = provider.to_models_config()["providers"]
+    assert {
+        pid: [row["id"] for row in payload["models"]] for pid, payload in rendered.items()
+    } == {
+        "omnigent": [models[0]],
+        "omnigent-mlflow": [models[1]],
+    }
+    assert rendered["omnigent"]["api"] == "anthropic-messages"
+    assert rendered["omnigent-mlflow"]["api"] == "openai-completions"
+    assert rendered["omnigent-mlflow"]["baseUrl"] == (
+        "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1"
+    )
+    assert switched.model == models[1]
+    assert switched.to_models_config() == provider.to_models_config()
 
 
 def test_acp_slug_binding_preserves_one_model_restriction() -> None:

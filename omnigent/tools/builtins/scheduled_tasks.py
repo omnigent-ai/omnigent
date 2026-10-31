@@ -287,7 +287,8 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                         "session_id": {
-                            "type": ["string", "null"],
+                            # Gemini rejects list-valued ``type``; anyOf spells the same union.
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
                             "description": (
                                 "With session_mode 'continue': the existing session to "
                                 "continue, or null so the next run starts a new session "
@@ -323,7 +324,7 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                         "project_id": {
-                            "type": ["string", "null"],
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
                             "description": (
                                 "File future fired sessions into this existing project id. "
                                 "Null stops filing them into a project."

@@ -1279,6 +1279,7 @@ const inferenceProviderIds = new Set([
   "omnigent",
   "omnigent-openai",
   "omnigent-completions",
+  "omnigent-mlflow",
 ]);
 
 function hasInferenceBinding() {

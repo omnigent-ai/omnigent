@@ -512,6 +512,10 @@ def _sanitize_schema(schema: ToolSpec) -> ToolSpec:
     ``additionalProperties``, and ``$ref``.  Union keywords are collapsed
     to the first ``object`` branch when one exists (it carries the
     structured properties the model needs), else the first typed branch.
+    A union of one type with ``null`` instead stays an ``anyOf`` beside
+    its description: every Databricks gateway surface accepts that,
+    Gemini rejects a list-valued ``type``, and a ``nullable`` flag gets
+    other models to send the string ``"null"``.
     This ensures the schema is accepted by Databricks serving endpoints.
     """
     if not isinstance(schema, dict):
@@ -521,8 +525,12 @@ def _sanitize_schema(schema: ToolSpec) -> ToolSpec:
         if key in ("examples", "default", "$ref", "additionalProperties"):
             continue
         if key in ("anyOf", "oneOf", "allOf"):
-            # Prefer the object branch: collapsing to a primitive drops the properties.
             if isinstance(value, list) and value:
+                nullable = _nullable_union_branch(value) if key != "allOf" else None
+                if nullable is not None:
+                    result["anyOf"] = [_sanitize_schema(nullable), {"type": "null"}]
+                    continue
+                # Prefer the object branch: collapsing to a primitive drops the properties.
                 typed = [c for c in value if isinstance(c, dict) and "type" in c]
                 for candidate in typed:
                     if candidate["type"] == "object":
@@ -537,6 +545,14 @@ def _sanitize_schema(schema: ToolSpec) -> ToolSpec:
         else:
             result[key] = value
     return result
+
+
+def _nullable_union_branch(branches: list[Any]) -> ToolSpec | None:
+    """Return the typed branch of an exact ``T | null`` union, or ``None`` for any other."""
+    if len(branches) != 2 or not all(isinstance(c, dict) and "type" in c for c in branches):
+        return None
+    non_null = [c for c in branches if c["type"] != "null"]
+    return non_null[0] if len(non_null) == 1 else None
 
 
 def _generate_extension_js(port: int, tool_schemas: list[ToolSpec], token: str) -> str:
