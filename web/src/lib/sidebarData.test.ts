@@ -138,33 +138,37 @@ describe("scope refresh", () => {
   });
 });
 
-it("uses creation time for scope boundaries, appended pages, and capped refreshes", () => {
-  const newest = { ...row("new", 10), created_at: 30 };
-  const middle = { ...row("middle", 20), created_at: 20 };
-  const oldest = { ...row("old", 30), created_at: 10 };
-  expect(
-    mergeScopeRows([newest, oldest], [middle], true, true, "old", "middle", "created_at").rows.map(
-      (r) => r.id,
-    ),
-  ).toEqual(["new", "middle"]);
-  const current = {
-    pages: [sessionRowsPage([newest, middle], true)],
-    pageParams: [undefined],
-    windowSize: 2,
-  };
-  const appended = appendScopePage(current, sessionRowsPage([oldest]), 1, "created_at");
-  expect(appended.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
-  const refreshed = refreshScopeWindow(
-    appended,
-    sessionRowsPage([newest, { ...middle, updated_at: 99 }], true),
-    2,
-    "created_at",
-  );
-  expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
-  expect(refreshed.pages[0].last_id).toBe("old");
-});
+it.each(["created_at", "title"] as const)(
+  "uses %s for scope boundaries, appended pages, and capped refreshes",
+  (sortBy) => {
+    // Newest-created first and A to Z list these alike, and opposite to Updated.
+    const newest = { ...row("new", 10), created_at: 30, title: "Apple" };
+    const middle = { ...row("middle", 20), created_at: 20, title: "banana" };
+    const oldest = { ...row("old", 30), created_at: 10, title: "Cherry" };
+    expect(
+      mergeScopeRows([newest, oldest], [middle], true, true, "old", "middle", sortBy).rows.map(
+        (r) => r.id,
+      ),
+    ).toEqual(["new", "middle"]);
+    const current = {
+      pages: [sessionRowsPage([newest, middle], true)],
+      pageParams: [undefined],
+      windowSize: 2,
+    };
+    const appended = appendScopePage(current, sessionRowsPage([oldest]), 1, sortBy);
+    expect(appended.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+    const refreshed = refreshScopeWindow(
+      appended,
+      sessionRowsPage([newest, { ...middle, updated_at: 99 }], true),
+      2,
+      sortBy,
+    );
+    expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+    expect(refreshed.pages[0].last_id).toBe("old");
+  },
+);
 
-it("orders by name like the server: folded case, code points, untitled last", () => {
+it("keys names like the server: folded case, untitled last", () => {
   expect(["beta", null, "Alpha", "ab", "a-c", ""].map(titleSortKey).sort()).toEqual([
     "0a-c",
     "0ab",
@@ -172,29 +176,6 @@ it("orders by name like the server: folded case, code points, untitled last", ()
     "0beta",
     "1",
     "1",
-  ]);
-  const titled = (id: string, title: string | null) => ({ ...row(id, 0), title });
-  const alpha = titled("alpha", "Alpha");
-  const bravo = titled("bravo", "bravo");
-  const charlie = titled("charlie", "Charlie");
-  const untitled = titled("untitled", null);
-  // Shared has more rows after "bravo", so mine's "Charlie" waits for it.
-  expect(
-    mergeScopeRows([alpha, charlie], [bravo], false, true, null, "bravo", "title").rows.map(
-      (r) => r.id,
-    ),
-  ).toEqual(["alpha", "bravo"]);
-  const current = {
-    pages: [sessionRowsPage([charlie, alpha], true)],
-    pageParams: [undefined],
-    windowSize: 2,
-  };
-  const appended = appendScopePage(current, sessionRowsPage([untitled, bravo]), 2, "title");
-  expect(appended.pages[0].data.map((r) => r.id)).toEqual([
-    "alpha",
-    "bravo",
-    "charlie",
-    "untitled",
   ]);
 });
 

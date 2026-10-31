@@ -19,8 +19,7 @@ import pytest
 from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
 
 from tests._helpers.polling import poll_until
-from tests._helpers.session import post_session_bundle
-from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.collaboration._multi_user_server import create_user_session
 
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
@@ -406,15 +405,7 @@ def _seed_session(base_url: str, title: str, project: str | None) -> str:
     metadata: dict[str, object] = {"title": title} if title else {}
     if project:
         metadata["labels"] = {"omni_project": project}
-    response = post_session_bundle(
-        httpx.post,
-        f"{base_url}/v1/sessions",
-        _build_hello_world_bundle(),
-        metadata=metadata,
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    return response.json()["session_id"]
+    return create_user_session(base_url, headers={}, metadata=metadata)
 
 
 _UNFILED_TITLES = ["!mango plan", "!Zebra notes", "!lemon tasks"]
