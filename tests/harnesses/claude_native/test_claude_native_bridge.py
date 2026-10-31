@@ -30,6 +30,7 @@ from typing import Any, TextIO
 from unittest.mock import Mock
 
 import httpx
+import psutil
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
@@ -11108,6 +11109,141 @@ def test_readiness_stops_at_deadline_between_liveness_probes(
 
     assert clock.monotonic() == 0.75
     probe.assert_called_once()
+
+
+def _slow_boot_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_seconds: Callable[[float], float | None],
+    *,
+    ready_at: float = float("inf"),
+) -> tuple[_VirtualClock, list[float]]:
+    """Boot a live pane on a virtual clock whose CPU time follows *cpu_seconds*."""
+    clock = _VirtualClock()
+    cpu_reads: list[float] = []
+
+    def read_cpu(
+        socket_path: str, tmux_target: str, bridge_dir: Path | None = None
+    ) -> float | None:
+        cpu_reads.append(clock.monotonic())
+        return cpu_seconds(clock.monotonic())
+
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_: _READY_PANE if clock.monotonic() >= ready_at else _BOOTING_PANE,
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_: claude_native_bridge._ClaudePaneState(True),
+    )
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 0)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_cpu_seconds", read_cpu)
+    return clock, cpu_reads
+
+
+def test_readiness_waits_past_the_cap_while_the_boot_uses_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock, cpu_reads = _slow_boot_clock(monkeypatch, lambda now: now / 2, ready_at=260.0)
+
+    claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=30.0)
+
+    assert clock.monotonic() == 260.0
+    assert cpu_reads == [150.0, 180.0, 210.0, 240.0]
+
+
+@pytest.mark.parametrize(
+    "cpu_seconds",
+    [
+        pytest.param(lambda now: 12.0, id="idle"),
+        pytest.param(lambda now: now / 20, id="below-busy-share"),
+        pytest.param(lambda now: None, id="unreadable"),
+    ],
+)
+def test_readiness_stops_at_the_cap_unless_the_boot_is_busy(
+    monkeypatch: pytest.MonkeyPatch, cpu_seconds: Callable[[float], float | None]
+) -> None:
+    clock, cpu_reads = _slow_boot_clock(monkeypatch, cpu_seconds)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=30.0)
+
+    assert clock.monotonic() == 180.0
+    assert cpu_reads == [150.0, 180.0]
+    assert "busy-boot" not in str(excinfo.value)
+
+
+def test_busy_boot_wait_stops_at_the_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock, _ = _slow_boot_clock(monkeypatch, lambda now: now)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=30.0)
+
+    assert clock.monotonic() == 480.0
+    assert "10 busy-boot extensions" in str(excinfo.value)
+
+
+def test_busy_boot_window_shrinks_with_a_short_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 3.0)
+    clock, cpu_reads = _slow_boot_clock(monkeypatch, lambda now: now / 2, ready_at=5.0)
+
+    claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.3)
+
+    assert clock.monotonic() == 5.0
+    assert cpu_reads == [1.5, 3.0, 4.5]
+
+
+def test_hard_readiness_budget_ignores_a_busy_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock, cpu_reads = _slow_boot_clock(monkeypatch, lambda now: now)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/sock", "main", timeout_s=2.0, extend_for_slow_boot=False
+        )
+
+    assert clock.monotonic() == 2.0
+    assert cpu_reads == []
+
+
+def _cpu_process(
+    user: float, system: float = 0.0, children_user: float = 0.0, children_system: float = 0.0
+) -> Mock:
+    process = Mock()
+    process.cpu_times.return_value = SimpleNamespace(
+        user=user, system=system, children_user=children_user, children_system=children_system
+    )
+    return process
+
+
+def test_pane_cpu_seconds_totals_readable_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    exited = Mock()
+    exited.cpu_times.side_effect = psutil.NoSuchProcess(4242)
+    unreadable = Mock()
+    unreadable.cpu_times.side_effect = psutil.AccessDenied(4243)
+    processes = [_cpu_process(1.5, 0.25, 2.0, 0.5), exited, unreadable, _cpu_process(0.75)]
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_processes", lambda *_: processes)
+
+    assert claude_native_bridge._claude_pane_cpu_seconds("/tmp/sock", "main") == 5.0
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        pytest.param(
+            SimpleNamespace(returncode=1, stdout="", stderr="no server"), id="tmux-failed"
+        ),
+        pytest.param(SimpleNamespace(returncode=0, stdout="", stderr=""), id="no-pane"),
+    ],
+)
+def test_pane_cpu_seconds_without_a_pane_process_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, listing: SimpleNamespace
+) -> None:
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: listing)
+
+    assert claude_native_bridge._claude_pane_cpu_seconds("/tmp/sock", "main") is None
 
 
 @pytest.mark.parametrize("alive", [True, None])
