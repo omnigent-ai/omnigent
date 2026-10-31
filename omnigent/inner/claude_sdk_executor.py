@@ -111,6 +111,14 @@ _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 # Claude Code floors a thinking budget at this size and requires max_tokens above it.
 _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 
+# A fresh client's replayed history may fill this share of the context window,
+# leaving room for Claude Code's prompt, tools and reply before it can compact.
+_REPLAYED_HISTORY_WINDOW_SHARE = 0.5
+# Overcounts English and code tokens, and approximates one token per CJK character.
+_REPLAYED_HISTORY_BYTES_PER_TOKEN = 3
+# An image's token cost does not follow its encoded size; this also floors a PDF's estimate.
+_REPLAYED_ATTACHMENT_TOKEN_ESTIMATE = 2_000
+
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks Unity Gateway only serves Claude requests
 # in coding-agent mode when this header is present, so the Databricks
@@ -621,6 +629,87 @@ def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
             _text_block(json.dumps(_redact_inline_base64(raw_block), ensure_ascii=True))
         )
     return rendered
+
+
+def _has_replayable_history(messages: list[Message]) -> bool:
+    """Whether a fresh client must replay turns before the latest user message."""
+    return sum(msg.get("role") == "user" for msg in messages) > 1
+
+
+def _resolve_replay_context_window(
+    declared_window: int | None, model: str | None, model_override: str | None
+) -> int:
+    """
+    Resolve the context window a fresh client's history replay is sized for.
+
+    :param declared_window: The spec's ``executor.context_window``, or ``None``.
+    :param model: The spec model, e.g. ``"claude-sonnet-4-5"``, or ``None``.
+    :param model_override: The session's model override, which takes
+        precedence over the declared window.
+    :returns: The window in tokens, or the shared fallback when unknown
+        or not positive.
+    """
+    from omnigent.llms.context_window import (
+        DEFAULT_CONTEXT_WINDOW,
+        resolve_effective_context_window,
+    )
+
+    try:
+        window = resolve_effective_context_window(
+            declared_window, model, model_override=model_override
+        )
+    except ValueError:
+        # A malformed AP_CONTEXT_WINDOW_OVERRIDE must not fail every restarted turn.
+        logger.warning("ClaudeSDKExecutor: unreadable context window override", exc_info=True)
+        return DEFAULT_CONTEXT_WINDOW
+    return window if window and window > 0 else DEFAULT_CONTEXT_WINDOW
+
+
+def _render_prior_message(message: Message) -> list[_JsonObject]:
+    """
+    Render one prior message as role-labelled blocks for the history replay.
+
+    :param message: A prior inner :class:`Message`.
+    :returns: Anthropic content blocks opening with the message's role.
+    """
+    role = str(message.get("role", "user")).replace("_", " ")
+    raw_content = message.get("content")
+    rendered = [] if raw_content is None else _render_prior_content_blocks(raw_content)
+    if not rendered:
+        rendered = [_text_block("")]
+    # Label the message inline when it opens with text; an attachment
+    # that leads the message gets the label on its own line instead.
+    if rendered[0].get("type") == "text":
+        rendered[0] = _text_block(f"{role}: {rendered[0]['text']}")
+    else:
+        rendered.insert(0, _text_block(f"{role}:"))
+    return rendered
+
+
+def _estimated_replay_tokens(blocks: list[_JsonObject]) -> int:
+    """
+    Estimate the prompt tokens one rendered prior message adds to a replay.
+
+    :param blocks: The message's blocks from :func:`_render_prior_message`.
+    :returns: A deliberately high estimate, so the replay stays under budget.
+    """
+    tokens = 0
+    for block in blocks:
+        source = block.get("source")
+        if block.get("type") == "text":
+            text = block.get("text")
+        elif isinstance(source, dict) and source.get("type") == "text":
+            text = source.get("data")
+        elif block.get("type") == "document" and isinstance(source, dict):
+            # A PDF is billed per page, so its encoded size stands in for its page count.
+            payload_tokens = len(str(source.get("data", ""))) // _REPLAYED_HISTORY_BYTES_PER_TOKEN
+            tokens += max(_REPLAYED_ATTACHMENT_TOKEN_ESTIMATE, payload_tokens)
+            continue
+        else:
+            tokens += _REPLAYED_ATTACHMENT_TOKEN_ESTIMATE
+            continue
+        tokens += len(str(text).encode("utf-8")) // _REPLAYED_HISTORY_BYTES_PER_TOKEN
+    return tokens
 
 
 def _parse_data_uri(uri: str) -> tuple[str, str]:
@@ -1713,6 +1802,7 @@ class ClaudeSDKExecutor(Executor):
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
         system_prompt_preset: str | None = None,
+        context_window: int | None = None,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1727,6 +1817,9 @@ class ClaudeSDKExecutor(Executor):
             model: Override the model name.
             system_prompt_preset: Set to ``claude_code`` to append agent
                 instructions to Claude Code's prompt. Unset preserves the custom prompt.
+            context_window: The spec's declared context window in tokens,
+                e.g. ``1000000``. Sizes the history a fresh client replays;
+                ``None`` resolves the window from the model.
             permission_mode: SDK permission mode (default: auto
                 so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
@@ -1805,6 +1898,7 @@ class ClaudeSDKExecutor(Executor):
         self._os_env_spec = os_env
         self._os_env = os_env is not None
         self._model_override = model
+        self._context_window = context_window
         self._permission_mode = permission_mode
         self._gateway = gateway
         self._databricks_profile = databricks_profile
@@ -2774,9 +2868,10 @@ class ClaudeSDKExecutor(Executor):
             return
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
-        prompt = self._build_prompt(
-            messages,
-            resume_session=resume_session,
+        prompt = (
+            self._build_prompt(messages, resume_session=True)
+            if resume_session
+            else await self._fresh_session_prompt(messages, cfg)
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -2790,7 +2885,7 @@ class ClaudeSDKExecutor(Executor):
             # turns, but let /compact operate on the existing client's context.
             await self._close_live_client(session_key)
             resume_session = False
-            prompt = self._build_prompt(messages, resume_session=False)
+            prompt = await self._fresh_session_prompt(messages, cfg)
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
@@ -2846,13 +2941,7 @@ class ClaudeSDKExecutor(Executor):
         # to a ``databricks-*`` model: the Omnigent producer always resolves a
         # concrete model (spec > provider default > catalog default) before
         # spawning, so no ``databricks-*`` default is injected there.
-        model = cfg.model or self._model_override
-        if model is None and self._gateway_uses_databricks_profile:
-            if self._resolved_default_model is None:
-                self._resolved_default_model = await run_sync_on_thread(
-                    _resolve_databricks_claude_model, self._databricks_profile
-                )
-            model = self._resolved_default_model
+        model = cfg.model or await self._spec_or_default_model()
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
@@ -3701,11 +3790,53 @@ class ClaudeSDKExecutor(Executor):
         logger.info("ClaudeSDKExecutor: turn complete")
         yield TurnComplete(response=response_text, usage=turn_usage)
 
+    async def _spec_or_default_model(self) -> str | None:
+        """
+        Return the spec model, or the workspace default for an unpinned
+        Databricks-profile session, resolved once per executor.
+
+        :returns: The model id, or ``None`` to let the SDK pick its default.
+        """
+        if self._model_override is None and self._gateway_uses_databricks_profile:
+            if self._resolved_default_model is None:
+                self._resolved_default_model = await run_sync_on_thread(
+                    _resolve_databricks_claude_model, self._databricks_profile
+                )
+            return self._resolved_default_model
+        return self._model_override
+
+    async def _fresh_session_prompt(
+        self, messages: list[Message], cfg: ExecutorConfig
+    ) -> str | list[_JsonObject]:
+        """
+        Build the first prompt for a newly launched client.
+
+        Prior history is replayed within a share of the turn model's context
+        window, so a long session still fits after its client restarts.
+
+        :param messages: Conversation history as inner :class:`Message` dicts.
+        :param cfg: The turn's executor config, carrying any model override.
+        :returns: The prompt from :meth:`_build_prompt`.
+        """
+        budget = None
+        if _has_replayable_history(messages):
+            base_model = self._model_override if cfg.model else await self._spec_or_default_model()
+            # Off-loop: the window lookup may fetch the model catalog.
+            window = await run_sync_on_thread(
+                _resolve_replay_context_window,
+                self._context_window,
+                base_model,
+                cfg.model,
+            )
+            budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
+        return self._build_prompt(messages, resume_session=False, history_token_budget=budget)
+
     @staticmethod
     def _build_prompt(
         messages: list[Message],
         *,
         resume_session: bool,
+        history_token_budget: int | None = None,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -3726,6 +3857,10 @@ class ClaudeSDKExecutor(Executor):
         :param resume_session: ``True`` when the SDK session
             already has prior turns cached (no need to replay
             history).
+        :param history_token_budget: Estimated tokens the replayed
+            history may use, e.g. ``100000``. The newest prior messages
+            that fit are kept behind a marker counting the omitted ones;
+            ``None`` replays every prior message.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
@@ -3734,8 +3869,7 @@ class ClaudeSDKExecutor(Executor):
             # The live session already holds its tool items; only a fresh one replays them.
             return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
 
-        user_messages = [msg for msg in messages if msg.get("role") == "user"]
-        if len(messages) <= 1 or len(user_messages) <= 1:
+        if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
 
         # Check if the latest user message is multimodal — if so,
@@ -3746,19 +3880,31 @@ class ClaudeSDKExecutor(Executor):
         latest_index = max(i for i, msg in enumerate(messages) if msg.get("role") == "user")
         prior = messages[:latest_index] + messages[latest_index + 1 :]
 
+        kept: list[list[_JsonObject]] = []
+        remaining_tokens = history_token_budget
+        for msg in reversed(prior):
+            rendered = _render_prior_message(msg)
+            if remaining_tokens is not None:
+                remaining_tokens -= _estimated_replay_tokens(rendered)
+                if remaining_tokens < 0:
+                    break
+            kept.append(rendered)
+
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
-        for msg in prior:
-            role = str(msg.get("role", "user")).replace("_", " ")
-            raw_content = msg.get("content")
-            rendered = [] if raw_content is None else _render_prior_content_blocks(raw_content)
-            if not rendered:
-                rendered = [_text_block("")]
-            # Label the message inline when it opens with text; an attachment
-            # that leads the message gets the label on its own line instead.
-            if rendered[0].get("type") == "text":
-                rendered[0] = _text_block(f"{role}: {rendered[0]['text']}")
-            else:
-                rendered.insert(0, _text_block(f"{role}:"))
+        omitted = len(prior) - len(kept)
+        if omitted:
+            logger.info(
+                "ClaudeSDKExecutor: replaying %d of %d prior messages within %d tokens",
+                len(kept),
+                len(prior),
+                history_token_budget,
+            )
+            prior_blocks.append(
+                _text_block(
+                    f"[Earlier messages omitted to fit the model's context window: {omitted}.]"
+                )
+            )
+        for rendered in reversed(kept):
             prior_blocks.extend(rendered)
         prior_blocks.append(_text_block(""))
         prior_blocks.append(

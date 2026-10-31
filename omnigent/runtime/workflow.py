@@ -1357,6 +1357,11 @@ def _build_claude_sdk_spawn_env(
             if binding_for_harness(load_runtime_inference_config(), "claude-sdk") is not None
             else model.removeprefix("anthropic/")
         )
+    # Always set, so an inherited window never sizes another agent's history replay.
+    context_window = spec.executor.context_window
+    env["HARNESS_CLAUDE_SDK_CONTEXT_WINDOW"] = (
+        "" if context_window is None else str(context_window)
+    )
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.

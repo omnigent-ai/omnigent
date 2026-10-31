@@ -26,6 +26,7 @@ Endpoints:
 - ``POST /mock/configure`` — load a keyed response sequence.
 - ``POST /mock/reset`` — clear all state.
 - ``GET /mock/requests`` — return captured request bodies.
+- ``POST /mock/context_window`` — reject oversized ``/v1/messages`` prompts.
 - ``GET /gate/pending`` — check if any request is blocked on a gate.
 - ``POST /gate/release`` — release the oldest pending gate.
 - ``GET /stats`` — return ``{"request_count": N}``.
@@ -73,7 +74,7 @@ import threading
 import time as _time_mod
 import uuid as _uuid_mod
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import uvicorn
@@ -136,6 +137,10 @@ _DEFAULT_KEY = "default"
 
 
 # ── SSE event builders (following Codex pattern) ─────────
+
+
+def _estimated_prompt_tokens(body: bytes) -> int:
+    return len(body) // 4
 
 
 def _response_id() -> str:
@@ -936,6 +941,8 @@ class MockState:
         self.pending_gates: list[QueuedResponse] = []
         # Ids ``GET /v1/models`` reports; see ``POST /mock/served_models``.
         self.served_models: list[str] = []
+        # See ``POST /mock/context_window``.
+        self.context_window_tokens: int | None = None
         self._lock = asyncio.Lock()
 
     def get_queue(self, key: str) -> _ResponseQueue:
@@ -1104,6 +1111,7 @@ class MockState:
         self.captured_message_requests.clear()
         self.request_count = 0
         self.served_models = []
+        self.context_window_tokens = None
 
 
 _state = MockState()
@@ -1221,6 +1229,7 @@ async def create_message(
     except (json.JSONDecodeError, ValueError):
         parsed = {"raw": body.decode(errors="replace")}
 
+    prompt_tokens = _estimated_prompt_tokens(body)
     async with _state._lock:
         accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
@@ -1228,10 +1237,23 @@ async def create_message(
         _state.captured_message_requests.append(
             {"body": parsed, "betas": _anthropic_betas(request, parsed)}
         )
-        queue = _state.resolve_queue_for_request(parsed)
-        qr = queue.next()
+        window = _state.context_window_tokens
+        overflow = window is not None and prompt_tokens > window
+        qr = QueuedResponse() if overflow else _state.resolve_queue_for_request(parsed).next()
 
     await _record_evidence_async("request", parsed, accepted_at_ns)
+
+    if overflow:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": f"prompt is too long: {prompt_tokens} tokens > {window} maximum",
+                },
+            },
+        )
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1250,6 +1272,9 @@ async def create_message(
         qr._pending.set()
         _state.pending_gates.append(qr)
         await qr._gate.wait()
+
+    if window is not None:
+        qr = replace(qr, usage={"input_tokens": prompt_tokens, **(qr.usage or {})})
 
     req_model = parsed.get("model") if isinstance(parsed, dict) else None
     echo_model = req_model if isinstance(req_model, str) and req_model else "mock-model"
@@ -1476,6 +1501,27 @@ async def set_served_models(request: Request) -> dict[str, object]:
     async with _state._lock:
         _state.served_models = [m for m in models if isinstance(m, str) and m]
     return {"configured": True, "count": len(_state.served_models)}
+
+
+@app.post("/mock/context_window")
+async def set_context_window(request: Request) -> dict[str, object]:
+    """Enforce a context window on ``/v1/messages`` (cleared by ``/mock/reset``).
+
+    Prompts are estimated at four request-body bytes per token. Larger prompts
+    get the Anthropic ``prompt is too long`` 400 without consuming a queued
+    response; accepted prompts report the estimate as ``input_tokens``.
+
+    Body::
+
+        {"max_input_tokens": 100000}
+    """
+    body = await request.json()
+    limit = body.get("max_input_tokens")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+        raise HTTPException(status_code=400, detail="max_input_tokens must be a positive int")
+    async with _state._lock:
+        _state.context_window_tokens = limit
+    return {"configured": True, "max_input_tokens": limit}
 
 
 @app.post("/mock/configure")

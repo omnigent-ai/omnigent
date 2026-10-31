@@ -23,6 +23,9 @@ Env vars read at startup:
 - ``HARNESS_CLAUDE_SDK_MODEL``: model identifier, e.g.
   ``"databricks-claude-opus-4-6"``. ``None`` falls back to
   Claude SDK's own default.
+- ``HARNESS_CLAUDE_SDK_CONTEXT_WINDOW``: the spec's declared
+  ``executor.context_window`` in tokens, e.g. ``"1000000"``. Sizes the
+  history a restarted client replays; unset resolves it from the model.
 - ``HARNESS_CLAUDE_SDK_GATEWAY``: ``"1"`` / ``"true"`` to route
   through a vendor-neutral gateway (base URL + bearer-token
   command + model). The Databricks Unity Gateway is one producer of
@@ -107,6 +110,7 @@ _logger = logging.getLogger(__name__)
 # the module docstring for semantics. Centralizing as constants
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_CLAUDE_SDK_MODEL"
+_ENV_CONTEXT_WINDOW = "HARNESS_CLAUDE_SDK_CONTEXT_WINDOW"
 _ENV_GATEWAY = "HARNESS_CLAUDE_SDK_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_CLAUDE_SDK_GATEWAY_HOST"
@@ -254,6 +258,24 @@ def _resolve_skills_filter() -> str | list[str]:
     return "all"
 
 
+def _resolve_context_window() -> int | None:
+    """
+    Resolve the spec-declared context window from env config.
+
+    :returns: The positive window in tokens, or ``None`` when unset or
+        malformed so the executor resolves the window from the model.
+    """
+    raw = os.environ.get(_ENV_CONTEXT_WINDOW, "").strip()
+    if not raw:
+        return None
+    try:
+        window = int(raw)
+    except ValueError:
+        _logger.warning("%s is not an integer (%r); ignoring it", _ENV_CONTEXT_WINDOW, raw)
+        return None
+    return window if window > 0 else None
+
+
 def _build_claude_sdk_executor() -> Executor:
     """
     Construct a :class:`ClaudeSDKExecutor` from env-var config.
@@ -287,6 +309,7 @@ def _build_claude_sdk_executor() -> Executor:
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
+        context_window=_resolve_context_window(),
         permission_mode=os.environ.get(_ENV_PERMISSION_MODE, _DEFAULT_PERMISSION_MODE),
         system_prompt_preset=os.environ.get(_ENV_SYSTEM_PROMPT_PRESET) or None,
         gateway=gateway,
