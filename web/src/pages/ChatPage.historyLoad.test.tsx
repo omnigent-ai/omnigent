@@ -225,6 +225,27 @@ describe("KeepBottomOnResize", () => {
 
     expect(metrics.scrollTop).toBe(1320);
     expect(stickContext.scrollToBottom).toHaveBeenCalledWith("instant");
+
+    // The pin's own scroll event arrives after the next line already grew the transcript.
+    metrics.scrollHeight = 2042;
+    fireEvent.scroll(scrollRoot);
+    act(() => resize?.());
+    expect(metrics.scrollTop).toBe(1341);
+  });
+
+  it("leaves transcript growth alone once the reader scrolls up, before the library notices", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnResize />);
+
+    metrics.scrollTop = 1100;
+    fireEvent.scroll(scrollRoot);
+    metrics.scrollHeight = 2021;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(metrics.scrollTop).toBe(1100);
   });
 
   it("leaves transcript growth under an escaped reader alone", () => {
@@ -240,7 +261,7 @@ describe("KeepBottomOnResize", () => {
     expect(metrics.scrollTop).toBe(800);
   });
 
-  it("leaves transcript growth to the library while the reader selects text in it", () => {
+  it("holds still while the reader drags a selection in the transcript", () => {
     const { metrics, scrollRoot } = makeScrollRoot();
     scrollRoot.textContent = "streamed reply";
     document.body.append(scrollRoot);
@@ -249,11 +270,17 @@ describe("KeepBottomOnResize", () => {
     stickContext.state.escapedFromLock = false;
     render(<KeepBottomOnResize />);
 
+    fireEvent.pointerDown(scrollRoot);
     metrics.scrollHeight = 2021;
     act(() => resize?.());
-
     expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
     expect(metrics.scrollTop).toBe(1300);
+
+    // A finished selection stays in place but no longer holds the view.
+    fireEvent.pointerUp(scrollRoot);
+    metrics.scrollHeight = 2042;
+    act(() => resize?.());
+    expect(metrics.scrollTop).toBe(1341);
     document.getSelection()!.removeAllRanges();
     scrollRoot.remove();
   });

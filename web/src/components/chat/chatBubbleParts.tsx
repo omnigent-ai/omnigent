@@ -1250,6 +1250,8 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   return null;
 }
 
+const POINTER_STATE_EVENTS = ["pointerdown", "pointerup", "pointercancel"] as const;
+
 /** Keep bottom-locked readers pinned when the viewport or the transcript changes height. */
 export function KeepBottomOnResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
@@ -1263,18 +1265,24 @@ export function KeepBottomOnResize() {
   useEffect(() => {
     const el = scrollRef?.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
-    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
     let clientHeight = el.clientHeight;
     let scrollHeight = el.scrollHeight;
+    // Against the last observed layout: a pin's own scroll event can arrive
+    // after the next streamed line has grown the transcript.
+    const isAtObservedBottom = () => scrollHeight - clientHeight - el.scrollTop <= 1;
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtObservedBottom();
+    let pointerDown = false;
     let frame: number | null = null;
     const onScroll = () => {
-      wasBottomLocked = isPhysicallyAtBottom();
+      wasBottomLocked = isAtObservedBottom();
     };
-    // The library holds a reader who is selecting text; leave that to it.
+    const onPointer = (event: Event) => {
+      pointerDown = event.type === "pointerdown";
+    };
+    // Like the library, hold still while the reader drags a selection in the transcript.
     const isSelecting = () => {
       const selection = document.getSelection();
-      if (!selection || selection.isCollapsed) return false;
+      if (!pointerDown || !selection || selection.isCollapsed) return false;
       const common = selection.getRangeAt(0).commonAncestorContainer;
       return common.contains(el) || el.contains(common);
     };
@@ -1284,7 +1292,7 @@ export function KeepBottomOnResize() {
       clientHeight = el.clientHeight;
       scrollHeight = el.scrollHeight;
       const following = state.isAtBottom && !state.escapedFromLock && !isSelecting();
-      if (!(viewportResized && wasBottomLocked) && !(contentGrew && following)) return;
+      if (!wasBottomLocked || !(viewportResized || (contentGrew && following))) return;
       // Gecko delivers this callback before the frame paints, but the
       // library's scrollToBottom always lands a frame later (it defers
       // through a rAF promise), so the resize paints with the transcript
@@ -1304,10 +1312,12 @@ export function KeepBottomOnResize() {
       });
     });
     el.addEventListener("scroll", onScroll, { passive: true });
+    for (const type of POINTER_STATE_EVENTS) document.addEventListener(type, onPointer, true);
     observer.observe(el);
     if (contentRef.current) observer.observe(contentRef.current);
     return () => {
       el.removeEventListener("scroll", onScroll);
+      for (const type of POINTER_STATE_EVENTS) document.removeEventListener(type, onPointer, true);
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
