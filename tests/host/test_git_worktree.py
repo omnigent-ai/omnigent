@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -373,6 +376,19 @@ def test_create_worktree_existing_branch_rejects_base_branch(git_repo: Path) -> 
     assert "base_branch" in exc.value.message
 
 
+def test_create_worktree_checkout_outlasting_command_timeout_completes(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large repo's slow checkout finishes instead of hitting the per-command git timeout."""
+    _commit_slow_smudge_file(git_repo, delay_s=3)
+    monkeypatch.setattr(git_worktree_module, "_GIT_TIMEOUT_S", 1.0)
+
+    created = create_worktree(repo_path=str(git_repo), branch_name="large-checkout")
+
+    assert (Path(created.worktree_path) / "slow.bin").read_text() == "payload\n"
+    assert _current_branch(Path(created.worktree_path)) == "large-checkout"
+
+
 def test_create_worktree_non_repo_fails(tmp_path: Path) -> None:
     """A directory that isn't a git repo is rejected."""
     plain = tmp_path / "plain"
@@ -472,10 +488,10 @@ def test_list_worktrees_fetches_all_timestamps_with_one_git_command(
     original_run_git = git_worktree_module._run_git
     show_calls: list[list[str]] = []
 
-    def run_git(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+    def run_git(args: list[str], *, cwd: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         if args[:3] == ["show", "-s", "--format=%H%x00%ct"]:
             show_calls.append(args)
-        return original_run_git(args, cwd=cwd)
+        return original_run_git(args, cwd=cwd, **kwargs)
 
     monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
 
@@ -553,6 +569,9 @@ def test_list_worktrees_preserves_probe_failure(
     suffix = f": {stderr}" if stderr else ""
     assert exc.value.message == f"git worktree list failed (exit 128){suffix}"
     assert run.call_args.kwargs["env"]["LC_ALL"] == "C"
+    # Git must never wait on a credential prompt the server cannot show.
+    assert run.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert run.call_args.kwargs["stdin"] is subprocess.DEVNULL
 
 
 @pytest.mark.parametrize(
@@ -658,9 +677,11 @@ def test_directory_validation_survives_revision_moving(
     real_run = git_worktree_module._run_git
     moved = False
 
-    def move_after_validation(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+    def move_after_validation(
+        args: list[str], *, cwd: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
         nonlocal moved
-        result = real_run(args, cwd=cwd)
+        result = real_run(args, cwd=cwd, **kwargs)
         if args[:2] == ["cat-file", "-t"] and not moved:
             ref = "main" if mode == "head" else "moving"
             _git(git_repo, "update-ref", f"refs/heads/{ref}", before)
@@ -719,15 +740,198 @@ def test_failed_pinned_checkout_rolls_back_without_hiding_original_error(
     _git(git_repo, "commit", "-m", "web")
     real_run = git_worktree_module._run_git
 
-    def fail_checkout(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+    def fail_checkout(
+        args: list[str], *, cwd: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
         if args[:2] == ["checkout", "--force"]:
             return subprocess.CompletedProcess(args, 1, "", "checkout failed")
         if rollback_fails and args[:2] == ["worktree", "remove"]:
             return subprocess.CompletedProcess(args, 1, "", "rollback failed")
-        return real_run(args, cwd=cwd)
+        return real_run(args, cwd=cwd, **kwargs)
 
     monkeypatch.setattr(git_worktree_module, "_run_git", fail_checkout)
     with pytest.raises(WorktreeError, match="could not check out validated"):
         create_worktree(repo_path=str(source), branch_name="new")
     assert _branch_exists(git_repo, "new") is rollback_fails
     assert len(list_worktrees(repo_path=str(git_repo))) == (2 if rollback_fails else 1)
+
+
+def _commit_slow_smudge_file(repo: Path, delay_s: int) -> None:
+    """Commit ``slow.bin`` behind a smudge filter that sleeps on every checkout.
+
+    :param repo: Repository to commit into.
+    :param delay_s: Seconds each checkout of the file takes.
+    """
+    (repo / ".gitattributes").write_text("slow.bin filter=slow\n")
+    (repo / "slow.bin").write_text("payload\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "slow file")
+    _git(repo, "config", "filter.slow.smudge", f"sh -c 'exec 2>/dev/null; sleep {delay_s}; cat'")
+    _git(repo, "config", "filter.slow.clean", "cat")
+    _git(repo, "config", "filter.slow.required", "true")
+
+
+def test_create_worktree_slow_checkout_beyond_budget_times_out(git_repo: Path) -> None:
+    """The create budget still bounds a slow checkout, and the error names it."""
+    _commit_slow_smudge_file(git_repo, delay_s=3)
+
+    with pytest.raises(WorktreeError, match="worktree creation timed out after 1s"):
+        create_worktree(repo_path=str(git_repo), branch_name="feature/slow", timeout_s=1.0)
+
+
+@dataclass
+class _TimedGit:
+    """Real git under a fake clock that advances by a set time per command.
+
+    :param elapsed_s: Simulated seconds per command, keyed like ``"fetch"``
+        or ``"worktree add"``.
+    :param fail: Commands to report as failed instead of running.
+    :param time_out: Commands that use their whole timeout and are killed.
+    :param hang_after: Every command after the first one with this key also
+        uses its whole timeout and is killed, e.g. ``"fetch"``.
+    :param bounds: ``(command, timeout)`` each git process was given, in order.
+    :param windows: ``(command, start, latest end)`` on the fake clock for
+        each git process, where the latest end is when its timeout kills it.
+    """
+
+    elapsed_s: dict[str, float] = field(default_factory=dict)
+    fail: set[str] = field(default_factory=set)
+    time_out: set[str] = field(default_factory=set)
+    hang_after: str | None = None
+    bounds: list[tuple[str, float]] = field(default_factory=list)
+    windows: list[tuple[str, float, float]] = field(default_factory=list)
+
+
+@pytest.fixture
+def timed_git(monkeypatch: pytest.MonkeyPatch) -> _TimedGit:
+    """Run git processes against a controllable monotonic clock."""
+    timed = _TimedGit()
+    clock = [1000.0]
+    real_exec = git_worktree_module._exec_git
+    monkeypatch.setattr(git_worktree_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def run(argv: list[str], *, cwd: str, timeout: float) -> subprocess.CompletedProcess[str]:
+        command = f"worktree {argv[1]}" if argv[0] == "worktree" else argv[0]
+        hangs = command in timed.time_out or timed.hang_after in {c for c, _ in timed.bounds}
+        timed.bounds.append((command, timeout))
+        timed.windows.append((command, clock[0], clock[0] + timeout))
+        if hangs:
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+        clock[0] += timed.elapsed_s.get(command, 0.0)
+        if command in timed.fail:
+            return subprocess.CompletedProcess(argv, 1, "", f"{command} failed")
+        return real_exec(argv, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(git_worktree_module, "_exec_git", run)
+    return timed
+
+
+def _subdirectory_repo_with_unfetched_base(repo: Path) -> Path:
+    """Add ``web/`` and an ``origin`` whose ``main`` must be fetched first.
+
+    :returns: The ``web`` directory, so create pins and checks out a commit.
+    """
+    (repo / "web").mkdir()
+    (repo / "web" / "index.html").write_text("<html></html>")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "add web")
+    _git(repo, "remote", "add", "origin", str(repo))
+    return repo / "web"
+
+
+def test_create_worktree_size_scaling_commands_share_one_budget(
+    git_repo: Path, timed_git: _TimedGit
+) -> None:
+    """Fetch, ``worktree add`` and ``checkout`` draw on one budget; metadata keeps its bound."""
+    source = _subdirectory_repo_with_unfetched_base(git_repo)
+    timed_git.elapsed_s.update({"fetch": 100.0, "worktree add": 200.0})
+
+    create_worktree(
+        repo_path=str(source),
+        branch_name="feature/budget",
+        base_branch="origin/main",
+        timeout_s=1000.0,
+    )
+
+    # The pinned checkout's rollback keeps min(120 s, a quarter of the budget) in reserve.
+    size_scaling = {"fetch", "worktree add", "checkout"}
+    assert [bound for bound in timed_git.bounds if bound[0] in size_scaling] == [
+        ("fetch", 880.0),
+        ("worktree add", 780.0),
+        ("checkout", 580.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "fetch_elapsed_s", "hang_after"),
+    [(1000.0, 1000.0, None), (1000.0, 870.0, "fetch"), (140.0, 100.0, "fetch")],
+    ids=["fetch-spends-budget", "metadata-after-fetch", "legacy-metadata-after-fetch"],
+)
+def test_create_worktree_stops_once_budget_is_spent(
+    git_repo: Path,
+    timed_git: _TimedGit,
+    timeout_s: float,
+    fetch_elapsed_s: float,
+    hang_after: str | None,
+) -> None:
+    """Once fetch, or a metadata command after it, reaches the deadline, the create fails
+    before ``worktree add`` starts, without overrunning the budget's reserve."""
+    source = _subdirectory_repo_with_unfetched_base(git_repo)
+    timed_git.elapsed_s["fetch"] = fetch_elapsed_s
+    timed_git.hang_after = hang_after
+    reserve = min(git_worktree_module._GIT_TIMEOUT_S, timeout_s / 4)
+
+    with pytest.raises(WorktreeError, match=f"worktree creation timed out after {timeout_s:.0f}s"):
+        create_worktree(
+            repo_path=str(source),
+            branch_name="feature/budget",
+            base_branch="origin/main",
+            timeout_s=timeout_s,
+        )
+
+    assert "worktree add" not in {command for command, _ in timed_git.bounds}
+    assert not _branch_exists(git_repo, "feature/budget")
+    assert max(end for _, _, end in timed_git.windows) <= 1000.0 + timeout_s
+    if hang_after is not None:
+        # The stalled metadata command was cut off where the work part of the budget ends.
+        assert timed_git.windows[-1][2] == 1000.0 + timeout_s - reserve
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "checkout_elapsed_s", "checkout_times_out", "expected_remove_bound", "error"),
+    [
+        (1000.0, 100.0, False, 900.0, "could not check out validated"),
+        (1000.0, 880.0, False, 120.0, "could not check out validated"),
+        # An older server omits timeout_s and waits 150 s for the reply.
+        (140.0, 0.0, True, 35.0, "worktree creation timed out after 140s"),
+        (140.0, 100.0, False, 40.0, "could not check out validated"),
+    ],
+    ids=["budget-left", "reserve-only", "legacy-checkout-timeout", "legacy-late-failure"],
+)
+def test_create_worktree_rollback_gets_remaining_budget_or_metadata_bound(
+    git_repo: Path,
+    timed_git: _TimedGit,
+    timeout_s: float,
+    checkout_elapsed_s: float,
+    checkout_times_out: bool,
+    expected_remove_bound: float,
+    error: str,
+) -> None:
+    """A failed checkout's rollback uses the rest of the budget, and a reserve kept back
+    from fetch, add and checkout lets the whole failure path finish within ``timeout_s``."""
+    source = _subdirectory_repo_with_unfetched_base(git_repo)
+    timed_git.elapsed_s["checkout"] = checkout_elapsed_s
+    if checkout_times_out:
+        timed_git.time_out.add("checkout")
+    else:
+        timed_git.fail.add("checkout")
+    deadline = 1000.0 + timeout_s
+
+    with pytest.raises(WorktreeError, match=error):
+        create_worktree(repo_path=str(source), branch_name="feature/rollback", timeout_s=timeout_s)
+
+    assert ("worktree remove", expected_remove_bound) in timed_git.bounds
+    assert not _branch_exists(git_repo, "feature/rollback")
+    # Every git call, rollback included, is killed by the deadline at the latest.
+    assert max(end for _, _, end in timed_git.windows) <= deadline

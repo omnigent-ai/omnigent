@@ -1,10 +1,17 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComposerPrLink } from "./ComposerPrLink";
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
+import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 
-afterEach(cleanup);
+vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: vi.fn(() => false) }));
+
+afterEach(() => {
+  cleanup();
+  vi.mocked(useIsCoarsePointer).mockReturnValue(false);
+});
 
 describe("ComposerPrLink", () => {
   it.each(["ready", "loading", "unknown"] as const)(
@@ -111,5 +118,58 @@ describe("ComposerPrLink", () => {
     render(<ComposerPrLink state="ready" prCount={1} prNumber={null} onOpen={() => {}} />);
     expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("1 PR");
     expect(screen.queryByText("#null")).toBeNull();
+  });
+
+  it.each([false, true])("shows each PR state on keyboard focus (coarse=%s)", async (coarse) => {
+    vi.mocked(useIsCoarsePointer).mockReturnValue(coarse);
+    const prs: ComposerPullRequest[] = [
+      {
+        url: "https://github.com/example/app/pull/42",
+        host: "github.com",
+        repository: "example/app",
+        number: 42,
+        relationship: "created",
+        title: "Resolve conflicting changes",
+        state: "OPEN",
+        merge_state_status: "DIRTY",
+      },
+      {
+        url: "https://github.com/example/app/pull/41",
+        host: "github.com",
+        repository: "example/app",
+        number: 41,
+        relationship: "created",
+        title: "Previously merged work",
+        state: "MERGED",
+      },
+    ];
+    const onOpen = vi.fn();
+    render(
+      <ComposerPrLink
+        state="ready"
+        prCount={2}
+        prNumber={42}
+        prStatus="conflict"
+        prs={prs}
+        onOpen={onOpen}
+      />,
+    );
+    const link = screen.getByTestId("composer-pr-link");
+    expect(link).toHaveAttribute("data-pr-status", "conflict");
+    expect(link).toHaveAccessibleName("2 PRs");
+    expect(link).not.toHaveAttribute("aria-describedby");
+    fireEvent.focus(link);
+    const preview = await screen.findByTestId("composer-pr-preview");
+    expect(link).toHaveAttribute("aria-describedby", preview.id);
+    expect(link).toHaveAccessibleDescription(/Merge conflicts.*Merged.*Previously merged work/);
+    expect(preview.querySelectorAll("li[data-pr-status]")).toHaveLength(2);
+    expect(preview.querySelector("li")).toHaveAttribute("data-pr-status", "conflict");
+    expect(screen.getByText("Merged")).toBeVisible();
+    expect(screen.getByText("Previously merged work")).toBeVisible();
+    expect(preview.querySelector(".lucide-git-merge")).toBeInTheDocument();
+    fireEvent.keyDown(link, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
+    fireEvent.click(link);
+    expect(onOpen).toHaveBeenCalledTimes(1);
   });
 });

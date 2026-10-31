@@ -31,6 +31,7 @@ import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
@@ -228,7 +229,14 @@ function TranscriptImpl({
       flushSync(() => setNativeFindConversationId(display.conversationId));
     };
     window.addEventListener("keydown", handleFind);
-    return () => window.removeEventListener("keydown", handleFind);
+    // The desktop Edit > Find… menu opens its find bar without a keydown.
+    const unsubscribeFindOpened = onFindOpened(() => {
+      if (display.conversationId) setNativeFindConversationId(display.conversationId);
+    });
+    return () => {
+      window.removeEventListener("keydown", handleFind);
+      unsubscribeFindOpened();
+    };
   }, [display.conversationId]);
   const disableVirtualization = nativeFindConversationId === display.conversationId;
   const [searchParams] = useSearchParams();
@@ -756,6 +764,25 @@ export function VirtualBubbleList({
     },
   });
 
+  // A row mounted mid-scroll is only measured by its ResizeObserver, after the layout
+  // has recorded its shift. Measuring it right after the commit corrects the scroll first.
+  const measureRow = useCallback(
+    (node: HTMLDivElement | null) => {
+      virtualizer.measureElement(node);
+      if (node === null) return;
+      queueMicrotask(() => {
+        const key = node.dataset.bubbleKey;
+        if (!node.isConnected || key === undefined || virtualizer.itemSizeCache.has(key)) return;
+        // The cached offset lags scroll writes until the next scroll event, and the
+        // correction below writes an absolute position built from it.
+        const scroller = virtualizer.scrollElement;
+        if (scroller) virtualizer.scrollOffset = scroller.scrollTop;
+        virtualizer.resizeItem(Number(node.dataset.index), node.getBoundingClientRect().height);
+      });
+    },
+    [virtualizer],
+  );
+
   // An assistant bubble is keyed by its first item, so a history page that
   // continues the top turn renames it. Keep rendering it under the key its row
   // already has: React keeps the node (a remount replays the action row's hover
@@ -1078,7 +1105,7 @@ export function VirtualBubbleList({
             key={rowKey(bubble)}
             data-index={item.index}
             data-bubble-key={rowKey(bubble)}
-            ref={virtualizer.measureElement}
+            ref={measureRow}
             className="relative"
           >
             <BubbleView

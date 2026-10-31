@@ -493,12 +493,64 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
   });
 
+  it("folds a finished Codex turn's commentary into one Worked row by default", () => {
+    const codexTurn: AssistantBubble = {
+      ...foldOnlyBubble([
+        {
+          kind: "text",
+          itemId: "t1",
+          text: "Reading the tests.",
+          final: true,
+          phase: "commentary",
+        },
+        toolItem("c6"),
+        { kind: "text", itemId: "t2", text: "Adding the case.", final: true, phase: "commentary" },
+        toolItem("c7"),
+        { kind: "text", itemId: "t3", text: "Added the test.", final: true, phase: "final_answer" },
+      ]),
+      continued: false,
+    };
+    render(<BubbleView bubble={codexTurn} />);
+    expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Worked for 2m 27s" })).toBeInTheDocument();
+    expect(screen.queryByText("Reading the tests.")).not.toBeInTheDocument();
+    expect(screen.getByText("Added the test.")).toBeVisible();
+    cleanup();
+
+    // Without answer labels, progress messages stay visible unless the user opts in.
+    const unlabeled = codexTurn.items.map((item) =>
+      item.kind === "text" ? { ...item, phase: undefined } : item,
+    );
+    render(<BubbleView bubble={{ ...codexTurn, items: unlabeled }} />);
+    expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+    expect(screen.getByText("Reading the tests.")).toBeVisible();
+  });
+
   it("spans the column for a fold-only turn so the row's hairline draws", () => {
     // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
     // (a flex-1 span) collapses to zero width and the click target stops
     // short of the column. The prose cap keeps it aligned with the rule
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble.firstElementChild).not.toHaveClass("w-fit");
+  });
+
+  it("spans the prose width for tool rows beside a short reply", () => {
+    // WHY: shrink-wrapped to "Done.", the rows above it would cut their titles off mid-column.
+    render(
+      <BubbleView
+        bubble={{
+          ...foldOnlyBubble([
+            toolItem("c5"),
+            { kind: "text", itemId: "t5", text: "Done.", final: true },
+          ]),
+          continued: false,
+        }}
+      />,
+    );
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");

@@ -766,6 +766,33 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Called 1 tool")).toBeDefined();
     });
 
+    it("folds Codex commentary into one row without the opt-in", () => {
+      const items: RenderItem[] = [
+        {
+          kind: "text",
+          itemId: "m0",
+          text: "Reading the tests.",
+          final: true,
+          phase: "commentary",
+        },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Adding the case.", final: true, phase: "commentary" },
+        tool(2, "Bash"),
+        { kind: "text", itemId: "m2", text: "Added the test.", final: true, phase: "final_answer" },
+      ];
+      const view = render(<BlockRenderer items={items} sessionStatus="idle" workedForS={9} />);
+      expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+      expect(screen.getByRole("button", { name: "Worked for 9s" })).toBeDefined();
+      expect(screen.queryByText("Reading the tests.")).toBeNull();
+      expect(screen.getByText("Added the test.")).toBeDefined();
+
+      // A Codex bubble that ends without a marked answer keeps its last message.
+      view.rerender(<BlockRenderer items={items.slice(0, 4)} sessionStatus="idle" />);
+      expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+      expect(screen.getByText("Adding the case.")).toBeDefined();
+      expect(screen.queryByText("Reading the tests.")).toBeNull();
+    });
+
     describe("with foldNarration", () => {
       it("folds narration and work behind one row, leaving the last message", () => {
         const items: RenderItem[] = [
@@ -854,10 +881,7 @@ describe("BlockRenderer dispatch", () => {
           tool(2, "Bash"),
           { kind: "text", itemId: "m3", text: "Done.", final: true, phase: "final_answer" },
         ];
-        const view = render(<BlockRenderer items={items} sessionStatus="idle" />);
-        expect(screen.getByText("Multiplying first.")).toBeDefined();
-
-        view.rerender(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
         expect(screen.queryByText("Multiplying first.")).toBeNull();
         // Answer text and an unlabelled message stay visible beside the folds.
         expect(screen.getByText("17 × 23 = 391.")).toBeDefined();
