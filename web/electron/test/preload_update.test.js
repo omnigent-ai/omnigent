@@ -64,15 +64,20 @@ describe("browser action bridge", () => {
   it("forwards typed actions to main", async () => {
     const h = loadPreload();
     const params = { ref: 2, text: "hello" };
-    await h.desktop.browserPerformAction("conversation", "type", params);
+    assert.equal(h.desktop.browserSessionNetworkPolicy, true);
+    await h.desktop.browserPerformAction("conversation", "type", params, "local-host");
     const { channel, args } = h.invokes.at(-1);
     assert.equal(channel, "omnigent:browser-perform-action");
     assert.equal(args.conversationId, "conversation");
     assert.equal(args.action, "type");
     assert.deepEqual(args.params, params);
-    await h.desktop.browserExecute("conversation", "legacy input");
+    assert.equal(args.sourceHostId, "local-host");
+    await h.desktop.browserExecute("conversation", "legacy input", "local-host");
     assert.equal(h.invokes.at(-1).channel, "omnigent:browser-execute");
     assert.equal(h.invokes.at(-1).args.js, "legacy input");
+    assert.equal(h.invokes.at(-1).args.sourceHostId, "local-host");
+    await h.desktop.browserScreenshot("conversation", "local-host");
+    assert.equal(h.invokes.at(-1).args.sourceHostId, "local-host");
   });
 });
 

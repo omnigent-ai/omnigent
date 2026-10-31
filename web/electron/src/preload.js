@@ -262,12 +262,12 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
 
   /**
    * Open (create-if-absent) or navigate a conversation's view. `opts.force`
-   * reloads on same URL; `opts.agent` marks model-issued nav, which the main
-   * process gates behind a scheme/host allowlist (URL-bar nav omits it).
+   * reloads on same URL. Agent views require a verified local sourceHostId;
+   * user tabs retain the public-network policy without local provenance.
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, rememberedArcaHostId?: string}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),
@@ -292,19 +292,26 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserResize: (conversationId, bounds) =>
     ipcRenderer.invoke("omnigent:browser-resize", { conversationId, bounds }),
+  /** Capability marker for session-scoped network policy on every browser tool. */
+  browserSessionNetworkPolicy: true,
   /**
    * Capture the conversation's view as a base64 PNG data URL.
    * @param {string} conversationId
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
-  browserScreenshot: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId }),
+  browserScreenshot: (conversationId, sourceHostId) =>
+    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, sourceHostId }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
-  browserPerformAction: (conversationId, action, params) =>
-    ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params }),
+  browserPerformAction: (conversationId, action, params, sourceHostId) =>
+    ipcRenderer.invoke("omnigent:browser-perform-action", {
+      conversationId,
+      action,
+      params,
+      sourceHostId,
+    }),
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
-  browserExecute: (conversationId, js) =>
-    ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js }),
+  browserExecute: (conversationId, js, sourceHostId) =>
+    ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, sourceHostId }),
   /**
    * Destroy the conversation's view (explicit close — unmount only detaches).
    * @param {string} conversationId

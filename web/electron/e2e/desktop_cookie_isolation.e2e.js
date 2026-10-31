@@ -122,9 +122,16 @@ describe(
       "performs snapshot, click and type through the preload bridge",
       { timeout: 180_000 },
       async () => {
+        const configDir = path.join(tmpDir, "local-action-config");
+        fs.mkdirSync(configDir);
+        fs.writeFileSync(
+          path.join(configDir, "config.yaml"),
+          "host:\n  host_id: local-action-host\n",
+        );
         const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
           serverUrl: server.serverUrl,
           recordDir,
+          env: { OMNIGENT_CONFIG_HOME: configDir },
         });
         const conversationId = "browser-actions";
         try {
@@ -159,11 +166,13 @@ describe(
                         cid,
                         requestedAction,
                         requestedParams,
+                        "local-action-host",
                       ),
                     { cid: conversationId, action, params },
                   )
                 : window.evaluate(
-                    ({ cid, script }) => window.omnigentDesktop.browserExecute(cid, script),
+                    ({ cid, script }) =>
+                      window.omnigentDesktop.browserExecute(cid, script, "local-action-host"),
                     { cid: conversationId, script: buildBrowserActionScript(action, params) },
                   );
             const snapshot = await perform("snapshot");

@@ -18,13 +18,16 @@ const {
 } = require("../src/browserUrlPolicy");
 
 describe("browserUrlPolicy — agent navigation allowlist", () => {
-  it("allows only canonical loopback destinations with Arca eligibility", () => {
+  it("allows all HTTP(S) destinations for verified local sessions", () => {
     for (const host of ["localhost", "127.0.0.1", "[::1]"]) {
       assert.equal(
-        isAgentNavigationAllowed(`http://${host}:5173/`, { allowLocalhost: true }).ok,
+        isAgentNavigationAllowed(`http://${host}:5173/`, { allowPrivateNetwork: true }).ok,
         true,
       );
-      assert.equal(isAgentNavigationAllowed(`https://${host}/`, { allowLocalhost: true }).ok, true);
+      assert.equal(
+        isAgentNavigationAllowed(`https://${host}/`, { allowPrivateNetwork: true }).ok,
+        true,
+      );
       assert.equal(isAgentNavigationAllowed(`http://${host}/`).ok, false);
     }
     for (const url of [
@@ -38,10 +41,13 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
       "http://10.0.0.1",
       "http://172.16.0.1",
       "http://192.168.1.1",
-      "file:///tmp/a",
-      "data:text/html,test",
     ]) {
-      assert.equal(isAgentNavigationAllowed(url, { allowLocalhost: true }).ok, false, url);
+      assert.equal(isAgentNavigationAllowed(url, { allowPrivateNetwork: true }).ok, true, url);
+    }
+  });
+  it("retains scheme validation for local sessions", () => {
+    for (const url of ["file:///tmp/a", "data:text/html,test", "javascript:alert(1)", "bad"]) {
+      assert.equal(isAgentNavigationAllowed(url, { allowPrivateNetwork: true }).ok, false, url);
     }
   });
   it("allows ordinary public http(s) URLs", () => {
@@ -268,16 +274,16 @@ describe("browserUrlPolicy — DNS-aware agent navigation", () => {
     });
   });
 
-  it("does not resolve literals, rejected URLs, or the exact Arca loopback hosts", async () => {
+  it("does not resolve literals, rejected URLs, or verified local destinations", async () => {
     lookups.length = 0;
     assert.equal((await checkAgentNavigation("http://8.8.8.8/", { resolveHost })).ok, true);
     assert.equal((await checkAgentNavigation("file:///etc/passwd", { resolveHost })).ok, false);
     assert.equal((await checkAgentNavigation("http://[fd12::1]/", { resolveHost })).ok, false);
-    const arca = { resolveHost, allowLocalhost: true };
+    const arca = { resolveHost, allowPrivateNetwork: true };
     assert.equal((await checkAgentNavigation("http://localhost:5173/", arca)).ok, true);
     assert.deepEqual(lookups, []);
-    // A DNS alias for loopback is not part of the Arca exception.
-    assert.equal((await checkAgentNavigation("http://lvh.me:5173/", arca)).ok, false);
+    // Local sessions may resolve private names in Chromium directly.
+    assert.equal((await checkAgentNavigation("http://lvh.me:5173/", arca)).ok, true);
   });
 });
 
@@ -311,15 +317,15 @@ describe("browserUrlPolicy — connected address check", () => {
     }
   });
 
-  it("allows loopback only for the exact Arca hosts when eligible", () => {
-    const eligible = { allowLocalhost: true };
+  it("allows private responses for local sessions", () => {
+    const eligible = { allowPrivateNetwork: true };
     assert.equal(
       isAgentConnectionAllowed("http://localhost:5173/", "127.0.0.1", eligible).ok,
       true,
     );
     assert.equal(isAgentConnectionAllowed("http://[::1]:5173/", "::1", eligible).ok, true);
     assert.equal(isAgentConnectionAllowed("http://localhost:5173/", "127.0.0.1").ok, false);
-    assert.equal(isAgentConnectionAllowed("http://lvh.me:5173/", "127.0.0.1", eligible).ok, false);
+    assert.equal(isAgentConnectionAllowed("http://lvh.me:5173/", "127.0.0.1", eligible).ok, true);
   });
 });
 

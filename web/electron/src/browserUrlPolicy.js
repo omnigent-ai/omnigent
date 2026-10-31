@@ -1,9 +1,6 @@
-// Allowlist for AGENT-driven browser navigation (the URL-bar path
-// stays permissive — it's a user gesture). An unguarded model-issued loadURL
-// could point the view at file:// / cloud-metadata / loopback / private hosts
-// and read the bytes back via screenshot (SSRF + local-file read + exfil).
-// Runs in the main process (gate holds regardless of caller); Electron-free,
-// with DNS injectable, so `node --test` can exercise it without Electron.
+// Renderer-requested navigation shares one policy, including the URL bar.
+// Verified local sessions may reach private destinations. Other renderer
+// navigation retains the public-network policy for remote and unverified sessions.
 
 "use strict";
 
@@ -12,10 +9,6 @@ const dns = require("node:dns");
 // Schemes the agent may navigate to; everything else (file:, chrome:, data:,
 // javascript:, ...) is a privileged surface or code channel and is rejected.
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
-
-// The exact loopback hosts an eligible Arca agent context may open. Other
-// loopback spellings and DNS names that resolve to loopback stay blocked.
-const ARCA_LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
  * Parse a dotted-quad IPv4 host into four octets, or null if not IPv4. The
@@ -171,14 +164,14 @@ function isBlockedHostname(hostname) {
 
 /**
  * Decide whether an AGENT-issued navigation to `url` is allowed: `{ ok: true }`
- * for an http(s) URL to a non-internal host (or eligible Arca loopback), else
+ * for an http(s) URL to a non-internal host (or any host for a verified local session), else
  * `{ ok: false, error }`. Never throws — an unparseable URL is a rejection.
  * Judges the URL alone; `checkAgentNavigation` adds DNS resolution.
  *
  * @param {string} url
  * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
+function isAgentNavigationAllowed(url, { allowPrivateNetwork = false } = {}) {
   if (typeof url !== "string" || url.trim() === "") {
     return { ok: false, error: "navigation blocked: empty url" };
   }
@@ -195,7 +188,7 @@ function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
     };
   }
   const hostname = parsed.hostname;
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) {
+  if (allowPrivateNetwork) {
     return { ok: true };
   }
   if (isBlockedHostname(hostname)) {
@@ -224,17 +217,17 @@ async function lookupHostAddresses(hostname) {
  * address it resolves to must be public. Resolution failure blocks.
  *
  * @param {string} url
- * @param {{ allowLocalhost?: boolean, resolveHost?: (hostname: string) => Promise<string[]> }} [options]
+ * @param {{ allowPrivateNetwork?: boolean, resolveHost?: (hostname: string) => Promise<string[]> }} [options]
  * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
 async function checkAgentNavigation(
   url,
-  { allowLocalhost = false, resolveHost = lookupHostAddresses } = {},
+  { allowPrivateNetwork = false, resolveHost = lookupHostAddresses } = {},
 ) {
-  const verdict = isAgentNavigationAllowed(url, { allowLocalhost });
+  const verdict = isAgentNavigationAllowed(url, { allowPrivateNetwork });
   if (!verdict.ok) return verdict;
   const { hostname } = new URL(url);
-  if ((allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
+  if (allowPrivateNetwork || isIpLiteral(hostname)) {
     return verdict;
   }
   let addresses = [];
@@ -261,17 +254,17 @@ async function checkAgentNavigation(
  *
  * @param {string} url
  * @param {string | undefined} ip
- * @param {{ allowLocalhost?: boolean }} [options]
+ * @param {{ allowPrivateNetwork?: boolean }} [options]
  * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentConnectionAllowed(url, ip, { allowLocalhost = false } = {}) {
+function isAgentConnectionAllowed(url, ip, { allowPrivateNetwork = false } = {}) {
   let hostname = "";
   try {
     hostname = new URL(url).hostname;
   } catch {
     // Judge the address alone.
   }
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) return { ok: true };
+  if (allowPrivateNetwork) return { ok: true };
   if (!ip) {
     return {
       ok: false,

@@ -353,8 +353,6 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   getAgentContextForEvent = () => null,
-  recoverAgentNavigationForEvent = async () => false,
-  getAgentNavigationHintForEvent = () => null,
   // Injected so native dialogs can be parented to the sender's window.
   getWindowForEvent = () => null,
   chromeCookieStore = chromeCookieStoreModule,
@@ -397,13 +395,13 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
+    const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
     const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
     const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
     const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
     const navigate = async (registry) => {
       // The first-party renderer supplies the source-session host; main owns
       // the target and eligibility. Caller exception flags never establish identity.
-      const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
       if (url) {
         const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
         if (!isCurrent()) return cancelled;
@@ -416,31 +414,8 @@ function registerBrowserIpc({
         agentContext,
       });
     };
-    let r = await navigate(g.registry);
+    const r = await navigate(g.registry);
     if (!isCurrent()) return cancelled;
-    let recovered = false;
-    if (!r.ok && opts?.agent) {
-      try {
-        recovered = await recoverAgentNavigationForEvent(
-          event,
-          url,
-          opts?.sourceHostId,
-          opts?.rememberedArcaHostId,
-          opts?.sourceIsArcaHost,
-        );
-      } catch {
-        recovered = false;
-      }
-    }
-    if (!isCurrent()) return cancelled;
-    if (recovered) {
-      // Recovery updates main-owned identity, so rebuild the context and ask
-      // the registry to evaluate the same navigation once more.
-      const refreshed = gateRegistry(event);
-      if (refreshed.error || refreshed.registry !== g.registry) return cancelled;
-      r = await navigate(refreshed.registry);
-      if (!isCurrent()) return cancelled;
-    }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {
@@ -451,21 +426,7 @@ function registerBrowserIpc({
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    const hint =
-      !r.ok && opts?.agent
-        ? getAgentNavigationHintForEvent(
-            event,
-            url,
-            opts?.sourceHostId,
-            opts?.rememberedArcaHostId,
-            opts?.sourceIsArcaHost,
-          )
-        : null;
-    return {
-      ok: r.ok,
-      created: r.created ?? false,
-      error: hint ? `${r.error} ${hint}` : r.error,
-    };
+    return { ok: r.ok, created: r.created ?? false, error: r.error };
   });
 
   // Attach the named conversation's view to the host window (detaching the
@@ -517,37 +478,40 @@ function registerBrowserIpc({
     return { ok: true };
   });
 
-  // Capture the conversation's view as a base64 PNG.
-  ipcMain.handle("omnigent:browser-screenshot", async (event, args) => {
+  // Check access before execution and before returning screenshots or DOM data.
+  async function withAgentView(event, args, run) {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
+    const context = getAgentContextForEvent(event, args?.sourceHostId);
+    const access = g.registry.getForAgent(args?.conversationId, context);
+    if (!access.ok) return access;
     try {
-      const image = await entry.view.webContents.capturePage();
-      const dataUrl = `data:image/png;base64,${image.toPNG().toString("base64")}`;
-      return { ok: true, dataUrl };
+      const result = await run(access.entry.view.webContents);
+      const current = g.registry.getForAgent(args?.conversationId, context);
+      if (!isPinnedOriginSender(event) || !current.ok || current.entry !== access.entry) {
+        return { ok: false, error: "Browser view or session access changed during the action." };
+      }
+      return result;
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
-  });
+  }
+
+  ipcMain.handle("omnigent:browser-screenshot", (event, args) =>
+    withAgentView(event, args, async (webContents) => {
+      const image = await webContents.capturePage();
+      return { ok: true, dataUrl: `data:image/png;base64,${image.toPNG().toString("base64")}` };
+    }),
+  );
 
   // Both transports converge on main-owned scripts and the same sender gate.
   async function performBrowserAction(event, args, legacy = false) {
-    const g = gateRegistry(event);
-    if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
-    try {
+    return withAgentView(event, args, async (webContents) => {
       const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
       const js = buildBrowserActionScript(action, params);
-      const result = await entry.view.webContents.executeJavaScript(js, false);
+      const result = await webContents.executeJavaScript(js, false);
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
-    } catch (e) {
-      return { ok: false, error: e && e.message ? e.message : String(e) };
-    }
+    });
   }
   ipcMain.handle("omnigent:browser-perform-action", (event, args) =>
     performBrowserAction(event, args),

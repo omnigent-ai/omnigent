@@ -47,18 +47,17 @@ const DEFAULT_CAP = 10;
  * @returns {string}
  */
 function agentPartition(scope, viewId) {
-  let conversationId = viewId;
-  // Session IDs are UUID hex strings; tab keys follow browserViewId in
-  // web/src/hooks/useBrowserTabs.ts. Only storage uses the owning session ID.
+  return `omnigent-agent-${scope}-${browserViewOwnerId(viewId)}`;
+}
+
+/** Match user tab keys shared with web/src/lib/browserTabs.ts. */
+function browserViewOwnerId(viewId) {
   const tab = /^browser-tab:([^:]+):[^:]+$/.exec(viewId);
-  if (tab) {
-    try {
-      conversationId = decodeURIComponent(tab[1]);
-    } catch {
-      // An invalid tab key keeps its own isolated partition.
-    }
+  try {
+    return tab ? decodeURIComponent(tab[1]) : viewId;
+  } catch {
+    return viewId;
   }
-  return `omnigent-agent-${scope}-${conversationId}`;
 }
 
 // Monotonic per-process counter: each registry (shell window) gets a distinct
@@ -81,7 +80,7 @@ function createBrowserViewRegistry({
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
-  isArcaAgentContext = () => false,
+  isLocalAgentContext = () => false,
   // (hostname, partition) => Promise<string[]> for the agent DNS check, and
   // (url, partition) => Promise<string> ("DIRECT" or a PAC-style proxy list).
   resolveHost = lookupHostAddresses,
@@ -156,6 +155,7 @@ function createBrowserViewRegistry({
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
       agentContext: null,
+      privateNetworkAllowed: false,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
       // tracker). Null until design mode is enabled for this entry.
@@ -169,6 +169,28 @@ function createBrowserViewRegistry({
 
   function get(conversationId) {
     return entries.get(conversationId) || null;
+  }
+
+  function getForAgent(conversationId, agentContext) {
+    const entry = get(conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    // A local page may already contain private frames or fetched data. Discard
+    // it before a remote session can read it, even when its top-level URL is public.
+    if (
+      !isLocalAgentContext(agentContext) &&
+      (!entry.agentNavLocked || entry.privateNetworkAllowed)
+    ) {
+      close(conversationId, "browser-access-changed");
+      return {
+        ok: false,
+        error: "Browser access changed. Navigate to a public URL before using browser tools.",
+      };
+    }
+    return { ok: true, entry };
+  }
+
+  function allowsPrivateNetwork(entry) {
+    return entry.privateNetworkAllowed && isLocalAgentContext(entry.agentContext);
   }
 
   function getOrCreate(conversationId) {
@@ -218,7 +240,7 @@ function createBrowserViewRegistry({
       }
       if (entry.agentNavLocked) {
         const verdict = isAgentNavigationAllowed(url, {
-          allowLocalhost: isArcaAgentContext(entry.agentContext),
+          allowPrivateNetwork: allowsPrivateNetwork(entry),
         });
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
@@ -269,23 +291,15 @@ function createBrowserViewRegistry({
     });
   }
 
-  // SECURITY (SSRF): enforce the agent-navigation allowlist on the child view's
-  // OWN navigation events, not just the first loadURL. A server 302 / meta-
-  // refresh / location.href during an agent-initiated navigation would otherwise
-  // redirect the view to an internal host (metadata / loopback / RFC-1918) with
-  // no re-check, and browser_screenshot could read it back. `will-navigate` and
-  // `will-redirect` (plus subframes via `will-frame-navigate`) are the blocking
-  // hooks — did-navigate is report-only and fires too late. Enforced ONLY while
-  // `entry.agentNavLocked` (set per-navigation from opts.agent), so user-typed
-  // URL-bar browsing — including legitimate auth-redirect chains to internal
-  // hosts — stays permissive.
+  // Recheck page-driven navigation so redirects and frames cannot bypass the
+  // initial policy. IPC latches this guard for every renderer request.
   function attachAgentNavGuard(conversationId, entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
       const verdict = isAgentNavigationAllowed(targetUrl, {
-        allowLocalhost: isArcaAgentContext(entry.agentContext),
+        allowPrivateNetwork: allowsPrivateNetwork(entry),
       });
       if (!verdict.ok) {
         try {
@@ -388,15 +402,19 @@ function createBrowserViewRegistry({
   // DNS-aware check for an agent's first hop. openOrNavigate stays synchronous
   // (literal checks only), so browserIpc awaits this before it: a name that
   // resolves internally fails with an error instead of creating a blank view.
-  function checkAgentNavigationFor(conversationId, url, agentContext) {
-    const partition = agentPartition(partitionScope, conversationId);
+  function checkAgentNavigationFor(
+    conversationId,
+    url,
+    agentContext,
+    partition = agentPartition(partitionScope, conversationId),
+  ) {
     return checkAgentNavigation(url, {
-      allowLocalhost: isArcaAgentContext(agentContext),
+      allowPrivateNetwork: isLocalAgentContext(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
     });
   }
 
-  function agentLockedEntryFor(webContentsId) {
+  function agentLockedEntryFor(webContentsId, partition) {
     for (const entry of entries.values()) {
       let id;
       try {
@@ -406,18 +424,36 @@ function createBrowserViewRegistry({
       }
       if (id === webContentsId) return entry.agentNavLocked ? entry : null;
     }
-    return null;
+    if (!partition) return null;
+    // Worker requests may have no WebContents ID. Use the most restrictive
+    // view in the owning partition; an orphaned worker gets public access only.
+    const owners = [...entries.values()].filter(
+      (entry) => agentPartition(partitionScope, entry.conversationId) === partition,
+    );
+    return (
+      owners.find((entry) => !allowsPrivateNetwork(entry)) ??
+      owners[0] ?? {
+        conversationId: "",
+        agentContext: null,
+        privateNetworkAllowed: false,
+      }
+    );
   }
 
   // SECURITY (SSRF): network-layer half of the agent guard, wired by main.js
-  // to webRequest.onBeforeRequest for document requests on these views'
+  // to webRequest.onBeforeRequest for all network requests on these views'
   // partitions. Resolves true to cancel. Unlike the will-* guards it sees every
   // hop — redirects, window-open loads, history navigations — and can wait on
   // DNS, so a public name pointing at an internal address is refused too.
-  async function shouldCancelAgentRequest({ webContentsId, url }) {
-    const entry = agentLockedEntryFor(webContentsId);
+  async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+    const entry = agentLockedEntryFor(webContentsId, partition);
     if (!entry) return false; // user-driven or unattributed: permissive
-    const verdict = await checkAgentNavigationFor(entry.conversationId, url, entry.agentContext);
+    const verdict = await checkAgentNavigationFor(
+      entry.conversationId,
+      url.replace(/^ws(s?):/, "http$1:"),
+      allowsPrivateNetwork(entry) ? entry.agentContext : null,
+      partition,
+    );
     if (verdict.ok) return false;
     sendToRenderer("browser-nav-blocked", {
       conversationId: entry.conversationId,
@@ -429,10 +465,10 @@ function createBrowserViewRegistry({
 
   // Wired to webRequest.onBeforeSendHeaders. A pure HTTP-cache hit reports no
   // connected address (Chromium's HttpCache::Transaction::GetRemoteEndpoint),
-  // so agent documents skip cache reads (`no-cache`, per http_cache_util's
+  // so agent requests skip cache reads (`no-cache`, per http_cache_util's
   // GetLoadFlagsForExtraHeaders) and every response checked below carries one.
-  function agentRequestHeaders({ webContentsId, requestHeaders }) {
-    if (!agentLockedEntryFor(webContentsId)) return {};
+  function agentRequestHeaders({ webContentsId, requestHeaders }, partition) {
+    if (!agentLockedEntryFor(webContentsId, partition)) return {};
     const headers = {};
     const directives = new Map(); // lowercased → as sent, keeping e.g. no-store
     for (const [name, value] of Object.entries(requestHeaders ?? {})) {
@@ -453,20 +489,20 @@ function createBrowserViewRegistry({
 
   // Check Chromium's connected endpoint to catch DNS rebinding.
   // Electron 42 supplies details.ip despite stale typings.
-  async function shouldCancelAgentResponse({ webContentsId, url, ip }) {
-    const entry = agentLockedEntryFor(webContentsId);
+  async function shouldCancelAgentResponse({ webContentsId, url, ip }, partition) {
+    const entry = agentLockedEntryFor(webContentsId, partition);
     if (!entry) return false;
-    const verdict = isAgentConnectionAllowed(url, ip, {
-      allowLocalhost: isArcaAgentContext(entry.agentContext),
+    const verdict = isAgentConnectionAllowed(url.replace(/^ws(s?):/, "http$1:"), ip, {
+      allowPrivateNetwork: allowsPrivateNetwork(entry),
     });
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress).
-    const partition = agentPartition(partitionScope, entry.conversationId);
+    const requestPartition = partition ?? agentPartition(partitionScope, entry.conversationId);
     const proxied =
       !!ip &&
-      (await isProxyAddress(ip, await resolveProxy(url, partition), (hostname) =>
-        resolveHost(hostname, partition),
+      (await isProxyAddress(ip, await resolveProxy(url, requestPartition), (hostname) =>
+        resolveHost(hostname, requestPartition),
       ));
     if (proxied) return false;
     sendToRenderer("browser-nav-blocked", {
@@ -479,28 +515,31 @@ function createBrowserViewRegistry({
 
   function openOrNavigate(conversationId, url, bounds, opts) {
     const force = !!(opts && opts.force);
-    // Agent-driven nav (opts.agent) is gated by an allowlist (see
-    // browserUrlPolicy) so the model can't point the view at file:// /
-    // metadata / loopback / private hosts and exfiltrate via screenshot. URL-bar
-    // (user-typed) nav stays permissive. Checked before getOrCreate so a
-    // rejected nav creates no blank view.
+    // Check before creating a view. Renderer IPC also marks URL-bar requests
+    // as agent-driven, since renderer flags cannot establish user intent.
     if (opts && opts.agent && url) {
       const verdict = isAgentNavigationAllowed(url, {
-        allowLocalhost: isArcaAgentContext(opts.agentContext),
+        allowPrivateNetwork: isLocalAgentContext(opts.agentContext),
       });
       if (!verdict.ok) {
         return { ok: false, error: verdict.error };
       }
     }
+    if (opts?.agent && !isLocalAgentContext(opts.agentContext)) {
+      const pendingNavigation = pendingNavigations.get(conversationId);
+      getForAgent(conversationId, opts.agentContext);
+      if (pendingNavigation) pendingNavigations.set(conversationId, pendingNavigation);
+    }
     const result = getOrCreate(conversationId);
     if (!result.ok) return result;
     const { entry, created } = result;
     // Latch who drives THIS navigation so the will-navigate/will-redirect guard
-    // enforces the allowlist on an agent nav's whole redirect chain, and leaves
-    // user-typed URL-bar nav permissive. Set only when a url is actually issued.
+    // enforces the allowlist on the whole redirect chain. Set only when a URL
+    // is actually issued.
     if (url) {
       entry.agentNavLocked = !!(opts && opts.agent);
       entry.agentContext = entry.agentNavLocked ? (opts.agentContext ?? null) : null;
+      entry.privateNetworkAllowed = entry.agentNavLocked && isLocalAgentContext(entry.agentContext);
     }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
@@ -658,6 +697,7 @@ function createBrowserViewRegistry({
   return {
     // Lifecycle
     get,
+    getForAgent,
     getOrCreate,
     openOrNavigate,
     beginAgentNavigation,
@@ -685,5 +725,6 @@ function createBrowserViewRegistry({
 module.exports = {
   createBrowserViewRegistry,
   agentPartition,
+  browserViewOwnerId,
   DEFAULT_CAP,
 };
