@@ -900,6 +900,44 @@ def test_active_skill_processor_stamps_spans_while_active() -> None:
     assert telemetry._active_skill_var.get() is None
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_session_attributes_scope_stamps_spans_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """Every span inside the scope carries each attribute; disabled telemetry binds nothing."""
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true" if enabled else "false")
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(telemetry._make_session_attributes_processor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    attributes = {"omnigent.session.title": "Fix login", "omnigent.project.name": "Web"}
+
+    with telemetry.session_attributes_scope(attributes):
+        with tracer.start_as_current_span("agent:demo"):
+            with tracer.start_as_current_span("tool:Bash"):
+                pass
+    with tracer.start_as_current_span("outside.scope"):
+        pass
+
+    spans = {s.name: dict(s.attributes or {}) for s in exporter.get_finished_spans()}
+    expected = attributes if enabled else {}
+    assert spans["agent:demo"] == expected
+    assert spans["tool:Bash"] == expected
+    assert spans["outside.scope"] == {}
+
+
+@pytest.mark.parametrize("attributes", [None, {}])
+def test_session_attributes_scope_binds_nothing_for_an_empty_mapping(
+    monkeypatch: pytest.MonkeyPatch, attributes: dict[str, str] | None
+) -> None:
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+
+    with telemetry.session_attributes_scope(attributes):
+        assert telemetry._session_attributes_var.get() is None
+    assert telemetry._session_attributes_var.get() is None
+
+
 def test_make_span_attribute_processor_is_generic() -> None:
     """The factory stamps any attribute from any value getter, e.g. a context var."""
     import contextvars

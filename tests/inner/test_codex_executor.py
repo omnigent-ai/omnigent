@@ -958,9 +958,10 @@ class TestCodexExecutor(unittest.TestCase):
 
         session._request = AsyncMock(side_effect=request)
         messages = []
+        reported_efforts = []
         for index, effort in enumerate((None, "high", "high", None, None, "medium", None), 1):
             messages.append({"role": "user", "content": f"message-{index}"})
-            async for _ in session.run_turn(
+            async for event in session.run_turn(
                 messages=messages,
                 tools=[
                     {
@@ -975,7 +976,8 @@ class TestCodexExecutor(unittest.TestCase):
                 sandbox="workspace-write",
                 reasoning_effort=effort,
             ):
-                pass
+                if isinstance(event, TurnComplete):
+                    reported_efforts.append(event.reasoning_effort)
             messages.append({"role": "assistant", "content": "remembered"})
             self.assertEqual(server_effort, effort or default_effort, f"turn {index}: {effort=}")
 
@@ -990,6 +992,12 @@ class TestCodexExecutor(unittest.TestCase):
                 "medium",
                 default_effort,
             ],
+        )
+        # Each turn reports the effort it ran at; the model default is unknown
+        # until Codex names it, so a first Default turn reports none.
+        self.assertEqual(
+            reported_efforts,
+            [configured_default, *applied_efforts[1:]],
         )
         methods = [call.args[0] for call in session._request.await_args_list]
         self.assertEqual(methods.count("thread/start"), 1)
