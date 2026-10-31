@@ -549,8 +549,8 @@ describe("BlockRenderer dispatch", () => {
       // group — the most-recent tool renders (the collapsed group's content
       // is unmounted), while an older one stays folded. Guards against a
       // regression that folds everything.
-      expect(screen.getByText(/tool_5/)).toBeDefined();
-      expect(screen.queryByText(/tool_1/)).toBeNull();
+      expect(screen.getByText("Tool 5")).toBeDefined();
+      expect(screen.queryByText("Tool 1")).toBeNull();
     },
   );
 
@@ -600,11 +600,11 @@ describe("BlockRenderer dispatch", () => {
       const runTrigger = runLabel.closest("button");
       expect(runTrigger?.firstElementChild).toBe(runLabel);
       expect(runTrigger?.lastElementChild?.tagName.toLowerCase()).toBe("svg");
-      expect(runTrigger).toHaveClass("text-chat");
+      expect(runTrigger).toHaveClass("text-ui");
       expect(runTrigger).not.toHaveClass("text-sm");
       fireEvent.click(runTrigger!);
-      const individualToolTrigger = screen.getByText(/tool_3/).closest("button");
-      expect(individualToolTrigger).toHaveClass("text-chat");
+      const individualToolTrigger = screen.getByText("Tool 3").closest("button");
+      expect(individualToolTrigger).toHaveClass("text-ui");
       expect(individualToolTrigger).not.toHaveClass("text-sm");
       // The answer remains visible after expansion too.
       expect(screen.getByText("All done here.")).toBeDefined();
@@ -720,7 +720,7 @@ describe("BlockRenderer dispatch", () => {
       expect(trigger).toHaveAttribute("type", "button");
       expect(trigger).toHaveAttribute("aria-expanded", "false");
       expect(trigger).toHaveClass("gap-2", "py-1");
-      expect(trigger).toHaveClass("text-chat");
+      expect(trigger).toHaveClass("text-ui");
       expect(trigger).not.toHaveClass("text-sm");
       expect(trigger).not.toHaveClass("w-full");
       expect(trigger.querySelector(".border-t")).toBeNull();
@@ -831,6 +831,62 @@ describe("BlockRenderer dispatch", () => {
           fold.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING,
         ).toBeTruthy();
         expect(screen.queryByText("Gathering context.")).toBeNull();
+      });
+
+      it("folds only Codex commentary when the turn reports answer phases", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Plan: multiply, then save.", final: true },
+          {
+            kind: "text",
+            itemId: "m1",
+            text: "Multiplying first.",
+            final: true,
+            phase: "commentary",
+          },
+          tool(1, "Bash"),
+          {
+            kind: "text",
+            itemId: "m2",
+            text: "17 × 23 = 391.",
+            final: true,
+            phase: "partial_answer",
+          },
+          tool(2, "Bash"),
+          { kind: "text", itemId: "m3", text: "Done.", final: true, phase: "final_answer" },
+        ];
+        const view = render(<BlockRenderer items={items} sessionStatus="idle" />);
+        expect(screen.getByText("Multiplying first.")).toBeDefined();
+
+        view.rerender(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.queryByText("Multiplying first.")).toBeNull();
+        // Answer text and an unlabelled message stay visible beside the folds.
+        expect(screen.getByText("17 × 23 = 391.")).toBeDefined();
+        expect(screen.getByText("Done.")).toBeDefined();
+        expect(screen.getByText("Plan: multiply, then save.")).toBeDefined();
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+      });
+
+      it("folds commentary that follows the final answer", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "It is 391.", final: true, phase: "final_answer" },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Saved it.", final: true, phase: "commentary" },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getByText("It is 391.")).toBeDefined();
+        expect(screen.queryByText("Saved it.")).toBeNull();
+      });
+
+      it("falls back to the last message when no answer phase is reported", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Checking.", final: true, phase: "commentary" },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Still checking.", final: true, phase: "commentary" },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.queryByText("Checking.")).toBeNull();
+        expect(screen.getByText("Still checking.")).toBeDefined();
       });
 
       it("leaves a single-message turn and a live turn unfolded until it settles", () => {
@@ -958,23 +1014,27 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getByText("All done.")).toBeDefined();
       });
 
-      it("keeps a continued bubble's last message visible", () => {
-        // A later bubble may answer a wake or a question card, not this turn.
-        const items: RenderItem[] = [
-          { kind: "text", itemId: "m0", text: "Dispatching sub-agents.", final: true },
-          tool(1, "Agent"),
-          { kind: "text", itemId: "m1", text: "Here is the answer.", final: true },
-        ];
-        const inputs = { items, sessionStatus: "idle" as const, continued: true };
-        expect(rendersOnlyWorkedFold({ ...inputs, foldNarration: true })).toBe(false);
-        render(<BlockRenderer {...inputs} foldNarration />);
-        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
-        expect(screen.getByText("Here is the answer.")).toBeDefined();
-        expect(screen.queryByText("Dispatching sub-agents.")).toBeNull();
+      // The rule is decided per bubble, so a commentary-only bubble falls back too.
+      it.each([undefined, "commentary" as const])(
+        "keeps a continued bubble's last message visible (phase: %s)",
+        (phase) => {
+          // A later bubble may answer a wake or a question card, not this turn.
+          const items: RenderItem[] = [
+            { kind: "text", itemId: "m0", text: "Dispatching sub-agents.", final: true, phase },
+            tool(1, "Agent"),
+            { kind: "text", itemId: "m1", text: "Here is the answer.", final: true, phase },
+          ];
+          const inputs = { items, sessionStatus: "idle" as const, continued: true };
+          expect(rendersOnlyWorkedFold({ ...inputs, foldNarration: true })).toBe(false);
+          render(<BlockRenderer {...inputs} foldNarration />);
+          expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+          expect(screen.getByText("Here is the answer.")).toBeDefined();
+          expect(screen.queryByText("Dispatching sub-agents.")).toBeNull();
 
-        const textOnly = { ...inputs, items: [items[0]!, items[2]!] };
-        expect(rendersOnlyWorkedFold({ ...textOnly, foldNarration: true })).toBe(false);
-      });
+          const textOnly = { ...inputs, items: [items[0]!, items[2]!] };
+          expect(rendersOnlyWorkedFold({ ...textOnly, foldNarration: true })).toBe(false);
+        },
+      );
 
       it("keeps the last non-blank message as the answer", () => {
         const items: RenderItem[] = [
@@ -1158,9 +1218,9 @@ describe("BlockRenderer dispatch", () => {
         </FileViewerContext.Provider>,
       );
       // The dispatch card and both assistant messages stay visible.
-      expect(screen.getByText(/sys_session_send/)).toBeDefined();
+      expect(screen.getByText("Start child session:")).toBeDefined();
       expect(screen.getByText("Dispatching.")).toBeDefined();
-      expect(screen.queryByText(/tool_1/)).toBeNull();
+      expect(screen.queryByText("Tool 1")).toBeNull();
       expect(screen.getByText("Relayed.")).toBeDefined();
     });
 
@@ -1208,7 +1268,7 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
       expect(screen.getByText("Skill")).toBeDefined();
       expect(screen.getByText("dev-productivity:simplify")).toBeDefined();
-      expect(screen.queryByText(/tool_1/)).toBeNull();
+      expect(screen.queryByText("Tool 1")).toBeNull();
       expect(screen.getByText("Acknowledged.")).toBeDefined();
     });
 
@@ -1324,7 +1384,7 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
       expect(screen.getByText("Edit landed.")).toBeDefined();
       expect(screen.getByText("Editing the file.")).toBeDefined();
-      expect(screen.queryByText(/turn_diff/)).toBeNull();
+      expect(screen.queryByText("Turn diff")).toBeNull();
 
       // Expanding the Worked row reveals the trace; the diff sits in
       // the (still-collapsed) tool-run group alongside the shell call.
@@ -1332,7 +1392,7 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Editing the file.")).toBeDefined();
       const runLabel = screen.getByText("Ran 1 shell command, called 1 other tool");
       fireEvent.click(runLabel);
-      expect(screen.getByText(/turn_diff/)).toBeDefined();
+      expect(screen.getByText("Turn diff")).toBeDefined();
     });
 
     it("keeps narration visible when a continued turn yields to sub-agents", () => {

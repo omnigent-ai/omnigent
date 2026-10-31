@@ -28,6 +28,8 @@ const {
   getHostConnectionFast,
   probeServerAuth,
   localHostId,
+  readLocalHostId,
+  liveDaemonRecordFor,
 } = require("../src/omnigent_cli");
 
 describe("cliCommandParts", () => {
@@ -258,6 +260,29 @@ describe("parseJsonLoose", () => {
 });
 
 describe("matchesServer", () => {
+  for (const field of ["server_url", "target", "resolved_server_url"]) {
+    it(`matches loopback aliases in ${field} without matching a different port`, () => {
+      const record = { [field]: "http://localhost:6767" };
+      assert.equal(matchesServer(record, "http://127.0.0.1:6767"), true);
+      assert.equal(matchesServer(record, "http://127.0.0.1:6768"), false);
+    });
+  }
+  for (const [recordUrl, serverUrl, expected] of [
+    ["https://localhost", "http://127.0.0.1", false],
+    ["http://localhost:80", "https://127.0.0.1", false],
+    ["https://localhost:443", "http://[::1]", false],
+    ["http://localhost:6767", "http://127.0.0.1:6767", true],
+    ["http://localhost:80/app", "http://127.0.0.1/app", true],
+    ["https://localhost:443/app", "https://[::1]/app", true],
+    ["http://localhost:6767/app", "http://127.0.0.1:6767/other", false],
+    ["http://localhost:6767/app?a=1", "http://127.0.0.1:6767/app?a=2", false],
+    ["http://alice@localhost:6767", "http://bob@127.0.0.1:6767", false],
+    ["http://localhost:6767/#one", "http://127.0.0.1:6767/#two", false],
+  ]) {
+    it(`${recordUrl} ${expected ? "matches" : "does not match"} ${serverUrl}`, () => {
+      assert.equal(matchesServer({ server_url: recordUrl }, serverUrl), expected);
+    });
+  }
   it("matches on server_url or target, ignoring trailing slashes", () => {
     assert.equal(matchesServer({ server_url: "https://x.com/" }, "https://x.com"), true);
     assert.equal(matchesServer({ target: "https://x.com" }, "https://x.com/"), true);
@@ -498,6 +523,59 @@ describe("probeServerAuth — /v1/me auth gate", () => {
 
     assert.deepEqual(res, { authed: false, reachable: false });
     assert.equal(calls.length, 0);
+  });
+});
+
+describe("liveDaemonRecordFor", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("skips a dead matching record before a live record", async () => {
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    const records = [dead, process.pid].map((pid) => ({
+      pid,
+      target: "https://server.example",
+      mode: "server",
+      host_id: "local",
+    }));
+    mock.method(fs, "readdirSync", () => ["dead.json", "live.json"]);
+    mock.method(fs, "readFileSync", (filename) =>
+      JSON.stringify(records[filename.endsWith("dead.json") ? 0 : 1]),
+    );
+    assert.equal(liveDaemonRecordFor("https://server.example").pid, process.pid);
+    assert.equal(
+      (await getHostConnectionFast("https://server.example", { probe: false })).connected,
+      true,
+    );
+    assert.equal(liveDaemonRecordFor("https://different.example"), null);
+  });
+
+  it("matches a loopback alias through the parsed daemon record", () => {
+    const record = {
+      pid: process.pid,
+      target: "local",
+      mode: "local",
+      resolved_server_url: "http://127.0.0.1:6767",
+    };
+    mock.method(fs, "readdirSync", () => ["live.json"]);
+    mock.method(fs, "readFileSync", () => JSON.stringify(record));
+    assert.equal(liveDaemonRecordFor("http://localhost:6767").pid, process.pid);
+    assert.equal(liveDaemonRecordFor("http://localhost:6768"), null);
+  });
+});
+
+describe("readLocalHostId", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("follows config rewrites and normalizes the legacy prefix", () => {
+    let config = "host:\n  host_id: host_first\n";
+    mock.method(fs, "readFileSync", () => config);
+    assert.equal(readLocalHostId(), "first");
+    config = "host:\n  host_id: second\n";
+    assert.equal(readLocalHostId(), "second");
+    config = "{}";
+    assert.equal(readLocalHostId(), null);
+    config = "[bad yaml";
+    assert.equal(readLocalHostId(), null);
   });
 });
 

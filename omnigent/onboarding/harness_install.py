@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import NamedTuple
 
@@ -56,6 +57,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.inner import _proc
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -1108,12 +1110,124 @@ def harness_install_display(key: str) -> str:
     return " ".join(harness_install_command(key))
 
 
+# Lines of installer stderr kept for diagnosis. The output is teed straight to
+# this process as it arrives, so this buffer only has to be long enough to hold
+# npm's error block — not the whole install log, which must not grow the host
+# daemon's memory.
+_INSTALLER_STDERR_TAIL_LINES = 80
+
+# Grace for the tee thread to drain after the installer exits. Bounded so a
+# pipe that never reaches EOF cannot hang the install call.
+_INSTALLER_TEE_DRAIN_TIMEOUT_S = 5.0
+
+# npm's own machine-readable cause line: ``npm error code EACCES`` on npm 10+,
+# ``npm ERR! code EACCES`` on 9 and earlier. Matching the code rather than the
+# prose keeps this stable across npm majors.
+_NPM_ERROR_CODE_RE = re.compile(r"npm (?:error|ERR!)\s+code\s+([A-Z0-9_]+)")
+
+# npm cause code -> what the user can do about it. Deliberately small: these are
+# the failures a person can actually act on.
+_NPM_FAILURE_REASONS: dict[str, str] = {
+    "EACCES": "permission denied writing the global install directory",
+    "EPERM": "permission denied writing the global install directory",
+    "ECONNREFUSED": "could not reach the npm registry",
+    "ECONNRESET": "could not reach the npm registry",
+    "ENOTFOUND": "could not reach the npm registry",
+    "ETIMEDOUT": "could not reach the npm registry",
+    "EAI_AGAIN": "could not reach the npm registry (DNS lookup failed)",
+    "ENETUNREACH": "could not reach the npm registry (network unreachable)",
+    "E401": "the npm registry rejected the credentials",
+    "E403": "the npm registry refused access to the package",
+    "ENEEDAUTH": "the npm registry requires authentication",
+    "ENOSPC": "no space left on the device",
+}
+
+
+def _installer_failure_reason(returncode: int, stderr_tail: str) -> str:
+    """Name an install failure's cause, falling back to the exit code.
+
+    :param returncode: The installer's exit status.
+    :param stderr_tail: The tail of the installer's stderr, possibly empty.
+    :returns: A cause naming what the user can fix when the output identifies
+        one, else ``"installer exited with code <n>"``. The bare exit code is
+        the fallback rather than an error, because a vendor installer's output
+        is not npm-shaped and still has to produce *some* reason.
+    """
+    for code in _NPM_ERROR_CODE_RE.findall(stderr_tail):
+        explanation = _NPM_FAILURE_REASONS.get(code)
+        if explanation is not None:
+            return f"{explanation} (npm {code})"
+    return f"installer exited with code {returncode}"
+
+
+def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
+    """Run an installer, teeing its stderr so it is both shown and readable.
+
+    The installer's output has to keep streaming to this process — that is what
+    makes a failure visible in the setup terminal and the host log — but the
+    reason string also needs to read it. So stderr is piped and each line is
+    written straight through as it arrives, while a bounded tail is retained
+    for :func:`_installer_failure_reason`. stdout is left inheriting, untouched.
+
+    The tee thread owns the pipe and closes it at EOF. A child the installer
+    leaves running can hold the pipe open after the installer exits, so the
+    drain wait is bounded rather than closing the pipe here, which would block
+    until that child exits.
+
+    :param cmd: The installer argv, e.g. ``["npm", "install", "-g", pkg]``.
+    :param timeout: Seconds to wait before killing the installer.
+    :returns: ``(returncode, stderr_tail)``.
+    :raises subprocess.TimeoutExpired: If *timeout* elapses first; the
+        installer and its child processes are killed before this propagates.
+    :raises OSError: If the installer cannot be executed at all.
+    """
+    tail: deque[str] = deque(maxlen=_INSTALLER_STDERR_TAIL_LINES)
+    tail_lock = threading.Lock()
+    # Not _proc.spawn_kwargs(): a new session would cut the setup wizard's
+    # installers off from the terminal (prompts, /dev/tty, Ctrl-C).
+    proc = subprocess.Popen(
+        cmd,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        bufsize=1,
+    )
+    stream = proc.stderr
+    assert stream is not None  # stderr=PIPE above
+
+    def _tee() -> None:
+        with stream:
+            for line in stream:
+                with tail_lock:
+                    tail.append(line)
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+    # A reader thread, so a wedged installer still hits the timeout below
+    # instead of blocking forever on a read that never reaches EOF.
+    pump = threading.Thread(target=_tee, name="harness-install-stderr", daemon=True)
+    pump.start()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Killing only the installer would leave npm lifecycle scripts or the
+        # inner shell of ``curl | bash`` running and writing to the pipe.
+        _proc.kill_tree(proc)
+        proc.wait()
+        raise
+    finally:
+        pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
+    with tail_lock:
+        return returncode, "".join(tail)
+
+
 class HarnessInstallResult(NamedTuple):
     """Outcome of :func:`try_install_harness_cli`.
 
-    :param installed: Whether the CLI resolves after the attempt, via the same
-        :func:`resolve_cli_binary` ladder readiness uses (``PATH`` plus the
-        common global install dirs), not bare ``PATH`` alone.
+    :param installed: Whether the CLI is ready after the attempt by the same
+        :func:`harness_cli_installed` check readiness uses: it resolves via the
+        :func:`resolve_cli_binary` ladder (``PATH`` plus the common global
+        install dirs) and its version is in the supported range.
     :param reason: Human-readable failure reason when ``installed`` is False;
         ``None`` on success.
     """
@@ -1126,17 +1240,23 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     """Install the harness CLI, returning whether it landed and why not.
 
     Same behavior and side effects as :func:`install_harness_cli` (the
-    installer's output streams to this process, uncaptured, so failures stay
-    visible in the setup terminal / host log), but returns a human-readable
-    reason so a UI-driven install can surface "npm is not available on the
-    host" instead of a silent boolean failure.
+    installer's output still streams to this process, so failures stay visible
+    in the setup terminal / host log), but returns a human-readable reason so a
+    UI-driven install can surface "npm is not available on the host" instead of
+    a silent boolean failure.
+
+    A failing installer's stderr is teed rather than merely passed through, so
+    the reason can name what the user has to fix — a permission problem and an
+    unreachable registry are both exit code 1 and were previously reported
+    identically.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
-        resolves via :func:`resolve_cli_binary` (including the no-op where it
-        was already present), otherwise ``(False, reason)`` naming the failure
-        (manual-only spec, missing installer, timeout, OS error, non-zero exit,
-        or a post-install binary-not-found).
+        resolves via :func:`resolve_cli_binary` and passes its version range
+        (including the no-op where it was already present), otherwise
+        ``(False, reason)`` naming the failure (manual-only spec, missing
+        installer, timeout, OS error, a diagnosed or bare non-zero exit, a
+        post-install binary-not-found, or a CLI still outside its range).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
@@ -1147,7 +1267,7 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     if shutil.which(cmd[0]) is None:
         return HarnessInstallResult(False, f"{cmd[0]!r} is not available on the host")
     try:
-        result = subprocess.run(cmd, check=False, timeout=300)
+        returncode, stderr_tail = _run_installer(cmd, timeout=300)
     except subprocess.TimeoutExpired:
         return HarnessInstallResult(False, "install timed out after 300s")
     except OSError as exc:
@@ -1163,7 +1283,9 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
     # via the ladder — the spurious "failed" toast next to a green "ready" tick.
     resolved = resolve_cli_binary(spec.binary)
-    if resolved is not None:
+    # A failed upgrade leaves the outdated binary resolving, so success also needs
+    # the version check readiness applies.
+    if resolved is not None and harness_cli_installed(key):
         # Put the resolving dir on ``PATH`` for this process so the setup
         # wizard's *later* steps — harness_login / harness_cli_logged_in /
         # harness_logout — which shell out with the bare binary name and only
@@ -1175,22 +1297,29 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         if resolved_dir not in path_entries:
             os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
         return HarnessInstallResult(True, None)
-    if result.returncode != 0:
-        return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
+    if returncode != 0:
+        return HarnessInstallResult(False, _installer_failure_reason(returncode, stderr_tail))
+    if resolved is not None:
+        version, required = harness_cli_version(key)
+        found = f"{version} (requires {required})" if version and required else "unsupported"
+        return HarnessInstallResult(
+            False, f"installer completed but {spec.binary!r} is still {found}"
+        )
     return HarnessInstallResult(
         False, f"installer completed but {spec.binary!r} could not be found"
     )
 
 
 def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI; return whether it landed on ``PATH``.
+    """Install the harness CLI; return whether it is now ready to use.
 
     Thin wrapper over :func:`try_install_harness_cli` that discards the failure
     reason, preserving the boolean contract the setup wizard relies on.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: ``True`` when the CLI is on ``PATH`` after the install attempt,
-        ``False`` if the installer is missing or the install failed.
+    :returns: ``True`` when the CLI resolves and is version-compatible after
+        the install attempt, ``False`` if the installer is missing or the
+        install failed, including an upgrade that left the old version.
     :raises KeyError: If *key* has no install spec.
     """
     return try_install_harness_cli(key).installed
