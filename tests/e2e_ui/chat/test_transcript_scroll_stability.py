@@ -526,7 +526,8 @@ _STREAM_PROMPT = "Tell me a long story, streamed."
 # few seconds and the view has to keep up rather than jump once.
 _STREAM_CHUNK_DELAY_S = 0.03
 
-# Measure the newest text, not the scroll extent (which includes footer spacing).
+# Measure the newest text, not the scroll extent (which includes footer spacing),
+# in each frame as it paints: after layout and the transcript's own observers.
 _TRACK_NEWEST_TEXT = """
 () => {
   const el = document.querySelector('[data-pw-scroller]');
@@ -551,9 +552,14 @@ _TRACK_NEWEST_TEXT = """
       Math.max(0, line.bottom - viewport.bottom, viewport.top - line.top),
       el.scrollHeight,
       section.textContent.length,
+      Math.round(el.scrollHeight - el.clientHeight - el.scrollTop),
     ]);
   };
-  const tick = () => { setTimeout(sample, 0); requestAnimationFrame(tick); };
+  const tick = () => {
+    const observer = new ResizeObserver(() => { sample(); observer.disconnect(); });
+    observer.observe(el);
+    requestAnimationFrame(tick);
+  };
   requestAnimationFrame(tick);
 }
 """
@@ -605,18 +611,12 @@ def test_streaming_reply_keeps_newest_text_visible(
 
     # The final line is visible even if footer spacing extends below the viewport.
     assert samples[-1][1] <= 2, samples[-1]
-    # And followed the reply as it grew.
+    # And followed the reply in every frame: growth never painted before the
+    # scroll that follows it, which drops the transcript's end by a line.
     growing = [s for s in samples if s[2] > height_before]
     assert growing, samples[:3]
-    # A resize may precede its scroll correction by one frame. Count only
-    # intervals bounded by two clipped-text samples; a delayed first sample
-    # does not establish how long the view has been behind.
-    behind_ms = 0
-    longest_behind_ms = 0
-    for (t0, d0, _h0, _n0), (t1, d1, _h1, _n1) in pairwise(growing):
-        behind_ms = behind_ms + (t1 - t0) if d0 > 8 and d1 > 8 else 0
-        longest_behind_ms = max(longest_behind_ms, behind_ms)
-    assert longest_behind_ms <= 100, (longest_behind_ms, [s for s in growing if s[1] > 8][:20])
+    behind = [s for s in growing if s[4] > 2]
+    assert behind == [], (len(behind), len(growing), behind[:20])
 
 
 # --- Pinned at the bottom: a reply's completion keeps the reader at the end ---

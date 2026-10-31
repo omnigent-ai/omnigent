@@ -7,7 +7,7 @@ import { useChatStore } from "@/store/chatStore";
 import {
   HistoryAutoLoader,
   JumpToTopButton,
-  KeepBottomOnViewportResize,
+  KeepBottomOnResize,
   LatestTurnSpacer,
 } from "./ChatPage";
 
@@ -70,17 +70,19 @@ function setScrollMetrics(
   });
 }
 
-describe("KeepBottomOnViewportResize", () => {
+describe("KeepBottomOnResize", () => {
   let resize: (() => void) | null;
   let disconnectSpy = vi.fn<() => void>();
   let nextFrameId: number;
   let frames: Map<number, FrameRequestCallback>;
+  let observed: Element[];
 
   beforeEach(() => {
     resize = null;
     disconnectSpy.mockClear();
     nextFrameId = 1;
     frames = new Map();
+    observed = [];
     stickContext.scrollRef.current = null;
     stickContext.contentRef.current = null;
     stickContext.isAtBottom = false;
@@ -92,7 +94,9 @@ describe("KeepBottomOnViewportResize", () => {
       constructor(callback: ResizeObserverCallback) {
         resize = () => callback([], this as unknown as ResizeObserver);
       }
-      observe() {}
+      observe(target: Element) {
+        observed.push(target);
+      }
       disconnect() {
         disconnectSpy();
       }
@@ -145,7 +149,7 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.clientHeight = 650;
     act(() => resize?.());
@@ -160,7 +164,7 @@ describe("KeepBottomOnViewportResize", () => {
 
   it("leaves an escaped reader anchored by the browser", () => {
     const { metrics } = makeScrollRoot(800);
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.clientHeight = 650;
     act(() => resize?.());
@@ -175,7 +179,7 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = false;
     stickContext.state.escapedFromLock = true;
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.clientHeight = 650;
     act(() => resize?.());
@@ -190,7 +194,7 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.scrollTop = 1250;
     stickContext.state.isAtBottom = false;
@@ -207,16 +211,51 @@ describe("KeepBottomOnViewportResize", () => {
     expect(metrics.scrollTop).toBe(1250);
   });
 
-  it("ignores content-only resize notifications", () => {
-    const { metrics } = makeScrollRoot();
+  it("pins a following reader in the frame the transcript grows", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    const content = document.createElement("div");
+    stickContext.contentRef.current = content;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnResize />);
+    expect(observed).toEqual([scrollRoot, content]);
+
+    metrics.scrollHeight = 2021;
+    act(() => resize?.());
+
+    expect(metrics.scrollTop).toBe(1320);
+    expect(stickContext.scrollToBottom).toHaveBeenCalledWith("instant");
+  });
+
+  it("leaves transcript growth under an escaped reader alone", () => {
+    const { metrics } = makeScrollRoot(800);
     stickContext.isAtBottom = true;
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.scrollHeight = 2200;
     act(() => resize?.());
 
     expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
     expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(800);
+  });
+
+  it("leaves transcript growth to the library while the reader selects text in it", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    scrollRoot.textContent = "streamed reply";
+    document.body.append(scrollRoot);
+    document.getSelection()!.selectAllChildren(scrollRoot);
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnResize />);
+
+    metrics.scrollHeight = 2021;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(metrics.scrollTop).toBe(1300);
+    document.getSelection()!.removeAllRanges();
+    scrollRoot.remove();
   });
 
   it("disconnects the observer and cancels a queued follow-up frame", () => {
@@ -224,7 +263,7 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
-    const { unmount } = render(<KeepBottomOnViewportResize />);
+    const { unmount } = render(<KeepBottomOnResize />);
 
     metrics.clientHeight = 650;
     act(() => resize?.());

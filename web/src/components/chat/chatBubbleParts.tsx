@@ -1250,12 +1250,13 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   return null;
 }
 
-/** Keep bottom-locked readers pinned when the composer changes viewport height. */
-export function KeepBottomOnViewportResize() {
+/** Keep bottom-locked readers pinned when the viewport or the transcript changes height. */
+export function KeepBottomOnResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef?: React.RefObject<HTMLElement>;
   };
   const scrollRef = ctx.scrollRef;
+  const contentRef = ctx.contentRef;
   const state = ctx.state;
   const scrollToBottom = ctx.scrollToBottom;
 
@@ -1265,20 +1266,30 @@ export function KeepBottomOnViewportResize() {
     const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
     let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
     let clientHeight = el.clientHeight;
+    let scrollHeight = el.scrollHeight;
     let frame: number | null = null;
     const onScroll = () => {
       wasBottomLocked = isPhysicallyAtBottom();
     };
+    // The library holds a reader who is selecting text; leave that to it.
+    const isSelecting = () => {
+      const selection = document.getSelection();
+      if (!selection || selection.isCollapsed) return false;
+      const common = selection.getRangeAt(0).commonAncestorContainer;
+      return common.contains(el) || el.contains(common);
+    };
     const observer = new ResizeObserver(() => {
-      const nextHeight = el.clientHeight;
-      if (nextHeight === clientHeight) return;
-      clientHeight = nextHeight;
-      if (!wasBottomLocked) return;
+      const viewportResized = el.clientHeight !== clientHeight;
+      const contentGrew = el.scrollHeight > scrollHeight;
+      clientHeight = el.clientHeight;
+      scrollHeight = el.scrollHeight;
+      const following = state.isAtBottom && !state.escapedFromLock && !isSelecting();
+      if (!(viewportResized && wasBottomLocked) && !(contentGrew && following)) return;
       // Gecko delivers this callback before the frame paints, but the
       // library's scrollToBottom always lands a frame later (it defers
-      // through a rAF promise), so the shrink paints with the transcript
-      // shoved up before the follow-up pin snaps it back — a visible
-      // bounce on every wrapped composer line. Pin synchronously here
+      // through a rAF promise), so the resize paints with the transcript
+      // off its end before the follow-up pin snaps it back — a visible
+      // bounce on every wrapped composer or streamed line. Pin synchronously here
       // first; the async pins below stay as a safety net for engines that
       // deliver the callback after paint. Target the library's park
       // position (one pixel short) so the settle is identical whether our
@@ -1294,12 +1305,13 @@ export function KeepBottomOnViewportResize() {
     });
     el.addEventListener("scroll", onScroll, { passive: true });
     observer.observe(el);
+    if (contentRef.current) observer.observe(contentRef.current);
     return () => {
       el.removeEventListener("scroll", onScroll);
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [scrollRef, scrollToBottom, state]);
+  }, [scrollRef, contentRef, scrollToBottom, state]);
 
   return null;
 }
