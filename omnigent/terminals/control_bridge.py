@@ -32,7 +32,8 @@ Design notes learned from the protocol (see ``control_bridge`` spike):
 The browser-facing stream uses binary frames for raw pane bytes, text JSON
 frames for resize controls, and binary frames for input. A typed text JSON
 frame carries tmux clipboard updates because outer-client OSC 52 is absent from
-``%output``.
+``%output``. Another, sent first, lists the terminal queries tmux answers itself
+so the browser doesn't answer them a second time.
 
 Tmux's own overlays (``display-popup``, copy-mode, status line) are not delivered
 to control clients. The native cost-approval popup remains available to users
@@ -57,6 +58,7 @@ from typing import Final
 from fastapi import WebSocket, WebSocketDisconnect
 
 from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
+from omnigent.terminals.query_replies import tmux_answered_queries
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
@@ -666,6 +668,15 @@ async def bridge_tmux_control_to_websocket(
         with contextlib.suppress(*_WS_CLOSE_EXPECTED_ERRORS):
             await websocket.close(code=WS_CLOSE_INTERNAL_ERROR, reason="tmux not found")
         return
+
+    # The browser drops its reply to these queries, which tmux answers itself.
+    # Sent before any pane output so no query reaches the browser first, and
+    # probed before the capture so nothing slow sits between capture and attach.
+    tmux_answers = await tmux_answered_queries(tmux, {"TERM": _WEB_TERMINAL_TERM})
+    if tmux_answers is not None:
+        message = json.dumps({"type": "tmux-replies", "queries": sorted(tmux_answers)})
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+            await websocket.send_text(message)
 
     # Seed the browser terminal with the current screen BEFORE attaching so no
     # pre-attach content is missing. Failure is non-fatal — a live pane redraw

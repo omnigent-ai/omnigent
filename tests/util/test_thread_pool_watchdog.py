@@ -87,9 +87,11 @@ async def test_backed_up_pool_reports_where_workers_are_once_per_interval(pool_r
         assert row["event_name"] == "runner_thread_pool_backed_up"
         assert record.attributes["pid"] == os.getpid()
         assert record.attributes["workers"] == 1
+        assert record.attributes["thread_name_prefix"] == "runner"
         assert record.attributes["waited_s"] >= 0.3
         assert "in hold_worker x1" in record.attributes["worker_locations"]
         assert "in hold_worker x1" in message
+        assert "thread pool 'runner' backed up" in message
         assert "\n" not in message
         assert "Worker runner_0" in stack_trace
         assert "in hold_worker" in stack_trace

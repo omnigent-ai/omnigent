@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyPullRequestLabelChange,
   applyPullRequestReviewerChange,
+  computeLinkedPullRequestPollInterval,
   computePullRequestPollInterval,
   fetchPullRequestInfo,
   normalizePullRequestInfo,
@@ -304,6 +305,39 @@ describe("computePullRequestPollInterval", () => {
       );
     }
   });
+
+  it("does not poll for linked PRs before receiving metadata", () => {
+    expect(computeLinkedPullRequestPollInterval(undefined)).toBe(false);
+  });
+
+  it.each([
+    { states: [], selected: null, interval: false },
+    { states: ["MERGED", "closed"], selected: null, interval: false },
+    { states: [], selected: "MERGED", interval: false },
+    { states: ["OPEN"], selected: "CLOSED", interval: false },
+    { states: ["MERGED", "OPEN"], selected: null, interval: 30_000 },
+    { states: ["CLOSED", "UNKNOWN"], selected: null, interval: 30_000 },
+    { states: [null], selected: null, interval: 30_000 },
+    { states: [undefined], selected: null, interval: 30_000 },
+    { states: ["CLOSED"], selected: "UNKNOWN", interval: 30_000 },
+    { states: ["CLOSED", "OPEN"], selected: "MERGED", interval: 30_000 },
+  ])(
+    "linked polling for $states with selection $selected is $interval",
+    ({ states, selected, interval }) => {
+      const info = ready({
+        pr: selected ? { ...ready().pr!, url: "pr-0", state: selected } : null,
+        prs: states.map((state, index) => ({
+          url: `pr-${index}`,
+          host: "github.com",
+          repository: "org/repo",
+          number: index + 1,
+          relationship: "attached",
+          state,
+        })),
+      });
+      expect(computeLinkedPullRequestPollInterval(info)).toBe(interval);
+    },
+  );
 
   it("polls setup/availability states the user fixes outside the app", () => {
     // No info yet (initial error / transient failure with no cache).

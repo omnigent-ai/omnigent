@@ -1370,6 +1370,26 @@ def _pr_patch(root: str, reference: PullRequestRef | None) -> dict[str, Any]:
     return {"object": "session.github.pr_diff", "patch": out}
 
 
+def _pr_patch_at_revision(
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+) -> dict[str, Any]:
+    """Reject a patch if the PR moves before or during its fetch."""
+
+    def check_revision() -> None:
+        pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
+        if (
+            _api_string(pr, "head", "sha") != head_sha
+            or _api_string(pr, "base", "sha") != base_sha
+        ):
+            raise ValueError("The pull request changed; refresh before viewing its conversations.")
+
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        check_revision()
+        result = _pr_patch(root, reference)
+        check_revision()
+    return {**result, "head_sha": head_sha, "base_sha": base_sha}
+
+
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:
     if reference.host != "github.com":
         _, accounts = _list_accounts(root)
@@ -1947,22 +1967,44 @@ def _pr_json_write(
 
 def _create_comment(root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
     """Post once and return GitHub's canonical comment, without a follow-up read."""
-    uncertain = "Could not confirm comment posting. Check GitHub before retrying."
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
-        host = _host_args(root, reference)
-        token = _pr_token(root, reference)
-        if _gh_timed_out.get():
-            raise ValueError("GitHub authentication timed out. Your comment was not sent.")
-        rc, out, err = _pr_json_write(
+        result = _post_comment(
             root,
-            host=host,
-            token=token,
-            method="POST",
+            reference,
             endpoint=f"repos/{reference.repository}/issues/{reference.number}/comments",
-            fields={"body": body},
+            body=body,
         )
-        if _gh_timed_out.get():
-            raise ValueError(uncertain)
+    author = result.get("user")
+    return {
+        "object": "session.github.pr_comment",
+        "comment": {
+            "author": author.get("login") if isinstance(author, dict) else None,
+            "body": result.get("body") or "",
+            "created_at": result.get("created_at"),
+            "url": result["html_url"],
+        },
+    }
+
+
+def _post_comment(
+    root: str, reference: PullRequestRef, *, endpoint: str, body: str
+) -> dict[str, Any]:
+    """Publish once within the caller's deadline; preserve uncertainty after dispatch."""
+    uncertain = "Could not confirm comment posting. Check GitHub before retrying."
+    host = _host_args(root, reference)
+    token = _pr_token(root, reference)
+    if _gh_timed_out.get():
+        raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+    rc, out, err = _pr_json_write(
+        root,
+        host=host,
+        token=token,
+        method="POST",
+        endpoint=endpoint,
+        fields={"body": body},
+    )
+    if _gh_timed_out.get():
+        raise ValueError(uncertain)
     try:
         result = json.loads(out)
     except ValueError:
@@ -1975,16 +2017,7 @@ def _create_comment(root: str, reference: PullRequestRef, *, body: str) -> dict[
         raise ValueError(uncertain)
     if not result.get("id") or not isinstance(result.get("html_url"), str):
         raise ValueError(uncertain)
-    author = result.get("user")
-    return {
-        "object": "session.github.pr_comment",
-        "comment": {
-            "author": author.get("login") if isinstance(author, dict) else None,
-            "body": result.get("body") or "",
-            "created_at": result.get("created_at"),
-            "url": result["html_url"],
-        },
-    }
+    return result
 
 
 def _edit_details(

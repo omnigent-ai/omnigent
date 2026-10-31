@@ -65,9 +65,9 @@ export function ModelEffortFields({
   onSelectOpenChange?: (open: boolean) => void;
 }) {
   // When a host is pinned, use its live-resolved model options (mirrors the
-  // interactive dialog on a connected host). With no host pinned — the common
-  // case, since scheduled tasks resolve a host at fire time — fall back to the
-  // static Claude aliases so the picker is always populated.
+  // interactive dialog on a connected host). With no host pinned (an older
+  // task that resolves its host when it fires, or before one is picked), fall
+  // back to the static Claude aliases so the picker is always populated.
   const { data: hostModelOptions } = useHostModelOptions(
     hostId === "" ? null : hostId,
     "claude-native",

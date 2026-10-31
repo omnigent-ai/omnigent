@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
+import type { Editor } from "@tiptap/core";
 import type { Transaction } from "@tiptap/pm/state";
 import type { Node } from "@tiptap/pm/model";
 import type { Comment } from "@/hooks/useComments";
@@ -46,9 +47,11 @@ import {
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { applyExternalMarkdown } from "./TipTapEditorHelpers";
+import { rememberSourceBlocks } from "./markdownSourceBlocks";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
+  markdownKeepingSource,
 } from "./tiptapMarkdownPatches";
 
 // Minimal-escaping serialiser override (see tiptapMarkdownPatches.ts) —
@@ -61,11 +64,11 @@ installMarkdownSerializerPatch();
 // tiptapMarkdownPatches.ts).
 installMarkdownParserPatch();
 
-// TipTap drops a file's final newline, and the empty paragraph it appends after
-// a closing heading, code block or footnote list saves as blank lines. End the
-// file the way it was loaded: with one newline, or none.
-function readMarkdown(editor: { getMarkdown: () => string }, endsWithNewline: boolean): string {
-  const markdown = editor.getMarkdown().replace(/\n+$/, "");
+// Unedited blocks keep their source (markdownSourceBlocks.ts). TipTap drops the
+// final newline and saves its trailing empty paragraph as blank lines, so end
+// the file the way it was loaded: with one newline, or none.
+function readMarkdown(editor: Editor, endsWithNewline: boolean): string {
+  const markdown = markdownKeepingSource(editor).replace(/\n+$/, "");
   return endsWithNewline && markdown !== "" ? `${markdown}\n` : markdown;
 }
 
@@ -392,6 +395,7 @@ function MarkdownRichTextViewerInner({
       setDirty(!ed.state.doc.eq(baselineDocRef.current));
     },
     onCreate: ({ editor: ed }) => {
+      rememberSourceBlocks(ed, content);
       // Capture baseline after the initial content has been parsed.
       baselineRef.current = readMarkdown(ed, endsWithNewlineRef.current);
       baselineDocRef.current = ed.state.doc;
@@ -432,6 +436,7 @@ function MarkdownRichTextViewerInner({
       if (editor.isDestroyed) return;
       const savedScroll = scrollContainerRef.current?.scrollTop ?? 0;
       applyExternalMarkdown(editor, newContent);
+      rememberSourceBlocks(editor, newContent);
       endsWithNewlineRef.current = newContent.endsWith("\n");
       baselineRef.current = readMarkdown(editor, endsWithNewlineRef.current);
       baselineDocRef.current = editor.state.doc;

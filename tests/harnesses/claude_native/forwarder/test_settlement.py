@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,12 @@ from omnigent.harnesses.claude_native.bridge import (
     prepare_bridge_dir,
     record_hook_event,
 )
+from tests.harnesses.claude_native.forwarder.test_failure_telemetry import (
+    _append_transcript,
+    _poll_hooks,
+    _poll_transcript,
+)
+from tests.harnesses.claude_native.test_claude_native_bridge import _read_native_user
 
 
 @pytest.mark.asyncio
@@ -60,6 +67,7 @@ async def test_partial_transcript_tail_does_not_promote_pending_settle(
         seen_source_ids=("before-tail:0:message",),
         settled_response_id="older-turn",
         pending_settled_response_id="current-turn",
+        pending_settled_at=123.0,
     )
     forwarder._write_forward_state(bridge_dir, state)
     posted_items: list[dict[str, Any]] = []
@@ -101,6 +109,7 @@ async def test_partial_transcript_tail_does_not_promote_pending_settle(
             ),
         )
         assert dedupe.pending_settled_response_id == "current-turn"
+        assert dedupe.pending_settled_at == 123.0
         assert dedupe.settled_response_id == "older-turn"
         assert not posted_items
         with transcript_path.open("a", encoding="utf-8") as handle:
@@ -110,6 +119,7 @@ async def test_partial_transcript_tail_does_not_promote_pending_settle(
         assert completed.pending_settled_response_id == "current-turn"
         settled = await _poll(completed)
         assert settled.pending_settled_response_id is None
+        assert settled.pending_settled_at is None
         assert settled.settled_response_id == "current-turn"
         assert forwarder._read_forward_state(bridge_dir) == settled
 
@@ -177,19 +187,23 @@ def test_transcript_forward_state_persists_settled_response_id(tmp_path: Path) -
         current_response_id="resp_a",
         settled_response_id="resp_a",
         pending_settled_response_id="resp_b",
+        pending_settled_at=123.0,
     )
     forwarder._write_forward_state(bridge_dir, state)
     loaded = forwarder._read_forward_state(bridge_dir)
     assert loaded is not None
     assert loaded.settled_response_id == "resp_a"
     assert loaded.pending_settled_response_id == "resp_b"
+    assert loaded.pending_settled_at == 123.0
 
     raw = json.loads((bridge_dir / forwarder._FORWARDER_STATE_FILE).read_text("utf-8"))
     del raw["settled_response_id"]
+    del raw["pending_settled_at"]
     (bridge_dir / forwarder._FORWARDER_STATE_FILE).write_text(json.dumps(raw), "utf-8")
     legacy = forwarder._read_forward_state(bridge_dir)
     assert legacy is not None
     assert legacy.settled_response_id is None
+    assert legacy.pending_settled_at is None
 
 
 def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> None:
@@ -205,6 +219,7 @@ def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> Non
     transcript_path.write_text("", encoding="utf-8")
     dedupe = forwarder._ForwardDedupeState()
     dedupe.pending_settled_response_id = "resp_a"
+    dedupe.pending_settled_at = 123.0
     tail = ClaudeTranscriptItem(
         source_id="s1:0:message",
         item_type="message",
@@ -251,6 +266,7 @@ def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> Non
     )
     assert dedupe.settled_response_id == "resp_a"
     assert dedupe.pending_settled_response_id is None
+    assert dedupe.pending_settled_at is None
 
     # Idempotent once promoted.
     assert (
@@ -437,6 +453,91 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("after_stop", [False, True])
+async def test_peer_input_uses_stop_time_when_observed_on_later_polls(
+    tmp_path: Path, queued: bool, restart: bool, after_stop: bool
+) -> None:
+    """Only input timestamped after Stop opens a peer turn, including after restart."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    state = forwarder.TranscriptForwardState(
+        transcript_path, 0, byte_offset=0, current_response_id="previous"
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    requests: list[dict[str, Any]] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_request), base_url="http://test"
+    ) as client:
+        dedupe = forwarder._ForwardDedupeState()
+        record_hook_event(bridge_dir, {"hook_event_name": "Stop"})
+        await _poll_hooks(
+            client, bridge_dir, forwarder.HookForwardState(0, byte_offset=0), dedupe, "previous"
+        )
+        assert dedupe.pending_settled_response_id == "previous"
+        assert dedupe.settled_response_id is None
+        assert dedupe.pending_settled_at is not None
+        _read_native_user(
+            tmp_path,
+            '<agent-message from="reviewer">Done</agent-message>',
+            queued="task-notification" if queued else None,
+            timestamp=datetime.fromtimestamp(
+                dedupe.pending_settled_at + (1 if after_stop else -1), UTC
+            ).isoformat(),
+            isMeta=True,
+            origin={"kind": "peer", "handback": True, "senderTaskId": "agent-1"},
+        )
+        requests.clear()
+        if restart:
+            state = forwarder._read_forward_state(bridge_dir)
+            assert state is not None
+            assert state.pending_settled_at == dedupe.pending_settled_at
+            dedupe = forwarder._ForwardDedupeState()
+        if after_stop:
+            state = await _poll_transcript(client, bridge_dir, state, dedupe)
+            assert state.current_response_id != "previous"
+            if restart:
+                state = forwarder._read_forward_state(bridge_dir)
+                assert state is not None
+                dedupe = forwarder._ForwardDedupeState()
+        _append_transcript(
+            transcript_path,
+            {
+                "type": "assistant",
+                "uuid": "peer-reply",
+                "message": {"role": "assistant", "content": "Continuing."},
+            },
+        )
+        after_reply = await _poll_transcript(client, bridge_dir, state, dedupe)
+
+    assert [request["type"] for request in requests] == ["external_conversation_item"] * (
+        3 if after_stop else 2
+    )
+    items = [request["data"] for request in requests]
+    if after_stop:
+        marker = items.pop(0)
+        assert marker["item_data"]["is_meta"] is True
+        assert marker["item_data"]["content"] == [
+            {"type": "input_text", "text": "[System: Message from another session]"}
+        ]
+        assert marker["response_id"] == after_reply.current_response_id != "previous"
+    else:
+        assert after_reply.current_response_id == "previous"
+    hidden, reply = items
+    assert hidden["item_data"]["is_meta"] is True
+    assert hidden["subagent_return_id"] == "agent-1"
+    assert reply["item_data"]["content"] == [{"type": "output_text", "text": "Continuing."}]
+    assert reply["response_id"] == after_reply.current_response_id
+
+
+@pytest.mark.asyncio
 async def test_failed_settle_checkpoint_leaves_hook_available_for_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -490,3 +591,4 @@ async def test_failed_settle_checkpoint_leaves_hook_available_for_retry(
     loaded = forwarder._read_forward_state(bridge_dir)
     assert loaded is not None
     assert loaded.pending_settled_response_id == "resp_ended"
+    assert loaded.pending_settled_at is not None

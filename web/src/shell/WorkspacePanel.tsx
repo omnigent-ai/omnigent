@@ -32,6 +32,7 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   ALT_KEY,
   ARIA_MOD_KEY,
@@ -63,6 +64,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -1088,6 +1090,7 @@ function WorkspacePanelImpl({
   for (const tabId of sideChats.tabs) {
     chatTabLabels[tabId] = subagentTabLabels[tabId] ?? `Side chat ${++sideChatNumber}`;
   }
+  const railInertRef = useInertRef<HTMLElement>(inert ?? false);
   const selectedSideChat = sideChats.selected;
   const selectedSubagentId =
     selectedSideChat === null ? null : subagentSessionIdFromTab(selectedSideChat);
@@ -1430,8 +1433,8 @@ function WorkspacePanelImpl({
   const rail = (
     <aside
       aria-label="Workspace"
+      ref={railInertRef}
       aria-hidden={!open}
-      inert={inert}
       // The resize hook can starve the rail to width 0 while it stays mounted;
       // marking it collapsed keeps index.css's safe-area padding off it so a
       // zero-width rail can't paint a ghost bg-card strip on native shells.
@@ -1859,7 +1862,9 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : scopeView === "github" ? (
-            <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+            <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+              <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+            </RenderErrorBoundary>
           ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
               <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
