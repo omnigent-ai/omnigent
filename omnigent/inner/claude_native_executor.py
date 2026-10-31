@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import threading
 from collections.abc import AsyncIterator, Callable
 from functools import partial
@@ -14,6 +15,7 @@ from pathlib import Path
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
+    MANAGED_SANDBOX_SIGN_IN_REMEDY,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeMessageNotAccepted,
@@ -34,7 +36,9 @@ from omnigent.harnesses.claude_native.bridge import (
     read_launch_model,
     read_model_env,
     read_model_picker_values,
+    read_transcript_path,
 )
+from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -55,11 +59,29 @@ from omnigent.models.claude_model_vocabulary import claude_model_command_arg, no
 
 _logger = logging.getLogger(__name__)
 
+_AUTH_COMMAND_GUIDANCE = (
+    "Claude Code's sign-in runs in its own terminal, so /login and /logout do "
+    "nothing from the web chat. Run omni setup on the host to sign in again — "
+    "or to sign out — then retry."
+)
+_AUTH_COMMAND_GUIDANCE_MANAGED_SANDBOX = (
+    "Claude Code's sign-in runs in its own terminal, so /login and /logout do "
+    "nothing from the web chat. " + MANAGED_SANDBOX_SIGN_IN_REMEDY
+)
+
 # How long a turn waits for the person to answer a Claude question or permission
 # prompt that held its message before anything was typed. Inside the server's
 # 600 s pending-input lifetime, so a message still held at the end is reported.
 _ANSWER_HOLD_S = 8 * 60.0
 _ANSWER_POLL_S = 1.0
+
+# Below this much free space Claude Code fails to append its transcript
+# ("Transcript write failed (ENOSPC)"), so a message would run unseen by the web.
+_MIN_TRANSCRIPT_FREE_BYTES = 1024 * 1024
+_HOST_DISK_FULL_MESSAGE = (
+    "The host's disk is full, so Claude Code can't save this conversation and the "
+    "message was not sent."
+)
 
 
 class ClaudeNativeExecutor(Executor):
@@ -255,20 +277,28 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
         if is_auth_slash_command(text):
-            # Claude Code's sign-in flow is an interactive TUI handoff the
-            # bridge cannot drive, so /login is escaped into plain text and
-            # reaches the model as a prompt. An expired login answers it with
-            # "Login expired · Please run /login" — a loop. Point at the host
-            # command that does re-authenticate instead of typing anything.
-            # `omni setup` covers both directions: its harness menu signs in
-            # (`claude auth login --claudeai`) and signs out (`claude auth
-            # logout`), so one pointer serves /login and /logout alike.
+            # Claude Code's sign-in is an interactive TUI handoff the bridge
+            # cannot drive; typed as prose, /login only gets the same expired
+            # login answer back. Answer with a reachable remedy, typing nothing.
             yield ExecutorError(
                 message=(
-                    "Claude Code's sign-in runs in its own terminal, so /login and "
-                    "/logout do nothing from the web chat. Run omni setup on the host "
-                    "to sign in again — or to sign out — then retry."
+                    _AUTH_COMMAND_GUIDANCE_MANAGED_SANDBOX
+                    if in_managed_sandbox()
+                    else _AUTH_COMMAND_GUIDANCE
                 ),
+                undelivered=True,
+            )
+            return
+        if await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
+            _logger.warning(
+                "claude-native: host disk is full; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=_HOST_DISK_FULL_MESSAGE,
+                code="host_disk_full",
+                title="Host storage is full",
+                remediation="Free up disk space on the host, then send your message again.",
                 undelivered=True,
             )
             return
@@ -332,7 +362,9 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            # The pane is still alive here: this turn's error reports the close,
+            # so the runner must not also report the pane's exit as a failure.
+            cleanup_error = self._reap_failed_turn(expected_close=True)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -409,10 +441,10 @@ class ClaudeNativeExecutor(Executor):
             self._reap_failed_turn()
             raise
 
-    def _reap_failed_turn(self) -> str | None:
+    def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""
         try:
-            kill_session(self._bridge_dir, timeout_s=1.0)
+            kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
         except TmuxSessionNotAdvertised:
             _logger.debug(
                 "claude-native: timed-out session already disappeared",
@@ -571,6 +603,23 @@ def _session_is_active(bridge_dir: Path, request_session_id: str | None) -> bool
         return True
     active_session_id = read_active_session_id(bridge_dir)
     return active_session_id is None or active_session_id == request_session_id
+
+
+def _transcript_disk_full(bridge_dir: Path) -> bool:
+    """
+    Whether the filesystem holding Claude's transcript has no room left.
+
+    :param bridge_dir: Native bridge directory, which records the transcript path.
+    :returns: ``True`` when free space is below :data:`_MIN_TRANSCRIPT_FREE_BYTES`;
+        ``False`` when it is not, or the transcript is not known yet.
+    """
+    transcript_path = read_transcript_path(bridge_dir)
+    if transcript_path is None:
+        return False
+    try:
+        return shutil.disk_usage(transcript_path.parent).free < _MIN_TRANSCRIPT_FREE_BYTES
+    except OSError:
+        return False
 
 
 def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:

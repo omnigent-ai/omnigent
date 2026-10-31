@@ -455,7 +455,7 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     let eligible = true;
     const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };
     const { registry, fire, windowOpen, loaded } = makeEventCapturingRegistry({
-      isArcaAgentContext: (ctx) => eligible && ctx === context,
+      allowsLocalhost: (ctx) => eligible && ctx === context,
     });
     assert.equal(
       registry.openOrNavigate("arca", "http://localhost:5173", undefined, {
@@ -491,7 +491,7 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
 
   it("does not carry a previous Arca context into another navigation or registry", () => {
     const context = {};
-    const options = { isArcaAgentContext: (ctx) => ctx === context };
+    const options = { allowsLocalhost: (ctx) => ctx === context };
     const first = makeEventCapturingRegistry(options);
     const second = makeEventCapturingRegistry();
     assert.equal(
@@ -595,6 +595,35 @@ function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
 }
 
 describe("browserViewRegistry — network-layer agent guard (DNS + connected address)", () => {
+  it("scopes loopback document access to the eligible view, including frames", async () => {
+    const { registry, idOf, fire } = makeNetworkGuardRegistry({
+      allowsLocalhost: (context) => context?.hostIsThisMachine === true,
+    });
+    registry.openOrNavigate("local", "http://127.0.0.1:5173", undefined, {
+      agent: true,
+      agentContext: { hostIsThisMachine: true },
+    });
+    assert.equal(fire("will-redirect", "http://192.168.1.1").prevented, true);
+    registry.openOrNavigate("local", "https://example.com", undefined, {
+      agent: true,
+      agentContext: { hostIsThisMachine: true },
+    });
+    const frame = {
+      webContentsId: idOf("local"),
+      url: "http://127.0.0.1:5173",
+      resourceType: "subFrame",
+      ip: "127.0.0.1",
+    };
+    assert.equal(await registry.shouldCancelAgentRequest(frame), false);
+    assert.equal(await registry.shouldCancelAgentResponse(frame), false);
+    assert.equal(fire("will-frame-navigate", frame.url).prevented, false);
+    registry.openOrNavigate("remote", "https://example.com", undefined, { agent: true });
+    assert.equal(
+      await registry.shouldCancelAgentRequest({ ...frame, webContentsId: idOf("remote") }),
+      true,
+    );
+  });
+
   it("refuses an agent first hop to a name that resolves to loopback", async () => {
     const { registry, lookups } = makeNetworkGuardRegistry();
     const verdict = await registry.checkAgentNavigation("conv_1", "http://lvh.me:8899/", null);
@@ -700,7 +729,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
   it("keeps the Arca loopback exception for exact hosts but not DNS aliases", async () => {
     const context = { sourceHostId: "arca-host" };
     const { registry, idOf } = makeNetworkGuardRegistry({
-      isArcaAgentContext: (ctx) => ctx === context,
+      allowsLocalhost: (ctx) => ctx === context,
     });
     registry.openOrNavigate("arca", "http://localhost:5173/", undefined, {
       agent: true,
