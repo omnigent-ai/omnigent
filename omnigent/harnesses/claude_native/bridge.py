@@ -106,6 +106,11 @@ if TYPE_CHECKING:
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
+from omnigent.inner.terminal_lifecycle import (
+    TERMINAL_INSTANCE_ID_ENV,
+    TERMINAL_LAUNCH_ID_ENV,
+    TERMINAL_LAUNCH_SESSION_ID_ENV,
+)
 from omnigent.native import native_bridge_common, policy_allow_cache
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
@@ -241,6 +246,13 @@ _TOOL_RELAY_FILE = "tool_relay.json"
 # commands can discover the live relay without a JSON parser. Re-written
 # on every relay start, so hooks survive runner restarts (new port).
 _TOOL_RELAY_ENV_FILE = "tool_relay.env"
+# The terminal's launch ids, which hooks that post to the relay send as headers
+# because the runner records lifecycle evidence outside the terminal's environment.
+_TERMINAL_ENV_HEADERS = (
+    (TERMINAL_INSTANCE_ID_ENV, "X-Omnigent-Terminal-Instance-Id"),
+    (TERMINAL_LAUNCH_ID_ENV, "X-Omnigent-Terminal-Launch-Id"),
+    (TERMINAL_LAUNCH_SESSION_ID_ENV, "X-Omnigent-Terminal-Launch-Session-Id"),
+)
 _TMUX_FILE = "tmux.json"
 # Written into the pane's private dir just before Omnigent kills the pane, so the
 # runner reads the exit as Omnigent's own close rather than the terminal dying.
@@ -2354,6 +2366,38 @@ def _python_hook_command(parts: list[str]) -> str:
     return _pin_runner_tmpdir(shlex.join(parts))
 
 
+def _relay_hook_command(bridge_dir: Path, path: str, python_command: str) -> str:
+    """
+    Build a hook command that posts its payload to the runner's relay at *path*.
+
+    The runner does the hook's work and curl prints its answer, so no Python
+    process starts. When the relay may already have recorded the event (curl
+    sent the request, then got part of the answer, timed out, or lost the
+    connection: exit 18, 28, 52 or 56), the command exits rather than record it
+    twice. curl also exits 28 when the connection itself times out, so it
+    reports the request bytes it sent (``%{size_request}``), and a failure
+    before any were sent counts as a miss. Any other failure, a refusal from
+    the relay included, sends stdin to *python_command*, as do a missing
+    ``tool_relay.env`` and a host without curl.
+    """
+    from omnigent.native.tool_observer_hook import relay_curl
+
+    relay_env = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
+    headers = " ".join(f'-H "{header}: ${name}"' for name, header in _TERMINAL_ENV_HEADERS)
+    options = f"-sf -w '\\n%{{size_request}}' {headers}"
+    return (
+        "p=$(cat); "
+        f"if [ -r {relay_env} ] && command -v curl >/dev/null 2>&1; then . {relay_env}; "
+        "out=$(printf '%s' \"$p\" | "
+        + relay_curl(path, max_time=10, options=options)
+        # The last line of curl's output is the request size from -w.
+        + "); rc=$?; nl='\n'; sent=${out##*$nl}; out=${out%$nl*}; "
+        "case $rc in 0) printf '%s' \"$out\"; exit 0 ;; "
+        '18|28|52|56) [ "$sent" = 0 ] || exit 0 ;; esac; fi; '
+        f"printf '%s' \"$p\" | {python_command}"
+    )
+
+
 def build_hook_settings(
     bridge_dir: Path,
     *,
@@ -2441,8 +2485,14 @@ def build_hook_settings(
     # Claude owns command-hook stderr, so it does not reach the runner logs.
     # Persist it for the forwarder to relay with the Omnigent session id.
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
-    command = f"{_python_hook_command(command_parts)} 2>> {observer_stderr}"
+    python_command = f"{_python_hook_command(command_parts)} 2>> {observer_stderr}"
+    command = _relay_hook_command(bridge_dir, "/hook/claude/event", python_command)
     hook = {"type": "command", "command": command}
+    # Claude writes a turn's final message to the transcript while its Stop
+    # hooks run, and the forwarder ends the turn with the text forwarded so
+    # far. Python's start-up keeps that message ahead of the Stop record; a
+    # curl hook can beat it, and a native sub-agent's parent gets no output.
+    turn_end_hook = {"type": "command", "command": python_command}
     framework_context_parts = [
         python,
         "-I",
@@ -2452,9 +2502,14 @@ def build_hook_settings(
         "--bridge-dir",
         str(bridge_dir),
     ]
+    # Most prompts carry no framework context, so the shell answers those.
+    framework_context_file = shlex.quote(str(bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE))
     framework_context_hook = {
         "type": "command",
-        "command": f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}",
+        "command": (
+            f"if [ ! -e {framework_context_file} ]; then cat >/dev/null; exit 0; fi; "
+            f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}"
+        ),
     }
     session_start_hook = {
         "type": "command",
@@ -2477,8 +2532,8 @@ def build_hook_settings(
     hooks: dict[str, list[_JsonObject]] = {
         "SessionStart": [{"hooks": [session_start_hook]}],
         "SessionEnd": [{"hooks": [hook]}],
-        "Stop": [{"hooks": [hook]}],
-        "StopFailure": [{"hooks": [hook]}],
+        "Stop": [{"hooks": [turn_end_hook]}],
+        "StopFailure": [{"hooks": [turn_end_hook]}],
         # ``UserPromptSubmit`` is the symmetric counterpart to
         # ``Stop`` — fires when a new user prompt reaches Claude
         # (web-UI message via tmux send-keys, or direct keystrokes
@@ -7363,12 +7418,11 @@ def start_tool_relay(
         relay_info["session_id"] = session_id
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
     # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
-    env_path = bridge_dir / _TOOL_RELAY_ENV_FILE
-    env_path.write_text(
+    # Hooks source this file whenever they run, so it is replaced whole.
+    _write_private_file(
+        bridge_dir / _TOOL_RELAY_ENV_FILE,
         f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
-        encoding="utf-8",
     )
-    os.chmod(env_path, 0o600)
     relay = ClaudeNativeToolRelay(
         bridge_dir=bridge_dir,
         httpd=httpd,
@@ -7694,6 +7748,7 @@ def _tool_relay_handler_factory(
                 "/hook/claude/evaluate-policy",
                 "/hook/pi/extension-ui",
                 "/hook/observe-tool",
+                "/hook/claude/event",
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -7724,6 +7779,9 @@ def _tool_relay_handler_factory(
             if self.path == "/hook/claude/evaluate-policy":
                 self._handle_hook_evaluate(payload)
                 return
+            if self.path == "/hook/claude/event":
+                self._handle_claude_hook(payload)
+                return
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
                 return
@@ -7747,6 +7805,28 @@ def _tool_relay_handler_factory(
             with mutation:
                 result = _run_relay_tool(tool_executor, loop, name, arguments)
             self._send_json(result)
+
+        def _handle_claude_hook(self, payload: _JsonObject) -> None:
+            """Record one Claude hook event the way the Python hook does.
+
+            A SessionStart from ``/clear`` or ``/resume`` can rotate the
+            Omnigent session, which the Python hook does with the terminal's
+            credentials, so those answer 409 and the hook command runs it.
+            """
+            from omnigent.harnesses.claude_native.hook import record_hook_payload
+
+            if bridge_dir is None or (
+                payload.get("hook_event_name") == "SessionStart"
+                and payload.get("source") in ("clear", "resume")
+            ):
+                self.send_error(HTTPStatus.CONFLICT)
+                return
+            env = {name: self.headers.get(header, "") for name, header in _TERMINAL_ENV_HEADERS}
+            # Failures go where the Python hook's stderr goes, which the
+            # forwarder reports with the session id.
+            with (bridge_dir / OBSERVER_HOOK_STDERR_FILE).open("a", encoding="utf-8") as stderr:
+                output = record_hook_payload(bridge_dir, payload, env=env, diagnostics=stderr)
+            self._respond_hook_output(output)
 
         def _respond_hook_output(self, output: dict[str, object] | None) -> None:
             """Answer a hook-evaluate request with final hook output JSON.
@@ -10707,6 +10787,11 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
     :param payload: JSON-compatible object.
     :returns: None.
     """
+    _write_private_file(path, json.dumps(payload, separators=(",", ":")))
+
+
+def _write_private_file(path: Path, text: str) -> None:
+    """Atomically write *text* to *path* with owner-only permissions."""
     _ensure_secure_dir(path.parent)
     tmp_path: Path | None = None
     try:
@@ -10719,7 +10804,7 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
             delete=False,
         ) as handle:
             tmp_path = Path(handle.name)
-            handle.write(json.dumps(payload, separators=(",", ":")))
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_path, 0o600)
