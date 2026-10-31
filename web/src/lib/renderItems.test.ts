@@ -2425,6 +2425,28 @@ describe("buildBubbles — lifecycle from activeResponse", () => {
       },
     ]);
   });
+
+  it("carries a TextDone phase onto its text item", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "msg_commentary", responseId: "codex_turn_123" }),
+        fullText: "Checking the tests.",
+        hasCodeBlocks: false,
+        phase: "commentary",
+      },
+    ];
+    const a = buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(a.items).toEqual([
+      {
+        kind: "text",
+        itemId: "msg_commentary",
+        text: "Checking the tests.",
+        final: true,
+        phase: "commentary",
+      },
+    ]);
+  });
 });
 
 describe("buildBubbles — reasoning", () => {

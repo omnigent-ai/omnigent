@@ -4,8 +4,12 @@ import { startTransition, Suspense, useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  cancelHarnessLogin,
+  fetchHarnessLogin,
   installHarnessOnHost,
+  logoutHarnessOnHost,
   refreshHarnessAccountsOnHost,
+  startHarnessLogin,
   useDetectedCredentials,
   useHostModelOptions,
   useHosts,
@@ -66,6 +70,100 @@ describe("harness account routes", () => {
       "/v1/hosts/old-host/harnesses/accounts/refresh",
       "/v1/hosts/older-host/harnesses/accounts/refresh",
     ]);
+  });
+
+  it("uses encoded login, poll, cancel, and logout routes", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          login_id: "login/1",
+          verification_url: "https://auth.example.test/device",
+          user_code: "ABCD-EFGH",
+          expires_at: 1_798_761_600,
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ status: "pending", error: null, expired: false }))
+      .mockResolvedValueOnce(mockResponse({}, 204))
+      .mockResolvedValueOnce(mockResponse({ configured_harnesses: null, harness_accounts: null }));
+
+    await expect(startHarnessLogin("host/1", "codex-native")).resolves.toEqual({
+      kind: "started",
+      login_id: "login/1",
+      verification_url: "https://auth.example.test/device",
+      user_code: "ABCD-EFGH",
+      expires_at: 1_798_761_600,
+    });
+    await expect(fetchHarnessLogin("host/1", "codex-native", "login/1")).resolves.toEqual({
+      status: "pending",
+      error: null,
+      expired: false,
+    });
+    await cancelHarnessLogin("host/1", "codex-native", "login/1");
+    await expect(logoutHarnessOnHost("host/1", "codex-native")).resolves.toEqual({
+      configured_harnesses: null,
+      harness_accounts: null,
+    });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/hosts/host%2F1/harnesses/codex/login",
+      "/v1/hosts/host%2F1/harnesses/codex/login/login%2F1",
+      "/v1/hosts/host%2F1/harnesses/codex/login/login%2F1",
+      "/v1/hosts/host%2F1/harnesses/codex/logout",
+    ]);
+    expect(fetchMock.mock.calls.map(([, init]) => init.method ?? "GET")).toEqual([
+      "POST",
+      "GET",
+      "DELETE",
+      "POST",
+    ]);
+  });
+
+  it("preserves login_unsupported as an ApiError", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { code: "login_unsupported", message: "Update the host." } }, 409),
+    );
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toMatchObject({
+      status: 409,
+      code: "login_unsupported",
+      message: "Update the host.",
+    });
+  });
+
+  it("rejects a javascript verification URL", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        login_id: "login-1",
+        verification_url: "javascript:alert(1)",
+        user_code: "ABCD-EFGH",
+        expires_at: 1_798_761_600,
+      }),
+    );
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toThrow(
+      "invalid sign-in link",
+    );
+  });
+
+  it("uses the shared API error parser for non-string FastAPI detail", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ detail: [{ msg: "invalid" }] }, 422));
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toMatchObject({
+      status: 422,
+      message: "422 Error",
+    });
+  });
+
+  it.each([
+    { code: "login_busy", login_id: "busy/1" },
+    { error: { code: "login_busy", login_id: "busy/1" } },
+  ])("returns an active login id from a busy response", async (body) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(body, 409));
+
+    await expect(startHarnessLogin("host_1", "native-codex")).resolves.toEqual({
+      kind: "busy",
+      login_id: "busy/1",
+    });
   });
 });
 

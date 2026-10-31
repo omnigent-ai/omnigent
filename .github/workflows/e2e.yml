@@ -14,6 +14,10 @@ name: E2E Tests
 #                       ci.yml, with no fork-e2e/** mirror (#802 removed the
 #                       credential setup). The eight shard checks are required by
 #                       merge-ready.yml.
+#
+# Workers per shard: the dispatch input, else the E2E_PARALLELISM repository
+# variable, else 3. Set the variable to retune runs without a code change;
+# fork PRs never see repository variables and always use the default.
 
 on:
   schedule:
@@ -41,9 +45,9 @@ on:
   workflow_dispatch:
     inputs:
       parallelism:
-        description: "Number of pytest workers per shard (-n flag). Default 2 runs up to 16 workers across 8 shards."
+        description: "Number of pytest workers per shard (-n flag). Empty uses the E2E_PARALLELISM repository variable, else 3."
         required: false
-        default: "2"
+        default: ""
 
 concurrency:
   # PRs key by number, dispatch by branch (so re-runs cancel); schedule keys
@@ -86,7 +90,7 @@ jobs:
   setup:
     name: E2E coverage scope
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -118,12 +122,12 @@ jobs:
     # Sharded matrix: each shard runs ~1/N of the set, under the wallclock
     # budget where CrowdStrike kills long jobs (#426). max-parallel:8 runs
     # all shards concurrently so one wedged shard can't block the others.
-    # Two pytest workers per shard allow up to 16 concurrent test workers.
+    # Three pytest workers per shard allow up to 24 concurrent test workers.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
     # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Job-level cap (composite-action run steps can't set timeout-minutes):
     # ~30 min of tests + setup, replacing the old per-step 30-min backstop.
     timeout-minutes: 35
@@ -148,5 +152,5 @@ jobs:
         with:
           shard_id: ${{ matrix.shard_id }}
           num_shards: ${{ matrix.num_shards }}
-          parallelism: ${{ github.event.inputs.parallelism || '2' }}
+          parallelism: ${{ github.event.inputs.parallelism || vars.E2E_PARALLELISM || '3' }}
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
