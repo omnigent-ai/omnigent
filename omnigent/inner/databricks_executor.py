@@ -27,6 +27,7 @@ import time
 from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -864,7 +865,10 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
                 candidate = (
                     _sdk_config(profile=profile_name)
                     if source == "SDK"
-                    else _DatabricksCliProfileAuthConfig(profile=profile_name, host=host)
+                    else _DatabricksCliProfileAuthConfig(
+                        profile=profile_name,
+                        host=_databrickscfg_profile_host(config, profile_name) or host,
+                    )
                 )
                 candidate.authenticate()
             except Exception:  # noqa: BLE001 — try the next source or profile
@@ -1141,6 +1145,37 @@ def _host_match_key(host: str) -> str:
     :returns: The comparison key, e.g. ``"example.databricks.com"``.
     """
     return host.strip().rstrip("/").split("://", 1)[-1].lower()
+
+
+def _databrickscfg_profile_host(
+    config: configparser.ConfigParser | None, profile: str
+) -> str | None:
+    """The workspace URL *profile* configures, spelled as the SDK reports it.
+
+    A named section without its own ``host`` inherits ``[DEFAULT]``'s, as in
+    :func:`_databrickscfg_host_matches_and_sp_sections`. Like the SDK, it adds
+    ``https://`` when the scheme is missing and drops a trailing ``/`` and a
+    ``:443`` port, so a CLI mint reports the URL an SDK mint would.
+
+    :param config: A parse from :func:`_read_databrickscfg_no_inheritance`.
+    :param profile: Section name, e.g. ``"my-ws"``.
+    :returns: The URL, e.g. ``"https://example.databricks.com"``, or ``None``
+        when the profile names no usable host.
+    """
+    if config is None or not config.has_section(profile):
+        return None
+    default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
+    host = config[profile].get("host", default_host).strip()
+    if not host:
+        return None
+    if "://" not in host:
+        host = f"https://{host}"
+    parts = urlsplit(host)
+    try:
+        netloc = parts.netloc.rsplit(":", 1)[0] if parts.port == 443 else parts.netloc
+    except ValueError:
+        return None
+    return urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), parts.query, parts.fragment))
 
 
 def _databrickscfg_host_matches_and_sp_sections(

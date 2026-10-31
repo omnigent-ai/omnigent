@@ -1944,6 +1944,29 @@ def test_resolve_auth_for_host_mints_cli_profiles_without_the_sdk(
     assert attempts == [("cli", "ws")]
 
 
+def test_cli_mint_reports_the_host_the_profile_configures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CLI mint returns the workspace URL an SDK mint would, not the caller's spelling."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[ws]\nhost = HTTPS://Example.databricks.com/\nauth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    attempts = _fake_profile_sources(monkeypatch, stale=set(), sdk_tokens={})
+
+    _auth, host = databricks_executor._resolve_databricks_auth(
+        host="https://example.databricks.com"
+    )
+
+    assert attempts == [("cli", "ws")]
+    assert host == "https://Example.databricks.com"
+
+
 def test_resolve_auth_for_host_tries_the_remembered_profile_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
