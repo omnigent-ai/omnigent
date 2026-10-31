@@ -63,8 +63,7 @@ def test_no_block_or_no_allowlist_key_allows_everything() -> None:
 def test_an_empty_allowlist_key_refuses_every_source(
     empty: object, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # `allowed_sources:` with nothing under it parses as null: it used to mean
-    # "any repository", the opposite of what writing the key asks for.
+    # `allowed_sources:` with nothing under it parses as null; it fails closed.
     with caplog.at_level(logging.WARNING):
         policy = SkillsMarketplacePolicy.from_config({"allowed_sources": empty})
     assert policy.allowed_sources == ()
@@ -168,8 +167,7 @@ def test_repository_key_and_configured_sources() -> None:
 
 
 def test_sources_keep_their_directory_and_accept_the_allowed_sources_form() -> None:
-    # host/owner/repo used to parse as owner "github.com", repo "acme", so the
-    # seeded source pointed at a repository that does not exist.
+    # host/owner/repo names owner and repo after the host, not the host as owner.
     policy = SkillsMarketplacePolicy.from_config(
         {
             "sources": [

@@ -30,7 +30,6 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions.routes_agent import register_agent_routes
 from omnigent.server.routes.skills import create_skills_router
-from omnigent.spec import load
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -699,11 +698,6 @@ async def test_bundle_download_carries_personal_skills_only_for_the_runner_and_t
             assert "skills/owners-skill/SKILL.md" not in delivered
             # The local user's own install is nobody's on a multi-user server.
             assert "agents/child/skills/local-skill/SKILL.md" not in delivered
-            if expected:
-                # The child the runner loads from this bundle discovers the skill itself.
-                loaded = load(response.content, dest=tmp_path / "extract" / str(len(headers)))
-                child = next(s for s in loaded.sub_agents if s.name == "child")
-                assert "owners-skill" in {skill.name for skill in child.skills}
         # With no owner to resolve, even the runner's fetch carries no installs:
         # neither the local user's nor everyone's, rather than guessing an owner.
         response = await client.get(

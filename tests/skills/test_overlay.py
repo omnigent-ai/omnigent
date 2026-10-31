@@ -14,16 +14,7 @@ from omnigent.skills.overlay import (
     overlay_skills,
     validate_skill_tarball,
 )
-
-
-def _tar(files: dict[str, bytes]) -> bytes:
-    out = io.BytesIO()
-    with tarfile.open(fileobj=out, mode="w:gz") as tf:
-        for name, data in files.items():
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            tf.addfile(info, io.BytesIO(data))
-    return out.getvalue()
+from tests._helpers.skill_repos import skill_tarball
 
 
 def _names(data: bytes) -> list[str]:
@@ -31,8 +22,10 @@ def _names(data: bytes) -> list[str]:
         return sorted(tf.getnames())
 
 
-BUNDLE = _tar({"config.yaml": b"name: a\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"})
-SKILL = _tar({"SKILL.md": b"---\nname: review\n---\n", "notes.txt": b"n"})
+BUNDLE = skill_tarball(
+    {"config.yaml": b"name: a\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"}
+)
+SKILL = skill_tarball({"SKILL.md": b"---\nname: review\n---\n", "notes.txt": b"n"})
 
 
 def test_overlay_adds_skills_under_the_bundle_skills_dir() -> None:
@@ -69,7 +62,7 @@ def test_unsafe_or_incomplete_skill_tarballs_are_rejected(
     files: dict[str, bytes], reason: str
 ) -> None:
     with pytest.raises(SkillTarballError, match=reason):
-        validate_skill_tarball(_tar(files))
+        validate_skill_tarball(skill_tarball(files))
 
 
 def test_a_link_in_a_skill_tarball_is_rejected() -> None:
@@ -89,7 +82,7 @@ def test_a_link_in_a_skill_tarball_is_rejected() -> None:
 def test_namespaced_and_reserved_names_keep_bundle_precedence(tmp_path: Path) -> None:
     # A bundle skill two levels down is still ``triage``; the parsed spec's
     # canonical names (``code-review`` for a legacy ``Code_Review`` dir) win too.
-    bundle = _tar(
+    bundle = skill_tarball(
         {
             "config.yaml": b"name: a\n",
             "skills/team/triage/SKILL.md": b"---\nname: triage\ndescription: t\n---\n",
@@ -97,7 +90,7 @@ def test_namespaced_and_reserved_names_keep_bundle_precedence(tmp_path: Path) ->
         }
     )
     assert bundle_skill_names(bundle) == {"triage", "Code_Review"}
-    skill = _tar({"SKILL.md": b"---\nname: x\ndescription: d\n---\n", "notes.txt": b"n"})
+    skill = skill_tarball({"SKILL.md": b"---\nname: x\ndescription: d\n---\n", "notes.txt": b"n"})
     merged = overlay_skills(
         bundle,
         # "team" is the bundle's namespace folder, not a skill of its own.
@@ -136,7 +129,7 @@ def test_overlay_bytes_do_not_depend_on_the_clock(monkeypatch: pytest.MonkeyPatc
 
 def test_overlay_targets_a_child_agents_directory() -> None:
     # A session running a child reads skills from agents/<dir>/skills, not the root.
-    bundle = _tar(
+    bundle = skill_tarball(
         {
             "config.yaml": b"name: a\n",
             "agents/child/config.yaml": b"name: child\n",
@@ -161,4 +154,4 @@ def test_only_the_root_skill_md_is_the_manifest() -> None:
     assert is_root_manifest("SKILL.md") and is_root_manifest("./SKILL.md")
     assert not is_root_manifest(".SKILL.md") and not is_root_manifest("docs/SKILL.md")
     with pytest.raises(SkillTarballError, match=r"no SKILL\.md at its root"):
-        validate_skill_tarball(_tar({".SKILL.md": b"decoy"}))
+        validate_skill_tarball(skill_tarball({".SKILL.md": b"decoy"}))
