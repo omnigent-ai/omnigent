@@ -1960,3 +1960,43 @@ def test_missing_harness_cli_flags_outdated_version(
     spec = hi.missing_harness_cli("opencode-native")
     assert spec is not None
     assert spec.binary == "opencode"
+
+
+def test_missing_harness_cli_passes_when_version_probe_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present CLI whose ``--version`` probe times out is not reported missing.
+
+    On a CPU-starved host a large single-binary CLI (kimi is a Node SEA) can
+    take longer than the probe budget just to print its version. That proves
+    nothing about whether the harness can boot, so the dispatch / launch
+    preflight must let it through rather than tell the orchestrator the CLI is
+    "missing or outdated" and have it write the harness off for the run.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(argv, k.get("timeout", 0))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.missing_harness_cli("kimi-native") is None
+    # The setup / readiness verdict stays conservative: unverified != installed.
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is False
+
+
+def test_missing_harness_cli_flags_failing_version_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``--version`` probe that exits non-zero still blocks dispatch.
+
+    Only a timeout is inconclusive; a CLI that runs and fails is broken here.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    spec = hi.missing_harness_cli("kimi-native")
+    assert spec is not None
+    assert spec.binary == "kimi"
