@@ -1339,3 +1339,42 @@ async def test_source_and_policy_changes_reach_a_warm_sessions_next_turn(
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client,
     ):
         assert await turn(client) != readded
+
+
+def test_a_skills_filter_selects_an_install_by_its_label_too(db_uri: str, tmp_path: Path) -> None:
+    # Host skills match a skills: list by command or frontmatter label; installs
+    # follow the same contract, so a list written with the label keeps them.
+    from omnigent.server.skill_injection import SessionTarget
+    from omnigent.spec.types import AgentSpec
+
+    store = SqlAlchemySkillStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    for name, label in (("review", "Code Review"), ("triage", None)):
+        artifacts.put(
+            f"skills/{name}.tar.gz",
+            skill_tarball({"SKILL.md": f"---\nname: {name}\ndescription: d\n---\n".encode()}),
+        )
+        store.install(
+            name=name,
+            display_name=label,
+            description="d",
+            source_url=REPO_URL,
+            ref=None,
+            commit=None,
+            path=f"skills/{name}",
+            scope="user",
+            owner_user_id="alice",
+            bundle_location=f"skills/{name}.tar.gz",
+            bundle_bytes=1,
+            installed_by="alice",
+        )
+    spec = AgentSpec(spec_version=1, name="a", skills_filter=["Code Review"])
+    merged = with_installed_skills(
+        skill_tarball({"config.yaml": b"name: a\n"}),
+        owner_id="alice",
+        skill_store=store,
+        artifact_store=artifacts,
+        target=SessionTarget(spec, ""),
+    )
+    names = _names(merged)
+    assert "skills/review/SKILL.md" in names and "skills/triage/SKILL.md" not in names
