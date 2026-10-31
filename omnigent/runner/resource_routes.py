@@ -1199,16 +1199,35 @@ def register_resource_routes(
             },
         )
 
+    async def _changes_registry(
+        session_id: str, environment_id: str, agent_spec: AgentSpec | None
+    ) -> FilesystemRegistry | None:
+        from omnigent.runtime.filesystem_registry import MultiRepositoryFilesystemRegistry
+
+        if environment_id != DEFAULT_ENVIRONMENT_ID:
+            try:
+                resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.NOT_FOUND) from exc
+        registry = await _resolve_session_fs_registry(session_id)
+        if isinstance(registry, MultiRepositoryFilesystemRegistry):
+            return registry.with_git_runner(
+                lambda argv, cwd, timeout: resource_registry.resolve_environment(
+                    session_id, environment_id, agent_spec
+                ).run_git(argv, cwd, timeout)
+            )
+        return registry
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
     async def list_filesystem_changes(
         session_id: str,
-        environment_id: str,  # noqa: ARG001
+        environment_id: str,
     ) -> JSONResponse:
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
-        await _require_os_env(session_id)
+        agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
         try:
             # git status can take seconds; keep it off the loop (relay probes)
             # and off the default pool (native message delivery).
@@ -1236,6 +1255,9 @@ def register_resource_routes(
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                **(
+                    {"repository_root": rec["repository_root"]} if "repository_root" in rec else {}
+                ),
             }
             for rec in raw_changes
         ]
@@ -1255,7 +1277,7 @@ def register_resource_routes(
     ) -> JSONResponse:
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
 
         from omnigent.entities.environment_filesystem import InvalidPath
         from omnigent.runner.environment_filesystem import _validate_path
@@ -1293,6 +1315,11 @@ def register_resource_routes(
                 if session_registry is not None
                 else None
             )
+            before = (
+                await run_slow_io(session_registry.get_baseline, relative_path)
+                if session_registry is not None and record is not None
+                else None
+            )
         except GitStatusUnavailable as exc:
             return JSONResponse(
                 status_code=500,
@@ -1312,12 +1339,6 @@ def register_resource_routes(
                 },
             )
         is_deleted = record.get("status") == "deleted"
-
-        before: str | None = (
-            await run_slow_io(session_registry.get_baseline, relative_path)
-            if session_registry is not None
-            else None
-        )
 
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
