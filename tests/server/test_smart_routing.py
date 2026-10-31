@@ -388,6 +388,31 @@ async def test_llm_routing_client_clamps_hallucinated_model() -> None:
     assert result.model == models[0]  # clamped to cheapest
 
 
+# A judge whose classification and model field disagree is applied by its
+# classification: the rubric defines each class by list position.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict_model", "rationale", "expect_model"),
+    [
+        ("sonnet", "This is a COMPLEX task (setup); selected most capable model opus.", "opus"),
+        ("sonnet", "This is a SIMPLE task (greeting); selected cheapest model haiku.", "haiku"),
+        ("haiku", "This is a MODERATE task (one file); selected mid-range model.", "sonnet"),
+        ("sonnet", "This is a MODERATE task (one file); selected mid-range model.", "sonnet"),
+        ("opus", "This is a COMPLEX task (refactor); selected most capable model opus.", "opus"),
+        ("sonnet", "no classification given", "sonnet"),
+    ],
+)
+async def test_llm_routing_client_applies_the_stated_tier(
+    verdict_model: str, rationale: str, expect_model: str
+) -> None:
+    verdict = {"harness": "claude-native", "model": verdict_model, "rationale": rationale}
+    client = LLMRoutingClient(_FakeLLMClient(verdict))
+    result = await client.route("task", {"claude-native": ["haiku", "sonnet", "opus"]})
+    assert result is not None
+    assert result.model == expect_model
+    assert result.rationale == rationale
+
+
 @pytest.mark.asyncio
 async def test_llm_routing_client_rejects_empty_model() -> None:
     verdict = {"harness": "claude-sdk", "model": "", "rationale": "x"}
@@ -3525,3 +3550,185 @@ async def test_a_runner_rebind_invalidates_the_routing_catalog() -> None:
     await fetch_runner_models("conv_overlay", client)
 
     assert client.get.call_count == 2
+
+
+# ── HostRoutingClient (routing.provider: host) ─────────────────────
+
+_HOST_MENU = {"claude-native": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"]}
+
+
+def _host_runner(handler: Any) -> Any:  # type: ignore[explicit-any]
+    """A runner client whose ``routing-judge`` (and ``models``) answers come from *handler*."""
+    import httpx
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://runner")
+
+
+def _judged(text: str) -> Any:  # type: ignore[explicit-any]
+    import httpx
+
+    return httpx.Response(200, json={"status": "judged", "text": text})
+
+
+@pytest.mark.asyncio
+async def test_host_judge_asks_the_bound_runner_with_the_shared_rubric() -> None:
+    from omnigent.server.smart_routing import HostRoutingClient, judge_runner
+
+    seen: list[Any] = []
+
+    def handler(request: Any) -> Any:  # type: ignore[explicit-any]
+        seen.append((request.url.path, json.loads(request.content)))
+        # A CLI may fence its JSON; the verdict inside it is what counts.
+        return _judged(
+            '```json\n{"harness": "claude-native", "model": "claude-opus-4-8",'
+            ' "rationale": "COMPLEX"}\n```'
+        )
+
+    client = HostRoutingClient()
+    async with _host_runner(handler) as runner:
+        with judge_runner("conv_host", runner):
+            result = await client.route("redesign the persistence layer", _HOST_MENU)
+
+    assert result == RoutingResult(
+        model="claude-opus-4-8", rationale="COMPLEX", harness="claude-native"
+    )
+    assert client.last_error is None
+    [(path, body)] = seen
+    assert path == "/v1/sessions/conv_host/routing-judge"
+    assert body["message"] == "redesign the persistence layer"
+    assert body["instructions"] == _build_rubric(_HOST_MENU)
+
+
+@pytest.mark.asyncio
+async def test_host_judge_clamps_a_hallucinated_model_like_the_llm_judge() -> None:
+    from omnigent.server.smart_routing import HostRoutingClient, judge_runner
+
+    client = HostRoutingClient()
+    async with _host_runner(
+        lambda _r: _judged('{"harness": "x", "model": "claude-ultra", "rationale": "r"}')
+    ) as runner:
+        with judge_runner("conv_host_clamp", runner):
+            result = await client.route("task", _HOST_MENU)
+    assert result is not None
+    assert (result.model, result.harness) == ("claude-haiku-4-5", "claude-native")
+
+
+@pytest.mark.asyncio
+async def test_host_judge_declines_without_a_bound_runner() -> None:
+    """A create routes before its runner exists: decline, the first-turn hook routes."""
+    from omnigent.server.smart_routing import HostRoutingClient
+
+    client = HostRoutingClient()
+    assert await client.route("task", _HOST_MENU) is None
+    assert client.last_error is not None
+    assert "first turn" in client.last_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expect_error"),
+    [
+        # The session's harness has no host CLI judge (e.g. pi).
+        (200, {"status": "unsupported", "text": None}, "no host judge"),
+        # CLI missing, not logged in, or nonzero exit: the runner says so generically.
+        (502, {"error": "routing_judge_failed"}, "502"),
+        # An older runner that predates the endpoint.
+        (404, {"detail": "Not Found"}, "404"),
+        # Prose instead of a verdict.
+        (200, {"status": "judged", "text": "I think haiku"}, "no JSON object"),
+    ],
+)
+async def test_host_judge_fails_open(status: int, body: dict[str, Any], expect_error: str) -> None:
+    import httpx
+
+    from omnigent.server.smart_routing import HostRoutingClient, judge_runner
+
+    client = HostRoutingClient()
+    async with _host_runner(lambda _r: httpx.Response(status, json=body)) as runner:
+        with judge_runner("conv_host_fail", runner):
+            assert await client.route("task", _HOST_MENU) is None
+    assert client.last_error is not None
+    assert expect_error in client.last_error
+
+
+@pytest.mark.asyncio
+async def test_host_judge_fails_open_within_the_routing_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import time
+
+    import httpx
+
+    from omnigent.server.smart_routing import HostRoutingClient, judge_runner
+
+    monkeypatch.setattr("omnigent.server.smart_routing.ROUTING_REQUEST_TIMEOUT_S", 0.2)
+
+    async def handler(_request: Any) -> Any:  # type: ignore[explicit-any]
+        await asyncio.sleep(60)
+        return _judged("{}")
+
+    client = HostRoutingClient()
+    started = time.monotonic()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as runner:
+        with judge_runner("conv_host_slow", runner):
+            assert await client.route("task", _HOST_MENU) is None
+    assert time.monotonic() - started < 30
+    assert client.last_error is not None
+
+
+@pytest.mark.asyncio
+async def test_route_turn_binds_the_sessions_runner_as_the_host_judge() -> None:
+    """The first-turn path hands the host judge the runner it already holds."""
+    from omnigent.server.smart_routing import HostRoutingClient
+
+    def handler(request: Any) -> Any:  # type: ignore[explicit-any]
+        import httpx
+
+        if request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={
+                    "workers": {
+                        "self": {"models": [{"id": m} for m in _HOST_MENU["claude-native"]]}
+                    }
+                },
+            )
+        assert request.url.path == "/v1/sessions/conv_host_turn/routing-judge"
+        return _judged(
+            '{"harness": "claude-native", "model": "claude-sonnet-4-6", "rationale": "MODERATE"}'
+        )
+
+    caps = FakeCaps(routing_client=HostRoutingClient())
+    async with _host_runner(handler) as runner:
+        with patch("omnigent.runtime._globals._caps", new=caps):
+            model, verdict = await route_turn(
+                "claude-native",
+                "fix the login error and add a test",
+                session_id="conv_host_turn",
+                runner_client=runner,
+                gateway_backed=False,
+                allow_static_fallback=False,
+            )
+    assert model == "claude-sonnet-4-6"
+    assert verdict is not None
+    assert verdict["router_source"] == "oss-llm"
+
+
+def test_routing_provider_host_builds_only_the_host_judge() -> None:
+    """``provider: host`` needs no ``llm:`` block and reports the built-in source."""
+    from omnigent.cli import _build_routing_backends, parse_routing_settings
+    from omnigent.server.routing_backend import routing_sources
+    from omnigent.server.smart_routing import HostRoutingClient
+
+    cfg = {"routing": {"provider": "host"}}
+    backends = _build_routing_backends(cfg, None, parse_routing_settings(cfg["routing"]))
+
+    assert backends.external is None
+    assert isinstance(backends.local, HostRoutingClient)
+    assert routing_sources(FakeCaps(routing_backends=backends)) == {
+        "external": False,
+        "oss": True,
+    }
