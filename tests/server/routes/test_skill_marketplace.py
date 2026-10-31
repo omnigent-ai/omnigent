@@ -739,6 +739,53 @@ async def test_a_fetch_in_flight_refuses_a_second_from_the_same_account(market) 
     assert (await first).status_code == 201
 
 
+@pytest.mark.asyncio
+async def test_an_over_long_or_empty_name_is_refused_as_bad_input(market) -> None:
+    # An over-long name reached the store unchecked and answered 500.
+    client, _app, _ = market
+    for name in ("a" * 65, ""):
+        refused = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": [name]}
+        )
+        assert refused.status_code == 422, refused.text
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_request_keeps_its_fetch_slot_until_the_clone_ends(market) -> None:
+    import threading
+
+    # The clone runs in a thread a cancelled request cannot stop; releasing the
+    # slot on cancel let an account start clone after clone behind the cap.
+    client, app, _ = market
+    entered = threading.Event()
+    finish = threading.Event()
+    real_package = app.state.skill_fetcher.package
+
+    def slow_package(*args, **kwargs):  # type: ignore[no-untyped-def]
+        entered.set()
+        assert finish.wait(timeout=10)
+        return real_package(*args, **kwargs)
+
+    app.state.skill_fetcher.package = slow_package
+    body = {"source": "acme/skills", "names": ["review"]}
+    abandoned = asyncio.create_task(client.post("/v1/installed-skills", json=body))
+    assert await asyncio.to_thread(entered.wait, 5)
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+    # The clone is still running, so the account's next fetch is refused.
+    again = await client.post("/v1/installed-skills", json=body)
+    assert again.status_code == 409 and "still running" in again.text
+    finish.set()
+    app.state.skill_fetcher.package = real_package
+    for _ in range(100):
+        retried = await client.post("/v1/installed-skills", json=body)
+        if retried.status_code != 409:
+            break
+        await asyncio.sleep(0.05)
+    assert retried.status_code == 201, retried.text
+
+
 def test_effective_skills_read_every_page_and_stop_at_the_delivery_limit(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

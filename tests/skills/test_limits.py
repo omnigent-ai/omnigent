@@ -65,3 +65,9 @@ def test_delivery_budgets_fit_inside_what_a_runner_unpacks() -> None:
     assert limits.MAX_DELIVERY_ENTRIES < limits.RUNNER_UNPACK_ENTRIES
     assert limits.MAX_SKILL_BYTES <= limits.MAX_DELIVERY_BYTES_PER_SCOPE
     assert limits.MAX_SKILL_ENTRIES <= limits.MAX_DELIVERY_ENTRIES_PER_SCOPE
+
+
+def test_the_skill_name_bound_is_the_runners() -> None:
+    from omnigent.spec import validator
+
+    assert limits.MAX_SKILL_NAME_CHARS == validator._SKILL_NAME_MAX_LEN

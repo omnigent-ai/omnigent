@@ -17,7 +17,7 @@ import logging
 import tarfile
 import uuid
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, Field
@@ -33,6 +33,7 @@ from omnigent.skills.git_source import GitSourceError, repository_label
 from omnigent.skills.limits import (
     MAX_INSTALLED_PER_OWNER,
     MAX_NAMES_PER_INSTALL,
+    MAX_SKILL_NAME_CHARS,
     MAX_SOURCE_PATH_CHARS,
 )
 from omnigent.skills.overlay import (
@@ -163,13 +164,17 @@ class InstalledSkillList(BaseModel):
     last_id: str | None = None
 
 
+# A skill's directory name, as the runner's spec validator accepts it.
+SkillName = Annotated[str, Field(min_length=1, max_length=MAX_SKILL_NAME_CHARS)]
+
+
 class InstallSkillsRequest(BaseModel):
     """Installs are all-or-nothing: a refused name leaves nothing installed."""
 
     source: str = Field(min_length=1, max_length=512)
     ref: str | None = Field(default=None, max_length=255)
     path: str | None = Field(default=None, max_length=MAX_SOURCE_PATH_CHARS)
-    names: list[str] = Field(min_length=1, max_length=MAX_NAMES_PER_INSTALL)
+    names: list[SkillName] = Field(min_length=1, max_length=MAX_NAMES_PER_INSTALL)
     scope: Literal["user", "org"] = "user"
 
 
@@ -350,10 +355,22 @@ def create_skill_marketplace_router(
             )
         fetching.add(account)
         try:
-            async with fetch_slots:
-                return await asyncio.to_thread(fn, *args, **kwargs)
-        finally:
+            await fetch_slots.acquire()
+        except BaseException:
             fetching.discard(account)
+            raise
+        # A cancelled request cannot stop the clone's thread, so the slot and the
+        # account's turn are held until the work itself ends, not the request.
+        work = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+
+        def release(done: asyncio.Future[object]) -> None:
+            fetch_slots.release()
+            fetching.discard(account)
+            if not done.cancelled():
+                done.exception()  # retrieved, so an abandoned failure is not logged as lost
+
+        work.add_done_callback(release)
+        return await asyncio.shield(work)
 
     def resolve_allowed(source: str, ref: str | None, path: str | None) -> ResolvedSource:
         """The repository, ref and directory for a source within ``allowed_sources``."""

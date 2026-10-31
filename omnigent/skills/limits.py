@@ -65,6 +65,9 @@ MAX_DELIVERY_ENTRIES = 2 * MAX_DELIVERY_ENTRIES_PER_SCOPE
 MAX_PAGE = 200
 DEFAULT_PAGE = 50
 
+# The longest skill directory name the runner's spec validator accepts.
+MAX_SKILL_NAME_CHARS = 64
+
 # Stored-column bounds, in characters.
 MAX_NAME_CHARS = 255
 MAX_DISPLAY_NAME_CHARS = 256
