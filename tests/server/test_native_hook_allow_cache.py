@@ -11,6 +11,7 @@ from omnigent.cli import _parse_native_hook_allow_cache_seconds
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.runtime.policies.builder import (
     _DEFAULT_POLICY_SPECS_CACHE,
+    _DEFAULT_POLICY_SPECS_KEY,
     _SESSION_POLICY_SPECS_CACHE,
     _load_default_policy_specs,
     _load_session_policy_specs,
@@ -65,7 +66,6 @@ def test_cache_window_counts_from_the_policy_list_reads(db_uri: str) -> None:
 
     :param db_uri: Per-test SQLite URI from the root conftest.
     """
-    from omnigent.db.db_models import current_workspace_id
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
     store = SqlAlchemyPolicyStore(db_uri)
@@ -73,9 +73,8 @@ def test_cache_window_counts_from_the_policy_list_reads(db_uri: str) -> None:
     _SESSION_POLICY_SPECS_CACHE.clear()
     assert _load_default_policy_specs(store) == []
     assert _load_session_policy_specs(_SESSION_ID, store) == []
-    workspace_id = current_workspace_id()
-    specs, loaded_at = _DEFAULT_POLICY_SPECS_CACHE[workspace_id]
-    _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = (specs, loaded_at - 25.0)
+    specs, loaded_at = _DEFAULT_POLICY_SPECS_CACHE[_DEFAULT_POLICY_SPECS_KEY]
+    _DEFAULT_POLICY_SPECS_CACHE[_DEFAULT_POLICY_SPECS_KEY] = (specs, loaded_at - 25.0)
     caps = RuntimeCaps(native_hook_allow_cache_seconds=lambda: 60.0)
 
     body = _no_policy_allow_body(caps, _SESSION_ID, store)
