@@ -2515,7 +2515,10 @@ def create_runner_app(
         context = BackgroundTitleContext(
             prompt=body.prompt[:BACKGROUND_TITLE_MAX_PROMPT_CHARS],
             harness=effective_harness,
-            spawn_env=dict(spawn_env or {}),
+            spawn_env={
+                **(spawn_env or {}),
+                **resource_registry.client_surface_env(conversation_id),
+            },
             process_manager=process_manager,
             cwd=resolver_cwd,
             model_override=body.model_override,

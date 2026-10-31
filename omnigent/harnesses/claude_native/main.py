@@ -1643,6 +1643,8 @@ def claude_tool_env_file() -> str:
 
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    client_surface: str | None = None,
 ) -> dict[str, str]:
     """
     Build env overrides for a native Claude Code terminal process.
@@ -1664,18 +1666,29 @@ def build_native_claude_terminal_env(
         ``{"ENABLE_TOOL_SEARCH": "true"}``.
     """
     terminal_env = {
+        "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV: "true",
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
         _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
     }
     if claude_config is not None:
         terminal_env.update(claude_config.env)
+        terminal_env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
     configured_base_url = (
         claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is not None else None
     )
+    base_url = configured_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    if is_databricks_ai_gateway_url(base_url):
+        terminal_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            terminal_env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV)
+            or os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            CLAUDE_CODE_AGENT,
+            via_ug=is_ug_route(base_url),
+            client_surface=client_surface,
+        )
     if _ambient_env_is_non_anthropic_gateway(configured_base_url):
         terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
     # A user-provided env file keeps priority; it replaces the tmux scrub.
@@ -3122,10 +3135,19 @@ def _ucode_config_for_profile(
         # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
         # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
-        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: with_gateway_attribution_lines(
-            _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ug=True
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: "\n".join(
+            value
+            for value in (
+                _DATABRICKS_CODING_AGENT_HEADER,
+                agent_state.env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            )
+            if value
         ),
     }
+    if is_databricks_ai_gateway_url(base_url):
+        env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV], CLAUDE_CODE_AGENT, via_ug=True
+        )
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
     # names.  Without this Claude Code normalises the picked model to a
@@ -3615,11 +3637,12 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
                 "connected workspace host) — using the profile-derived gateway route.",
             )
 
-    env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-        env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
-        CLAUDE_CODE_AGENT,
-        via_ug=adopted_ug_route,
-    )
+    if is_databricks_ai_gateway_url(env[_UCODE_CLAUDE_BASE_URL_ENV]):
+        env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            CLAUDE_CODE_AGENT,
+            via_ug=adopted_ug_route,
+        )
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
     return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
 
@@ -6982,7 +7005,8 @@ def _claude_terminal_request(
         "cwd": str(Path.cwd().resolve()),
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
-    spec["env"] = build_native_claude_terminal_env(claude_config)
+    # This wrapper is the CLI; don't trust a surface inherited from a session's shell.
+    spec["env"] = build_native_claude_terminal_env(claude_config, client_surface="cli")
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove provider/session variables that can override the

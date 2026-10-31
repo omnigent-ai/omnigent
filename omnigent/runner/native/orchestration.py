@@ -1831,7 +1831,11 @@ async def _auto_create_opencode_terminal(
     config = maybe_merge_user_provider_config(config)
 
     if config:
-        write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
+        write_opencode_provider_config(
+            xdg_config_home_for_bridge_dir(bridge_dir),
+            config,
+            client_surface=resource_registry.client_surface(session_id),
+        )
 
     # The server runs with a per-session XDG_DATA_HOME, so copy the user's
     # `opencode auth login` credentials in — otherwise it can't authenticate
@@ -2791,6 +2795,7 @@ async def _auto_create_pi_terminal(
                 launch_config.reasoning_effort,
                 selection=spec_model,
                 global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
+                client_surface=resource_registry.client_surface(session_id),
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -9657,7 +9662,10 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(claude_config),
+        env=build_native_claude_terminal_env(
+            claude_config,
+            client_surface=resource_registry.client_surface(session_id),
+        ),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning

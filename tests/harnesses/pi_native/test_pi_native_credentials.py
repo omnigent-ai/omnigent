@@ -3401,10 +3401,10 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     renders = 0
     original = creds.PiProviderConfig.to_models_config
 
-    def _counting(self: creds.PiProviderConfig) -> object:
+    def _counting(self: creds.PiProviderConfig, *, client_surface: str | None = None) -> object:
         nonlocal renders
         renders += 1
-        return original(self)
+        return original(self, client_surface=client_surface)
 
     monkeypatch.setattr(creds.PiProviderConfig, "to_models_config", _counting)
 

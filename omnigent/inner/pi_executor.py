@@ -84,6 +84,7 @@ from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.json_types import JsonValue
 from omnigent.util.reasoning_effort import (
@@ -1021,7 +1022,9 @@ def _build_models_json(
     for provider_config in config["providers"].values():
         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
             provider_config["headers"] = gateway_attribution_headers(
-                PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
+                PI_AGENT,
+                via_ug=is_ug_route(provider_config["baseUrl"]),
+                client_surface=harness_client_surface(),
             )
     return config
 
