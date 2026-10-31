@@ -602,7 +602,7 @@ other browser permissions remain denied.
 This controls Chromium's local-network permission answers, **not a network
 firewall**: Electron versions may not gate every local-network fetch on this
 permission. Approval does not bypass CORS, TLS certificate validation, or the
-agent navigation policy. A helper that rejects this origin through its own CORS
+browser navigation policy. A helper that rejects this origin through its own CORS
 policy must be configured to allow it; the pane does not rewrite those headers.
 
 ### Browser implementation
