@@ -54,12 +54,17 @@ function cookieMatchesOrigin(cookie, origin) {
 
 // The workspace rejected a freshly minted session: the stored credentials need a browser sign-in.
 const SESSION_REJECTED = "SESSION_REJECTED";
-// The workspace IP access list refused session-create (e.g. off the VPN): retried.
+// The workspace IP access list refused a request (e.g. off the VPN): retried.
 const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
 const sessionRejected = (message) =>
   Object.assign(new Error(message), { errorCode: SESSION_REJECTED });
 // Session-create timed out or its response was cut off (databricks-session.js).
 const SESSION_TRANSPORT = "SESSION_TRANSPORT";
+
+/** Whether an HTTP error response is the workspace IP access list refusing this network. */
+function isIpAclRefusal(status, body) {
+  return status === 403 && /is blocked by Databricks IP ACL/.test(body);
+}
 
 /** Whether a renewal failure is worth retrying: no response, HTTP 5xx/429, or an IP ACL block. */
 function isTransientRenewalError(error) {
@@ -341,6 +346,7 @@ module.exports = {
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
   cookieMatchesOrigin,
+  isIpAclRefusal,
   isTransientRenewalError,
   SESSION_REJECTED,
   IP_ACL_BLOCKED,
