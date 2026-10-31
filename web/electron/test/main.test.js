@@ -684,7 +684,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -1924,6 +1924,8 @@ describe("Databricks auth mode wiring", () => {
         });
         t.after(h.cleanup);
         h.api.setReconnectDelaysMs(retries);
+        // The wording an IP access list refusal shows once it has lasted.
+        h.api.setBlockedHintDelayMs(0);
         if (failure) {
           // oxlint-disable-next-line no-await-in-loop
           await assert.rejects(h.api.loadServerUrl(h.win, workspace));
@@ -3792,6 +3794,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     );
     // Only network failures use the minute-long retries.
     assert.equal(h.api.reconnectSlowDelayMs(), 60_000);
+    assert.equal(h.api.blockedHintDelayMs(), 30_000);
   });
 
   const setupEvent = (h) => ({
@@ -3920,24 +3923,35 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.equal(h.overlay.hint, null);
   });
 
+  const unreachable = "Check your network connection.";
+  const blocked = "Databricks blocked this network. Connect from a network the workspace allows.";
   for (const event of ["resume", "unlock-screen"]) {
-    it(`starts the fast retries over on ${event}`, async (t) => {
-      const h = browserHarness(t, [20], {
-        ensureSession: async () => {
-          throw new TypeError("fetch failed");
-        },
+    // [renewal failure, overlay hint before the wake, then after it]
+    for (const [failure, before, after] of [
+      [() => new TypeError("fetch failed"), unreachable, unreachable],
+      // Refusals after wake wait again before saying the network is blocked.
+      [() => Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }), blocked, ""],
+    ]) {
+      it(`starts the fast retries over on ${event} after "${failure().message}"`, async (t) => {
+        const h = browserHarness(t, [20], {
+          ensureSession: async () => {
+            throw failure();
+          },
+        });
+        h.api.setReconnectSlowDelayMs(60_000);
+        h.api.setBlockedHintDelayMs(10);
+        await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+        await until(() => h.calls.auth.length === 2, "the fast retry");
+        // The next retry is a minute away.
+        await wait(60);
+        assert.equal(h.calls.auth.length, 2);
+        assert.equal(h.overlay.hint, before);
+        h.powerMonitor.emit(event);
+        assert.equal(h.overlay.hint, after);
+        await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
+        assert.deepEqual(h.calls.loadFile, []);
       });
-      h.api.setReconnectSlowDelayMs(60_000);
-      await assert.rejects(h.api.loadServerUrl(h.win, workspace));
-      await until(() => h.calls.auth.length === 2, "the fast retry");
-      // The next retry is a minute away.
-      await wait(60);
-      assert.equal(h.calls.auth.length, 2);
-      h.powerMonitor.emit(event);
-      await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
-      assert.equal(h.overlay.hint, "Check your network connection.");
-      assert.deepEqual(h.calls.loadFile, []);
-    });
+    }
   }
 
   it("returns a failed deep link to its conversation", async (t) => {
@@ -4071,17 +4085,19 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     ["the workspace redirects to login", loginRedirect],
   ]) {
     it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
-      const { h, network } = await connected(t, [30, 30, 30]);
+      const { h, network } = await connected(t, Array(6).fill(30));
+      h.api.setBlockedHintDelayMs(50);
       h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
       network.verdict = "blocked";
       drop(h, network);
       await until(() => h.overlay.hint !== null, "the reconnecting overlay");
-      // The conversation stays underneath, no longer trusted.
-      assert.equal(h.overlay.hint, `${blocked}.`);
+      // The conversation stays underneath, no longer trusted, behind a hint-less overlay.
+      assert.equal(h.overlay.shows[0], "");
       assert.equal(h.api.windows.get(h.win).origin, null);
       assert.deepEqual(h.calls.loadFile, []);
-      // Connect, the blocked renewal, then one blocked background retry.
-      await until(() => network.sessionCreates === 3, "a blocked retry");
+      // Connect, the blocked renewal, then blocked background retries outlasting the wait.
+      await until(() => h.overlay.hint === `${blocked}.`, "the blocked-network hint");
+      assert.ok(network.sessionCreates >= 3);
       network.verdict = "allow";
       await until(() => h.calls.loadURL.length === 2, "the reconnect");
       // Back on the page the user was on; setup never showed.
@@ -4101,6 +4117,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   it("keeps retrying off the VPN after the fast retries run out, then reconnects", async (t) => {
     const { h, network } = await connected(t, [20]);
     h.api.setReconnectSlowDelayMs(20);
+    h.api.setBlockedHintDelayMs(20);
     h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
     network.verdict = "blocked";
     network.removeCookie();
@@ -4136,7 +4153,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     });
     assert.equal(result.reconnecting, true);
     // Connect off the VPN puts the overlay over the setup page and restarts the loop.
-    assert.equal(h.overlay.hint, `${blocked}.`);
+    assert.equal(h.overlay.hint, "");
     assert.equal(h.calls.loadFile.length, 1);
     // The loop restarted: another blocked background attempt follows Connect.
     await until(() => network.sessionCreates === 4, "a blocked retry after Connect");
@@ -4202,7 +4219,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     h.api.setReconnectSlowDelayMs(20);
     network.verdict = "blocked";
     assert.equal((await connect()).reconnecting, true);
-    assert.equal(h.overlay.hint, `${blocked}.`);
+    assert.equal(h.overlay.hint, "");
     await until(() => network.sessionCreates === 2, "a blocked retry");
     network.verdict = "allow";
     await until(() => h.calls.loadURL.length === 1, "the reconnect");
