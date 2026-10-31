@@ -17,14 +17,11 @@ def least_used_project_color(used_colors: Iterable[object]) -> str:
     return min(THEME_PALETTE_IDS, key=lambda color: counts[color])
 
 
-def recommended_project_color(project_store: ProjectStore, user_id: str | None) -> str:
-    projects = project_store.list(user_id=user_id)
-    return least_used_project_color(project.config.get("color") for project in projects)
-
-
 def with_project_color(
     project_store: ProjectStore, user_id: str | None, config: dict[str, Any]
 ) -> dict[str, Any]:
     if config.get("icon") or config.get("color") in THEME_PALETTE_IDS:
         return dict(config)
-    return {**config, "color": recommended_project_color(project_store, user_id)}
+    projects = project_store.list(user_id=user_id)
+    color = least_used_project_color(project.config.get("color") for project in projects)
+    return {**config, "color": color}

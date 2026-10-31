@@ -10,12 +10,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import {
-  ProjectAppearanceButton,
-  useRecommendedProjectColor,
-} from "@/components/ProjectIconPicker";
+import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
 import type { ProjectAppearance } from "@/lib/projectColors";
+
+const UNMARKED: ProjectAppearance = { icon: null, color: null };
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that
@@ -26,13 +25,8 @@ import type { ProjectAppearance } from "@/lib/projectColors";
 export function NewProjectButton({ onCreated }: { onCreated: (name: string) => void }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
-  // The picked mark; null until the user picks, so the recommended color stays
-  // live (it can change as the project list loads).
-  const [picked, setPicked] = useState<ProjectAppearance | null>(null);
-  const recommendedColor = useRecommendedProjectColor();
-  // Until the recommendation loads nothing is checked; creating then leaves
-  // the color to the server, which picks the same recommendation.
-  const appearance = picked ?? { icon: null, color: recommendedColor ?? null };
+  // With nothing picked, the server assigns the least-used color on create.
+  const [appearance, setAppearance] = useState<ProjectAppearance>(UNMARKED);
   const createProject = useCreateProject();
 
   const submit = () => {
@@ -48,7 +42,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
         onSuccess: (project) => {
           setOpen(false);
           setName("");
-          setPicked(null);
+          setAppearance(UNMARKED);
           onCreated(project.name);
         },
       },
@@ -69,7 +63,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             onClick={(e) => {
               e.stopPropagation();
               setName("");
-              setPicked(null);
+              setAppearance(UNMARKED);
               setOpen(true);
             }}
           >
@@ -92,7 +86,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
           <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
             <ProjectAppearanceButton
               value={appearance}
-              onChange={setPicked}
+              onChange={setAppearance}
               testId="new-project-icon"
             />
             <input

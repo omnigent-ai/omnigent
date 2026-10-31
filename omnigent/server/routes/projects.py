@@ -22,7 +22,7 @@ from fastapi import APIRouter, Request
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.project_colors import recommended_project_color, with_project_color
+from omnigent.project_colors import with_project_color
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
@@ -30,7 +30,6 @@ from omnigent.server.schemas import (
     CreateProjectRequest,
     ProjectOrderRequest,
     ProjectOrderResponse,
-    RecommendedProjectColorResponse,
     UpdateProjectRequest,
 )
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
@@ -132,13 +131,6 @@ def create_projects_router(
         )
         announce_projects_changed(user_id)
         return preference
-
-    @router.get("/projects/recommended-color")
-    async def get_recommended_project_color(request: Request) -> RecommendedProjectColorResponse:
-        """Return the color a new project would be auto-assigned."""
-        user_id = require_user(request, auth_provider)
-        color = await asyncio.to_thread(recommended_project_color, project_store, user_id)
-        return RecommendedProjectColorResponse(color=color)
 
     @router.get("/projects/{project_id}")
     async def get_project(request: Request, project_id: str) -> dict[str, Any]:

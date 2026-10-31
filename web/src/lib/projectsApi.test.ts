@@ -7,7 +7,6 @@ import {
   createProject,
   deleteProject,
   getProject,
-  getRecommendedProjectColor,
   listProjects,
   renameProject,
   updateProjectConfig,
@@ -76,14 +75,6 @@ describe("createProject", () => {
       name: "New",
       config: { host_id: "h1", agent_id: "ag_1" },
     });
-  });
-});
-
-describe("getRecommendedProjectColor", () => {
-  it("GETs the recommendation", async () => {
-    fetchMock.mockResolvedValue(mockResponse({ color: "nord" }));
-    await expect(getRecommendedProjectColor()).resolves.toBe("nord");
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects/recommended-color");
   });
 });
 
