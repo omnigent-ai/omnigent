@@ -6027,37 +6027,66 @@ def _claude_pane_processes(
     return tree
 
 
-def _claude_pane_cpu_seconds(
-    socket_path: str, tmux_target: str, bridge_dir: Path | None = None
-) -> float | None:
-    """
-    Total the CPU time used by the processes running a Claude Code pane.
+class _PaneCpuSample(NamedTuple):
+    """The CPU time of a Claude Code pane's readable processes at one moment."""
 
-    On Linux, reaped children count too, so a boot step that runs and exits
-    between two readings is not lost; psutil reports them as zero on macOS. A
-    process that cannot be read is skipped.
+    taken_at: float
+    # pid -> (start time, user plus system seconds); the start time tells a
+    # recycled pid apart.
+    processes: dict[int, tuple[float, float]]
+
+
+def _claude_pane_cpu_sample(
+    socket_path: str, tmux_target: str, bridge_dir: Path | None = None
+) -> _PaneCpuSample | None:
+    """
+    Read the CPU time of each process running a Claude Code pane.
+
+    A process that cannot be read is left out.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param bridge_dir: Bridge directory whose Claude session's process is
         included (see :func:`_claude_pane_processes`), or ``None``.
-    :returns: User plus system seconds, e.g. ``12.5``, or ``None`` when the
-        pane's process could not be found or no process could be read.
+    :returns: The sample, or ``None`` when the pane's process could not be
+        found or no process could be read.
     """
     import psutil
 
+    taken_at = time.time()
     processes = _claude_pane_processes(socket_path, tmux_target, bridge_dir)
     if processes is None:
         return None
-    total: float | None = None
+    readings: dict[int, tuple[float, float]] = {}
     for process in processes:
         with contextlib.suppress(psutil.Error):
             times = process.cpu_times()
-            total = (total or 0.0) + (
-                times.user + times.system + times.children_user + times.children_system
-            )
-    return total
+            readings[process.pid] = (process.create_time(), times.user + times.system)
+    return _PaneCpuSample(taken_at, readings) if readings else None
+
+
+def _pane_cpu_seconds_between(earlier: _PaneCpuSample, later: _PaneCpuSample) -> float:
+    """
+    Total the CPU time a pane's processes used between two samples.
+
+    Each process is compared only with itself, so one that exits cannot cancel
+    the others' work, and one already running but unread in *earlier* adds
+    nothing. A process started after *earlier* counts in full. Time used by a
+    process that exits in between, or by children it reaps, is not counted.
+
+    :param earlier: The sample at the start of the window.
+    :param later: The sample at its end.
+    :returns: CPU seconds, e.g. ``3.0``.
+    """
+    used = 0.0
+    for pid, (started, cpu_s) in later.processes.items():
+        before = earlier.processes.get(pid)
+        if before is not None and before[0] == started:
+            used += cpu_s - before[1]
+        elif started >= earlier.taken_at:
+            used += cpu_s
+    return used
 
 
 def claude_pane_ready(bridge_dir: Path) -> bool:
@@ -7117,8 +7146,8 @@ def _wait_for_claude_prompt_ready(
         else 0.0
     )
     busy_ceiling = max(hard_deadline, started + _TMUX_READY_BUSY_BOOT_CEILING_S)
-    # (when, CPU seconds) at the start of the window that decides the next extension.
-    cpu_mark: tuple[float, float | None] | None = None
+    # (when, CPU sample) at the start of the window that decides the next extension.
+    cpu_mark: tuple[float, _PaneCpuSample | None] | None = None
     busy_extensions = 0
     next_repaint = started + _CLAUDE_REPAINT_AFTER_S
     polls = 0
@@ -7261,28 +7290,31 @@ def _wait_for_claude_prompt_ready(
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         now = time.monotonic()
         if busy_window_s > 0 and cpu_mark is None and now >= hard_deadline - busy_window_s:
-            cpu_mark = (now, _claude_pane_cpu_seconds(socket_path, tmux_target, bridge_dir))
+            cpu_mark = (now, _claude_pane_cpu_sample(socket_path, tmux_target, bridge_dir))
         if time.monotonic() >= hard_deadline:
             if cpu_mark is None or hard_deadline >= busy_ceiling:
                 break
-            marked_at, marked_cpu_s = cpu_mark
+            marked_at, marked_sample = cpu_mark
             now = time.monotonic()
-            cpu_s = _claude_pane_cpu_seconds(socket_path, tmux_target, bridge_dir)
+            sample = _claude_pane_cpu_sample(socket_path, tmux_target, bridge_dir)
+            if marked_sample is None or sample is None:
+                break
+            used_cpu_s = _pane_cpu_seconds_between(marked_sample, sample)
             busy_cpu_s = max(
                 _TMUX_READY_BUSY_BOOT_CPU_SHARE * (now - marked_at),
                 _TMUX_READY_BUSY_BOOT_MIN_CPU_S,
             )
-            if marked_cpu_s is None or cpu_s is None or cpu_s - marked_cpu_s < busy_cpu_s:
+            if used_cpu_s < busy_cpu_s:
                 break
             hard_deadline = min(now + busy_window_s, busy_ceiling)
-            cpu_mark = (now, cpu_s)
+            cpu_mark = (now, sample)
             busy_extensions += 1
             delivery_diagnostics.record_readiness(prompt_busy_boot_extensions=busy_extensions)
             _logger.info(
                 "claude-native: terminal still booting after %.1fs (%.2f CPU-s in %.1fs); "
                 "waiting up to %.1fs more",
                 now - started,
-                cpu_s - marked_cpu_s,
+                used_cpu_s,
                 now - marked_at,
                 hard_deadline - now,
             )
