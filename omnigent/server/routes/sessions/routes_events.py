@@ -305,6 +305,7 @@ from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     MAX_SESSION_EVENT_REQUEST_BYTES,
 )
+from omnigent.skills.policy import DEFAULT_POLICY as DEFAULT_SKILLS_POLICY
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
@@ -3493,6 +3494,7 @@ def register_events_routes(
                 conv,
                 skill_store=getattr(request.app.state, "skill_store", None),
                 conversation_store=conversation_store,
+                policy=getattr(request.app.state, "skills_policy", DEFAULT_SKILLS_POLICY),
             )
             if _agent
             else None

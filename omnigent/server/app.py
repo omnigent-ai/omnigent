@@ -1997,6 +1997,7 @@ def create_app(
             runner_router,
             agent_store=agent_store,
             skill_store=active_skill_store,
+            skills_policy=skills_policy,
         )
 
         from omnigent.runner.resource_registry import (

@@ -1264,3 +1264,78 @@ async def test_a_marketplace_change_reaches_a_warm_sessions_next_turn(
         await client.patch(f"/v1/installed-skills/{skill_id}", json={"enabled": False})
         after_disable = await turn()
         assert after_disable not in (warm, after_install)
+
+
+@pytest.mark.asyncio
+async def test_source_and_policy_changes_reach_a_warm_sessions_next_turn(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With URL installs off the browse list decides delivery, and the policy
+    # always does, so both have to move the revision a warm runner compares.
+    import json
+
+    from tests.server.helpers import build_agent_bundle
+
+    forwarded: list[str] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content)["agent_revision"])
+        return httpx.Response(202, json={"queued": True})
+
+    async def to_fake_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        return runner_client
+
+    async def relay_ready(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", to_fake_runner)
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", relay_ready)
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+    listed_only = {"skills_marketplace": {"allow_url_install": False}}
+    app, artifact_store = _build(db_uri, tmp_path, server_config=listed_only)
+    app.state.skill_fetcher = _fetcher(repo)
+    session_id = _bind_session(db_uri, artifact_store, build_agent_bundle("warm"))
+
+    async def turn(client: httpx.AsyncClient) -> str:
+        sent = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+        assert sent.status_code == 202, sent.text
+        return forwarded[-1]
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(runner), base_url="http://r"
+        ) as runner_client,
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client,
+    ):
+        source = (await client.post("/v1/skill-sources", json={"source": "acme/skills"})).json()
+        installed = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+        assert installed.status_code == 201, installed.text
+        listed = await turn(client)
+        assert await turn(client) == listed
+        # Removing the source stops delivering the skill; the revision moves.
+        assert (await client.delete(f"/v1/skill-sources/{source['id']}")).status_code == 204
+        removed = await turn(client)
+        assert removed != listed
+        # Adding it back makes the skill deliverable again; so does the revision.
+        assert (
+            await client.post("/v1/skill-sources", json={"source": "acme/skills"})
+        ).status_code == 201
+        readded = await turn(client)
+        assert readded not in (listed, removed)
+
+    # The same database under another policy: nothing else changed, the revision does.
+    tighter = {"skills_marketplace": {"allow_url_install": False, "allowed_sources": ["x/y/z"]}}
+    app, _ = _build(db_uri, tmp_path, server_config=tighter)
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(runner), base_url="http://r"
+        ) as runner_client,
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client,
+    ):
+        assert await turn(client) != readded

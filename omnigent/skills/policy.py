@@ -29,6 +29,7 @@ also stops serving skills that were installed under a looser policy.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import logging
 import math
 import os
@@ -125,6 +126,11 @@ class SkillsMarketplacePolicy:
         """:raises SkillPolicyError: When the repository is outside ``allowed_sources``."""
         if not self.allows(clone_url):
             raise SkillPolicyError(f"{clone_url} is not an allowed skill source on this server.")
+
+    def delivery_fingerprint(self) -> str:
+        """A short digest of the settings that decide which installs are delivered."""
+        decisive = repr((self.allowed_sources, self.allow_url_install))
+        return hashlib.sha256(decisive.encode()).hexdigest()[:12]
 
     def is_configured(self, url: str, ref: str | None, path: str = "") -> bool:
         """Whether the operator listed this exact repository, ref and directory."""

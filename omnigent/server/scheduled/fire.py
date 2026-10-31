@@ -94,6 +94,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.skill_injection import session_agent_revision
+from omnigent.skills.policy import DEFAULT_POLICY as DEFAULT_SKILLS_POLICY
 from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
 if TYPE_CHECKING:
@@ -1272,6 +1273,7 @@ async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
         conv,
         skill_store=getattr(deps.app_state, "skill_store", None),
         conversation_store=deps.conversation_store,
+        policy=getattr(deps.app_state, "skills_policy", DEFAULT_SKILLS_POLICY),
     )
 
 

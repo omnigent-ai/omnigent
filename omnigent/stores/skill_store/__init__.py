@@ -227,8 +227,11 @@ class SkillStore(ABC):
         """The visible installs among *names* (org-scoped plus the user's own)."""
 
     @abstractmethod
-    def installed_revision(self, user_id: str | None) -> str:
-        """A token that changes whenever the org's or *user_id*'s installs change."""
+    def installed_revision(self, user_id: str | None, *, include_sources: bool = False) -> str:
+        """A token that changes whenever the org's or *user_id*'s installs change.
+
+        With *include_sources*, adding or removing a browsable source changes it too.
+        """
 
     @abstractmethod
     def count_installed(self, scope: SkillScope, owner_user_id: str | None) -> int:

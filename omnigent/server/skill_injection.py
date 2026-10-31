@@ -71,13 +71,15 @@ async def session_agent_revision(
     *,
     skill_store: SkillStore | None,
     conversation_store: ConversationStore,
+    policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
 ) -> str:
-    """The revision a session's turn carries, including its owner's installed skills.
+    """The revision a session's turn carries, including what decides its delivered skills.
 
     The runner rebuilds a session's spec when the revision changes, so a
     marketplace change reaches a warm session's next turn instead of its
-    menu listing a skill its spec lacks. Without the marketplace this is the
-    bundle-and-selection revision alone.
+    menu listing a skill its spec lacks. That covers the owner's installs,
+    the policy, and, when URL installs are off, the browse list. Without the
+    marketplace this is the bundle-and-selection revision alone.
     """
     base = mcp_selection_revision(bundle_location, conv.labels)
     if skill_store is None:
@@ -85,9 +87,10 @@ async def session_agent_revision(
 
     def installed() -> str:
         owner = conversation_store.get_session_owner(conv.id, owner_only=True)
-        return skill_store.installed_revision(owner)
+        return skill_store.installed_revision(owner, include_sources=not policy.allow_url_install)
 
-    return f"{base}+skills.{await asyncio.to_thread(installed)}"
+    token = await asyncio.to_thread(installed)
+    return f"{base}+skills.{token}.p{policy.delivery_fingerprint()}"
 
 
 def bundle_loaded(agent_cache: AgentCache | None, agent: Agent) -> LoadedAgent | None:
