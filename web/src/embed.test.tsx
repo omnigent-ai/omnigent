@@ -126,6 +126,34 @@ describe("macOS Electron embed", () => {
   });
 });
 
+describe("embed heading font", () => {
+  // The host page styles headings by element (e.g. `body h2`), so a sidebar
+  // section header would drop the user's UI font without a scoped reset.
+  it("scopes a heading font-family reset that outranks host element rules", () => {
+    const selectors: string[] = [];
+    css.walkDecls("font-family", (decl) => {
+      if (decl.value === "inherit" && decl.parent?.type === "rule") {
+        selectors.push((decl.parent as Rule).selector);
+      }
+    });
+    const scope = document.createElement("div");
+    scope.className = "omnigent-app";
+    scope.innerHTML = "<nav><h2>Sessions</h2></nav>";
+    document.body.append(scope);
+    const outside = document.createElement("h2");
+    document.body.append(outside);
+
+    const selector = selectors.find((s) => scope.querySelector("h2")!.matches(s));
+    expect(selector).toBeDefined();
+    // A leading class selector beats element-only host rules like `body h2`.
+    expect(selector!.startsWith(".omnigent-app ")).toBe(true);
+    expect(outside.matches(selector!)).toBe(false);
+
+    scope.remove();
+    outside.remove();
+  });
+});
+
 describe("embed color scheme", () => {
   // The scope root resolves `color` from the light tokens, so the portal root
   // must re-apply the foreground color for overlays to read dark-mode text.
