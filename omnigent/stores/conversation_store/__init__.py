@@ -46,7 +46,8 @@ FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 # the prior history instead of a blank session. Once the clone captures its
 # OWN native session id (``external_session_id`` set on first launch), this
 # directive is inert — the launch path only consults it while
-# ``external_session_id`` is still NULL. Cleared/ignored thereafter.
+# ``external_session_id`` is still NULL. A fork of this clone copies it only
+# while the clone has no native session and the fork is full and same-family.
 FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY = "omnigent.fork.source_external_session_id"
 
 # Fork directive: set when the fork binds a NATIVE target harness
@@ -235,11 +236,14 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # source's id would route the fork to the wrong host. Mirrors the server's
 # ``REQUESTED_HOST_ID_LABEL_KEY`` (cross-checked by a store test).
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
+# ``fork_conversation`` restamps the native resume directive itself, so a
+# truncated or cross-family fork never inherits its source's directive.
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
 }

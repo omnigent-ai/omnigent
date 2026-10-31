@@ -5706,9 +5706,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             # ``resume_source_native_session=False``); in both cases the
             # directive is skipped so the runner's carry-history
             # fork-rebuild path synthesizes the native transcript from the
-            # copied items instead.
-            if source_ext_session and not truncated and resume_source_native_session:
-                fork_labels[FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY] = source_ext_session
+            # copied items instead. A source that is itself a never-launched
+            # fork has no native session yet; its own directive still names the
+            # transcript its copied items came from, so a full fork keeps it.
+            resume_directive = source_ext_session or source_labels.get(
+                FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+            )
+            if resume_directive and not truncated and resume_source_native_session:
+                fork_labels[FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY] = resume_directive
             # When the fork binds a native target, mark it so the runner
             # rebuilds the native transcript (clone the source's native
             # transcript when same-family, else build from the copied
