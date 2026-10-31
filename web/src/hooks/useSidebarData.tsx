@@ -16,6 +16,7 @@ import {
   writeSidebarViewPreferences,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
+import { parseProjectSessionsQueryKey } from "@/lib/sessionListCache";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import { dedupeSessionRows, mergeScopeRows, sessionRowsPage } from "@/lib/sidebarData";
 import {
@@ -61,8 +62,10 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
           void client.resetQueries({
             queryKey,
             predicate: ({ queryKey: key }) =>
-              (key[0] === "conversations" ? key[5] : key[2]) ===
-              (next.ordering === "created" ? "created_at" : undefined),
+              (key[0] === "conversations"
+                ? (key[5] ?? "updated_at")
+                : parseProjectSessionsQueryKey(key).sortBy) ===
+              (next.ordering === "created" ? "created_at" : "updated_at"),
           });
         }
         void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
