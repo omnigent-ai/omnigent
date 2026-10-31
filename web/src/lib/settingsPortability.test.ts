@@ -1,6 +1,12 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  readHiddenPickerAgents,
+  subscribeHiddenPickerAgents,
+  writeHiddenPickerAgents,
+} from "./pickerEntryVisibility";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
   type SessionWorkspaceState,
@@ -123,4 +129,19 @@ describe.each([
     });
     expect(localStorage.getItem(storageKey)).toBe("true");
   });
+});
+
+it("carries hidden picker entries through export and import and tells an open picker", () => {
+  writeHiddenPickerAgents(new Set(["polly"]));
+  const exported = collectSettings()!;
+  expect(exported.settings[HIDDEN_PICKER_AGENTS_STORAGE_KEY]).toBe('["polly"]');
+  const listener = vi.fn();
+  const unsubscribe = subscribeHiddenPickerAgents(listener);
+
+  applyImportedSettings({ version: 1, settings: {} });
+  expect(readHiddenPickerAgents().size).toBe(0);
+  applyImportedSettings(exported);
+  expect(readHiddenPickerAgents()).toEqual(new Set(["polly"]));
+  expect(listener).toHaveBeenCalledTimes(2);
+  unsubscribe();
 });
