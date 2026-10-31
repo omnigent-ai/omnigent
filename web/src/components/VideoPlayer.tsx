@@ -20,8 +20,12 @@ import {
   downloadWorkspaceFile,
   fetchWorkspaceFileBlob,
   useFileContent,
+  usesDirectFileDownload,
+  workspaceFileDownloadUrl,
 } from "@/hooks/useFileContent";
 import { showToast } from "@/components/ui/toast";
+import { withBasePath } from "@/lib/basePath";
+import { isHostRoutingEnabled } from "@/lib/host";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { formatVideoTime } from "@/lib/video";
@@ -48,7 +52,12 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const path = "path" in props ? props.path : undefined;
   const [requested, setRequested] = useState(false);
   const [blobSrc, setBlobSrc] = useState<string>();
-  const src = requested ? (remoteSrc ?? blobSrc) : undefined;
+  const direct = usesDirectFileDownload() && !isHostRoutingEnabled();
+  const directSrc =
+    conversationId && path && direct
+      ? withBasePath(workspaceFileDownloadUrl(conversationId, path))
+      : undefined;
+  const src = requested ? (remoteSrc ?? directSrc ?? blobSrc) : undefined;
   const [failed, setFailed] = useState(false);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState<number | null>(null);
@@ -94,8 +103,9 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   };
 
   // Recordings can be large. Fetch only on Play, and release bytes on close.
+  // Skip fetching if using direct download URLs (range requests handled by browser).
   useEffect(() => {
-    if (!requested || !conversationId || !path) return;
+    if (!requested || !conversationId || !path || direct) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
     void fetchWorkspaceFileBlob(conversationId, path, controller.signal)
@@ -111,7 +121,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [requested, conversationId, path]);
+  }, [requested, conversationId, path, direct]);
 
   useEffect(() => {
     // Capture the element before React clears its ref on unmount.

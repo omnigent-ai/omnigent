@@ -313,9 +313,8 @@ def test_file_viewer_download_saves_the_complete_file(
         page.keyboard.press("Escape")
         expect(viewer.locator(".tiptap")).to_have_count(0)
         expect(viewer.get_by_text("too large to load fully", exact=False)).to_be_visible()
-    rail.get_by_role("button", name="View settings").click()
     with page.expect_download() as download_info:
-        page.get_by_role("menuitem", name="Download file").click()
+        rail.get_by_role("button", name="Download file").click()
     download = download_info.value
     assert download.suggested_filename == file_name
     saved = tmp_path / file_name
