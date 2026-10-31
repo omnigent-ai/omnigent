@@ -33,7 +33,9 @@ import httpx
 import psutil
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
@@ -11205,6 +11207,29 @@ def test_readiness_waits_past_the_cap_while_the_boot_uses_cpu(
 
     assert clock.monotonic() == 260.0
     assert cpu_reads == [150.0, 180.0, 210.0, 240.0]
+
+
+def test_busy_boot_extensions_reach_the_delivery_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _slow_boot_clock(monkeypatch, lambda now: [_cpu_process(now / 2)], ready_at=200.0)
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: "owned-session",
+        cancelled_error=claude_native_bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=30.0)
+
+    with caplog.at_level("INFO", logger=delivery_diagnostics.__name__):
+        deliver(tmp_path, content="hello")
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    attributes = record_to_row(record, source="runner")["attributes"]
+    assert attributes["prompt_busy_boot_extensions"] == "1"
 
 
 @pytest.mark.parametrize(
