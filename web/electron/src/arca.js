@@ -31,10 +31,9 @@ const { StringDecoder } = require("node:string_decoder");
 const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 
 /**
- * Connecting may cold-start the EC2 instance, which takes minutes, and Isaac's
- * pre-configuration on the instance can wait up to 5 minutes for a workspace
- * sign-in before `omni host` reports OMNIGENT_AUTH_REQUIRED. The ceiling must
- * outlast both, or the timeout hides the sign-in error that starts the login.
+ * Outlasts a cold start plus Isaac's wait for a browser sign-in nobody can
+ * finish, so the sign-in error arrives first. Can drop once Isaac skips that
+ * wait for `--background --non-interactive`.
  */
 const CONNECT_TIMEOUT_MS = 10 * 60 * 1000;
 /** `isaac omni login` gives up on its browser sign-in after 5 minutes. */
@@ -229,9 +228,8 @@ function buildLoginArgs(serverUrl) {
 function describeConnectFailure(run) {
   const output = `${run.stderr}\n${run.stdout}`;
   // `omni host --non-interactive` fails loud with a sign-in hint when the
-  // Arca box's Databricks credentials can't mint a server token. Checked before
-  // the timeout: a run that printed it but outlived the ceiling still needs the
-  // sign-in, not a retry.
+  // Arca box's Databricks credentials can't mint a server token. It wins over a
+  // timeout: a run that printed it needs sign-in, not a retry.
   if (/OMNIGENT_AUTH_REQUIRED|not signed in|authentication failed \(HTTP 401\)/i.test(output)) {
     return {
       ok: false,
@@ -673,7 +671,7 @@ async function runArcaExtend(mode, deps = {}) {
  * }}
  */
 function startArcaCommand(serverUrl, deps = {}, login = false) {
-  const timeoutMs = deps.timeoutMs ?? (login ? LOGIN_TIMEOUT_MS : CONNECT_TIMEOUT_MS);
+  const timeoutMs = deps.timeoutMs ?? CONNECT_TIMEOUT_MS;
   const onOutput = deps.onOutput || (() => {});
   const arcaPath = (deps.resolveArcaPath || resolveArcaPath)();
   if (!arcaPath) {
@@ -817,7 +815,11 @@ function startArcaConnect(serverUrl, deps = {}) {
 }
 
 function startArcaLogin(serverUrl, deps = {}) {
-  return startArcaCommand(serverUrl, deps, true);
+  return startArcaCommand(
+    serverUrl,
+    { ...deps, timeoutMs: deps.timeoutMs ?? LOGIN_TIMEOUT_MS },
+    true,
+  );
 }
 
 /**

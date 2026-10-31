@@ -536,7 +536,7 @@ describe("startArcaConnect / connectArcaHost", () => {
     }
   });
 
-  it("starts sign-in when a connect that printed the auth error outlives the timeout", async () => {
+  it("reports the auth error a connect printed before it timed out", async () => {
     const child = fakeConnectChild();
     const run = startArcaConnect("https://account.databricks.com/omnigent?o=123", {
       resolveArcaPath: () => "/bin/arca",

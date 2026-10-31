@@ -1147,12 +1147,42 @@ describe("Arca auto-connect wiring", () => {
 
       const recovered = errorKind === "omni-auth";
       assert.equal((await requested).ok, recovered);
-      assert.deepEqual(
-        h.calls.arcaConsentRuns,
-        recovered ? [{ serverUrl: workspace, options: undefined }] : [],
-      );
+      assert.equal(h.calls.arcaConsentRuns.length, recovered ? 1 : 0);
+      if (recovered) {
+        assert.equal(h.calls.arcaConsentRuns[0].serverUrl, workspace);
+        assert.equal(h.calls.arcaConsentRuns[0].options.signInFirst, true);
+      }
       assert.deepEqual(h.calls.arcaSetups, []);
       assert.deepEqual(h.calls.arcaConnects, recovered ? [workspace, workspace] : [workspace]);
+    });
+  }
+
+  for (const errorKind of ["omni-auth", "timeout"]) {
+    it(`signs in first on Connect only after a finished passive ${errorKind}`, async (t) => {
+      let attempts = 0;
+      const h = loadNavigationHarness({
+        serverUrl: workspace,
+        databricksMode: "browser",
+        internalFeatures: true,
+        arcaPath,
+        arcaConsentResult: { ok: true },
+        arcaResult: () =>
+          ++attempts === 1 ? { ok: false, errorKind, error: "Connect failed." } : { ok: true },
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      enableFeature(h);
+      await h.api.loadServerUrl(h.win, workspace);
+      await until(() => h.calls.arcaConnects.length === 1, "passive Arca connection");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      await h.ipc.get("omnigent:arca-connect")({
+        sender: h.webContents,
+        senderFrame: { url: workspace },
+      });
+      assert.equal(h.calls.arcaConsentRuns.length, 1);
+      assert.equal(h.calls.arcaConsentRuns[0].serverUrl, workspace);
+      assert.equal(h.calls.arcaConsentRuns[0].options.signInFirst, errorKind === "omni-auth");
     });
   }
 
