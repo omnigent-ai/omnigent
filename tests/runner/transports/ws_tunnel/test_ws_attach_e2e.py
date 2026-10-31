@@ -35,8 +35,10 @@ from omnigent.runner.transports.ws_tunnel.serve import (
 )
 from omnigent.server._runner_ws_tunnel import (
     DirectAttachEndpoint,
+    RunnerUnavailableWSError,
     _TunneledWSConn,
     make_direct_attach_resolver,
+    make_tunnel_ws_factory,
 )
 
 
@@ -346,3 +348,11 @@ async def test_direct_attach_resolver_misses_resolve_to_none() -> None:
         )
     finally:
         registry.deregister("runner-direct-2")
+
+
+def test_tunnel_ws_factory_reports_runner_tunnel_dropped_after_routing_as_unavailable() -> None:
+    """A tunnel lost between routing and lookup is retryable, not an internal error."""
+    factory = make_tunnel_ws_factory(_StubRouter("runner-offline"), TunnelRegistry())
+
+    with pytest.raises(RunnerUnavailableWSError):
+        factory("/v1/sessions/conv1/resources/terminals/terminal_pi_main/attach")

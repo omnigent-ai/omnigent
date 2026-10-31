@@ -29,13 +29,15 @@ from starlette.websockets import WebSocketDisconnect
 
 from omnigent.entities import Conversation, SessionPermission
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     _globals,
     set_runner_client,
     set_runner_router,
     set_runner_ws_factory,
 )
-from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
+from omnigent.server._runner_ws_tunnel import make_tunnel_ws_factory
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -43,6 +45,7 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
 )
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
 from omnigent.terminals.ws_common import WS_CLOSE_WRONG_REPLICA
@@ -113,12 +116,13 @@ class _StubConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
-    def add(self, conversation_id: str) -> None:
+    def add(self, conversation_id: str, **fields: Any) -> None:
         self._conversations[conversation_id] = Conversation(
             id=conversation_id,
             created_at=0,
             updated_at=0,
             root_conversation_id=conversation_id,
+            **fields,
         )
 
 
@@ -559,18 +563,40 @@ async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:
     assert interactive_factory.calls == []
 
 
-async def test_attach_terminal_wrong_replica_closes_with_retry_code(app: FastAPI) -> None:
+@pytest.mark.parametrize(
+    ("host_live_elsewhere", "expected_code"),
+    [(True, WS_CLOSE_WRONG_REPLICA), (False, 1013)],
+    ids=["wrong_replica", "runner_tunnel_not_connected"],
+)
+async def test_attach_terminal_absent_runner_tunnel_closes_with_retry_code(
+    app: FastAPI, host_live_elsewhere: bool, expected_code: int
+) -> None:
     """
-    A wrong-replica routing miss closes with the retryable code so the browser
-    re-dials without its slice key instead of reporting the runner offline.
+    A pinned runner whose tunnel is absent closes with a code the browser
+    retries instead of the dead-end internal error: 4400 re-dials without the
+    slice key when the host lives on another replica, and 1013 re-dials with
+    backoff while the runner reconnects.
 
     :param app: The FastAPI app fixture.
+    :param host_live_elsewhere: Whether the session's host is live on
+        another replica.
+    :param expected_code: The close code the browser must receive.
     """
 
-    def factory(path: str):
-        raise WrongReplicaWSError(f"tunnel for {path} lives on another replica")
+    class _HostLiveness:
+        def is_online(self, host_id: str) -> bool:
+            return host_live_elsewhere
 
-    set_runner_ws_factory(factory)
+    conversations = _StubConversationStore()
+    conversations.add("conv_ws", runner_id="runner_reconnecting", host_id="host_ws")
+    tunnels = TunnelRegistry()
+    router = RunnerRouter(
+        registry=tunnels,
+        conversation_store=conversations,
+        host_registry=HostRegistry(),
+        host_store=_HostLiveness(),
+    )
+    set_runner_ws_factory(make_tunnel_ws_factory(router, tunnels))
 
     with (
         TestClient(app).websocket_connect(
@@ -580,7 +606,7 @@ async def test_attach_terminal_wrong_replica_closes_with_retry_code(app: FastAPI
     ):
         ws.receive_bytes()
 
-    assert exc_info.value.code == WS_CLOSE_WRONG_REPLICA
+    assert exc_info.value.code == expected_code
 
 
 async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> None:
