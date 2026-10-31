@@ -26,6 +26,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
     )
     assert flags.frontend_dict() == {
         "sandbox_profiles": False,
+        "workspace_upload": False,
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
