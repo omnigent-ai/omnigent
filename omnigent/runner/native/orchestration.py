@@ -25,7 +25,7 @@ import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypedDict
 
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1959,7 +1959,7 @@ async def _auto_create_opencode_terminal(
             session_key="main",
             resource_role=OPENCODE_NATIVE_TERMINAL_ROLE,
             parent_os_env=agent_os_env,
-            additional_read_roots=_agent_skill_roots(agent_spec),
+            **_agent_skill_root_kwargs(agent_spec),
             spec=TerminalEnvSpec(
                 os_env=OSEnvSpec(
                     type="caller_process",
@@ -2845,7 +2845,7 @@ async def _auto_create_pi_terminal(
         session_key="main",
         resource_role=PI_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -3272,7 +3272,7 @@ async def _auto_create_cursor_terminal(
         session_key="main",
         resource_role=CURSOR_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -3485,7 +3485,7 @@ async def _auto_create_goose_terminal(
         session_key="main",
         resource_role=GOOSE_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -3754,7 +3754,7 @@ async def _auto_create_hermes_terminal(
         session_key="main",
         resource_role=HERMES_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -3920,7 +3920,7 @@ async def _auto_create_kiro_terminal(
         session_key="main",
         resource_role=KIRO_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -4152,7 +4152,7 @@ async def _auto_create_devin_terminal(
         session_key="main",
         resource_role=DEVIN_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -4517,7 +4517,7 @@ async def _auto_create_qwen_terminal(
         session_key="main",
         resource_role=QWEN_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -4746,7 +4746,7 @@ async def _auto_create_kimi_terminal(
         session_key="main",
         resource_role=KIMI_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -4974,7 +4974,7 @@ async def _launch_codex_native_tui(
         session_key="main",
         resource_role=CODEX_NATIVE_TERMINAL_ROLE,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -7784,6 +7784,18 @@ def _agent_skill_roots(agent_spec: AgentSpec | ResolvedSpec | None) -> list[Path
     return skill_resource_roots(getattr(spec, "skills", None) or ())
 
 
+class _SkillRootKwargs(TypedDict, total=False):
+    """The optional terminal-launch argument carrying an agent's skill directories."""
+
+    additional_read_roots: list[Path]
+
+
+def _agent_skill_root_kwargs(agent_spec: AgentSpec | ResolvedSpec | None) -> _SkillRootKwargs:
+    """``additional_read_roots`` for a terminal launch, omitted when no skills are bundled."""
+    roots = _agent_skill_roots(agent_spec)
+    return {"additional_read_roots": roots} if roots else {}
+
+
 def _is_runner_owned_codex_terminal(
     resource_registry: SessionResourceRegistry,
     resource: SessionResourceView,
@@ -9748,7 +9760,7 @@ async def _auto_create_claude_terminal(
             session_key="main",
             spec=env_spec,
             parent_os_env=agent_os_env,
-            additional_read_roots=_agent_skill_roots(agent_spec),
+            **_agent_skill_root_kwargs(agent_spec),
             # Mark this as the claude-native agent terminal so its pane
             # activity drives the session's PTY-derived working status.
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -9963,7 +9975,7 @@ async def _auto_create_repl_terminal(
         session_key=_REPL_TERMINAL_SESSION_KEY,
         spec=env_spec,
         parent_os_env=agent_os_env,
-        additional_read_roots=_agent_skill_roots(agent_spec),
+        **_agent_skill_root_kwargs(agent_spec),
         # Runner-private marker the attach WebSocket uses to recreate
         # this terminal when its tmux session has died (the REPL exited
         # or crashed) instead of rejecting the attach.
