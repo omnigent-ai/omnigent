@@ -1174,7 +1174,7 @@ describe("Arca auto-connect wiring", () => {
       enableFeature(h);
       await h.api.loadServerUrl(h.win, workspace);
       await until(() => h.calls.arcaConnects.length === 1, "passive Arca connection");
-      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise(setImmediate);
 
       await h.ipc.get("omnigent:arca-connect")({
         sender: h.webContents,
