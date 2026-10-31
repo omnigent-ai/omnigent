@@ -62,6 +62,7 @@ def test_a_databricks_deployment_gets_both_backends(workspace: Any) -> None:
     with _policy_client():
         backends = _build_routing_backends(cfg, _server_llm(), RoutingSettings())
     assert isinstance(backends.external, ExternalRoutingClient)
+    assert backends.external._router_name == "task_v3"
     assert isinstance(backends.local, LLMRoutingClient)
     # The primary every legacy consumer reads is the external client.
     assert backends.any() is backends.external
@@ -78,6 +79,7 @@ def test_an_explicit_external_provider_plus_an_llm_block_gets_both() -> None:
     with _policy_client():
         backends = _build_routing_backends(cfg, _server_llm(), RoutingSettings())
     assert isinstance(backends.external, ExternalRoutingClient)
+    assert backends.external._router_name == "task_v1"
     assert isinstance(backends.local, LLMRoutingClient)
 
 
