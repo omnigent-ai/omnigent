@@ -238,6 +238,8 @@ describe("useRunnerHealth", () => {
         finishOldPoll = resolve;
       }),
     );
+    const heard = vi.fn();
+    const unsubscribe = onRunnerHealthPolled(heard);
     const sessions = [input("conv_a")];
     const { result } = renderHook(() => useRunnerHealth(sessions));
     fetchMock.mockResolvedValueOnce(
@@ -249,6 +251,9 @@ describe("useRunnerHealth", () => {
       finishOldPoll(mockHealth({ conv_a: { runner_online: false, host_online: false } }));
     });
     expect(result.current.get("conv_a")?.host_online).toBe(true);
+    expect(heard).toHaveBeenCalledOnce();
+    expect(heard.mock.calls[0][0].get("conv_a")?.host_online).toBe(true);
+    unsubscribe();
   });
 
   it("polls nothing and stays empty when the session set is empty", async () => {
