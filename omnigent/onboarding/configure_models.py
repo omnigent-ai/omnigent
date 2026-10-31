@@ -163,6 +163,10 @@ _FAMILY_DEFAULT_BASE_URL: dict[str, str] = {
 _CATALOG_PROVIDER_FAMILY: dict[str, str] = {
     "anthropic": ANTHROPIC_FAMILY,
     "openai": OPENAI_FAMILY,
+    # MiniMax exposes an OpenAI-compatible Chat Completions API. Keep it as a
+    # first-class key provider so its native endpoint is selected instead of
+    # accidentally sending requests to api.openai.com.
+    "minimax": OPENAI_FAMILY,
     # ``gemini`` serves the Gemini surface (the antigravity harness drives the
     # SDK directly with a GEMINI_API_KEY).
     "gemini": GEMINI_FAMILY,
@@ -201,6 +205,7 @@ class _VendorEndpoint:
 # :func:`default_base_url_for_family` (and openai keeps the Responses default).
 _KEY_PROVIDER_ENDPOINT: dict[str, _VendorEndpoint] = {
     "openrouter": _VendorEndpoint("https://openrouter.ai/api/v1", CHAT_WIRE_API),
+    "minimax": _VendorEndpoint("https://api.minimax.io/v1", CHAT_WIRE_API),
     "groq": _VendorEndpoint("https://api.groq.com/openai/v1", CHAT_WIRE_API),
     "deepseek": _VendorEndpoint("https://api.deepseek.com", CHAT_WIRE_API),
     "xai": _VendorEndpoint("https://api.x.ai/v1", CHAT_WIRE_API),
@@ -256,6 +261,7 @@ def family_for_key_provider(provider: str) -> str:
 _PROVIDER_DISPLAY_NAME: dict[str, str] = {
     "openai": "OpenAI",
     "anthropic": "Anthropic",
+    "minimax": "MiniMax",
     "openrouter": "OpenRouter",
     "groq": "Groq",
     "deepseek": "DeepSeek",

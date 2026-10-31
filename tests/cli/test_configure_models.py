@@ -787,6 +787,21 @@ def test_provider_display_name_friendly(provider: str, expected: str) -> None:
     assert provider_display_name(provider) == expected
 
 
+def test_minimax_key_provider_uses_direct_chat_endpoint() -> None:
+    """MiniMax is routed to its own OpenAI-compatible endpoint."""
+    from omnigent.onboarding.configure_models import (
+        CHAT_WIRE_API,
+        family_for_key_provider,
+        key_provider_endpoint,
+    )
+
+    assert family_for_key_provider("minimax") == OPENAI_FAMILY
+    endpoint = key_provider_endpoint("minimax")
+    assert endpoint is not None
+    assert endpoint.base_url == "https://api.minimax.io/v1"
+    assert endpoint.wire_api == CHAT_WIRE_API
+
+
 def test_configure_models_add_subscription_via_flat_menu(isolated_config) -> None:
     """Picking "Claude — subscription" adds a subscription provider (cli=claude).
 
