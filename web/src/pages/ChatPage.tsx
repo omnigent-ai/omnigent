@@ -2100,6 +2100,8 @@ interface ComposerProps {
  * :param showModel: Whether to include ``/model`` (in-process sessions
  *     and claude-native, which both honor ``conv.model_override``; see
  *     the call site).
+ * :param showPermissions: Whether to include ``/permissions``, which opens
+ *     the codex-native approval-mode control in place of Codex's own popup.
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
@@ -2113,6 +2115,7 @@ export function buildSlashCommandMap(
   supportsModelReset = false,
   showMcp = false,
   showClear = false,
+  showPermissions = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2121,6 +2124,7 @@ export function buildSlashCommandMap(
     if (name === "/compact" && !showCompact) continue;
     if (name === "/mcp" && !showMcp) continue;
     if (name === "/clear" && !showClear) continue;
+    if (name === "/permissions" && !showPermissions) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2424,6 +2428,9 @@ function ComposerImpl(
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
+  // Bumped by "/permissions" on codex-native to open the approval-mode control
+  // instead of sending the command, which would open Codex's popup in its terminal.
+  const [permissionPickerOpenNonce, setPermissionPickerOpenNonce] = useState(0);
   // Single send-telemetry point (see submit()). Emitting here rather than via
   // the Button's componentId covers Enter-key sends too — a textarea Enter never
   // submits the form, so it would otherwise bypass the Button entirely.
@@ -2799,6 +2806,22 @@ function ComposerImpl(
     };
   }, [conversationId, replaceText]);
 
+  // An Arca send waits in the queue for the host, so typing reopens; other gates stay.
+  const inputDisabled =
+    ((disabled || (unreachable && !sendReconnectsArca)) && sendDisabledReason === null) ||
+    isReadOnly ||
+    composerLockedByBtw;
+  // A disabled textarea can't take focus, so the focus above is lost while the
+  // session starts. Focus it once it enables, unless the user focused something else.
+  const inputDisabledRef = useRef(inputDisabled);
+  useEffect(() => {
+    const wasDisabled = inputDisabledRef.current;
+    inputDisabledRef.current = inputDisabled;
+    if (!wasDisabled || inputDisabled || isMobileRef.current) return;
+    if (document.activeElement !== null && document.activeElement !== document.body) return;
+    textareaRef.current?.focus();
+  }, [inputDisabled]);
+
   // Publish edits as they happen so the open sidebar updates immediately,
   // rather than only learning about a draft when this composer unmounts.
   useEffect(() => {
@@ -2810,6 +2833,7 @@ function ComposerImpl(
   const hostOnline = useSessionHostOnline(composerSessionId ?? undefined);
   const {
     skills,
+    skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
   } = useSkills({
@@ -2876,6 +2900,7 @@ function ComposerImpl(
         supportsModelReset,
         composerSessionId !== null,
         showClear,
+        showCodexApprovalMode,
       ),
     [
       skills,
@@ -2888,6 +2913,7 @@ function ComposerImpl(
       supportsModelReset,
       composerSessionId,
       showClear,
+      showCodexApprovalMode,
     ],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
@@ -3268,6 +3294,27 @@ function ComposerImpl(
       case "/mcp":
         if (arg) setCommandError("Usage: /mcp");
         return true;
+      case "/permissions": {
+        // Claude's /permissions edits tool rules, not the mode, so it reaches the CLI.
+        if (!showCodexApprovalMode) return false;
+        if (arg) {
+          setCommandError("/permissions does not accept arguments");
+          return true;
+        }
+        if (!permissionControlInteractive || configBusy) {
+          setCommandError(
+            !isOwnerLevel(permissionLevel)
+              ? "Only the session owner can change the permission mode"
+              : "The permission mode can't be changed right now",
+          );
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        setPermissionPickerOpenNonce((n) => n + 1);
+        return true;
+      }
       case "/help": {
         const lines = Object.entries(slashCommands).map(([name, desc]) => `${name} — ${desc}`);
         setCommandError(lines.join("\n"));
@@ -3928,6 +3975,8 @@ function ComposerImpl(
             prCount={composerGit.prCount}
             prNumber={composerGit.prNumber}
             prNumberPrefix={composerGit.prNumberPrefix}
+            prs={composerGit.prs}
+            prStatus={composerGit.prStatus}
             onOpen={openComposerGithubTab}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
@@ -3992,11 +4041,7 @@ function ComposerImpl(
                         ? "Send a follow-up (queued) — Esc to stop"
                         : readyPlaceholder,
           rows: 1,
-          // An Arca send waits in the queue for the host, so typing reopens; other gates stay.
-          disabled:
-            ((disabled || (unreachable && !sendReconnectsArca)) && sendDisabledReason === null) ||
-            isReadOnly ||
-            composerLockedByBtw,
+          disabled: inputDisabled,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
@@ -4050,6 +4095,7 @@ function ComposerImpl(
                   builtinNames={slashCompletion.builtinNames}
                   labels={slashCompletion.labels}
                   skillsStatus={skillsStatus}
+                  skillsWarnings={skillsWarnings}
                   onRetrySkills={() => void refreshSkills()}
                   showMcpServers={showMcpServers}
                   mcpServers={mcpServers}
@@ -4223,6 +4269,7 @@ function ComposerImpl(
                       : "Only the session owner can change the permission mode"
                   }
                   onSelect={(mode) => void changePermission(mode)}
+                  openNonce={permissionPickerOpenNonce}
                 />
               )}
             </>
