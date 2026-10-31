@@ -51,6 +51,7 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.inner.harness_timeouts import timeout_seconds_from_env
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
@@ -128,9 +129,13 @@ _CONFIG_OPTION_MODEL = "model"
 _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
 
-# How long (seconds) to wait for qwen to respond to a JSON-RPC request
-# before treating the turn as timed out.
-_PROMPT_TIMEOUT_SECONDS = 300.0
+# Idle (time-without-progress) timeout for a prompt turn, in seconds. A slow
+# self-hosted model can emit nothing for minutes while it writes one large tool
+# call, so operators can raise this configurable idle deadline.
+_PROMPT_TIMEOUT_ENV = "HARNESS_QWEN_PROMPT_TIMEOUT_S"
+_PROMPT_TIMEOUT_SECONDS = timeout_seconds_from_env(_PROMPT_TIMEOUT_ENV, 300.0)
+
+# Idle timeout for the initial ACP handshake (initialize / session setup).
 _INIT_TIMEOUT_SECONDS = 30.0
 
 # ACP protocol version this executor targets.
