@@ -23,6 +23,7 @@ from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
     codex_home_for_bridge_dir,
 )
+from omnigent.util.json_types import JsonObject, JsonValue
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
 )
@@ -600,4 +601,65 @@ def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
         "on-failure",
         "-c",
         'approvals_reviewer="user"',
+    ]
+
+
+@pytest.mark.parametrize("field", ["approvalPolicy", "sandboxPolicy", "approvalsReviewer"])
+@pytest.mark.parametrize("value", [{}, [], None, 1, True, "unknown"])
+def test_codex_permission_launch_args_ignore_unsupported_settings(
+    field: str, value: JsonValue
+) -> None:
+    """Unknown settings cannot crash decoding or become permission flags."""
+    settings: JsonObject = {
+        "approvalPolicy": "on-failure",
+        "sandboxPolicy": {"type": "workspace-write"},
+        "approvalsReviewer": "user",
+    }
+    settings[field] = {"type": value} if field == "sandboxPolicy" else value
+
+    args = fwd._codex_terminal_launch_args_from_settings(settings)
+
+    assert args == (
+        ["--sandbox", "workspace-write", "--ask-for-approval", "on-failure"]
+        if field == "approvalsReviewer"
+        else None
+    )
+
+
+@pytest.mark.parametrize("source", ["resume", "settings_update"])
+async def test_object_approval_policy_preserves_settings_and_model_forwarding(source: str) -> None:
+    """An unsupported policy must not terminate resume or later model mirroring."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(
+        terminal_launch_args=["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+        approval_preset="read-only",
+    )
+    state.posted_terminal_launch_args = list(state.terminal_launch_args or [])
+    state.posted_approval_preset = state.approval_preset
+    settings: JsonObject = {
+        "model": "synthetic-model",
+        "approvalPolicy": {"reject": {"sandbox_approval": True}},
+        "sandboxPolicy": {"type": "workspace-write"},
+        "approvalsReviewer": "user",
+    }
+
+    if source == "resume":
+        state.note_resume_response({"result": settings})
+    else:
+        state.note_thread_settings_updated({"threadSettings": settings})
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    await fwd._sync_model_change(client, session_id="conv_x", forwarder_state=state)
+
+    assert state.terminal_launch_args == [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "on-request",
+    ]
+    assert state.approval_preset == "read-only"
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {"type": "external_model_change", "data": {"model": "synthetic-model"}},
+        )
     ]

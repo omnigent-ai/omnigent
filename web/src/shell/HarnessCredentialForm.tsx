@@ -58,7 +58,12 @@ export function HarnessCredentialForm({
   // (and persist) a cross-family key, e.g. an Anthropic key for Codex. Pi
   // consumes both families, so it can adopt an openai OR an anthropic key.
   const adoptFamilies = harnessCredentialAdoptFamilies(harness);
-  const adoptable = (detected ?? []).find((d) => d.env_var && adoptFamilies.includes(d.family));
+  const adoptable = (detected ?? []).find(
+    (credential) =>
+      credential.family !== "databricks" &&
+      credential.env_var &&
+      adoptFamilies.includes(credential.family),
+  );
 
   const [apiKey, setApiKey] = useState("");
   const [gatewayUrl, setGatewayUrl] = useState("");

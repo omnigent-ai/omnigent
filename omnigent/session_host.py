@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -23,6 +23,23 @@ def set_session_host(session_id: str, host_id: str | None) -> None:
 def get_session_host(session_id: str) -> str | None:
     """Return the last observed host, or None for an unknown or hostless session."""
     return _session_hosts.get(session_id)
+
+
+def session_routing_headers(url: str) -> dict[str, str]:
+    """Return the observed session owner's routing headers for HTTP or WS."""
+    parsed = urlsplit(url)
+    base_path, separator, route = parsed.path.partition("/v1/sessions/")
+    host_id = get_session_host(unquote(route.split("/")[0])) if separator else None
+    if host_id is None:
+        return {}
+    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
+    base_url = parsed._replace(scheme=scheme, path=base_path, query="", fragment="").geturl()
+    return databricks_request_headers(base_url, host_id=host_id)
+
+
+async def route_known_session_request(request: httpx.Request) -> None:
+    """Prefer an observed session owner over the caller's default host."""
+    request.headers.update(session_routing_headers(str(request.url)))
 
 
 async def route_session_request(request: httpx.Request) -> None:
