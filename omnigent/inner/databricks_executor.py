@@ -279,6 +279,8 @@ def databricks_bearer_token_command(
     host: str,
     profile: str | None = None,
     fallback_command: str | None = None,
+    *,
+    profile_from_env: bool = False,
 ) -> str:
     """Build the shell command a harness runs to mint a workspace bearer token.
 
@@ -291,7 +293,10 @@ def databricks_bearer_token_command(
     token --host`` then fails ("Use --profile to specify which profile") →
     empty token → 401. Host lookup is also how a pane and the server end up
     authenticating as *different* profiles for the same workspace, one of them
-    re-authed and the other not.
+    re-authed and the other not. A profile inherited from
+    ``DATABRICKS_CONFIG_PROFILE`` (``profile_from_env``) pins only the CLI mint:
+    the fallbacks select by host, as without a profile, so they keep the
+    environment's own credentials, which a profile-pinned SDK mint scrubs.
 
     **Refresh.** ``--force-refresh`` is attempted first: it renews a still-valid
     cached token, which is what keeps a long gateway session from hitting a
@@ -324,6 +329,8 @@ def databricks_bearer_token_command(
     :param fallback_command: Shell command printing a bearer token on stdout,
         run (before the databricks-sdk mint) when the profile above yields an
         empty token.
+    :param profile_from_env: Whether *profile* was inherited from
+        ``DATABRICKS_CONFIG_PROFILE`` rather than configured by the caller.
     :returns: Shell command that prints a bearer token on stdout.
     """
     # Fallbacks tried in order after the CLI mint, each only while the token is
@@ -331,6 +338,8 @@ def databricks_bearer_token_command(
     # first; the databricks-sdk mint is always the last resort so an M2M / OIDC /
     # PAT profile the U2M CLI can't mint still resolves — for every harness.
     fallbacks: list[str] = []
+    # An inherited profile keeps the fallbacks on host selection and ambient credentials.
+    fallback_profile = None if profile_from_env else profile
     if fallback_command is not None:
         fallbacks.append(fallback_command)
     else:
@@ -343,7 +352,7 @@ def databricks_bearer_token_command(
         # can be different users / service principals).
         from omnigent.host.databricks_credential import HOST_DATABRICKS_PROFILE
 
-        if profile == HOST_DATABRICKS_PROFILE:
+        if fallback_profile == HOST_DATABRICKS_PROFILE:
             try:
                 from omnigent.host.databricks_credential import broker_token_command
 
@@ -353,7 +362,7 @@ def databricks_bearer_token_command(
                 broker = None
             if broker is not None:
                 fallbacks.append(broker)
-    fallbacks.append(_databricks_sdk_token_command(host, profile))
+    fallbacks.append(_databricks_sdk_token_command(host, fallback_profile))
 
     selector = (
         f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
