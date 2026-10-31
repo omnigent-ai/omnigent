@@ -697,6 +697,59 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.deepEqual(lookups, [], "eligible subresources add no DNS lookups");
   });
 
+  it("revokes loopback requests and worker access before the blank page commits", async () => {
+    const { registry, idOf } = makeNetworkGuardRegistry({
+      allowsLocalhost: (context) => context?.hostIsThisMachine === true,
+    });
+    const context = { hostIsThisMachine: true };
+    registry.openOrNavigate("local", "https://example.com/", undefined, {
+      agent: true,
+      agentContext: context,
+    });
+    const entry = registry.get("local");
+    let commitBlank;
+    entry.view.webContents.loadURL = (url) => {
+      assert.equal(url, "about:blank");
+      return new Promise((resolve) => {
+        commitBlank = resolve;
+      });
+    };
+    const revocation = registry.revokeAgentView("local");
+    assert.equal(context.revoked, true);
+    assert.equal(entry.agentContext, context, "blank navigation is still pending");
+    const partition = agentPartition("w-test", "local");
+    try {
+      await Promise.all(
+        [idOf("local"), undefined].flatMap((webContentsId) =>
+          ["xhr", "webSocket"].map(async (resourceType) => {
+            const request = {
+              webContentsId,
+              resourceType,
+              url: `${resourceType === "webSocket" ? "ws" : "http"}://127.0.0.1:5173/x`,
+            };
+            assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
+            const response =
+              resourceType === "webSocket"
+                ? { ...request, statusCode: 101 }
+                : { ...request, ip: "127.0.0.1" };
+            assert.equal(await registry.shouldCancelAgentResponse(response, partition), true);
+          }),
+        ),
+      );
+      const publicWorker = {
+        resourceType: "xhr",
+        url: "https://example.com/asset",
+        ip: "93.184.215.14",
+      };
+      assert.equal(await registry.shouldCancelAgentRequest(publicWorker, partition), false);
+      assert.equal(await registry.shouldCancelAgentResponse(publicWorker, partition), false);
+    } finally {
+      commitBlank();
+      assert.deepEqual(await revocation, { ok: true });
+    }
+    assert.equal(entry.agentContext, null);
+  });
+
   it("refuses an agent first hop to a name that resolves to loopback", async () => {
     const { registry, lookups } = makeNetworkGuardRegistry();
     const verdict = await registry.checkAgentNavigation("conv_1", "http://lvh.me:8899/", null);
