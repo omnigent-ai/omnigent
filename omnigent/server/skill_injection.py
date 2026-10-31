@@ -9,7 +9,10 @@ caller sees rather than a skill silently missing from the menu.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from omnigent.entities import Agent, InstalledSkill
@@ -26,8 +29,7 @@ from omnigent.skills.limits import (
 from omnigent.skills.overlay import (
     SkillTarballError,
     UnpackedSize,
-    overlay_skills,
-    unpacked_size,
+    overlay_skills_within,
     validate_skill_tarball,
 )
 from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
@@ -40,6 +42,8 @@ _logger = logging.getLogger(__name__)
 
 # A user's own rows plus the org's, each capped at install time.
 MAX_DELIVERED_SKILLS = 2 * MAX_INSTALLED_PER_OWNER
+# Served bundles kept in memory across runner fetches.
+OVERLAY_CACHE_BYTES = 256 * 1024 * 1024
 
 
 class SkillDeliveryError(Exception):
@@ -103,6 +107,51 @@ def skill_allowed(spec: AgentSpec | None, name: str) -> bool:
     return True
 
 
+class _OverlayCache:
+    """Served bundles by everything that decides their bytes, least recently used out first.
+
+    A runner fetches a session's bundle on every start and reconnect; the
+    merge decompresses the agent bundle and every skill, so it is done once
+    per distinct input set. The key holds the agent bundle's digest and each
+    skill's row id and artifact key, which is unique to one write, so any
+    change to the bundle or to the installed set is a different entry.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max_bytes
+        self._entries: OrderedDict[tuple[object, ...], bytes] = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple[object, ...]) -> bytes | None:
+        with self._lock:
+            value = self._entries.get(key)
+            if value is not None:
+                self._entries.move_to_end(key)
+            return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0
+
+    def put(self, key: tuple[object, ...], value: bytes) -> None:
+        if len(value) > self._max_bytes // 4:
+            return
+        with self._lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._bytes -= len(old)
+            self._entries[key] = value
+            self._bytes += len(value)
+            while self._bytes > self._max_bytes:
+                _, evicted = self._entries.popitem(last=False)
+                self._bytes -= len(evicted)
+
+
+_overlay_cache = _OverlayCache(OVERLAY_CACHE_BYTES)
+
+
 def with_installed_skills(
     bundle_bytes: bytes,
     *,
@@ -120,28 +169,55 @@ def with_installed_skills(
     skill whose repository the server's policy no longer allows.
 
     A name the runner's spec validator refuses is skipped, since one invalid
-    skill would fail the whole spec.
+    skill would fail the whole spec. When the agent's own files leave too
+    little room under what a runner unpacks, the skills that do not fit are
+    left out with a warning rather than failing the session. The result is
+    cached per input set (see :class:`_OverlayCache`).
 
     :param target: The spec the session runs and its directory in the bundle;
         ``None`` means the root agent with no filter.
     :raises SkillDeliveryError: When the skills exceed :data:`MAX_DELIVERED_SKILLS`,
-        :data:`MAX_DELIVERY_BYTES` or :data:`MAX_DELIVERY_ENTRIES` together, or
-        the merged bundle would exceed what a runner unpacks.
+        :data:`MAX_DELIVERY_BYTES` or :data:`MAX_DELIVERY_ENTRIES` together.
     """
     target = target or SessionTarget(None, "")
     installed = effective_installed_skills(skill_store, owner_id, policy=policy)
     reserved = {skill.name for skill in getattr(target.spec, "skills", None) or []}
-    accepted: list[tuple[str, bytes]] = []
-    total = UnpackedSize(0, 0)
+    selected: list[InstalledSkill] = []
     for skill in installed:
         if not skill_allowed(target.spec, skill.name) or skill.name in reserved:
             continue
         if not is_valid_skill_name(skill.name):
             _logger.warning("skipping installed skill %r (%s): invalid name", skill.name, skill.id)
             continue
+        selected.append(skill)
+    if not selected:
+        return bundle_bytes
+    # Rows carry their unpacked size, so the backstop needs no artifact read.
+    total = UnpackedSize(0, 0)
+    for skill in selected:
+        total += UnpackedSize(skill.bundle_bytes, skill.bundle_entries)
+    if total.bytes > MAX_DELIVERY_BYTES or total.entries > MAX_DELIVERY_ENTRIES:
+        raise SkillDeliveryError(
+            f"Installed skills exceed {MAX_DELIVERY_BYTES // (1024 * 1024)} MB or "
+            f"{MAX_DELIVERY_ENTRIES} files together; disable or remove some in "
+            "Settings → Skills."
+        )
+    limit = UnpackedSize(RUNNER_UNPACK_BYTES, RUNNER_UNPACK_ENTRIES)
+    key = (
+        hashlib.sha256(bundle_bytes).hexdigest(),
+        target.prefix,
+        tuple(sorted(reserved)),
+        tuple((skill.id, skill.name, skill.bundle_location) for skill in selected),
+        limit,
+    )
+    cached = _overlay_cache.get(key)
+    if cached is not None:
+        return cached
+    accepted: list[tuple[str, bytes]] = []
+    for skill in selected:
         try:
             tarball = artifact_store.get(skill.bundle_location)
-            size = validate_skill_tarball(tarball)
+            validate_skill_tarball(tarball)
         except (SkillTarballError, OSError, KeyError, ValueError):
             _logger.warning(
                 "skipping installed skill %s (%s): unreadable tarball",
@@ -150,33 +226,26 @@ def with_installed_skills(
                 exc_info=True,
             )
             continue
-        total += size
-        if total.bytes > MAX_DELIVERY_BYTES or total.entries > MAX_DELIVERY_ENTRIES:
-            raise SkillDeliveryError(
-                f"Installed skills exceed {MAX_DELIVERY_BYTES // (1024 * 1024)} MB or "
-                f"{MAX_DELIVERY_ENTRIES} files together; disable or remove some in "
-                "Settings → Skills."
-            )
         accepted.append((skill.name, tarball))
-    if accepted:
-        try:
-            merged = unpacked_size(bundle_bytes) + total
-        except SkillTarballError:
-            # Not a readable archive: the overlay below falls back to serving it as is.
-            merged = total
-        if merged.bytes > RUNNER_UNPACK_BYTES or merged.entries > RUNNER_UNPACK_ENTRIES:
-            raise SkillDeliveryError(
-                "This agent's files and its installed skills together exceed what a "
-                f"session can unpack ({RUNNER_UNPACK_BYTES // (1024 * 1024)} MB, "
-                f"{RUNNER_UNPACK_ENTRIES} files); disable or remove some in Settings → Skills."
-            )
     try:
-        return overlay_skills(bundle_bytes, accepted, reserved=reserved, prefix=target.prefix)
+        merged, skipped = overlay_skills_within(
+            bundle_bytes, accepted, reserved=reserved, prefix=target.prefix, limit=limit
+        )
     except SkillTarballError:
         _logger.warning(
             "could not overlay installed skills; serving the bundle as is", exc_info=True
         )
         return bundle_bytes
+    if skipped:
+        _logger.warning(
+            "left installed skills %s out of a session's bundle: with the agent's own "
+            "files they exceed what a runner unpacks (%d MB, %d files)",
+            ", ".join(skipped),
+            RUNNER_UNPACK_BYTES // (1024 * 1024),
+            RUNNER_UNPACK_ENTRIES,
+        )
+    _overlay_cache.put(key, merged)
+    return merged
 
 
 def effective_installed_skills(

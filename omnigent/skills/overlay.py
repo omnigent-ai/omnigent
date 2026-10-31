@@ -136,10 +136,32 @@ def overlay_skills(
     :param prefix: Where the session's spec lives: ``""`` for the root agent,
         ``agents/<dir>/`` for a child, which the runner reads instead of the root.
     """
+    return overlay_skills_within(bundle_bytes, skills, reserved=reserved, prefix=prefix)[0]
+
+
+def overlay_skills_within(
+    bundle_bytes: bytes,
+    skills: Sequence[tuple[str, bytes]],
+    *,
+    reserved: Collection[str] = (),
+    prefix: str = "",
+    limit: UnpackedSize | None = None,
+) -> tuple[bytes, list[str]]:
+    """:func:`overlay_skills`, adding only the skills that keep the result within *limit*.
+
+    The agent's own files are counted as they are copied, so the bundle is
+    read once; a skill that would take the unpacked total past *limit* is
+    left out, and later, smaller ones may still fit.
+
+    :param limit: What the merged bundle may unpack to, or ``None`` for no bound.
+    :returns: The bundle, and the names left out for the limit, in *skills* order.
+    """
     if not skills:
-        return bundle_bytes
+        return bundle_bytes, []
     lead = _prefix_parts(prefix)
     present = bundle_skill_names(bundle_bytes, prefix=prefix) | set(reserved)
+    used = UnpackedSize(0, 0)
+    skipped: list[str] = []
     out = io.BytesIO()
     with (
         _open(bundle_bytes) as src,
@@ -147,11 +169,17 @@ def overlay_skills(
         tarfile.open(fileobj=packed, mode="w") as dst,
     ):
         for member in src:
+            used += UnpackedSize(member.size if member.isfile() else 0, 1)
             dst.addfile(member, src.extractfile(member) if member.isfile() else None)
         for name, data in skills:
             if name in present:
                 continue
-            validate_skill_tarball(data)
+            size = validate_skill_tarball(data)
+            after = used + size
+            if limit is not None and (after.bytes > limit.bytes or after.entries > limit.entries):
+                skipped.append(name)
+                continue
+            used = after
             with _open(data) as skill:
                 for member in skill:
                     rel = PurePosixPath(member.name)
@@ -167,4 +195,4 @@ def overlay_skills(
                     copied.type = member.type
                     dst.addfile(copied, skill.extractfile(member) if member.isfile() else None)
             present.add(name)
-    return out.getvalue()
+    return out.getvalue(), skipped

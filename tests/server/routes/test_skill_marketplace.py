@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import tarfile
 import threading
 from dataclasses import replace
@@ -670,7 +671,7 @@ async def test_installs_are_capped_per_owner_and_delivery_is_bounded(
 
 @pytest.mark.asyncio
 async def test_installs_and_delivery_hold_to_what_a_runner_unpacks(
-    market, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    market, db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The runner unpacks a session's bundle within fixed byte and entry limits;
     # a set of skills past them stopped every session from starting.
@@ -700,15 +701,53 @@ async def test_installs_and_delivery_hold_to_what_a_runner_unpacks(
         )
     ).status_code == 201
 
-    # The agent's own files count too: the merged bundle must still unpack.
+    # The agent's own files count too. When they leave too little room, the
+    # skills that do not fit are left out with a warning; the session still starts.
     session_id = _bind_session(
         db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
     )
     url = f"/v1/sessions/{session_id}/agent/contents"
-    assert (await client.get(url)).status_code == 200
+    served = _names((await client.get(url)).content)
+    assert {"skills/review/SKILL.md", "skills/triage/SKILL.md"} <= set(served)
     monkeypatch.setattr(skill_injection, "RUNNER_UNPACK_ENTRIES", 4)
-    refused = await client.get(url)
-    assert refused.status_code == 400 and "exceed what a session can unpack" in refused.text
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.skill_injection"):
+        trimmed = await client.get(url)
+    assert trimmed.status_code == 200
+    names = _names(trimmed.content)
+    assert "config.yaml" in names and "skills/review/SKILL.md" in names
+    assert "skills/triage/SKILL.md" not in names
+    assert any("left installed skills triage out" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_served_bundle_is_merged_once_per_input_set(market, db_uri: str) -> None:
+    # Every runner fetch rebuilt the archive, decompressing the agent bundle and
+    # every installed skill again.
+    client, app, artifact_store = market
+    installed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
+    url = f"/v1/sessions/{session_id}/agent/contents"
+    location = await _location(app, installed.json()["data"][0]["id"])
+    reads: list[str] = []
+    real_get = artifact_store.get
+
+    def counting_get(key: str) -> bytes | None:
+        reads.append(key)
+        return real_get(key)
+
+    artifact_store.get = counting_get  # type: ignore[method-assign]
+    first = (await client.get(url)).content
+    second = (await client.get(url)).content
+    assert first == second and reads.count(location) == 1
+    # A change to the installed set is a new merge.
+    skill_id = installed.json()["data"][0]["id"]
+    await client.patch(f"/v1/installed-skills/{skill_id}", json={"enabled": False})
+    assert "skills/review/SKILL.md" not in _names((await client.get(url)).content)
+    artifact_store.get = real_get  # type: ignore[method-assign]
 
 
 @pytest.mark.asyncio
@@ -913,7 +952,11 @@ def test_served_bundle_carries_the_owners_enabled_skills(db_uri: str, tmp_path: 
         "skills/shared/SKILL.md",
         "skills/team/deep/SKILL.md",
     ]
-    # An unreadable tarball drops only that skill.
+    # An unreadable tarball drops only that skill. It was rewritten in place,
+    # which a real install never does, so the served-bundle cache is cleared.
+    from omnigent.server import skill_injection
+
+    skill_injection._overlay_cache.clear()
     artifacts.put("skills/shared.tar.gz", b"not a tarball")
     merged = with_installed_skills(
         bundle, owner_id="alice", skill_store=store, artifact_store=artifacts

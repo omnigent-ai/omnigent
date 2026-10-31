@@ -78,8 +78,11 @@ include them.
   transaction, so a check is one locked read and two requests cannot overrun
   the budget on any engine. An install of several skills is all or nothing.
   Delivery keeps a backstop that answers with a message rather than a
-  thinner bundle, including when the agent's files and its skills together
-  would exceed what the runner unpacks.
+  thinner bundle. An agent whose own files are larger than their fifth is
+  still started: the installed skills that no longer fit beside it are left
+  out of that session's bundle, with a warning in the server log. A served
+  bundle is merged once per agent bundle and installed set and then reused,
+  so runner restarts and reconnects do not rebuild it.
 - A session that runs a child agent gets installed skills under that child's
   own directory (`agents/<dir>/skills/`), under the child's `skills:` filter,
   since that is where the runner reads the child's skills from.
