@@ -4058,6 +4058,10 @@ class SessionCreatedEvent(_SSEEventBase):
     parent_session_id: str | None = None
 
 
+# Why a session's work moved to another session (``session.superseded``).
+SupersessionReason = Literal["clear"]
+
+
 class SessionSupersededEvent(_SSEEventBase):
     """
     This conversation was superseded by another and clients should
@@ -4095,7 +4099,7 @@ class SessionSupersededEvent(_SSEEventBase):
     type: Literal["session.superseded"]
     conversation_id: str
     target_conversation_id: str
-    reason: Literal["clear"] = "clear"
+    reason: SupersessionReason = "clear"
 
 
 class SessionBtwSidechatEvent(_SSEEventBase):
