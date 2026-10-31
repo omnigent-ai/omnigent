@@ -55,6 +55,11 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
+import {
+  CHILD_SESSIONS_MAX_LIMIT,
+  childSessionsQueryKey,
+  useChildSessions,
+} from "@/hooks/useChildSessions";
 import type { Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import {
@@ -1421,6 +1426,23 @@ function SupportedForkSessionForm({
   const showConflictHint =
     (branchName.trim() === "" || usingSourceWorktree) && conflictingSessions.length > 0;
 
+  // In-flight sub-agents stay with the source — a clone never adopts them — so
+  // warn up front. Refetch on open (the cache may predate a child's turn start)
+  // and walk every page: an old running worker can sit behind newer idle ones.
+  useEffect(() => {
+    void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(sourceSessionId) });
+  }, [queryClient, sourceSessionId]);
+  const {
+    children: sourceChildren,
+    isLoading: sourceChildrenLoading,
+    isFetching: sourceChildrenFetching,
+    error: sourceChildrenError,
+  } = useChildSessions(sourceSessionId, null, { limit: CHILD_SESSIONS_MAX_LIMIT, allPages: true });
+  // A refetch of a cached list is still a check in progress: stale data must
+  // not read as "nothing running".
+  const checkingSubagents = sourceChildrenLoading || (sourceChildrenFetching ?? false);
+  const runningSubagentCount = sourceChildren.filter((child) => child.busy).length;
+
   // On a DIFFERENT host than the source nothing prefills the directory, so it
   // must be picked: show it at the top level instead of inside Advanced. On
   // the source host it stays under Advanced (the prefill needs no input).
@@ -2086,6 +2108,42 @@ function SupportedForkSessionForm({
                   Advanced settings to work in an isolated copy.
                 </>
               )}
+            </span>
+          </p>
+        )}
+
+        {checkingSubagents && sourceChildrenError === null && (
+          <p
+            className="text-sm text-muted-foreground"
+            data-testid="fork-session-subagent-check-pending"
+          >
+            Checking whether sub-agents are still running in the original session…
+          </p>
+        )}
+
+        {sourceChildrenError !== null && (
+          <p
+            className="flex items-start gap-1.5 text-sm text-muted-foreground"
+            data-testid="fork-session-subagent-check-failed"
+          >
+            <InfoIcon className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              Couldn't check whether sub-agents are still running in the original session. Any that
+              are stay with it, so their results will arrive there, not in the clone.
+            </span>
+          </p>
+        )}
+
+        {runningSubagentCount > 0 && (
+          <p
+            className="flex items-start gap-1.5 text-sm text-warning"
+            data-testid="fork-session-subagent-hint"
+          >
+            <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              {runningSubagentCount === 1
+                ? "1 sub-agent is still running. It stays with the original session, so its result will arrive there, not in the clone."
+                : `${runningSubagentCount} sub-agents are still running. They stay with the original session, so their results will arrive there, not in the clone.`}
             </span>
           </p>
         )}
