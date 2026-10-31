@@ -162,9 +162,8 @@ export interface OmnigentHostConfig {
    */
   cliServerUrlSuffix?: string;
   /**
-   * Optional URL to the host's own appearance/theme settings. When the host
-   * owns light/dark (the embed's own switcher is hidden), the settings screen
-   * links here so users can find where to change it. Omitted standalone.
+   * Optional URL to the host's appearance settings, linked beside the browser
+   * embed's automatic theme option. Omitted standalone and hidden in Electron.
    */
   themeSettingsUrl?: string;
   /**

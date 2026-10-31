@@ -45,7 +45,7 @@ export function FileMentionMenu({
   if (entries.length === 0 && !loading) return null;
 
   return (
-    <div className="absolute bottom-full left-0 z-10 mb-2 flex items-end gap-2">
+    <div className="absolute bottom-full left-0 z-30 mb-2 flex items-end gap-2">
       <div
         data-testid="file-mention-menu"
         className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
