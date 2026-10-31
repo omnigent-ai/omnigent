@@ -1745,12 +1745,16 @@ def create_app(
         )
         pr_reports.install(reporter)
         try:
+            await _app.state.workspace_uploads.start()
             with monitor_event_loop(process_role="runner"):
                 yield
         finally:
             pr_reports.install(None)
             await reporter.aclose()
-            await _stop_pm()
+            try:
+                await _app.state.workspace_uploads.stop()
+            finally:
+                await _stop_pm()
 
     app.router.lifespan_context = _lifespan
     return app
