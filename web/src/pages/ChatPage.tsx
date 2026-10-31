@@ -2100,7 +2100,7 @@ interface ComposerProps {
  *     and claude-native, which both honor ``conv.model_override``; see
  *     the call site).
  * :param showPermissions: Whether to include ``/permissions``, which opens
- *     the composer's permission control, so only sessions showing one.
+ *     the codex-native approval-mode control in place of Codex's own popup.
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
@@ -2427,8 +2427,8 @@ function ComposerImpl(
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
-  // Bumped by "/permissions" to open the permission control instead of sending
-  // the command, which would open the vendor's own selector in its terminal.
+  // Bumped by "/permissions" on codex-native to open the approval-mode control
+  // instead of sending the command, which would open Codex's popup in its terminal.
   const [permissionPickerOpenNonce, setPermissionPickerOpenNonce] = useState(0);
   // Single send-telemetry point (see submit()). Emitting here rather than via
   // the Button's componentId covers Enter-key sends too — a textarea Enter never
@@ -2883,7 +2883,7 @@ function ComposerImpl(
         supportsModelReset,
         composerSessionId !== null,
         showClear,
-        showClaudePermissionMode || showCodexApprovalMode,
+        showCodexApprovalMode,
       ),
     [
       skills,
@@ -2896,7 +2896,6 @@ function ComposerImpl(
       supportsModelReset,
       composerSessionId,
       showClear,
-      showClaudePermissionMode,
       showCodexApprovalMode,
     ],
   );
@@ -3274,7 +3273,8 @@ function ComposerImpl(
         if (arg) setCommandError("Usage: /mcp");
         return true;
       case "/permissions": {
-        if (!showClaudePermissionMode && !showCodexApprovalMode) return false;
+        // Claude's /permissions edits tool rules, not the mode, so it reaches the CLI.
+        if (!showCodexApprovalMode) return false;
         if (arg) {
           setCommandError("/permissions does not accept arguments");
           return true;

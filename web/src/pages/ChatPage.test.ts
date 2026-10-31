@@ -1411,7 +1411,7 @@ describe("buildSlashCommandMap", () => {
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
   });
 
-  it("includes /permissions only for sessions with a permission control", () => {
+  it("includes /permissions only when showPermissions is true (codex-native)", () => {
     expect(buildSlashCommandMap([], true, true)["/permissions"]).toBeUndefined();
     expect(
       buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
