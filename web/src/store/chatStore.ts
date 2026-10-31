@@ -1111,6 +1111,9 @@ export interface ConversationState {
 export interface SideChatComposerDraft {
   settings?: SideChatModelSettings;
   starting?: boolean;
+  /** Focus the input once it accepts text; set by a `+` that opened the tab,
+   *  consumed by the composer. */
+  autoFocus?: boolean;
   quotes?: ReplyQuote[];
   text: string;
   files: File[];
@@ -1217,6 +1220,8 @@ export interface ChatActions {
     childSessionId: string,
     mutate: (current: SideChatComposerDraft) => SideChatComposerDraft,
   ) => void;
+  /** Ask a side chat's composer to take focus once it accepts text. */
+  requestSideChatFocus: (childSessionId: string) => void;
   /** Drop a side chat's unsent composer state (sent, or the tab was closed). */
   clearSideChatComposer: (childSessionId: string) => void;
   /**
@@ -2555,6 +2560,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         [childSessionId]: mutate(s.sideChatComposers[childSessionId] ?? EMPTY_SIDE_CHAT_COMPOSER),
       },
     }));
+  },
+  requestSideChatFocus: (childSessionId) => {
+    useChatStore
+      .getState()
+      .updateSideChatComposer(childSessionId, (current) => ({ ...current, autoFocus: true }));
   },
   clearSideChatComposer: (childSessionId) => {
     useChatStore.setState((s) => {

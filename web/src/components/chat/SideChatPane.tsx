@@ -98,6 +98,18 @@ function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
 }
 
+const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
+
+/** A text field other than `own`: typing there must not be interrupted by a focus request. */
+function isOtherTextInput(target: EventTarget | null, own: HTMLElement | null): boolean {
+  if (!(target instanceof HTMLElement) || target === own) return false;
+  if (target instanceof HTMLInputElement) return TEXT_INPUT_TYPES.has(target.type);
+  return (
+    target instanceof HTMLTextAreaElement ||
+    target.matches('[contenteditable]:not([contenteditable="false"])')
+  );
+}
+
 // The forked-in item ids to hide are captured once per child and PERSISTED, so
 // leaving the tab (which unmounts this pane) or reloading doesn't recapture the
 // side chat's own completed turns as inherited history and blank the transcript.
@@ -659,6 +671,33 @@ function SideChatComposer({
   }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels, settingsSaving]);
 
   const ready = (pending ? !starting : agentId !== null) && !settingsSaving;
+  // A tab opened from a "+" is ready to type without a click. A live fork's
+  // input stays disabled until the child's agent binding arrives, so wait for it.
+  const autoFocus = composer?.autoFocus === true;
+  const dropFocusRequest = useCallback(() => {
+    // The tab may have been closed or its draft sent meanwhile; don't recreate it.
+    if (!useChatStore.getState().sideChatComposers[childId]) return;
+    updateComposer(childId, (current) => ({ ...current, autoFocus: false }));
+  }, [childId, updateComposer]);
+  useEffect(() => {
+    if (!autoFocus || !ready) return;
+    // The user may already be typing elsewhere, e.g. during a slow fork before
+    // this pane mounted; leave that field alone and just drop the request.
+    if (!isOtherTextInput(document.activeElement, tailTextareaRef.current)) {
+      tailTextareaRef.current?.focus();
+    }
+    dropFocusRequest();
+  }, [autoFocus, ready, dropFocusRequest]);
+  // Typing elsewhere while the fork binds cancels the request so focus is not
+  // pulled away later; a closing menu returning focus to its button does not.
+  useEffect(() => {
+    if (!autoFocus || ready) return;
+    const cancelOnOtherInput = (event: FocusEvent) => {
+      if (isOtherTextInput(event.target, tailTextareaRef.current)) dropFocusRequest();
+    };
+    document.addEventListener("focusin", cancelOnOtherInput);
+    return () => document.removeEventListener("focusin", cancelOnOtherInput);
+  }, [autoFocus, ready, dropFocusRequest]);
   const canSend =
     serializeReplyDraft({ quotes, text }).trim().length > 0 || (!pending && files.length > 0);
   const addFiles = (incoming: File[]) => {
