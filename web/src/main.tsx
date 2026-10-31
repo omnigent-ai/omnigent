@@ -25,10 +25,9 @@ import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
-  applyStoredUiFontSize,
-  applyUiFontFamily,
-  readUiFontFamily,
-} from "./lib/uiFontPreferences";
+  applyWebFontCapabilityFromServerInfo,
+  restoreFontPreferences,
+} from "./lib/restoreFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -93,10 +92,9 @@ applyMobileAppTargetAttribute();
 // can never float it — on any route, chat or auth. No-op off the iOS shell.
 hideNativeChatTerminalBar();
 
-// Apply saved font preferences before first paint. Without a saved size, CSS
-// keeps its viewport-specific default.
-applyStoredUiFontSize();
-applyUiFontFamily(readUiFontFamily());
+// Apply saved font CSS before first paint. Downloadable fonts wait for the
+// server capability probe below.
+restoreFontPreferences();
 
 // The standalone sidebar font size control was removed. Clear its legacy value
 // so sidebar items follow the shared desktop interface size.
@@ -131,7 +129,9 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
   useEffect(() => {
     let alive = true;
     void bootServerInfo.settled.then((resolved) => {
-      if (alive) setInfo(resolved);
+      if (!alive) return;
+      applyWebFontCapabilityFromServerInfo(resolved);
+      setInfo(resolved);
     });
     return () => {
       alive = false;
