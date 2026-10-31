@@ -20,7 +20,9 @@ default (``omnigent/inner/datamodel.py::AgentDef.async_enabled``),
 so agents that don't mention it still see the async surface and
 the same YAML produces the same tool list under Omnigent mode and the
 legacy path. Agents that explicitly want a minimal-tools surface
-declare ``async: false`` to suppress all three.
+declare ``async: false`` to suppress all three, except that a spec
+that can dispatch sub-agents keeps ``sys_read_inbox``: their results
+arrive only in the inbox.
 
 See ``designs/SERVER_HARNESS_CONTRACT.md`` §Async work + inbox
 for the protocol design and the rationale for the inbox-vs-poll
@@ -278,7 +280,8 @@ class SysReadInboxTool(Tool):
     matches.)
 
     Gated on ``async: true`` at the spec level (see
-    :class:`SysCallAsyncTool` docstring).
+    :class:`SysCallAsyncTool` docstring), except that a spec that can
+    dispatch sub-agents keeps it under ``async: false``.
     """
 
     @classmethod
