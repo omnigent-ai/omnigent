@@ -317,52 +317,33 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ForkSessionDialog", () => {
-  it.each<[string, string | null, Partial<ServerInfo> | undefined]>([
-    ["managed snapshot", null, undefined],
-    ["Databricks Sandbox host", "lakebox", undefined],
-    [
-      "Arclet host without an Arclet to fork onto",
-      "arclet",
-      { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox"] },
-    ],
-  ])(
-    "blocks the whole form for an unsupported source detected by %s",
-    async (source, provider, info) => {
-      useSessionMock.mockReturnValue({
-        session: {
-          hostId: "host_1",
-          labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
-        },
-        isLoading: false,
-        error: null,
-      } as ReturnType<typeof useSession>);
-      setHosts([host({ sandbox_provider: provider })]);
-      renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo", info });
+  it.each([
+    ["managed snapshot", null],
+    ["Arclet host", "arclet"],
+    ["Databricks Sandbox host", "lakebox"],
+  ])("offers every destination to a %s source", (source, provider) => {
+    useSessionMock.mockReturnValue({
+      session: {
+        hostId: "host_1",
+        labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useSession>);
+    setHosts([host({ sandbox_provider: provider }), host({ host_id: "host_2", name: "laptop" })]);
+    renderDialog({
+      sourceHostId: "host_1",
+      sourceWorkspace: "/Users/a/repo",
+      info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+    });
 
-      const submit = screen.getByTestId("fork-session-submit");
-      expect(submit).toBeDisabled();
-      expect(screen.getByRole("group", { name: "Clone session" })).toBe(submit.parentElement);
-      expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
-        "Forking this sandbox session is not supported yet.",
-      );
-      expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("fork-session-advanced-toggle")).not.toBeInTheDocument();
-      fireEvent.click(submit);
-      fireEvent.focus(submit.parentElement!);
-      fireEvent.keyDown(submit.parentElement!, { key: "Enter" });
-      await waitFor(() =>
-        expect(screen.getByRole("tooltip")).toHaveTextContent(
-          "Forking this sandbox session is not supported yet.",
-        ),
-      );
-      expect(submit.parentElement).toHaveAccessibleDescription(
-        "Forking this sandbox session is not supported yet.",
-      );
-      expect(forkSessionMock).not.toHaveBeenCalled();
-      expect(launchRunnerMock).not.toHaveBeenCalled();
-      expect(checkHostDirectoryMock).not.toHaveBeenCalled();
-    },
-  );
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+    expect(screen.getByTestId("fork-session-connect-host-toggle")).toBeInTheDocument();
+    openHostSelect();
+    expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
+    expect(screen.getByTestId("fork-session-sandbox-option")).toBeInTheDocument();
+    expect(screen.getByTestId("fork-session-sandbox-option-arclet")).toBeInTheDocument();
+  });
 
   it("does not expose an actionable form before the source snapshot resolves", () => {
     useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
@@ -1199,25 +1180,6 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-disabled", "true");
       expect(screen.getByTestId("connect-host-command")).toBeVisible();
       expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
-    });
-
-    it("explains that a sandbox-only source can't continue in a host directory", () => {
-      useSessionMock.mockReturnValue({
-        session: { hostId: "host_1", labels: {} },
-        isLoading: false,
-        error: null,
-      } as unknown as ReturnType<typeof useSession>);
-      setHosts([host({ sandbox_provider: "arclet" })]);
-      renderDialog({
-        ...RECOVERY,
-        info: { managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] },
-      });
-
-      expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
-        "This sandbox session can only be cloned onto a new sandbox.",
-      );
-      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
-      expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
     });
   });
 
@@ -2122,7 +2084,7 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     });
 
-    it("offers an Arclet source only a fresh Arclet and forks onto it", async () => {
+    it("forks an Arclet source onto a fresh Arclet beside the connected hosts", async () => {
       useSessionMock.mockReturnValue({
         session: {
           hostId: "host_1",
@@ -2134,31 +2096,28 @@ describe("ForkSessionDialog", () => {
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
-      // Both the source Arclet and another machine are online; neither is a target.
+      // The source Arclet is not a target, but another machine is.
       setHosts([host({ sandbox_provider: "arclet" }), host({ host_id: "host_2", name: "laptop" })]);
       forkSessionMock.mockResolvedValue({
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       renderDialog({
         ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+        info: { managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] },
       });
 
       await act(async () => {});
-      expect(screen.getByTestId("fork-session-sandbox-only-hint")).toHaveTextContent(
-        "This session can only be cloned onto a new Arclet Sandbox.",
-      );
-      expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
-      expect(screen.queryByTestId("fork-session-connect-host-toggle")).not.toBeInTheDocument();
-      // The only target is preselected, so the default state is submittable.
-      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Arclet Sandbox");
+      expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
       openHostSelect();
-      expect(screen.getAllByRole("option")).toHaveLength(1);
+      expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
       expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Arclet Sandbox");
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
       expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
 
+      // Picking the sandbox starts a repository-branch lookup that disables Clone until it settles.
+      await waitFor(() => expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled());
       fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await act(async () => {});
 
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
       expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {

@@ -44,10 +44,7 @@ import {
 import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
-import {
-  SESSION_ACTIONS_LOADING,
-  workspaceRecoveryDisabledReason,
-} from "@/lib/sessionCapabilities";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
@@ -140,8 +137,6 @@ const SAME_AS_SOURCE = "__same__";
 // their own `text-ui`, so the option font is shrunk via a descendant selector
 // on the dropdown content rather than plain inheritance.
 const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
-
-const NO_HOSTS: Host[] = [];
 
 /** Form fields that can block submit, mapped to the control a blocked click focuses. */
 type ForkField = "host" | "directory" | "sandboxRepo" | "sandboxProfile";
@@ -750,18 +745,12 @@ function ForkRunConfig({
  * @param onClose - Closes the host dialog (Cancel, and after a
  *   successful fork).
  */
-export function ForkSessionForm(
-  props: Omit<Parameters<typeof SupportedForkSessionForm>[0], "sandboxOnlyProvider">,
-) {
-  const { forkDisabledReason, forkSandboxProvider } = useSessionActionRestrictions(
-    props.sourceSessionId,
-    { hostId: props.sourceHostId },
-  );
-  const disabledReason =
-    forkDisabledReason ??
-    (props.workspaceRecovery ? workspaceRecoveryDisabledReason(forkSandboxProvider) : undefined);
-  if (disabledReason) {
-    const loading = disabledReason === SESSION_ACTIONS_LOADING;
+export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionForm>[0]) {
+  const { forkDisabledReason } = useSessionActionRestrictions(props.sourceSessionId, {
+    hostId: props.sourceHostId,
+  });
+  if (forkDisabledReason) {
+    const loading = forkDisabledReason === SESSION_ACTIONS_LOADING;
     return (
       <>
         <p
@@ -769,14 +758,14 @@ export function ForkSessionForm(
           className="text-sm text-muted-foreground"
           data-testid="fork-session-unavailable"
         >
-          {disabledReason}
+          {forkDisabledReason}
         </p>
         <DialogFooter>
           <Button variant="ghost" onClick={props.onClose}>
             Cancel
           </Button>
           {!loading && (
-            <DisabledActionTooltip reason={disabledReason} label="Clone session">
+            <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
               <Button data-testid="fork-session-submit" disabled>
                 {props.workspaceRecovery
                   ? "Continue"
@@ -790,7 +779,7 @@ export function ForkSessionForm(
       </>
     );
   }
-  return <SupportedForkSessionForm {...props} sandboxOnlyProvider={forkSandboxProvider} />;
+  return <SupportedForkSessionForm {...props} />;
 }
 
 function SupportedForkSessionForm({
@@ -801,7 +790,6 @@ function SupportedForkSessionForm({
   sourceGitBranch,
   upToResponseId,
   workspaceRecovery = false,
-  sandboxOnlyProvider,
   visible,
   onClose,
 }: {
@@ -812,8 +800,6 @@ function SupportedForkSessionForm({
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
   workspaceRecovery?: boolean;
-  /** The only target offered: a fresh sandbox from this provider. */
-  sandboxOnlyProvider?: string;
   visible: boolean;
   onClose: () => void;
 }) {
@@ -877,11 +863,10 @@ function SupportedForkSessionForm({
   const [showErrors, setShowErrors] = useState(false);
   const [focusField, setFocusField] = useState<ForkField | null>(null);
 
-  // A coding source ran in a working directory, so the fork needs a host +
-  // directory to start; a sandbox-only fork always picks its sandbox. Others
-  // fork with just name + agent (no directory to pick).
-  const sandboxOnly = sandboxOnlyProvider !== undefined;
-  const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace) || sandboxOnly;
+  // A coding source ran in a working directory; only then does the fork
+  // need a host + directory to start. A non-coding source forks with just
+  // name + agent (no directory to pick).
+  const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace);
 
   // Host/dir/worktree state — only meaningful for a coding source.
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
@@ -913,9 +898,8 @@ function SupportedForkSessionForm({
   const { data: sourceAgent } = useSessionAgent(sourceSessionId);
 
   // Hosts for the picker — only for a coding source (a non-coding fork
-  // never shows the host field). A sandbox-only fork offers none.
-  const { data: fetchedHosts } = useHosts({ enabled: isCodingSource && !sandboxOnly });
-  const hosts = sandboxOnly ? NO_HOSTS : fetchedHosts;
+  // never shows the host field).
+  const { data: hosts } = useHosts({ enabled: isCodingSource });
   const allHosts = hosts ?? [];
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
@@ -930,14 +914,11 @@ function SupportedForkSessionForm({
   const managedSandboxesEnabled =
     !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
   // One picker row per configured provider; a single-provider server
-  // yields exactly one, as does a sandbox-only fork.
-  const sandboxProviderRows = useMemo(() => {
-    if (info === "loading") return [];
-    const offered = sandboxProviderOptions(info);
-    return sandboxOnlyProvider === undefined
-      ? offered
-      : offered.filter((provider) => provider === sandboxOnlyProvider);
-  }, [info, sandboxOnlyProvider]);
+  // yields exactly one.
+  const sandboxProviderRows = useMemo(
+    () => (info !== "loading" ? sandboxProviderOptions(info) : []),
+    [info],
+  );
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -1824,45 +1805,35 @@ function SupportedForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
-                {/* A sandbox is a usable target, so connecting a host is a
-                    collapsed, optional step rather than a "no hosts connected"
-                    banner. A sandbox-only fork can't use one, so it says why. */}
-                {sandboxOnlyProvider !== undefined ? (
-                  <p
-                    className="text-sm text-muted-foreground"
-                    data-testid="fork-session-sandbox-only-hint"
+                {/* A sandbox is a usable target, so no dead-end even with no
+                    host online: offer connecting one as a collapsed, optional
+                    step rather than an alarming "no hosts connected" banner. */}
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setShowConnect((v) => !v)}
+                    className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
+                    data-testid="fork-session-connect-host-toggle"
                   >
-                    This session can only be cloned onto a new{" "}
-                    {sandboxOptionLabel(sandboxOnlyProvider)}.
-                  </p>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => setShowConnect((v) => !v)}
-                      className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
-                      data-testid="fork-session-connect-host-toggle"
-                    >
-                      {showConnect ? (
-                        <ChevronUpIcon className="size-3.5" />
-                      ) : (
-                        <ChevronDownIcon className="size-3.5" />
-                      )}
-                      {onlineHosts.length === 0
-                        ? "Connect a host from your terminal"
-                        : "Connect another host from your terminal"}
-                    </button>
-                    {showConnect && (
-                      <ConnectHostInstructions
-                        serverUrl={serverUrl}
-                        onSshConnected={(hostId) => {
-                          setShowConnect(false);
-                          selectHost(hostId);
-                        }}
-                      />
+                    {showConnect ? (
+                      <ChevronUpIcon className="size-3.5" />
+                    ) : (
+                      <ChevronDownIcon className="size-3.5" />
                     )}
-                  </>
-                )}
+                    {onlineHosts.length === 0
+                      ? "Connect a host from your terminal"
+                      : "Connect another host from your terminal"}
+                  </button>
+                  {showConnect && (
+                    <ConnectHostInstructions
+                      serverUrl={serverUrl}
+                      onSshConnected={(hostId) => {
+                        setShowConnect(false);
+                        selectHost(hostId);
+                      }}
+                    />
+                  )}
+                </>
               </>
             )}
             <ForkFieldError message={fieldError("host")} />
