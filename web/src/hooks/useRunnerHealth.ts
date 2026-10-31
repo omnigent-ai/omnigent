@@ -40,15 +40,26 @@ export interface SessionLiveness {
   host_version: string | null;
 }
 
-export const POLL_INTERVAL_MS = 10_000;
+const POLL_INTERVAL_MS = 10_000;
 // Exponential-backoff ceiling on consecutive /health failures.
 const POLL_MAX_INTERVAL_MS = 60_000;
 
 const refreshListeners = new Set<() => void>();
+const pollListeners = new Set<(liveness: Map<string, SessionLiveness>) => void>();
 
 /** Poll `/health` now instead of at the next tick, e.g. right after a host wakes. */
 export function refreshRunnerHealth(): void {
   for (const listener of refreshListeners) listener();
+}
+
+/** Hear each successful `/health` poll's liveness; returns the unsubscribe. */
+export function onRunnerHealthPolled(
+  listener: (liveness: Map<string, SessionLiveness>) => void,
+): () => void {
+  pollListeners.add(listener);
+  return () => {
+    pollListeners.delete(listener);
+  };
 }
 
 interface BatchHealthResponse {
@@ -131,6 +142,7 @@ export function useRunnerHealth(
             }
             setStatusMap(next);
             success = true;
+            for (const listener of pollListeners) listener(next);
           }
         }
       } catch {

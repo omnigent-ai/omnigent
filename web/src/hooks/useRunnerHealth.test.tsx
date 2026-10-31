@@ -8,7 +8,12 @@
 
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type RunnerHealthInput, refreshRunnerHealth, useRunnerHealth } from "./useRunnerHealth";
+import {
+  type RunnerHealthInput,
+  onRunnerHealthPolled,
+  refreshRunnerHealth,
+  useRunnerHealth,
+} from "./useRunnerHealth";
 
 import * as nativeBridge from "@/lib/nativeBridge";
 
@@ -168,6 +173,36 @@ describe("useRunnerHealth", () => {
       expectStopped();
     },
   );
+
+  it("reports each successful poll to its listeners until they unsubscribe", async () => {
+    const heard = vi.fn();
+    const unsubscribe = onRunnerHealthPolled(heard);
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 503 } as Response);
+    const sessions = [input("conv_a")];
+    const { result } = renderHook(() => useRunnerHealth(sessions));
+    await act(async () => {});
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(heard).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValueOnce(
+      mockHealth({ conv_a: { runner_online: false, host_online: false } }),
+    );
+    act(() => refreshRunnerHealth());
+    await waitFor(() => expect(heard).toHaveBeenCalledOnce());
+    expect(heard.mock.calls[0][0].get("conv_a")).toEqual({
+      runner_online: false,
+      host_online: false,
+      host_version: null,
+    });
+
+    unsubscribe();
+    fetchMock.mockResolvedValueOnce(
+      mockHealth({ conv_a: { runner_online: false, host_online: true } }),
+    );
+    act(() => refreshRunnerHealth());
+    await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(true));
+    expect(heard).toHaveBeenCalledOnce();
+  });
 
   it("ignores a stale poll that finishes after a desktop-triggered refresh", async () => {
     let notify!: () => void;

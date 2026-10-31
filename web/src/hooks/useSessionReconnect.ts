@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
-import { POLL_INTERVAL_MS, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
+import { onRunnerHealthPolled, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -15,12 +15,17 @@ import { retrySession } from "@/lib/sessionsApi";
 import type { SandboxStatus } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 
-/** How long a woken sandbox may wait to read online: three health polls. */
-export const SANDBOX_WAKE_ONLINE_GRACE_MS = 3 * POLL_INTERVAL_MS;
+/** How many health polls may report a woken sandbox's host offline before the wake gives up. */
+export const SANDBOX_WAKE_ONLINE_GRACE_POLLS = 3;
 
 /** Identifies a reported launch stage by value; snapshots rebuild the object. */
 function launchKey(launch: SandboxStatus | null): string {
   return launch ? JSON.stringify([launch.stage, launch.error, launch.details]) : "";
+}
+
+/** A launch that failed or waits on the user is no longer making progress. */
+function launchStopped(launch: SandboxStatus | null): boolean {
+  return launch?.stage === "failed" || launch?.stage === "action_required";
 }
 
 /**
@@ -53,6 +58,7 @@ export function useSessionReconnect({
   const inFlight = useRef<{ progressToast?: string | number } | null>(null);
   // The open session's launch stage, compared against its value at the wake's click.
   const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const launchInProgress = launch !== null && !launchStopped(launch);
   const wakeStart = useRef<{ operation: object; launch: string; stageChanged: boolean } | null>(
     null,
   );
@@ -139,14 +145,20 @@ export function useSessionReconnect({
     if (sandboxWake === "awaiting_online" && hostOnline === true) setSandboxWake(null);
   }, [sandboxWake, hostOnline]);
 
+  // Count polls, not time, since `/health` backs off on failures. The count waits
+  // for the launch to stop reporting progress, and starts from zero then.
   useEffect(() => {
-    if (sandboxWake !== "awaiting_online") return;
-    const timer = setTimeout(() => {
+    if (sandboxWake !== "awaiting_online" || launchInProgress || !sessionId) return;
+    let offlinePolls = 0;
+    return onRunnerHealthPolled((liveness) => {
+      const session = liveness.get(sessionId);
+      if (!session || session.host_online === true) return;
+      offlinePolls += 1;
+      if (offlinePolls !== SANDBOX_WAKE_ONLINE_GRACE_POLLS) return;
       setSandboxWake(null);
       toast.error("The sandbox didn't come online. Try Reconnect host again.");
-    }, SANDBOX_WAKE_ONLINE_GRACE_MS);
-    return () => clearTimeout(timer);
-  }, [sandboxWake]);
+    });
+  }, [sandboxWake, launchInProgress, sessionId]);
 
   // A failed or waiting stage left over from before the click mustn't end the
   // wake; one reported since then does, even if it repeats the old one.
@@ -154,8 +166,7 @@ export function useSessionReconnect({
     const start = wakeStart.current;
     if (sandboxWake === null || !start) return;
     if (launchKey(launch) !== start.launch) start.stageChanged = true;
-    if (!start.stageChanged || (launch?.stage !== "failed" && launch?.stage !== "action_required"))
-      return;
+    if (!start.stageChanged || !launchStopped(launch)) return;
     if (inFlight.current === start.operation) inFlight.current = null;
     wakeStart.current = null;
     setSandboxWake(null);
