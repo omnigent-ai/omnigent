@@ -88,7 +88,9 @@ def codex_native_process_registry_path() -> Path:
     return _codex_native_state_root() / _REGISTRY_FILE
 
 
-def acquire_codex_native_process_owner_lock() -> CodexNativeProcessOwnerLock | None:
+def acquire_codex_native_process_owner_lock(
+    state_root: Path | None = None,
+) -> CodexNativeProcessOwnerLock | None:
     """
     Acquire a per-launcher owner lock for crash-safe reconciliation.
 
@@ -98,11 +100,13 @@ def acquire_codex_native_process_owner_lock() -> CodexNativeProcessOwnerLock | N
     sweep. A healthy concurrent launcher still holds the lock, so its
     child entries are skipped even when their child PID/tag are live.
 
+    :param state_root: Directory holding the owner-lock directory; defaults
+        to the codex-native state root.
     :returns: Held owner lock, or ``None`` if it could not be created.
     """
     if fcntl is None:
         return None
-    root = _codex_native_state_root() / _OWNER_LOCK_DIR
+    root = (state_root or _codex_native_state_root()) / _OWNER_LOCK_DIR
     fd: int | None = None
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)

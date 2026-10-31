@@ -132,6 +132,13 @@ class HostMaintenanceJanitor:
 
             return await _run_sync_stage(reconcile_codex_native_process_registry)
 
+        async def _reconcile_opencode_processes() -> object:
+            from omnigent.harnesses.opencode_native.process_registry import (
+                reconcile_opencode_native_process_registry,
+            )
+
+            return await _run_sync_stage(reconcile_opencode_native_process_registry)
+
         async def _reap_terminals() -> object:
             from omnigent.inner.terminal import reap_orphaned_terminals
 
@@ -146,6 +153,7 @@ class HostMaintenanceJanitor:
             stages=(
                 ("harness_process_orphans", _reap_harness_processes),
                 ("codex_process_registry", _reconcile_codex_processes),
+                ("opencode_process_registry", _reconcile_opencode_processes),
                 ("terminal_orphans", _reap_terminals),
                 ("native_bridge_orphans", _reap_native_bridge_dirs),
             ),

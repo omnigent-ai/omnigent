@@ -53,6 +53,11 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MIN_VERSION,
     OpenCodeClient,
 )
+from omnigent.harnesses.opencode_native.process_registry import (
+    OpenCodeNativeServerRegistration,
+    register_opencode_native_server,
+)
+from omnigent.inner import _proc
 
 _logger = logging.getLogger(__name__)
 
@@ -426,6 +431,7 @@ class OpenCodeNativeServer:
         self.xdg_config_home = xdg_config_home_for_bridge_dir(bridge_dir)
         self.port: int | None = port
         self.process: subprocess.Popen[bytes] | None = None
+        self.process_registration: OpenCodeNativeServerRegistration | None = None
         self.version: str | None = None
 
     @property
@@ -495,14 +501,17 @@ class OpenCodeNativeServer:
             self.workspace,
             self.xdg_data_home,
         )
+        # Own process group, recorded so host maintenance can reap it if this runner dies.
         self.process = subprocess.Popen(
             argv,
             cwd=str(self.workspace),
             env=self.env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **_proc.spawn_kwargs(),
         )
         try:
+            self.process_registration = register_opencode_native_server(self.process.pid)
             await self._wait_until_ready()
         except BaseException:
             # No caller owns the child until startup succeeds.
@@ -551,18 +560,21 @@ class OpenCodeNativeServer:
             directory=directory or str(self.workspace),
         )
 
-    async def close(self) -> None:  # pragma: no cover
+    async def close(self) -> None:
         """Terminate the server subprocess if running."""
         process = self.process
         if process is None:
             return
         if process.poll() is None:
-            process.terminate()
+            _proc.terminate_tree(process)
             try:
                 await asyncio.to_thread(process.wait, 10)
             except subprocess.TimeoutExpired:
-                process.kill()
+                _proc.kill_tree(process)
                 await asyncio.to_thread(process.wait)
+        if self.process_registration is not None:
+            self.process_registration.release()
+            self.process_registration = None
         self.process = None
 
 

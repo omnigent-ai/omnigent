@@ -151,6 +151,11 @@ prefixed digest is used when one is already present), holding e.g.
 `codex-native/` additionally holds `process-registry.json` (+ `.lock`) and
 `process-owners/`, tracking spawned CLI processes
 (`omnigent/harnesses/codex_native/process_registry.py`).
+`opencode-native-processes/` holds the same files for runner-owned
+`opencode serve` processes, so host maintenance can stop servers left by a
+killed runner (`omnigent/harnesses/opencode_native/process_registry.py`). It
+sits outside `opencode-native/` because bridge-directory pruning must never
+remove a live owner lock.
 
 Not every native harness lives here: `qwen-native`, `hermes-native`, and
 `cursor-native` root their per-session bridge dirs in the system temp
