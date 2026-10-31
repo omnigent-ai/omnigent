@@ -15,6 +15,10 @@ MIB = 1024 * 1024
 
 # Indexing a checkout.
 MAX_CATALOG_ENTRIES = 500
+# Marketplace plugins followed from one manifest, and directories examined
+# while looking for SKILL.md files, so a hostile manifest or tree stops early.
+MAX_CATALOG_PLUGINS = 200
+MAX_CATALOG_SCANNED_DIRS = 5_000
 MAX_SKILL_MD_BYTES = MIB
 MAX_MANIFEST_BYTES = MIB
 

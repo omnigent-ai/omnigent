@@ -213,6 +213,12 @@ async def test_a_source_directory_is_browsed_installed_and_updated(
         updated = await client.post(f"/v1/installed-skills/{row['id']}/update")
         assert updated.status_code == 200, updated.text
 
+        # A link straight to the skills folder, the one people paste, lists its skills.
+        folder = await client.post(
+            "/v1/skill-catalog",
+            json={"source": "https://github.com/acme/mono/tree/main/team-a/skills"},
+        )
+        assert [s["name"] for s in folder.json()["skills"]] == ["lint"]
         # A link to one skill's directory previews just that skill.
         single = await client.post(
             "/v1/skill-catalog",

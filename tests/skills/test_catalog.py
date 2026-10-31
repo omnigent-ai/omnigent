@@ -172,3 +172,55 @@ def test_a_directory_is_indexed_as_its_own_catalog(tmp_path: Path) -> None:
     # A link to one skill's directory is that skill, not the catalog around it.
     single = index_checkout(repo / "team-a" / "skills" / "lint", prefix="team-a/skills/lint")
     assert [(e.name, e.path) for e in single] == [("lint", "team-a/skills/lint")]
+
+
+def test_a_hostile_manifest_or_tree_is_scanned_only_so_far(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from omnigent.skills import catalog
+    from tests._helpers.skill_repos import write_skill
+
+    # Each listed plugin cost a directory walk that no skill budget counted.
+    monkeypatch.setattr(catalog, "MAX_CATALOG_PLUGINS", 3)
+    repo = tmp_path / "market"
+    (repo / ".claude-plugin").mkdir(parents=True)
+    plugins = []
+    for index in range(10):
+        (repo / f"p{index}" / "skills" / "empty").mkdir(parents=True)
+        plugins.append({"name": f"p{index}", "source": f"./p{index}"})
+    write_skill(repo / "p9" / "skills", "late", "Never reached")
+    (repo / ".claude-plugin" / "marketplace.json").write_text(json.dumps({"plugins": plugins}))
+    skipped: list[str] = []
+    assert index_checkout(repo, skipped=skipped) == []
+    assert any("only the first 3 of 10 plugins" in note for note in skipped)
+
+    # Directories without a SKILL.md are counted as they are examined.
+    monkeypatch.setattr(catalog, "MAX_CATALOG_SCANNED_DIRS", 4)
+    tree = tmp_path / "tree"
+    for index in range(10):
+        (tree / "skills" / f"ns{index}" / "nothing").mkdir(parents=True)
+    write_skill(tree / "skills" / "zz", "last", "Past the scan budget")
+    skipped = []
+    assert index_checkout(tree, skipped=skipped) == []
+    assert any("stopped after examining 4 directories" in note for note in skipped)
+
+
+def test_a_link_to_a_skills_folder_lists_its_skills_and_an_empty_catalog_says_why(
+    tmp_path: Path,
+) -> None:
+    from tests._helpers.skill_repos import write_skill
+
+    repo = tmp_path / "mono"
+    write_skill(repo / "team-a" / "skills", "lint", "Lint")
+    write_skill(repo / "team-a" / "skills" / "ops", "deploy", "Deploy")
+    entries = index_checkout(repo / "team-a" / "skills", prefix="team-a/skills")
+    assert [(e.name, e.path) for e in entries] == [
+        ("lint", "team-a/skills/lint"),
+        ("deploy", "team-a/skills/ops/deploy"),
+    ]
+    (repo / "docs").mkdir()
+    skipped: list[str] = []
+    assert index_checkout(repo / "docs", skipped=skipped, prefix="docs") == []
+    assert skipped and skipped[-1].startswith("no skills found under docs")

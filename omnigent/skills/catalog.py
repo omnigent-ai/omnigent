@@ -22,6 +22,8 @@ from pathlib import Path, PurePosixPath
 
 from omnigent.skills.limits import (
     MAX_CATALOG_ENTRIES,
+    MAX_CATALOG_PLUGINS,
+    MAX_CATALOG_SCANNED_DIRS,
     MAX_DESCRIPTION_CHARS,
     MAX_DISPLAY_NAME_CHARS,
     MAX_MANIFEST_BYTES,
@@ -90,20 +92,29 @@ def _subdirs(directory: Path) -> list[Path]:
         return []
 
 
-def _candidate_skill_dirs(skills_dir: Path, root: Path, skipped: list[str]) -> list[Path]:
-    """``skills/<name>`` and ``skills/<namespace>/<name>`` directories holding a SKILL.md."""
+def _candidate_skill_dirs(
+    skills_dir: Path, root: Path, skipped: list[str], scanned: _Budget
+) -> list[Path]:
+    """``skills/<name>`` and ``skills/<namespace>/<name>`` directories holding a SKILL.md.
+
+    Each directory examined takes one unit of *scanned*; the walk stops when it runs out.
+    """
     if skills_dir.is_symlink() or not skills_dir.is_dir() or not _inside(root, skills_dir):
         if skills_dir.is_symlink():
             skipped.append(f"{skills_dir.name}: skills directory is a link; not followed")
         return []
     out: list[Path] = []
     for child in _subdirs(skills_dir):
+        if not scanned.take():
+            return out
         if (child / "SKILL.md").exists() or (child / "SKILL.md").is_symlink():
             out.append(child)
             continue
-        out.extend(
-            grandchild for grandchild in _subdirs(child) if (grandchild / "SKILL.md").exists()
-        )
+        for grandchild in _subdirs(child):
+            if not scanned.take():
+                return out
+            if (grandchild / "SKILL.md").exists():
+                out.append(grandchild)
     return out
 
 
@@ -124,7 +135,12 @@ def _plugin_dirs(root: Path, skipped: list[str]) -> list[tuple[str, Path]]:
         skipped.append(f"{MARKETPLACE_MANIFEST}: no plugins list")
         return []
     out: list[tuple[str, Path]] = []
-    for item in plugins:
+    if len(plugins) > MAX_CATALOG_PLUGINS:
+        skipped.append(
+            f"{MARKETPLACE_MANIFEST}: only the first {MAX_CATALOG_PLUGINS} of "
+            f"{len(plugins)} plugins are read"
+        )
+    for item in plugins[:MAX_CATALOG_PLUGINS]:
         if not isinstance(item, dict):
             continue
         name, source = item.get("name"), item.get("source")
@@ -158,10 +174,15 @@ class _Budget:
 
 
 def _entries_under(
-    skills_dir: Path, root: Path, plugin: str | None, skipped: list[str], budget: _Budget
+    skills_dir: Path,
+    root: Path,
+    plugin: str | None,
+    skipped: list[str],
+    budget: _Budget,
+    scanned: _Budget,
 ) -> Iterator[CatalogEntry]:
     """Yield entries lazily; nothing is read once *budget* runs out."""
-    for skill_dir in _candidate_skill_dirs(skills_dir, root, skipped):
+    for skill_dir in _candidate_skill_dirs(skills_dir, root, skipped, scanned):
         if not budget.take():
             return
         entry = _entry(skill_dir, root, plugin, skipped)
@@ -231,6 +252,7 @@ def index_checkout(
     seen: set[str] = set()
     out: list[CatalogEntry] = []
     budget = _Budget(MAX_CATALOG_ENTRIES)
+    scanned = _Budget(MAX_CATALOG_SCANNED_DIRS)
 
     def add(entries: Iterator[CatalogEntry]) -> None:
         for entry in entries:
@@ -250,11 +272,23 @@ def index_checkout(
         entry = _entry(root, root, None, notes)
         add(iter([entry] if entry is not None else []))
         return out
-    for rel in SKILL_ROOTS:
-        add(_entries_under(root / rel, root, None, notes, budget))
-    if not budget.exhausted:
-        for plugin, plugin_dir in _plugin_dirs(root, notes):
-            add(_entries_under(plugin_dir / "skills", root, plugin, notes, budget))
+    if prefix and root.name == "skills":
+        # A link straight to a skills folder: its children are the skills.
+        add(_entries_under(root, root, None, notes, budget, scanned))
+    else:
+        for rel in SKILL_ROOTS:
+            add(_entries_under(root / rel, root, None, notes, budget, scanned))
+        if not budget.exhausted and not scanned.exhausted:
+            for plugin, plugin_dir in _plugin_dirs(root, notes):
+                add(_entries_under(plugin_dir / "skills", root, plugin, notes, budget, scanned))
     if budget.exhausted:
         notes.append(f"catalog truncated at {MAX_CATALOG_ENTRIES} skills")
+    if scanned.exhausted:
+        notes.append(f"catalog stopped after examining {MAX_CATALOG_SCANNED_DIRS} directories")
+    if not out:
+        where = prefix or "the repository root"
+        notes.append(
+            f"no skills found under {where}: a catalog reads skills/<name>/SKILL.md, "
+            ".agents/skills, .claude/skills or .claude-plugin/marketplace.json there"
+        )
     return out
