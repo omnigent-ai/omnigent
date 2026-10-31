@@ -16,7 +16,7 @@ matching the server-side conversation lifecycle defined in
 ``omnigent/server/API.md`` ("Sessions API"). Per the same spec
 there is no event replay; this helper opens a fresh SSE subscription
 per :meth:`send` call, posts the input event, and yields the typed
-:data:`omnigent.server.schemas.ServerStreamEvent` envelopes
+:data:`omnigent_client.wire.ServerStreamEvent` envelopes
 until the turn's terminal ``response.*`` event arrives.
 
 The helper does NOT re-export under the existing public name
@@ -38,27 +38,6 @@ import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, overload
-
-from omnigent.server.schemas import (
-    CancelledEvent,
-    CompletedEvent,
-    CreatedEvent,
-    ElicitationRequestEvent,
-    FailedEvent,
-    IncompleteEvent,
-    InProgressEvent,
-    OutputFileDoneEvent,
-    OutputItemDoneEvent,
-    OutputTextDeltaEvent,
-    QueuedEvent,
-    ReasoningStartedEvent,
-    ReasoningSummaryTextDeltaEvent,
-    ReasoningTextDeltaEvent,
-    ServerStreamEvent,
-    SessionChildSessionUpdatedEvent,
-    SessionCreatedEvent,
-    SessionStatusEvent,
-)
 
 from ._child_status import TERMINAL_TASK_STATUSES, child_summary_busy
 from ._errors import OmnigentError
@@ -82,6 +61,26 @@ from ._tool_handler import (
     ToolCallStartCtx,
 )
 from ._types import File, Response
+from .wire import (
+    CancelledEvent,
+    CompletedEvent,
+    CreatedEvent,
+    ElicitationRequestEvent,
+    FailedEvent,
+    IncompleteEvent,
+    InProgressEvent,
+    OutputFileDoneEvent,
+    OutputItemDoneEvent,
+    OutputTextDeltaEvent,
+    QueuedEvent,
+    ReasoningStartedEvent,
+    ReasoningSummaryTextDeltaEvent,
+    ReasoningTextDeltaEvent,
+    ServerStreamEvent,
+    SessionChildSessionUpdatedEvent,
+    SessionCreatedEvent,
+    SessionStatusEvent,
+)
 
 # Text block types accepted when falling back from streamed deltas
 # to final assistant message content.

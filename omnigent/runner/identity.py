@@ -58,7 +58,10 @@ RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # because it is part of the same client/server handshake contract and the
 # server imports it from this module (server -> runner, not the reverse).
 # The non-HTTP scheme is deliberate: a browser computes ``Origin`` from
-# the page URL and can never emit this value.
+# the page URL and can never emit this value. ``omnigent_client.wire``
+# carries the same literal so the client can send it without importing
+# this package; this module stays stdlib-only because the sandboxed os_env
+# helper imports it with only the ``omnigent`` package on its path.
 OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # "1" enables per-session workspace isolation so each session
 # gets its own subdirectory. Set by shared-host servers; single-user

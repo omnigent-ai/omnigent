@@ -7,8 +7,6 @@ from typing import Any, Literal, overload
 
 import httpx
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
-
 from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._http import is_loopback_url
@@ -18,6 +16,7 @@ from ._session import Session
 from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
+from .wire import OMNIGENT_INTERNAL_WS_ORIGIN
 
 
 def _port_or_default(url: httpx.URL) -> int | None:
