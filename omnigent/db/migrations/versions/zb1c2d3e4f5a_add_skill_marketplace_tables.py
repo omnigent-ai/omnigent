@@ -97,6 +97,8 @@ def _skill_principals_columns() -> list[sa.Column]:
         sa.Column("installed_count", sa.Integer(), nullable=False),
         sa.Column("enabled_bytes", sa.BigInteger(), nullable=False),
         sa.Column("enabled_entries", sa.Integer(), nullable=False),
+        # Bumped by every write, so a running session can tell its skills changed.
+        sa.Column("revision", sa.BigInteger(), nullable=False),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
     ]
 

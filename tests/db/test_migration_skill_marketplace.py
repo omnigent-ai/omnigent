@@ -104,6 +104,7 @@ def _assert_lifecycle(engine: sa.Engine, config: object) -> None:
             "installed_count",
             "enabled_bytes",
             "enabled_entries",
+            "revision",
             "created_at",
         ]
 
@@ -184,6 +185,7 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
                 installed_count=0,
                 enabled_bytes=0,
                 enabled_entries=0,
+                revision=0,
                 created_at=0,
             )
         row = SqlInstalledSkill(
