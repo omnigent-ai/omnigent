@@ -419,12 +419,18 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
   it.each(["host lookup", "navigation result"])(
     "keeps the latest URL submission when the earlier %s finishes last",
     async (pendingStage) => {
-      const firstHost = Promise.withResolvers<unknown>();
-      const firstNavigation = Promise.withResolvers<{ ok: boolean; error?: string }>();
+      let resolveFirstHost!: (host: unknown) => void;
+      const firstHost = new Promise((resolve) => {
+        resolveFirstHost = resolve;
+      });
+      let resolveFirstNavigation!: (result: { ok: boolean; error?: string }) => void;
+      const firstNavigation = new Promise<{ ok: boolean; error?: string }>((resolve) => {
+        resolveFirstNavigation = resolve;
+      });
       getSessionSlim
         .mockReturnValueOnce(
           pendingStage === "host lookup"
-            ? firstHost.promise
+            ? firstHost
             : Promise.resolve({ id: "conv_preview", hostId: "local-host" }),
         )
         .mockResolvedValue({ id: "conv_preview", hostId: "remote-host" });
@@ -432,9 +438,7 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
         browserOpenOrNavigate: vi
           .fn()
           .mockImplementationOnce(() =>
-            pendingStage === "navigation result"
-              ? firstNavigation.promise
-              : Promise.resolve({ ok: true }),
+            pendingStage === "navigation result" ? firstNavigation : Promise.resolve({ ok: true }),
           )
           .mockResolvedValue({ ok: true }),
       });
@@ -457,8 +461,8 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
         ),
       );
       await act(async () => {
-        firstHost.resolve({ id: "conv_preview", hostId: "local-host" });
-        firstNavigation.resolve({ ok: false, error: "stale failure" });
+        resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
+        resolveFirstNavigation({ ok: false, error: "stale failure" });
       });
       expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(
         pendingStage === "host lookup" ? 1 : 2,

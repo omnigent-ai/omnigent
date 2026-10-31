@@ -1,6 +1,29 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
 const { isHostThisMachine } = require("../src/hostIdentity");
+
+it("imports browser IPC and checks injected identities without desktop js-yaml", () => {
+  execFileSync(process.execPath, [
+    "-e",
+    `const assert = require("node:assert/strict");
+     const Module = require("node:module");
+     const load = Module._load;
+     Module._load = function (name, ...args) {
+       assert.notEqual(name, "js-yaml", "Browser IPC must not load desktop js-yaml");
+       return load.call(this, name, ...args);
+     };
+     const { isHostThisMachine, SESSION_HOST_PROTOCOL } = require(process.argv[1]);
+     require(process.argv[2]);
+     assert.equal(SESSION_HOST_PROTOCOL, 1);
+     assert.equal(isHostThisMachine(
+       { hostId: "local", serverUrl: "https://server.example" },
+       { readLocalHostId: () => "local", liveDaemonRecordFor: () => ({ host_id: "local" }) },
+     ), true);`,
+    require.resolve("../src/hostIdentity"),
+    require.resolve("../src/browserIpc"),
+  ]);
+});
 
 describe("isHostThisMachine", () => {
   for (const { name, hostId, localId, record, expected } of [

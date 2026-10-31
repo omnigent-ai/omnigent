@@ -534,12 +534,15 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     "keeps a pending %s lookup tied to its source across visible-session switches",
     async (pendingHop) => {
       const bridge = installBridge();
-      const pending = Promise.withResolvers<unknown>();
+      let resolvePending!: (host: unknown) => void;
+      const pending = new Promise((resolve) => {
+        resolvePending = resolve;
+      });
       const sourceId = "conv_background_A";
       const pendingId = pendingHop === "source" ? sourceId : "parent";
       getSessionSlim.mockImplementation((id: string) =>
         id === pendingId
-          ? pending.promise
+          ? pending
           : Promise.resolve({ id, hostId: null, parentSessionId: "parent" }),
       );
       const hook = renderRelay();
@@ -547,7 +550,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith(pendingId));
       hook.rerender({ id: "conv_visible_B" });
       setSessionHost("conv_visible_B", "local-host");
-      pending.resolve({ id: pendingId, hostId: "arca-host", parentSessionId: null });
+      resolvePending({ id: pendingId, hostId: "arca-host", parentSessionId: null });
       await vi.waitFor(() =>
         expect(postedResult().result).toEqual({
           ok: true,
