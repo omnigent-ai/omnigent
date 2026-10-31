@@ -227,6 +227,10 @@ class SkillStore(ABC):
         """The visible installs among *names* (org-scoped plus the user's own)."""
 
     @abstractmethod
+    def installed_revision(self, user_id: str | None) -> str:
+        """A token that changes whenever the org's or *user_id*'s installs change."""
+
+    @abstractmethod
     def count_installed(self, scope: SkillScope, owner_user_id: str | None) -> int:
         """Rows of one principal, counted no further than the per-principal cap."""
 

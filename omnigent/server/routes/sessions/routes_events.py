@@ -295,6 +295,7 @@ from omnigent.server.schemas import (
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.skill_injection import session_agent_revision
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
@@ -3484,6 +3485,18 @@ def register_events_routes(
                     agent_id=conv.agent_id,
                     sub_agent_name=conv.sub_agent_name,
                 )
+        # The owner's installed skills are part of the revision, so a warm
+        # runner rebuilds its spec after a marketplace change.
+        _agent_revision = (
+            await session_agent_revision(
+                _agent.bundle_location,
+                conv,
+                skill_store=getattr(request.app.state, "skill_store", None),
+                conversation_store=conversation_store,
+            )
+            if _agent
+            else None
+        )
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
                 raise OmnigentError(
@@ -3503,6 +3516,7 @@ def register_events_routes(
                 created_by=created_by,
                 legacy_skill_names=_legacy_skill_names,
                 startup_input=request if isinstance(request, StartupInputContext) else None,
+                agent_revision=_agent_revision,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
@@ -3521,9 +3535,7 @@ def register_events_routes(
             native_shell_authorized=native_shell_authorized,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
-            agent_revision=mcp_selection_revision(_agent.bundle_location, conv.labels)
-            if _agent
-            else None,
+            agent_revision=_agent_revision,
             background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.

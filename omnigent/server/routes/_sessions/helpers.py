@@ -7957,6 +7957,7 @@ async def _dispatch_skill_slash_command_to_runner(
     created_by: str | None,
     legacy_skill_names: Mapping[str, str] | None = None,
     startup_input: StartupInputContext | None = None,
+    agent_revision: str | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -8060,7 +8061,9 @@ async def _dispatch_skill_slash_command_to_runner(
         "role": "user",
         "content": meta_content,
         "agent_id": conv.agent_id,
-        "agent_revision": mcp_selection_revision(agent.bundle_location, conv.labels),
+        # The caller's revision includes the owner's installed skills.
+        "agent_revision": agent_revision
+        or mcp_selection_revision(agent.bundle_location, conv.labels),
         "model": agent.name,
         "has_mcp_servers": has_mcp_servers,
         # Live-renderer hint: the runner drops ``browser_*`` schemas for

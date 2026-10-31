@@ -1194,3 +1194,61 @@ def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None
             created_by=None,
         )
     assert delivery_statements() == before
+
+
+@pytest.mark.asyncio
+async def test_a_marketplace_change_reaches_a_warm_sessions_next_turn(
+    market, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A running session kept its cached spec, since nothing about its agent
+    # changed, while its menu listed the newly installed skill. The turn's
+    # revision now carries the owner's installs, so the runner rebuilds the
+    # spec (as it does for any new revision) on the next turn.
+    import json
+
+    client, _app, artifact_store = market
+    forwarded: list[str] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content)["agent_revision"])
+        return httpx.Response(202, json={"queued": True})
+
+    async def to_fake_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        return runner_client
+
+    async def relay_ready(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    from tests.server.helpers import build_agent_bundle
+
+    session_id = _bind_session(db_uri, artifact_store, build_agent_bundle("warm"))
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as runner_client:
+        monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", to_fake_runner)
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._ensure_runner_relay_ready", relay_ready
+        )
+
+        async def turn() -> str:
+            sent = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert sent.status_code == 202, sent.text
+            return forwarded[-1]
+
+        warm = await turn()
+        assert await turn() == warm  # nothing changed: the runner keeps its spec
+        installed = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+        assert installed.status_code == 201, installed.text
+        after_install = await turn()
+        assert after_install != warm
+        skill_id = installed.json()["data"][0]["id"]
+        await client.patch(f"/v1/installed-skills/{skill_id}", json={"enabled": False})
+        after_disable = await turn()
+        assert after_disable not in (warm, after_install)

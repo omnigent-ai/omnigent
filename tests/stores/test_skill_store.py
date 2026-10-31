@@ -510,3 +510,36 @@ def test_values_that_would_not_fit_are_rejected_before_writing(
             display_name=None,
         )
     assert store.get(row.id).description == "ok description"
+
+
+def test_every_write_changes_the_installed_revision(store: SqlAlchemySkillStore) -> None:
+    # A warm session's turns carry this token; any change to what its owner
+    # would be delivered has to change it, or the runner keeps a stale spec.
+    seen = [store.installed_revision("alice")]
+
+    def changed() -> None:
+        current = store.installed_revision("alice")
+        assert current not in seen
+        seen.append(current)
+
+    row = _install(store, "a")
+    changed()
+    _install(store, "a", bundle_bytes=10)  # a same-size reinstall still counts
+    changed()
+    store.set_enabled(row.id, False)
+    changed()
+    store.update(
+        row.id,
+        commit=None,
+        bundle_location="skills/a2.tar.gz",
+        bundle_bytes=10,
+        bundle_entries=3,
+        description="d",
+        display_name=None,
+    )
+    changed()
+    _install(store, "shared", scope="org")
+    changed()
+    store.delete(row.id)
+    changed()
+    assert store.installed_revision("bob") != store.installed_revision("alice")
