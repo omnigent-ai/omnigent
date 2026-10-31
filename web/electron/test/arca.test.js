@@ -387,6 +387,16 @@ describe("arca connect failures", () => {
       assert.equal(describeConnectFailure({ code: 1, stdout: "", stderr }).errorKind, "omni-auth");
     }
   });
+  it("reports a sign-in error the run printed before it timed out", () => {
+    const result = describeConnectFailure({
+      code: null,
+      stdout: "",
+      stderr: "Error: OMNIGENT_AUTH_REQUIRED: No usable Omnigent login for this server",
+      timedOut: true,
+    });
+    assert.equal(result.errorKind, "omni-auth");
+    assert.equal(result.authError, true);
+  });
   it("maps a timeout, sign-in, missing-CLI, and unreachable instance", () => {
     assert.match(
       describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true }).error,
@@ -521,6 +531,25 @@ describe("startArcaConnect / connectArcaHost", () => {
       assert.equal(child.killed, true);
       child.emit("exit", 0);
       assert.equal((await run.promise).ok, false);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+
+  it("starts sign-in when a connect that printed the auth error outlives the timeout", async () => {
+    const child = fakeConnectChild();
+    const run = startArcaConnect("https://account.databricks.com/omnigent?o=123", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      timeoutMs: 1,
+    });
+    child.stderr.emit("data", "Error: OMNIGENT_AUTH_REQUIRED: No usable Omnigent login\n");
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await run.promise;
+      assert.equal(result.errorKind, "omni-auth");
+      assert.equal(result.authError, true);
+      assert.equal(child.killed, true);
     } finally {
       clearTimeout(keepAlive);
     }
