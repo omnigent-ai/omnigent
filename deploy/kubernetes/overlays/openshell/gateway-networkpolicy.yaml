@@ -26,8 +26,16 @@ spec:
       to:
         - ipBlock:
             cidr: 0.0.0.0/0
-    # OpenShell gateway gRPC — replace the CIDR with your gateway's
-    # actual endpoint to restrict egress to only that host.
+    # OpenShell gateway — the in-cluster gateway listens on 8080
+    # (http://openshell.openshell.svc.cluster.local:8080).
+    - ports:
+        - protocol: TCP
+          port: 8080
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshell
+    # General HTTPS egress (LLM providers, package mirrors, etc.).
     - ports:
         - protocol: TCP
           port: 443
