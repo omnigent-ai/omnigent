@@ -262,6 +262,24 @@ describe("arca connect console flow", () => {
     assert.deepEqual(done.at(-1)[1], { ok: false, error: "sign-in timed out" });
   });
 
+  it("signs in before connecting when a connect already failed for sign-in", async () => {
+    const { world, flow } = flowHarness();
+    const url = "https://account.databricks.com/omnigent?o=123";
+    const result = flow.run(null, url, { signInFirst: true });
+    const win = world.windows[0];
+    assert.equal(world.logins.length, 0);
+    world.sendFrom(win, "arca-connect:confirm");
+    assert.equal(world.connects.length, 0);
+    assert.equal(world.logins.length, 1);
+    world.logins[0].finish({ ok: true });
+    await Promise.resolve();
+    assert.equal(world.connects[0].serverUrl, url);
+    // The sign-in already ran, so a connect that still needs one doesn't start another.
+    world.connects[0].finish({ ok: false, authError: true, error: "still rejected" });
+    assert.equal((await result).error, "still rejected");
+    assert.equal(world.logins.length, 1);
+  });
+
   it("cancels remote login without starting a host after a late successful exit", async () => {
     const { world, flow } = flowHarness();
     const result = flow.run(null, "https://account.databricks.com/omnigent?o=123");

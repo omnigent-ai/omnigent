@@ -4971,7 +4971,7 @@ function registerIpc() {
         isPinnedOriginSender(event) &&
         !win.isDestroyed()
       ) {
-        return arcaConnectFlow.run(win, arcaServerUrl);
+        return arcaConnectFlow.run(win, arcaServerUrl, { signInFirst: true });
       }
       return status.state === "online"
         ? { ok: true, alreadyRunning: status.alreadyRunning === true, identity: status.identity }
@@ -4982,7 +4982,10 @@ function registerIpc() {
             authError: status.errorKind === "omni-auth",
           };
     }
-    return arcaConnectFlow.run(win, arcaServerUrl);
+    const lastAutoRun = arcaAutoConnect.getStatus(arcaServerUrl);
+    return arcaConnectFlow.run(win, arcaServerUrl, {
+      signInFirst: lastAutoRun.state === "failed" && lastAutoRun.errorKind === "omni-auth",
+    });
   });
 
   let arcaExtendInFlight = false;
