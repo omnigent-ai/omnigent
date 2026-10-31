@@ -11,7 +11,11 @@ import { SidebarDataProvider } from "./useSidebarData";
 import { useAgents } from "./useAgents";
 import { refreshScopeWindow } from "@/lib/sidebarData";
 import type { Conversation } from "./useConversations";
-import { useAvailableAgents, prefetchAvailableAgentDetails } from "./useAvailableAgents";
+import {
+  useAgentCatalog,
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+} from "./useAvailableAgents";
 
 // The template catalog and sidebar Mine cache load through authenticatedFetch.
 // URL-keyed stubs exercise the real fetch and mapping path.
@@ -421,6 +425,119 @@ describe("useAvailableAgents", () => {
       },
     ]);
   });
+
+  it("keeps custom agents on a native harness as their own rows, named by their own name", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+          { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: true },
+          // Seeded via OMNIGENT_BUILTIN_AGENT_DIRS: a built-in, but not the stock wrapper.
+          { id: "ag_teamresearch", name: "teamresearch", harness: "claude-native", builtin: true },
+          // Registered with `omnigent server --agent` (builtin: false).
+          {
+            id: "ag_autoresearch",
+            name: "autoresearch",
+            harness: "claude-native",
+            builtin: false,
+            created_at: 2,
+          },
+          {
+            id: "ag_fieldnotes",
+            name: "fieldnotes",
+            harness: "kiro-native",
+            builtin: false,
+            created_at: 1,
+          },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: EMPTY_MINE,
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    // Only the stock wrappers carry the vendor label; a custom agent on the same
+    // native harness keeps its own name and its own row, never folded away.
+    expect((result.current.data ?? []).map((a) => [a.id, a.display_name])).toEqual([
+      ["ag_native", "Claude Code"],
+      ["ag_kiro", "Kiro"],
+      ["ag_teamresearch", "Teamresearch"],
+      ["ag_autoresearch", "Autoresearch"],
+      ["ag_fieldnotes", "Fieldnotes"],
+    ]);
+  });
+
+  it("a seeded built-in custom Kiro agent does not shadow legacy Kiro rows", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+          // Seeded on kiro-native under its own name, not the stock
+          // kiro-native-ui wrapper, so it is not the Kiro built-in.
+          { id: "ag_teamkiro", name: "teamkiro", harness: "kiro-native", builtin: true },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: sessionResponse({
+        object: "list",
+        // A legacy plain-"kiro" row is hidden only when the stock Kiro wrapper
+        // exists; with no wrapper seeded it keeps its own session row.
+        data: [{ id: "ag_legacy_kiro", name: "kiro" }],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    const rows = (result.current.data ?? []).map((a) => [a.id, a.display_name]);
+    expect(rows).toContainEqual(["ag_teamkiro", "Teamkiro"]);
+    expect(rows).toContainEqual(["ag_legacy_kiro", "Kiro"]);
+  });
+
+  it.each([true, false])(
+    "folds a builtin=%s stock wrapper clone into the single vendor row",
+    async (builtin) => {
+      routeFetch({
+        [BUILTINS_URL]: mockResponse({
+          object: "list",
+          data: [
+            { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+            // A fork clone carries the stock wrapper's name, so it folds into the
+            // vendor row even when flagged: stock-name recognition wins over the exemption.
+            {
+              id: "ag_clone",
+              name: "claude-native-ui (fork conv_7)",
+              harness: "claude-native",
+              builtin,
+            },
+          ],
+          has_more: false,
+        }),
+        [MINE_URL]: EMPTY_MINE,
+      });
+
+      const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+        expect(result.current.isPlaceholderData).toBe(false);
+      });
+
+      expect((result.current.data ?? []).map((a) => [a.id, a.display_name])).toEqual([
+        ["ag_native", "Claude Code"],
+      ]);
+    },
+  );
 
   it("defaults a missing harness to null", async () => {
     routeFetch({
@@ -1002,6 +1119,49 @@ describe("prefetchAvailableAgentDetails", () => {
     // Shadow removed; only the seeded built-in remains.
     expect(queryClient.getQueryData(["available-agents"])).toEqual([kiroBuiltin]);
   });
+
+  it("keeps a session agent when its only native peer is an explicitly flagged custom agent", async () => {
+    // The sole kiro peer is a user-flagged custom agent, not the stock
+    // wrapper, so enrichment must not fold the session row into it. Both keep
+    // their own rows.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const customKiro = testAgent("ag_teamkiro", "teamkiro", {
+      display_name: "Teamkiro",
+      harness: "kiro-native",
+      builtin: true,
+    });
+    const sessionKiro = testAgent("ag_session_kiro", "kiro-naitive", {
+      display_name: "Kiro-naitive",
+      harness: null,
+      sessionId: "conv_kiro",
+    });
+    queryClient.setQueryData(["available-agents"], [customKiro, sessionKiro]);
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "ag_session_kiro",
+        object: "agent",
+        name: "kiro-naitive",
+        harness: "kiro-native",
+        skills: [],
+      }),
+    );
+
+    await prefetchAvailableAgentDetails(sessionKiro, queryClient);
+
+    expect(queryClient.getQueryData(["available-agents"])).toEqual([
+      customKiro,
+      {
+        id: "ag_session_kiro",
+        name: "kiro-naitive",
+        display_name: "Kiro-naitive",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+        sessionId: "conv_kiro",
+      },
+    ]);
+  });
 });
 
 // Pinned agents (e.g. a project's configured default) must survive discovery:
@@ -1238,6 +1398,41 @@ describe("useAvailableAgents slow discovery scan", () => {
     // GET /v1/agents — the placeholder must not double the catalog load.
     const catalogCalls = fetchMock.mock.calls.filter((c) => c[0] === BUILTINS_URL);
     expect(catalogCalls).toHaveLength(1);
+  });
+
+  it("drops a suppressed built-in that session history would otherwise resurface", async () => {
+    // A deployment trimmed polly via OMNIGENT_SEEDED_AGENTS after the row was
+    // seeded, so a user's older sessions still bind it. The catalog omits the
+    // row and names it as suppressed; the discovery pass must not promote it
+    // back into the picker as a "custom" agent.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "ag_native", name: "claude-native-ui", harness: "claude-native" }],
+        has_more: false,
+        suppressed_agent_names: ["polly"],
+      }),
+      [MINE_URL]: sessionResponse({
+        object: "list",
+        data: [
+          { id: "ag_polly", name: "polly" },
+          { id: "ag_polly_fork", name: "polly (fork conv_3)" },
+          { id: "ag_doc", name: "doc-writer" },
+        ],
+        has_more: false,
+      }),
+    });
+    // A project default pinning the trimmed row must not bring it back either.
+    const { result } = renderHook(
+      () => ({ ...useAvailableAgents({ pinnedAgentIds: ["ag_polly"] }) }),
+      { wrapper },
+    );
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+    const names = (result.current.data ?? []).map((a) => a.name);
+    expect(names).toEqual(["claude-native-ui", "doc-writer"]);
   });
 });
 
@@ -1480,5 +1675,72 @@ describe("useAvailableAgents user agents (scope=user)", () => {
 
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
     expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
+  });
+});
+
+describe("useAgentCatalog", () => {
+  it("lists the caller's agents and flags ACP harnesses without a sidebar provider", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [
+          { id: "ag_jcode", name: "jcode", harness: "jcode", builtin: true },
+          { id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true },
+        ],
+        has_more: false,
+      }),
+      "/v1/agents?scope=user&limit=50": mockResponse({
+        data: [{ id: "ag_helper", name: "my-helper", harness: "claude-sdk", builtin: false }],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "jcode", label: "Jcode", capabilities: { integration_mode: "acp-subprocess" } },
+        ],
+      }),
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAgentCatalog(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: true }}>
+            {children}
+          </CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+
+    await waitFor(() => {
+      expect(result.current.data?.find((a) => a.name === "my-helper")?.mine).toBe(true);
+      expect(result.current.data?.find((a) => a.name === "jcode")?.acpHarness).toBe(true);
+    });
+  });
+
+  it("reports a failed catalog and loads it on retry", async () => {
+    const harnesses = mockResponse({ data: [] });
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+      [HARNESSES_URL]: harnesses,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAgentCatalog(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>{children}</CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [{ id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true }],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: harnesses,
+    });
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.data?.map((a) => a.name)).toEqual(["polly"]));
+    expect(result.current.isError).toBe(false);
   });
 });

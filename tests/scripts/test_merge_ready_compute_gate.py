@@ -19,6 +19,9 @@ def _run(
     dependency_outcome: str = "success",
     dependency_required: str = "true",
     post_red: str = "false",
+    freshness_failed: str = "false",
+    api_failed: str = "false",
+    expires_at: str = "",
 ) -> dict[str, str]:
     """Run compute-gate.sh with the given env and parse its GITHUB_OUTPUT.
 
@@ -36,6 +39,9 @@ def _run(
             "DEPENDENCY_EVAL": dependency_outcome,
             "DEPENDENCY_REQUIRED": dependency_required,
             "POST_RED": post_red,
+            "FRESHNESS_FAILED": freshness_failed,
+            "API_FAILED": api_failed,
+            "EXPIRES_AT": expires_at,
             "GITHUB_OUTPUT": str(out_file),
         }
     )
@@ -91,6 +97,33 @@ def test_short_desc_never_exceeds_140_chars(tmp_path: Path) -> None:
     """The 140-char commit status limit is respected."""
     out = _run(tmp_path, eval_outcome="failure")
     assert len(out["short_desc"]) <= 140
+
+
+def test_green_status_carries_expiry_for_idle_pr_sweep(tmp_path: Path) -> None:
+    out = _run(tmp_path, eval_outcome="success", expires_at="2099-01-01T00:00:00Z")
+    assert out["state"] == "success"
+    assert out["short_desc"] == "All required checks green; expires 2099-01-01T00:00:00Z"
+
+
+def test_freshness_failure_revokes_green_without_automerge(tmp_path: Path) -> None:
+    out = _run(
+        tmp_path,
+        eval_outcome="failure",
+        failed="- CI is older than 24 hours; update the branch for fresh CI.\n",
+        freshness_failed="true",
+        dependency_required="false",
+    )
+    assert out["state"] == "failure"
+    assert out["post_status"] == "true"
+    assert "24h" in out["short_desc"]
+    assert "update the branch" in out["long_desc"]
+
+
+def test_ci_that_expires_during_dependency_evaluation_cannot_turn_green(tmp_path: Path) -> None:
+    out = _run(tmp_path, eval_outcome="success", expires_at="2000-01-01T00:00:00Z")
+    assert out["state"] == "failure"
+    assert out["post_status"] == "true"
+    assert "expired during evaluation" in out["long_desc"]
 
 
 def test_dependency_evidence_must_succeed_even_when_ci_is_green(tmp_path: Path) -> None:
