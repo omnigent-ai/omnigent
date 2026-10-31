@@ -4,11 +4,12 @@ Each SDK harness ships as an optional extra (``omnigent[cursor]``, etc.).  The
 install command depends on *how* omnigent itself was installed:
 
 * **``uv tool``** — the package lives in an isolated tool environment that
-  ``uv pip install`` cannot reach.  A registry install reinstalls with the
-  extra via ``uv tool install --with "omnigent[extra]" omnigent --force``; a
-  git-source install (``uv tool install git+…``) instead reinstalls from that
-  same source (``uv tool install --force "omnigent[extra] @ git+…"``) so the
-  tool is not silently re-pulled from PyPI.
+  ``uv pip install`` cannot reach, and ``uv tool install --force`` replaces the
+  tool's recorded requirements instead of adding to them.  So the reinstall
+  names the receipt's extras together with the new one (``uv tool install
+  --force "omnigent[copilot,databricks]"``); a git-source install (``uv tool
+  install git+…``) reinstalls from that same source (``uv tool install --force
+  "omnigent[extra] @ git+…"``) so the tool is not silently re-pulled from PyPI.
 * **``uv`` (non-tool)** — ``uv pip install --python <sys.executable>
   "omnigent[extra]"`` pins the install to the running interpreter.  The bare
   form instead resolves the *active* virtualenv, which fails outright on a
@@ -59,32 +60,49 @@ def _installed_vcs_url() -> str | None:
     return info.vcs_url if info is not None else None
 
 
+def _recorded_uv_tool_extras() -> list[str]:
+    """Return the extras the ``uv tool`` receipt records for omnigent.
+
+    Reads ``uv-receipt.toml`` via
+    :func:`omnigent.update_check._read_uv_tool_extras`. Empty when no readable
+    receipt exists or no extras were requested.
+    """
+    from omnigent.update_check import _read_uv_tool_extras
+
+    return _read_uv_tool_extras() or []
+
+
 def extra_install_command(extra: str) -> list[str]:
     """Return the argv that installs *extra* into the running environment.
 
     Detects the install method and picks the right tool:
 
     1. ``uv tool`` install, git source → ``uv tool install --force
-       "omnigent[extra] @ git+…"`` (keeps the tool on its original source)
-    2. ``uv tool`` install, registry → ``uv tool install --with ...
-       omnigent --force``
+       "omnigent[extras] @ git+…"`` (keeps the tool on its original source)
+    2. ``uv tool`` install, registry → ``uv tool install --force
+       "omnigent[extras]"``
     3. ``uv`` on PATH (non-tool) → ``uv pip install --python <sys.executable>
        "omnigent[extra]"``
     4. fallback → ``<sys.executable> -m pip install "omnigent[extra]"``
 
+    Both ``uv tool`` forms name the receipt's recorded extras alongside *extra*:
+    ``--force`` replaces the tool's requirements, so an ``omnigent[databricks]``
+    install would otherwise lose ``databricks`` while gaining *extra*. Other
+    ``--with`` requirements the receipt records are not re-applied.
+
     :param extra: The pip extra name, e.g. ``"cursor"``.
     :returns: The install argv.
     """
-    target = f"omnigent[{extra}]"
-
     if _is_uv_tool_install():
+        target = f"omnigent[{','.join(sorted({*_recorded_uv_tool_extras(), extra}))}]"
         vcs_url = _installed_vcs_url()
         if vcs_url is not None:
-            # Git-source tool install: reinstall from the same source with the
-            # extra attached, else a bare ``omnigent`` re-pulls it from PyPI.
+            # Git-source tool install: reinstall from the same source, else a
+            # bare ``omnigent`` re-pulls it from PyPI.
             return ["uv", "tool", "install", "--force", f"{target} @ {vcs_url}"]
-        return ["uv", "tool", "install", "--with", target, "omnigent", "--force"]
+        return ["uv", "tool", "install", "--force", target]
 
+    target = f"omnigent[{extra}]"
     if shutil.which("uv") is not None:
         # ``--python`` pins the install to the interpreter that will import the
         # extra.  Without it ``uv pip install`` requires an active virtualenv
