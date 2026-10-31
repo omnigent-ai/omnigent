@@ -50,6 +50,7 @@ const mocks = vi.hoisted(() => ({
   // Picker options come from useArchivedProjectNames (a dedicated scan), not
   // from the loaded rows — so tests set them independently of `conversations`.
   projectNames: [] as string[],
+  projects: [] as { id: string | null; name: string; icon?: string | null }[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
 }));
@@ -122,6 +123,7 @@ vi.mock("@/hooks/useConversations", async () => {
     // Picker options are sourced from this dedicated scan, decoupled from the
     // loaded rows so archived-only projects on later pages still appear.
     useArchivedProjectNames: () => ({ data: mocks.projectNames }),
+    useProjects: () => ({ data: mocks.projects }),
     useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     // Mirrors react-query's mutate: per-call `onSuccess` runs once the
     // mutation settles, which is what drives the post-unarchive navigation.
@@ -263,6 +265,7 @@ beforeEach(() => {
   mocks.conversations = [];
   mocks.pages = undefined;
   mocks.projectNames = [];
+  mocks.projects = [];
   mocks.hasNextPage = false;
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
@@ -1477,6 +1480,7 @@ describe("SettingsPage", () => {
 
   it("scopes the archived list to the project picked in the filter", () => {
     mocks.projectNames = ["Alpha", "Beta"];
+    mocks.projects = [{ id: "project-alpha", name: "Alpha", icon: "🚀" }];
     mocks.conversations = [
       conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
       conv("conv_b", {
@@ -1498,8 +1502,16 @@ describe("SettingsPage", () => {
     });
     const select = screen.getByTestId("archived-project-filter");
     expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
-    expect(within(select).getByRole("option", { name: "Alpha" })).toBeInTheDocument();
-    expect(within(select).getByRole("option", { name: "Beta" })).toBeInTheDocument();
+    const alphaOption = within(select).getByRole("option", { name: "Alpha" });
+    const alphaIcon = alphaOption.querySelector('[data-testid="project-icon"]');
+    expect(alphaIcon).toHaveTextContent("🚀");
+    expect(alphaIcon).toHaveAttribute("aria-hidden", "true");
+    expect(alphaIcon?.nextElementSibling).toHaveTextContent("Alpha");
+
+    const betaOption = within(select).getByRole("option", { name: "Beta" });
+    const betaIcon = betaOption.querySelector('svg[aria-hidden="true"]');
+    expect(betaIcon).toBeInTheDocument();
+    expect(betaIcon?.nextElementSibling).toHaveTextContent("Beta");
 
     // Picking a project narrows the list to that project's archived sessions.
     // Select values are discriminated (`project:<name>`), never the raw name.
