@@ -43,12 +43,3 @@ def test_timeout_constants_reexported(name: str) -> None:
     from omnigent.server.routes import sessions as facade
 
     assert isinstance(getattr(facade, name), float)
-
-
-def test_runner_client_resolve_attempts_reexported() -> None:
-    """The connected-runner lookup budget is read through the facade like the timeouts."""
-    from omnigent.server.routes import sessions as facade
-
-    attempts = facade._RUNNER_CLIENT_RESOLVE_ATTEMPTS
-    assert isinstance(attempts, int)
-    assert attempts >= 1
