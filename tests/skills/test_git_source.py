@@ -496,3 +496,45 @@ def test_a_ref_git_cannot_take_is_refused_before_git_runs(
     monkeypatch.setattr(git_source.subprocess, "Popen", no_spawn)
     with pytest.raises(git_source.GitSourceError, match="not a branch or tag name"):
         git_source.clone_github_source("https://github.com/a/b.git", ref, tmp_path / "r")
+
+
+def test_a_clone_is_stopped_once_git_writes_past_its_output_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The watchdog bounded the checkout on disk, not what git wrote to its
+    # pipes, so repository-driven diagnostics could fill the server's memory.
+    fake_git = _stand_in_git(
+        tmp_path / "chatty-git.py",
+        "import time\n"
+        "os.makedirs(dest)\n"
+        "for _ in range(4000):\n"
+        "    sys.stderr.write('remote: ' + 'x' * 1000 + '\\n'); sys.stderr.flush()\n"
+        "time.sleep(60)\n",
+    )
+    monkeypatch.setattr(git_source, "GIT", str(fake_git))
+    monkeypatch.setattr(git_source, "MAX_GIT_OUTPUT_BYTES", 64 * 1024)
+    monkeypatch.setattr(git_source, "CHECKOUT_POLL_S", 0.05)
+    kept: list[int] = []
+    real_pipe = git_source._BoundedPipe
+
+    def recording_pipe(stream, limit):  # type: ignore[no-untyped-def]
+        pipe = real_pipe(stream, limit)
+        real_text = pipe.text
+
+        def text(timeout: float) -> str:
+            value = real_text(timeout)
+            kept.append(len(value.encode()))
+            return value
+
+        pipe.text = text  # type: ignore[method-assign]
+        return pipe
+
+    monkeypatch.setattr(git_source, "_BoundedPipe", recording_pipe)
+    started = time.monotonic()
+    with pytest.raises(git_source.GitSourceError, match="more output than this server accepts"):
+        git_source.clone_github_source(
+            str(fake_git), None, tmp_path / "checkout", isolated=True, max_bytes=1024 * 1024
+        )
+    # Stopped well before its 60-second sleep, keeping only a bounded slice.
+    assert time.monotonic() - started < 15
+    assert kept and max(kept) <= 64 * 1024
