@@ -24,7 +24,7 @@ import {
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "@/lib/workspaceTabPreferences";
-import { WorkspacePanel } from "./WorkspacePanel";
+import { MAX_WARM_RAIL_TERMINALS, WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
 // these tests focus on WorkspacePanel's own logic (the open-file/shell tab
@@ -785,6 +785,65 @@ describe("WorkspacePanel shell tabs", () => {
     expect(await screen.findByTestId("terminal-view-stub")).toBeInTheDocument();
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
     expect(panel.parentElement).toHaveClass("invisible");
+  });
+
+  it("keeps a shown shell attached behind another shell tab until its tab closes", async () => {
+    const other = { ...term, id: "terminal_zsh_s2", session: "u-second" };
+    const otherKey = "terminal:terminal_zsh_s2";
+    useTerminalsMock.mockReturnValue({ terminals: [term, other], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({
+      openTerminals: [termKey, otherKey],
+      selectedTerminalKey: termKey,
+    });
+    const firstView = await screen.findByText("terminal_zsh_s1");
+    // Never shown, so never attached.
+    expect(screen.queryByText("terminal_zsh_s2")).toBeNull();
+
+    rerender({ selectedTerminalKey: otherKey });
+    await screen.findByText("terminal_zsh_s2");
+    // Same node: the first shell's xterm and attach survived the switch.
+    expect(screen.getByText("terminal_zsh_s1")).toBe(firstView);
+    expect(firstView.parentElement).toHaveClass("invisible", "pointer-events-none");
+
+    rerender({ selectedTerminalKey: termKey });
+    expect(screen.getByText("terminal_zsh_s1")).toBe(firstView);
+    expect(firstView.parentElement).not.toHaveClass("invisible");
+
+    rerender({ openTerminals: [termKey] });
+    expect(screen.queryByText("terminal_zsh_s2")).toBeNull();
+    // Terminal ids are deterministic, so a relaunch can reuse the closed id; it waits to be shown.
+    rerender({ openTerminals: [termKey, otherKey] });
+    expect(screen.queryByText("terminal_zsh_s2")).toBeNull();
+  });
+
+  it("starts each session with fresh shell mounts", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({
+      openTerminals: [termKey],
+      selectedTerminalKey: termKey,
+    });
+    const firstView = await screen.findByTestId("terminal-view-stub");
+
+    // The next session reuses the terminal id; it must not inherit this xterm.
+    rerender({ conversationId: "conv_other", selectedTerminalKey: null });
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    rerender({ selectedTerminalKey: termKey });
+    expect(await screen.findByTestId("terminal-view-stub")).not.toBe(firstView);
+  });
+
+  it("detaches the least recently shown shell past the warm limit", async () => {
+    const shells = Array.from({ length: MAX_WARM_RAIL_TERMINALS + 1 }, (_, index) => ({
+      ...term,
+      id: `terminal_zsh_s${index}`,
+    }));
+    const keys = shells.map((shell) => `terminal:${shell.id}`);
+    useTerminalsMock.mockReturnValue({ terminals: shells, isLoading: false, error: null });
+    const { rerender } = renderWorkspace({ openTerminals: keys, selectedTerminalKey: keys[0] });
+    for (const key of keys) rerender({ selectedTerminalKey: key });
+
+    await screen.findByText(shells[shells.length - 1].id);
+    expect(screen.getAllByTestId("terminal-view-stub")).toHaveLength(MAX_WARM_RAIL_TERMINALS);
+    expect(screen.queryByText(shells[0].id)).toBeNull();
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
