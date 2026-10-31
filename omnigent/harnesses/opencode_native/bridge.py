@@ -30,9 +30,13 @@ import os
 import secrets
 import shutil
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from filelock import FileLock
 
 from omnigent.native import native_bridge_common
 
@@ -54,6 +58,7 @@ OPENCODE_SERVER_USERNAME_ENV_VAR = "OPENCODE_SERVER_USERNAME"
 OPENCODE_DEFAULT_USERNAME = "opencode"
 
 _STATE_FILE = "state.json"
+_STATE_LOCK_FILE = "state.lock"
 _AUTH_SECRET_FILE = "auth.secret"
 _XDG_DATA_DIR = "xdg-data"
 _XDG_CONFIG_DIR = "xdg-config"
@@ -570,6 +575,13 @@ def state_path(bridge_dir: Path) -> Path:
     return bridge_dir / _STATE_FILE
 
 
+@contextmanager
+def _bridge_state_lock(bridge_dir: Path) -> Iterator[None]:
+    """Serialize bridge-state read/modify/write cycles across threads and processes."""
+    with FileLock(str(bridge_dir / _STATE_LOCK_FILE)):
+        yield
+
+
 def write_bridge_state(bridge_dir: Path, state: OpenCodeNativeBridgeState) -> None:
     """
     Persist shared native OpenCode state atomically.
@@ -579,6 +591,12 @@ def write_bridge_state(bridge_dir: Path, state: OpenCodeNativeBridgeState) -> No
     :returns: None.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with _bridge_state_lock(bridge_dir):
+        _write_bridge_state_unlocked(bridge_dir, state)
+
+
+def _write_bridge_state_unlocked(bridge_dir: Path, state: OpenCodeNativeBridgeState) -> None:
+    """Atomically replace bridge state while the caller holds its state lock."""
     path = state_path(bridge_dir)
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
     try:
@@ -676,6 +694,27 @@ def read_bridge_state(bridge_dir: Path) -> OpenCodeNativeBridgeState | None:
     )
 
 
+def _update_bridge_state(
+    bridge_dir: Path,
+    update: Callable[[OpenCodeNativeBridgeState], OpenCodeNativeBridgeState],
+) -> bool:
+    """
+    Apply *update* to the persisted state in one locked read/modify/write cycle.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param update: Returns the new state from the current one.
+    :returns: ``True`` when state existed and was updated.
+    """
+    if not state_path(bridge_dir).is_file():
+        return False
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return False
+        _write_bridge_state_unlocked(bridge_dir, update(state))
+    return True
+
+
 def update_active_message_id(
     bridge_dir: Path,
     active_message_id: str | None,
@@ -691,18 +730,26 @@ def update_active_message_id(
         leaves the existing status untouched.
     :returns: None.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return
-    import dataclasses
-
-    write_bridge_state(
+    _update_bridge_state(
         bridge_dir,
-        dataclasses.replace(
+        lambda state: replace(
             state,
             active_message_id=active_message_id,
             status=status if status is not None else state.status,
         ),
+    )
+
+
+def update_opencode_session_id(bridge_dir: Path, opencode_session_id: str) -> None:
+    """
+    Point web prompts, interrupts and compaction at another OpenCode session.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param opencode_session_id: OpenCode session id, e.g. ``"ses_abc123"``.
+    :returns: None.
+    """
+    _update_bridge_state(
+        bridge_dir, lambda state: replace(state, opencode_session_id=opencode_session_id)
     )
 
 
@@ -714,12 +761,7 @@ def update_last_event_id(bridge_dir: Path, last_event_id: str) -> None:
     :param last_event_id: Last SSE event id, e.g. ``"evt_..."``.
     :returns: None.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return
-    import dataclasses
-
-    write_bridge_state(bridge_dir, dataclasses.replace(state, last_event_id=last_event_id))
+    _update_bridge_state(bridge_dir, lambda state: replace(state, last_event_id=last_event_id))
 
 
 def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
@@ -739,14 +781,10 @@ def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
     :returns: ``True`` when the state existed and was updated, ``False`` when
         no bridge state is present (server not launched yet).
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return False
-    import dataclasses
-
     normalized = model_override.strip() if isinstance(model_override, str) else None
-    write_bridge_state(bridge_dir, dataclasses.replace(state, model_override=normalized or None))
-    return True
+    return _update_bridge_state(
+        bridge_dir, lambda state: replace(state, model_override=normalized or None)
+    )
 
 
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:

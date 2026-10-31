@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import pytest
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
 from omnigent.harnesses.opencode_native.client import OpenCodeEvent
@@ -427,3 +428,227 @@ async def test_handle_event_no_longer_calls_update_last_event_id() -> None:
     assert "update_last_event_id" not in source, (
         "update_last_event_id must be removed from opencode_native_forwarder"
     )
+
+
+def _status_edges(server: _RecordingServerClient) -> list[str]:
+    return [
+        body["data"]["status"]
+        for _url, body in server.posts
+        if body["type"] == "external_session_status"
+    ]
+
+
+async def _run_without_backoff(fwd: fwd_mod.OpenCodeNativeForwarder, max_reconnects: int) -> None:
+    async def _no_sleep(_s: float) -> None:
+        pass
+
+    orig_sleep = fwd_mod.asyncio.sleep
+    fwd_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
+    try:
+        await fwd.run(max_reconnects=max_reconnects)
+    finally:
+        fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
+
+
+async def test_session_idle_missed_during_reconnect_gap_ends_the_turn() -> None:
+    """A reconnected OpenCode ``/event`` stream does not replay a ``session.idle`` it missed."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    opencode.message_snapshots = [
+        [],
+        [
+            {
+                "info": {"id": "msg_1", "role": "assistant", "time": {"completed": 2}},
+                "parts": [
+                    {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "full answer"}
+                ],
+            }
+        ],
+    ]
+    opencode._event_batches = [
+        [
+            _ev("session.status", status={"type": "busy"}),
+            _ev("message.updated", info={"id": "msg_1", "role": "assistant"}),
+            _ev(
+                "message.part.updated",
+                part={"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "full"},
+            ),
+        ],
+        [],
+    ]
+
+    await _run_without_backoff(fwd, max_reconnects=1)
+
+    assert _status_edges(server) == ["running", "idle"]
+
+
+async def test_running_turn_ends_when_opencode_server_stays_unreachable() -> None:
+    """When ``opencode serve`` dies mid-turn every reconnect fails to connect."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    edges_at_connection: list[list[str]] = []
+
+    async def _consume_until_server_dies() -> None:
+        edges_at_connection.append(_status_edges(server))
+        if len(edges_at_connection) > 1:
+            raise httpx.ConnectError("All connection attempts failed")
+        await fwd.handle_event(_ev("session.status", status={"type": "busy"}))
+        await fwd.handle_event(_ev("message.updated", info={"id": "msg_1", "role": "assistant"}))
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
+
+    async def _unreachable(_session_id: str) -> list[dict[str, Any]]:
+        raise httpx.ConnectError("All connection attempts failed")
+
+    fwd._consume_once = _consume_until_server_dies  # type: ignore[method-assign]
+    opencode.list_messages = _unreachable  # type: ignore[method-assign]
+
+    await _run_without_backoff(fwd, max_reconnects=20)
+
+    # After the first connection, four refused reconnects leave the turn running; a fifth fails it.
+    assert edges_at_connection[5] == ["running"]
+    assert edges_at_connection[6] == ["running", "failed"]
+    assert _status_edges(server) == ["running", "failed"]
+    failed = [b for _u, b in server.posts if b["type"] == "external_session_status"][-1]
+    assert failed["data"]["output"] == fwd_mod._SERVER_UNREACHABLE_OUTPUT
+
+
+@pytest.mark.parametrize(
+    ("newest_message", "expected_edges"),
+    [
+        pytest.param(
+            {"id": "msg_2", "role": "assistant", "finish": "tool-calls", "time": {"completed": 2}},
+            ["running"],
+            id="tool-step-continues",
+        ),
+        pytest.param({"id": "msg_2", "role": "user"}, ["running"], id="queued-prompt"),
+        pytest.param(
+            {
+                "id": "msg_2",
+                "role": "assistant",
+                "error": {"name": "APIError", "data": {"message": "overloaded"}},
+            },
+            ["running", "failed"],
+            id="reply-failed",
+        ),
+    ],
+)
+async def test_catch_up_ends_the_turn_only_when_history_shows_it_finished(
+    newest_message: dict[str, Any], expected_edges: list[str]
+) -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_ev("session.status", status={"type": "busy"}))
+    await fwd.handle_event(_ev("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    opencode.messages = [{"info": newest_message, "parts": []}]
+
+    await fwd.catch_up_from_history()
+
+    assert _status_edges(server) == expected_edges
+
+
+async def test_catch_up_settles_a_root_session_left_running_after_tui_new() -> None:
+    """After TUI ``/new``, catch-up reads every in-flight root; the turn ends with the last."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_ev("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_ev("session.created", sessionID="ses_new", info={"id": "ses_new"}))
+    for info in ({"id": "msg_2", "role": "user"}, {"id": "msg_3", "role": "assistant"}):
+        await fwd.handle_event(_ev("message.updated", sessionID="ses_new", info=info))
+    assert fwd._opencode_session_id == "ses_new"
+
+    def _finished(message_id: str) -> dict[str, Any]:
+        info = {"id": message_id, "role": "assistant", "finish": "stop", "time": {"completed": 4}}
+        return {"info": info, "parts": []}
+
+    histories = {
+        _SESSION: [_finished("msg_1")],
+        "ses_new": [
+            {"info": {"id": "msg_2", "role": "user"}, "parts": []},
+            {"info": {"id": "msg_3", "role": "assistant"}, "parts": []},
+        ],
+    }
+    requested: list[str] = []
+
+    async def _history(session_id: str) -> list[dict[str, Any]]:
+        requested.append(session_id)
+        return histories[session_id]
+
+    opencode.list_messages = _history  # type: ignore[method-assign]
+
+    await fwd.catch_up_from_history()
+
+    assert sorted(requested) == sorted([_SESSION, "ses_new"])
+    assert _status_edges(server) == ["running"]
+
+    histories["ses_new"][-1] = _finished("msg_3")
+    await fwd.catch_up_from_history()
+
+    assert _status_edges(server) == ["running", "idle"]
+
+
+async def test_catch_up_mirrors_a_prompt_sent_to_an_idle_root_during_the_gap() -> None:
+    """A TUI prompt in an earlier, idle root during the gap is mirrored and becomes the target."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_ev("session.created", sessionID="ses_new", info={"id": "ses_new"}))
+    await fwd.handle_event(
+        _ev("message.updated", sessionID="ses_new", info={"id": "msg_1", "role": "user"})
+    )
+    finished = {"id": "msg_3", "role": "assistant", "finish": "stop", "time": {"completed": 3}}
+    histories = {
+        _SESSION: [
+            {
+                "info": {"id": "msg_2", "role": "user"},
+                "parts": [{"id": "prt_2", "messageID": "msg_2", "type": "text", "text": "back"}],
+            },
+            {
+                "info": finished,
+                "parts": [{"id": "prt_3", "messageID": "msg_3", "type": "text", "text": "reply"}],
+            },
+        ],
+        "ses_new": [{"info": {"id": "msg_1", "role": "user"}, "parts": []}],
+    }
+
+    async def _history(session_id: str) -> list[dict[str, Any]]:
+        return histories[session_id]
+
+    opencode.list_messages = _history  # type: ignore[method-assign]
+
+    await fwd.catch_up_from_history()
+
+    items = [
+        b["data"]["item_data"]
+        for _u, b in server.posts
+        if b["type"] == "external_conversation_item"
+    ]
+    assert [(item["role"], item["content"][0]["text"]) for item in items] == [
+        ("user", "back"),
+        ("assistant", "reply"),
+    ]
+    assert fwd._opencode_session_id == _SESSION
+
+
+async def test_reconnect_that_reaches_the_server_resets_the_unreachable_count() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    connections = {"n": 0}
+
+    async def _consume_with_short_outages() -> None:
+        connections["n"] += 1
+        if connections["n"] == 1:
+            await fwd.handle_event(_ev("session.status", status={"type": "busy"}))
+            await fwd.handle_event(
+                _ev("message.updated", info={"id": "msg_1", "role": "assistant"})
+            )
+            return
+        if connections["n"] != 6:
+            raise httpx.ConnectError("All connection attempts failed")
+
+    fwd._consume_once = _consume_with_short_outages  # type: ignore[method-assign]
+
+    await _run_without_backoff(fwd, max_reconnects=9)
+
+    assert connections["n"] == 10
+    assert _status_edges(server) == ["running"]
