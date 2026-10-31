@@ -6033,8 +6033,9 @@ def _claude_pane_cpu_seconds(
     """
     Total the CPU time used by the processes running a Claude Code pane.
 
-    Reaped children count too, so a boot step that runs and exits between two
-    readings is not lost. A process that cannot be read is skipped.
+    On Linux, reaped children count too, so a boot step that runs and exits
+    between two readings is not lost; psutil reports them as zero on macOS. A
+    process that cannot be read is skipped.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -6042,18 +6043,20 @@ def _claude_pane_cpu_seconds(
     :param bridge_dir: Bridge directory whose Claude session's process is
         included (see :func:`_claude_pane_processes`), or ``None``.
     :returns: User plus system seconds, e.g. ``12.5``, or ``None`` when the
-        pane's process could not be found.
+        pane's process could not be found or no process could be read.
     """
     import psutil
 
     processes = _claude_pane_processes(socket_path, tmux_target, bridge_dir)
     if processes is None:
         return None
-    total = 0.0
+    total: float | None = None
     for process in processes:
         with contextlib.suppress(psutil.Error):
             times = process.cpu_times()
-            total += times.user + times.system + times.children_user + times.children_system
+            total = (total or 0.0) + (
+                times.user + times.system + times.children_user + times.children_system
+            )
     return total
 
 
