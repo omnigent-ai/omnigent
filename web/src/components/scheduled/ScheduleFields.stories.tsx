@@ -12,11 +12,26 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-function ScheduleExample({ initialModel }: { initialModel: ScheduleModel }) {
+function ScheduleExample({
+  initialModel,
+  initialTimezone = "Asia/Singapore",
+  width = 560,
+}: {
+  initialModel: ScheduleModel;
+  initialTimezone?: string;
+  width?: number;
+}) {
   const [model, setModel] = useState(initialModel);
+  const [timezone, setTimezone] = useState(initialTimezone);
   return (
-    <div className="w-[560px] rounded-xl border bg-card p-4">
-      <ScheduleFields model={model} onChange={setModel} />
+    <div className="rounded-xl border bg-card p-4" style={{ width }}>
+      <ScheduleFields
+        model={model}
+        anchoredScheduling
+        onChange={setModel}
+        timezone={timezone}
+        onTimezoneChange={setTimezone}
+      />
     </div>
   );
 }
@@ -42,4 +57,23 @@ export const WeeklyTimePickerOpen: Story = {
   play: async ({ canvasElement }) => {
     await userEvent.click(within(canvasElement).getByTestId("schedule-time-picker-trigger"));
   },
+};
+
+export const NarrowCustomSchedule: Story = {
+  render: () => (
+    <ScheduleExample
+      width={340}
+      initialTimezone="America/Argentina/Buenos_Aires"
+      initialModel={{
+        ...DEFAULT_SCHEDULE_MODEL,
+        preset: "custom",
+        customFreq: "weekly",
+        interval: 3,
+        weekdays: ["MO", "WE", "FR", "SU"],
+        hour: 14,
+        minute: 30,
+        end: { type: "count", count: 12 },
+      }}
+    />
+  ),
 };

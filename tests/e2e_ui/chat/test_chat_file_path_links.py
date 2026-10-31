@@ -268,6 +268,57 @@ def test_chat_link_opens_file_beyond_first_large_directory_page(
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
 
 
+def test_chat_link_to_folder_browses_it_in_files_tree(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    runner_id: str,
+    tmp_path: Path,
+) -> None:
+    """A chat link to an existing folder opens it in the Files tree, not a "wasn't found" toast."""
+    folder = tmp_path / "experimental" / "data" / "mobile-touch-targets"
+    folder.mkdir(parents=True)
+    (folder / "touch-targets.md").write_text("# Touch targets\n")
+
+    create_resp = post_operator_session(
+        httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(tmp_path)), timeout=30.0
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+    try:
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
+        env_resp = httpx.get(
+            f"{live_server}/v1/sessions/{session_id}/resources/environments/default",
+            timeout=10.0,
+        )
+        env_resp.raise_for_status()
+        root = env_resp.json()["metadata"]["root"]
+        link_target = f"{root}/experimental/data/mobile-touch-targets"
+        event_resp = httpx.post(
+            f"{live_server}/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_assistant_message",
+                "data": {
+                    "agent": _AGENT_NAME,
+                    "text": f"Results are in [mobile-touch-targets]({link_target}).",
+                },
+            },
+            timeout=10.0,
+        )
+        event_resp.raise_for_status()
+
+        page: Page = request.getfixturevalue("page")
+        page.goto(f"{live_server}/c/{session_id}")
+        link = page.get_by_role("button", name="mobile-touch-targets", exact=True)
+        expect(link).to_be_visible(timeout=30_000)
+        link.click()
+
+        rail = page.get_by_role("complementary", name="Workspace")
+        expect(rail.get_by_text("touch-targets.md")).to_be_visible(timeout=30_000)
+        expect(page.get_by_text("wasn't found")).to_have_count(0)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+
+
 # A phone-sized touch context: no hover affordance exists there, so a file
 # link that does not react to a tap reads as simply broken.
 _MOBILE_CTX = {

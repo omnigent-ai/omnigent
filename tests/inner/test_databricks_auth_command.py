@@ -545,3 +545,41 @@ def test_the_sdk_path_bounds_and_restores_the_network_timeout(
     databricks_token._sdk_bearer(None, "https://example.databricks.com")
     assert seen["during"] == databricks_token._SDK_NETWORK_TIMEOUT_S
     assert socket.getdefaulttimeout() == before
+
+
+@pytest.mark.posix_only
+def test_the_generated_helper_retries_a_transient_mint_failure(tmp_path: Path) -> None:
+    """
+    One CLI blip must not empty the token and fail the turn.
+
+    The forced and plain mints both fail on the first attempt (a transient OIDC or
+    CLI error), then succeed. Without a retry the helper prints nothing.
+    """
+    import os
+    import subprocess
+
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    counter = tmp_path / "mint-calls"
+    fake = tmp_path / "databricks"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in *--help*) echo "  --force-refresh"; exit 0;; esac\n'
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "{counter}"\n'
+        '[ "$n" -ge 3 ] || exit 1\n'
+        'echo \'{"access_token":"retried"}\'\n'
+    )
+    fake.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}",
+        "DATABRICKS_CONFIG_FILE": str(tmp_path / "nonexistent-databrickscfg"),
+    }
+    for key in list(env):
+        if key.startswith("DATABRICKS_") and key != "DATABRICKS_CONFIG_FILE":
+            env.pop(key, None)
+    command = databricks_bearer_token_command("https://example.databricks.com", "agent")
+    result = subprocess.run(
+        ["sh", "-c", command], env=env, capture_output=True, text=True, check=False
+    )
+    assert result.stdout.strip() == "retried"
