@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +121,7 @@ def _list_task_ids(base_url: str) -> set[str]:
 
 
 @pytest.fixture(autouse=True)
-def _delete_scheduled_tasks_created_by_test(live_server: str) -> Iterator[None]:
+def _delete_scheduled_tasks_created_by_test(request: pytest.FixtureRequest) -> Iterator[None]:
     """Delete every scheduled task a test creates, tracked or not.
 
     ``live_server`` is one server for the whole pytest session, so a task a
@@ -130,6 +130,12 @@ def _delete_scheduled_tasks_created_by_test(live_server: str) -> Iterator[None]:
     locator. Diffing the id set before/after the test closes that gap without
     relying on each test to register what it created.
     """
+    server_fixture = (
+        "automations_v2_server"
+        if "automations_v2_server" in request.fixturenames
+        else "live_server"
+    )
+    live_server = request.getfixturevalue(server_fixture)
     before = _list_task_ids(live_server)
     yield
     for task_id in _list_task_ids(live_server) - before:
@@ -158,6 +164,13 @@ def online_host(live_server: str, tmp_path: Path) -> Iterator[Host]:
     unpinned tasks must still find no online host.
     """
     with _online_host(tmp_path / "host", live_server) as host:
+        yield host
+
+
+@pytest.fixture
+def automations_v2_host(automations_v2_server: str, tmp_path: Path) -> Iterator[Host]:
+    """Connect the custom-schedule journey to its explicitly enabled server."""
+    with _online_host(tmp_path / "host", automations_v2_server) as host:
         yield host
 
 
@@ -192,39 +205,7 @@ def _row_by_name(page: Page, name: str):
 
 
 def _pick_minute(page: Page, minute: int) -> None:
-    """Open the time picker and click a minute cell.
-
-    The time input opens the picker on focus, so by the time a caller reaches the
-    clock button the picker is already open and being dismissed by whatever the
-    caller clicked last. Radix keeps the popover mounted through its exit
-    animation, and toggling the clock mid-exit re-opens it only to have Radix
-    dismiss it again immediately — leaving the minute cells alive just until the
-    animation ends, long enough for a visibility check to pass and the click
-    after it to miss. Waiting for the exit to finish means the toggle acts on a
-    genuinely closed picker, so no re-open-and-retry is needed.
-
-    Selecting a minute does not close the popover, and an open floating-ui
-    popover keeps recomputing its position — leaving the dialog's submit button
-    perpetually "not stable" for Playwright. So dismiss the picker (by clicking a
-    field inside the dialog, an interaction-outside — Escape would bubble to the
-    Radix Dialog and close it) and wait for it to unmount, letting the layout
-    settle before the caller submits.
-
-    Every dismiss click on the name input uses force=True: while the picker
-    popover is open the Radix Dialog owns pointer hit-testing over the modal, so
-    a normal actionability-gated click resolves to the ``dialog-overlay`` at the
-    input's coordinates ("overlay intercepts pointer events") and blocks the full
-    30s under load. A forced click still dispatches a real pointerdown on the
-    input, which Radix registers as the interaction-outside that closes the
-    popover — the same reason the open click below is forced.
-
-    :param page: Playwright page with the create/edit task dialog open.
-    :param minute: Minute of the hour to select (0-59).
-    """
-    name_input = page.get_by_test_id("task-name-input")
-    # The popover content element: it carries data-state (open/closed) and
-    # unmounts only after the exit animation finishes, so its count/state are
-    # the reliable signals for both waits below.
+    """Pick a minute and close the popover before the caller submits."""
     popover_content = page.locator('[data-slot="popover-content"]').filter(
         has=page.get_by_test_id("schedule-time-picker")
     )
@@ -232,8 +213,7 @@ def _pick_minute(page: Page, minute: int) -> None:
     page.get_by_test_id("schedule-time-picker-trigger").click()
     expect(popover_content).to_have_attribute("data-state", "open")
     page.get_by_test_id(f"schedule-minute-{minute:02d}").click()
-    # Dismiss the picker so its floating position stops churning the layout.
-    name_input.click(force=True)
+    page.keyboard.press("Escape")
     expect(popover_content).to_have_count(0)
 
 
@@ -421,19 +401,22 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
     agent_trigger.click()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
-    expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Daily")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Every day")
 
     time_input = page.get_by_test_id("schedule-time")
+    page.get_by_test_id("schedule-time-picker-trigger").click()
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
+    page.get_by_test_id("schedule-time-picker-trigger").click()
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
     time_input.click()
     expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
     expect(time_input).to_be_focused()
     time_input.press("ControlOrMeta+A")
     time_input.press_sequentially("9:37")
     assert time_input.input_value() == "9:37"
-    # force=True: focusing the time input opened the picker popover, so a normal
-    # click here can resolve to the dialog overlay (see _pick_minute's note). A
-    # forced click still blurs the input and closes the picker.
-    page.get_by_test_id("task-name-input").click(force=True)
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    page.get_by_test_id("task-name-input").click()
     expect(time_input).to_have_value("09:37 AM")
     # Pick a minute the typed input did NOT already produce, so this proves the
     # picker applied the click rather than re-reading the value typing had set.
@@ -477,9 +460,9 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.press("ControlOrMeta+A")
     time_input.press_sequentially("10:37")
     assert time_input.input_value() == "10:37"
-    # force=True: the time input's focus reopened the picker popover, so blur it
-    # with a forced click that can't be swallowed by the dialog overlay.
-    page.get_by_test_id("task-name-input").click(force=True)
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    page.get_by_test_id("task-name-input").click()
     expect(time_input).to_have_value("10:37 AM")
     submit.click()
 
@@ -586,6 +569,95 @@ def _pick_select_option(page: Page, trigger_test_id: str, option_label: str) -> 
     """
     page.get_by_test_id(trigger_test_id).click()
     page.get_by_role("option", name=option_label, exact=True).click()
+
+
+@pytest.mark.usefixtures("automations_v2_host")
+def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_server: str) -> None:
+    """Nested schedule pickers stay open and persist the visual recurrence and timezone."""
+    name = f"Custom schedule {uuid.uuid4().hex[:8]}"
+    _open_automations_page(page, automations_v2_server)
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill(name)
+    page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
+    _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
+    page.get_by_label("Repeat every", exact=True).fill("2")
+    page.get_by_test_id("schedule-time").click()
+    page.get_by_test_id("schedule-hour-10").click()
+    page.get_by_test_id("schedule-time").click()
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    expect(page.get_by_label("Repeat every", exact=True)).to_be_visible()
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
+    expect(page.get_by_test_id("schedule-time")).to_have_value("10:00 AM")
+    page.keyboard.press("Escape")
+    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
+    expect(page.get_by_label("Frequency", exact=True)).to_have_text("Every day")
+    _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
+    page.get_by_label("Repeat every", exact=True).fill("2")
+    _pick_select_option(page, "custom-freq-trigger", "Months")
+    page.get_by_test_id("custom-freq-trigger").click()
+    expect(page.get_by_role("listbox")).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("listbox")).to_have_count(0)
+    expect(
+        page.locator('[data-slot="popover-content"]').filter(
+            has=page.get_by_label("Repeat every", exact=True)
+        )
+    ).to_have_attribute("data-state", "open")
+    days = page.get_by_role("group", name="Days of the month")
+    days.get_by_role("button", name="15", exact=True).click()
+    page.get_by_test_id("schedule-time").fill("23:37")
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    page.get_by_role("button", name="Apply", exact=True).click()
+    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
+
+    page.get_by_test_id("task-timezone-trigger").click()
+    page.get_by_placeholder("Search timezones…").fill("Singapore")
+    page.get_by_role("option", name="Asia/Singapore", exact=True).click()
+    expect(page.get_by_test_id("task-timezone-trigger")).to_contain_text("Asia/Singapore")
+    page.get_by_role("combobox", name="Schedule ends", exact=True).click()
+    page.get_by_role("option", name="After", exact=True).click()
+    page.get_by_label("Occurrences", exact=True).fill("4")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    row = _row_by_name(page, name)
+    expect(row).to_be_visible(timeout=30_000)
+    response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks", timeout=10.0)
+    response.raise_for_status()
+    task = next(task for task in response.json()["scheduled_tasks"] if task["name"] == name)
+    assert task["rrule"] == "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15;BYHOUR=23;BYMINUTE=37;COUNT=4"
+    assert task["timezone"] == "Asia/Singapore"
+
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    page.get_by_test_id("custom-schedule-trigger").click()
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
+    expect(page.get_by_test_id("custom-freq-trigger")).to_have_text("Months")
+    expect(page.get_by_test_id("schedule-time")).to_have_value("11:37 PM")
+    expect(days.get_by_role("button", name="15", exact=True)).to_have_attribute(
+        "aria-pressed", "true"
+    )
+    page.get_by_label("Repeat every", exact=True).fill("3")
+    page.keyboard.press("Escape")
+    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
+    page.get_by_test_id("custom-schedule-trigger").click()
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
+    page.get_by_role("button", name="Apply", exact=True).click()
+    page.get_by_role("combobox", name="Schedule ends", exact=True).click()
+    page.get_by_role("option", name="On date", exact=True).click()
+    end_date = f"{datetime.now(UTC).year + 2}-06-10"
+    page.get_by_label("End date", exact=True).fill(end_date)
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
+    response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}", timeout=10.0)
+    response.raise_for_status()
+    assert response.json()["rrule"] == (
+        "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15;BYHOUR=23;BYMINUTE=37;"
+        f"UNTIL={end_date.replace('-', '')}T155959Z"
+    )
+    assert response.json()["timezone"] == "Asia/Singapore"
 
 
 def test_scheduled_task_model_effort_controls_visible_for_capable_agent(

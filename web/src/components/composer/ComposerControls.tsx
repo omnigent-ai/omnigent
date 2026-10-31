@@ -1,4 +1,11 @@
-import { forwardRef, useRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
 import {
   ChevronDownIcon,
   FolderIcon,
@@ -156,6 +163,7 @@ export function ComposerPermissionPicker({
   interactiveWhileLoading = false,
   onSelect,
   testIdPrefix = "composer",
+  openNonce = 0,
 }: {
   label: string;
   value: string;
@@ -171,13 +179,23 @@ export function ComposerPermissionPicker({
   interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
   testIdPrefix?: string;
+  /** Opens the menu each time this changes to a new nonzero value. */
+  openNonce?: number;
 }) {
+  const inert = disabled || (loading && !interactiveWhileLoading);
+  const [open, setOpen] = useState(false);
+  const appliedOpenNonce = useRef(openNonce);
+  useEffect(() => {
+    if (!openNonce || openNonce === appliedOpenNonce.current) return;
+    appliedOpenNonce.current = openNonce;
+    if (!inert) setOpen(true);
+  }, [openNonce, inert]);
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild disabled={inert}>
         <button
           type="button"
-          disabled={disabled || (loading && !interactiveWhileLoading)}
+          disabled={inert}
           aria-busy={loading || undefined}
           className={cn(
             "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
