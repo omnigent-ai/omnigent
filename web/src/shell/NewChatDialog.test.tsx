@@ -4213,7 +4213,12 @@ describe("NewChatLandingScreen", () => {
       "pb-[max(20px,env(safe-area-inset-bottom))]",
       "md:pb-16",
     );
-    expect(landingContent?.firstElementChild).toHaveClass("flex-1", "md:flex-none");
+    expect(landingContent?.firstElementChild).toHaveClass(
+      "flex-1",
+      "md:flex-none",
+      "max-md:min-h-0",
+      "max-md:overflow-hidden",
+    );
     expect(composerSurface.firstElementChild).toBe(workspaceControls);
     expect(workspaceControls).toContainElement(workspace);
     expect(workspaceControls.nextElementSibling).toBe(composer.closest("form"));
