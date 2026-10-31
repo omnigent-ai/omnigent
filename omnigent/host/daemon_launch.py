@@ -21,6 +21,7 @@ import click
 import httpx
 
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.host.launch_audit import launch_audit_headers
 from omnigent.process_logging import display_log_path, process_log_dir
 
 # Steady-state poll cadence while waiting for a daemon-spawned runner to
@@ -105,17 +106,26 @@ def open_daemon_client(
     """
     from omnigent_client._http import is_loopback_url
 
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, databricks_request_headers
 
     pinned = {**headers, **databricks_request_headers(base_url, host_id=host_id)}
+
+    async def pin_request(request: httpx.Request) -> None:
+        # Auth refresh may inject this machine's key; the selected host wins.
+        key = client.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        if key is not None:
+            request.headers[OMNIGENT_SLICE_KEY_HEADER] = key
+
     # A proxy cannot reach a loopback server, so local targets bypass it.
-    return httpx.AsyncClient(
+    client = httpx.AsyncClient(
         base_url=base_url,
         headers=pinned,
         auth=auth,
         timeout=timeout,
         trust_env=not is_loopback_url(base_url),
+        event_hooks={"request": [pin_request]},
     )
+    return client
 
 
 async def wait_for_host_online(
@@ -163,15 +173,18 @@ async def wait_for_host_online(
     raise click.ClickException(message)
 
 
-async def runner_is_online(client: httpx.AsyncClient, runner_id: str) -> bool:
+async def runner_is_online(
+    client: httpx.AsyncClient, runner_id: str, *, headers: dict[str, str] | None = None
+) -> bool:
     """
     Return whether a runner currently has an open tunnel to the server.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param runner_id: Runner id, e.g. ``"runner_abc123"``.
+    :param headers: Optional diagnostic context for an attachment attempt.
     :returns: ``True`` when the status endpoint reports ``online``.
     """
-    resp = await client.get(f"/v1/runners/{url_component(runner_id)}/status")
+    resp = await client.get(f"/v1/runners/{url_component(runner_id)}/status", headers=headers)
     return resp.status_code == 200 and bool(_json_body(resp).get("online"))
 
 
@@ -261,20 +274,35 @@ async def launch_or_reuse_daemon_runner(
     :returns: The bound runner id, e.g. ``"runner_abc123"``.
     :raises click.ClickException: If the launch request fails.
     """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.session_host import set_session_host
+
+    headers = launch_audit_headers(host_id=host_id, fresh=fresh)
+    owner_host = host_id
     if fresh:
         existing = None
     else:
-        snap = await client.get(f"/v1/sessions/{url_component(session_id)}")
-        existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
+        snap = await client.get(f"/v1/sessions/{url_component(session_id)}", headers=headers)
+        snapshot = _json_body(snap) if snap.status_code == 200 else {}
+        existing = snapshot.get("runner_id")
+        saved_host = snapshot.get("host_id")
+        if isinstance(saved_host, str) and saved_host:
+            owner_host = saved_host
     if isinstance(existing, str) and existing:
-        if await runner_is_online(client, existing):
+        # Runner status is replica-local; probe the existing owner's replica.
+        client.headers.update(databricks_request_headers(str(client.base_url), host_id=owner_host))
+        if await runner_is_online(client, existing, headers=headers):
+            set_session_host(session_id, owner_host)
             return existing
+        # Offline recovery keeps the caller's requested destination and workspace.
+        client.headers.update(databricks_request_headers(str(client.base_url), host_id=host_id))
         # Stale binding (offline runner): clear it so the launch
         # endpoint's atomic ``UPDATE ... WHERE runner_id IS NULL`` can
         # bind the freshly-spawned runner. "" is the clear sentinel.
         await client.patch(
             f"/v1/sessions/{url_component(session_id)}",
             json={"runner_id": ""},
+            headers=headers,
         )
     # The host tunnel can be briefly absent from the server's in-memory
     # registry while it (re)connects — e.g. just after `omnigent host`
@@ -291,6 +319,7 @@ async def launch_or_reuse_daemon_runner(
         resp = await client.post(
             f"/v1/hosts/{url_component(host_id)}/runners",
             json={"session_id": session_id, "workspace": workspace},
+            headers=headers,
             timeout=60.0,
         )
         if resp.status_code < 400:
@@ -304,6 +333,7 @@ async def launch_or_reuse_daemon_runner(
     runner_id = resp.json().get("runner_id")
     if not isinstance(runner_id, str) or not runner_id:
         raise click.ClickException("Host launch response did not include a runner_id.")
+    set_session_host(session_id, host_id)
     return runner_id
 
 

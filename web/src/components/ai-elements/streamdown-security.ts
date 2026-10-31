@@ -1,6 +1,6 @@
 import { cjk } from "@streamdown/cjk";
 import { createMathPlugin } from "@streamdown/math";
-import { mermaid } from "@streamdown/mermaid";
+import { mermaid } from "./mermaidPlugin";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 import { lazyCodePlugin } from "./lazyCodePlugin";
 
