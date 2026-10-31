@@ -90,6 +90,9 @@ const state = {
   failDeleteSource: false,
   failDeleteSkill: false,
   secondPage: null as InstalledSkill[] | null,
+  failSecondPage: false,
+  // Resolved by a test to release a held /v1/skill-catalog preview.
+  previewGate: null as Promise<void> | null,
 };
 const page = <T,>(data: T[], has_more = false, last_id: string | null = null) => ({
   data,
@@ -103,6 +106,8 @@ function script() {
     const method = init?.method ?? "GET";
     calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
     if (url.startsWith("/v1/installed-skills?") && method === "GET") {
+      if (url.includes("after=") && state.failSecondPage)
+        return json({ error: { message: "next page is unavailable" } }, 503);
       if (url.includes("after=") && state.secondPage) return json(page(state.secondPage));
       return json(
         page(state.installed, state.secondPage !== null, state.secondPage ? "cursor" : null),
@@ -121,24 +126,40 @@ function script() {
     if (url === "/v1/skill-sources" && method === "POST") return json(source, 201);
     if (url === "/v1/skill-sources/src1" && method === "DELETE" && state.failDeleteSource)
       return json({ error: { message: "This source is set in the server config" } }, 403);
-    if (url === "/v1/skill-sources/src1" && method === "DELETE")
+    const deleted = /^\/v1\/skill-sources\/(\w+)$/.exec(url);
+    if (deleted && method === "DELETE") {
+      state.sources = state.sources.filter((s) => s.id !== deleted[1]);
       return new Response(null, { status: 204 });
+    }
     if (url === "/v1/installed-skills/sk1" && method === "PATCH" && state.failPatch)
       return json({ error: { message: "Administrator access required" } }, 403);
     if (url.startsWith("/v1/skill-sources/src1/catalog")) return json(catalog);
+    if (url.startsWith("/v1/skill-sources/src2/catalog"))
+      return json({ ...catalog, skills: [{ ...catalog.skills[1], name: "deploy" }] });
+    if (url === "/v1/skill-catalog" && state.previewGate) await state.previewGate;
     if (url === "/v1/skill-catalog")
       // A repository directory link: the catalog names the directory it indexed.
       return json({ ...catalog, url: "https://github.com/other/repo.git", path: "team-a" });
     if (url === "/v1/installed-skills" && method === "POST") return json({ data: [review] }, 201);
-    if (url === "/v1/installed-skills/sk1" && method === "PATCH")
-      return json({ ...review, enabled: false });
+    if (url === "/v1/installed-skills/sk1" && method === "PATCH") {
+      const enabled = (JSON.parse(String(init?.body)) as { enabled: boolean }).enabled;
+      state.installed = state.installed.map((s) => (s.id === "sk1" ? { ...s, enabled } : s));
+      return json({ ...review, enabled });
+    }
     if (url === "/v1/installed-skills/sk1/content")
       return json({ markdown: "---\nname: review\n---\nReview it." });
-    if (url === "/v1/installed-skills/sk1/update") return json(review);
+    if (url === "/v1/installed-skills/sk1/update") {
+      state.installed = state.installed.map((s) =>
+        s.id === "sk1" ? { ...s, commit: "b".repeat(40) } : s,
+      );
+      return json(state.installed[0]);
+    }
     if (url === "/v1/installed-skills/sk1" && method === "DELETE" && state.failDeleteSkill)
       return json({ error: { message: "Not the owner of this skill" } }, 403);
-    if (url === "/v1/installed-skills/sk1" && method === "DELETE")
+    if (url === "/v1/installed-skills/sk1" && method === "DELETE") {
+      state.installed = state.installed.filter((s) => s.id !== "sk1");
       return new Response(null, { status: 204 });
+    }
     return json({ error: { message: `unexpected ${method} ${url}` } }, 500);
   });
 }
@@ -172,6 +193,8 @@ beforeEach(() => {
   state.failDeleteSource = false;
   state.failDeleteSkill = false;
   state.secondPage = null;
+  state.failSecondPage = false;
+  state.previewGate = null;
   calls.length = 0;
   fetchMock.mockReset();
   script();
@@ -192,13 +215,21 @@ describe("SettingsSkillsSection", () => {
     expect(row).toHaveTextContent("acme/skills");
     expect(row).toHaveTextContent("aaaaaaa");
 
-    fireEvent.click(within(row).getByTestId("installed-skill-toggle-review"));
+    const toggle = within(row).getByTestId("installed-skill-toggle-review");
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
     await waitFor(() =>
       expect(calls).toContainEqual({
         method: "PATCH",
         url: "/v1/installed-skills/sk1",
         body: { enabled: false },
       }),
+    );
+    // The list reflects the server's answer once it refetches.
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId("installed-skill-review")).getByRole("switch"),
+      ).not.toBeChecked(),
     );
   });
 
@@ -339,6 +370,10 @@ describe("SettingsSkillsSection", () => {
         body: undefined,
       }),
     );
+    // The refetched row shows the commit the update moved it to.
+    expect(
+      await within(screen.getByTestId("installed-skill-review")).findByText("bbbbbbb"),
+    ).toBeInTheDocument();
 
     fireEvent.click(within(row).getByRole("button", { name: "Remove review" }));
     fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
@@ -353,6 +388,8 @@ describe("SettingsSkillsSection", () => {
         body: undefined,
       }),
     );
+    expect(await screen.findByTestId("installed-skills-empty")).toBeInTheDocument();
+    expect(screen.queryByTestId("installed-skill-review")).toBeNull();
   });
 
   it("shows the server's message when a mutation is refused", async () => {
@@ -367,8 +404,17 @@ describe("SettingsSkillsSection", () => {
     state.secondPage = [{ ...review, id: "sk9", name: "later", display_name: "Later skill" }];
     renderSection();
     await screen.findByTestId("installed-skill-review");
+    // A failed continuation keeps the loaded rows and their controls, with
+    // the error beside a button that retries.
+    state.failSecondPage = true;
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await screen.findByText("next page is unavailable")).toBeInTheDocument();
+    expect(screen.getByTestId("installed-skill-review")).toBeInTheDocument();
+    expect(screen.getByRole("switch")).toBeInTheDocument();
+    state.failSecondPage = false;
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
     expect(await screen.findByTestId("installed-skill-later")).toBeInTheDocument();
+    expect(screen.queryByText("next page is unavailable")).toBeNull();
     expect(calls.some((c) => c.url.includes("after=cursor"))).toBe(true);
   });
 
@@ -388,6 +434,40 @@ describe("SettingsSkillsSection", () => {
     const mine = screen.getByTestId("installed-skill-mine");
     expect(within(mine).getByRole("switch")).toBeInTheDocument();
     expect(within(mine).getByRole("button", { name: "Remove mine" })).toBeInTheDocument();
+  });
+
+  it("moves Browse to a remaining source when the selected one is removed", async () => {
+    state.sources = [source, { ...source, id: "src2", name: "acme/deploy" }];
+    renderSection();
+    openBrowse();
+    fireEvent.click(await screen.findByTestId("skill-source-src1"));
+    await screen.findByTestId("catalog-skill-triage");
+    fireEvent.click(screen.getByRole("button", { name: "Remove source acme/skills" }));
+    expect(await screen.findByTestId("catalog-skill-deploy")).toBeInTheDocument();
+    expect(screen.queryByTestId("skill-source-src1")).toBeNull();
+    expect(screen.getByTestId("skill-source-src2")).toHaveAttribute("aria-current", "true");
+  });
+
+  it("keeps a newer source selection when a URL preview finishes late", async () => {
+    let release!: () => void;
+    state.previewGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    renderSection();
+    openBrowse();
+    fireEvent.change(await screen.findByTestId("skill-url-input"), {
+      target: { value: "other/repo" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Preview skills/ }));
+    await waitFor(() => expect(calls.some((c) => c.url === "/v1/skill-catalog")).toBe(true));
+    fireEvent.click(screen.getByTestId("skill-source-src1"));
+    release();
+    await screen.findByTestId("catalog-skill-triage");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Preview skills/ })).not.toBeDisabled(),
+    );
+    expect(screen.queryByText(/Previewing/)).toBeNull();
+    expect(screen.getByTestId("skill-source-src1")).toHaveAttribute("aria-current", "true");
   });
 
   it("lets an admin add and remove sources", async () => {
@@ -413,8 +493,12 @@ describe("SettingsSkillsSection", () => {
       }),
     );
 
+    // The removed source is gone from the list.
+    await waitFor(() => expect(screen.queryByTestId("skill-source-src1")).toBeNull());
+
     // A refused removal says why, next to the source that stayed.
     cleanup();
+    state.sources = [source];
     state.failDeleteSource = true;
     renderSection();
     openBrowse();
