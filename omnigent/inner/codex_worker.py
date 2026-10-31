@@ -11,12 +11,14 @@ from .datamodel import OSEnvSpec
 from .egress.controller import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .model_signer import SignerReadiness
 from .sandbox import (
+    SandboxPolicy,
     cleanup_private_tmpdir,
     create_exec_launcher,
     create_private_tmpdir,
     get_backend,
     resolve_sandbox,
     with_additional_read_roots,
+    with_additional_write_files,
     with_additional_write_roots,
     with_spawn_env_allowlist,
 )
@@ -57,6 +59,30 @@ class CodexWorkerLaunch:
         tmpdir = self._egress_tmpdir
         self._egress_tmpdir = None
         cleanup_private_tmpdir(tmpdir)
+
+
+def _contain_host_codex_home_links(policy: SandboxPolicy, codex_home: Path) -> SandboxPolicy:
+    """Repair private-home links into the host Codex home, which the sandbox does not mount."""
+    # SQLite keeps WAL sidecars beside the shared database, so start a private store.
+    memories = codex_home / "memories_1.sqlite"
+    if memories.is_symlink():
+        memories.unlink()
+    login = codex_home / "auth.json"
+    if not login.is_symlink():
+        return policy
+    host_login = login.parent / login.readlink()
+    host_login = host_login.parent.resolve() / host_login.name
+    # A sandboxed session may have replaced the host login with a link; never grant its target.
+    if host_login.is_symlink() or not host_login.is_file():
+        return policy
+    granted = with_additional_write_files(policy, [host_login])
+    # The grant resolves the path again; drop it if the login was swapped for a link meanwhile.
+    if not set(granted.write_files) <= {*policy.write_files, host_login}:
+        return policy
+    # Codex refreshes the login in place; link straight to the granted file.
+    login.unlink()
+    login.symlink_to(host_login)
+    return granted
 
 
 def prepare_codex_catalog_probe(
@@ -145,6 +171,8 @@ def prepare_codex_worker(
         if signer_readiness.ca_bundle_path.parent != signer_readiness.socket_path.parent:
             raise ValueError("signer relay and public CA must share one public directory")
         policy = with_additional_read_roots(policy, [signer_readiness.ca_bundle_path.parent])
+    else:
+        policy = _contain_host_codex_home_links(policy, codex_home)
     staged_env = dict(worker_env) if worker_env is not None else None
     if signer_readiness is not None:
         assert staged_env is not None
