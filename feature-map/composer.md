@@ -127,6 +127,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   as text. A claude-sdk `/clear` continues in a new, empty session on the same
   machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
+- `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
+  a searchable list of the session's prompts, newest first. Choosing one
+  continues the conversation in a new session holding only the history before
+  that prompt, on the same host, workspace and runner, with the prompt back in
+  the composer to edit; the original session keeps everything and links to the
+  new one. Offered only when `/v1/info` reports `session_rewind`; otherwise a
+  typed `/rewind` is sent as text. Files are not restored. States: loading
+  prompts, prompts failed to load, no prompts, refused while a turn runs or the
+  runner and host are offline (error under the composer).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited

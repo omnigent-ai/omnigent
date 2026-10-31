@@ -75,6 +75,7 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
+  rewindSession,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -1423,6 +1424,12 @@ export interface ChatActions {
   compact: () => Promise<void>;
   /** Run the harness's /clear; the view follows the session that continues the work. */
   clearContext: () => Promise<void>;
+  /**
+   * Rewind the active session to just before the prompt `itemId`: the server
+   * forks the earlier history onto the same machine, and this opens the fork
+   * with the prompt back in its composer.
+   */
+  rewindToPrompt: (itemId: string) => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -3568,6 +3575,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     await postEvent(conversationId, { type: "clear", data: {} });
+  },
+
+  rewindToPrompt: async (itemId) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const rewound = await rewindSession(conversationId, itemId);
+    setSessionDraft(rewound.sessionId, { text: rewound.prompt, files: [] });
+    useChatStore.setState((s) =>
+      s.conversationId === conversationId ? { redirectToConversationId: rewound.sessionId } : {},
+    );
   },
 
   refreshSessionState: async (conversationId) => {
