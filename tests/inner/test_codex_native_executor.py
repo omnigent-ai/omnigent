@@ -1595,6 +1595,7 @@ def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
     assert "4000" in message
     assert "-32600" not in message
     assert "Codex native executor error" not in message
+    assert events[0].undelivered is True
     # The doomed objective never reaches the app-server.
     assert _FakeCodexNativeClient.requests == []
 

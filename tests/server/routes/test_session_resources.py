@@ -8866,17 +8866,19 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
 
 
 @pytest.mark.asyncio
-async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
+@pytest.mark.parametrize(
+    "refusal_case",
+    ["claude_auth", "claude_inactive", "claude_empty", "codex_goal_too_long", "codex_empty"],
+)
+async def test_native_pre_delivery_refusal_is_not_reclassified_as_missing_by_later_mirror(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal_case: str,
 ) -> None:
-    """A pre-delivery refusal must not be reported again as a missing message.
-
-    Claude refuses web ``/login`` before touching the terminal. If that failure
-    is not marked undelivered, the input stays pending. The next successful
-    message's transcript mirror skips it and persists a second error with code
-    ``native_prompt_not_recorded``.
-    """
+    """A refused input must not become a second error when the next echo arrives."""
+    from omnigent.harnesses.claude_native.bridge import REQUEST_SESSION_ID_ENV_VAR
     from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
     from omnigent.runtime import pending_inputs
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
@@ -8893,24 +8895,43 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
     assert conversation is not None
     first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
     later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
-    auth_content = [{"type": "input_text", "text": "/login"}]
+    harness = "codex" if refusal_case.startswith("codex") else "claude"
+    if harness == "codex":
+        conversation.labels["omnigent.wrapper"] = "codex-native-ui"
+    if refusal_case == "claude_inactive":
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    text = {
+        "claude_auth": "/login",
+        "claude_inactive": "message from an old tab",
+        "claude_empty": "",
+        "codex_goal_too_long": "/goal " + "x" * 4001,
+        "codex_empty": "",
+    }[refusal_case]
+    refused_content = [{"type": "input_text", "text": text}]
     later_content = [{"type": "input_text", "text": "continue after login"}]
     first_pending = pending_inputs.record(
         session_id,
-        auth_content,
+        refused_content,
         created_by="alice@example.com",
         stable_id=first_stable_id,
     )
-    adapter = ExecutorAdapter(executor_factory=lambda: ClaudeNativeExecutor(tmp_path))
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: (
+            CodexNativeExecutor(bridge_dir=tmp_path)
+            if harness == "codex"
+            else ClaudeNativeExecutor(tmp_path)
+        )
+    )
     context = TurnContext(
-        response_id="resp_login_refused",
+        response_id="resp_input_refused",
         event_queue=asyncio.Queue(),
         cancelled=asyncio.Event(),
     )
     try:
         with pytest.raises(RuntimeError) as raised:
             await adapter.run_turn(
-                CreateResponseRequest(model="claude", input=auth_content),
+                CreateResponseRequest(model="claude", input=refused_content),
                 context,
             )
         refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
@@ -8919,7 +8940,7 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
                 _sse_frame(
                     {
                         "type": "response.in_progress",
-                        "response": {"id": "resp_login_refused", "model": "claude"},
+                        "response": {"id": "resp_input_refused", "model": harness},
                     }
                 ),
                 _sse_frame(
@@ -8927,8 +8948,8 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
                         "type": "response.failed",
                         "input_stable_id": first_stable_id,
                         "response": {
-                            "id": "resp_login_refused",
-                            "model": "claude",
+                            "id": "resp_input_refused",
+                            "model": harness,
                             "error": refusal,
                         },
                     }
@@ -8953,7 +8974,7 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
                     "item_type": "message",
                     "item_data": {"role": "user", "content": later_content},
                     "response_id": "native_later_turn",
-                    "source_id": "claude:later:0",
+                    "source_id": f"{harness}:later:0",
                 },
             ),
             store,  # type: ignore[arg-type]
@@ -8970,6 +8991,9 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
             f"settled {later_pending}; persisted={missing_errors}"
         )
         assert refusal.get("undelivered") is True
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[0].data.content == refused_content
+        assert store.appended_items[-1].data.content == later_content
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
         assert later_pending not in pending_inputs.pending_ids(session_id)
     finally:
