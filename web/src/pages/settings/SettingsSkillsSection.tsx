@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { PackageIcon, PlusIcon, RefreshCwIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { skillUrlInstallEnabled, skillsMarketplaceEnabled } from "@/lib/capabilities";
@@ -89,7 +89,9 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
   const canMutate = (skill: InstalledSkill) => isAdmin || skill.scope === "user";
 
   if (installed.isPending) return <Loading label="Loading installed skills" />;
-  if (installed.isError) return <ErrorLine error={installed.error} />;
+  // Only a failure with nothing loaded replaces the list; a failed continuation
+  // or refetch keeps the rows and shows its error inline.
+  if (installed.isError && skills.length === 0) return <ErrorLine error={installed.error} />;
   if (skills.length === 0) {
     return (
       <p className="py-6 text-ui text-muted-foreground" data-testid="installed-skills-empty">
@@ -167,6 +169,7 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
           </div>
         </div>
       ))}
+      {installed.isError && <ErrorLine error={installed.error} />}
       {installed.hasNextPage && (
         <Button
           variant="outline"
@@ -185,8 +188,8 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
           <DialogHeader>
             <DialogTitle>Remove {removing?.name}?</DialogTitle>
             <DialogDescription>
-              New sessions stop offering it. Sessions already running keep the copy they started
-              with.
+              New sessions stop offering it, and running sessions drop it on their next turn. A
+              terminal harness that is already open keeps it until the terminal restarts.
             </DialogDescription>
           </DialogHeader>
           {remove.error && <ErrorLine error={remove.error} />}
@@ -257,7 +260,10 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
     () => sources.data?.pages.flatMap((page) => page.data) ?? [],
     [sources.data],
   );
-  const activeId = selectedId ?? list[0]?.id;
+  // A selection that no longer lists (it was removed) falls back to the first source.
+  const activeId = list.some((s) => s.id === selectedId) ? selectedId : list[0]?.id;
+  // Bumped on every navigation, so a preview that finishes later cannot override it.
+  const navigation = useRef(0);
   const catalog = useSourceCatalog(preview ? undefined : activeId, true);
   const refresh = useRefreshCatalog();
   const shown = preview ?? catalog.data ?? null;
@@ -281,6 +287,7 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
                   !preview && source.id === activeId ? "bg-muted" : ""
                 }`}
                 onClick={() => {
+                  navigation.current += 1;
                   setPreview(null);
                   refresh.reset();
                   setSelectedId(source.id);
@@ -324,7 +331,14 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
           </p>
         )}
         {isAdmin && <AddSourceForm />}
-        {urlInstall && <AddFromUrlForm onPreview={setPreview} />}
+        {urlInstall && (
+          <AddFromUrlForm
+            onStart={() => ++navigation.current}
+            onPreview={(result, started) => {
+              if (started === navigation.current) setPreview(result);
+            }}
+          />
+        )}
       </aside>
       <section>
         {preview && (
@@ -427,7 +441,15 @@ function AddSourceForm() {
   );
 }
 
-function AddFromUrlForm({ onPreview }: { onPreview: (catalog: SkillCatalog) => void }) {
+function AddFromUrlForm({
+  onStart,
+  onPreview,
+}: {
+  /** Starts a preview; returns its navigation id. */
+  onStart: () => number;
+  /** Shows the result unless a newer navigation happened since *started*. */
+  onPreview: (catalog: SkillCatalog, started: number) => void;
+}) {
   const preview = usePreviewCatalog();
   const [source, setSource] = useState("");
   const [ref, setRef] = useState("");
@@ -437,9 +459,10 @@ function AddFromUrlForm({ onPreview }: { onPreview: (catalog: SkillCatalog) => v
       onSubmit={(event) => {
         event.preventDefault();
         if (!source.trim()) return;
+        const started = onStart();
         preview.mutate(
           { source: source.trim(), ref: ref.trim() || null },
-          { onSuccess: onPreview },
+          { onSuccess: (result) => onPreview(result, started) },
         );
       }}
     >
