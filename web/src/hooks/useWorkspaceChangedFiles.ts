@@ -23,6 +23,7 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
@@ -267,18 +268,8 @@ async function fetchWorkspaceChangedFiles(
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
-  if (!res.ok) {
-    // Surface the server's reason (e.g. "git status timed out after 30s") so
-    // the panel shows what actually went wrong rather than a bare status code.
-    let message = `${res.status} ${res.statusText}`;
-    try {
-      const body = (await res.json()) as { error?: { message?: string } };
-      if (body?.error?.message) message = body.error.message;
-    } catch {
-      // Non-JSON body (gateway/front-door error) — keep the status line.
-    }
-    throw new Error(message);
-  }
+  // Proxied runner failures arrive as a 502 `{detail}`, not `{error}`.
+  if (!res.ok) throw await apiErrorFromResponse(res);
   const json = (await res.json()) as ChangedFilesResponse;
   const data: WorkspaceChangedFile[] = json.data.map((e) => ({
     path: e.path,

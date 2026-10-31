@@ -219,6 +219,11 @@ function DirectoryPathsProbe({
   return null;
 }
 
+function ChangedFilesErrorProbe({ id }: { id: string }) {
+  const { error } = useWorkspaceChangedFiles(id);
+  return error ? <output data-testid="changes-error">{error.message}</output> : null;
+}
+
 function AllFilesProbeAt({ id, location }: { id: string; location: string }) {
   useWorkspaceAllFiles(id, {}, location);
   return null;
@@ -478,6 +483,32 @@ describe("useWorkspaceChangedFiles gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useWorkspaceChangedFiles error reason", () => {
+  it.each([
+    [
+      "runner error envelope",
+      500,
+      { error: { code: "git_status_failed", message: "git status timed out after 5.0s" } },
+    ],
+    ["server proxy detail", 502, { detail: "git status timed out after 5.0s" }],
+  ])("surfaces the reason from a %s", async (_shape, status, body) => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse(body, status));
+
+    render(
+      <Wrap>
+        <ChangedFilesErrorProbe id="conv_slow_git" />
+      </Wrap>,
+    );
+
+    expect(await screen.findByTestId("changes-error")).toHaveTextContent(
+      "git status timed out after 5.0s",
+    );
   });
 });
 

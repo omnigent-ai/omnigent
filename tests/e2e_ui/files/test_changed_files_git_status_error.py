@@ -7,15 +7,16 @@ identically to a genuinely clean tree ("No workspace changes yet"). A read that
 *could not run* was therefore indistinguishable from "nothing changed", which is
 exactly what made a real worktree report impossible to diagnose.
 
-The fix makes ``/changes`` return ``500 {error:{code:"git_status_failed", message}}``
-on failure, and the web hook (``useWorkspaceChangedFiles``) parses that body and
-throws so the panel shows "Failed to load: <reason>" (in the destructive style)
-instead of the misleading empty state.
+On failure the runner answers ``500 {error:{code:"git_status_failed", message}}``, which
+the server's runner proxy relays to the browser as ``502 {detail: message}``. The web
+hook (``useWorkspaceChangedFiles``) parses that body and throws so the panel shows
+"Failed to load: <reason>" (in the destructive style) instead of the misleading
+empty state.
 
 The failure is injected by intercepting the ``/changes`` request and fulfilling it
-with the 500 error shape the runner now returns — no real git breakage needed — so
-the test deterministically exercises the hook's error parsing and the panel's error
-branch. Everything else (environment availability, liveness) stays real so the
+with the 502 body the browser receives — no real git breakage needed — so the test
+deterministically exercises the hook's error parsing and the panel's error branch.
+Everything else (environment availability, liveness) stays real so the
 changed-files query actually fires.
 """
 
@@ -47,13 +48,13 @@ def test_git_status_failure_surfaces_in_files_panel(
 
     def _fail_changes(route: Route) -> None:
         route.fulfill(
-            status=500,
+            status=502,
             headers={"content-type": "application/json"},
-            body=json.dumps({"error": {"code": "git_status_failed", "message": _GIT_REASON}}),
+            body=json.dumps({"detail": _GIT_REASON}),
         )
 
     # Intercept ONLY the changed-files endpoint. Registered before navigation so
-    # the very first fetch fails; a plain 500 is not retried (it is not the
+    # the very first fetch fails; a 502 is not retried (it is not the
     # runner-offline 503), so the query settles to its error state immediately.
     page.route(
         re.compile(

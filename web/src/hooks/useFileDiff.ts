@@ -11,6 +11,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
   useWorkspaceChangedFiles,
@@ -30,15 +31,6 @@ export interface FileDiffResponse {
   after: string | null;
 }
 
-class FileDiffError extends Error {
-  readonly status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.status = status;
-  }
-}
-
 async function fetchFileDiff(conversationId: string, path: string): Promise<FileDiffResponse> {
   // Encode each path segment individually so slashes remain structural.
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
@@ -46,19 +38,7 @@ async function fetchFileDiff(conversationId: string, path: string): Promise<File
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
     `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/diff/${encodedPath}`;
   const res = await authenticatedFetch(url);
-  if (!res.ok) {
-    // Surface the server's reason (e.g. "git status timed out after 5.0s")
-    // so the diff view shows what actually went wrong rather than a bare
-    // status code — mirroring the changed-files panel.
-    let message = `${res.status} ${res.statusText}`;
-    try {
-      const body = (await res.json()) as { error?: { message?: string } };
-      if (body?.error?.message) message = body.error.message;
-    } catch {
-      // Non-JSON body (gateway/front-door error) — keep the status line.
-    }
-    throw new FileDiffError(message, res.status);
-  }
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as FileDiffResponse;
 }
 
@@ -96,7 +76,7 @@ export function useFileDiff(
     // An old diff link may point to a now-unchanged file; don't retry its expected 404.
     ...(requestedBeforeDiscovery && {
       retry: (failureCount: number, error: Error) =>
-        !(error instanceof FileDiffError && error.status === 404) && failureCount < 3,
+        !(error instanceof ApiError && error.status === 404) && failureCount < 3,
     }),
     staleTime: 5_000,
   });
