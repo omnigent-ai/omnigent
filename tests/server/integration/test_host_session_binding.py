@@ -34,6 +34,7 @@ from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.managed_hosts import (
+    ONLINE_TIMEOUT_ENV_VAR,
     ManagedHostLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
@@ -443,7 +444,7 @@ async def test_managed_session_create_end_to_end(
     # A healthy fake host registers in well under a second; shrink the
     # online-poll budget so a registration regression fails the test in
     # seconds instead of hanging into the pytest timeout.
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     # No real runner ever connects in this harness; shrink the
     # background task's runner-tunnel wait so it settles (and the
     # task finishes) within the test instead of lingering 30s.
@@ -580,7 +581,7 @@ async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(
     env = managed_session_env
     # Same shrunken online-poll budget as the e2e golden path: a
     # registration regression should fail in seconds.
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     # No real runner connects; settle the background task quickly.
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
@@ -687,7 +688,7 @@ async def test_managed_multipart_bundle_create_end_to_end(
     is scheduled, so a launch failure can't orphan an unowned row).
     """
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
     )
@@ -976,7 +977,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     from omnigent.runtime import session_stream
 
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     # This test asserts the happy-path "ready" progress edge; fake the
     # runner tunnel connect so settlement is driven by progress ordering,
     # not by the runner WebSocket harness.
@@ -1181,7 +1182,7 @@ async def test_subagent_session_reuses_managed_sandbox_runner(
     the sub-agent runs nowhere.
     """
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
     )
@@ -1256,7 +1257,7 @@ async def test_message_relaunches_dead_managed_sandbox(
     503s and none of the generation-2 effects below happen.
     """
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     # Let the initial create settle successfully; after that this test switches
     # the relaunch generation back to a runner-connect timeout.
     monkeypatch.setattr(
@@ -1917,7 +1918,7 @@ async def test_shutdown_waits_for_an_in_flight_launch_to_bind_its_host(
     from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     loop = asyncio.get_running_loop()
     gate = threading.Event()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
@@ -1971,7 +1972,7 @@ async def test_shutdown_cancelling_the_bind_write_keeps_the_session_startable(
     from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     loop = asyncio.get_running_loop()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
 
@@ -2038,7 +2039,7 @@ async def test_managed_session_deleted_during_provision_terminates_sandbox(
     import threading
 
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     loop = asyncio.get_running_loop()
     gate = threading.Event()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
