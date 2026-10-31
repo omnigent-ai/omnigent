@@ -43,7 +43,15 @@ if startup in {"dead", "dead-no-status"}:
     print("Startup failed", flush=True)
     raise SystemExit(1)
 print("Starting Claude Code...", flush=True)
-time.sleep(1.0)
+if startup == "cpu-busy":
+    boot_started = time.monotonic()
+    while (now := time.monotonic()) < boot_started + 4.0:
+        print(f"Loading plugins... {now - boot_started:.1f}s", end="\r\n", flush=True)
+        while time.monotonic() < now + 0.05:
+            pass
+        time.sleep(0.05)
+else:
+    time.sleep(1.0)
 draft = "\n".join(f"OLD {index}" for index in range(8)) if startup.startswith("stale-") else ""
 box = _InputBox("bash" if startup == "stale-shell-frame" else "prompt", draft)
 
@@ -97,6 +105,7 @@ while True:
     "startup",
     [
         "slow",
+        "cpu-busy",
         "dead",
         "dead-no-status",
         "base-budget-only",
@@ -114,7 +123,9 @@ def test_first_message_survives_slow_terminal_startup(
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr(
-        bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.3 if startup == "base-budget-only" else 5.0
+        bridge,
+        "_TMUX_READY_SLOW_BOOT_TIMEOUT_S",
+        {"base-budget-only": 0.3, "cpu-busy": 3.0}.get(startup, 5.0),
     )
     gate_started = tmp_path / "gate-started"
     delivered = tmp_path / "delivered.json"
@@ -199,11 +210,11 @@ def test_first_message_survives_slow_terminal_startup(
                     time.sleep(0.05)
             bridge_dir = tmp_path / "bridge"
             bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="main")
-            if startup == "slow":
+            if startup in {"slow", "cpu-busy"}:
                 bridge.inject_user_message(
                     bridge_dir, content="FIRST_PROMPT_DELIVERED", timeout_s=0.3
                 )
-                assert time.monotonic() - started_at[0] >= 1.0
+                assert time.monotonic() - started_at[0] >= (4.0 if startup == "cpu-busy" else 1.0)
                 assert json.loads(delivered.read_text()) == [["prompt", "FIRST_PROMPT_DELIVERED"]]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
             elif startup.startswith("stale-"):
