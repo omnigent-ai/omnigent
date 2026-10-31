@@ -127,8 +127,9 @@ def _plugin_dirs(root: Path, skipped: list[str]) -> list[tuple[str, Path]]:
         return []
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        skipped.append(f"{MARKETPLACE_MANIFEST}: unreadable ({exc})")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError: a small manifest nested past the parser's depth.
+        skipped.append(f"{MARKETPLACE_MANIFEST}: unreadable ({type(exc).__name__})")
         return []
     plugins = data.get("plugins") if isinstance(data, dict) else None
     if not isinstance(plugins, list):

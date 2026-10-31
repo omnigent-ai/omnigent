@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -229,6 +230,23 @@ _LIMIT_KEYS = {
 }
 
 
+def _positive_limit(value: Any, unit: int, *, whole: bool) -> int | float | None:
+    """*value* times *unit* when it is a finite positive number, else ``None``.
+
+    A count (``whole``) must stay at least one once truncated, so 0.5 entries
+    is refused rather than becoming a budget of zero; ``.inf`` and ``.nan``
+    are refused because they would disable or break the comparison.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    if whole:
+        converted = int(value * unit)
+        return converted if converted >= 1 else None
+    return float(value)
+
+
 def _parse_limits(raw: Any) -> CloneLimits:
     """Operator overrides for one clone's budgets; a bad value keeps that default."""
     if raw is None:
@@ -241,13 +259,16 @@ def _parse_limits(raw: Any) -> CloneLimits:
         if key not in _LIMIT_KEYS:
             _logger.warning("%s.limits.%s is not a known limit; ignoring it", CONFIG_KEY, key)
             continue
-        if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        field, unit = _LIMIT_KEYS[key]
+        converted = _positive_limit(value, unit, whole=field != "timeout_s")
+        if converted is None:
             _logger.warning(
-                "%s.limits.%s must be a positive number; using the default", CONFIG_KEY, key
+                "%s.limits.%s must be a finite positive number; using the default",
+                CONFIG_KEY,
+                key,
             )
             continue
-        field, unit = _LIMIT_KEYS[key]
-        values[field] = int(value * unit) if field != "timeout_s" else float(value)
+        values[field] = converted
     return CloneLimits(**values)
 
 
