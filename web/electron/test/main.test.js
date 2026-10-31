@@ -280,6 +280,9 @@ function loadNavigationHarness({
       if (!listeners.has(eventName)) listeners.set(eventName, []);
       listeners.get(eventName).push(listener);
     },
+    prependListener(eventName, listener) {
+      listeners.set(eventName, [listener, ...(listeners.get(eventName) ?? [])]);
+    },
     emit(eventName, ...args) {
       for (const listener of listeners.get(eventName) ?? []) listener({}, ...args);
     },
@@ -4946,10 +4949,18 @@ it("dismisses native loading feedback when the server document fails", async (t)
     },
   });
   t.after(h.cleanup);
+  let stops = 0;
+  h.webContents.stop = () => {
+    stops++;
+  };
+  h.api.setServerResponseTimeoutMs(20);
   await assert.rejects(h.api.loadServerUrl(h.win, "https://example.com/"), /connection lost/);
   const shown = h.calls.loading.find((call) => call.action === "show");
   assert.equal(shown.label, "Opening Omnigent…");
   assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+  await wait(40);
+  assert.equal(stops, 0);
+  assert.deepEqual(h.calls.loadFile, []);
 });
 
 describe("server response deadline (src/main.js)", () => {
@@ -5013,7 +5024,7 @@ describe("server response deadline (src/main.js)", () => {
     assert.equal(h.calls.loading.at(-1).action, "hide");
   });
 
-  it("stops a superseded load at its deadline without returning to setup", async (t) => {
+  it("stops a superseded load at once without returning to setup", async (t) => {
     let stalled;
     const reachedLoad = new Promise((resolve) => {
       stalled = resolve;
@@ -5026,10 +5037,39 @@ describe("server response deadline (src/main.js)", () => {
     await reachedLoad;
     // A newer attempt that has not navigated yet, e.g. still signing in.
     h.api.pinWindow(h.win, "https://other.example");
-    await assert.rejects(pending, { name: "AbortError" });
     assert.equal(h.stops, 1);
-    await wait(0);
+    await assert.rejects(pending, { name: "AbortError" });
+    await wait(40);
+    assert.equal(h.stops, 1);
     assert.deepEqual(h.calls.loadFile, []);
+  });
+
+  const setupError = (h) => new URLSearchParams(h.calls.loadFile[0][1].search).get("error");
+
+  it("keeps a failed load's own error and setup fallback", async (t) => {
+    const h = stalledHarness(t, async (url) => {
+      h.emit("did-fail-load", -102, "ERR_CONNECTION_REFUSED", url, true);
+      await wait(0);
+      throw Object.assign(new Error("ERR_CONNECTION_REFUSED (-102)"), {
+        code: "ERR_CONNECTION_REFUSED",
+      });
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { code: "ERR_CONNECTION_REFUSED" });
+    await wait(40);
+    assert.equal(h.stops, 0);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupError(h), "ERR_CONNECTION_REFUSED (-102)");
+  });
+
+  it("leaves an HTTP error page to the setup fallback without stopping it", async (t) => {
+    const h = stalledHarness(t, async (url) => {
+      h.emit("did-navigate", url, 500, "Internal Server Error");
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { name: "AbortError" });
+    await wait(40);
+    assert.equal(h.stops, 0);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupError(h), "500 Internal Server Error");
   });
 });
 
