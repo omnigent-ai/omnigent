@@ -531,7 +531,7 @@ describe("liveDaemonRecordFor", () => {
   afterEach(() => mock.restoreAll());
 
   it("skips a dead matching record before a live record", async () => {
-    const dead = 123456;
+    const dead = process.pid + 1;
     mock.method(process, "kill", (pid) => {
       if (pid === dead) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
       assert.equal(pid, process.pid);
