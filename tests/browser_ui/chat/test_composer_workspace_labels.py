@@ -70,10 +70,13 @@ def test_composer_details_wrap_without_clipping(
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
     expect(controls).to_be_visible(timeout=30_000)
-    expect(controls.get_by_role("button")).to_have_count(0)
+    # Only a bound working directory is interactive: it copies its path.
+    expect(controls.get_by_role("button")).to_have_count(1 if has_binding else 0)
     workspace = controls.get_by_test_id("composer-workspace-dir")
     workspace_title = (
-        f"Working directory: {_WORKSPACE}" if has_binding else "No working directory bound"
+        f"Working directory: {_WORKSPACE}. Click to copy."
+        if has_binding
+        else "No working directory bound"
     )
     expect(workspace).to_have_attribute("title", workspace_title)
     if has_binding:
