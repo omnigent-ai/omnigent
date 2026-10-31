@@ -239,6 +239,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         project_id: str | None = None,
         execution_target: str = "connected_host",
         state: str = "active",
+        delegation_ref: str | None = None,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         created_at = now_epoch()
@@ -265,6 +266,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 execution_target=encode_scheduled_task_execution_target(execution_target),
                 host_id=host_id,
                 project_id=project_id,
+                delegation_ref=delegation_ref,
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
                 last_run_conversation_id=None,

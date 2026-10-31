@@ -68,6 +68,9 @@ RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+# The runner starts a codex-native session whose collaboration-mode label is
+# ``plan`` (armed on the New Session screen) in Codex Plan mode:
+CAP_CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
 # The host answers ``host.mcp_servers`` with its user-level MCP inventory:
 CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
@@ -84,6 +87,7 @@ CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
+    CAP_CODEX_PLAN_AT_LAUNCH,
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
@@ -1089,7 +1093,8 @@ class HostFsRequestFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
-        ``"diff"``, ``"search"``.
+        ``"diff"``, ``"search"``, or PR resources including ``"github_info"``,
+        ``"github_review_threads"`` and ``"github_review_thread_comments"``.
     :param workspace: Absolute path to the session's workspace on the
         host, e.g. ``"/Users/alice/project"``.
     :param session_id: Session id, forwarded to the change registry.
@@ -1116,7 +1121,7 @@ class HostFsWriteFrame:
     (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
     reviewer edits (``op="github_reviewers_update"``), title and description edits
     (``op="github_details_update"``), comments (``op="github_comment_create"``),
-    description attachment uploads
+    review replies (``op="github_review_thread_reply"``), description attachment uploads
     (``op="github_attachment_upload"``, the file base64-encoded in
     ``content_base64``), merges (``op="github_merge"``),
     and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
@@ -1129,8 +1134,8 @@ class HostFsWriteFrame:
     :param op: Write op name — ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
-        ``"github_attachment_upload"``, ``"github_merge"``, or
-        ``"github_disable_auto_merge"``.
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1221,6 +1226,8 @@ class HostSkillsResultFrame:
     error_code: str | None = None
     session_id: str | None = None
     agent_id: str | None = None
+    # Sources the host could not read; non-empty means ``skills`` is incomplete.
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1328,6 +1335,8 @@ class HostImportedLocalSession:
         server synthesize one from the first user message.
     :param source: Harness this session came from, e.g. ``"claude"``. Carried
         per session so an "all harnesses" request can mix sources in one batch.
+    :param archived: Whether the harness had archived this session; the server
+        archives the imported conversation too. Absent from older hosts.
     """
 
     external_session_id: str
@@ -1335,6 +1344,7 @@ class HostImportedLocalSession:
     items: list[_JsonObject]
     title: str | None = None
     source: str = ""
+    archived: bool = False
 
 
 @dataclass
@@ -2022,6 +2032,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error_code": frame.error_code,
                 "session_id": frame.session_id,
                 "agent_id": frame.agent_id,
+                "warnings": frame.warnings,
             }
         )
     if isinstance(frame, HostPluginsFrame):
@@ -2173,6 +2184,7 @@ def _imported_local_session_payload(session: HostImportedLocalSession) -> _JsonO
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 
@@ -3206,6 +3218,8 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
         error_code=_optional_nullable_str(msg, "error_code"),
         session_id=_optional_nullable_str(msg, "session_id"),
         agent_id=_optional_nullable_str(msg, "agent_id"),
+        # Absent from older hosts, which never reported partial catalogs.
+        warnings=_optional_str_list(msg, "warnings"),
     )
 
 
@@ -3413,6 +3427,7 @@ def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
         items=items,
         title=title,
         source=source,
+        archived=_required_bool(raw, "archived") if "archived" in raw else False,
     )
 
 

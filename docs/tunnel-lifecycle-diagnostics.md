@@ -261,7 +261,10 @@ when the context exits.
   the outage still fails the turn. `held_host_offline` means the session's
   user-run host went offline too; the disconnect sweep holds the turn
   (`runner_disconnect_held_host_offline` / `runner_disconnect_hold_ended`) and
-  the reconnect restarts the relay. The
+  the reconnect restarts the relay. When the host returns without the runner,
+  the hold ends `host_back_relaunched` if the server relaunched the runner
+  (the turn fails as `runner_interrupted`, not redelivered) or
+  `host_back_without_runner` if the relaunch was not acknowledged. The
   `runner_disconnected` row carries the same two attributes. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected

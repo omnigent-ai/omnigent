@@ -61,6 +61,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         workspace="/home/alice/repo",
         host_id=_uid("host_abc123"),
         project_id=_uid("proj_abc"),
+        delegation_ref="workspaces/1/omnigent-scheduled-tasks/st_1/delegations/owner",
     )
     assert task.id == _uid("st_1")
     assert task.workspace_id == 0
@@ -80,6 +81,9 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.execution_target == "connected_host"
     assert task.host_id == _uid("host_abc123")
     assert task.project_id == _uid("proj_abc")
+    assert task.delegation_ref == "workspaces/1/omnigent-scheduled-tasks/st_1/delegations/owner"
+    stored = store.get(_uid("st_1"))
+    assert stored is not None and stored.delegation_ref == task.delegation_ref
     assert task.state == "active"
     assert task.last_run_at is None
     assert task.last_run_conversation_id is None
@@ -107,6 +111,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
     assert task.host_id is None
+    assert task.delegation_ref is None
     assert task.state == "active"
 
 

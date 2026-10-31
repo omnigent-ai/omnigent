@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import os
+import subprocess
 import tarfile
 from dataclasses import replace
 from pathlib import Path
@@ -15,7 +17,11 @@ import pytest
 import yaml
 
 from omnigent.host.frames import HostSkillsFrame
-from omnigent.host.skills import HostSkillDiscovery
+from omnigent.host.skills import (
+    INCOMPLETE_CATALOG_TTL_SECONDS,
+    SKILLS_CACHE_TTL_SECONDS,
+    HostSkillDiscovery,
+)
 from omnigent.spec import load
 from omnigent.spec.skill_sources import resolve_session_skills
 
@@ -281,3 +287,71 @@ def test_directory_catalog_never_downloads_a_session_bundle(tmp_path: Path) -> N
         HostSkillsFrame("request", "claude-native", str(tmp_path)), tmp_path
     ) == [{"name": "local", "description": "local description"}]
     fetch.assert_not_called()
+
+
+def test_incomplete_codex_catalog_reports_warnings_and_is_cached_only_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr("omnigent.host.skills.time", SimpleNamespace(monotonic=lambda: now[0]))
+    codex_home = tmp_path / "home" / ".codex"
+    for directory in (codex_home / "skills" / "local", codex_home / "skills" / "later"):
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(_skill(directory.name))
+    plugin = codex_home / "plugins" / "cache" / "market" / "toolkit" / "1.0.0"
+    (plugin / ".codex-plugin").mkdir(parents=True)
+    (plugin / ".codex-plugin" / "plugin.json").write_text(json.dumps({"name": "toolkit"}))
+    (plugin / "skills" / "review").mkdir(parents=True)
+    (plugin / "skills" / "review" / "SKILL.md").write_text(_skill("review"))
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "/test/codex")
+    cli = Mock(side_effect=subprocess.CalledProcessError(1, "codex", stderr="Error: broken"))
+    monkeypatch.setattr("omnigent.spec.codex_plugin_skills.subprocess.run", cli)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.skill_discovery.loaded_codex_skills",
+        Mock(side_effect=RuntimeError("Codex skills/list connection failed")),
+    )
+    discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
+    frame = HostSkillsFrame("request", "codex-native", str(tmp_path))
+
+    def names(warnings: list[str]) -> list[str]:
+        return [skill["name"] for skill in discovery.discover(frame, tmp_path, warnings=warnings)]
+
+    # Standalone skills survive both failed plugin sources, and the catalog says why.
+    warning = (
+        "Codex plugin skills unavailable: `codex plugin list` exited 1 and "
+        "`codex app-server` could not list skills; see the host log for details."
+    )
+    assert names(warnings := []) == ["later", "local"]
+    assert warnings == [warning]
+
+    # Within its short TTL the incomplete catalog is served from the cache, warning included.
+    cli.side_effect = None
+    cli.return_value = subprocess.CompletedProcess(
+        [],
+        0,
+        stdout=json.dumps(
+            {
+                "installed": [
+                    {
+                        "marketplaceName": "market",
+                        "name": "toolkit",
+                        "version": "1.0.0",
+                        "enabled": True,
+                    }
+                ]
+            }
+        ),
+    )
+    assert names(warnings := []) == ["later", "local"]
+    assert warnings == [warning]
+    assert cli.call_count == 1
+
+    # Once that expires a retry rescans, and the complete catalog is cached for the full TTL.
+    now[0] = INCOMPLETE_CATALOG_TTL_SECONDS + 1
+    assert names(warnings := []) == ["later", "local", "toolkit:review"]
+    assert warnings == []
+    cli.side_effect = OSError("gone")
+    now[0] += SKILLS_CACHE_TTL_SECONDS - 1
+    assert names(warnings := []) == ["later", "local", "toolkit:review"]
+    assert warnings == []
+    assert cli.call_count == 2
