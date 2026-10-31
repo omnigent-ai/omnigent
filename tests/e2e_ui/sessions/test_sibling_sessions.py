@@ -81,8 +81,8 @@ async def _drive(rig: ManagedReplicas) -> None:
                         await page.screenshot(path=str(evidence / "add-agent-menu.png"))
                         await page.get_by_test_id("add-sibling-session").click()
                         await expect(
-                            page.get_by_test_id("sibling-composer-context")
-                        ).to_contain_text("Add new agent")
+                            page.get_by_role("heading", name="Add an agent", exact=True)
+                        ).to_be_visible()
                         await expect(
                             page.get_by_test_id("new-chat-landing-host-chip")
                         ).not_to_contain_text("New Sandbox")
