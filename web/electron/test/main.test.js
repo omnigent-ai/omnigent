@@ -3962,6 +3962,25 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
         assert.deepEqual(h.calls.loadFile, []);
       });
     }
+
+    it(`restarts a blocked-network wait still running on ${event}`, async (t) => {
+      const h = browserHarness(t, [20], {
+        ensureSession: async () => {
+          throw Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" });
+        },
+      });
+      h.api.setReconnectSlowDelayMs(60_000);
+      h.api.setBlockedHintDelayMs(600);
+      await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+      await until(() => h.calls.auth.length === 2, "the fast retry");
+      await wait(300);
+      assert.equal(h.overlay.hint, "");
+      const wokeAt = Date.now();
+      h.powerMonitor.emit(event);
+      await until(() => h.overlay.hint === blocked, "the hint after the restarted wait");
+      // Not at the first refusal's deadline, about 300 ms after the wake.
+      assert.ok(Date.now() - wokeAt >= 590, `hint ${Date.now() - wokeAt} ms after ${event}`);
+    });
   }
 
   it("waits again for the blocked-network hint after an unreachable retry", async (t) => {
