@@ -1574,10 +1574,12 @@ def register_core_routes(
             if project_store is not None:
                 for proj in project_store.list(user_id=user_id):
                     icon = proj.config.get("icon")
+                    color = proj.config.get("color")
                     by_name[proj.name] = SessionProjectSummary(
                         id=proj.id,
                         name=proj.name,
                         icon=icon if isinstance(icon, str) else None,
+                        color=color if isinstance(color, str) else None,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in sorted(conversation_store.list_projects(owned_by=user_id)):

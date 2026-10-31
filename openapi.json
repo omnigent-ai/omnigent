@@ -1825,7 +1825,7 @@
         "properties": {
           "config": {
             "additionalProperties": true,
-            "description": "Optional default session settings (opaque JSON object). Omitted / empty stores no defaults.",
+            "description": "Optional default session settings (opaque JSON object). Omitted / empty stores no defaults. Without an `icon` or a palette `color`, the server assigns a `color`.",
             "title": "Config",
             "type": "object"
           },
@@ -5377,6 +5377,21 @@
         "title": "ReasoningTextDeltaEvent",
         "type": "object"
       },
+      "RecommendedProjectColorResponse": {
+        "description": "The color a new project would be auto-assigned.",
+        "properties": {
+          "color": {
+            "description": "A web theme palette id, the one most different from the colors the caller's other projects use.",
+            "title": "Color",
+            "type": "string"
+          }
+        },
+        "required": [
+          "color"
+        ],
+        "title": "RecommendedProjectColorResponse",
+        "type": "object"
+      },
       "ResetSessionModelOverrideRequest": {
         "additionalProperties": false,
         "description": "Reset a launch-time model selection only while that selection is current.",
@@ -7837,6 +7852,18 @@
       "SessionProjectSummary": {
         "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
         "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The project's chosen color (a web theme palette id), read from its `config`; `None` when unset or for a label-only folder.",
+            "title": "Color"
+          },
           "icon": {
             "anyOf": [
               {
@@ -13554,7 +13581,7 @@
         ]
       },
       "post": {
-        "description": "Create a new, empty project owned by the caller.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
+        "description": "Create a new, empty project owned by the caller.\n\nA project created with neither an emoji nor a color is assigned the\ncolor most different from the caller's other projects' colors.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
         "operationId": "create_project_v1_projects_post",
         "requestBody": {
           "content": {
@@ -13653,6 +13680,57 @@
           }
         },
         "summary": "Save Project Order",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/recommended-color": {
+      "get": {
+        "description": "Recommend a color for a new project, or a replacement for one.\n\n**Returns:** The recommended palette id.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
+        "operationId": "get_recommended_project_color_v1_projects_recommended_color_get",
+        "parameters": [
+          {
+            "description": "A project whose own color is left out, when recommending a replacement for it.",
+            "in": "query",
+            "name": "exclude_project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Exclude Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecommendedProjectColorResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Recommended Project Color",
         "tags": [
           "projects"
         ]

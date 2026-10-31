@@ -1,19 +1,31 @@
 import { useState } from "react";
 import { CheckIcon, FolderIcon, PlusIcon, SearchIcon } from "lucide-react";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useProjects } from "@/hooks/useConversations";
+import { projectColorValue } from "@/lib/projectColors";
 import { cn } from "@/lib/utils";
 
 /**
  * Leading visual for a project row: the project's emoji icon when set,
- * otherwise a folder glyph. Decorative only — row names carry the semantics.
+ * otherwise a folder glyph in its palette color (muted when it has none).
+ * Decorative only — row names carry the semantics.
  *
  * Defaults to the `size-3.5` (14px) footprint the dropdown and sidebar rows
  * use; callers pass `className` to resize both branches together (the header
  * breadcrumb overrides to `size-4`/`text-[16px]`). The emoji matches the
  * folder's box and centers, so a resized icon column stays aligned.
  */
-export function ProjectRowIcon({ icon, className }: { icon?: string | null; className?: string }) {
+export function ProjectRowIcon({
+  icon,
+  color,
+  className,
+}: {
+  icon?: string | null;
+  color?: string | null;
+  className?: string;
+}) {
+  const folderColor = projectColorValue(color, useResolvedThemeMode());
   return icon ? (
     // Emoji advance-widths vary per glyph; a fixed centered box keeps the
     // trailing label's left edge aligned with the folder-fallback rows.
@@ -30,7 +42,9 @@ export function ProjectRowIcon({ icon, className }: { icon?: string | null; clas
   ) : (
     <FolderIcon
       aria-hidden="true"
+      data-project-color={folderColor ? (color ?? undefined) : undefined}
       className={cn("size-3.5 shrink-0 text-muted-foreground", className)}
+      style={{ color: folderColor }}
     />
   );
 }
@@ -62,7 +76,7 @@ export function ProjectPicker({
   const canCreate =
     trimmed.length > 0 &&
     !projects.some((project) => project.name.toLowerCase() === trimmed.toLowerCase());
-  const currentProjectIcon = projects.find((project) => project.name === currentProject)?.icon;
+  const current = projects.find((project) => project.name === currentProject);
 
   return (
     <>
@@ -85,7 +99,7 @@ export function ProjectPicker({
             textValue={project.name}
             onSelect={() => onSelect(project.name)}
           >
-            <ProjectRowIcon icon={project.icon} />
+            <ProjectRowIcon icon={project.icon} color={project.color} />
             <span className="flex-1 truncate text-left">{project.name}</span>
             {currentProject === project.name && (
               <CheckIcon className="size-3.5 shrink-0 text-primary" />
@@ -114,7 +128,7 @@ export function ProjectPicker({
             textValue={`Remove from ${currentProject}`}
             onSelect={() => onSelect("")}
           >
-            <ProjectRowIcon icon={currentProjectIcon} />
+            <ProjectRowIcon icon={current?.icon} color={current?.color} />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}

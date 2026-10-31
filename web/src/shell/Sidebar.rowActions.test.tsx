@@ -13,6 +13,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type * as ProjectsApi from "@/lib/projectsApi";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -142,6 +143,10 @@ vi.mock("./ForkSessionDialog", () => ({
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
+vi.mock("@/lib/projectsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProjectsApi>()),
+  getRecommendedProjectColor: vi.fn().mockResolvedValue("nord"),
+}));
 // Pin "who am I": ownership (and therefore Leave, which revokes the viewer's
 // own grant) is derived from this id. Unmocked it resolves to null in jsdom,
 // which reads as "not the owner" for shared rows but leaves Leave with no id
@@ -348,13 +353,16 @@ describe("quick pin/unpin hover button", () => {
     }
   });
 
-  it("tints the new-project icon selector with the active theme accent", () => {
+  it("preselects the server's recommended color in the new-project dialog", async () => {
     renderSidebar();
     fireEvent.click(screen.getByTestId("new-project"));
 
-    const iconSelector = screen.getByTestId("new-project-icon");
-    expect(iconSelector).toHaveClass("bg-primary/10");
-    expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Nord" })).toHaveAttribute("aria-checked", "true"),
+    );
+    expect(screen.getByTestId("project-appearance-caption")).toHaveTextContent(
+      "Nord (recommended)",
+    );
   });
 
   it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {

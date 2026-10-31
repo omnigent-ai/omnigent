@@ -7,6 +7,7 @@ import {
   createProject,
   deleteProject,
   getProject,
+  getRecommendedProjectColor,
   listProjects,
   renameProject,
   updateProjectConfig,
@@ -75,6 +76,18 @@ describe("createProject", () => {
       name: "New",
       config: { host_id: "h1", agent_id: "ag_1" },
     });
+  });
+});
+
+describe("getRecommendedProjectColor", () => {
+  it("GETs the recommendation, excluding a project when given", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ color: "nord" }));
+    await expect(getRecommendedProjectColor()).resolves.toBe("nord");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects/recommended-color");
+    await getRecommendedProjectColor("p 1");
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/v1/projects/recommended-color?exclude_project_id=p%201",
+    );
   });
 });
 

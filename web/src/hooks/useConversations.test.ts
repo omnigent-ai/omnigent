@@ -561,6 +561,27 @@ describe("useRenameProject", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects");
   });
 
+  it("carries a promoted folder's initial config in the create", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_new", name: "Renamed" })); // POST create
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }), // members page
+    );
+
+    const { result } = renderRenameHook();
+    await result.current.mutateAsync({
+      id: null,
+      oldName: "old",
+      newName: "Renamed",
+      config: { icon: "🔥" },
+    });
+
+    const createInit = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(createInit.body as string)).toEqual({
+      name: "Renamed",
+      config: { icon: "🔥" },
+    });
+  });
+
   it("returns the existing id for a first-class rename", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_1", name: "Renamed" })); // PATCH rename
     fetchMock.mockResolvedValueOnce(
@@ -2458,22 +2479,28 @@ describe("useUpdateProjectConfig cache seeding", () => {
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
 
-    // The PATCH (label-only folder → promoted, so a create precedes it) returns
-    // the fresh first-class project with its stored config.
-    fetchMock
-      .mockResolvedValueOnce(mockResponse({ id: "p_new", name: "Work" })) // apiCreateProject
-      .mockResolvedValueOnce(
-        mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x" } }),
-      );
+    // A label-only folder is promoted by one create carrying the config; no
+    // PATCH follows to replace what the server stored (its assigned color).
+    const created = { agent_id: "ag_x", color: "omni" };
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "p_new", name: "Work", config: created }));
 
     const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
     result.current.mutate({ id: null, name: "Work", config: { agent_id: "ag_x" } });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const createInit = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(createInit.method).toBe("POST");
+    expect(JSON.parse(createInit.body as string)).toEqual({
+      name: "Work",
+      config: { agent_id: "ag_x" },
+    });
     // The config cache holds the fresh value keyed by the NEW id.
-    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({ agent_id: "ag_x" });
+    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual(created);
     // The projects list now resolves "Work" → the promoted first-class id.
-    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
+    expect(queryClient.getQueryData(["projects"])).toEqual([
+      { id: "p_new", name: "Work", icon: undefined, color: "omni" },
+    ]);
   });
 });
 

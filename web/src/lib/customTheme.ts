@@ -181,7 +181,7 @@ function ensureContrast(color: string, backgrounds: string[], toward: string): s
   return passes(result) ? result : toward;
 }
 
-function readableForeground(background: string): "#111318" | "#ffffff" {
+export function readableForeground(background: string): "#111318" | "#ffffff" {
   const value = luminance(background);
   const darkContrast = (value + 0.05) / (luminance("#111318") + 0.05);
   const lightContrast = (luminance("#ffffff") + 0.05) / (value + 0.05);
