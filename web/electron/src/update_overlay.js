@@ -90,18 +90,22 @@ function createUpdateOverlay({
     contents.send("omnigent:update-overlay-height", height);
   }
 
-  function collapse(parent, overlay) {
-    notifyParentHeight(parent, 0);
-    position(parent, overlay, 1);
-    overlay.setIgnoreMouseEvents(true, { forward: true });
-    if (!overlay.isVisible()) overlay.showInactive();
+  function setVisibleHeight(parent, overlay, height) {
+    notifyParentHeight(parent, height);
+    if (height > 0) {
+      position(parent, overlay, height);
+      if (!overlay.isVisible()) overlay.showInactive();
+    } else if (overlay.isVisible()) {
+      // Window capture can include transparent child windows in its bounds.
+      overlay.hide();
+    }
   }
 
   function suppress(parent) {
     const overlay = overlays.get(parent);
     if (!overlay || overlay.isDestroyed()) return;
     suppressedParents.add(parent);
-    collapse(parent, overlay);
+    setVisibleHeight(parent, overlay, 0);
   }
 
   function unsuppress(parent) {
@@ -109,10 +113,7 @@ function createUpdateOverlay({
     suppressedParents.delete(parent);
     if (!overlay || overlay.isDestroyed() || parent.isDestroyed()) return;
     const height = heights.get(overlay) ?? 0;
-    notifyParentHeight(parent, height);
-    position(parent, overlay, Math.max(1, height));
-    overlay.setIgnoreMouseEvents(height === 0, height === 0 ? { forward: true } : undefined);
-    if (!overlay.isVisible()) overlay.showInactive();
+    setVisibleHeight(parent, overlay, height);
   }
 
   function position(parent, overlay, height) {
@@ -165,6 +166,8 @@ function createUpdateOverlay({
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
+        // Keep ResizeObserver reporting new notices while the window is hidden.
+        backgroundThrottling: false,
       },
     });
     if (platform === "darwin") {
@@ -197,7 +200,9 @@ function createUpdateOverlay({
       );
     });
 
-    const reposition = () => position(parent, overlay, heights.get(overlay) ?? 1);
+    const reposition = () => {
+      if (overlay.isVisible()) position(parent, overlay, heights.get(overlay) ?? 1);
+    };
     parent.on("resize", reposition);
     parent.on("move", reposition);
     // Electron does NOT auto-close child windows when their parent closes, so
@@ -222,13 +227,6 @@ function createUpdateOverlay({
 
   function registerIpc() {
     // The overlay reports its rendered card height; 0 => nothing to show.
-    //
-    // We must NOT hide() the window when empty: a hidden BrowserWindow suspends
-    // its renderer, so its ResizeObserver stops firing and the card could never
-    // report a height again to re-appear (e.g. after a transient "checking"
-    // state collapses it). Instead keep the window shown but collapse it to an
-    // invisible, click-through 1px sliver, which keeps layout — and the
-    // ResizeObserver — alive so it expands again the moment there's content.
     ipcMain.on("omnigent:overlay-height", (event, height) => {
       const overlay = overlayForSender(event);
       if (!overlay) return;
@@ -238,21 +236,13 @@ function createUpdateOverlay({
         heights.set(overlay, h);
         const state = updater.getStatus()?.state;
         if (state === "available" || state === "downloading" || state === "downloaded") {
-          collapse(parent, overlay);
+          setVisibleHeight(parent, overlay, 0);
           return;
         }
         suppressedParents.delete(parent);
       }
       heights.set(overlay, h);
-      notifyParentHeight(parent, h);
-      if (h > 0) {
-        position(parent, overlay, h);
-        overlay.setIgnoreMouseEvents(false);
-      } else {
-        position(parent, overlay, 1);
-        overlay.setIgnoreMouseEvents(true, { forward: true });
-      }
-      if (!overlay.isVisible()) overlay.showInactive();
+      setVisibleHeight(parent, overlay, h);
     });
 
     // The parent SPA reads the current value on mount so an overlay that became
