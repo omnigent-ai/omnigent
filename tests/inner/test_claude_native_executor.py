@@ -15,7 +15,9 @@ from typing import Any
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge as claude_bridge
+from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
@@ -28,6 +30,7 @@ from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
+from tests.harnesses.claude_native.test_claude_native_bridge import _EditableComposer
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -1909,27 +1912,30 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    pane = "❯ "
+    composer = _EditableComposer("", cursor=0)
+    bridge_clock = claude_bridge.time
+    composer.install(monkeypatch)
+    monkeypatch.setattr(claude_bridge, "time", bridge_clock)
+    capture_lost = False
     enters = 0
     prompt_pending = False
     killed: list[Path] = []
 
     def run_tmux(socket_path: str, *args: str) -> None:
-        nonlocal pane, enters, prompt_pending
-        del socket_path
-        if args[-1] == "Space":
-            pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
-        elif args[0] == "paste-buffer":
-            pane = "❯ review this function"
-            prompt_pending = not submitted
-        elif args[-1] == "Enter":
+        nonlocal capture_lost, enters, prompt_pending
+        if args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.
             enters += 1
             prompt_pending = refusal == "pending_prompt"
             if refusal == "capture_lost":
-                pane = ""
+                capture_lost = True
+        else:
+            composer._run_tmux(socket_path, *args)
+            if args[0] == "paste-buffer":
+                prompt_pending = not submitted
+
+    def capture_pane(socket_path: str, tmux_target: str) -> str:
+        return "" if capture_lost else composer._capture_pane(socket_path, tmux_target)
 
     if refusal == "missing_target":
         wait_for_target = claude_bridge._wait_for_tmux_info
@@ -1947,7 +1953,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
-    monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_a: pane)
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture_pane)
     monkeypatch.setattr(claude_bridge, "_has_approval_wait", lambda _bridge: prompt_pending)
     monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.0)
@@ -1971,7 +1977,8 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
 
     if refusal == "draft_persisted":
         assert enters >= 1
-        assert pane == "❯ review this function"
+        # The bracketed-paste transport appends a protective newline before Enter.
+        assert composer.text == "review this function\n"
     else:
         assert enters == int(submitted)
     assert killed == []
@@ -1989,9 +1996,12 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auth_evidence", ["observed", "unknown", "broken_sink"])
 async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    auth_evidence: str,
 ) -> None:
     """
     A launcher sign-in prompt fails the turn with the link and leaves the pane.
@@ -2002,15 +2012,29 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     """
     bridge_dir = tmp_path / "bridge"
     killed: list[Path] = []
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_sign_in")
+    observation: delivery_diagnostics.LauncherAuthCheckAttributes | None = (
+        {
+            "launcher_auth_check_observation": "last_observed",
+            "launcher_auth_check_reason": "cli_exit",
+            "launcher_auth_check_exception_type": "none",
+            "launcher_auth_check_exit_code": 7,
+        }
+        if auth_evidence != "unknown"
+        else None
+    )
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise ClaudeSignInPending(
+        pending = ClaudeSignInPending(
             "Claude Code is waiting for a sign-in in this session's terminal, "
             "so the message was not delivered.",
             title="Claude Code can't start until you sign in to Databricks",
             remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
         )
+        if observation is not None:
+            pending.launcher_auth_check = observation
+        raise pending
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
@@ -2018,6 +2042,12 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
         "kill_session",
         lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
     )
+    if auth_evidence == "broken_sink":
+
+        def broken_log(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("logging unavailable")
+
+        monkeypatch.setattr(claude_native_executor._logger, "warning", broken_log)
 
     executor = ClaudeNativeExecutor(bridge_dir)
     events = [
@@ -2039,6 +2069,38 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     assert "HQ7M-2KPD" in error.remediation
     # The gate failed before the prompt was typed: the message never reached Claude Code.
     assert error.undelivered is True
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launcher_sign_in_pending"
+    ]
+    if auth_evidence == "broken_sink":
+        assert records == []
+    else:
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        row = record_to_row(records[0], source="harness")
+        assert row["session_id"] == "conv_sign_in"
+        expected = (
+            {
+                "launcher_auth_check_observation": "last_observed",
+                "launcher_auth_check_reason": "cli_exit",
+                "launcher_auth_check_exception_type": "none",
+                "launcher_auth_check_exit_code": "7",
+            }
+            if auth_evidence == "observed"
+            else {
+                "launcher_auth_check_observation": "unknown",
+                "launcher_auth_check_reason": "unknown",
+            }
+        )
+        assert {
+            k: v for k, v in row["attributes"].items() if k.startswith("launcher_")
+        } == expected
+        assert "signin.example.com" not in json.dumps(row)
+        assert "HQ7M-2KPD" not in json.dumps(row)
+    assert "signin.example.com" not in caplog.text
+    assert "HQ7M-2KPD" not in caplog.text
 
 
 @pytest.mark.asyncio
