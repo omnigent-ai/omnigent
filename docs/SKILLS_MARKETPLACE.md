@@ -57,8 +57,11 @@ so every harness discovers them exactly like skills the agent author bundled.
 The agent spec's `skills:` filter applies to them as it does to host skills,
 and a skill the bundle itself carries always wins a name collision.
 
-Sessions pick up installs, updates and removals when they next start. With
-the feature switched off, installed rows stay in the database but nothing
+A session picks up installs, updates, removals, enable or disable changes,
+source changes and policy changes on its next turn: the change moves the
+session's agent revision, so the runner fetches the bundle again before that
+turn. A terminal or native TUI harness that is already open reads its
+skills at launch and keeps them until that terminal restarts. With the feature switched off, installed rows stay in the database but nothing
 reads them: the routes are absent and neither discovery nor served bundles
 include them.
 
