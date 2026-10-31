@@ -231,7 +231,7 @@ def create_skills_router(
             shadowed = {
                 skill.name
                 for skill in installed
-                if skill.name not in not_installable and skill_allowed(installed_spec, skill.name)
+                if skill.name not in not_installable and skill_allowed(installed_spec, skill)
             }
             skills = [skill for skill in skills if skill.name not in shadowed] + added
         return SkillsResponse(skills=skills, warnings=result.warnings)
@@ -304,7 +304,7 @@ def installed_skill_summaries(
     for skill in installed:
         if not skill.user_invocable:
             continue
-        if skill.name in bundled or not skill_allowed(spec, skill.name):
+        if skill.name in bundled or not skill_allowed(spec, skill):
             continue
         out.append(
             SkillSummary(

@@ -36,7 +36,8 @@ from omnigent.skills.overlay import (
     validate_skill_tarball,
 )
 from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
-from omnigent.spec.types import AgentSpec
+from omnigent.spec.parser import skill_matches_names
+from omnigent.spec.types import AgentSpec, SkillSpec
 from omnigent.spec.validator import is_valid_skill_name
 from omnigent.stores import ArtifactStore, ConversationStore
 from omnigent.stores.skill_store import SkillStore
@@ -134,13 +135,20 @@ def _find_sub_agent(spec: AgentSpec, name: str, prefix: str) -> SessionTarget | 
     return None
 
 
-def skill_allowed(spec: AgentSpec | None, name: str) -> bool:
-    """Apply the agent spec's ``skills:`` filter the way host skills honour it."""
+def skill_allowed(spec: AgentSpec | None, skill: InstalledSkill) -> bool:
+    """Apply the agent spec's ``skills:`` filter as host skills get it.
+
+    A name list selects a skill by its command or by its frontmatter label,
+    through the same :func:`skill_matches_names` host discovery uses.
+    """
     skills_filter = getattr(spec, "skills_filter", "all") if spec is not None else "all"
     if skills_filter == "none":
         return False
     if isinstance(skills_filter, list):
-        return name in skills_filter
+        candidate = SkillSpec(
+            name=skill.name, description="", content="", display_name=skill.display_name
+        )
+        return skill_matches_names(candidate, skills_filter)
     return True
 
 
@@ -221,7 +229,7 @@ def with_installed_skills(
     reserved = {skill.name for skill in getattr(target.spec, "skills", None) or []}
     selected: list[InstalledSkill] = []
     for skill in installed:
-        if not skill_allowed(target.spec, skill.name) or skill.name in reserved:
+        if not skill_allowed(target.spec, skill) or skill.name in reserved:
             continue
         if not is_valid_skill_name(skill.name):
             _logger.warning("skipping installed skill %r (%s): invalid name", skill.name, skill.id)
