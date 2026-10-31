@@ -340,6 +340,9 @@ def test_usage_accumulates_and_dedupes_across_messages(tmp_path: Path) -> None:
   assert.equal(last.cumulative_input_tokens, 350);
   assert.equal(last.cumulative_output_tokens, 100);
   assert.equal(last.cumulative_cache_read_input_tokens, 50);
+  // context_tokens is the latest message's occupancy, not a cumulative sum.
+  assert.equal(usage[0].data.context_tokens, 140);
+  assert.equal(last.context_tokens, 310);
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
