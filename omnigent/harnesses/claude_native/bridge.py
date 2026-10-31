@@ -4464,12 +4464,13 @@ def _paste_and_submit(
     # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
     # interior newlines (mapped to CR below) stay data instead of becoming
     # per-line submits. See anthropics/claude-code#52126.
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        paste_file.write(_paste_payload_bytes(text + "\n"))
-        paste_path = paste_file.name
+    paste_path: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_path = paste_file.name
+            paste_file.write(_paste_payload_bytes(text + "\n"))
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
         _run_tmux(
             socket_path,
@@ -4483,8 +4484,9 @@ def _paste_and_submit(
         )
         delivery_diagnostics.record_details(paste_sent=True)
     finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
+        if paste_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
     # Wait until the TUI has visibly committed the paste into its input
     # box before submitting. Claude Code coalesces rapid stdin bursts
     # into a paste; an Enter that arrives while it is still consuming

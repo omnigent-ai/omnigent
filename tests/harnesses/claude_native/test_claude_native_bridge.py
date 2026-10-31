@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import io
 import itertools
 import json
@@ -20,7 +21,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -4737,6 +4738,51 @@ def test_inject_user_message_pastes_content_then_submits(
         "claude:0.0",
         "Enter",
     ]
+    assert not list(bridge_dir.glob("paste_*.bin"))
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "close"])
+def test_paste_file_is_removed_when_payload_write_fails(
+    failure_phase: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write or buffered close must not leave the prompt on disk."""
+    original_temporary_file = tempfile.NamedTemporaryFile
+    failure = OSError(errno.ENOSPC, "synthetic disk full")
+    created_paths: list[Path] = []
+
+    @contextmanager
+    def failing_temporary_file(**kwargs: Any) -> Iterator[Any]:
+        with original_temporary_file(**kwargs) as paste_file:
+            created_paths.append(Path(paste_file.name))
+            if failure_phase == "write":
+
+                def partial_write(payload: bytes) -> None:
+                    paste_file.file.write(payload[:3])
+                    paste_file.file.flush()
+                    raise failure
+
+                monkeypatch.setattr(paste_file, "write", partial_write)
+            yield paste_file
+        if failure_phase == "close":
+            raise failure
+
+    run_tmux = Mock()
+    monkeypatch.setattr(
+        claude_native_bridge.tempfile, "NamedTemporaryFile", failing_temporary_file
+    )
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _bridge_dir: False)
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+
+    with pytest.raises(OSError) as caught:
+        claude_native_bridge._paste_and_submit(
+            tmp_path, "synthetic.sock", "claude:0.0", text="synthetic prompt", needle="synthetic"
+        )
+
+    assert caught.value is failure
+    assert len(created_paths) == 1
+    assert not created_paths[0].exists()
+    run_tmux.assert_not_called()
 
 
 @pytest.mark.parametrize(
