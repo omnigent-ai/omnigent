@@ -1386,6 +1386,17 @@ def build_native_controls(
         if bound_model:
             resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
             model_arg = resolved_model
+        from omnigent.models.claude_resolution_logging import log_claude_model_resolution
+
+        log_claude_model_resolution(
+            phase="native_model_change",
+            session_id=conv_id,
+            selection_source="inference_binding" if bound_model else "session_override",
+            selected_model=selected_model,
+            resolved_model=model_arg,
+            model_env=env,
+            picker_values=picker_values,
+        )
         if model_arg is None:
             _logger.warning(
                 "claude-native model change: %r has no spelling session=%s accepts "

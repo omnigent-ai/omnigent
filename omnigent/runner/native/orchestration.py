@@ -70,6 +70,7 @@ from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
+from omnigent.models.claude_resolution_logging import log_claude_model_resolution
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -9320,9 +9321,23 @@ async def _auto_create_claude_terminal(
     # The launch model without the session's pick: the agent-spec pin, else
     # the provider's own default. Also what a pick the provider cannot serve
     # falls back to.
+    spec_model = _claude_native_model_from_spec(agent_spec)
+    model_selection_source = (
+        "session_override"
+        if session_model_override
+        else "agent_spec"
+        if spec_model
+        else "provider_config"
+        if claude_config is not None and claude_config.model
+        else "cli_default"
+    )
+    selected_model = (
+        session_model_override
+        or spec_model
+        or (claude_config.model if claude_config is not None else None)
+    )
     unpinned_launch_model = resolve_claude_native_model_selection(
-        _claude_native_model_from_spec(agent_spec)
-        or (claude_config.model if claude_config is not None else None),
+        spec_model or (claude_config.model if claude_config is not None else None),
         claude_config,
     )
     launch_model = (
@@ -9331,6 +9346,7 @@ async def _auto_create_claude_terminal(
         else unpinned_launch_model
     )
     if claude_binding is not None:
+        model_selection_source = "inference_binding"
         unpinned_launch_model = resolve_bound_model(
             inference_config, "claude-native", _claude_native_model_from_spec(agent_spec)
         )
@@ -9347,6 +9363,7 @@ async def _auto_create_claude_terminal(
     # Bound here so the vocabulary record below reads the same rows the
     # launch validated against, whether or not that validation ran.
     launch_catalog: list[dict[str, object]] | None = None
+    launch_catalog_was_stale = False
     if claude_binding is None and (session_model_override or launch_model is None):
         from omnigent.harnesses.claude_native.main import (
             claude_catalog_launch_spelling,
@@ -9358,7 +9375,6 @@ async def _auto_create_claude_terminal(
         )
         from omnigent.models.model_catalog_store import default_row
 
-        launch_catalog_was_stale = False
         try:
             # Read staleness BEFORE the fetch: the fetch itself kicks the
             # background re-probe, which could land between the two reads and
@@ -9459,6 +9475,7 @@ async def _auto_create_claude_terminal(
                         extra={"session_id": session_id},
                     )
                     launch_model = unpinned_launch_model
+                    model_selection_source = "provider_fallback"
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
@@ -9475,6 +9492,7 @@ async def _auto_create_claude_terminal(
             else:
                 catalog_default = default_row(launch_catalog)
                 if catalog_default is not None:
+                    model_selection_source = "catalog_default"
                     launch_model = (
                         str(catalog_default.get("model") or catalog_default.get("id") or "")
                         or None
@@ -9497,6 +9515,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import record_model_vocabulary
     from omnigent.harnesses.claude_native.main import stored_claude_picker_values
 
+    launch_picker_values = stored_claude_picker_values(claude_config, launch_catalog)
     await asyncio.to_thread(
         record_model_vocabulary,
         bridge_dir,
@@ -9505,7 +9524,7 @@ async def _auto_create_claude_terminal(
         # The catalog rows are the CLI's own picker, so their ids are the
         # spellings a later ``/model`` can type — a managed picker names
         # rows no pin covers.
-        picker_values=stored_claude_picker_values(claude_config, launch_catalog),
+        picker_values=launch_picker_values,
     )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
@@ -9537,6 +9556,20 @@ async def _auto_create_claude_terminal(
                 or fork_carry_history
             ),
         ),
+    )
+    log_claude_model_resolution(
+        phase="native_launch",
+        session_id=session_id,
+        selection_source=model_selection_source,
+        selected_model=selected_model,
+        resolved_model=launch_model,
+        model_env=claude_config.env if claude_config is not None else None,
+        picker_values=launch_picker_values,
+        catalog_available=launch_catalog is not None
+        if claude_binding is None and (session_model_override or unpinned_launch_model is None)
+        else None,
+        catalog_stale=launch_catalog_was_stale if launch_catalog is not None else None,
+        explicit_launch_args=session_launch_args,
     )
 
     # Pass ``ap_server_url`` so ``build_hook_settings`` registers the

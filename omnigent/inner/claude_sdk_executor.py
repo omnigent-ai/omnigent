@@ -61,6 +61,7 @@ from omnigent.models.claude_model_vocabulary import (
     served_alias_pins,
     served_canonical_overrides,
 )
+from omnigent.models.claude_resolution_logging import log_claude_model_resolution
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
@@ -2866,6 +2867,23 @@ class ClaudeSDKExecutor(Executor):
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
         settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
+        model_selection_source = (
+            "executor_config"
+            if cfg.model
+            else "executor_override"
+            if self._model_override
+            else "gateway_default"
+            if self._gateway_uses_databricks_profile
+            else "cli_default"
+        )
+        log_claude_model_resolution(
+            phase="sdk_query",
+            selection_source=model_selection_source,
+            selected_model=cfg.model or self._model_override,
+            resolved_model=model,
+            model_env=env,
+            model_overrides=model_overrides,
+        )
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -3456,6 +3474,15 @@ class ClaudeSDKExecutor(Executor):
                             getattr(result_msg, "is_error", None),
                         )
                         if getattr(result_msg, "is_error", None):
+                            log_claude_model_resolution(
+                                phase="sdk_failure",
+                                selection_source=model_selection_source,
+                                selected_model=cfg.model or self._model_override,
+                                resolved_model=model,
+                                reported_model=observed_model,
+                                model_env=env,
+                                model_overrides=model_overrides,
+                            )
                             # Harness-level failure (e.g. expired login). Surface
                             # as an executor error rather than assistant content.
                             failure_text = result_msg.result or "claude-sdk harness error"

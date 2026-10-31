@@ -4189,10 +4189,14 @@ async def test_result_message_is_error_yields_executor_error() -> None:
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
     from omnigent.inner.executor import ExecutorError, TurnComplete
+    from tests.debug_log_helpers import capture_debug_rows
 
-    executor = ClaudeSDKExecutor()
+    executor = ClaudeSDKExecutor(model="private-selected-model")
     fake_sdk = _failed_result_sdk("Not logged in · Please run /login")
-    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        capture_debug_rows("runner") as rows,
+    ):
         events = [
             e
             async for e in executor.run_turn(
@@ -4201,6 +4205,14 @@ async def test_result_message_is_error_yields_executor_error() -> None:
                 "",
             )
         ]
+
+    resolution = [
+        row["attributes"] for row in rows if row["event_name"] == "claude_model_resolution"
+    ]
+    assert [row["phase"] for row in resolution] == ["sdk_query", "sdk_failure"]
+    assert all(row["selection_source"] == "executor_override" for row in resolution)
+    assert resolution[0]["selected_model_sha256"] == resolution[1]["resolved_model_sha256"]
+    assert all("private-selected-model" not in str(row) for row in resolution)
 
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert errors, (

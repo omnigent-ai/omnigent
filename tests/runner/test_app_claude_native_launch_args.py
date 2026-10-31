@@ -1356,6 +1356,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     from unittest.mock import Mock
 
     from omnigent.runner.resource_registry import SessionResourceRegistry
+    from tests.debug_log_helpers import capture_debug_rows
 
     seeded: list[tuple[Path, dict[str, str] | None]] = []
     registry = Mock(spec=SessionResourceRegistry)
@@ -1381,10 +1382,21 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
         ],
     )
 
-    with pytest.raises(RuntimeError, match="stop after seeding"):
+    with (
+        capture_debug_rows("runner") as rows,
+        pytest.raises(RuntimeError, match="stop after seeding"),
+    ):
         await _auto_create_claude_terminal_for_test(
             monkeypatch, session_id="conv_seed_launch_env", workspace=bridge_dir, registry=registry
         )
+
+    resolution = [
+        row["attributes"] for row in rows if row["event_name"] == "claude_model_resolution"
+    ]
+    assert len(resolution) == 1
+    assert resolution[0]["phase"] == "native_launch"
+    assert resolution[0]["selection_source"] == "cli_default"
+    assert "resolved_model_sha256" not in resolution[0]
 
     assert len(seeded) == 1
     workspace, env = seeded[0]
