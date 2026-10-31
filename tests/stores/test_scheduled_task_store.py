@@ -1069,6 +1069,55 @@ def test_update_run_unknown_run_returns_none(
     assert store.update_run(_uid("nope"), status="succeeded", finished_at=1) is None
 
 
+def test_enrich_run_failure_preserves_terminal_state(store: SqlAlchemyScheduledTaskStore) -> None:
+    run_id = _seed_running_run(store, "enrich")
+    store.update_run(run_id, status="failed", finished_at=202)
+    updated = store.enrich_run_failure(run_id, error_code="runner_error", error="actionable cause")
+    assert updated is not None
+    assert (updated.status, updated.finished_at) == ("failed", 202)
+    assert (updated.error_code, updated.error) == ("runner_error", "actionable cause")
+    assert store.enrich_run_failure(run_id, error_code="other", error="later cause") is None
+    persisted = store.list_runs(_uid("task_enrich"))[0][0]
+    assert (persisted.error_code, persisted.error) == ("runner_error", "actionable cause")
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "detail"),
+    [
+        ("running", None, None),
+        ("succeeded", None, None),
+        ("failed", "incomplete", None),
+        ("failed", None, "known cause"),
+    ],
+)
+def test_enrich_run_failure_refuses_other_outcomes(
+    store: SqlAlchemyScheduledTaskStore,
+    status: str,
+    code: str | None,
+    detail: str | None,
+) -> None:
+    run_id = _seed_running_run(store, "preserve")
+    if status != "running":
+        store.update_run(run_id, status=status, finished_at=202, error_code=code, error=detail)
+    assert store.enrich_run_failure(run_id, error_code="other", error="later cause") is None
+    persisted = store.list_runs(_uid("task_preserve"))[0][0]
+    assert (persisted.status, persisted.error_code, persisted.error) == (status, code, detail)
+
+
+def test_enrich_run_failure_is_workspace_scoped(store: SqlAlchemyScheduledTaskStore) -> None:
+    with workspace_scope(11):
+        run_id = _seed_running_run(store, "enrich_scoped")
+        store.update_run(run_id, status="failed", finished_at=202)
+    assert store.enrich_run_failure(run_id, error_code="other", error="wrong workspace") is None
+    with workspace_scope(11):
+        persisted = store.list_runs(_uid("task_enrich_scoped"))[0][0]
+        assert persisted.error is None
+        assert (
+            store.enrich_run_failure(run_id, error_code="runner_error", error="cause") is not None
+        )
+    assert store.enrich_run_failure(_uid("absent"), error_code="other", error="cause") is None
+
+
 # ── list_running_runs_for_tasks (lazy-on-read LIST backstop source) ──────────
 
 

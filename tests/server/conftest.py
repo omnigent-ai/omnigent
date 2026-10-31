@@ -39,9 +39,10 @@ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import init as init_runtime
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import _elicitation_registry, presence
+from omnigent.server import _elicitation_registry, presence, session_live_state
 from omnigent.server.app import create_app
 from omnigent.server.routes import sessions as sessions_routes
+from omnigent.server.routes._sessions.common import _session_failure_observations
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -392,6 +393,16 @@ class _MockResponsesNamespace:
 
 
 # ── Fixtures ──────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_failure_observations() -> Iterator[None]:
+    """Session IDs and workspaces are reused across tests in the same worker."""
+    _session_failure_observations.clear()
+    session_live_state._scheduled_failure_runs.clear()
+    yield
+    _session_failure_observations.clear()
+    session_live_state._scheduled_failure_runs.clear()
 
 
 @pytest.fixture()

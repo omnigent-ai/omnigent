@@ -237,6 +237,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_failure_observations,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -8573,6 +8574,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
+    _session_failure_observations.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
 

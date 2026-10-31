@@ -43,6 +43,8 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
+import cachetools
+
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 
@@ -73,6 +75,10 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Bind late diagnostics to the exact run this process completed for that turn.
+_scheduled_failure_runs: WorkspaceScopedCache[str, tuple[str, str]] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096)
+)
 # This process's own last touch_runner_liveness() stamp per runner id.
 # Never erased by clear_runner_liveness — only configure() resets it.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
@@ -97,6 +103,7 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+    _scheduled_failure_runs.clear()
     _last_liveness_stamp.clear()
 
 
@@ -142,7 +149,7 @@ def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type
     def _run() -> Any:
         try:
             return fn(*args)
-        except Exception:  # best-effort display state
+        except Exception:
             _logger.warning("session live-state write failed (%s)", description, exc_info=True)
             if on_failure is not None:
                 on_failure()
@@ -196,12 +203,16 @@ def persist_live_status(session_id: str, status: str) -> None:
 def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state for a session handed to another replica."""
     _last_status.pop(session_id, None)
+    if _scheduled_task_store is not None:
+        submit("forget_scheduled_failure", _scheduled_failure_runs.pop, session_id, None)
 
 
 def persist_scheduled_run_completion(
     conversation_id: str,
     run_status: str,
     *,
+    response_id: str | None = None,
+    only_enrich: bool = False,
     error_code: str | None = None,
     error: str | None = None,
 ) -> None:
@@ -226,14 +237,20 @@ def persist_scheduled_run_completion(
     Idempotent by construction: ``update_run`` is conditional on
     ``WHERE status = running``, so a run already terminal (a fire-time
     ``skipped``/``failed``, or the startup/lazy backstop) is never clobbered
-    and a terminal edge seen twice transitions at most once. Best-effort like
-    the other writes here — a failure logs and is dropped; the backstop
+    and a terminal edge seen twice transitions at most once. A later classified
+    failure for the same response can fill an empty failure reason on the exact
+    run completed here, without changing its outcome or completion time.
+    The bounded in-process binding is lost on restart or replica handoff.
+    Best-effort like the other writes here — a failure logs and is dropped; the backstop
     (startup sweep / lazy-on-read) is the durability guarantee for the rare
     dropped-write or restart-in-flight case.
 
     :param conversation_id: The fired conversation whose turn just ended.
     :param run_status: Terminal run status to set — ``"succeeded"`` (turn
         completed) or ``"failed"`` (turn errored/cancelled/disconnected).
+    :param response_id: Known turn identity, required for later failure enrichment.
+    :param only_enrich: A late old-turn event may enrich its bound run but cannot
+        complete a currently running run.
     :param error_code: Short failure classification when ``run_status`` is
         ``"failed"`` (e.g. the conversation's ``last_task_error_code``).
     :param error: Optional human-readable failure detail for ``"failed"``.
@@ -243,18 +260,28 @@ def persist_scheduled_run_completion(
         return
 
     def _transition() -> None:
+        if run_status == "failed" and response_id:
+            binding = _scheduled_failure_runs.get(conversation_id)
+            if binding is not None and binding[0] == response_id:
+                if error_code or error:
+                    store.enrich_run_failure(binding[1], error_code=error_code, error=error)
+                return
+        if only_enrich:
+            return
         run = store.get_running_run_by_conversation(conversation_id)
         if run is None:
             # Not a scheduled fire, or its run is already terminal — nothing to
             # do. This is the common case (interactive sessions).
             return
-        store.update_run(
+        updated = store.update_run(
             run.id,
             status=run_status,
             finished_at=int(time.time()),
             error=error,
             error_code=error_code,
         )
+        if updated is not None and run_status == "failed" and response_id:
+            _scheduled_failure_runs[conversation_id] = (response_id, updated.id)
 
     submit("scheduled_run_completion", _transition)
 

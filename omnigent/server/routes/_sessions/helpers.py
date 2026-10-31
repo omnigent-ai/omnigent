@@ -247,10 +247,12 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_failure_observations,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _SessionFailureObservation,
     _unbound_managed_launch_tasks,
     build_policy_engine,
     get_agent_cache,
@@ -4969,7 +4971,7 @@ def _publish_status(
         edges, e.g. ``"codex_turn_abc123"``.
     :param failure_origin: Stable slug naming the publish path behind a
         ``"failed"`` edge, e.g. ``"runner_disconnected_mid_turn"``. Every
-        server-side failure logs one ERROR from here, so without it the
+        first failure observation and any new detail log ERROR here, so without it the
         dozen unrelated causes that reach this function are one
         undifferentiated signature. Ignored for non-failed edges.
     :param failure_context: Untrusted optional native evidence, normalized at
@@ -5006,8 +5008,93 @@ def _publish_status(
         _session_active_response_cache.pop(session_id, None)
         return
     previous_status = _session_status_cache.get(session_id)
-    _session_status_cache[session_id] = status
-    if previous_status != status:
+    duplicate_failure = False
+    distinct_failure = False
+    observed_error = error
+    enrichment_attributes: dict[str, str] = {}
+    failure_attributes = failure_log_attributes(failure_context) if status == "failed" else {}
+    active_response_id = _session_active_response_cache.get(session_id)
+    previous_failure = _session_failure_observations.get(session_id)
+    stale_failure = (
+        status == "failed"
+        and response_id is not None
+        and active_response_id is not None
+        and response_id != active_response_id
+        and previous_failure is not None
+        and response_id == previous_failure.response_id
+    )
+    if status == "failed":
+        # Capture the turn before the terminal edge clears its active identity.
+        response_id = response_id or active_response_id
+        first_observed_at_ms = int(time.time() * 1000)
+        # Read progress and derived availability flags are not new causes.
+        failure_evidence = {
+            key: value
+            for key, value in failure_attributes.items()
+            if key
+            not in {
+                "diagnostic_last_read_at",
+                "diagnostic_read_offset",
+                "diagnostic_lines_omitted",
+                "diagnostic_bytes_omitted",
+                "failure_context_version",
+                "failure_context_missing_fields",
+            }
+        }
+        failure_evidence.update(disconnect_evidence or {})
+        if (
+            response_id is not None
+            and (previous_status == "failed" or stale_failure)
+            and previous_failure is not None
+            and previous_failure.response_id == response_id
+        ):
+            first_observed_at_ms = previous_failure.first_observed_at_ms
+            previous_failure_id = previous_failure.evidence.get("failure_id")
+            incoming_failure_id = failure_evidence.get("failure_id")
+            distinct_failure = bool(
+                previous_failure_id
+                and incoming_failure_id
+                and previous_failure_id != incoming_failure_id
+            )
+            new_evidence = any(
+                previous_failure.evidence.get(key) != value
+                for key, value in failure_evidence.items()
+            )
+            if error is None or error == previous_failure.observed_error:
+                if error is None:
+                    error = previous_failure.error
+                duplicate_failure = not new_evidence
+            if observed_error is None and not distinct_failure:
+                observed_error = previous_failure.observed_error
+            if not duplicate_failure and (previous_failure.observed_error is None or new_evidence):
+                enrichment_attributes = {
+                    "failure_observation": "additional" if distinct_failure else "enriched",
+                    "previous_failure_origin": previous_failure.origin,
+                    "first_failure_at_ms": str(first_observed_at_ms),
+                }
+            if not distinct_failure:
+                failure_evidence = previous_failure.evidence | failure_evidence
+        if response_id is not None and not duplicate_failure:
+            _session_failure_observations[session_id] = _SessionFailureObservation(
+                response_id=response_id,
+                error=error.model_copy(deep=True) if error is not None else None,
+                observed_error=observed_error.model_copy(deep=True)
+                if observed_error is not None
+                else None,
+                origin=failure_origin or "unattributed",
+                first_observed_at_ms=first_observed_at_ms,
+                evidence=failure_evidence,
+            )
+        elif response_id is None:
+            # Without a turn identity, a later failure could be independent.
+            _session_failure_observations.pop(session_id, None)
+    elif status == "idle":
+        _session_failure_observations.pop(session_id, None)
+    if stale_failure:
+        enrichment_attributes["failure_status_applied"] = "false"
+    else:
+        _session_status_cache[session_id] = status
+    if not stale_failure and previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
         # A turn can open or merge a PR while nobody watches; refresh what the server
@@ -5016,7 +5103,7 @@ def _publish_status(
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
-    if persist_live_status:
+    if persist_live_status and not stale_failure:
         session_live_state.persist_live_status(session_id, status)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
@@ -5038,45 +5125,48 @@ def _publish_status(
     elif status == "idle":
         session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
     elif status == "failed":
-        # Canonical server-side broken-turn signal: every server-originated
-        # failed turn (runner disconnect mid-turn, setup/dispatch failure,
-        # rejection) funnels through here, so log once at ERROR for the
-        # dashboard. Relayed runner failures arrive via session_stream and are
-        # already logged runner-side, so they don't reach this path.
-        #
-        # Because every cause shares this one line, the row has to carry which
-        # path published it: the origin slug, the failure code, and the status
-        # the session was leaving. The message keeps its "session turn failed
-        # for <id>: <detail>" shape so existing detail-matching stays valid.
+        # Keep the first signal and each new cause; repeated observations of
+        # a known turn must neither inflate errors nor erase richer detail.
         origin = failure_origin or "unattributed"
-        failure_code = error.code if error is not None else "none"
-        _logger.error(
-            "session turn failed for %s (origin=%s code=%s prev=%s): %s",
-            session_id,
-            origin,
-            failure_code,
-            previous_status or "unknown",
-            _failure_log_detail(error),
-            extra=debug_event(
-                "session_turn_failed",
-                session_id=session_id,
-                origin=origin,
-                code=failure_code,
-                previous_status=previous_status or "unknown",
-                response_id=response_id,
-                active_response_id_at_failure=_session_active_response_cache.get(session_id),
-                cached_background_task_count=_session_background_task_count_cache.get(session_id),
-                **failure_log_attributes(failure_context),
-                **(failure_intake or {}),
-                **(disconnect_evidence or {}),
-            ),
-        )
+        # A new failure identity must not inherit a different failure's cause.
+        log_error = observed_error
+        failure_code = log_error.code if log_error is not None else "none"
+        if not duplicate_failure:
+            _logger.error(
+                "session turn failed for %s (origin=%s code=%s prev=%s): %s",
+                session_id,
+                origin,
+                failure_code,
+                previous_status or "unknown",
+                _failure_log_detail(log_error),
+                extra=debug_event(
+                    "session_turn_failed",
+                    session_id=session_id,
+                    origin=origin,
+                    code=failure_code,
+                    previous_status=previous_status or "unknown",
+                    response_id=response_id,
+                    active_response_id_at_failure=_session_active_response_cache.get(session_id),
+                    cached_background_task_count=_session_background_task_count_cache.get(
+                        session_id
+                    ),
+                    **failure_attributes,
+                    **(failure_intake or {}),
+                    **(disconnect_evidence or {}),
+                    **enrichment_attributes,
+                ),
+            )
         session_live_state.persist_scheduled_run_completion(
             session_id,
             "failed",
+            response_id=response_id,
+            only_enrich=stale_failure,
             error_code=error.code if error is not None else None,
             error=error.message if error is not None else None,
         )
+    if stale_failure:
+        # Old-turn diagnostics must not close or fail the response now running.
+        return
     # Track the in-flight response id for snapshot-based reconnect (see
     # _session_active_response_cache). A running/waiting edge that names a
     # turn opens it; any idle/failed edge closes it.

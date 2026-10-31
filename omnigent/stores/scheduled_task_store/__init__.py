@@ -342,6 +342,27 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def enrich_run_failure(
+        self,
+        run_id: str,
+        *,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """Fill a failed run's missing reason without changing its outcome.
+
+        The caller must bind the diagnostic to the response that failed this
+        run. Only failed runs with neither an error nor a code are eligible;
+        existing reasons and the original completion time are preserved.
+
+        :param run_id: The exact previously completed run.
+        :param error: Later human-readable failure detail.
+        :param error_code: Later failure classification.
+        :returns: The enriched run, or ``None`` if missing or ineligible.
+        """
+        ...
+
+    @abstractmethod
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """
         Return the ``running`` run for a conversation, or ``None``.
