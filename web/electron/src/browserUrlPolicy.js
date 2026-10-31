@@ -13,9 +13,9 @@ const dns = require("node:dns");
 // javascript:, ...) is a privileged surface or code channel and is rejected.
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
-// The exact loopback hosts an eligible Arca agent context may open. Other
+// The exact loopback hosts an eligible session context may open. Other
 // loopback spellings and DNS names that resolve to loopback stay blocked.
-const ARCA_LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
  * Parse a dotted-quad IPv4 host into four octets, or null if not IPv4. The
@@ -171,7 +171,7 @@ function isBlockedHostname(hostname) {
 
 /**
  * Decide whether an AGENT-issued navigation to `url` is allowed: `{ ok: true }`
- * for an http(s) URL to a non-internal host (or eligible Arca loopback), else
+ * for an http(s) URL to a non-internal host (or eligible loopback), else
  * `{ ok: false, error }`. Never throws — an unparseable URL is a rejection.
  * Judges the URL alone; `checkAgentNavigation` adds DNS resolution.
  *
@@ -195,7 +195,7 @@ function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
     };
   }
   const hostname = parsed.hostname;
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) {
+  if (allowLocalhost && LOOPBACK_HOSTS.has(hostname)) {
     return { ok: true };
   }
   if (isBlockedHostname(hostname)) {
@@ -234,7 +234,7 @@ async function checkAgentNavigation(
   const verdict = isAgentNavigationAllowed(url, { allowLocalhost });
   if (!verdict.ok) return verdict;
   const { hostname } = new URL(url);
-  if ((allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
+  if ((allowLocalhost && LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
     return verdict;
   }
   let addresses = [];
@@ -271,7 +271,7 @@ function isAgentConnectionAllowed(url, ip, { allowLocalhost = false } = {}) {
   } catch {
     // Judge the address alone.
   }
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) return { ok: true };
+  if (allowLocalhost && LOOPBACK_HOSTS.has(hostname)) return { ok: true };
   if (!ip) {
     return {
       ok: false,

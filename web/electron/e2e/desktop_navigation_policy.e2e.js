@@ -64,7 +64,7 @@ it(
     global.navigationRedirects = [];
     mod.createBrowserViewRegistry = (opts) => {
       const registry = create({ ...opts,
-        isArcaAgentContext: (context) => context?.trustedPreviewFixture === true,
+        allowsLocalhost: (context) => context?.trustedPreviewFixture === true,
       });
       const response = registry.shouldCancelAgentResponse.bind(registry);
       registry.shouldCancelAgentResponse = async (details) => {
@@ -350,6 +350,145 @@ it(
         });
         fs.rmSync(scratch, { recursive: true, force: true });
       }
+    }
+  },
+);
+
+it(
+  "opens this machine's loopback preview via the address bar and agent relay, denying a remote session",
+  { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 120_000 },
+  async () => {
+    const { startDesignBackend, eventually } = require("./desktopDesignPromptHarness");
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-localhost-"));
+    const recordDir =
+      process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
+      fs.mkdtempSync(path.join(os.tmpdir(), "omni-localhost-recordings-"));
+    let previewLoads = 0;
+    const fixture = http.createServer((request, response) => {
+      if (request.url === "/") previewLoads++;
+      response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
+      response.end("<title>This machine preview</title><h1>Localhost preview works</h1>");
+    });
+    await new Promise((resolve) => {
+      fixture.listen(0, "127.0.0.1", resolve);
+    });
+    const previewUrl = `http://127.0.0.1:${fixture.address().port}/`;
+    const hostId = "a".repeat(32);
+    let backend;
+    let desktop;
+    try {
+      backend = await startDesignBackend(scratch);
+      const machineHome = path.join(scratch, "machine");
+      const stateDir = path.join(machineHome, ".omnigent");
+      fs.mkdirSync(path.join(stateDir, "daemons"), { recursive: true });
+      fs.writeFileSync(path.join(stateDir, "config.yaml"), `host:\n  host_id: ${hostId}\n`);
+      // Disk-backed enrollment and a live PID exercise the production predicate.
+      fs.writeFileSync(
+        path.join(stateDir, "daemons", "local.json"),
+        JSON.stringify({
+          pid: process.pid,
+          target: backend.serverUrl,
+          server_url: backend.serverUrl,
+          mode: "server",
+          host_id: hostId,
+        }),
+      );
+      desktop = await launchDesktop({
+        serverUrl: backend.serverUrl,
+        recordDir,
+        env: { HOME: machineHome, OMNIGENT_CONFIG_HOME: stateDir },
+      });
+      const { window, electronApp } = desktop;
+      let sessionIsLocal = true;
+      await window.route(/\/v1\/sessions\/[a-f0-9]+(?:\?.*)?$/, async (route) => {
+        if (route.request().method() !== "GET") return route.continue();
+        const response = await route.fetch();
+        const body = await response.json();
+        const local = body.id === backend.sessionId && sessionIsLocal;
+        await route.fulfill({
+          response,
+          json: { ...body, host_id: local ? hostId : "b".repeat(32) },
+        });
+      });
+      await window.goto(`${backend.serverUrl}/c/${backend.sessionId}`);
+      await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
+      const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
+      if (await expand.isVisible()) await expand.click();
+      await window.getByRole("button", { name: "Open new", exact: true }).click();
+      await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
+      const bar = window.getByRole("textbox", { name: "Address bar" });
+      await bar.fill(previewUrl);
+      await bar.press("Enter");
+      await eventually(
+        () =>
+          electronApp.evaluate((_electron, url) => {
+            const registry = global.omnigentTestBrowserRegistries[0];
+            const entry = registry.get(registry.activeConversationId());
+            return (
+              entry?.view.webContents.getURL() === url &&
+              entry.agentContext?.hostIsThisMachine === true
+            );
+          }, previewUrl),
+        "address-bar loopback preview",
+      );
+      const action = async (sessionId) => {
+        const response = await fetch(
+          `${backend.serverUrl}/v1/sessions/${sessionId}/browser/action_request`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "navigate", args: { url: previewUrl } }),
+            signal: AbortSignal.timeout(30_000),
+          },
+        );
+        assert.equal(response.ok, true);
+        return response.json();
+      };
+      assert.equal((await action(backend.sessionId)).ok, true);
+      const content = await electronApp.evaluate(async (_electron, sessionId) => {
+        const entry = global.omnigentTestBrowserRegistries[0].get(sessionId);
+        await new Promise((resolve) => {
+          if (!entry.view.webContents.isLoading()) resolve();
+          else entry.view.webContents.once("did-finish-load", resolve);
+        });
+        return entry.view.webContents.executeJavaScript("document.body.innerText");
+      }, backend.sessionId);
+      assert.match(content, /Localhost preview works/);
+      const loadsBeforeMove = previewLoads;
+      sessionIsLocal = false;
+      const moved = await action(backend.sessionId);
+      assert.equal(moved.ok, false, JSON.stringify(moved));
+      assert.match(moved.error, /blocked/i);
+      assert.equal(previewLoads, loadsBeforeMove, "a moved session sends no loopback request");
+      assert.equal(
+        await electronApp.evaluate((_electron, sessionId) => {
+          return global.omnigentTestBrowserRegistries[0].get(sessionId).view.webContents.getURL();
+        }, backend.sessionId),
+        "about:blank",
+        "a moved session removes the previous local document",
+      );
+      await window.goto(`${backend.serverUrl}/c/${backend.otherSessionId}`);
+      await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
+      const denied = await eventually(async () => {
+        const result = await action(backend.otherSessionId);
+        return result.error === "no browser renderer is connected" ? null : result;
+      }, "remote session browser relay");
+      assert.equal(denied.ok, false, JSON.stringify(denied));
+      assert.match(denied.error, /blocked/i);
+    } finally {
+      if (desktop) {
+        await desktop.window.unrouteAll({ behavior: "wait" });
+        await desktop.electronApp.close();
+        await desktop.stopDisplayCapture();
+        console.log(saveRecording(recordDir, "this-machine-localhost"));
+        fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+      }
+      if (backend) await backend.close();
+      fixture.closeAllConnections();
+      await new Promise((resolve) => {
+        fixture.close(resolve);
+      });
+      fs.rmSync(scratch, { recursive: true, force: true });
     }
   },
 );

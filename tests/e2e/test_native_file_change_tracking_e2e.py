@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -53,7 +52,7 @@ async def test_native_write_reaches_changes_registry(
         file_change_observer=_observe,
     )
     hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
-    command = shlex.split(str(hook["command"]))
+    command = ["/bin/sh", "-c", str(hook["command"])]
     try:
         report = workspace / "report.md"
         report.write_text("hi\n")

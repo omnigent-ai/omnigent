@@ -1,25 +1,9 @@
-"""Browser e2e: the session filter re-scopes only the flat Sessions list.
+"""Browser E2E for pinned visibility and project membership across sidebar filters.
 
-The sidebar's session filter (the funnel: All / My sessions / Shared / Archived)
-picks a slice of conversations, but the **Pinned** and **Projects** sections are
-built from the full non-archived set — NOT the filtered slice — so switching the
-filter must never empty them:
-
-- **Pinned** shows EVERY pinned session on every filter. A pinned *shared*
-  session (owned by someone else) stays under Pinned on "My sessions", and a
-  pinned *owned* session stays under Pinned on "Shared sessions"; both survive
-  the "Archived sessions" filter too. Pins are per-user, so the viewer's own pin
-  set drives this regardless of who owns the session.
-- **Projects** renders the same folders and contents on every filter. Filing is
-  owner-only, so a folder shows the viewer's owned sessions — but the group and
-  its folders must not vanish when the filter switches to Shared or Archived.
-
-These drive the real chain the mocked ``Sidebar`` unit tests exercise, but
-end-to-end: seed owned + shared sessions (and a filed project) over the REST
-API, pin/file through the live UI, toggle the filter, and assert the Pinned /
-Projects sections hold their rows. Runs against a dedicated multi-user server
-(the shared ``live_server`` is single-user, which hides the Shared filter), the
-same harness as ``test_sidebar_ownership_gating.py``.
+Pins stay visible on every filter. Project folders keep live owned members on
+All / My / Shared and switch to archived owned members on Archived. These
+journeys use the real REST API and a dedicated multi-user server so the Shared
+filter and owner boundaries are exercised.
 """
 
 from __future__ import annotations
@@ -184,17 +168,11 @@ def test_pinned_section_ignores_the_session_filter(
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
-def test_projects_section_ignores_the_session_filter(
+def test_project_folders_follow_archived_filter(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """The Projects group + its folders survive the Shared / Archived filters.
-
-    Files a viewer-owned session into a project, then walks the filter to Shared
-    and Archived — the Projects group and the folder stay put. Before the fix
-    the Projects section was suppressed entirely on the Shared/Archived tabs, so
-    the folder vanished when the filter switched.
-    """
+    """Folders survive every filter and switch between live and archived members."""
     server = multi_user_server
     uniq = uuid.uuid4().hex[:6]
     viewer_email = f"viewer-proj-{uniq}@ui.test"
@@ -205,6 +183,13 @@ def test_projects_section_ignores_the_session_filter(
     # float it out of the folder.
     filed = _create_session(server, owner_email=viewer_email, title=f"e2e-proj-filed-{uniq}")
     _patch(server, filed, viewer_email, {"labels": {_PROJECT_LABEL_KEY: project}})
+
+    archived = _create_session(server, owner_email=viewer_email, title=f"e2e-proj-archived-{uniq}")
+    _patch(
+        server, archived, viewer_email, {"labels": {_PROJECT_LABEL_KEY: project}, "archived": True}
+    )
+    unfiled = _create_session(server, owner_email=viewer_email, title=f"e2e-unfiled-{uniq}")
+    _patch(server, unfiled, viewer_email, {"archived": True})
 
     with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{filed}")
@@ -217,16 +202,33 @@ def test_projects_section_ignores_the_session_filter(
         )
         expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
 
+        project_button = page.get_by_role("button", name=project, exact=True)
+        if project_button.get_attribute("aria-expanded") != "true":
+            project_button.click()
+        expect(project_button).to_have_attribute("aria-expanded", "true")
+        folder = page.get_by_role("button", name=project, exact=True).locator(
+            "xpath=ancestor::section[1]"
+        )
+        expect(folder.locator(f'a[href="/c/{filed}"]')).to_be_visible()
+        expect(folder.locator(f'a[href="/c/{archived}"]')).to_have_count(0)
+
         # Shared sessions: the Projects group and the folder must NOT disappear
         # (this whole section used to be hidden on the Shared tab).
         _set_filter(page, "shared")
         expect(page.get_by_role("button", name="Projects", exact=True)).to_be_visible()
         expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
 
-        # Archived sessions: same — the Projects group and folder stay put.
+        # Archived members are filed in the folder, leaving only unfiled archives flat.
         _set_filter(page, "archived")
-        expect(page.get_by_role("button", name="Projects", exact=True)).to_be_visible()
-        expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
+        expect(folder.locator(f'a[href="/c/{archived}"]')).to_be_visible()
+        expect(folder.locator(f'a[href="/c/{filed}"]')).to_have_count(0)
+        sessions = _section(page, "Sessions")
+        expect(sessions.locator(f'a[href="/c/{unfiled}"]')).to_be_visible()
+        expect(sessions.locator(f'a[href="/c/{archived}"]')).to_have_count(0)
+
+        _set_filter(page, "mine")
+        expect(folder.locator(f'a[href="/c/{filed}"]')).to_be_visible()
+        expect(folder.locator(f'a[href="/c/{archived}"]')).to_have_count(0)
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
