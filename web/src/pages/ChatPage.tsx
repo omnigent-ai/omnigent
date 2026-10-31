@@ -462,9 +462,11 @@ export function ChatPage() {
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
   // (every 4 s) so messages arriving while viewing are marked seen.
+  const viewedConversation = conversations?.find((c) => c.id === sessionConvId);
   useMarkConversationSeen(
     sessionConvId,
-    conversations?.find((c) => c.id === sessionConvId)?.updated_at,
+    viewedConversation?.updated_at,
+    viewedConversation?.last_turn_finish_id,
   );
 
   // Sync the store's active conversation to the URL. Single source of

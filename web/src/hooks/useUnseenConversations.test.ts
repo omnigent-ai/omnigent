@@ -424,15 +424,107 @@ describe("useMarkConversationSeen", () => {
     expect(lastPutBody()).toEqual({ last_seen: 6_000, unread: false });
   });
 
-  it("does NOT mark seen while the window is blurred", async () => {
+  it("does NOT mark seen or report a turn finish until the window is focused", async () => {
     const mod = await loadFresh();
     mod.seedReadState([]);
     setWindowFocused(false);
     vi.useFakeTimers({ now: 5_000_000 });
 
-    renderHook(() => mod.useMarkConversationSeen("conv-1", 4_000));
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 4_000, "p-1"));
 
     expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(false); // no baseline written
+    expect(putCount()).toBe(0);
+
+    setWindowFocused(true);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(lastPutBody()).toEqual({
+      last_seen: 5_000,
+      unread: false,
+      watched_turn_finish_id: "p-1",
+    });
+  });
+
+  it("reports each newly watched turn finish while focused", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 5_000_000 });
+
+    const { rerender } = renderHook(
+      ({ finishId }) => mod.useMarkConversationSeen("conv-1", 4_000, finishId),
+      { initialProps: { finishId: "p-1" as string | null } },
+    );
+    expect(lastPutBody()).toEqual({
+      last_seen: 5_000,
+      unread: false,
+      watched_turn_finish_id: "p-1",
+    });
+
+    rerender({ finishId: "p-2" });
+    expect(lastPutBody()).toEqual({
+      last_seen: 5_000,
+      unread: false,
+      watched_turn_finish_id: "p-2",
+    });
+    const putsAfterSecondFinish = putCount();
+
+    rerender({ finishId: "p-2" });
+    expect(putCount()).toBe(putsAfterSecondFinish);
+  });
+
+  it("sends a watched turn finish only with the write that reports it", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 4_000, "p-1"));
+    expect(lastPutBody()).toHaveProperty("watched_turn_finish_id", "p-1");
+
+    mod.markConversationUnread("conv-1", 9_000);
+
+    expect(lastPutBody()).toEqual({ last_seen: 8_999, unread: true });
+  });
+
+  it("retries the current read-state without the turn finish when the server rejects that field", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    let rejectField!: () => void;
+    authFetch.mockReturnValueOnce(
+      new Promise((resolve) => {
+        rejectField = () => resolve({ ok: false, status: 422, json: async () => ({}) });
+      }),
+    );
+
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 4_000, "p-1"));
+    mod.markConversationUnread("conv-1", 9_000);
+    rejectField();
+
+    await vi.waitFor(() => expect(putCount()).toBe(3));
+    expect(lastPutBody()).toEqual({ last_seen: 8_999, unread: true });
+  });
+
+  it("resends a watched turn finish after its write fails", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 5_000_000 });
+    authFetch.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) });
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 4_000, "p-1"));
+    await act(async () => {});
+
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(putCount()).toBe(2);
+    expect(lastPutBody()).toEqual({
+      last_seen: 5_000,
+      unread: false,
+      watched_turn_finish_id: "p-1",
+    });
   });
 
   it("preserves a seeded explicit-unread on reload (first mount does not clear)", async () => {

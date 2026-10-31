@@ -241,6 +241,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _session_turn_finish_cache,
     _unbound_managed_launch_tasks,
     get_caps,
     get_server_runner_router,
@@ -353,6 +354,7 @@ from omnigent.server.routes._sessions.helpers import (
     _seed_missing_title_from_user_message,
     _session_status_from_cache,
     _session_status_with_child_rollup,
+    _session_turn_finish_id,
     _SessionEventDispatchResult,
     _signal_terminal_resolved_harness_elicitation,
     _spec_harness,
@@ -368,6 +370,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    _watched_turn_finish_id,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
@@ -1301,6 +1304,8 @@ def _build_session_list_item(
         ),
         viewer_last_seen=viewer_last_seen,
         viewer_unread=viewer_unread,
+        last_turn_finish_id=_session_turn_finish_id(conv.id, child_session_ids),
+        viewer_watched_turn_finish_id=_watched_turn_finish_id(user_id, conv.id),
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,
@@ -8572,6 +8577,7 @@ class _RelayTransportLost(Exception):
 def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
+    _session_turn_finish_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 

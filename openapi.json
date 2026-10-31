@@ -5213,6 +5213,19 @@
             "description": "Whether this session is explicitly flagged unread for the caller.",
             "title": "Unread",
             "type": "boolean"
+          },
+          "watched_turn_finish_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's `last_turn_finish_id` the caller just watched with the session open and focused, e.g. `\"3f9c0d1e2a4b-17\"`. The caller's other devices skip that finish's notification. Omitted or `None` keeps the stored value.",
+            "title": "Watched Turn Finish Id"
           }
         },
         "required": [
@@ -7433,6 +7446,18 @@
             "title": "Labels",
             "type": "object"
           },
+          "last_turn_finish_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque id of the latest turn finish behind `status` (including direct sub-agent children), e.g. `\"3f9c0d1e2a4b-17\"`. Changes on each finish; `None` when the serving process recorded none. In-memory only.",
+            "title": "Last Turn Finish Id"
+          },
           "owner": {
             "anyOf": [
               {
@@ -7605,6 +7630,18 @@
             "description": "Whether the *requesting user* explicitly marked this session unread. Per-viewer; lifts the active-row dot suppression on the client. `False` by default.",
             "title": "Viewer Unread",
             "type": "boolean"
+          },
+          "viewer_watched_turn_finish_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The `last_turn_finish_id` the *requesting user* last watched on any device with the session open, reported through `PUT /v1/sessions/{id}/read-state`. Clients skip a turn-end notification for the finish it names. In-memory only.",
+            "title": "Viewer Watched Turn Finish Id"
           },
           "workspace": {
             "anyOf": [

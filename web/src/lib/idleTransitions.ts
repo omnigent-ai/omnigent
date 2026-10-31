@@ -48,6 +48,37 @@ export function detectIdleTransitions(
   });
 }
 
+/** Snapshot of each conversation's latest turn-finish id, keyed by id. */
+export function buildTurnFinishMap(conversations: Conversation[]): Map<string, string | undefined> {
+  const map = new Map<string, string | undefined>();
+  for (const conversation of conversations) {
+    map.set(conversation.id, conversation.last_turn_finish_id ?? undefined);
+  }
+  return map;
+}
+
+/**
+ * Whether the user already watched this conversation's latest turn finish
+ * with the session open on some device, making its turn-end notification
+ * redundant.
+ *
+ * The finish must differ from `baselineFinishId`, the id this client saw
+ * while the turn was still running, so an acknowledgement of an earlier
+ * finish never silences a turn the server gave no new finish id. Missing ids
+ * read as not watched, so the notification still fires.
+ */
+export function isTurnFinishWatched(
+  conversation: Conversation,
+  baselineFinishId: string | undefined,
+): boolean {
+  const finishId = conversation.last_turn_finish_id;
+  return (
+    typeof finishId === "string" &&
+    finishId !== baselineFinishId &&
+    finishId === conversation.viewer_watched_turn_finish_id
+  );
+}
+
 /** Snapshot of each conversation's pending-elicitation count, keyed by id. */
 export function buildElicitationMap(conversations: Conversation[]): Map<string, number> {
   const map = new Map<string, number>();

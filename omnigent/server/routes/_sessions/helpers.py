@@ -229,6 +229,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _STOP_RUNNER_RESULT_TIMEOUT_S,
     _STOP_SESSION_TYPE,
     _TURN_ACTOR_LABEL,
+    _TURN_FINISH_ID_PREFIX,
     _UI_ADDED_AGENT_TITLE_PREFIX,
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
@@ -244,6 +245,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _read_explicit_unread,
     _read_last_seen,
+    _read_watched_turn_finish,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -251,6 +253,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _session_turn_finish_cache,
+    _turn_finish_sequence,
     _unbound_managed_launch_tasks,
     build_policy_engine,
     get_agent_cache,
@@ -613,7 +617,39 @@ def _read_state_entry(user_id: str | None, session_id: str) -> tuple[int | None,
     return last_seen, unread
 
 
-def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread: bool) -> None:
+def _watched_turn_finish_id(user_id: str | None, session_id: str) -> str | None:
+    """
+    Read the turn finish the caller last watched, on any device, for one session.
+
+    :param user_id: Authenticated user id, or ``None`` in single-user mode.
+    :param session_id: Session/conversation identifier.
+    :returns: The acknowledged ``last_turn_finish_id``, e.g. ``"3f9c0d1e2a4b-17"``,
+        or ``None`` when no device reported one.
+    """
+    return _read_watched_turn_finish.get(_discovery_key(user_id), {}).get(session_id)
+
+
+def _local_turn_finish_sequence(turn_finish_id: str) -> int | None:
+    """
+    Read the sequence of a turn finish id this process issued.
+
+    :param turn_finish_id: A ``last_turn_finish_id``, e.g. ``"3f9c0d1e2a4b-17"``.
+    :returns: The sequence, e.g. ``17``, or ``None`` for an id from another
+        replica or an earlier process.
+    """
+    prefix, _, sequence = turn_finish_id.rpartition("-")
+    if prefix != _TURN_FINISH_ID_PREFIX or not sequence.isdigit():
+        return None
+    return int(sequence)
+
+
+def _set_read_state(
+    user_id: str | None,
+    session_id: str,
+    last_seen: int,
+    unread: bool,
+    watched_turn_finish_id: str | None = None,
+) -> None:
     """
     Set the caller's read-state for one session.
 
@@ -621,9 +657,20 @@ def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread
     :param session_id: Session/conversation identifier.
     :param last_seen: Wall-clock baseline in seconds.
     :param unread: Whether the session is explicitly flagged unread.
+    :param watched_turn_finish_id: The ``last_turn_finish_id`` the caller just
+        watched with the session open, e.g. ``"3f9c0d1e2a4b-17"``. ``None``
+        keeps the stored value, as does an id older than the stored one.
     """
     key = _discovery_key(user_id)
     _read_last_seen.setdefault(key, {})[session_id] = last_seen
+    if watched_turn_finish_id is not None:
+        watched = _read_watched_turn_finish.setdefault(key, {})
+        stored = watched.get(session_id)
+        stored_sequence = None if stored is None else _local_turn_finish_sequence(stored)
+        new_sequence = _local_turn_finish_sequence(watched_turn_finish_id)
+        # A delayed acknowledgment must not replace a newer finish's.
+        if stored_sequence is None or new_sequence is None or new_sequence >= stored_sequence:
+            watched[session_id] = watched_turn_finish_id
     if unread:
         _read_explicit_unread.setdefault(key, set()).add(session_id)
     else:
@@ -650,6 +697,8 @@ def _prune_session_read_state(session_id: str) -> None:
         seen.pop(session_id, None)
     for unread in _read_explicit_unread.values():
         unread.discard(session_id)
+    for watched in _read_watched_turn_finish.values():
+        watched.pop(session_id, None)
 
 
 def _discovery_key(user_id: str | None) -> str:
@@ -1385,6 +1434,31 @@ def _session_status_with_child_rollup(
     ):
         return "running"
     return own_status
+
+
+def _session_turn_finish_id(conversation_id: str, child_session_ids: list[str]) -> str | None:
+    """
+    Identify the latest turn finish behind a session-list row's status.
+
+    Covers direct sub-agent children like
+    :func:`_session_status_with_child_rollup`, so a parent row that stops
+    running when its last child finishes reports that child's finish.
+
+    :param conversation_id: Session/conversation identifier,
+        e.g. ``"conv_parent123"``.
+    :param child_session_ids: Direct sub-agent child conversation ids,
+        e.g. ``["conv_child1"]``.
+    :returns: An opaque id such as ``"3f9c0d1e2a4b-17"``, or ``None`` when
+        this process recorded no finish for the session or its children.
+    """
+    sequences = [
+        sequence
+        for session_id in (conversation_id, *child_session_ids)
+        if (sequence := _session_turn_finish_cache.get(session_id)) is not None
+    ]
+    if not sequences:
+        return None
+    return f"{_TURN_FINISH_ID_PREFIX}-{max(sequences)}"
 
 
 async def _collect_descendant_conversation_ids(
@@ -5007,6 +5081,8 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    if previous_status in ("running", "waiting") and status in ("idle", "failed"):
+        _session_turn_finish_cache[session_id] = next(_turn_finish_sequence)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
@@ -12493,6 +12569,7 @@ __all__ = [
     "_seed_missing_title_from_user_message",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
+    "_session_turn_finish_id",
     "_set_read_state",
     "_signal_harness_elicitation_resolved_by_id",
     "_signal_terminal_resolved_harness_elicitation",
@@ -12519,6 +12596,7 @@ __all__ = [
     "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
+    "_watched_turn_finish_id",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
     "prefetch_session_routing_catalogs",
