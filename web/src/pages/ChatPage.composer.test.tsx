@@ -1040,14 +1040,14 @@ describe("Composer slash-command menu", () => {
   });
 
   function renderClearComposer(
-    harness: "claude-native" | "codex-native",
+    harness: "claude-native" | "codex-native" | "claude-sdk",
     advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
   ) {
     const { sessionHarness } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness }));
     useChatStore.setState({ sessionHarness: harness });
     const clearContext = vi.spyOn(useChatStore.getState(), "clearContext").mockResolvedValue();
-    const props = composerProps({ isNativeWrapper: true });
+    const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
     render(
       <CapabilitiesProvider
         info={advertised === "loading" ? "loading" : { ...FALLBACK_SERVER_INFO, ...advertised }}
@@ -1059,7 +1059,7 @@ describe("Composer slash-command menu", () => {
     return { clearContext, onSend: props.onSend };
   }
 
-  it.each(["claude-native", "codex-native"] as const)(
+  it.each(["claude-native", "codex-native", "claude-sdk"] as const)(
     "%s /clear runs the clear control when the server accepts it",
     (harness) => {
       const { clearContext, onSend } = renderClearComposer(harness, {
@@ -1075,6 +1075,7 @@ describe("Composer slash-command menu", () => {
     ["claude-native", {}],
     ["claude-native", { session_event_types: ["message"] }],
     ["codex-native", {}],
+    ["claude-sdk", { session_event_types: ["message"] }],
     ["claude-native", "loading"],
   ] as const)("%s sends a typed /clear as text when server info is %o", (harness, advertised) => {
     const { clearContext, onSend } = renderClearComposer(harness, advertised);
