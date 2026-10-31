@@ -1267,14 +1267,18 @@ export function KeepBottomOnResize() {
     if (!el || typeof ResizeObserver === "undefined") return;
     let clientHeight = el.clientHeight;
     let scrollHeight = el.scrollHeight;
-    // Against the last observed layout: a pin's own scroll event can arrive
-    // after the next streamed line has grown the transcript.
-    const isAtObservedBottom = () => scrollHeight - clientHeight - el.scrollTop <= 1;
-    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtObservedBottom();
+    // At the end of the last observed layout or the current one: a pin's own scroll
+    // event can arrive after the next line grew the transcript, and a shrink's
+    // clamp before its resize callback.
+    const isAtEnd = () => {
+      const end = Math.min(scrollHeight, el.scrollHeight) - Math.max(clientHeight, el.clientHeight);
+      return end - el.scrollTop <= 1;
+    };
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtEnd();
     let pointerDown = false;
     let frame: number | null = null;
     const onScroll = () => {
-      wasBottomLocked = isAtObservedBottom();
+      wasBottomLocked = isAtEnd();
     };
     const onPointer = (event: Event) => {
       pointerDown = event.type === "pointerdown";

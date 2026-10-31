@@ -233,6 +233,22 @@ describe("KeepBottomOnResize", () => {
     expect(metrics.scrollTop).toBe(1341);
   });
 
+  it("keeps following after a shrink clamps the reader before its resize callback", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnResize />);
+
+    metrics.scrollHeight = 1950;
+    metrics.scrollTop = 1250;
+    fireEvent.scroll(scrollRoot);
+    act(() => resize?.());
+    metrics.scrollHeight = 1971;
+    act(() => resize?.());
+
+    expect(metrics.scrollTop).toBe(1270);
+  });
+
   it("leaves transcript growth alone once the reader scrolls up, before the library notices", () => {
     const { metrics, scrollRoot } = makeScrollRoot();
     stickContext.state.isAtBottom = true;
