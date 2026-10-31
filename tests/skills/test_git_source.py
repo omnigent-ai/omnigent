@@ -152,15 +152,36 @@ def test_isolated_clone_drops_inherited_git_config_and_helpers(
     assert env["HOME"] == str(operator_home)
 
 
-def test_tar_untrusted_dir_stops_at_the_limits_before_reading_more(tmp_path: Path) -> None:
+def test_tar_untrusted_dir_stops_at_the_limits_before_reading_more(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     src = tmp_path / "skill"
     src.mkdir()
     (src / "SKILL.md").write_text("---\nname: x\ndescription: y\n---\n")
     (src / "big.bin").write_bytes(b"\0" * 4096)
+    opened: list[str] = []
+    real_path_open = Path.open
+    real_tar_open = git_source.tarfile.bltn_open
+
+    def recording_path_open(self: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        opened.append(self.name)
+        return real_path_open(self, *args, **kwargs)
+
+    def recording_tar_open(name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        opened.append(Path(name).name)
+        return real_tar_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", recording_path_open)
+    monkeypatch.setattr(git_source.tarfile, "bltn_open", recording_tar_open)
     with pytest.raises(git_source.GitSourceError, match="larger than"):
         git_source.tar_untrusted_dir(src, what="a skill", max_bytes=1024)
+    # Refused on its size alone: the oversized file was never opened.
+    assert "big.bin" not in opened
+    opened.clear()
     with pytest.raises(git_source.GitSourceError, match="more than 1 files"):
         git_source.tar_untrusted_dir(src, what="a skill", max_entries=1)
+    assert "big.bin" not in opened
+    monkeypatch.undo()
     # Within the limits the archive is produced.
     assert git_source.tar_untrusted_dir(src, what="a skill", max_bytes=8192, max_entries=5)
 

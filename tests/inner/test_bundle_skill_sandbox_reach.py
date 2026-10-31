@@ -110,8 +110,7 @@ async def test_a_sandboxed_shell_runs_a_bundle_skills_script() -> None:
 def test_a_terminal_sandbox_gets_the_read_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Terminals built their own environment from the parent os_env spec, so
-    # only the primary environment had the skill directories granted.
+    # Terminals build their own environment, so forward the skill read roots.
     from omnigent.inner import terminal as terminal_mod
     from omnigent.inner.datamodel import TerminalEnvSpec
 
