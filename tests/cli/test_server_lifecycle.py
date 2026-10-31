@@ -448,6 +448,40 @@ def test_stop_reports_untracked_orphan_server(monkeypatch: pytest.MonkeyPatch) -
     assert "Nothing to stop." not in result.output
 
 
+def test_stop_reaps_orphaned_managed_terminals_and_reports_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``stop`` runs the orphan terminal reaper after the server and reports it.
+
+    A SIGKILL'd runner leaves its detached private-socket tmux server (session
+    ``main``) and harness child with no owner. ``stop`` must drive the orphan
+    reaper and surface what it cleaned up, and only after the server itself is
+    down so it never races a live owner. The reaper's own behaviour -- owner
+    checks and killing the server plus its harness child -- is covered by
+    ``tests/inner/test_terminal_orphan_ownership.py``.
+    """
+    order: list[str] = []
+    monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
+    monkeypatch.setattr("omnigent.cli.local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr("omnigent.cli.stop_untracked_local_server", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.cli.stop_local_omnigent_server",
+        Mock(side_effect=lambda *a, **k: order.append("stop_server")),
+    )
+
+    def _reap() -> int:
+        order.append("reap")
+        return 2
+
+    monkeypatch.setattr("omnigent.inner.terminal.reap_orphaned_terminals", _reap)
+
+    result = CliRunner().invoke(cli, ["stop"])
+
+    assert result.exit_code == 0, result.output
+    assert "2 orphaned terminal(s)" in result.output
+    assert order == ["stop_server", "reap"]
+
+
 def test_server_stop_finds_untracked_orphan_when_pidfile_lost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
