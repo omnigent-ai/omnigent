@@ -437,11 +437,6 @@ def test_opencode_native_fork_clones_session(opencode_host: oc.OpenCodeHost) -> 
     assert _mentions_topic(oc.assistant_texts(items)[-1]), oc.transcript(items)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the server /events route rejects type 'clear', so the runner's "
-    "opencode-native clear handler is unreachable over HTTP",
-)
 def test_opencode_native_clear_starts_fresh_session(opencode_host: oc.OpenCodeHost) -> None:
     """``/clear`` relaunches OpenCode on a new, empty session."""
     client = opencode_host.client
@@ -464,15 +459,20 @@ def test_opencode_native_clear_starts_fresh_session(opencode_host: oc.OpenCodeHo
 
 
 def _user_opencode_has_sessions() -> bool:
-    """Whether the user's own OpenCode store exists and holds a root session."""
+    """Whether the user's own OpenCode 2.x store exists and holds a session.
+
+    A store still on OpenCode 1.x's schema does not count: import reports it
+    as needing an upgrade rather than importing from it.
+    """
     db = opencode_db_path()
     if db is None or not db.is_file():
         return False
     try:
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
             tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
-            table = "session_v2" if "session_v2" in tables else "session"
-            row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
+            if "session_v2" not in tables:
+                return False
+            row = conn.execute("SELECT count(*) FROM session_v2").fetchone()
     except sqlite3.Error:
         return False
     return bool(row and row[0])
@@ -485,14 +485,16 @@ def _session_ids(client: httpx.Client) -> set[str]:
     return {str(s["id"]) for s in resp.json().get("data", [])}
 
 
-def test_opencode_native_import_last_session(http_client: httpx.Client, live_server: str) -> None:
+def test_opencode_native_import_last_session(
+    http_client: httpx.Client, live_server: str, tmp_path: Path
+) -> None:
     """``omnigent import --harness opencode --last 1`` imports from the user's store.
 
     Import snapshots the user's ``opencode.db`` before reading it, so the store
     is never modified.
     """
     if not _user_opencode_has_sessions():
-        pytest.skip("no OpenCode sessions in the user's own store to import")
+        pytest.skip("no OpenCode 2.x sessions in the user's own store to import")
     before = _session_ids(http_client)
     result = subprocess.run(
         [
@@ -505,7 +507,9 @@ def test_opencode_native_import_last_session(http_client: httpx.Client, live_ser
             "--server",
             live_server,
         ],
-        env=cli_env(),
+        # An empty config home: the machine's own host identity, unknown to this
+        # server, would otherwise bind the import to a missing host.
+        env={**cli_env(), "OMNIGENT_CONFIG_HOME": str(tmp_path / "config")},
         capture_output=True,
         text=True,
         timeout=180,
@@ -515,7 +519,7 @@ def test_opencode_native_import_last_session(http_client: httpx.Client, live_ser
     after = _session_ids(http_client)
     imported = sorted(after - before)
     try:
-        if "already imported" in output.lower() and not imported:
+        if re.search(r"Already imported: [1-9]", output) and not imported:
             pytest.skip(f"newest OpenCode session was already imported: {output[-300:]}")
         assert result.returncode == 0, output[-2000:]
         assert len(imported) == 1, f"expected one imported session, got {imported}: {output}"

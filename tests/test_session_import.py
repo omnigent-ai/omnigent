@@ -374,6 +374,8 @@ def _patch_import_server(
     monkeypatch.setattr(
         local_import, "client_for_state", lambda **_kwargs: client or _FakeHttpClient()
     )
+    # Never inspect the developer's real OpenCode store.
+    monkeypatch.setattr(local_import, "_opencode_store_is_v1", lambda _db: False)
     return snapshots
 
 
@@ -409,6 +411,35 @@ def test_opencode_import_client_reports_failed_snapshot(
     with pytest.raises(SessionImportNotFoundError, match="could not be copied"):
         local_import._run_opencode_import(_open())
     assert _FakeImportServer.instances == []
+
+
+@pytest.mark.parametrize(
+    ("tables", "message"),
+    [
+        (["session"], "written by OpenCode 1.x"),
+        (["session", "session_v2"], "could not be copied"),
+    ],
+    ids=["v1-store", "v2-store"],
+)
+def test_opencode_import_client_names_a_v1_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tables: list[str], message: str
+) -> None:
+    """A store still on OpenCode 1.x's schema is reported as such, not as a copy failure."""
+    user_db = tmp_path / "opencode.db"
+    with contextlib.closing(sqlite3.connect(user_db)) as conn:
+        for table in tables:
+            conn.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY)")
+    store_is_v1 = local_import._opencode_store_is_v1
+    _patch_import_server(monkeypatch, snapshot_ok=False)
+    monkeypatch.setattr(local_import, "opencode_db_path", lambda: user_db)
+    monkeypatch.setattr(local_import, "_opencode_store_is_v1", store_is_v1)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    with pytest.raises(SessionImportNotFoundError, match=message):
+        local_import._run_opencode_import(_open())
 
 
 def test_opencode_import_client_stops_server_when_client_close_fails(

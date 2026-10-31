@@ -165,8 +165,12 @@ def mock_url(mock_host: tuple[Host, str]) -> str:
 
 
 def _marker(label: str) -> str:
-    """A prompt token unique to one turn, used to claim its scripted queue."""
-    return f"{label}-{uuid.uuid4().hex[:10]}"
+    """A prompt token unique to one turn, used to claim its scripted queue.
+
+    The mock prefers the longest matching token, so every marker has the same
+    length: a request that replays earlier turns then routes by its newest one.
+    """
+    return f"{label[:12]:-<12}-{uuid.uuid4().hex[:10]}"
 
 
 def _script(mock_url: str, marker: str, responses: list[dict[str, Any]]) -> None:
@@ -369,14 +373,44 @@ def test_fork_first_turn_carries_the_parent_history(
     )
 
 
+def _compaction_summary(fact: str) -> str:
+    """A summary in OpenCode's compaction template, which it rejects otherwise."""
+    return "\n".join(
+        [
+            "## Objective",
+            "- Keep the conversation going.",
+            "## Requirements",
+            "- (none)",
+            "## Decisions",
+            "- (none)",
+            "## Work State",
+            "### Completed",
+            f"- {fact}",
+            "### Active",
+            "- (none)",
+            "### Blocked",
+            "- (none)",
+            "## Next Move",
+            "1. (none)",
+            "## Relevant Files",
+            "(none)",
+            "## Important Context",
+            f"- {fact}",
+        ]
+    )
+
+
 def test_compact_finishes_and_the_next_turn_works(
     opencode_host: oc.OpenCodeHost, mock_url: str
 ) -> None:
-    """`compaction`: ``/compact`` completes on OpenCode and a later turn still answers."""
+    """`compaction`: ``/compact`` completes and the next request carries its summary."""
     client = opencode_host.client
     session_id = opencode_host.create_session(opencode_host.workspace("compact"))
     first = _marker("BEFORE-COMPACT")
-    _script(mock_url, first, [{"text": f"OK-{first}"}])
+    fact = f"SUMMARY-{first}"
+    # The compaction request resends the conversation, so the turn's marker
+    # routes it to the same queue: the second reply is the summary.
+    _script(mock_url, first, [{"text": f"OK-{first}"}, {"text": _compaction_summary(fact)}])
     oc.turn(client, session_id, f"Reply OK. {first}")
 
     with oc.SseRecorder(opencode_host.live_server, session_id) as sse:
@@ -391,3 +425,5 @@ def test_compact_finishes_and_the_next_turn_works(
     _script(mock_url, after, [{"text": f"OK-{after}"}])
     items = oc.turn(client, session_id, f"Reply OK. {after}")
     assert oc.assistant_texts(items)[-1] == f"OK-{after}", oc.transcript(items)
+    next_request = json.dumps(_requests_with(mock_url, after)[0])
+    assert fact in next_request, "the post-compaction request lost the summary"

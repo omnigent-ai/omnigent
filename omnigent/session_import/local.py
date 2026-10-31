@@ -172,6 +172,21 @@ def _opencode_user_store_exists() -> bool:
     return db is not None and db.is_file()
 
 
+def _opencode_store_is_v1(db: Path) -> bool:
+    """Whether *db* has OpenCode 1.x's schema (``session`` but no ``session_v2``).
+
+    Read-only and best effort: an unreadable store reports ``False``.
+    """
+    try:
+        with contextlib.closing(
+            sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+        ) as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    except sqlite3.Error:
+        return False
+    return "session" in tables and "session_v2" not in tables
+
+
 @contextlib.asynccontextmanager
 async def _opencode_import_client() -> AsyncIterator[OpenCodeClient]:
     """Start a short-lived ``opencode serve`` on a snapshot of the user's DB.
@@ -187,6 +202,11 @@ async def _opencode_import_client() -> AsyncIterator[OpenCodeClient]:
         bridge_dir = Path(scratch)
         user_db = opencode_db_path()
         if user_db is None or not snapshot_opencode_database(user_db, bridge_dir):
+            if user_db is not None and _opencode_store_is_v1(user_db):
+                raise SessionImportNotFoundError(
+                    f"OpenCode database {user_db} was written by OpenCode 1.x; open it once "
+                    "with OpenCode 2.0 to upgrade it, then import again"
+                )
             raise SessionImportNotFoundError("OpenCode database could not be copied")
         try:
             server = OpenCodeNativeServer(
