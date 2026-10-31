@@ -13,6 +13,8 @@ const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
 const { buildDesignModeScript } = require("./designModeScript");
 
+const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
 const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
@@ -195,9 +197,8 @@ function goForward(wc) {
 }
 
 /**
- * Wire nav listeners onto a new view so the URL bar live-tracks the real url
- * (redirects, in-page links, agent nav). Fires `browser-url-changed` +
- * `browser-nav-state` to the owning renderer. Attached once at create time.
+ * Track URL, title and history changes for the owning renderer, including
+ * detached views. Attached once at create time.
  *
  * @param {object} params
  * @param {string} params.conversationId
@@ -205,8 +206,11 @@ function goForward(wc) {
  * @param {(channel: string, payload: unknown) => void} params.send  window-scoped sender
  */
 function attachNavListeners({ conversationId, webContents, send }) {
+  const emitPageMetadata = (url, title = webContents.getTitle()) => {
+    send("browser-url-changed", { conversationId, url, title });
+  };
   const emitUrl = (url) => {
-    send("browser-url-changed", { conversationId, url });
+    emitPageMetadata(url);
     const { canGoBack, canGoForward } = readNavState(webContents);
     send("browser-nav-state", { conversationId, canGoBack, canGoForward });
   };
@@ -216,6 +220,10 @@ function attachNavListeners({ conversationId, webContents, send }) {
   webContents.on("did-navigate-in-page", (_e, url, isMainFrame) => {
     if (isMainFrame) emitUrl(url);
   });
+  webContents.on("page-title-updated", (_e, title) => {
+    emitPageMetadata(webContents.getURL(), title);
+  });
+  webContents.on("did-finish-load", () => emitPageMetadata(webContents.getURL()));
 }
 
 // ── Design mode (point-and-prompt) ─────────────────────────────────────────
@@ -381,6 +389,34 @@ function registerBrowserIpc({
     }
   };
 
+  async function withAgentView(event, args) {
+    const gated = gateRegistry(event);
+    if (gated.error) return gated;
+    const entry = gated.registry.get(args?.conversationId);
+    if (!entry) return { error: "No browser view" };
+    const context = entry.agentContext;
+    if (context?.revoked) return { error: "The previous browser page is no longer available" };
+    if (context?.hostIsThisMachine === true) {
+      const opts = args?.opts;
+      if (
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        typeof opts.sourceHostId !== "string" ||
+        !opts.sourceHostId
+      ) {
+        return { error: "Current session host is required to read this browser view" };
+      }
+      const currentContext = getAgentContextForEvent(event, opts);
+      if (
+        opts.sourceHostId !== context.sourceHostId ||
+        currentContext?.hostIsThisMachine !== true
+      ) {
+        await gated.registry.revokeAgentView(args.conversationId);
+        return { error: "Session host changed; the previous browser page is no longer available" };
+      }
+    }
+    return { entry };
+  }
+
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
@@ -395,9 +431,13 @@ function registerBrowserIpc({
     const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
     const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
     const navigate = async (registry) => {
-      // The first-party renderer supplies the source-session host; main owns
-      // the target and eligibility. Caller exception flags never establish identity.
-      const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+      // Main validates the renderer-supplied host; opts only route.
+      const agentContext = getAgentContextForEvent(event, opts);
+      if (registry.needsAgentViewRevocation?.(registry.get(conversationId), agentContext)) {
+        const cleared = await registry.revokeAgentView(conversationId, isCurrent);
+        if (!isCurrent()) return cancelled;
+        if (!cleared.ok) return cleared;
+      }
       if (url) {
         const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
         if (!isCurrent()) return cancelled;
@@ -405,7 +445,8 @@ function registerBrowserIpc({
       }
       return registry.openOrNavigate(conversationId, url, bounds, {
         force: !!opts?.force,
-        // Renderer flags do not establish user intent.
+        // Renderer flags cannot prove user intent; enforce policy for every
+        // renderer navigation, including the URL bar.
         agent: true,
         agentContext,
       });
@@ -458,6 +499,7 @@ function registerBrowserIpc({
     return {
       ok: r.ok,
       created: r.created ?? false,
+      ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
       error: hint ? `${r.error} ${hint}` : r.error,
     };
   });
@@ -513,11 +555,9 @@ function registerBrowserIpc({
 
   // Capture the conversation's view as a base64 PNG.
   ipcMain.handle("omnigent:browser-screenshot", async (event, args) => {
-    const g = gateRegistry(event);
+    const g = await withAgentView(event, args);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
+    const { entry } = g;
     try {
       const image = await entry.view.webContents.capturePage();
       const dataUrl = `data:image/png;base64,${image.toPNG().toString("base64")}`;
@@ -529,11 +569,9 @@ function registerBrowserIpc({
 
   // Both transports converge on main-owned scripts and the same sender gate.
   async function performBrowserAction(event, args, legacy = false) {
-    const g = gateRegistry(event);
+    const g = await withAgentView(event, args);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
+    const { entry } = g;
     try {
       const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
       const js = buildBrowserActionScript(action, params);
@@ -558,10 +596,21 @@ function registerBrowserIpc({
     const { conversationId } = args ?? {};
     const entry = typeof conversationId === "string" ? g.registry.get(conversationId) : null;
     if (!entry) return { exists: false };
+    const webContents = entry.view.webContents;
+    const url = webContents.getURL();
+    // A new view has no committed URL while its first navigation is loading.
+    const pendingUrl =
+      (url === "" || url === "about:blank") &&
+      (webContents.isLoadingMainFrame?.() ?? webContents.isLoading?.() ?? false)
+        ? entry.lastRequestedUrl
+        : undefined;
     return {
       exists: true,
-      url: entry.view.webContents.getURL(),
-      ...readNavState(entry.view.webContents),
+      hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
+      url,
+      title: webContents.getTitle(),
+      ...(pendingUrl ? { pendingUrl } : {}),
+      ...readNavState(webContents),
     };
   });
 

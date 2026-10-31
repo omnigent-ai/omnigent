@@ -36,7 +36,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
 `harness=<harness>` saves a user default. Omit `--global` to save in the current
 project. Use `omnigent config list` to inspect the files and
 `omnigent config unset [--global] model` to remove a value. Startup commands
-and argument lists are configured in the user file's per-harness mappings;
+and argument lists are configured in the user file's per-harness mappings, as is
+`harness.codex-native.app_server`, a wrapper for Codex's session app-servers;
 `config list` names any project-file entries it ignores.
 
 **Launch:** run `omnigent run` with an agent/default agent and optional model
