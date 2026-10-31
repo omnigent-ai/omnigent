@@ -276,8 +276,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
   Design mode, and click an element. Type an instruction in the floating popup
   and use Send or Enter.
-- Change Settings → Always steer to choose whether busy-session follow-ups
-  queue or send immediately. Existing queued messages retain FIFO ordering.
+- Change Settings → Always steer (on by default) to choose whether
+  busy-session follow-ups queue or send immediately. Existing queued messages
+  retain FIFO ordering.
 
 **New-session composer** (landing page, or New session):
 

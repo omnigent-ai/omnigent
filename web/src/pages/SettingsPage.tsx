@@ -1621,7 +1621,7 @@ function DatabricksIntegrationControl() {
 }
 
 /**
- * Opt-in dispatch for messages sent while the agent is working.
+ * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());
