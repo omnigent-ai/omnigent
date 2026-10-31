@@ -61,6 +61,9 @@ function agentPartition(scope, viewId) {
   return `omnigent-agent-${scope}-${conversationId}`;
 }
 
+/** Persistent partition every view uses when the shared browser profile is on. */
+const SHARED_PROFILE_PARTITION = "persist:omnigent-browser";
+
 // Monotonic per-process counter: each registry (shell window) gets a distinct
 // default partition scope. In-memory partitions never outlive the process, so
 // no cross-run uniqueness is needed.
@@ -90,7 +93,11 @@ function createBrowserViewRegistry({
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
+  // () => boolean: put every view on SHARED_PROFILE_PARTITION instead.
+  sharedProfile = () => false,
 } = {}) {
+  const partitionFor = (viewId) =>
+    sharedProfile() ? SHARED_PROFILE_PARTITION : agentPartition(partitionScope, viewId);
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
 
@@ -180,7 +187,7 @@ function createBrowserViewRegistry({
     const view = WebContentsViewCtor({
       webPreferences: {
         // Per-conversation storage isolation — see agentPartition.
-        partition: agentPartition(partitionScope, conversationId),
+        partition: partitionFor(conversationId),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
@@ -389,7 +396,7 @@ function createBrowserViewRegistry({
   // (literal checks only), so browserIpc awaits this before it: a name that
   // resolves internally fails with an error instead of creating a blank view.
   function checkAgentNavigationFor(conversationId, url, agentContext) {
-    const partition = agentPartition(partitionScope, conversationId);
+    const partition = partitionFor(conversationId);
     return checkAgentNavigation(url, {
       allowLocalhost: isArcaAgentContext(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
@@ -462,7 +469,7 @@ function createBrowserViewRegistry({
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress).
-    const partition = agentPartition(partitionScope, entry.conversationId);
+    const partition = partitionFor(entry.conversationId);
     const proxied =
       !!ip &&
       (await isProxyAddress(ip, await resolveProxy(url, partition), (hostname) =>
@@ -685,5 +692,6 @@ function createBrowserViewRegistry({
 module.exports = {
   createBrowserViewRegistry,
   agentPartition,
+  SHARED_PROFILE_PARTITION,
   DEFAULT_CAP,
 };

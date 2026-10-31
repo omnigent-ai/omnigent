@@ -42,6 +42,8 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
+  /** Last http(s) page of each open browser view, keyed by view id, so tabs reopen after a relaunch. */
+  browserTabPages?: Record<string, { url: string; title?: string }>;
   /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
    *  by design: side chats are ephemeral and vanish when the app is closed. */
   openSideChats?: string[];
@@ -128,6 +130,13 @@ function sanitize(entry: unknown): SessionWorkspaceState {
     state.selectedTerminalKey = record.selectedTerminalKey;
   }
   if (Array.isArray(record.openBrowsers)) state.openBrowsers = uniqueIds(record.openBrowsers);
+  if (typeof record.browserTabPages === "object" && record.browserTabPages !== null) {
+    state.browserTabPages = Object.fromEntries(
+      Object.entries(record.browserTabPages as Record<string, { url?: unknown; title?: unknown }>)
+        .filter(([, page]) => typeof page?.url === "string" && /^https?:\/\//.test(page.url))
+        .filter(([, page]) => page.title === undefined || typeof page.title === "string"),
+    ) as SessionWorkspaceState["browserTabPages"];
+  }
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;
   }

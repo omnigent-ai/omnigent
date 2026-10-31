@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
-import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
@@ -85,6 +85,12 @@ export function useBrowserTabs(conversationId: string) {
     const updated = new Set<string>();
     const setPage = (viewId: string, page: BrowserPage) => {
       setPages((current) => ({ ...current, [viewId]: page }));
+      // Remember the page so the tab reopens it after a relaunch.
+      if (!page.url || !/^https?:\/\//.test(page.url)) return;
+      const owner = browserViewOwnerId(viewId);
+      const saved = readSessionWorkspaceState(owner).browserTabPages;
+      const browserTabPages = { ...saved, [viewId]: { url: page.url, title: page.title } };
+      writeSessionWorkspaceState(owner, { browserTabPages });
     };
     const unsubscribe = bridge.onBrowserUrlChanged?.((page) => {
       if (!active || !viewIds.has(page.conversationId)) return;
@@ -103,7 +109,8 @@ export function useBrowserTabs(conversationId: string) {
                 url: page.url && page.url !== "about:blank" ? page.url : page.pendingUrl,
                 title: page.title,
               }
-            : {},
+            : (readSessionWorkspaceState(browserViewOwnerId(viewId)).browserTabPages?.[viewId] ??
+                {}),
         );
       } catch {
         // A closed view or an older shell can leave the default tab label.
@@ -199,6 +206,12 @@ export function useBrowserTabs(conversationId: string) {
       agentNavigationEpoch(conversationId) !== navigationEpoch
     ) {
       return true;
+    }
+    const closedViewId = browserViewId(conversationId, tabId);
+    const saved = readSessionWorkspaceState(conversationId).browserTabPages ?? {};
+    if (closedViewId in saved) {
+      const kept = Object.entries(saved).filter(([viewId]) => viewId !== closedViewId);
+      writeSessionWorkspaceState(conversationId, { browserTabPages: Object.fromEntries(kept) });
     }
     update((previous) => {
       const index = previous.tabs.indexOf(tabId);

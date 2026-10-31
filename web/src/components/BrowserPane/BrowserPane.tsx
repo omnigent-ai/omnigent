@@ -43,7 +43,9 @@ import {
 } from "@/components/ui/select";
 import type { ChromeCookieImportResult, ChromeCookiePreviewResult } from "@/lib/nativeBridge";
 import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
+import { browserViewOwnerId } from "@/lib/browserTabs";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
+import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { cn } from "@/lib/utils";
 
 /** Renderer CSS-pixel bounds pushed to the main process (converted to window
@@ -205,12 +207,23 @@ export function BrowserPane({
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && !viewChanged && r?.exists) {
+      if (cancelled || viewChanged) return;
+      if (r?.exists) {
         setHasView(true);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
+        return;
       }
+      // A tab reopened after a relaunch has no view yet; load its saved page.
+      const owner = browserViewOwnerId(conversationId);
+      const saved = readSessionWorkspaceState(owner).browserTabPages?.[conversationId];
+      if (!saved || !bridge.browserOpenOrNavigate) return;
+      setCurrentUrl(saved.url);
+      bridge
+        .browserOpenOrNavigate(conversationId, saved.url, undefined, undefined)
+        .then((result) => !result.ok && setNavigationError(result.error ?? "Unable to reopen."))
+        .catch(() => setNavigationError("Unable to reopen this page."));
     });
 
     const unsubCreated = bridge.onBrowserViewCreated?.((payload) => {
@@ -699,7 +712,7 @@ export function BrowserPane({
             <DialogDescription>
               Copies {activeCookieScope}'s cookies into this conversation's browser, so the site
               reuses the sign-in you already have in Chrome. Nothing is written back to Chrome, and
-              the copy disappears when Omnigent quits.
+              the copy disappears when Omnigent quits unless the shared browser profile is on.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3">
@@ -764,7 +777,8 @@ export function BrowserPane({
               {/* Agent and user tabs share one jar per conversation: the agent can
                   act as you on this site whether or not it drives this tab. */}
               This conversation's tabs share one cookie jar, including any tab the agent controls,
-              so the agent can act as you on this site while these cookies are loaded.
+              so the agent can act as you on this site while these cookies are loaded. With the
+              shared browser profile on, every conversation's tabs share it.
             </p>
           </div>
           <DialogFooter>

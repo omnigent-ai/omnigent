@@ -3780,13 +3780,17 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   });
 }
 
-// Electron keeps one webRequest listener per event per session, and a
-// conversation's tabs share one partition, so install once per session and let
-// the registry attribute each request to its view.
+// Electron keeps one webRequest listener per event per session, and the shared
+// profile's session spans windows, so install once per session and route each
+// request to the registry that owns its view.
 const guardedAgentSessions = new WeakSet();
+const agentViewRegistries = new Map(); // webContents id -> owning registry
 
 /** Enforce the agent navigation policy on document requests at the network layer. */
-function guardAgentPartitionRequests(partition, registry) {
+function guardAgentPartitionRequests(partition, registry, webContents) {
+  const viewId = webContents.id;
+  agentViewRegistries.set(viewId, registry);
+  webContents.once("destroyed", () => agentViewRegistries.delete(viewId));
   const ses = session.fromPartition(partition);
   if (guardedAgentSessions.has(ses)) return;
   guardedAgentSessions.add(ses);
@@ -3800,14 +3804,15 @@ function guardAgentPartitionRequests(partition, registry) {
       (cancel) => callback({ cancel }),
       () => callback({ cancel: true }),
     );
+  const ownerOf = (details) => agentViewRegistries.get(details.webContentsId) ?? registry;
   ses.webRequest.onBeforeRequest(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentRequest(details), callback),
+    answer(ownerOf(details).shouldCancelAgentRequest(details), callback),
   );
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
-    callback(registry.agentRequestHeaders(details)),
+    callback(ownerOf(details).agentRequestHeaders(details)),
   );
   ses.webRequest.onHeadersReceived(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentResponse(details), callback),
+    answer(ownerOf(details).shouldCancelAgentResponse(details), callback),
   );
 }
 
@@ -3908,9 +3913,10 @@ function createBrowserRegistryForWindow(win) {
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
-      guardAgentPartitionRequests(opts.webPreferences.partition, registry);
+      guardAgentPartitionRequests(opts.webPreferences.partition, registry, view.webContents);
       return view;
     },
+    sharedProfile: () => loadSettings().browser_shared_profile === true,
     // Resolve and look up proxies through the view's own Chromium session, so
     // the agent checks see what its navigation will use.
     resolveHost: async (hostname, partition) => {
