@@ -9,12 +9,18 @@ conservative 128K fallback.
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from omnigent.onboarding.providers import ModelInfo, find_catalog_models
+
+if TYPE_CHECKING:
+    from omnigent.onboarding.provider_config import ProviderEntry
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
@@ -312,6 +318,7 @@ def fetch_model_pricing_with_provider(
     model: str,
     provider_config: dict[str, Any] | None = None,
     harness: str | None = None,
+    provider_entry: ProviderEntry | None = None,
 ) -> ModelPricing | None:
     """
     Fetch model pricing, checking provider config first then catalog.
@@ -343,48 +350,56 @@ def fetch_model_pricing_with_provider(
         ``"anthropic/claude-sonnet-4-6"``.
     :param provider_config: Parsed provider config from
         :func:`~omnigent.onboarding.provider_config.load_config`. When
-        ``None``, skips provider lookup and falls through to catalog.
+        ``None``, the config-default provider lookup is skipped; an explicit
+        ``provider_entry`` is still consulted.
     :param harness: Harness name to determine which provider family to check,
         e.g. ``"claude-sdk"`` or ``"codex"``. When ``None``, skips provider
         lookup and falls through to catalog. SDK executors may pass
         executor-style spellings (``claude_sdk``, ``agents_sdk``) which are
         normalized internally.
+    :param provider_entry: The exact :class:`~omnigent.onboarding.provider_config.ProviderEntry`
+        for the session's actual provider. When supplied, the family-pricing
+        lookup uses this entry directly instead of re-resolving the default
+        provider via :func:`~omnigent.onboarding.provider_config.default_provider_for_harness`.
+        Callers that know which named provider a session was launched with
+        (e.g. via ``executor.auth: {type: provider, name: ...}``) should
+        pass it here so sessions on non-default providers are priced
+        correctly. Callers that omit it get default-provider pricing for
+        the harness family. ``harness`` must also be supplied; without it
+        the provider family cannot be resolved and the entry is ignored.
     :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
         pricing is unavailable.
-
-    .. note::
-        LIMITATION: This function uses ``default_provider_for_harness`` to
-        resolve the provider, which returns the DEFAULT provider for the given
-        harness, not necessarily the provider actually used by the session.
-        Sessions using named providers (via ``ProviderAuth``) that differ from
-        the default may be priced incorrectly. A future improvement should
-        thread the actual ``ProviderEntry`` from launch/session state instead
-        of re-resolving the default.
     """
     # Step 1: Check provider config custom pricing first (configured rates take precedence)
     # Canonicalize harness to handle SDK executor spellings (claude_sdk -> claude-sdk)
-    if provider_config is not None and harness is not None:
+    if provider_entry is not None and harness is None:
+        _logger.debug(
+            "provider_entry supplied without harness; cannot resolve the pricing "
+            "family, falling through to catalog"
+        )
+    if harness is not None:
         from omnigent.harness_aliases import canonicalize_harness
 
         canonical_harness = canonicalize_harness(harness) or harness
-        # Lazy import to avoid circular dependency. provider_config imports
-        # this module at top level, so we import it only when needed here.
-        from omnigent.onboarding.provider_config import (
-            default_provider_for_harness,
-        )
 
         try:
-            provider = default_provider_for_harness(provider_config, canonical_harness)
-            if provider is not None:
-                # Determine which family (anthropic/openai) this harness uses
-                from omnigent.onboarding.provider_config import provider_family_for_harness
+            from omnigent.onboarding.provider_config import provider_family_for_harness
 
-                family_name = provider_family_for_harness(canonical_harness)
-                if family_name is not None:
-                    # Get the family config with custom pricing (if any)
+            family_name = provider_family_for_harness(canonical_harness)
+            if family_name is not None:
+                # Use the explicitly-supplied provider entry when the caller
+                # knows which provider the session actually ran on. Fall back
+                # to the config-default when none was supplied.
+                provider = provider_entry
+                if provider is None and provider_config is not None:
+                    from omnigent.onboarding.provider_config import (
+                        default_provider_for_harness,
+                    )
+
+                    provider = default_provider_for_harness(provider_config, canonical_harness)
+                if provider is not None:
                     family = provider.family(family_name)
                     if family is not None and family.pricing is not None:
-                        # Convert per-million prices to per-token
                         return ModelPricing(
                             input_per_token=family.pricing.input_per_million / 1_000_000,
                             output_per_token=family.pricing.output_per_million / 1_000_000,
@@ -400,9 +415,18 @@ def fetch_model_pricing_with_provider(
                             ),
                         )
         except Exception:
-            # If provider lookup fails (e.g., malformed config, import error),
-            # fall through to catalog rather than breaking cost tracking entirely.
-            pass
+            # Provider lookup failed (e.g. malformed config); fall through to
+            # catalog rather than breaking cost tracking entirely. An explicit
+            # provider_entry failing is a real misconfiguration, so log louder.
+            if provider_entry is not None:
+                _logger.warning(
+                    "pricing lookup failed for provider %r (model %r); using catalog",
+                    getattr(provider_entry, "name", None),
+                    model,
+                    exc_info=True,
+                )
+            else:
+                _logger.debug("provider pricing lookup failed; using catalog", exc_info=True)
 
     # Step 2: Fall back to catalog pricing when provider pricing is not configured
     catalog_pricing = fetch_model_pricing(model)
