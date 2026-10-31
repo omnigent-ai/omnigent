@@ -2891,7 +2891,12 @@ fs.mkdirSync(inboxDir, { recursive: true });
 fs.writeFileSync(payloadPath, JSON.stringify({ id: "compact-1", type: "compact" }));
 fs.writeFileSync(
   configPath,
-  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
+  JSON.stringify({
+    serverUrl: "http://omnigent.test",
+    sessionId: "session-1",
+    inboxDir,
+    bridgeDir: inboxDir,
+  }),
 );
 
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
@@ -3959,7 +3964,12 @@ const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-model-inbox-"));
 const configPath = path.join(inboxDir, "config.json");
 fs.writeFileSync(
   configPath,
-  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
+  JSON.stringify({
+    serverUrl: "http://omnigent.test",
+    sessionId: "session-1",
+    inboxDir,
+    bridgeDir: inboxDir,
+  }),
 );
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -4302,6 +4312,49 @@ def test_bound_models_use_literal_ids_and_only_managed_providers() -> None:
   await deliverModelChange("anthropic/databricks-claude-opus-4-1");
   assert.equal(setModelCalls.length, 2);
   assert.equal(errorItems().length, 1);
+
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_inbox_model_change_acknowledges_startup_replay(tmp_path: Path) -> None:
+    """An acknowledged model change writes success only after ``setModel`` resolves."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  const changeId = "model_change_startup-test";
+  const ackPath = path.join(inboxDir, "acks", `${changeId}.json`);
+  const file = path.join(inboxDir, "000-startup-model.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      id: changeId,
+      type: "model_change",
+      model: "omnigent/databricks-claude-opus-4-1",
+      ack_id: changeId,
+    }),
+  );
+  const deadline = Date.now() + 3000;
+  while (!fs.existsSync(ackPath)) {
+    if (Date.now() > deadline) throw new Error("model_change ack was not written");
+    await sleep(20);
+  }
+  const ack = JSON.parse(fs.readFileSync(ackPath, "utf8"));
+  assert.deepEqual(ack, { id: changeId, ok: true });
+  assert.equal(setModelCalls.length, 1, JSON.stringify(setModelCalls));
   finish();
 })().catch((error) => {
   finish();
