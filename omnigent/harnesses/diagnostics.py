@@ -213,6 +213,10 @@ def sign_in_running_elsewhere(screen: str | None) -> bool:
     return bool(screen) and _SIGN_IN_ELSEWHERE.search(screen) is not None
 
 
+# Closes a sign-in card's next step; dropped for a held message, which is sent on its own.
+SIGN_IN_RESEND_STEP = "; then send your message again."
+
+
 # A launcher, or a ``sudo`` it runs, reading a password from the terminal, e.g.
 # "Password:" or "[sudo] password for alice:". Typed input is not echoed, so
 # the prompt stays the last line until it is answered.
@@ -234,6 +238,24 @@ def launcher_password_prompt(screen: str | None) -> bool:
     return bool(lines) and _PASSWORD_PROMPT.search(lines[-1]) is not None
 
 
+_INSTALL_PROMPT = re.compile(r"\binstall\b[^?\r\n]*\?\s*\[[yn]/[yn]\]\s*:?\s*$", re.IGNORECASE)
+
+
+def launcher_install_prompt(screen: str | None) -> bool:
+    """Whether a launcher ends on an unanswered installation confirmation.
+
+    The short tail permits a wrapped question; later output or an echoed
+    answer means the launcher already moved past it.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` for an install question ending in a yes/no prompt.
+    """
+    if not screen:
+        return False
+    lines = [line.strip() for line in screen.splitlines() if line.strip()]
+    return bool(lines) and _INSTALL_PROMPT.search(" ".join(lines[-3:])) is not None
+
+
 def sign_in_next_step(agent: str) -> str:
     """Phrase the next step for a card whose harness is waiting on a launcher sign-in.
 
@@ -248,5 +270,5 @@ def sign_in_next_step(agent: str) -> str:
     """
     return (
         f"Open the sign-in link and sign in. {agent} continues on its own once the "
-        "sign-in completes; then send your message again."
+        f"sign-in completes{SIGN_IN_RESEND_STEP}"
     )
