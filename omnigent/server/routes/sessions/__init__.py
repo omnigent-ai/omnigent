@@ -910,7 +910,7 @@ def create_sessions_router(
 
     if pull_request_refresher is None:
         pull_request_refresher = PullRequestRefresher()
-    register_core_routes(
+    clear_session_into_fresh_session = register_core_routes(
         router,
         conversation_store=conversation_store,
         agent_store=agent_store,
@@ -1002,6 +1002,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
+        clear_session_into_fresh_session=clear_session_into_fresh_session,
     )
 
     register_permissions_routes(

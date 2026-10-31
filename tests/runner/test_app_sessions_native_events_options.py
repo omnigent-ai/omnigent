@@ -3919,6 +3919,67 @@ async def test_events_compact_on_claude_sdk_buffers_behind_active_turn() -> None
     )
 
 
+def _build_claude_sdk_runner_app() -> tuple[Any, _FakeProcessManager]:
+    """Wire a runner app whose sessions resolve to a claude-sdk spec."""
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    sdk_spec = _harness_spec("claude-sdk")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the claude-sdk spec for any agent_id."""
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return app, pm
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", ["active_turn", "buffered_message", None])
+async def test_events_clear_on_claude_sdk_releases_the_idle_client(busy: str | None) -> None:
+    """
+    ``clear`` on an idle claude-sdk session drops its live client and history.
+
+    The server continues the work in a fresh session, so the old session's
+    SDK client must not keep the old context warm. A turn in flight, or a
+    message waiting for one, refuses with 409 and leaves everything intact.
+    """
+    from omnigent.runner.app import _session_histories_ref
+
+    app, pm = _build_claude_sdk_runner_app()
+    sid = "d3f2b8c4e5a16b7c9d0e1f2a31425344"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        history = [{"type": "message", "role": "user", "content": "earlier"}]
+        _session_histories_ref[sid] = history
+        if busy == "active_turn":
+            app.state.active_turns[sid] = object()
+        elif busy == "buffered_message":
+            app.state.session_message_buffers[sid] = [{"type": "message"}]
+
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "clear"})
+
+    try:
+        if busy is None:
+            assert resp.status_code == 200, resp.text
+            assert sid in pm.released
+            assert sid not in _session_histories_ref
+        else:
+            assert resp.status_code == 409, resp.text
+            assert resp.json()["error"] == "claude_sdk_clear_busy"
+            assert sid not in pm.released
+            assert _session_histories_ref.get(sid) is history
+    finally:
+        _session_histories_ref.pop(sid, None)
+
+
 async def _accumulate_session_events(
     sid: str,
     *,

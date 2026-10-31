@@ -1002,7 +1002,13 @@ Request body matches `SessionEventInput`:
                                   in place); the harness then moves the
                                   terminal onto a fresh session that live
                                   viewers follow via `session.superseded`.
-                                  Other harnesses get a 400. Payload: `{}`.
+                                  For claude-sdk the runner drops the old
+                                  session's live SDK client (409 while a
+                                  turn runs) and the server continues the
+                                  work in an empty session on the same
+                                  host, workspace and runner, returning
+                                  its id as `session_id`. Other harnesses
+                                  get a 400. Payload: `{}`.
       - "stop_session"          — terminate the live session without
                                   deleting the conversation (owner-only;
                                   requires LEVEL_OWNER). Forwarded
