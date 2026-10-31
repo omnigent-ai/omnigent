@@ -27,6 +27,10 @@ from tests.e2e.test_host_claude_native_e2e import (
 from tests.e2e.test_host_claude_native_fork_e2e import (
     _builtin_agent_id,
     _host_daemon,
+    _plant_code_words,
+    _prompt_item_id,
+    _recall_code_words,
+    _rewind_and_check_placement,
     _send_user_message,
     _wait_until_idle,
 )
@@ -139,3 +143,34 @@ def test_clear_claude_sdk_continues_empty_on_the_same_host(
             http_client, session_id=source_id, marker=word, timeout=240.0
         )
         assert word in recalled, recalled
+
+
+def test_rewind_claude_sdk_keeps_only_the_earlier_turns(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    claude-sdk ``/rewind`` keeps only the turns before the chosen prompt.
+
+    The SDK replays the Omnigent transcript into a fresh client, so the
+    model's recall shows exactly which history the rewound session carries.
+    """
+    workspace = tmp_path / "rewind_sdk_ws"
+    workspace.mkdir()
+    kept = f"KEPTWORD_{uuid.uuid4().hex[:6].upper()}"
+    dropped = f"DROPWORD_{uuid.uuid4().hex[:6].upper()}"
+
+    with _host_daemon(tmp_path, live_server):
+        host_id = _online_host_id(http_client, timeout=30.0)
+        source_id = _create_sdk_session_on_host(http_client, host_id=host_id, workspace=workspace)
+        _plant_code_words(http_client, session_id=source_id, words=[kept, dropped])
+
+        rewound_id = _rewind_and_check_placement(
+            http_client,
+            source_id=source_id,
+            item_id=_prompt_item_id(http_client, session_id=source_id, fragment=dropped),
+            prompt_fragment=dropped,
+        )
+        reply = _recall_code_words(http_client, session_id=rewound_id, expected=kept)
+        assert dropped not in reply, f"rewound claude-sdk session recalled {dropped!r}: {reply!r}"
