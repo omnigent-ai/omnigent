@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 from collections import Counter
@@ -191,13 +192,39 @@ async def test_attachment_resolution_deadline_releases_a_stalled_request(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "kind", "decoder_recursion"),
+    [
+        ("private-response", "non_json", False),
+        ('{"error":{"message":"File not found"}}', "file_not_found", False),
+        ('{"error":{"message":"Conversation not found"}}', "session_not_found", False),
+        ('{"error":{"message":"private-response"}}', "other_json", False),
+        ("[" * 1500 + "0" + "]" * 1500, "non_json", True),
+        ("private-response" * 1000, "oversized", False),
+    ],
+    ids=["non_json", "missing_file", "missing_session", "unknown_json", "deep_json", "large_body"],
+)
 async def test_attachment_failure_diagnostics_omit_file_and_response_contents(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    kind: str,
+    decoder_recursion: bool,
 ) -> None:
+    request_id = "0123456789abcdef0123456789abcdef"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(404, text=body, headers={"X-Request-Id": request_id})
+        if decoder_recursion:
+
+            def fail_decode() -> object:
+                raise RecursionError("decoder nesting limit")
+
+            monkeypatch.setattr(response, "json", fail_decode)
+        return response
+
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(404, text="private-response")
-        ),
+        transport=httpx.MockTransport(respond),
         base_url="https://private.example.test",
     ) as client:
         with caplog.at_level(logging.WARNING, logger=native_attachments.__name__):
@@ -211,5 +238,9 @@ async def test_attachment_failure_diagnostics_omit_file_and_response_contents(
     assert row["session_id"] == "session-example"
     assert row["attributes"]["http_status"] == "404"
     assert row["attributes"]["stage"] == "metadata"
+    assert row["attributes"]["response_kind"] == kind
+    assert row["attributes"]["server_request_id"] == request_id
+    assert row["attributes"]["file_id_sha256"] == hashlib.sha256(b"private-file").hexdigest()
+    assert row["attributes"]["response_bytes"] == str(len(body))
     assert "private-" not in json.dumps(row)
     assert "private.example.test" not in json.dumps(row)
