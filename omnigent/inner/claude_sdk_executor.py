@@ -38,9 +38,10 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+from uuid import uuid4
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
@@ -50,6 +51,7 @@ from omnigent.databricks_ai_gateway import (
     is_ug_route,
     with_gateway_attribution_lines,
 )
+from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
@@ -821,6 +823,44 @@ def _sandbox_disabled_by_env() -> bool:
     return False
 
 
+def _log_sdk_client_event(
+    action: str,
+    client: object,
+    *,
+    client_id: str | None = None,
+    close_reason: str | None = None,
+    error: BaseException | None = None,
+) -> None:
+    """Record process identity and our lifecycle actions without CLI output or arguments."""
+    with suppress(Exception):
+        transport = getattr(client, "_transport", None)
+        process = getattr(transport, "_process", None)
+        pid = getattr(process, "pid", None)
+        returncode = getattr(process, "returncode", None)
+        logger.info(
+            "Claude SDK client lifecycle: %s",
+            action,
+            extra=debug_event(
+                "claude_sdk_client_lifecycle",
+                sdk_action=action,
+                sdk_client_id=client_id,
+                sdk_close_reason=close_reason,
+                sdk_process_pid=pid if type(pid) is int and pid > 0 else None,
+                sdk_process_returncode=returncode if type(returncode) is int else None,
+                sdk_process_state=(
+                    "unavailable"
+                    if process is None
+                    else "running"
+                    if returncode is None
+                    else "exited"
+                    if type(returncode) is int
+                    else "unknown"
+                ),
+                exception_type=type(error).__name__ if error is not None else None,
+            ),
+        )
+
+
 def _terminate_process_tree(process: _Process | None) -> None:
     _proc.terminate_tree(process)
 
@@ -901,6 +941,7 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    diagnostic_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 @dataclass(frozen=True)
@@ -2075,6 +2116,7 @@ class ClaudeSDKExecutor(Executor):
                 effort=getattr(options, "effort", None),
             )
             self._clients[session_key] = state
+            _log_sdk_client_event("connected", client, client_id=state.diagnostic_id)
             return client
 
         if state.model != model:
@@ -2086,10 +2128,13 @@ class ClaudeSDKExecutor(Executor):
         self._crashed_sessions.pop(session_key, None)
         await self._close_live_client(session_key)
 
-    async def _close_live_client(self, session_key: str) -> None:
+    async def _close_live_client(self, session_key: str, *, reason: str = "session_close") -> None:
         state = self._clients.pop(session_key, None)
         if state is None:
             return
+        _log_sdk_client_event(
+            "close_requested", state.client, client_id=state.diagnostic_id, close_reason=reason
+        )
         try:
             current_loop = asyncio.get_running_loop()
             current_task = asyncio.current_task()
@@ -2128,6 +2173,7 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.pop(session_key, None)
         if state is None:
             return
+        _log_sdk_client_event("turn_cancelled", state.client, client_id=state.diagnostic_id)
         # Close in the background: an await here runs under an in-flight
         # cancellation and could itself be cancelled, leaking the CLI process.
         task = asyncio.create_task(self._force_close_client(state.client))
@@ -2146,6 +2192,7 @@ class ClaudeSDKExecutor(Executor):
         returncode = getattr(process, "returncode", None)
         if returncode is None:
             return
+        _log_sdk_client_event("exit_observed", state.client, client_id=state.diagnostic_id)
         logger.warning(
             "Claude SDK CLI for session %s terminated between turns "
             "(exit code: %s); discarding the dead client so this turn "
@@ -2153,11 +2200,16 @@ class ClaudeSDKExecutor(Executor):
             session_key,
             returncode,
         )
-        await self._close_live_client(session_key)
+        await self._close_live_client(session_key, reason="process_exited")
 
     async def close(self) -> None:
         session_keys = list(self._clients)
         for session_key in session_keys:
+            state = self._clients.get(session_key)
+            if state is not None:
+                _log_sdk_client_event(
+                    "shutdown_requested", state.client, client_id=state.diagnostic_id
+                )
             await self.close_session(session_key)
         if self._gateway_shim is not None:
             await self._gateway_shim.aclose()
@@ -2167,6 +2219,7 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             return False
+        _log_sdk_client_event("interrupt_requested", state.client, client_id=state.diagnostic_id)
         # Interrupt is best-effort and fast; a failure just falls through to
         # the close below.
         try:
@@ -2247,15 +2300,22 @@ class ClaudeSDKExecutor(Executor):
             process = transport._process
             if process is not None:
                 if process.returncode is None:
+                    _log_sdk_client_event("terminate_requested", client)
                     _terminate_process_tree(process)
                     try:
                         with suppress(Exception):
                             await asyncio.wait_for(process.wait(), timeout=5)
                     except TimeoutError:
+                        _log_sdk_client_event(
+                            "kill_requested", client, close_reason="wait_timeout"
+                        )
                         _kill_process_tree(process)
                         with suppress(Exception):
                             await process.wait()
                     except asyncio.CancelledError:
+                        _log_sdk_client_event(
+                            "kill_requested", client, close_reason="cleanup_cancelled"
+                        )
                         _kill_process_tree(process)
                         with suppress(Exception):
                             await process.wait()
@@ -2788,7 +2848,7 @@ class ClaudeSDKExecutor(Executor):
         if state is not None and state.effort != reasoning_effort and prompt != "/compact":
             # Effort is a launch option. Rebuild with history for conversational
             # turns, but let /compact operate on the existing client's context.
-            await self._close_live_client(session_key)
+            await self._close_live_client(session_key, reason="effort_change")
             resume_session = False
             prompt = self._build_prompt(messages, resume_session=False)
 
@@ -3606,7 +3666,14 @@ class ClaudeSDKExecutor(Executor):
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
             self._pending_framework_context.pop(session_key, None)
             self._crashed_sessions[session_key] = str(exc)
-            await self._close_live_client(session_key)
+            failed_state = self._clients.get(session_key)
+            _log_sdk_client_event(
+                "turn_error_observed",
+                failed_state.client if failed_state is not None else None,
+                client_id=failed_state.diagnostic_id if failed_state is not None else None,
+                error=exc,
+            )
+            await self._close_live_client(session_key, reason="turn_error")
             stderr_text = "\n".join(stderr_lines) if stderr_lines else "(no stderr captured)"
             diagnostics_text = (
                 "\n".join(system_diagnostics)
