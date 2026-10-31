@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 import httpx
 import pytest
 
@@ -26,22 +29,72 @@ def test_creation_stage_accumulates_repeated_measurements(monkeypatch: pytest.Mo
     assert float(attrs["create_persistence_ms"]) == pytest.approx(5.0)
 
 
-def test_creation_stage_records_failed_work(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+def test_creation_stage_records_failed_work(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
+) -> None:
     """A stage that raises still contributes timing to the request error row."""
     debug_logging.reset_request_audit_attrs()
     moments = iter([30.0, 30.004])
     monkeypatch.setattr(creation_logging.time, "perf_counter", lambda: next(moments))
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(error_type, match="private-failure"):
         with creation_logging.creation_stage("create_acl_ms"):
-            raise RuntimeError("boom")
+            raise error_type("private-failure")
 
     attrs = debug_logging.current_request_audit_attrs()
     assert float(attrs["create_acl_ms"]) == pytest.approx(4.0)
+    assert attrs["creation_failure_phase"] == "acl"
+    assert attrs["creation_exception_type"] == error_type.__name__
+    assert "private-failure" not in json.dumps(attrs)
+
+
+def test_creation_failure_preserves_first_stage_and_excludes_private_values() -> None:
+    debug_logging.reset_request_audit_attrs()
+    debug_logging.add_audit_attrs(creation_phase="identity")
+    error_type = type("private-exception/path", (RuntimeError,), {})
+    creation_logging.record_creation_failure(
+        error_type("private-message"),
+        validation_errors=[
+            {"loc": ("body", "agent_id"), "type": "string_type", "input": "private-input"},
+            {"loc": ("private-field",), "type": ["private-type"], "msg": "private-message"},
+        ],
+    )
+    debug_logging.add_audit_attrs(creation_phase="post_persistence")
+    creation_logging.record_creation_failure(RuntimeError("private-outer-error"))
+
+    attrs = debug_logging.current_request_audit_attrs()
+    assert attrs["creation_failure_phase"] == "identity"
+    assert attrs["creation_exception_type"] == "other"
+    assert attrs["creation_validation_fields"] == "agent_id"
+    assert attrs["creation_validation_types"] == "other,string_type"
+    assert attrs["creation_validation_count"] == "2"
+    assert "private-" not in json.dumps(attrs)
+
+
+def test_creation_failure_does_not_mark_unrelated_request() -> None:
+    debug_logging.reset_request_audit_attrs()
+    creation_logging.record_creation_failure(RuntimeError("not a create"))
+    assert not debug_logging.current_request_audit_attrs()
+
+
+def test_creation_failure_tolerates_broken_diagnostic_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    debug_logging.reset_request_audit_attrs()
+    debug_logging.add_audit_attrs(creation_phase="validation")
+
+    def fail_sink(**_attributes: object) -> None:
+        raise RuntimeError("diagnostics unavailable")
+
+    monkeypatch.setattr(creation_logging, "add_audit_attrs", fail_sink)
+    creation_logging.record_creation_failure(ValueError("original failure"))
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["success", "invalid", "managed_failure", "child_failure"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "invalid", "managed_failure", "child_failure", "malformed_parent"]
+)
 async def test_creation_request_correlation_and_classification(
     client: httpx.AsyncClient, outcome: str
 ) -> None:
@@ -51,6 +104,8 @@ async def test_creation_request_correlation_and_classification(
     if outcome == "managed_failure":
         body["host_type"] = "managed"
     elif outcome == "child_failure":
+        body["parent_session_id"] = "00000000000000000000000000000000"
+    elif outcome == "malformed_parent":
         body["parent_session_id"] = "missing-parent"
     elif outcome == "invalid":
         body = {"agent_id": 42}
@@ -79,6 +134,21 @@ async def test_creation_request_correlation_and_classification(
     else:
         assert response.status_code >= 400
         assert ends[0]["event_name"] == "session_creation_failed"
+        assert (
+            ends[0]["attributes"]["failure_phase"]
+            == {
+                "invalid": "request_validation",
+                "managed_failure": "post_persistence",
+                "child_failure": "persistence",
+                "malformed_parent": "validation",
+            }[outcome]
+        )
+        assert ends[0]["attributes"]["exception_type"]
+        assert ends[0]["attributes"]["failure_site"]
+    assert ends[0]["attributes"]["session_persisted"] == str(bool(created))
+    if outcome == "invalid":
+        assert ends[0]["attributes"]["validation_fields"] == "agent_id"
+        assert ends[0]["attributes"]["validation_types"] == "string_type"
     if outcome in {"success", "managed_failure"}:
         assert len(created) == 1
         assert created[0]["attributes"]["agent_id"] == agent_id
@@ -94,7 +164,7 @@ async def test_creation_request_correlation_and_classification(
         "unknown"
         if outcome == "invalid"
         else "child"
-        if outcome == "child_failure"
+        if outcome in {"child_failure", "malformed_parent"}
         else "top_level"
     )
     assert ends[0]["attributes"]["creation_kind"] == expected_kind
