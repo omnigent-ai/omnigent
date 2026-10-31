@@ -72,7 +72,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
-from omnigent.db.account_authority import account_authority_scope
+from omnigent.db.account_authority import account_authority_scope, account_checks_enabled
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
@@ -205,8 +205,8 @@ class FireDeps:
     # Saves a managed fire's prompt until its sandbox connects. Present whenever
     # managed launches are supported.
     startup_inputs: Any | None = None
-    # ``app.state``, read per fire for the default-public-sessions policy.
-    # ``None`` (tests, embedders) leaves every fired session private.
+    # ``app.state``, read per fire for the default-public-sessions policy and
+    # the legacy timer. ``None`` (tests, embedders) leaves every fired session private.
     app_state: Any | None = None
     # Confirms a task's project still exists before filing the session into it.
     project_store: Any | None = None
@@ -711,6 +711,12 @@ async def _disable_for_deleted_owner(
         task.user_id,
     )
     await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+    # As DELETE does, drop this server's legacy timer; the database scheduler needs no removal.
+    scheduler = getattr(deps.app_state, "scheduled_task_scheduler", None)
+    if scheduler is not None and not getattr(
+        deps.app_state, "scheduled_task_dispatch_enabled", False
+    ):
+        scheduler.remove(task.id)
     await recorder.finish(
         "failed",
         error=f"owner {task.user_id!r} registration is no longer active; task disabled",
@@ -975,12 +981,18 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
 
     A NULL owner (single-user / OSS) always resolves to
     :data:`RESERVED_USER_LOCAL` and is never considered deleted; without a
-    permission store there is no account to check against.
+    permission store there is no account to check against. External auth saves
+    no task generation, so a live owner row is the whole check there. A saved
+    generation, or a NULL one under account checks, must match the row.
     """
     if task.user_id is None or deps.permission_store is None:
         return False
     owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
-    return owner is None or owner.account_generation != task.account_generation
+    if owner is None:
+        return True
+    if task.account_generation is None and not account_checks_enabled():
+        return False
+    return owner.account_generation != task.account_generation
 
 
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:

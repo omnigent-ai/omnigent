@@ -510,8 +510,13 @@ async def test_revoked_identity_of_a_deleted_owner_disables_the_task(store, monk
         await finish(status, **kwargs)
 
     claimed.lease.finish = record_finish
+    deps = _deps(store)
+    # The database scheduler has no timers to remove.
+    deps.app_state = SimpleNamespace(
+        scheduled_task_scheduler=SimpleNamespace(), scheduled_task_dispatch_enabled=True
+    )
     executor = ClaimedRunExecutor(
-        _deps(store),
+        deps,
         fire_identity=_failing_identity(FireIdentityRevoked("owner removed")),
         launch_dispatch=AsyncMock(),
     )

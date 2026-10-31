@@ -18,10 +18,14 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from sqlalchemy import update
 
-from omnigent.db.utils import builtin_agent_id
+from omnigent.db.db_models import SqlUser
+from omnigent.db.utils import builtin_agent_id, get_or_create_engine
+from omnigent.entities.scheduled_task import ScheduledTaskRun
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.app import create_app
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
@@ -39,6 +43,7 @@ from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStor
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
+from tests._helpers.polling import poll_until_async
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import FakeSandboxLauncher
 
@@ -2317,6 +2322,57 @@ async def test_run_now_503_when_scheduler_not_running(
     auth_app.state.scheduled_task_run_now = None
     resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
     assert resp.status_code == 503, resp.text
+
+
+async def _run_now_and_wait(
+    client: httpx.AsyncClient, db_uri: str, task_id: str
+) -> ScheduledTaskRun:
+    resp = await client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert resp.status_code == 202, resp.text
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    await poll_until_async(lambda: store.list_runs(task_id)[0])
+    return store.list_runs(task_id)[0][0]
+
+
+async def test_run_now_keeps_task_of_external_owner_with_password_generation(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # Setting a password gives the externally authenticated owner's row a generation.
+    assert SqlAlchemyAccountStore(db_uri).update_password("alice@example.com", "unused-hash")
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+
+    run = await _run_now_and_wait(auth_client, db_uri, task_id)
+
+    assert run.error_code != "owner_deleted", run.error
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.status_code == 200, got.text
+    assert got.json()["state"] == "active"
+
+
+async def test_run_now_that_disables_task_for_deleted_owner_drops_its_timer(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    scheduler = auth_app.state.scheduled_task_scheduler
+    assert scheduler.next_run_at(task_id) is not None
+    # Leave the task active, as when an account deletion commits after a fire read the task.
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            update(SqlUser).where(SqlUser.id == "alice@example.com").values(deleted_at=1)
+        )
+
+    run = await _run_now_and_wait(auth_client, db_uri, task_id)
+
+    assert run.error_code == "owner_deleted", run.error
+    assert scheduler.next_run_at(task_id) is None
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)

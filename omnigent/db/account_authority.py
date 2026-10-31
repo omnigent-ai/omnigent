@@ -47,6 +47,11 @@ def account_checks_scope(enabled: bool) -> Iterator[None]:
         _account_checks_enabled.reset(token)
 
 
+def account_checks_enabled() -> bool:
+    """Whether this app validates saved authority against its accounts table."""
+    return _account_checks_enabled.get()
+
+
 def bind_account_authority(user_id: str, generation: str) -> None:
     """Capture the identity authenticated by this request or durable job."""
     _authority.set(AccountAuthority(user_id, generation, current_workspace_id()))
