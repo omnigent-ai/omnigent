@@ -948,6 +948,64 @@ def test_preload_codex_thread_keeps_rollout_when_restamp_fails(
     assert fake_client.closed
 
 
+class _ScriptedResumeClient(_FakeCodexAppServerClient):
+    """Fake client that raises each scripted error once, then answers normally."""
+
+    def __init__(self, errors: list[Exception]) -> None:
+        super().__init__()
+        self.errors = errors
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.error = self.errors.pop(0) if self.errors else None
+        return await super().request(method, params)
+
+
+@pytest.mark.parametrize(
+    ("retain_client", "retry_refused"),
+    [(False, False), (True, False), (True, True)],
+    ids=["closes_client", "retains_client", "second_refusal_surfaces"],
+)
+def test_preload_codex_thread_retries_provider_mismatch_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    retain_client: bool,
+    retry_refused: bool,
+) -> None:
+    """A restamped resume retries once under Codex's provider and keeps client ownership."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"omnigent_databricks"}}\n'
+    )
+    refusals = [
+        codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)
+        for _ in range(2 if retry_refused else 1)
+    ]
+    fake_client = _ScriptedResumeClient(list(refusals))
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    preload = codex_native_app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876",
+        "thread_test",
+        model_provider="omnigent_databricks",
+        retain_client=retain_client,
+        rollout_path=rollout,
+    )
+
+    if retry_refused:
+        with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+            asyncio.run(preload)
+        assert raised.value is refusals[1]
+    else:
+        assert asyncio.run(preload) is (fake_client if retain_client else None)
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"] * 2
+    first, retry = (params for _method, params in fake_client.requests)
+    assert retry == {**first, "modelProvider": "Databricks"}
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "Databricks"
+    assert fake_client.closed is (retry_refused or not retain_client)
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
