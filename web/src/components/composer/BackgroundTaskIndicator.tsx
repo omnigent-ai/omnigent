@@ -5,6 +5,10 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import type { BackgroundTaskInfo } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import {
+  COMPOSER_POPOVER_HEADER_INSET,
+  measureComposerPopoverHeaderInset,
+} from "@/pages/chatLayout";
 import { useChatStore } from "@/store/chatStore";
 
 function taskLabel(task: BackgroundTaskInfo): string {
@@ -78,6 +82,7 @@ export function BackgroundTaskIndicator() {
   const bgTasks = useChatStore((s) => s.backgroundTasks);
   const conversationId = useChatStore((s) => s.conversationId);
   const [open, setOpen] = useState(false);
+  const [collisionPadding, setCollisionPadding] = useState(COMPOSER_POPOVER_HEADER_INSET);
   const triggerRef = useRef<HTMLButtonElement>(null);
   // Escape returns to the trigger; session switches must never move focus.
   const closeReasonRef = useRef<"session-change" | "escape" | null>(null);
@@ -98,7 +103,10 @@ export function BackgroundTaskIndicator() {
   const handleOpenChange = (next: boolean) => {
     // A fresh open consumes any stale close reason, so the next ordinary
     // close restores focus normally.
-    if (next) closeReasonRef.current = null;
+    if (next) {
+      closeReasonRef.current = null;
+      setCollisionPadding(measureComposerPopoverHeaderInset());
+    }
     setOpen(next);
   };
 
@@ -135,7 +143,7 @@ export function BackgroundTaskIndicator() {
         <PopoverContent
           side="top"
           align="end"
-          collisionPadding={8}
+          collisionPadding={collisionPadding}
           aria-label={countLabel}
           onEscapeKeyDown={() => {
             if (open) closeReasonRef.current = "escape";

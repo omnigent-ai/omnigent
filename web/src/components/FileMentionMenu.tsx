@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { FileTextIcon, FolderIcon, PlusIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import { COMPOSER_POPOVER_MAX_H, COMPOSER_POPOVER_Z } from "@/pages/chatLayout";
 
 interface FileMentionMenuProps {
   /** Directory currently being browsed ("" = workspace root). */
@@ -45,19 +46,25 @@ export function FileMentionMenu({
   if (entries.length === 0 && !loading) return null;
 
   return (
-    <div className="absolute bottom-full left-0 z-30 mb-2 flex items-end gap-2">
+    <div
+      className={cn(
+        "absolute bottom-full left-0 mb-2 flex flex-col",
+        COMPOSER_POPOVER_Z,
+        COMPOSER_POPOVER_MAX_H,
+      )}
+    >
       <div
         data-testid="file-mention-menu"
-        className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+        className="flex min-h-0 w-80 max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
       >
-        <div className="flex items-center justify-between gap-2 px-1.5 py-1 text-sm font-medium text-muted-foreground">
+        <div className="flex shrink-0 items-center justify-between gap-2 px-1.5 py-1 text-sm font-medium text-muted-foreground">
           <span className="truncate">{currentDir ? `/${currentDir}` : "Workspace"}</span>
           <span className="shrink-0 text-[10px]">↵ open · ⇥ attach</span>
         </div>
         {entries.length === 0 && loading ? (
           <div className="px-1.5 py-1 text-ui text-muted-foreground">Loading…</div>
         ) : (
-          <div ref={listRef} role="listbox" className="max-h-80 overflow-y-auto">
+          <div ref={listRef} role="listbox" className="max-h-80 min-h-0 overflow-y-auto">
             {entries.map((entry, i) => {
               const isDir = entry.type === "directory";
               return (
