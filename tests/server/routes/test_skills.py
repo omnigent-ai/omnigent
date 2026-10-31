@@ -234,6 +234,9 @@ async def test_presession_catalog_matches_filtered_invocations(
     # A hidden install still takes its name at runtime, so the host's "secret"
     # it shadows must not be offered either.
     _install_personal_skill(db_uri, tmp_path, "owner", "secret", user_invocable=False)
+    # The bundle's helper-only skills/lib/ keeps an install named "lib" out of
+    # the served archive, so the menu must not offer it.
+    _install_personal_skill(db_uri, tmp_path, "owner", "lib", description="Installed lib")
     for name in ("bundled", "hidden", "allowed", "denied", "secret"):
         directory = tmp_path / ".claude" / "skills" / name
         directory.mkdir(parents=True)
@@ -251,7 +254,21 @@ async def test_presession_catalog_matches_filtered_invocations(
             ),
         ],
     )
-    monkeypatch.setattr(app.state.agent_cache, "load", lambda *a, **kw: SimpleNamespace(spec=spec))
+    bundle_dir = tmp_path / "bundle"
+    bundle_files = {
+        "config.yaml": b"name: agent\n",
+        "skills/bundled/SKILL.md": b"---\nname: bundled\ndescription: b\n---\n",
+        "skills/hidden/SKILL.md": b"---\nname: hidden\ndescription: h\n---\n",
+        "skills/lib/helper.py": b"HELPER = 1\n",
+    }
+    for relative, data in bundle_files.items():
+        (bundle_dir / relative).parent.mkdir(parents=True, exist_ok=True)
+        (bundle_dir / relative).write_bytes(data)
+    monkeypatch.setattr(
+        app.state.agent_cache,
+        "load",
+        lambda *a, **kw: SimpleNamespace(spec=spec, workdir=bundle_dir),
+    )
     from omnigent.server.routes.builtin_agents import _to_agent_object as builtin_agent_object
     from omnigent.server.routes.sessions.routes_permissions import (
         _to_agent_object as session_agent_object,
@@ -323,8 +340,25 @@ async def test_presession_catalog_matches_filtered_invocations(
     if any(s.name == "allowed" for s in expected):
         listed.append(installed)
     assert response.json()["skills"] == listed
-    assert {"hidden", "secret"}.isdisjoint(s["name"] for s in response.json()["skills"])
+    menu = {s["name"] for s in response.json()["skills"]}
+    assert {"hidden", "secret", "lib"}.isdisjoint(menu)
     assert response.json()["warnings"] == []
+    # The archive a session would be served agrees with the menu.
+    from omnigent.server.skill_injection import with_installed_skills
+    from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+
+    served = with_installed_skills(
+        skill_tarball(bundle_files),
+        owner_id="owner",
+        skill_store=SqlAlchemySkillStore(db_uri),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    with tarfile.open(fileobj=io.BytesIO(served), mode="r:gz") as tf:
+        names = tf.getnames()
+    delivered = {name.split("/")[1] for name in names if name.startswith("skills/")}
+    assert "skills/lib/helper.py" in names and "skills/lib/SKILL.md" not in names
+    for name in ("allowed", "secret"):
+        assert name in delivered
 
 
 async def test_presession_discovery_rejects_private_agent(
@@ -520,7 +554,11 @@ async def test_session_catalog_lists_the_owners_installed_skills_under_the_agent
     loaded = app.state.agent_cache.load(agent.id, agent.bundle_location)
     child = next(s for s in loaded.spec.sub_agents if s.name == "child")
     spec = replace(loaded.spec, sub_agents=[replace(child, skills_filter=skill_filter)])
-    monkeypatch.setattr(app.state.agent_cache, "load", lambda *a, **kw: SimpleNamespace(spec=spec))
+    monkeypatch.setattr(
+        app.state.agent_cache,
+        "load",
+        lambda *a, **kw: SimpleNamespace(spec=spec, workdir=loaded.workdir),
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:

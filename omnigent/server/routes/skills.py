@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -20,13 +21,13 @@ from omnigent.server.routes._session_create_validation import validate_session_a
 from omnigent.server.schemas import SkillSummary
 from omnigent.server.skill_injection import (
     SkillDeliveryError,
-    bundle_spec,
+    bundle_loaded,
     effective_installed_skills,
     session_target,
     skill_allowed,
-    spec_reserved_names,
 )
 from omnigent.skills.git_source import repository_label
+from omnigent.skills.overlay import reserved_install_names
 from omnigent.skills.policy import DEFAULT_POLICY
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
@@ -88,6 +89,8 @@ def create_skills_router(
         installed_owner = user_id
         installed_known = True
         installed_spec: AgentSpec | None = None
+        # The extracted bundle directory installs go into; None when unknown.
+        installed_dir: Path | None = None
         if session_id is not None:
             if any(value is not None for value in (host_id, harness, path, agent_id)):
                 raise HTTPException(
@@ -123,9 +126,13 @@ def create_skills_router(
                 )
                 # Unresolved ownership on a multi-user server lists nobody's installs.
                 installed_known = installed_owner is not None or permission_store is None
-                installed_spec = session_target(
-                    await asyncio.to_thread(bundle_spec, agent_cache, agent), sub_agent_name
-                ).spec
+                session_bundle = await asyncio.to_thread(bundle_loaded, agent_cache, agent)
+                target = session_target(
+                    session_bundle.spec if session_bundle is not None else None, sub_agent_name
+                )
+                installed_spec = target.spec
+                if session_bundle is not None:
+                    installed_dir = session_bundle.workdir / target.prefix
         else:
             if host_id is None or harness is None or path is None:
                 raise HTTPException(
@@ -155,6 +162,7 @@ def create_skills_router(
                 )
                 spec, agent_version = loaded.spec, str(agent.version)
                 installed_spec = spec
+                installed_dir = loaded.workdir
 
         conn = host_registry.get(host_id)
         if conn is None:
@@ -191,7 +199,11 @@ def create_skills_router(
         # Hidden bundled skills also reserve their names against collisions,
         # from the spec the session runs: the host already lists them itself.
         reserving = installed_spec if installed_spec is not None else spec
-        bundled = spec_reserved_names(reserving) if reserving is not None else set()
+        bundled = {skill.name for skill in reserving.skills} if reserving is not None else set()
+        # What delivery will not add: the overlay's rule over the same bundle.
+        not_installable = bundled | (
+            reserved_install_names(installed_dir) if installed_dir is not None else set()
+        )
         if spec is not None:
             skills = [
                 SkillSummary(
@@ -213,13 +225,13 @@ def create_skills_router(
             # Runtime precedence is bundle, then installed, then host: an
             # installed skill is delivered as bundle content and shadows the
             # host's, so the menu shows the installed one.
-            added = installed_skill_summaries(installed, installed_spec, bundled)
+            added = installed_skill_summaries(installed, installed_spec, not_installable)
             # Hidden installs take their name at runtime too, so they shadow
             # host skills although the menu does not list them.
             shadowed = {
                 skill.name
                 for skill in installed
-                if skill.name not in bundled and skill_allowed(installed_spec, skill.name)
+                if skill.name not in not_installable and skill_allowed(installed_spec, skill.name)
             }
             skills = [skill for skill in skills if skill.name not in shadowed] + added
         return SkillsResponse(skills=skills, warnings=result.warnings)

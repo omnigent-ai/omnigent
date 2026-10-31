@@ -13,7 +13,7 @@ import io
 import tarfile
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from omnigent.skills.limits import MAX_SKILL_BYTES, MAX_SKILL_ENTRIES
 
@@ -125,16 +125,44 @@ def bundle_skill_directories(bundle_bytes: bytes, *, prefix: str = "") -> set[st
     and stop looking inside, hiding the bundle's own skills there.
     """
     lead = _prefix_parts(prefix)
-    names: set[str] = set()
+    paths: list[tuple[list[str], bool]] = []
     with _open(bundle_bytes) as tf:
         for member in tf:
             parts = [part for part in PurePosixPath(member.name).parts if part != "."]
-            if parts[: len(lead)] != lead:
-                continue
-            rest = parts[len(lead) :]
-            if len(rest) >= 2 and rest[0] == "skills" and (len(rest) > 2 or member.isdir()):
-                names.add(rest[1])
+            if parts[: len(lead)] == lead:
+                paths.append((parts[len(lead) :], member.isdir()))
+    return _skill_directories(paths)
+
+
+def reserved_install_names(agent_dir: Path) -> set[str]:
+    """What :func:`overlay_skills` will not add into an extracted agent directory.
+
+    The same rule as the overlay applies to an archive (every name directly
+    under ``skills/`` plus every ``SKILL.md`` directory below it), so a menu
+    built from the extracted bundle offers exactly what delivery adds.
+
+    :param agent_dir: The directory holding the agent's ``skills/``: the
+        bundle root, or ``agents/<dir>/`` inside it for a child.
+    """
+    skills_dir = agent_dir / "skills"
+    if skills_dir.is_symlink() or not skills_dir.is_dir():
+        return set()
+    paths: list[tuple[list[str], bool]] = []
+    for path in skills_dir.rglob("*"):
+        rest = ["skills", *path.relative_to(skills_dir).parts]
+        paths.append((rest, path.is_dir() and not path.is_symlink()))
+    names = _skill_directories(paths)
+    names.update(rest[-2] for rest, _ in paths if len(rest) >= 3 and rest[-1] == "SKILL.md")
     return names
+
+
+def _skill_directories(paths: list[tuple[list[str], bool]]) -> set[str]:
+    """Names directly under ``skills/`` among ``(parts, is_dir)`` paths relative to an agent."""
+    return {
+        rest[1]
+        for rest, is_dir in paths
+        if len(rest) >= 2 and rest[0] == "skills" and (len(rest) > 2 or is_dir)
+    }
 
 
 def overlay_skills(

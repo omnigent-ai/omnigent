@@ -1138,20 +1138,20 @@ async def test_server_policy_binds_sources_url_installs_and_delivery(
 
 
 def test_a_bundle_namespace_folder_is_a_reserved_install_name(tmp_path: Path) -> None:
-    # The overlay skips an install named after a bundle namespace folder, so
-    # the menu must not offer it either.
-    from omnigent.server.skill_injection import spec_reserved_names
-    from omnigent.spec.types import AgentSpec, SkillSpec
+    # Discovery reserves what the overlay will not add: every name directly
+    # under the bundle's skills/, and every SKILL.md directory below it.
+    from omnigent.skills.overlay import bundle_skill_directories, reserved_install_names
 
-    spec = AgentSpec(
-        spec_version=1,
-        name="a",
-        skills=[
-            SkillSpec("triage", "d", "c", skill_dir=tmp_path / "skills" / "team" / "triage"),
-            SkillSpec("lint", "d", "c", skill_dir=tmp_path / "skills" / "lint"),
-        ],
-    )
-    assert spec_reserved_names(spec) == {"triage", "team", "lint"}
+    files = {
+        "skills/team/triage/SKILL.md": b"---\nname: triage\n---\n",
+        "skills/lint/SKILL.md": b"---\nname: lint\n---\n",
+        "skills/lib/helper.py": b"x = 1\n",
+    }
+    for relative, data in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_bytes(data)
+    assert reserved_install_names(tmp_path) == {"team", "triage", "lint", "lib"}
+    assert bundle_skill_directories(skill_tarball(files)) == {"team", "lint", "lib"}
 
 
 def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None:

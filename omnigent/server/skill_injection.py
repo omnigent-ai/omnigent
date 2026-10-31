@@ -17,6 +17,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from omnigent.entities import Agent, Conversation, InstalledSkill
+from omnigent.entities.agent import LoadedAgent
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.skills.git_source import ancestor_paths
@@ -89,17 +90,23 @@ async def session_agent_revision(
     return f"{base}+skills.{await asyncio.to_thread(installed)}"
 
 
-def bundle_spec(agent_cache: AgentCache | None, agent: Agent) -> AgentSpec | None:
-    """The agent's parsed spec, for its ``skills:`` filter; ``None`` when unavailable."""
+def bundle_loaded(agent_cache: AgentCache | None, agent: Agent) -> LoadedAgent | None:
+    """The agent's parsed spec and extracted bundle; ``None`` when unavailable."""
     if agent_cache is None:
         return None
     try:
         return agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
-        ).spec
+        )
     except Exception:  # noqa: BLE001 — the filter is advisory; the bundle still ships
         _logger.warning("could not load spec for agent %s to filter skills", agent.id)
         return None
+
+
+def bundle_spec(agent_cache: AgentCache | None, agent: Agent) -> AgentSpec | None:
+    """The agent's parsed spec, for its ``skills:`` filter; ``None`` when unavailable."""
+    loaded = bundle_loaded(agent_cache, agent)
+    return None if loaded is None else loaded.spec
 
 
 def session_target(spec: AgentSpec | None, sub_agent_name: str | None) -> SessionTarget:
@@ -122,22 +129,6 @@ def _find_sub_agent(spec: AgentSpec, name: str, prefix: str) -> SessionTarget | 
         if nested is not None:
             return nested
     return None
-
-
-def spec_reserved_names(spec: AgentSpec) -> set[str]:
-    """Names an installed skill cannot take: the spec's skills and their namespace folders.
-
-    The overlay skips an install named after a bundle folder under
-    ``skills/`` (see :func:`omnigent.skills.overlay.bundle_skill_directories`),
-    so the menu must not offer one either.
-    """
-    names: set[str] = set()
-    for skill in spec.skills:
-        names.add(skill.name)
-        parent = skill.skill_dir.parent if skill.skill_dir is not None else None
-        if parent is not None and parent.name != "skills" and parent.parent.name == "skills":
-            names.add(parent.name)
-    return names
 
 
 def skill_allowed(spec: AgentSpec | None, name: str) -> bool:
