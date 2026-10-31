@@ -536,7 +536,8 @@ class SysSessionListTool(Tool):
         return (
             "List sessions in two views. 'sub_agents': the named "
             "(agent, title) children under this conversation (and your "
-            "parent/siblings) — use their conversation_id to read "
+            "parent/siblings), including manually created full peers with session_role='peer', "
+            "busy/status and creator IDs. Use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
             "every session "
             "you can access, each with status, runner connectivity and "
@@ -939,6 +940,13 @@ class SysSessionCreateTool(Tool):
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
             "and a private sending session, including its side-chat source chain. "
+            "Set related_session=true with same_host or managed to create a full peer "
+            "in your current group instead. This requires related_sessions enabled and "
+            "owner authority; read-only sharing is allowed, editable sharing is not. "
+            "Managed peers get their own sandbox and runner. Existing peers are discoverable "
+            "with sys_session_list. Use sys_session_message for peer tasks and explicit "
+            "completion replies. Cross-machine peer messages require a connected managed "
+            "sandbox destination; a sandbox cannot send tasks back to a personal host. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
@@ -973,6 +981,13 @@ class SysSessionCreateTool(Tool):
                             "description": (
                                 "Default child; same_host or managed launches a private "
                                 "top-level session (agent_id only)."
+                            ),
+                        },
+                        "related_session": {
+                            "type": "boolean",
+                            "description": (
+                                "With same_host or managed, create a full peer in the caller's "
+                                "group. Default false preserves independent creation."
                             ),
                         },
                         "sandbox_provider": {

@@ -56,7 +56,7 @@ class FeatureDefinition:
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.RELATED_SESSIONS,
-        description="Related full sessions sharing an existing execution environment",
+        description="Related full sessions with owner-authorized group orchestration",
         owner="server",
         review_by_release="0.22.0",
     ),

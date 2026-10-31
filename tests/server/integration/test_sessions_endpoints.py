@@ -9890,10 +9890,12 @@ async def test_post_external_mcp_startup_all_ready_evicts_snapshot_cache(
         sessions_module._session_mcp_startup_cache.pop(session["id"], None)
 
 
+@pytest.mark.parametrize("separate_host", [False, True])
 async def test_delete_peer_keeps_shared_managed_host(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
+    separate_host: bool,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     host_store = HostStore(db_uri)
@@ -9912,9 +9914,30 @@ async def test_delete_peer_keeps_shared_managed_host(
     peer = store.create_conversation(
         parent_conversation_id=root.id, host_id=host_id, workspace="/workspace"
     )
+    if separate_host:
+        peer_host = uuid.uuid4().hex
+        host_store.register_managed_host(
+            host_id=peer_host,
+            name="peer",
+            user_id="local",
+            token="peer-token",
+            provider="modal",
+            sandbox_id="sandbox-peer",
+            token_expires_at=2_000_000_000,
+        )
+        store.set_host_id(peer.id, peer_host, workspace="/workspace")
     with patch(
         "omnigent.server.managed_hosts.terminate_managed_host", new_callable=AsyncMock
     ) as terminate:
+        if separate_host:
+            response = await client.delete(f"/v1/sessions/{root.id}")
+            assert response.status_code == 200, response.text
+            assert {call.args[0].host_id for call in terminate.await_args_list} == {
+                host_id,
+                peer_host,
+            }
+            assert store.get_conversation(peer.id) is None
+            return
         response = await client.delete(f"/v1/sessions/{peer.id}")
         assert response.status_code == 200, response.text
         terminate.assert_not_awaited()

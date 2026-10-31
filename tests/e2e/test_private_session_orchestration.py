@@ -23,9 +23,13 @@ _REPO = Path(__file__).resolve().parents[2]
 
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("harness", ["openai-agents", "codex-native"])
-@pytest.mark.parametrize("orchestration_enabled", [True, False], ids=["default", "kill-switch"])
+@pytest.mark.parametrize(
+    ("orchestration_enabled", "related"),
+    [(True, False), (False, False), (True, True)],
+    ids=["default", "kill-switch", "group"],
+)
 def test_private_manager_launch_send_read_and_sharing(
-    tmp_path, isolated_mock_llm_server_url, harness, orchestration_enabled
+    tmp_path, isolated_mock_llm_server_url, harness, orchestration_enabled, related
 ):
     if harness == "codex-native" and any(shutil.which(cmd) is None for cmd in ("codex", "tmux")):
         pytest.skip("requires Codex and tmux")
@@ -35,7 +39,7 @@ def test_private_manager_launch_send_read_and_sharing(
     base_env = {k: v for k, v in os.environ.items() if k in {"PATH", "LANG", "TMPDIR"}}
     with tempfile.TemporaryDirectory(prefix="orch-native-", dir="/tmp") as native_state:
         env = {
-            "OMNIGENT_FEATURES": None,
+            "OMNIGENT_FEATURES": "related_sessions" if related else None,
             "OMNIGENT_CONFIG_HOME": str(config),
             "OMNIGENT_CODEX_NATIVE_STATE_DIR": native_state,
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
@@ -47,7 +51,9 @@ def test_private_manager_launch_send_read_and_sharing(
             tmp_path / "stack", server_cwd=_REPO, server_env=env, base_env=base_env
         ) as stack:
             # The server's kill switch must work even when the runner opts in.
-            host_features = None if orchestration_enabled else "session_orchestration"
+            host_features = (
+                env["OMNIGENT_FEATURES"] if orchestration_enabled else "session_orchestration"
+            )
             stack.start_host(env={**env, "OMNIGENT_FEATURES": host_features}, cwd=_REPO)
             with httpx.Client(base_url=stack.base_url, timeout=60, trust_env=False) as client:
                 poll_until(
@@ -128,6 +134,19 @@ def test_private_manager_launch_send_read_and_sharing(
 
                 sessions = []
                 for title in ("Manager", "Worker"):
+                    if related and title == "Worker":
+                        manager = client.get(f"/v1/sessions/{sessions[0]}").json()
+                        response = client.post(
+                            "/v1/sessions",
+                            json={
+                                "agent_id": manager["agent_id"],
+                                "related_to_session_id": manager["id"],
+                                "title": "Manual worker",
+                            },
+                        )
+                        response.raise_for_status()
+                        sessions.append(response.json()["id"])
+                        continue
                     metadata = {
                         "title": title,
                         "host_id": host_id,
@@ -232,7 +251,7 @@ def test_private_manager_launch_send_read_and_sharing(
                     assert {row["id"] for row in rows} == {manager, worker}
                     return
                 shared = client.put(
-                    f"/v1/sessions/{worker}/permissions",
+                    f"/v1/sessions/{manager if related else worker}/permissions",
                     json={"user_id": "__public__", "level": 1},
                 )
                 assert shared.status_code == 200, shared.text
@@ -289,6 +308,7 @@ def test_private_manager_launch_send_read_and_sharing(
                                     {
                                         "agent_id": agent,
                                         "placement": "same_host",
+                                        "related_session": related,
                                         "title": "Independent worker",
                                         "message": "NEW_WORKER_TASK",
                                     },
@@ -301,17 +321,20 @@ def test_private_manager_launch_send_read_and_sharing(
                 )
                 send(manager, "MANAGER_SEND_READ_CREATE")
                 wait_text(manager, "MANAGER_CREATED")
-                rows = client.get("/v1/sessions", params={"visibility": "mine"}).json()["data"]
+                rows = client.get(
+                    "/v1/sessions", params={"visibility": "mine", "kind": "any"}
+                ).json()["data"]
                 created = next(row for row in rows if row["title"] == "Independent worker")
                 created = client.get(f"/v1/sessions/{created['id']}").json()
-                assert created["parent_session_id"] is None
+                assert created["parent_session_id"] == (manager if related else None)
                 assert created["labels"]["omnigent.created_by_session_id"] == manager
                 assert created["host_id"] == host_id
                 wait_text(created["id"], "NEW_WORKER_RESULT")
                 grants = client.get(f"/v1/sessions/{created['id']}/permissions").json()[
                     "permissions"
                 ]
-                assert [g["user_id"] for g in grants] == ["local"]
+                if not related:
+                    assert [g["user_id"] for g in grants] == ["local"]
 
                 configure(
                     "MANAGER_SEND_READ_CREATE_FIND",
@@ -333,24 +356,34 @@ def test_private_manager_launch_send_read_and_sharing(
                 wait_text(manager, "CREATOR_FOUND")
                 for call_id in ("creator-list", "creator-info"):
                     results = tool_results(call_id)
-                    assert results
+                    assert results, (call_id, get_mock_requests(mock))
                     output = results[-1].get("output", results[-1].get("content"))
                     if harness == "codex-native":
-                        # Codex wraps MCP content in timing text; the SDK renders a Python dict.
-                        content = json.loads(output.split("\nOutput:\n", 1)[1])
-                        payload = json.loads(content[0]["text"])
+                        if isinstance(output, list):
+                            output = "".join(part.get("text", "") for part in output)
+                        content = json.loads(output.split("\nOutput:", 1)[-1])
+                        payload = (
+                            json.loads(content[0]["text"])
+                            if isinstance(content, list)
+                            else content
+                        )
                     else:
                         payload = ast.literal_eval(output)
                     discovered_worker = (
                         next(
                             row
-                            for row in payload["sessions"]
-                            if row["session_id"] == created["id"]
+                            for row in payload["sub_agents" if related else "sessions"]
+                            if row["conversation_id" if related else "session_id"] == created["id"]
                         )
                         if call_id == "creator-list"
                         else payload
                     )
-                    assert discovered_worker["session_id"] == created["id"]
+                    key = (
+                        "conversation_id"
+                        if related and call_id == "creator-list"
+                        else "session_id"
+                    )
+                    assert discovered_worker[key] == created["id"]
                     assert discovered_worker["created_by_session_id"] == manager
 
                 before_managed = {
@@ -366,7 +399,11 @@ def test_private_manager_launch_send_read_and_sharing(
                             "tool_calls": [
                                 tool(
                                     "sys_session_create",
-                                    {"agent_id": agent, "placement": "managed"},
+                                    {
+                                        "agent_id": agent,
+                                        "placement": "managed",
+                                        "related_session": related,
+                                    },
                                     "managed",
                                 )
                             ]
@@ -384,13 +421,54 @@ def test_private_manager_launch_send_read_and_sharing(
                     ]
                 } == before_managed
 
+                if related:
+                    report = "MANAGER_SEND_READ_CREATE_MANAGED_COMPLETION"
+                    configure(report, [{"text": "REPORT_RECEIVED"}])
+                    configure("NEW_WORKER_TASK_SIBLING", [{"text": "SIBLING_RESULT"}])
+                    configure(
+                        "WORKER_TASK_REPORT",
+                        [
+                            {
+                                "tool_calls": [
+                                    tool(
+                                        "sys_session_message",
+                                        {"session_id": manager, "message": report},
+                                        "completion-report",
+                                    )
+                                ]
+                            },
+                            {
+                                "tool_calls": [
+                                    tool(
+                                        "sys_session_message",
+                                        {
+                                            "session_id": created["id"],
+                                            "message": "NEW_WORKER_TASK_SIBLING",
+                                        },
+                                        "sibling-task",
+                                    )
+                                ]
+                            },
+                            {"text": "WORKER_REPORTED"},
+                        ],
+                    )
+                    send(worker, "WORKER_TASK_REPORT")
+                    wait_text(worker, "WORKER_REPORTED")
+                    wait_text(manager, "REPORT_RECEIVED")
+                    wait_text(created["id"], "SIBLING_RESULT")
                 shared = client.put(
                     f"/v1/sessions/{manager}/permissions",
-                    json={"user_id": "__public__", "level": 1},
+                    json={
+                        "user_id": "bob" if related else "__public__",
+                        "level": 2 if related else 1,
+                    },
                 )
                 assert shared.status_code == 200, shared.text
+                block_prompt = "MANAGER_SEND_READ_CREATE_MANAGED_" + (
+                    "COMPLETION_BLOCK" if related else "BLOCK"
+                )
                 configure(
-                    "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK",
+                    block_prompt,
                     [
                         {
                             "tool_calls": [
@@ -404,10 +482,12 @@ def test_private_manager_launch_send_read_and_sharing(
                         {"text": "MANAGER_BLOCKED"},
                     ],
                 )
-                send(manager, "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK")
+                send(manager, block_prompt)
                 wait_text(manager, "MANAGER_BLOCKED")
                 assert "MUST_NOT_DELIVER" not in json.dumps(items(worker))
                 assert "Shared sessions cannot" in json.dumps(get_mock_requests(mock))
+                if related:
+                    return
 
                 configure(
                     "SCHEDULED_MANAGER_TASK",

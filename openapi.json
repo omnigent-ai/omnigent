@@ -6931,6 +6931,11 @@
             "description": "Per-session reasoning-effort override to apply to the fork, e.g. `\"high\"`. **Omitting** the field inherits the source's effort; an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets it. Validated against the shared effort vocabulary; provider support is enforced at launch. Set by the web fork dialog's effort picker.",
             "title": "Reasoning Effort"
           },
+          "related_session": {
+            "default": false,
+            "title": "Related Session",
+            "type": "boolean"
+          },
           "sandbox_profile_id": {
             "anyOf": [
               {

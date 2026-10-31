@@ -4,9 +4,21 @@ An agent in a private session can send work to another session owned by the
 same user, then read its status/history. It can also create private top-level
 workers on its host or a new managed sandbox. This is enabled by default, with
 `-session_orchestration` in `OMNIGENT_FEATURES` as a server kill switch.
+With `related_sessions` enabled, agents can also create and coordinate full peers
+inside their existing group, including groups shared read-only.
 
 ## Sub-features
 
+- `group`: opt-in `related_session=true` creation with `same_host` or `managed`
+  placement keeps the root relationship, with a separate runner for a fresh
+  sandbox. Main and full peers can message each other as the owner, even when
+  the root is public read-only. Editable sharing remains blocked.
+- `group-discovery`: session listing includes manually created peers and their
+  role, status, host, creator and pending approvals; peers also see Main and
+  siblings. Completion reports are explicit ordinary messages, never broadcasts.
+- `group-placement`: cross-machine peer messages require a currently connected,
+  managed-token-authenticated destination. Personal hosts are only addressable
+  on the caller's own machine. Delete All reclaims unused descendant sandboxes.
 - `message`: private sender, same owner and workspace; shared destinations are
   allowed and their readers see the message. Normal queue/steering applies.
 - `read-results`: the manager reads history/status; replies are not forwarded.
@@ -25,7 +37,8 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
-- `sharing`: sharing the sender blocks subsequent sends and independent creates.
+- `sharing`: sharing the sender blocks outside-group sends and independent creates.
+  Within-group operations allow read-only sharing but still reject editor grants.
   Side chats and their children also inherit restrictions from the source chain.
   Accepted work, including tasks saved while a worker starts, continues. Making
   the sender private restores eligibility.
@@ -52,6 +65,10 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   to choose an authorized profile/revision from the
   [provider catalog](../docs/extending/provider_profiles.md).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
+- With `related_sessions` enabled, create a peer in Agents, then ask Main or
+  another peer to discover it, send a task and explicitly report completion
+  using `sys_session_message`. Ask for a peer in a fresh sandbox with
+  `sys_session_create(agent_id=..., placement="managed", related_session=true)`.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
@@ -114,10 +131,24 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   task and no independent worker. Read history/info to confirm reads still work.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
+- The grouped workflow extends
+  `tests/e2e/test_private_session_orchestration.py::test_private_manager_launch_send_read_and_sharing`
+  with the `group` cases: real SDK/native MCP creation, manual-peer discovery,
+  sibling tasks, explicit completion reports, and editable-sharing rejection.
+  Managed group provisioning and cross-host authorization use the existing
+  integration scenarios in `tests/server/integration/test_session_orchestration.py`;
+  provisioning is simulated, not a live provider run.
 
 ## Gotchas
 
-- "Created by" records origin only: workers remain top-level and have their own
+- A new managed peer's initial task is durably queued. Later cross-machine
+  messages wait for a verified sandbox connection. Laptop managers can launch
+  managed peers and poll them, but those peers cannot send executing messages
+  back to the laptop. Completion reports are ordinary messages that can start
+  a turn; they follow the same destination checks. No automatic subscriptions
+  or transcript forwarding are added. MCP checks do not confine arbitrary shell
+  code already holding owner credentials.
+- For independent workers, "Created by" records origin only: they have their own
   permissions and lifecycle. Sharing a worker does not share its creator; the
   opaque creator ID remains in worker metadata, but the UI resolves its title
   through a separate authorized read. Forks drop the creator label. Older
@@ -143,7 +174,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   the runner; independent creation has no automatic routing fallback.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
-- A shared receiver can continue working but cannot message back while shared.
+- A shared receiver can continue working. Only read-only groups allow owner-run
+  agents to message back while shared.
 - Privacy checks govern these tools. They do not confine arbitrary code holding
   owner credentials or sanitize shared content the manager reads.
 - The source token authenticates its runner, not an exact session within that

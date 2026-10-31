@@ -54,18 +54,16 @@ async def resolve_related_session_create(
 
     if not request.app.state.feature_flags.enabled(Feature.RELATED_SESSIONS):
         raise OmnigentError("Related sessions are disabled", code=ErrorCode.FORBIDDEN)
-    # ponytail: reuse the proven environment; remote placement needs delegated authorization.
     if (
         body.parent_session_id is not None
         or body.sub_agent_name is not None
-        or body.host_type != "external"
         or body.git is not None
         or body.workspaces is not None
         or body.project_id is not None
     ):
         raise OmnigentError(
             "Related sessions use their source environment and cannot specify "
-            "a parent, named sub-agent, sandbox, worktree or project",
+            "a parent, named sub-agent, worktree or project",
             code=ErrorCode.INVALID_INPUT,
         )
     if user_id is not None and permission_store is not None:
@@ -96,6 +94,20 @@ async def resolve_related_session_create(
         raise OmnigentError(
             "Related sessions require a source with a bound runner", code=ErrorCode.INVALID_INPUT
         )
+    if body.host_type == "managed":
+        from omnigent.server.session_orchestration import require_orchestration_source
+
+        sender = await asyncio.to_thread(
+            require_orchestration_source,
+            request,
+            user_id,
+            conversation_store,
+            permission_store,
+            related_create=True,
+        )
+        if sender.id != source.id:
+            raise OmnigentError("Related creation must use the sender", code=ErrorCode.FORBIDDEN)
+        return body.model_copy(update={"parent_session_id": root.id}), source
     from omnigent.runner.routing import routing_host_session
 
     placement = await asyncio.to_thread(routing_host_session, source, conversation_store)

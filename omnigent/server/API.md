@@ -601,19 +601,27 @@ already uploaded or registered an agent. The response is the full
     Opt-in full peer session, gated by `/v1/info.features.related_sessions`
     (default false). Requires ownership of the source's session tree and a
     bound source runner. The new session attaches directly to the tree root
-    and reuses the source's execution environment with fresh context. Select
+    and normally reuses the source's execution environment with fresh context. Select
     its registered `agent_id` and optional `model_override` independently.
-    Do not combine with `parent_session_id`, `sub_agent_name`, managed placement,
+    Do not combine with `parent_session_id`, `sub_agent_name`,
     a new project/worktree, or a different host/workspace. Public read-only
     sharing remains inherited from the root; a reader cannot create peers.
     The server stamps the protected `omnigent.session_role=peer` label and
     records the source in `omnigent.created_by_session_id`.
 
+    Authenticated `POST /v1/sessions/orchestrated` requests may combine this
+    field with `host_type="managed"`. The related source must be the bound
+    sending session; the new peer gets its own sandbox/runner and inherits
+    the group's visibility. Owner authority and `session_orchestration` are
+    required. Read-only sharing is allowed for group operations; editable
+    sharing remains blocked. Ordinary browser creation stays on the source.
+
     Enable `OMNIGENT_FEATURES=related_sessions` on the server for the draft UI.
     This adds no host, runner, or sandbox-provider handshake requirement; do
     not pass the new server flag to an older host/runner process. Existing
-    creation requests without this field retain their behavior. The MCP
-    orchestration tools keep their existing creation and approval boundaries.
+    creation requests without this field retain their behavior. MCP callers
+    opt in with `sys_session_create(related_session=true, placement="managed")`
+    or `placement="same_host"`. Native tool approval scopes are unchanged.
 
   initial_input (object or null)
     When `/v1/info` advertises `durable_initial_input: true`, managed creates
