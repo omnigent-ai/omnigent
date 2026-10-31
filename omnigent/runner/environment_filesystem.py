@@ -12,6 +12,7 @@ filesystem service.
 from __future__ import annotations
 
 import base64
+import errno
 import os
 import re
 import stat
@@ -204,6 +205,35 @@ _BENEATH_SUPPORTED = (
 )
 
 
+def _open_parent_beneath(root: Path, rel: str) -> tuple[int, str]:
+    """Open the parent of *root*/*rel* without following a symlinked component.
+
+    :param root: Absolute directory the path is relative to.
+    :param rel: ``/``-separated path relative to *root*.
+    :returns: A descriptor for the parent, which the caller closes, and the
+        leaf name.
+    :raises OSError: ``ELOOP`` when a parent is a symlink, otherwise the
+        error from opening a component.
+    """
+    *parents, leaf = rel.split("/")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in parents:
+            try:
+                next_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            except NotADirectoryError:
+                # Linux reports a symlinked directory as ENOTDIR under O_DIRECTORY.
+                if stat.S_ISLNK(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                    raise OSError(errno.ELOOP, "Symbolic link in path", name) from None
+                raise
+            os.close(fd)
+            fd = next_fd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, leaf
+
+
 def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
     """``lstat`` *root*/*rel* without letting any component be a symlink.
 
@@ -218,31 +248,75 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
     :returns: The leaf's own ``stat`` result, or ``None`` when any component
         is missing, is a symlink, or cannot be opened.
     """
-    parts = rel.split("/")
     if not _BENEATH_SUPPORTED:
         full = root / rel
-        real_root = os.path.realpath(root)
-        parent = os.path.realpath(full.parent)
-        if parent != real_root and not parent.startswith(real_root.rstrip(os.sep) + os.sep):
+        if not _parent_resolves_beneath(root, full):
             return None
         try:
             return full.lstat()
         except OSError:
             return None
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        fd, leaf = _open_parent_beneath(root, rel)
     except OSError:
         return None
     try:
-        for name in parts[:-1]:
-            nfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
-            os.close(fd)
-            fd = nfd
-        return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+        return os.stat(leaf, dir_fd=fd, follow_symlinks=False)
     except OSError:
         return None
     finally:
         os.close(fd)
+
+
+def _parent_resolves_beneath(root: Path, full: Path) -> bool:
+    """Return whether *full*'s parent resolves to *root* or a directory inside it."""
+    real_root = os.path.realpath(root)
+    parent = os.path.realpath(full.parent)
+    return parent == real_root or parent.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
+def compare_file_beneath(
+    root: Path, rel: str, expected: bytes | None
+) -> tuple[os.stat_result, bool]:
+    """Stat *root*/*rel* and report whether it is a regular file holding *expected*.
+
+    Like :func:`_lstat_beneath`, no component is followed if it is a symlink.
+    Only a regular file is opened, without blocking, so a FIFO or device at
+    the path cannot stall the caller, and only a file of the expected size
+    is read.
+
+    :param root: Absolute directory the path is relative to.
+    :param rel: ``/``-separated path relative to *root*, e.g. ``"src/foo.py"``.
+    :param expected: Content to compare against, or ``None`` to only stat.
+    :returns: The leaf's own ``stat`` result and whether its content equals
+        *expected*.
+    :raises FileNotFoundError: When the path does not exist.
+    :raises NotADirectoryError: When a parent component is not a directory.
+    :raises OSError: When a parent is a symlink or the path cannot be read.
+    """
+    if not _BENEATH_SUPPORTED:
+        full = root / rel
+        if not _parent_resolves_beneath(root, full):
+            raise OSError(errno.ELOOP, "Path leaves the workspace", rel)
+        leaf_stat = full.lstat()
+        if expected is None or not stat.S_ISREG(leaf_stat.st_mode):
+            return leaf_stat, False
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(full, flags | getattr(os, "O_NONBLOCK", 0))
+    else:
+        dir_fd, leaf = _open_parent_beneath(root, rel)
+        try:
+            leaf_stat = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
+            if expected is None or not stat.S_ISREG(leaf_stat.st_mode):
+                return leaf_stat, False
+            file_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    with os.fdopen(file_fd, "rb") as handle:
+        file_stat = os.fstat(handle.fileno())
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size != len(expected):
+            return file_stat, False
+        return file_stat, handle.read(len(expected) + 1) == expected
 
 
 def search_indexed_paths(

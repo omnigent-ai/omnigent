@@ -7509,7 +7509,8 @@ async def _seed_os_env_snapshot(
     :meth:`~omnigent.runtime.filesystem_registry.FilesystemRegistry.seed_snapshot`
     so the before/after diff endpoint can show the original content.
     Silently skips when the file does not yet exist (new-file creates have no
-    baseline) or when any other read error occurs.
+    baseline), when it is binary (its content is not returned as text), or
+    when any other read error occurs.
 
     :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
         the current tool dispatch — reused to avoid opening a second connection.
@@ -7519,7 +7520,7 @@ async def _seed_os_env_snapshot(
     """
     try:
         existing = await os_env.read(path=path, offset=1, limit=None)
-        if isinstance(existing, dict) and "content" in existing:
+        if isinstance(existing, dict) and existing.get("encoding") == "utf-8":
             filesystem_registry.seed_snapshot(
                 path, existing["content"], session_id=conversation_id
             )

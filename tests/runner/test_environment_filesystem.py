@@ -1778,6 +1778,145 @@ async def test_changes_report_an_edited_file_deleted_outside_the_session(
 
 
 @pytest.mark.asyncio
+async def test_changes_drop_a_new_file_deleted_outside_the_session(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """A file the session created and a shell then removed leaves nothing to review."""
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    created = await client.put(
+        f"{base}/filesystem/notes.txt", json={"content": "new", "encoding": "utf-8"}
+    )
+    assert created.status_code == 200, created.text
+    listed = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(e["path"], e["status"]) for e in listed] == [("notes.txt", "created")]
+
+    (workspace / "notes.txt").unlink()
+
+    assert (await client.get(f"{base}/changes")).json()["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_changes_keep_edits_made_in_a_forked_copy_of_the_workspace(workspace: Path) -> None:
+    """A forked session edits a private copy, so the original tree cannot confirm a revert."""
+    forked = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            fork=True,
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert forked is not None
+    registry = SessionResourceRegistry()
+    registry._primary_envs["conv_test"] = forked
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            for path, content in (("hello.txt", "edited"), ("notes.txt", "new")):
+                written = await client.put(
+                    f"{base}/filesystem/{path}", json={"content": content, "encoding": "utf-8"}
+                )
+                assert written.status_code == 200, written.text
+            listed = (await client.get(f"{base}/changes")).json()["data"]
+            diff = await client.get(f"{base}/diff/notes.txt")
+    finally:
+        forked.close()
+
+    assert (workspace / "hello.txt").read_text() == "hello world"
+    assert not (workspace / "notes.txt").exists()
+    assert sorted((e["path"], e["status"]) for e in listed) == [
+        ("hello.txt", "modified"),
+        ("notes.txt", "created"),
+    ]
+    assert diff.status_code == 200, diff.text
+    assert diff.json()["after"] == "new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "edits_land_in", ["copy-on-write-spec", "forked-spec", "copy-on-write-environment"]
+)
+async def test_changes_keep_recorded_edits_the_runner_cannot_see(
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edits_land_in: str,
+) -> None:
+    """Overlay and forked writes leave the runner's tree unchanged, so it must not reconcile."""
+    from omnigent.inner.datamodel import WritePathSpec
+
+    os_env = OSEnvSpec(
+        type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none")
+    )
+    if edits_land_in == "copy-on-write-spec":
+        os_env = OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=[WritePathSpec(".", True)]),
+        )
+    elif edits_land_in == "forked-spec":
+        os_env = OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            fork=True,
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    else:
+        monkeypatch.setitem(
+            registry._primary_envs,
+            "conv_test",
+            SimpleNamespace(
+                cwd=workspace, sandbox=SimpleNamespace(copy_on_write_roots=[workspace])
+            ),
+        )
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        """Return the session snapshot that points at the agent under test."""
+        if request.url.path != "/v1/sessions/conv_test":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "ag_test"})
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> object:
+        """Return the agent spec whose os_env decides where edits land."""
+        return SimpleNamespace(os_env=os_env)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler), base_url="http://server"
+    )
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=workspace,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    changes = app.state.filesystem_registry
+    changes.seed_snapshot("hello.txt", "hello world", session_id="conv_test")
+    changes.record_change("hello.txt", "modified", "conv_test")
+    changes.record_change("notes.txt", "created", "conv_test")
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as client,
+    ):
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert sorted((e["path"], e["status"]) for e in resp.json()["data"]) == [
+        ("hello.txt", "modified"),
+        ("notes.txt", "created"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_diff_endpoint_returns_full_after_for_large_file(
     registry: SessionResourceRegistry,
     workspace: Path,

@@ -2715,6 +2715,36 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_os_env_write_emptying_a_binary_file_stays_in_changes(tmp_path: Path) -> None:
+    """A binary file's text read is empty, so it must not become the baseline."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.spec.types import AgentSpec
+
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\xff")
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+
+    await _execute_os_env_tool(
+        "sys_os_write",
+        {"path": "logo.png", "content": ""},
+        agent_spec=spec,
+        conversation_id="conv_binary_truncate",
+        filesystem_registry=filesystem_registry,
+    )
+
+    assert (tmp_path / "logo.png").read_bytes() == b""
+    listed = filesystem_registry.list_changed_files("conv_binary_truncate", limit=10)
+    assert [(r["path"], r["status"], r["bytes"]) for r in listed] == [("logo.png", "modified", 0)]
+
+
+@pytest.mark.asyncio
 async def test_runner_os_env_cleanup_is_off_loop_and_cancellation_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

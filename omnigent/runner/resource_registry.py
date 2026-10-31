@@ -1014,6 +1014,13 @@ class SessionResourceRegistry:
                 getattr(getattr(environment, "sandbox", None), "copy_on_write_roots", None)
             )
 
+    def primary_environment_root(self, session_id: str) -> Path | None:
+        """Return the working directory of the session's cached primary environment."""
+        with self._lock:
+            environment = self._primary_envs.get(session_id)
+        root = getattr(environment, "cwd", None)
+        return Path(root) if root is not None else None
+
     def _resolve_terminal_environment(self, session_id: str, spec: OSEnvSpec) -> OSEnvironment:
         """Resolve the environment shared by inherited terminals and file tools."""
         return self._resolve_primary(session_id, None, os_env_spec=spec)

@@ -716,10 +716,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # so the diff endpoint can return the true pre-modification state.
         self._snapshots: dict[str, str] = {}
         self._snapshots_lock = threading.Lock()
-        # Per-session snapshot ownership: session_id → set of normalized paths
-        # registered by that session.  Used by ``unregister_conversation`` to
-        # evict snapshot entries when a session ends, preventing unbounded growth.
-        self._snapshot_sessions: dict[str, set[str]] = {}
+        # Per-session snapshots: session_id → {normalized path → content that
+        # session saw first}.  Disk reconciliation compares against these, and
+        # ``unregister_conversation`` evicts the paths a session registered.
+        self._session_snapshots: dict[str, dict[str, str]] = {}
 
     def record_change(
         self,
@@ -778,7 +778,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._lock:
             self._session_events.pop(conversation_id, None)
         with self._snapshots_lock:
-            paths = self._snapshot_sessions.pop(conversation_id, set())
+            paths = self._session_snapshots.pop(conversation_id, {})
             for p in paths:
                 self._snapshots.pop(p, None)
 
@@ -825,7 +825,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         records = [
             record
             for event in by_path.values()
-            if (record := self._change_record(event, check_disk=check_disk)) is not None
+            if (record := self._change_record(conversation_id, event, check_disk=check_disk))
+            is not None
         ]
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
@@ -861,21 +862,28 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         if op is None:
             return None
         return self._change_record(
-            dataclasses.replace(events[-1], operation=op), check_disk=check_disk
+            session_id, dataclasses.replace(events[-1], operation=op), check_disk=check_disk
         )
 
-    def _change_record(self, event: _FileEvent, *, check_disk: bool) -> dict[str, Any] | None:
+    def _change_record(
+        self, session_id: str, event: _FileEvent, *, check_disk: bool
+    ) -> dict[str, Any] | None:
         """Return the file record for *event*'s net change, or ``None`` if nothing differs.
 
         Reverts and deletes made outside a tool call record no event, so with
         *check_disk* the net operation is checked against the file now on disk.
-        A file whose content matches its snapshot has no change left to show.
+        A file whose content matches the snapshot *session_id* took has no
+        change left to show.
         """
+        from omnigent.runner.environment_filesystem import compare_file_beneath
+
         status, size, modified_at = event.operation, event.bytes, event.modified_at
         if check_disk:
-            abs_path = self._cwd / event.path
+            baseline = (
+                None if status == "created" else self._session_baseline(session_id, event.path)
+            )
             try:
-                stat = abs_path.stat()
+                stat, matches = compare_file_beneath(self._cwd, event.path, baseline)
             except (FileNotFoundError, NotADirectoryError):
                 if status == "created":
                     return None
@@ -883,24 +891,21 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             except OSError:
                 pass
             else:
+                if matches:
+                    return None
                 if status != "created":
-                    if self._matches_snapshot(event.path, abs_path, stat.st_size):
-                        return None
                     status = "modified"
                 size, modified_at = stat.st_size, int(stat.st_mtime)
         return {"path": event.path, "status": status, "bytes": size, "modified_at": modified_at}
 
-    def _matches_snapshot(self, path: str, abs_path: Path, size: int) -> bool:
-        """Return whether *abs_path* holds exactly the snapshot seeded for *path*."""
+    def _session_baseline(self, session_id: str, path: str) -> bytes | None:
+        """Return the bytes *session_id* saw in *path* before its first change."""
         with self._snapshots_lock:
-            baseline = self._snapshots.get(path)
-        if baseline is None:
-            return False
+            baseline = self._session_snapshots.get(session_id, {}).get(path)
         try:
-            expected = baseline.encode("utf-8")
-            return len(expected) == size and abs_path.read_bytes() == expected
-        except (OSError, UnicodeEncodeError):
-            return False
+            return None if baseline is None else baseline.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
 
     def get_baseline(self, path: str) -> str | None:
         """Return the pre-modification baseline content of *path*, or ``None``.
@@ -941,7 +946,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             if norm not in self._snapshots:
                 self._snapshots[norm] = content
             if session_id:
-                self._snapshot_sessions.setdefault(session_id, set()).add(norm)
+                self._session_snapshots.setdefault(session_id, {}).setdefault(norm, content)
 
 
 # ── Git-backed implementation ─────────────────────────────────────────────────

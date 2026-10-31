@@ -1020,14 +1020,23 @@ def register_resource_routes(
             )
         return spec
 
-    def _changes_visible_on_disk(session_id: str, spec: AgentSpec | None) -> bool:
-        """Copy-on-write sessions write into an overlay the runner cannot read."""
+    def _changes_visible_on_disk(
+        session_id: str, spec: AgentSpec | None, registry: FilesystemRegistry
+    ) -> bool:
+        """Whether the session's edits land in the files under *registry*'s root.
+
+        Copy-on-write sessions write into an overlay the runner cannot read, and
+        forked sessions write into a private copy of the workspace.
+        """
         from omnigent.sandbox.copy_on_write import has_copy_on_write
 
-        return not (
-            has_copy_on_write(getattr(spec, "os_env", None))
-            or resource_registry.uses_copy_on_write(session_id)
-        )
+        os_env_spec = getattr(spec, "os_env", None)
+        if has_copy_on_write(os_env_spec) or getattr(os_env_spec, "fork", False):
+            return False
+        if resource_registry.uses_copy_on_write(session_id):
+            return False
+        root = resource_registry.primary_environment_root(session_id)
+        return root is None or root.resolve() == registry.cwd
 
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem")
     async def list_environment_root(
@@ -1226,7 +1235,7 @@ def register_resource_routes(
                     session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
-                    check_disk=_changes_visible_on_disk(session_id, agent_spec),
+                    check_disk=_changes_visible_on_disk(session_id, agent_spec, session_registry),
                 )
                 if session_registry is not None
                 else []
@@ -1303,7 +1312,7 @@ def register_resource_routes(
                     session_registry.get_changed_file,
                     session_id,
                     relative_path,
-                    check_disk=_changes_visible_on_disk(session_id, agent_spec),
+                    check_disk=_changes_visible_on_disk(session_id, agent_spec, session_registry),
                 )
                 if session_registry is not None
                 else None
@@ -1786,7 +1795,8 @@ def register_resource_routes(
             create_parents=create_parents,
         )
         if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+            operation = "created" if result.created else "modified"
+            filesystem_registry.record_change(relative_path, operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
