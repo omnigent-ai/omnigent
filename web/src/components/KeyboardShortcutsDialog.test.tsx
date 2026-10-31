@@ -207,7 +207,7 @@ describe("KeyboardShortcutsDialog", () => {
   it("shows the pinned-session shortcut with the Alt chord in a plain browser", () => {
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to pinned session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
     expect(row).toBeTruthy();
     // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…0 chip.
     expect(within(row!).getByText("Alt")).toBeTruthy();
@@ -218,7 +218,7 @@ describe("KeyboardShortcutsDialog", () => {
     isNativeShell.mockReturnValue(true);
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to pinned session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
     expect(row).toBeTruthy();
     expect(within(row!).queryByText("Alt")).toBeNull();
     expect(within(row!).getByText("1…0")).toBeTruthy();

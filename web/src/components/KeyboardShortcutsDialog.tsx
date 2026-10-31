@@ -28,6 +28,7 @@ import {
   NEW_TERMINAL_KEYS,
   newSessionShortcutKeys,
   PIN_SESSION_KEYS,
+  sessionNumberShortcutKeys,
   QUIT_KEYS,
   SHIFT_KEY,
   SPLIT_TERMINAL_KEYS,
@@ -176,14 +177,14 @@ const DESKTOP_COMMAND_SHORTCUTS: Shortcut[] = [
   { label: "Quit Omnigent", keys: [...QUIT_KEYS] },
 ];
 
-// Numeric pinned-session jump. The chord is platform-aware (see
-// usePinnedSessionHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
+// Numbered sidebar-session jump. The chord is platform-aware (see
+// useSessionNumberHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
 // Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
 // native tab-switching. Shown in both, with the matching glyphs.
-function pinnedSessionShortcut(native: boolean): Shortcut {
+function sessionNumberShortcut(native: boolean): Shortcut {
   return {
-    label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
+    label: "Jump to a sidebar session (1–10)",
+    keys: sessionNumberShortcutKeys("1…0", native),
   };
 }
 
@@ -240,7 +241,7 @@ function shortcutGroupsFor(
         items: [
           ...(electron ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }] : []),
           ...group.items,
-          pinnedSessionShortcut(native),
+          sessionNumberShortcut(native),
         ],
       };
     }

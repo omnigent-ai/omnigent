@@ -6,7 +6,7 @@
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PINNED_HOTKEY_DIGITS, usePinnedSessionHotkeys } from "./usePinnedSessionHotkeys";
+import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "./useSessionNumberHotkeys";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -38,7 +38,7 @@ function press(
 
 /** Render on macOS (⌘) by default; pass isMac=false for the Ctrl (Win/Linux) path. */
 function render(ids: readonly string[], activeId: string | undefined, isMac = true) {
-  return renderHook(() => usePinnedSessionHotkeys(ids, activeId, isMac));
+  return renderHook(() => useSessionNumberHotkeys(ids, activeId, isMac));
 }
 
 beforeEach(() => {
@@ -50,11 +50,11 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-describe("usePinnedSessionHotkeys", () => {
+describe("useSessionNumberHotkeys", () => {
   const ids = ["a", "b", "c"];
 
   it("exposes ten digits mapping 1–9 then 0", () => {
-    expect(PINNED_HOTKEY_DIGITS).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]);
+    expect(SESSION_HOTKEY_DIGITS).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]);
   });
 
   it("Cmd+1 opens the first pinned session", () => {

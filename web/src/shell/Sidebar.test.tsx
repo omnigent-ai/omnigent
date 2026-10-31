@@ -2888,6 +2888,31 @@ describe("Sidebar project Show more", () => {
     expect(folderRowIds()).toEqual([...filedIds(6), "conv_older"]);
   });
 
+  it("numbers the sessions above a folder's Show more and continues in the next folder", () => {
+    projectsMock.push("Customer X", "Customer Y");
+    mockConversations([
+      ...filedSessions(7),
+      conv("conv_other_folder", "Claude Code", {
+        labels: { omni_project: "Customer Y" },
+        updated_at: 1,
+      }),
+    ]);
+    localStorage.setItem(
+      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+      JSON.stringify(["Customer X", "Customer Y"]),
+    );
+    renderOnSession("conv_filed_1");
+
+    // Five rows show above Customer X's Show more, so the sixth number is Customer Y's row.
+    fireEvent.keyDown(window, {
+      code: "Digit6",
+      key: "6",
+      altKey: true,
+      ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
+    });
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
+  });
+
   it("steps the session hotkey past the sessions behind Show more", () => {
     projectsMock.push("Customer X", "Customer Y");
     mockConversations([
