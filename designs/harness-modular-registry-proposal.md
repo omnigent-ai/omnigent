@@ -470,6 +470,7 @@ signature.
 | 1.7 Server seeding loop | landed | #3599 | 07-31 |
 | 1.7 follow-up: opencode e2e onto shared agent-name constant | landed | #3656 | 07-31 |
 | 1.8 Derive enumerations + fork_history/shell-tool capability axes | landed | #3648 | 07-31 |
+| 2.1 Validator flip (accept community native harnesses) | in review | (this PR) | — |
 
 **1.4 descoped.** The CLI-subcommand collapse (`cli_native.py` → a loop over
 `native_agents()`) is orthogonal to making native harnesses community-pluggable:
