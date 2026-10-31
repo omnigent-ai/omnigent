@@ -652,6 +652,9 @@ def create_skill_marketplace_router(
                 skill.ref,
                 [skill.name],
                 path=skill.path,
+                # The skill may have moved: look under the directories above it,
+                # nearest first, before giving up.
+                fallback_paths=ancestor_paths(skill.path)[-2::-1],
             )
         except GitSourceError as exc:
             raise _invalid(exc) from None

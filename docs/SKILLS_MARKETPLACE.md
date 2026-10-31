@@ -42,8 +42,10 @@ github.com.
 
 A link into a directory (`/tree/<ref>/team-a`, or the `path` field of the
 API and of a configured source) makes that directory the catalog root, so a
-monorepo can keep each team's skills under its own folder. A link to one
-skill's directory lists just that skill. A source is one repository, ref and
+monorepo can keep each team's skills under its own folder. A link straight to
+a `skills/` folder (`/tree/<ref>/team-a/skills`) lists the skills in it, and a
+link to one skill's directory lists just that skill. A catalog that finds
+nothing says where it looked. A source is one repository, ref and
 directory: the same repository at its root and at `team-a` are two sources.
 
 ## How a skill reaches a session
@@ -216,7 +218,7 @@ Under `/v1`, mounted only when the feature is on:
 | `POST /skill-catalog` | Index any GitHub repository (the Add-from-URL path; a listed source only when `allow_url_install` is off) |
 | `GET/POST /installed-skills` | List (paged: `limit`, and `after` set to the previous page's `last_id`, an opaque cursor that survives the row's removal), and install by name from a repository |
 | `PATCH/DELETE /installed-skills/{id}` | Enable or disable, and remove |
-| `POST /installed-skills/{id}/update` | Refetch from the skill's directory at the same ref |
+| `POST /installed-skills/{id}/update` | Refetch from the skill's directory at the same ref, or by name from the directories above it when the skill moved |
 | `GET /installed-skills/{id}/content` | The stored `SKILL.md` |
 
 `GET /v1/skills` lists installed skills alongside bundled and host skills, with
