@@ -349,6 +349,9 @@ class ServerInfoResponse(BaseModel):
     # Declining a non-blocking Codex question card leaves the turn running; older
     # servers interrupt Codex, so the forwarder keeps those questions in the terminal.
     codex_nonblocking_decline: bool = False
+    # POST /v1/sessions/{id}/rewind and GET .../items?type=; absent on older servers,
+    # which clients treat as unsupported.
+    session_rewind: bool = False
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
@@ -3807,6 +3810,7 @@ def create_app(
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "session_claude_sdk_clear": True,
                 "codex_nonblocking_decline": True,
+                "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "session_title_instructions": user_settings_store is not None,
