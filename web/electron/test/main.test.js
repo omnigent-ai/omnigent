@@ -690,7 +690,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -3853,6 +3853,26 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
   });
 
+  it("reconnects behind the overlay when the workspace never responds", async (t) => {
+    let loads = 0;
+    const h = browserHarness(t, [25], {
+      loadURL: () => (loads++ === 0 ? new Promise(() => {}) : Promise.resolve()),
+    });
+    h.api.setServerResponseTimeoutMs(20);
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, undefined, { loadUrl: page }), {
+      code: "ERR_TIMED_OUT",
+    });
+    assert.equal(h.overlay.hint, "Check your network connection.");
+    assert.equal(h.calls.loading.at(-1).action, "hide");
+    await until(
+      () => h.calls.loadURL.length === 2 && h.api.windows.get(h.win).origin === origin,
+      "the reopened page",
+    );
+    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(h.overlay.hint, null);
+  });
+
   it("keeps the overlay up when a background session retry fails", async (t) => {
     const h = browserHarness(t, [20, 20], {
       ensureSession: async () => {
@@ -4930,6 +4950,68 @@ it("dismisses native loading feedback when the server document fails", async (t)
   const shown = h.calls.loading.find((call) => call.action === "show");
   assert.equal(shown.label, "Opening Omnigent…");
   assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+});
+
+describe("server response deadline (src/main.js)", () => {
+  const server = "http://127.0.0.1:6767";
+
+  function stalledHarness(t, loadServer) {
+    const h = loadNavigationHarness({ serverUrl: server, loadServer });
+    t.after(h.cleanup);
+    h.stops = 0;
+    h.webContents.stop = () => {
+      h.stops++;
+    };
+    h.api.setServerResponseTimeoutMs(20);
+    return h;
+  }
+
+  it("returns to setup with a timeout when the server accepts but never responds", async (t) => {
+    const events = [];
+    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      events.push(args),
+    );
+    const h = stalledHarness(t, () => new Promise(() => {}));
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { code: "ERR_TIMED_OUT" });
+    await wait(0);
+    assert.equal(h.stops, 1);
+    assert.equal(h.calls.loadFile.length, 1);
+    const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+    assert.deepEqual(
+      [params.get("error"), params.get("url")],
+      ["ERR_TIMED_OUT (-7)", `${server}/`],
+    );
+    const shown = h.calls.loading.find((call) => call.action === "show");
+    assert.equal(shown.label, "Opening Omnigent…");
+    assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+    const recorded = (name) =>
+      events.filter(([event]) => event === name).map(([, fields]) => fields);
+    assert.deepEqual(
+      recorded("navigation_failed").map(({ origin, code }) => [origin, code]),
+      [[server, "net_7"]],
+    );
+    assert.deepEqual(
+      recorded("connection_result").map(({ outcome, code }) => [outcome, code]),
+      [["failed", "ERR_TIMED_OUT"]],
+    );
+  });
+
+  it("keeps loading a server document that responded before the deadline", async (t) => {
+    let finishLoad;
+    const h = stalledHarness(t, (url) => {
+      h.emit("did-navigate", url, 200, "OK");
+      return new Promise((resolve) => {
+        finishLoad = resolve;
+      });
+    });
+    const pending = h.api.loadServerUrl(h.win, server);
+    await wait(60);
+    assert.equal(h.stops, 0);
+    assert.deepEqual(h.calls.loadFile, []);
+    finishLoad();
+    assert.equal(await pending, server);
+    assert.equal(h.calls.loading.at(-1).action, "hide");
+  });
 });
 
 describe("OIDC system-browser sign-in wiring", () => {
