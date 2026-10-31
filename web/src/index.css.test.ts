@@ -1085,6 +1085,18 @@ describe("index.css text selection colors", () => {
   });
 });
 
+describe("index.css full-width chat preference", () => {
+  const ruleFor = (target: string) =>
+    cssBlocks
+      .map(([block]) => block)
+      .find((block) => selectorOf(block) === `:root[data-full-width-chat] ${target}`);
+
+  it("widens the shared chat column and lifts the assistant prose cap", () => {
+    expect(ruleFor(".chat-column")).toContain("--chat-column-width: 100%");
+    expect(ruleFor(".is-assistant")).toContain("--chat-prose-width: none");
+  });
+});
+
 describe("index.css mobile settings title", () => {
   const titleRule = cssSource.match(/\.settings-page-title \{[^}]*\}/)?.[0];
   const headerFadeRule = cssSource.match(/\.settings-mobile-header::before \{[^}]*\}/)?.[0];

@@ -1625,6 +1625,16 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
+/* Full-width chat (Appearance setting / lib/fullWidthChatPreferences.ts).
+ * Unlayered, so it beats the column's Tailwind width utilities. */
+:root[data-full-width-chat] .chat-column {
+  --chat-column-width: 100%;
+}
+
+:root[data-full-width-chat] .is-assistant {
+  --chat-prose-width: none;
+}
+
 /* Prose shares one limit in ordinary replies and replies with wide content. */
 .chat-markdown > :is(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
   max-width: var(--chat-prose-width, 80ch);

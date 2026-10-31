@@ -240,6 +240,12 @@ import {
   notifyHiddenPickerAgentsChanged,
 } from "@/lib/pickerEntryVisibility";
 import {
+  applyFullWidthChat,
+  DEFAULT_FULL_WIDTH_CHAT,
+  readFullWidthChat,
+  writeFullWidthChat,
+} from "@/lib/fullWidthChatPreferences";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -966,6 +972,34 @@ function FoldAssistantNarrationControl() {
   );
 }
 
+/** Let the chat column and assistant prose span the full pane width. */
+function FullWidthChatControl() {
+  const [value, setValue] = useState(() => readFullWidthChat());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeFullWidthChat(next);
+    applyFullWidthChat(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Full-width chat"
+        labelId={labelId}
+        description="Let messages and the composer use the full width of the chat pane instead of a centered reading column."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="full-width-chat-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.full_width_chat"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
@@ -995,6 +1029,9 @@ function AppearanceSection() {
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
 
+    writeFullWidthChat(DEFAULT_FULL_WIDTH_CHAT);
+    applyFullWidthChat(DEFAULT_FULL_WIDTH_CHAT);
+
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
@@ -1023,6 +1060,7 @@ function AppearanceSection() {
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
           HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+          "omnigent:full-width-chat",
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -1063,6 +1101,7 @@ function AppearanceSection() {
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
       applyCustomTheme(readCustomTheme());
+      applyFullWidthChat(readFullWidthChat());
 
       setIsImportDialogOpen(false);
       setResetKey((k) => k + 1);
@@ -1097,6 +1136,9 @@ function AppearanceSection() {
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <FoldAssistantNarrationControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <FullWidthChatControl />
             </div>
           </SettingsGroup>
 
