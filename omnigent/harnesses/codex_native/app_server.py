@@ -135,6 +135,7 @@ _EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
 _EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CLOSE_TIMEOUT_SECONDS = 2.0
+_MODEL_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -189,6 +190,8 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 # Codex rejects permission flags on remote resume starting with this release.
 _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
+# Codex refuses turns on threads recorded under a provider other than its effective one.
+_MIN_MODEL_PROVIDER_CHECK_CODEX_VERSION = (0, 166, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
@@ -1124,6 +1127,26 @@ def is_active_writer_error(exc: BaseException) -> bool:
         and exc.message is not None
         and _CODEX_ACTIVE_WRITER_ERROR in exc.message
     )
+
+
+def codex_resume_current_model_provider(exc: BaseException) -> str | None:
+    """
+    Return the provider Codex requires after a ``thread/resume`` provider mismatch.
+
+    Codex 0.166+ resumes a thread only under its effective provider, and a
+    managed config layer can outrank the launch's ``-c model_provider`` pin.
+
+    :param exc: The exception raised by the resume request.
+    :returns: Codex's current provider, e.g. ``"Databricks"``, or ``None`` for
+        any other failure.
+    """
+    if not isinstance(exc, CodexAppServerResponseError) or exc.code != _CODEX_INVALID_REQUEST_CODE:
+        return None
+    data = exc.error.get("data") if isinstance(exc.error, dict) else None
+    if not isinstance(data, dict) or data.get("type") != "modelProviderMismatch":
+        return None
+    current = data.get("currentModelProvider")
+    return current if isinstance(current, str) and current else None
 
 
 def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
@@ -2197,7 +2220,9 @@ class CodexNativeAppServer:
     :param socket_path: Codex app-server Unix socket path.
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param env: Environment for the app-server subprocess.
-    :param config_overrides: Codex ``-c`` config override values.
+    :param config_overrides: Codex ``-c`` config override values. After
+        :meth:`start`, a ``model_provider`` pin names the provider Codex
+        actually runs, which a managed config layer can force.
     :param developer_instructions: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) appended to the private
         session config before app-server startup.
@@ -2617,6 +2642,7 @@ class CodexNativeAppServer:
                             _pin_codex_config_effort(
                                 self.codex_home, resolved_effort, effective_model
                             )
+                await self._pin_effective_model_provider(startup_client)
                 if self.policy_hook_disabled_reason is None:
                     try:
                         await self._trust_policy_hooks(client=startup_client)
@@ -2659,6 +2685,51 @@ class CodexNativeAppServer:
                 "Codex app-server startup failed before cleanup",
                 extra=self._startup_snapshot_event("codex_app_server_start_failed", exc),
             )
+
+    async def _pin_effective_model_provider(self, client: CodexAppServerClient) -> None:
+        """
+        Repoint the launch's ``model_provider`` pin at Codex's effective provider.
+
+        A managed config layer outranks ``-c model_provider``, but a ``--remote``
+        TUI still starts its thread under the pinned provider, and Codex 0.166+
+        then refuses every turn on that thread.
+
+        :param client: Initialized startup client.
+        :returns: None.
+        """
+        if (
+            self.codex_cli_version is not None
+            and self.codex_cli_version < _MIN_MODEL_PROVIDER_CHECK_CODEX_VERSION
+        ) or not any(
+            override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX)
+            for override in self.config_overrides
+        ):
+            return
+        try:
+            response = await asyncio.wait_for(
+                client.request("config/read", {"includeLayers": False, "cwd": str(self.cwd)}),
+                timeout=_MODEL_PROVIDER_READ_TIMEOUT_SECONDS,
+            )
+        except Exception:  # the launch's own pin is still usable
+            _logger.warning("Could not read Codex's effective model provider", exc_info=True)
+            return
+        result = response.get("result")
+        config = result.get("config") if isinstance(result, dict) else None
+        effective = config.get("model_provider") if isinstance(config, dict) else None
+        if not isinstance(effective, str) or not effective:
+            return
+        pin = f"{_MODEL_PROVIDER_OVERRIDE_PREFIX}{json.dumps(effective)}"
+        overrides = [
+            pin if override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX) else override
+            for override in self.config_overrides
+        ]
+        if overrides != self.config_overrides:
+            _logger.warning(
+                "Codex runs model provider %r over this launch's pin (likely a managed "
+                "config); the terminal uses it too",
+                effective,
+            )
+            self.config_overrides = overrides
 
     async def _trust_policy_hooks(self, *, client: CodexAppServerClient | None = None) -> None:
         """
@@ -4881,6 +4952,40 @@ def _set_codex_resume_config_value(config: CodexParams, key: str, value: object)
     config[key] = value
 
 
+def _restamp_codex_rollout_model_provider(rollout_path: Path, model_provider: str) -> None:
+    """
+    Rewrite a rollout's ``session_meta.model_provider``, keeping every later record.
+
+    :param rollout_path: Rollout JSONL whose first record is ``session_meta``.
+    :param model_provider: Provider id to record, e.g. ``"Databricks"``.
+    :raises ValueError: If the rollout does not start with ``session_meta``.
+    """
+    tmp: Path | None = None
+    try:
+        with rollout_path.open("rb") as source:
+            record = json.loads(source.readline())
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(payload, dict) or record.get("type") != "session_meta":
+                raise ValueError(f"{rollout_path} does not start with session_meta")
+            payload["model_provider"] = model_provider
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=rollout_path.parent,
+                prefix=f".{rollout_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as target:
+                tmp = Path(target.name)
+                target.write(json.dumps(record, separators=(",", ":")).encode() + b"\n")
+                while chunk := source.read(1 << 20):
+                    target.write(chunk)
+        os.replace(target.name, rollout_path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
 async def preload_codex_thread_for_resume(
     transport: str,
     thread_id: str,
@@ -4889,6 +4994,7 @@ async def preload_codex_thread_for_resume(
     retain_client: bool = False,
     cwd: Path | None = None,
     model_provider: str | None = None,
+    rollout_path: Path | None = None,
 ) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -4909,6 +5015,9 @@ async def preload_codex_thread_for_resume(
     :param cwd: Session working directory for resolving additional writable roots.
     :param model_provider: Launch-selected provider to apply over persisted thread settings.
         None preserves Codex's default resume behavior.
+    :param rollout_path: Thread rollout to restamp when Codex refuses the resume
+        because its effective provider differs, e.g. under a managed config.
+        None surfaces that refusal.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -4960,14 +5069,27 @@ async def preload_codex_thread_for_resume(
                 )
             )
             params["cwd"] = str(effective_cwd)
-        await client.request(
-            "thread/resume",
-            {
-                "threadId": thread_id,
-                "excludeTurns": True,
-                **params,
-            },
-        )
+        resume_params: CodexParams = {"threadId": thread_id, "excludeTurns": True, **params}
+        try:
+            await client.request("thread/resume", resume_params)
+        except CodexAppServerResponseError as exc:
+            current_provider = codex_resume_current_model_provider(exc)
+            if current_provider is None or rollout_path is None:
+                raise
+            _logger.warning(
+                "Codex resumes thread %s only under its effective provider %r "
+                "(requested %r); restamping %s",
+                thread_id,
+                current_provider,
+                model_provider,
+                rollout_path,
+            )
+            await asyncio.to_thread(
+                _restamp_codex_rollout_model_provider, rollout_path, current_provider
+            )
+            await client.request(
+                "thread/resume", {**resume_params, "modelProvider": current_provider}
+            )
         if retain_client:
             retained = True
             return client
