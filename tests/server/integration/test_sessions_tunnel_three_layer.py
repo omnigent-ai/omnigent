@@ -2444,6 +2444,137 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("status", ["idle", "failed"])
+@pytest.mark.parametrize("pending_history", [False, True])
+@pytest.mark.parametrize("fail_first_init", [False, True])
+async def test_child_completion_initializes_deferred_parent_inbox(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    pending_history: bool,
+    fail_first_init: bool,
+) -> None:
+    """A cold parent's real inbox receives one result without replaying an old turn."""
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.runner import subagent_work
+    from omnigent.runtime import get_conversation_store
+
+    stack = tunnel_three_layer_stack
+    create = await stack.ap_client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert create.status_code == 201, create.text
+    parent_id = create.json()["session_id"]
+    store = get_conversation_store()
+    parent = store.replace_runner_id(parent_id, _RUNNER_ID)
+    connection = stack.ap_app.state.tunnel_registry.get(_RUNNER_ID)
+    assert connection is not None
+    connection.owner = store.get_session_owner(parent_id, owner_only=True)
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent_id,
+        agent_id=parent.agent_id,
+        runner_id=_RUNNER_ID,
+    )
+    if pending_history:
+        store.append(
+            parent_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="earlier-turn",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "Do not replay this turn."}],
+                    ),
+                )
+            ],
+        )
+
+    wakes: list[dict[str, Any]] = []
+    wake_received = asyncio.Event()
+
+    async def get_snapshot(_self: Any, url: str, **kwargs: Any) -> httpx.Response:
+        return await stack.ap_client.get(url, **kwargs)
+
+    async def record_wake(_self: Any, url: str, **kwargs: Any) -> httpx.Response:
+        if url == f"/v1/sessions/{parent_id}/events":
+            wakes.append(kwargs["json"])
+            wake_received.set()
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(NullServerClient, "get", get_snapshot)
+    monkeypatch.setattr(NullServerClient, "post", record_wake)
+    initializer = stack.ap_app.state.runner_session_initializer
+    initialize = initializer.initialize
+    init_calls: list[dict[str, Any]] = []
+
+    async def record_init(conv: Any, client: Any, **kwargs: Any) -> httpx.Response:
+        assert conv.id == parent_id
+        init_calls.append(kwargs)
+        if fail_first_init and len(init_calls) == 1:
+            return httpx.Response(503, request=httpx.Request("POST", "http://runner/v1/sessions"))
+        return await initialize(conv, client, **kwargs)
+
+    monkeypatch.setattr(initializer, "initialize", record_init)
+    harness_requests: list[httpx.Request] = []
+    get_harness_client = stack.fake_pm.get_client
+
+    async def record_request(request: httpx.Request) -> None:
+        harness_requests.append(request)
+
+    async def harness_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client = await get_harness_client(*args, **kwargs)
+        client.event_hooks["request"] = [record_request]
+        return client
+
+    monkeypatch.setattr(stack.fake_pm, "get_client", harness_client)
+    work = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child.id,
+        agent="worker",
+        title="review",
+    )
+    body = {
+        "type": "external_session_status",
+        "data": {"status": status, "turn_completed": True, "output": "Review finished."},
+    }
+    try:
+        assert parent_id not in subagent_work._session_inboxes_ref
+        response = await stack.ap_client.post(f"/v1/sessions/{child.id}/events", json=body)
+        if fail_first_init:
+            assert response.status_code == 503, response.text
+            assert not work.delivered
+            assert parent_id not in subagent_work._session_inboxes_ref
+            assert wakes == []
+            response = await stack.ap_client.post(f"/v1/sessions/{child.id}/events", json=body)
+        assert response.status_code == 202, response.text
+        inbox = subagent_work._session_inboxes_ref[parent_id]
+        assert work.delivered
+        assert inbox.qsize() == 1
+        result = inbox.get_nowait()
+        assert result["output"] == "Review finished."
+        assert result["status"] == ("completed" if status == "idle" else "failed")
+        await asyncio.wait_for(wake_received.wait(), budget(5))
+        assert len(wakes) == 1
+        assert all(call["suppress_recovery_turn"] for call in init_calls)
+        assert not any(call.get("resume_interrupted_turn") for call in init_calls)
+        assert harness_requests == []
+
+        retry = await stack.ap_client.post(f"/v1/sessions/{child.id}/events", json=body)
+        assert retry.status_code == 202, retry.text
+        assert inbox.empty()
+        assert len(wakes) == 1
+        assert len(init_calls) == (2 if fail_first_init else 1)
+    finally:
+        subagent_work.unregister_subagent_work_for_session(parent_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize(
     "scenario",
     [

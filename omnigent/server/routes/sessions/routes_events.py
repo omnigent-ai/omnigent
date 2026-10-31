@@ -2527,6 +2527,8 @@ def register_events_routes(
                 # collab threads live in the app-server thread tree, and a
                 # devin sub-agent is a reconstructed chain of the parent
                 # session, never an omnigent-dispatched runner sub-agent.
+                from omnigent.server.routes import sessions as _sf
+
                 if runner_result is None:
                     # The child's pinned runner_id is stale — its runner was
                     # relaunched under a new id and only the parent was
@@ -2535,8 +2537,6 @@ def register_events_routes(
                     # parent hangs waiting for the child's inbox result. Heal
                     # the binding and re-deliver through the parent's live
                     # runner before failing.
-                    from omnigent.server.routes import sessions as _sf
-
                     recovered = await _sf._recover_subagent_status_forward_via_parent(
                         conv,
                         runner_router,
@@ -2546,6 +2546,16 @@ def register_events_routes(
                     )
                     if recovered is not None:
                         runner_result = recovered
+                recovered = await _sf._recover_subagent_missing_parent_inbox(
+                    conv,
+                    runner_result,
+                    runner_router,
+                    conversation_store,
+                    getattr(request.app.state, "runner_session_initializer", None),
+                    forward_body,
+                )
+                if recovered is not None:
+                    runner_result = recovered
                 _require_external_status_forward(
                     session_id,
                     status,

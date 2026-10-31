@@ -26,6 +26,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
@@ -436,6 +437,7 @@ from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    is_session_closed,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -3929,6 +3931,111 @@ async def _recover_subagent_status_forward_via_parent(
         runner_router,
         forward_body,
     )
+
+
+async def _recover_subagent_missing_parent_inbox(
+    child_conv: Conversation,
+    runner_result: _RunnerForwardResult | None,
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore,
+    initializer: RunnerSessionInitializer | None,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """Initialize a deferred root inbox and require the runner to confirm delivery."""
+    if runner_result is None or runner_result.status_code != 503:
+        return None
+    try:
+        rejection = json.loads(runner_result.body)
+    except ValueError:
+        return None
+    if (
+        not isinstance(rejection, dict)
+        or rejection.get("error") != "subagent_delivery_not_confirmed"
+        or rejection.get("reason") != "missing_parent_inbox"
+        or runner_router is None
+        or initializer is None
+    ):
+        return None
+    parent_id, runner_id = child_conv.parent_conversation_id, child_conv.runner_id
+    if parent_id is None or runner_id is None or parent_id == child_conv.id:
+        return None
+
+    def eligible_parent() -> Conversation | None:
+        rows = conversation_store.get_conversations([parent_id, child_conv.id])
+        parent, child = rows.get(parent_id), rows.get(child_conv.id)
+        if (
+            parent is None
+            or child is None
+            or child.parent_conversation_id != parent_id
+            or child.kind != "sub_agent"
+            or parent.parent_conversation_id is not None
+            or parent.kind == "sub_agent"
+            or parent.agent_id is None
+        ):
+            return None
+        for conv in (parent, child):
+            if (
+                conv.runner_id != runner_id
+                or conv.archived
+                or is_session_closed(conv.labels, conv.title)
+                or _intentional_stop_sessions.get(conv.id) == runner_id
+                or conv.id in _interrupt_fenced_sessions
+            ):
+                return None
+        owner = runner_router.runner_owner(runner_id)
+        parent_owner = conversation_store.get_session_owner(parent_id, owner_only=True)
+        child_owner = conversation_store.get_session_owner(child.id, owner_only=True)
+        # An ownerless runner and root are valid in local no-auth mode.
+        # Internal children can inherit the root's owner without their own grant.
+        if parent_owner != owner or (child_owner is not None and child_owner != owner):
+            return None
+        return parent
+
+    try:
+        parent = await asyncio.to_thread(eligible_parent)
+        if parent is None:
+            return None
+        client = await _get_runner_client(parent_id, runner_router, conversation=parent)
+        if client is None:
+            return None
+        generation = initializer.generation_for(runner_id, client)
+        response = await initializer.initialize(
+            parent,
+            client,
+            generation=generation,
+            timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+            suppress_recovery_turn=True,
+            trigger="subagent_missing_parent_inbox",
+        )
+        if not 200 <= response.status_code < 300:
+            return None
+        # A completion repairs only its root runtime; it does not resume other
+        # children or clear the parent's independently recorded failure state.
+        current_parent = await asyncio.to_thread(eligible_parent)
+        if current_parent is None or current_parent.agent_id != parent.agent_id:
+            return None
+        initializer.require_generation(runner_id, client, generation)
+        await _ensure_runner_relay_ready(
+            parent_id, runner_id, client, conversation_store, conversation=current_parent
+        )
+        current_parent = await asyncio.to_thread(eligible_parent)
+        if current_parent is None or current_parent.agent_id != parent.agent_id:
+            return None
+        initializer.require_generation(runner_id, client, generation)
+        response = await client.post(
+            f"/v1/sessions/{child_conv.id}/events", json=forward_body, timeout=5.0
+        )
+        current_parent = await asyncio.to_thread(eligible_parent)
+        if current_parent is None or current_parent.agent_id != parent.agent_id:
+            return None
+        initializer.require_generation(runner_id, client, generation)
+        if response.status_code == 204:
+            return _RunnerForwardResult(status_code=204, body=response.text)
+    except (httpx.HTTPError, ConnectionError, OmnigentError, SQLAlchemyError):
+        # Preserve the original retryable rejection when initialization or a
+        # fresh ownership/binding read fails; initialization alone is no ACK.
+        _logger.debug("Could not recover parent inbox for %s", child_conv.id, exc_info=True)
+    return None
 
 
 def _drive_terminal_resolved_elicitation(session_id: str, persisted: ConversationItem) -> None:
@@ -13930,6 +14037,7 @@ __all__ = [
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
+    "_recover_subagent_missing_parent_inbox",
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",
     "_relay_runner_stream",

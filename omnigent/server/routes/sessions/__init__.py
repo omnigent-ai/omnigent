@@ -662,6 +662,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _publish_and_wait_for_harness_elicitation as _publish_and_wait_for_harness_elicitation,
     _publish_subtree_cost_to_ancestors as _publish_subtree_cost_to_ancestors,
     _recover_subagent_status_forward_via_parent as _recover_subagent_status_forward_via_parent,
+    _recover_subagent_missing_parent_inbox as _recover_subagent_missing_parent_inbox,
     _register_policy_elicitation as _register_policy_elicitation,
     _relay_runner_stream as _relay_runner_stream,
     _relinquish_session_live_state as _relinquish_session_live_state,
