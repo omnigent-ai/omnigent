@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
@@ -79,6 +80,21 @@ function Field({
 function trimOrUndef(value: string): string | undefined {
   const trimmed = value.trim();
   return trimmed === "" ? undefined : trimmed;
+}
+
+/** One command per line; blank lines are dropped. */
+function commandsFromText(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+}
+
+/** The stored command list as editable text, ignoring a malformed value. */
+function commandsToText(commands: unknown): string {
+  return Array.isArray(commands)
+    ? commands.filter((c): c is string => typeof c === "string").join("\n")
+    : "";
 }
 
 export function ProjectSettingsDialog({
@@ -149,6 +165,8 @@ export function ProjectSettingsDialog({
   // effort ladder; NONE stores no default (unset key).
   const [effort, setEffort] = useState<string>(NONE);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [envCommands, setEnvCommands] = useState("");
+  const [setupCommands, setSetupCommands] = useState("");
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
   // DialogContent, so their dismiss (pick an option / click the body while
@@ -201,6 +219,8 @@ export function ProjectSettingsDialog({
     // The server stores config untyped, so ignore a malformed effort.
     setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
     setWorkspaceOpen(false);
+    setEnvCommands(commandsToText(c.env_commands));
+    setSetupCommands(commandsToText(c.setup_commands));
   }, [open, stored, loadFailed, launch]);
 
   const onSubmit = (e: FormEvent) => {
@@ -251,6 +271,12 @@ export function ProjectSettingsDialog({
     else if (!agentUnresolved) delete config.model;
     if (supportsEffortDefault && effortValue !== NONE) config.effort = effortValue;
     else if (!agentUnresolved) delete config.effort;
+    const envList = commandsFromText(envCommands);
+    if (envList.length > 0) config.env_commands = envList;
+    else delete config.env_commands;
+    const setupList = commandsFromText(setupCommands);
+    if (setupList.length > 0) config.setup_commands = setupList;
+    else delete config.setup_commands;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -662,6 +688,38 @@ export function ProjectSettingsDialog({
               </Select>
             </Field>
           )}
+
+          <Field
+            label="Environment commands"
+            hint="Run in your shell before every session starts; their environment reaches the agent (e.g. conda activate). One per line."
+            htmlFor="project-settings-env-commands"
+          >
+            <Textarea
+              id="project-settings-env-commands"
+              data-testid="project-settings-env-commands"
+              className="font-mono"
+              placeholder="conda activate my-env"
+              value={envCommands}
+              onChange={(e) => setEnvCommands(e.target.value)}
+              disabled={isLoading}
+            />
+          </Field>
+
+          <Field
+            label="Worktree setup"
+            hint="Run once per new git worktree, in the background (e.g. installs). $OMNIGENT_ROOT_PATH is the main checkout. One per line."
+            htmlFor="project-settings-setup-commands"
+          >
+            <Textarea
+              id="project-settings-setup-commands"
+              data-testid="project-settings-setup-commands"
+              className="font-mono"
+              placeholder={'cp "$OMNIGENT_ROOT_PATH/.env" .env\nnpm ci'}
+              value={setupCommands}
+              onChange={(e) => setSetupCommands(e.target.value)}
+              disabled={isLoading}
+            />
+          </Field>
 
           {loadFailed && (
             <p

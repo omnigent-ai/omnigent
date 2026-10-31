@@ -55,6 +55,7 @@ from omnigent.host.frames import (
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
     HostProbeAccountsResultFrame,
+    HostProjectSetupFinishedFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -955,6 +956,49 @@ def test_launch_runner_superseded_runner_ids_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(legacy))
     assert isinstance(decoded, HostLaunchRunnerFrame)
     assert decoded.superseded_runner_ids is None
+
+
+def test_launch_runner_project_setup_round_trips_and_is_absent_for_older_peers() -> None:
+    """Project setup crosses the wire only when set, and older peers decode without it."""
+    frame = HostLaunchRunnerFrame(
+        request_id="req_p",
+        binding_token="tok",
+        workspace="/w",
+        session_id="conv_p",
+        project_setup={"env_commands": ["conda activate proj"], "setup_commands": ["npm ci"]},
+        force_project_setup=True,
+    )
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+    legacy = HostLaunchRunnerFrame(request_id="req_l", binding_token="tok", workspace="/w")
+    encoded = encode_host_frame(legacy)
+    assert "project_setup" not in encoded
+    assert decode_host_frame(encoded) == legacy
+
+
+def test_launch_runner_rejects_malformed_project_setup() -> None:
+    """A malformed command list is rejected at decode, not run on the host."""
+    raw = json.loads(
+        encode_host_frame(HostLaunchRunnerFrame(request_id="r", binding_token="t", workspace="/w"))
+    )
+    raw["project_setup"] = {"env_commands": "conda activate proj"}
+    with pytest.raises(ValueError, match="env_commands"):
+        decode_host_frame(json.dumps(raw))
+
+
+def test_launch_result_and_setup_finished_report_round_trip() -> None:
+    """Project setup outcomes survive the trip back to the server."""
+    result = HostLaunchRunnerResultFrame(
+        request_id="req_r",
+        status="launched",
+        runner_id="runner_1",
+        project_setup_warnings=("conda env missing",),
+        project_setup_running=True,
+    )
+    assert decode_host_frame(encode_host_frame(result)) == result
+    report = HostProjectSetupFinishedFrame(
+        session_id="conv_1", warning="npm ci failed", log_path="/logs/setup.log"
+    )
+    assert decode_host_frame(encode_host_frame(report)) == report
 
 
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:

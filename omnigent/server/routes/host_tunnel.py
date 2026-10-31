@@ -60,6 +60,7 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsResultFrame,
+    HostProjectSetupFinishedFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -155,6 +156,9 @@ def create_host_tunnel_router(
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: RunnerExitedCallback | None = None,
+    on_project_setup_finished: (
+        Callable[[str, HostProjectSetupFinishedFrame], Awaitable[None]] | None
+    ) = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     harness_install: HarnessInstallGate = False,
@@ -189,6 +193,9 @@ def create_host_tunnel_router(
         :func:`log_runner_exited`) so rows carry the bound session.
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
+    :param on_project_setup_finished: Optional async callback fired when a
+        host reports a session's background project setup finished. Receives
+        the ``host_id`` and the report.
     :param on_host_update: Optional async callback fired when a connected
         host reports changed harness readiness. Receives ``host_id`` and owner.
     :param local_single_user: When ``True``, allow a host to re-own a
@@ -469,6 +476,7 @@ def create_host_tunnel_router(
                         runner_exit_reports,
                         on_runner_exited,
                         on_host_update,
+                        on_project_setup_finished,
                     ),
                     name=f"host-receive:{host_id}",
                 )
@@ -776,6 +784,9 @@ async def _receive_loop(
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: RunnerExitedCallback | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
+    on_project_setup_finished: (
+        Callable[[str, HostProjectSetupFinishedFrame], Awaitable[None]] | None
+    ) = None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -880,8 +891,21 @@ async def _receive_loop(
                         "error": frame.error,
                         "error_code": frame.error_code,
                         "workspace_recreated": frame.workspace_recreated,
+                        "project_setup_warnings": list(frame.project_setup_warnings),
+                        "project_setup_running": frame.project_setup_running,
                     }
                 )
+            continue
+
+        if isinstance(frame, HostProjectSetupFinishedFrame):
+            if on_project_setup_finished is not None:
+                try:
+                    await on_project_setup_finished(host_id, frame)
+                except Exception:
+                    # One failed report must not tear down the tunnel.
+                    _logger.exception(
+                        "on_project_setup_finished failed for %s/%s", host_id, frame.session_id
+                    )
             continue
 
         if isinstance(frame, HostStopRunnerResultFrame):

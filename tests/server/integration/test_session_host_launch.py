@@ -37,11 +37,13 @@ from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import Conversation
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
+    CAP_PROJECT_SETUP,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
+    HostProjectSetupFinishedFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -70,6 +72,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.budgets import Deadline, budget
 from tests.server.helpers import create_test_agent
 from tests.server.helpers import websocket_scope as _websocket_scope
@@ -154,15 +157,19 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
     )
 
 
-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+async def _connect_host(
+    app: FastAPI, *, capabilities: tuple[str, ...] = ()
+) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
     :param app: The FastAPI app under test (its ``state.host_registry``
         is the same instance the session-create launch path reads).
+    :param capabilities: Capability tokens the mock host advertises.
     :returns: The connected ASGI communicator, ready to exchange frames.
     """
     path = f"/v1/hosts/{_HOST_ID}/tunnel"
@@ -172,7 +179,12 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="laptop",
+            capabilities=list(capabilities),
+        )
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
     registry = app.state.host_registry
@@ -212,6 +224,7 @@ async def _serve_one_launch(
     launch_error: str | None = None,
     launch_error_code: str | None = None,
     workspace_recreated: bool = False,
+    result_fields: dict[str, object] | None = None,
 ) -> HostLaunchRunnerFrame:
     """Answer the host round-trips for a single inline session launch.
 
@@ -233,6 +246,7 @@ async def _serve_one_launch(
     :param workspace_recreated: Report that the host recreated a deleted
         workspace before spawning. Added as the raw wire key so the test
         exercises the server's decoding of an upgraded host's payload.
+    :param result_fields: Extra raw wire keys merged into the launch result.
     :returns: The ``host.launch_runner`` frame the server sent, so
         callers can assert on its fields (e.g. ``harness``).
     """
@@ -275,6 +289,8 @@ async def _serve_one_launch(
             )
             if workspace_recreated:
                 result_text = json.dumps({**json.loads(result_text), "workspace_recreated": True})
+            if result_fields:
+                result_text = json.dumps({**json.loads(result_text), **result_fields})
             await comm.send_input({"type": "websocket.receive", "text": result_text})
             return frame
     raise AssertionError("host never received a launch frame from the inline path")
@@ -4984,3 +5000,142 @@ async def test_side_chat_message_rebinds_to_already_relaunched_source_runner(
     side_chat_after = store.get_conversation(side_chat_id)
     assert side_chat_after is not None and side_chat_after.runner_id == replacement
     assert f"/v1/sessions/{side_chat_id}/events" in [path for path, _ in runners.posts]
+
+
+async def _create_project_session(
+    client: httpx.AsyncClient,
+    comm: ApplicationCommunicator,
+    config: dict[str, object],
+    *,
+    result_fields: dict[str, object] | None = None,
+) -> tuple[str, HostLaunchRunnerFrame]:
+    """Create a host-bound session filed in a new project with ``config``.
+
+    :returns: The session id and the launch frame the host received.
+    """
+    project = await client.post("/v1/projects", json={"name": "setup-proj", "config": config})
+    assert project.status_code == 200, project.text
+    agent = await create_test_agent(client)
+    responder = asyncio.create_task(
+        _serve_one_launch(comm, launch_status="launched", result_fields=result_fields)
+    )
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "project_id": project.json()["id"],
+        },
+    )
+    launch_frame = await responder
+    assert response.status_code == 201, response.text
+    return response.json()["id"], launch_frame
+
+
+async def _notices(client: httpx.AsyncClient, session_id: str) -> list[dict[str, object]]:
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    return [item for item in items.json()["data"] if item.get("type") == "error"]
+
+
+async def test_project_setup_reaches_the_host_and_its_outcome_reaches_the_session(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    """A capable host gets the project's commands; its warnings and the
+    background setup's completion appear in the session as notices."""
+    comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
+    config = {"env_commands": ["conda activate proj"], "setup_commands": ["npm ci"]}
+
+    session_id, launch_frame = await _create_project_session(
+        client,
+        comm,
+        config,
+        result_fields={
+            "project_setup_warnings": ["project env commands failed (exit 1)"],
+            "project_setup_running": True,
+        },
+    )
+
+    assert launch_frame.project_setup == config
+    notices = await _notices(client, session_id)
+    assert [(n["code"], n["level"]) for n in notices] == [
+        ("project_setup_failed", "error"),
+        ("project_setup_running", "info"),
+    ]
+    assert "exit 1" in str(notices[0]["message"])
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostProjectSetupFinishedFrame(
+                    session_id=session_id, warning="setup command `npm ci` failed (exit 1)"
+                )
+            ),
+        }
+    )
+    deadline = time.monotonic() + budget(5.0)
+    while len(notices) < 3 and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+        notices = await _notices(client, session_id)
+    assert notices[-1]["code"] == "project_setup_failed"
+    assert "npm ci" in str(notices[-1]["message"])
+
+
+async def test_setup_report_for_a_session_on_another_host_is_ignored(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    """A host can only post setup results into sessions bound to itself."""
+    comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
+    agent = await create_test_agent(client)
+    unbound = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert unbound.status_code == 201, unbound.text
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostProjectSetupFinishedFrame(session_id=unbound.json()["id"], warning="spoofed")
+            ),
+        }
+    )
+    await asyncio.sleep(0.2)
+
+    assert await _notices(client, unbound.json()["id"]) == []
+
+
+async def test_older_host_gets_no_project_setup_and_the_user_is_told(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    """A host without the capability is not sent commands it would ignore."""
+    comm = await _connect_host(app)
+
+    session_id, launch_frame = await _create_project_session(
+        client, comm, {"env_commands": ["conda activate proj"]}
+    )
+
+    assert launch_frame.project_setup is None
+    notices = await _notices(client, session_id)
+    assert [n["code"] for n in notices] == ["project_setup_failed"]
+    assert "too old" in str(notices[0]["message"])
+
+
+async def test_project_without_setup_sends_nothing(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
+
+    session_id, launch_frame = await _create_project_session(client, comm, {"model": "opus"})
+
+    assert launch_frame.project_setup is None
+    assert await _notices(client, session_id) == []
+
+
+async def test_malformed_project_setup_is_rejected_when_saved(client: httpx.AsyncClient) -> None:
+    response = await client.post(
+        "/v1/projects", json={"name": "bad", "config": {"setup_commands": "npm ci"}}
+    )
+
+    assert response.status_code in (400, 422), response.text
+    assert "setup_commands" in response.text

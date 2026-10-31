@@ -119,6 +119,7 @@ from omnigent.host.frames import (
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
     HostProbeAccountsResultFrame,
+    HostProjectSetupFinishedFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -150,6 +151,16 @@ from omnigent.host.git_worktree import (
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
+from omnigent.host.project_setup_runner import (
+    EnvDelta,
+    EnvProbeCache,
+    apply_env_delta,
+    claim_worktree_setup,
+    clear_setup_marker,
+    kill_running_project_commands,
+    prepare_project_env,
+    run_worktree_setup,
+)
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_accounts import (
@@ -192,6 +203,7 @@ from omnigent.process_logging import (
     redact_log_text,
     should_log_to_stderr,
 )
+from omnigent.project_setup import ProjectSetup
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
@@ -1377,6 +1389,7 @@ class HostProcess:
         # runner_id → exit report for exits that could not be sent
         # (tunnel down at the time). Flushed after the next hello.
         self._unreported_exits: dict[str, HostRunnerExitedFrame] = {}
+        self._unreported_project_setups: list[HostProjectSetupFinishedFrame] = []
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
@@ -1415,6 +1428,7 @@ class HostProcess:
         )
         self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
         self._zygote_disabled = False
+        self._env_probe_cache = EnvProbeCache()
         # Warms the zygote at daemon start so the first launch doesn't pay
         # its one-time import; see run().
         self._zygote_prestart_task: asyncio.Task[ZygoteManager | None] | None = None
@@ -2136,6 +2150,9 @@ class HostProcess:
         # so hand it the already-resolved value rather than making it re-derive.
         if self._origin_workspace_id:
             env[ORIGIN_WORKSPACE_ID_ENV_VAR] = self._origin_workspace_id
+        project_setup_warnings, project_env_delta = await self._apply_project_env(
+            frame, workspace, env
+        )
 
         # Embed the session id so operators can find all logs for a session
         # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep
@@ -2252,12 +2269,133 @@ class HostProcess:
             runner_id=runner_id,
             session_id=frame.session_id,
         )
+        # Installs can take minutes, longer than any launch wait, so they run
+        # after the runner is up and report back with host.project_setup_finished.
+        project_setup_running = await self._start_worktree_setup(
+            frame, workspace, project_env_delta
+        )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
             status="launched",
             runner_id=runner_id,
             workspace_recreated=workspace_recreated,
+            project_setup_warnings=tuple(project_setup_warnings),
+            project_setup_running=project_setup_running,
         )
+
+    async def _apply_project_env(
+        self,
+        frame: HostLaunchRunnerFrame,
+        workspace: Path,
+        env: dict[str, str],
+    ) -> tuple[list[str], EnvDelta]:
+        """Layer the project's ``env_commands`` changes onto the runner ``env``.
+
+        Never fails the launch: any failure comes back as a warning.
+
+        :param frame: The launch request carrying ``project_setup``.
+        :param workspace: The session workspace, already known to exist.
+        :param env: Runner environment, updated in place.
+        :returns: Warnings to show on the session, and the applied delta.
+        """
+        setup = ProjectSetup.from_mapping(frame.project_setup) if frame.project_setup else None
+        if setup is None or not setup.env_commands:
+            return [], EnvDelta()
+        try:
+            outcome = await self._run_host_subprocess_in_thread(
+                lambda: prepare_project_env(
+                    setup, workspace=str(workspace), cache=self._env_probe_cache
+                )
+            )
+        except Exception as exc:
+            _logger.exception("Project env commands crashed for %s", workspace)
+            crash = f"project env commands crashed on the host ({type(exc).__name__}: {exc})"
+            return [crash], EnvDelta()
+        apply_env_delta(env, outcome.env_delta)
+        for warning in outcome.warnings:
+            _logger.warning("Project env for session %s: %s", frame.session_id, warning)
+        return outcome.warnings, outcome.env_delta
+
+    async def _start_worktree_setup(
+        self,
+        frame: HostLaunchRunnerFrame,
+        workspace: Path,
+        env_delta: EnvDelta,
+    ) -> bool:
+        """Start the project's worktree ``setup_commands`` in the background.
+
+        :param frame: The launch request carrying ``project_setup``.
+        :param workspace: The session workspace.
+        :param env_delta: The project env delta (e.g. the conda ``PATH``), layered
+            onto the host env for the setup commands. The runner env itself is
+            not reused: it carries the runner's auth tokens.
+        :returns: Whether a setup run started.
+        """
+        setup = ProjectSetup.from_mapping(frame.project_setup) if frame.project_setup else None
+        if setup is None or not setup.setup_commands or not frame.session_id:
+            return False
+        session_id = frame.session_id
+        commands = setup.setup_commands
+
+        def claim() -> Path | None:
+            if frame.force_project_setup:
+                clear_setup_marker(str(workspace))
+            return claim_worktree_setup(commands, workspace=str(workspace))
+
+        try:
+            git_dir = await self._run_host_subprocess_in_thread(claim)
+        except Exception:
+            _logger.exception("Could not check project setup state for %s", workspace)
+            return False
+        if git_dir is None:
+            return False
+        claimed_git_dir: Path = git_dir
+        command_env = os.environ.copy()
+        apply_env_delta(command_env, env_delta)
+
+        async def run_and_report() -> None:
+            try:
+                result = await self._run_host_subprocess_in_thread(
+                    lambda: run_worktree_setup(
+                        commands,
+                        git_dir=claimed_git_dir,
+                        workspace=str(workspace),
+                        session_id=session_id,
+                        env=command_env,
+                    )
+                )
+                report = HostProjectSetupFinishedFrame(
+                    session_id=session_id,
+                    warning=result.warning,
+                    log_path=str(result.log_path),
+                )
+            except Exception as exc:
+                _logger.exception("Project setup crashed for %s", workspace)
+                report = HostProjectSetupFinishedFrame(
+                    session_id=session_id,
+                    warning=f"project setup crashed on the host ({type(exc).__name__}: {exc})",
+                )
+            await self._report_project_setup(report)
+
+        task = asyncio.create_task(run_and_report(), name=f"project-setup-{session_id}")
+        self._watcher_tasks.add(task)
+        task.add_done_callback(self._watcher_tasks.discard)
+        return True
+
+    async def _report_project_setup(self, report: HostProjectSetupFinishedFrame) -> None:
+        """Send a setup report, parking it for the next connection if offline."""
+        ws = self._ws
+        if ws is not None:
+            try:
+                await self._send_text(ws, encode_host_frame(report))
+                return
+            except Exception:  # any send failure parks the report
+                _logger.debug(
+                    "Could not report project setup for %s; queueing for reconnect",
+                    report.session_id,
+                    exc_info=True,
+                )
+        self._unreported_project_setups.append(report)
 
     def _ensure_zygote_started(self) -> ZygoteManager | None:
         """Start (or reuse) the runner zygote, latching the fallback on failure.
@@ -5076,6 +5214,9 @@ class HostProcess:
             for watcher in list(self._watcher_tasks):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watcher
+            # Background worktree installs run in their own sessions; stop them
+            # with the host rather than leaving them orphaned mid-install.
+            kill_running_project_commands()
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
@@ -5508,6 +5649,9 @@ class HostProcess:
                 await self._report_runner_exit(
                     runner_id, report.error, had_connected=report.had_connected
                 )
+            parked_setups, self._unreported_project_setups = self._unreported_project_setups, []
+            for setup_report in parked_setups:
+                await self._report_project_setup(setup_report)
             _print_host_status(
                 f"✓ Connected as {self._identity.name!r} "
                 f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "

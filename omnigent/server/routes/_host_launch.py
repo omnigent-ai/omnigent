@@ -18,6 +18,7 @@ Centralizing the checks here keeps the two call sites from drifting
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import os
@@ -26,14 +27,17 @@ from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, Project
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.host.frames import CAP_PROJECT_SETUP
+from omnigent.project_setup import ProjectSetup
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 
 if TYPE_CHECKING:
     from omnigent.server.sandbox_profiles import SandboxProfileCatalog
@@ -167,6 +171,83 @@ def configure_host_sharding(enabled: bool) -> None:
     """
     global _host_sharded
     _host_sharded = enabled
+
+
+_project_store: ProjectStore | None = None
+
+#: Server notice when a session's project has setup commands its host cannot run.
+PROJECT_SETUP_UNSUPPORTED_NOTICE = (
+    "This session's project has setup commands, but its host is too old to run "
+    "them. Update Omnigent on the host to apply them."
+)
+
+
+def configure_project_setup_source(project_store: ProjectStore | None) -> None:
+    """Record the store that launches read project setup commands from.
+
+    :param project_store: The server's project store; ``None`` disables
+        project setup (e.g. a deployment without projects).
+    """
+    global _project_store
+    _project_store = project_store
+
+
+@dataclass(frozen=True)
+class LaunchProjectSetup:
+    """Project setup to send with one runner launch.
+
+    :param wire: ``HostLaunchRunnerFrame.project_setup`` payload, or ``None``.
+    :param unsupported: The project has setup but the host lacks
+        :data:`CAP_PROJECT_SETUP`; the caller should tell the user.
+    """
+
+    wire: dict[str, list[str]] | None = None
+    unsupported: bool = False
+
+
+def _owned_project(project_id: str, owner: str | None) -> Project | None:
+    """Load a project owned by a host's owner.
+
+    A single-user server records its one user as either ``None`` or the
+    reserved local user depending on the auth mode, so both name that user.
+    """
+    assert _project_store is not None
+    owners: tuple[str | None, ...] = (
+        (None, RESERVED_USER_LOCAL) if owner in (None, RESERVED_USER_LOCAL) else (owner,)
+    )
+    for candidate in owners:
+        project = _project_store.get(project_id, user_id=candidate)
+        if project is not None:
+            return project
+    return None
+
+
+async def resolve_launch_project_setup(
+    conv: Conversation, host_conn: HostConnection
+) -> LaunchProjectSetup:
+    """Load the session's project setup for a launch on ``host_conn``.
+
+    The project is read as the host's owner, so only commands that user wrote
+    ever run on their machine. Read at launch time so edits apply to the next
+    launch. A lookup failure is logged and treated as "no setup".
+
+    :param conv: The session being launched.
+    :param host_conn: Live connection to the target host.
+    :returns: What to send, or an empty result.
+    """
+    if conv.project_id is None or _project_store is None:
+        return LaunchProjectSetup()
+    try:
+        project = await asyncio.to_thread(_owned_project, conv.project_id, host_conn.owner)
+        setup = ProjectSetup.from_mapping(project.config) if project is not None else None
+    except Exception:
+        _logger.warning("Could not load project setup for session %s", conv.id, exc_info=True)
+        return LaunchProjectSetup()
+    if setup is None:
+        return LaunchProjectSetup()
+    if CAP_PROJECT_SETUP not in host_conn.hello.capabilities:
+        return LaunchProjectSetup(unsupported=True)
+    return LaunchProjectSetup(wire=setup.to_wire())
 
 
 def _deployment_is_sharded() -> bool:

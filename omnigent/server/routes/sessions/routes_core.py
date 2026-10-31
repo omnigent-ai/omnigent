@@ -764,8 +764,10 @@ def register_core_routes(
         from omnigent.server.routes._host_launch import (
             LAUNCH_TIMEOUT_ENV_VAR,
             resolve_host_launch,
+            resolve_launch_project_setup,
             resolve_launch_timeout_s,
         )
+        from omnigent.server.routes._sessions.helpers import note_project_setup_on_launch
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -819,6 +821,7 @@ def register_core_routes(
                 stage="runner_launch",
             ),
         )
+        project_setup = await resolve_launch_project_setup(target.conv, conn)
         request_id = secrets.token_hex(8)
         future: asyncio.Future[HostLaunchResult] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -845,6 +848,7 @@ def register_core_routes(
                 ),
                 # The session had no runner bound, so nothing is superseded.
                 superseded_runner_ids=(),
+                project_setup=project_setup.wire,
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()
@@ -887,6 +891,14 @@ def register_core_routes(
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
+            )
+        else:
+            await note_project_setup_on_launch(
+                target.conv,
+                conversation_store,
+                unsupported=project_setup.unsupported,
+                warnings=launch_result.get("project_setup_warnings", ()),
+                running=launch_result.get("project_setup_running", False),
             )
         return runner_id, launch_failed
 

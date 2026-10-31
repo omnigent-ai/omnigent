@@ -57,6 +57,17 @@ export interface ProjectConfig {
    * model's ladder. Unset = the harness's own configured effort.
    */
   effort?: string;
+  /**
+   * Commands run in the user's shell before every session in this project
+   * starts; the environment changes they make (e.g. `conda activate`) reach
+   * the agent. Validated and executed by the server and host.
+   */
+  env_commands?: string[];
+  /**
+   * Commands run once per new git worktree, in the background after the
+   * session starts (e.g. installs). Re-run when the list changes.
+   */
+  setup_commands?: string[];
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

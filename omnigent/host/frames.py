@@ -37,6 +37,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_FILESYSTEM_ATTACHMENTS,
 )
+from omnigent.project_setup import ProjectSetup
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -83,6 +84,8 @@ CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
+# The host runs ``HostLaunchRunnerFrame.project_setup`` before spawning the runner:
+CAP_PROJECT_SETUP = "project_setup"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -100,6 +103,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_WORKTREE_CREATE_BUDGET,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_PROJECT_SETUP,
 ]
 
 
@@ -158,6 +162,7 @@ class HostFrameKind(str, Enum):
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
+    PROJECT_SETUP_FINISHED = "host.project_setup_finished"
     RUNNER_STATUS = "host.runner_status"
     RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
@@ -326,6 +331,12 @@ class HostLaunchRunnerFrame:
         falls back to stopping every runner launched for ``session_id``; an
         empty tuple stops none, e.g. after /clear moved the old runner to
         another session.
+    :param project_setup: The session's project setup commands
+        (:meth:`omnigent.project_setup.ProjectSetup.to_wire`), sent only to hosts
+        advertising :data:`CAP_PROJECT_SETUP`. ``None`` when the project has none.
+    :param force_project_setup: Re-run the worktree ``setup_commands`` even if
+        they already ran for this worktree. They run in the background after
+        the runner starts.
     """
 
     request_id: str
@@ -335,6 +346,8 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    project_setup: dict[str, list[str]] | None = None
+    force_project_setup: bool = False
 
 
 @dataclass
@@ -360,6 +373,10 @@ class HostLaunchRunnerResultFrame:
         workspace missing and recreated it as an empty directory before
         spawning the runner, so the server can tell the user. ``False`` on
         failure and from older hosts that don't send it.
+    :param project_setup_warnings: Project setup failures the server shows on
+        the session; the runner launched regardless. Empty from older hosts.
+    :param project_setup_running: Worktree ``setup_commands`` started in the
+        background; a :class:`HostProjectSetupFinishedFrame` follows.
     """
 
     request_id: str
@@ -368,6 +385,8 @@ class HostLaunchRunnerResultFrame:
     error: str | None = None
     error_code: str | None = None
     workspace_recreated: bool = False
+    project_setup_warnings: tuple[str, ...] = ()
+    project_setup_running: bool = False
 
 
 @dataclass
@@ -426,6 +445,24 @@ class HostRunnerExitedFrame:
     runner_id: str
     error: str
     had_connected: bool | None = None
+
+
+@dataclass
+class HostProjectSetupFinishedFrame:
+    """Host → server: a session's background worktree setup finished.
+
+    One-way report sent only by hosts advertising :data:`CAP_PROJECT_SETUP`.
+
+    :param session_id: Session whose launch started the setup, e.g. ``"conv_abc"``.
+    :param warning: Failure description with the output tail, or ``None`` when
+        every command succeeded.
+    :param log_path: Host path of the full setup log, e.g.
+        ``"~/.omnigent/logs/project-setup/project-setup-....log"``.
+    """
+
+    session_id: str
+    warning: str | None = None
+    log_path: str | None = None
 
 
 @dataclass
@@ -1459,6 +1496,7 @@ HostFrame = (
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostProjectSetupFinishedFrame
     | HostRunnerStatusFrame
     | HostRunnerStatusResultFrame
     | HostStatFrame
@@ -1599,6 +1637,10 @@ def encode_host_frame(frame: HostFrame) -> str:
         }
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
+        if frame.project_setup is not None:
+            payload["project_setup"] = frame.project_setup
+        if frame.force_project_setup:
+            payload["force_project_setup"] = True
         return _encode_payload(payload)
     if isinstance(frame, HostLaunchRunnerResultFrame):
         return _encode_payload(
@@ -1610,6 +1652,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
                 "error_code": frame.error_code,
                 "workspace_recreated": frame.workspace_recreated,
+                "project_setup_warnings": list(frame.project_setup_warnings),
+                "project_setup_running": frame.project_setup_running,
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
@@ -1627,6 +1671,15 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostProjectSetupFinishedFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PROJECT_SETUP_FINISHED.value,
+                "session_id": frame.session_id,
+                "warning": frame.warning,
+                "log_path": frame.log_path,
             }
         )
     if isinstance(frame, HostRunnerExitedFrame):
@@ -2424,6 +2477,12 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.PROJECT_SETUP_FINISHED:
+            return HostProjectSetupFinishedFrame(
+                session_id=_required_str(msg, "session_id"),
+                warning=_optional_nullable_str(msg, "warning"),
+                log_path=_optional_nullable_str(msg, "log_path"),
+            )
         case HostFrameKind.RUNNER_STATUS:
             return _decode_runner_status(msg)
         case HostFrameKind.RUNNER_STATUS_RESULT:
@@ -2668,6 +2727,12 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     inference_config = msg.get("inference_config")
     if inference_config is not None and not isinstance(inference_config, dict):
         raise ValueError("inference_config must be an object or null")
+    project_setup = msg.get("project_setup")
+    if project_setup is not None:
+        if not isinstance(project_setup, dict):
+            raise ValueError("project_setup must be an object or null")
+        setup = ProjectSetup.from_mapping(project_setup)
+        project_setup = setup.to_wire() if setup is not None else None
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
@@ -2681,6 +2746,8 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
             if "superseded_runner_ids" in msg
             else None
         ),
+        project_setup=project_setup,
+        force_project_setup=_optional_bool(msg, "force_project_setup"),
     )
 
 
@@ -2699,6 +2766,8 @@ def _decode_launch_runner_result(
         error=_optional_nullable_str(msg, "error"),
         error_code=_optional_nullable_str(msg, "error_code"),
         workspace_recreated=_optional_bool(msg, "workspace_recreated"),
+        project_setup_warnings=tuple(_optional_str_list(msg, "project_setup_warnings")),
+        project_setup_running=_optional_bool(msg, "project_setup_running"),
     )
 
 

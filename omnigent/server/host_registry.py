@@ -376,6 +376,8 @@ class HostLaunchResult(TypedDict, total=False):
     error: str | None
     error_code: str | None
     workspace_recreated: bool
+    project_setup_warnings: list[str]
+    project_setup_running: bool
 
 
 @dataclass

@@ -138,6 +138,55 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true });
   });
 
+  it("round-trips env and worktree setup commands, one per line", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { env_commands: ["conda activate proj"], setup_commands: ["npm ci"] },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-env-commands")).toHaveValue(
+        "conda activate proj",
+      ),
+    );
+    expect(screen.getByTestId("project-settings-setup-commands")).toHaveValue("npm ci");
+
+    // Blank lines and surrounding spaces are not stored as commands.
+    fireEvent.change(screen.getByTestId("project-settings-setup-commands"), {
+      target: { value: "  cp ../.env .env  \n\nnpm ci\n" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        env_commands: ["conda activate proj"],
+        setup_commands: ["cp ../.env .env", "npm ci"],
+      }),
+    );
+  });
+
+  it("drops a command list cleared to blank", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { env_commands: ["conda activate proj"] },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-env-commands")).toHaveValue(
+        "conda activate proj",
+      ),
+    );
+
+    fireEvent.change(screen.getByTestId("project-settings-env-commands"), {
+      target: { value: "   \n" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
   it("preserves the project icon when saving settings", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
