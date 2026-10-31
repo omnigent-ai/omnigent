@@ -121,6 +121,12 @@ def normalize_source_path(path: str | None) -> str:
     return cleaned
 
 
+def ancestor_paths(path: str) -> list[str]:
+    """``""`` and every leading part of *path*: the source directories that can hold it."""
+    parts = PurePosixPath(path).parts
+    return ["/".join(parts[:depth]) for depth in range(len(parts) + 1)]
+
+
 def repository_label(clone_url: str) -> str:
     """``owner/repo`` for a github.com clone URL, ``host/owner/repo`` elsewhere."""
     parts = urlsplit(clone_url)

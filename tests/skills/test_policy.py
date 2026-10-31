@@ -51,12 +51,25 @@ def test_from_config_keeps_usable_entries_and_logs_the_rest(
     assert len(skipped) == 5
 
 
-def test_no_block_or_an_explicit_empty_allowlist_allows_everything() -> None:
-    for raw in (None, {}, {"allowed_sources": []}):
+def test_no_block_or_no_allowlist_key_allows_everything() -> None:
+    for raw in (None, {}, {"allow_url_install": True}):
         policy = SkillsMarketplacePolicy.from_config(raw)
         assert policy.allowed_sources is None
         assert policy.allows("https://github.com/anyone/anything.git")
         assert policy.allow_url_install and not policy.sources and not policy.credentials
+
+
+@pytest.mark.parametrize("empty", [None, []])
+def test_an_empty_allowlist_key_refuses_every_source(
+    empty: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    # `allowed_sources:` with nothing under it parses as null: it used to mean
+    # "any repository", the opposite of what writing the key asks for.
+    with caplog.at_level(logging.WARNING):
+        policy = SkillsMarketplacePolicy.from_config({"allowed_sources": empty})
+    assert policy.allowed_sources == ()
+    assert not policy.allows("https://github.com/anyone/anything.git")
+    assert any("allowed_sources is empty" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize(

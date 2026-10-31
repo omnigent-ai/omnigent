@@ -16,7 +16,6 @@ import io
 import logging
 import tarfile
 import uuid
-from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -29,7 +28,7 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.skills.git_source import GitSourceError, repository_label
+from omnigent.skills.git_source import GitSourceError, ancestor_paths, repository_label
 from omnigent.skills.limits import (
     MAX_INSTALLED_PER_OWNER,
     MAX_NAMES_PER_INSTALL,
@@ -307,12 +306,6 @@ def _source_label(url: str, path: str) -> str:
     """``owner/repo`` (or ``host/owner/repo``), with the indexed directory when there is one."""
     label = repository_label(url)
     return f"{label} ({path})" if path else label
-
-
-def _ancestors(path: str) -> list[str]:
-    """``""`` and every leading part of *path*: the source directories that can hold it."""
-    parts = PurePosixPath(path).parts
-    return ["/".join(parts[:depth]) for depth in range(len(parts) + 1)]
 
 
 async def _installed_among(
@@ -651,7 +644,7 @@ def create_skill_marketplace_router(
         try:
             policy.require_allowed(skill.source_url)
             # Any listed source whose directory holds the skill's.
-            await require_browsable(skill.source_url, skill.ref, _ancestors(skill.path))
+            await require_browsable(skill.source_url, skill.ref, ancestor_paths(skill.path))
             commit, packaged = await fetch(
                 user_id,
                 fetcher(request).package,

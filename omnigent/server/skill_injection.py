@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from omnigent.entities import Agent, InstalledSkill
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.skills.git_source import ancestor_paths
 from omnigent.skills.limits import (
     MAX_DELIVERY_BYTES,
     MAX_DELIVERY_ENTRIES,
@@ -187,18 +188,27 @@ def effective_installed_skills(
     """The owner's enabled installed skills, one per name, user scope winning over org.
 
     A skill from a repository outside the policy's ``allowed_sources`` is left
-    out, so tightening the policy stops serving it. Reads at most
+    out, and with ``allow_url_install`` off so is one from no listed source,
+    so tightening the policy stops serving it. Reads at most
     :data:`MAX_DELIVERED_SKILLS` rows, two full pages.
 
     :raises SkillDeliveryError: When more rows than that are visible.
     """
     by_name: dict[str, InstalledSkill] = {}
+    # With URL installs off, only skills from a listed source are served, so
+    # turning the switch off also stops serving what was installed by URL.
+    listed = None if policy.allow_url_install else listed_sources(skill_store)
     after: str | None = None
     seen = 0
     while True:
         page = skill_store.list_for_user(owner_id, limit=MAX_PAGE, after=after)
         for skill in page.data:
             if not skill.enabled or not policy.allows(skill.source_url):
+                continue
+            if listed is not None and not any(
+                (skill.source_url, skill.ref, path) in listed
+                for path in ancestor_paths(skill.path)
+            ):
                 continue
             current = by_name.get(skill.name)
             if current is None or (current.scope == "org" and skill.scope == "user"):
@@ -213,3 +223,15 @@ def effective_installed_skills(
             break
         after = page.last_id
     return list(by_name.values())
+
+
+def listed_sources(skill_store: SkillStore) -> set[tuple[str, str | None, str]]:
+    """Every browsable source as ``(url, ref, path)``, read page by page."""
+    listed: set[tuple[str, str | None, str]] = set()
+    after: str | None = None
+    while True:
+        page = skill_store.list_sources(limit=MAX_PAGE, after=after)
+        listed.update((source.url, source.ref, source.path) for source in page.data)
+        if not page.has_more or page.last_id is None:
+            return listed
+        after = page.last_id

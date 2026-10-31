@@ -13,7 +13,7 @@ also stops serving skills that were installed under a looser policy.
           ref: v1.4.0
         - url: github.com/acme/monorepo
           path: team-a         # index this directory instead of the root
-      allowed_sources:         # host/owner/repo globs; empty = any
+      allowed_sources:         # host/owner/repo globs; omit the key to allow any
         - github.com/acme/*
         - github.acme.internal/*/*
       allow_url_install: false
@@ -168,7 +168,11 @@ class SkillsMarketplacePolicy:
             allow_url_install = False
         return cls(
             sources=tuple(_parse_sources(raw.get("sources"))),
-            allowed_sources=_parse_allowed_sources(raw.get("allowed_sources")),
+            allowed_sources=(
+                _parse_allowed_sources(raw["allowed_sources"])
+                if "allowed_sources" in raw
+                else None
+            ),
             allow_url_install=allow_url_install,
             credentials=tuple(_parse_credentials(raw.get("credentials"))),
             clone_limits=_parse_limits(raw.get("limits")),
@@ -247,13 +251,20 @@ def _parse_limits(raw: Any) -> CloneLimits:
     return CloneLimits(**values)
 
 
-def _parse_allowed_sources(raw: Any) -> tuple[str, ...] | None:
-    """``None`` when the key is absent or an explicit empty list; otherwise the usable globs.
+def _parse_allowed_sources(raw: Any) -> tuple[str, ...]:
+    """The usable globs of an ``allowed_sources`` key that is present.
 
-    A list that was given but yields no usable pattern fails closed to ``()``.
+    A key left empty (``allowed_sources:`` or ``[]``), or one that yields no
+    usable pattern, fails closed to ``()``: writing the key at all asks for a
+    restriction, so a blank must not turn into none. Only an absent key admits
+    every repository.
     """
     if raw is None or raw == []:
-        return None
+        _logger.warning(
+            "%s.allowed_sources is empty; refusing every source. Remove the key to allow any.",
+            CONFIG_KEY,
+        )
+        return ()
     patterns = tuple(_parse_patterns(raw))
     if not patterns:
         _logger.warning(

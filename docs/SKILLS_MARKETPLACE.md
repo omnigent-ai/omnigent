@@ -112,7 +112,7 @@ skills_marketplace:
       name: Acme skills    # optional
     - url: github.com/acme/monorepo
       path: team-a         # index this directory instead of the root
-  allowed_sources:         # host/owner/repo globs; empty = any
+  allowed_sources:         # host/owner/repo globs; omit the key to allow any
     - github.com/acme/*
     - github.acme.internal/*/*
   allow_url_install: false
@@ -134,10 +134,11 @@ skills_marketplace:
   or updated, and an installed skill from one is no longer served. The list
   fails closed: a block that is not a mapping, or a list whose entries are
   all unusable, refuses every repository (with a warning in the log) rather
-  than widening to all of them. Only an absent key, or an explicit empty
-  list, means any repository.
-- `allow_url_install: false` removes **Add from URL** and refuses installs
-  (and updates) from any repository that is not a listed source. A value
+  than widening to all of them, and so does a key left empty
+  (`allowed_sources:` or `[]`). Only an absent key means any repository.
+- `allow_url_install: false` removes **Add from URL**, refuses installs
+  (and updates) from any repository that is not a listed source, and stops
+  serving skills that were installed from one before the switch. A value
   that is not `true` or `false` counts as `false`.
 - `credentials` let the server reach private repositories without borrowing
   the operator's own git setup. The token named by `token_env` is read from

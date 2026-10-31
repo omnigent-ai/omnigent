@@ -957,6 +957,37 @@ def test_a_users_install_wins_over_the_orgs_whatever_the_order(
 
 
 @pytest.mark.asyncio
+async def test_turning_url_installs_off_stops_serving_what_was_installed_by_url(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
+) -> None:
+    # allowed_sources was re-checked at delivery but allow_url_install was not,
+    # so switching URL installs off kept serving every skill installed by URL.
+    app, artifact_store = _build(db_uri, tmp_path)
+    app.state.skill_fetcher = _fetcher(repo)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (
+            await client.post("/v1/skill-sources", json={"source": "acme/skills"})
+        ).status_code == 201
+        for source, name in (("acme/skills", "review"), ("acme/unlisted", "triage")):
+            installed = await client.post(
+                "/v1/installed-skills", json={"source": source, "names": [name]}
+            )
+            assert installed.status_code == 201, installed.text
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
+
+    closed = {"skills_marketplace": {"allow_url_install": False}}
+    app, _ = _build(db_uri, tmp_path, server_config=closed)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        served = _names((await client.get(f"/v1/sessions/{session_id}/agent/contents")).content)
+        assert "skills/review/SKILL.md" in served
+        assert "skills/triage/SKILL.md" not in served
+
+
+@pytest.mark.asyncio
 async def test_server_policy_binds_sources_url_installs_and_delivery(
     db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
 ) -> None:
