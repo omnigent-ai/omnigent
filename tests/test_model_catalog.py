@@ -2698,6 +2698,84 @@ def test_openai_compatible_listing_hits_the_versioned_base() -> None:
     ]
 
 
+def test_litellm_listing_is_enriched_from_model_info() -> None:
+    """A LiteLLM page pulls ``/v1/model/info`` for tool use, wires, and efforts."""
+    requests_seen: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request.url.path)
+        assert request.headers["authorization"] == "Bearer test-key"
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "gpt-6.1-sol", "mode": "responses", "max_input_tokens": 922000},
+                        {"id": "embed-default", "mode": "embedding"},
+                        {"id": "ds4"},
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "model_name": "gpt-6.1-sol",
+                        "model_info": {
+                            "mode": "responses",
+                            "litellm_provider": "chatgpt",
+                            "supports_function_calling": True,
+                            "supports_reasoning": True,
+                            "supports_xhigh_reasoning_effort": True,
+                        },
+                    },
+                    {"model_name": "ds4", "model_info": {"litellm_provider": "openai"}},
+                ]
+            },
+        )
+
+    provider = ResolvedModelProvider(
+        kind="gateway", family="openai", base_url="http://litellm.local/v1", api_key="test-key"
+    )
+    listing = model_catalog._fetch_openai_compatible_listing(
+        provider, transport=httpx.MockTransport(_handler)
+    )
+
+    assert requests_seen == ["/v1/models", "/v1/model/info"]
+    by_id = {m.id: m.metadata for m in listing.models}
+    gpt = by_id["gpt-6.1-sol"]
+    assert gpt.context_window == 922000
+    assert gpt.reasoning is not None
+    assert gpt.reasoning.efforts == {"low", "medium", "high", "xhigh"}
+    assert gpt.supports(ModelCapability.TOOL_USE) is True
+    assert by_id["embed-default"].supports(ModelCapability.TOOL_USE) is False
+    assert ModelWireAPI.OPENAI_CHAT in by_id["ds4"].wire_apis
+
+
+def test_litellm_listing_survives_missing_model_info() -> None:
+    """A failed ``/v1/model/info`` keeps the bare listing instead of failing discovery."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "grok-4.7", "mode": "chat", "max_input_tokens": 500000}]},
+            )
+        return httpx.Response(403, json={"error": "forbidden"})
+
+    provider = ResolvedModelProvider(
+        kind="gateway", family="openai", base_url="http://litellm.local/v1", api_key="test-key"
+    )
+    listing = model_catalog._fetch_openai_compatible_listing(
+        provider, transport=httpx.MockTransport(_handler)
+    )
+
+    assert listing.verified is True
+    assert [(m.id, m.context_window) for m in listing.models] == [("grok-4.7", 500000)]
+    assert listing.models[0].metadata.wire_apis == frozenset()
+
+
 def test_openai_compatible_listing_mints_bearer_via_auth_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

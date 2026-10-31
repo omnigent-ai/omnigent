@@ -48,6 +48,11 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.llms.litellm_model_metadata import (
+    index_litellm_model_info,
+    looks_like_litellm_listing,
+    parse_litellm_model_metadata,
+)
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -2060,37 +2065,43 @@ def _fetch_openai_compatible_listing(
         or an OpenRouter/LiteLLM-style gateway/local endpoint).
     :param transport: Optional httpx transport override for tests.
     :returns: A ``source="openai-compatible"`` listing; entries carry
-        ``context_window`` when the endpoint reports ``context_length``.
+        ``context_window`` when the endpoint reports ``context_length``. A
+        LiteLLM proxy's page is enriched from its ``/v1/model/info`` (tool
+        use, wire APIs, reasoning efforts).
     :raises ValueError: When the provider has no base URL or credential.
     :raises httpx.HTTPError: On transport/HTTP failures.
     """
     if not provider.base_url:
         raise ValueError("provider has no base_url to list models from")
     token = _resolve_bearer_token(provider)
+    headers = {"Authorization": f"Bearer {token}"}
+    litellm_info: dict[str, dict[str, Any]] | None = None
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        resp = client.get(
-            _models_url(provider.base_url),
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        resp = client.get(_models_url(provider.base_url), headers=headers)
         resp.raise_for_status()
         payload = resp.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        items = data if isinstance(data, list) else []
+        if looks_like_litellm_listing(items):
+            litellm_info = _fetch_litellm_model_info(client, provider.base_url, headers) or {}
     models: list[ModelEntry] = []
-    data = payload.get("data") if isinstance(payload, dict) else None
-    for item in data if isinstance(data, list) else []:
+    for item in items:
         if not isinstance(item, dict):
             continue
         model_id = item.get("id")
         if not isinstance(model_id, str) or not model_id:
             continue
         context_length = item.get("context_length")
-        models.append(
-            ModelEntry(
-                id=model_id,
-                family=model_family_token(model_id),
-                metadata=ModelMetadata(
-                    context_window=context_length if isinstance(context_length, int) else None
-                ),
+        metadata = ModelMetadata(
+            context_window=context_length if isinstance(context_length, int) else None
+        )
+        if litellm_info is not None:
+            parsed = parse_litellm_model_metadata(item, litellm_info.get(model_id))
+            metadata = replace(
+                parsed, context_window=metadata.context_window or parsed.context_window
             )
+        models.append(
+            ModelEntry(id=model_id, family=model_family_token(model_id), metadata=metadata)
         )
     return ModelListing(
         source="openai-compatible",
@@ -2098,6 +2109,30 @@ def _fetch_openai_compatible_listing(
         models=tuple(models),
         note=f"models reported by {_models_url(provider.base_url)}",
     )
+
+
+def _fetch_litellm_model_info(
+    client: httpx.Client, base_url: str, headers: dict[str, str]
+) -> dict[str, dict[str, Any]] | None:
+    """Best-effort ``/v1/model/info`` read from a LiteLLM proxy.
+
+    The listing stays authoritative for *which* models exist; this only adds
+    capability and reasoning-effort metadata, so any failure degrades to the
+    bare listing instead of failing discovery.
+
+    :param client: The open client the listing was fetched with.
+    :param base_url: The provider base URL, e.g. ``"http://litellm/v1"``.
+    :param headers: The listing's auth headers.
+    :returns: ``model_name`` → ``model_info``, or ``None`` when unavailable.
+    """
+    url = _models_url(base_url).removesuffix("/models") + "/model/info"
+    try:
+        resp = client.get(url, headers=headers)
+        resp.raise_for_status()
+        return index_litellm_model_info(resp.json())
+    except (httpx.HTTPError, ValueError):
+        _logger.debug("LiteLLM model info unavailable at %s", url, exc_info=True)
+        return None
 
 
 def _fetch_anthropic_listing(
