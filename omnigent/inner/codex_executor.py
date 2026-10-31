@@ -67,6 +67,7 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.project_setup import PROJECT_ENV_APPLIED_ENV_VAR
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -2243,6 +2244,19 @@ def _databricks_codex_config_overrides(
     ]
 
 
+def project_env_codex_config_overrides() -> list[str]:
+    """
+    Keep Codex tool shells on the runner env when a project env was applied.
+
+    Codex runs tool commands in a login shell by default, and a login shell's
+    startup (macOS ``path_helper``, ``.zprofile``) moves system dirs ahead of
+    an activated env's bin, so ``python3`` would leave a conda env.
+
+    :returns: ``["allow_login_shell=false"]`` on such a runner, else ``[]``.
+    """
+    return ["allow_login_shell=false"] if os.environ.get(PROJECT_ENV_APPLIED_ENV_VAR) else []
+
+
 def _provider_codex_config_overrides(
     *,
     model: str | None,
@@ -3066,7 +3080,7 @@ class _CodexAppServerSession:
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
             argv = [self._worker_launch.launch_path, "app-server"]
-            for override in self._codex_config_overrides:
+            for override in [*self._codex_config_overrides, *project_env_codex_config_overrides()]:
                 argv.extend(["-c", override])
             spawn_argv = argv
             pass_fds: tuple[int, ...] = ()

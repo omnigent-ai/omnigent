@@ -1849,13 +1849,18 @@ def create_app(
                 cookie_secret=_accounts_cfg.cookie_secret,
             )
 
+    from omnigent.host.frames import HostProjectSetupFinishedFrame
     from omnigent.runner.routing import RunnerRouter
     from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
-    from omnigent.server.routes._host_launch import configure_host_sharding
+    from omnigent.server.routes._host_launch import (
+        configure_host_sharding,
+        configure_project_setup_source,
+    )
 
     configure_host_sharding(host_sharded)
+    configure_project_setup_source(project_store)
     # A tunnel this replica retires on purpose is a handoff, not a lost runner.
     tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
     host_registry = HostRegistry()
@@ -4435,6 +4440,31 @@ def create_app(
 
         task.add_done_callback(_clear_grace_slot)
 
+    async def _on_project_setup_finished(
+        host_id: str, report: HostProjectSetupFinishedFrame
+    ) -> None:
+        """Show a session that its background project setup finished.
+
+        A host may only report on sessions bound to itself, so a host cannot
+        write notices into another user's sessions.
+
+        :param host_id: The reporting host's id.
+        :param report: The host's report.
+        """
+        from omnigent.server.routes._sessions.helpers import note_project_setup_finished
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, report.session_id)
+        if conv is None or conv.host_id != host_id:
+            _logger.warning(
+                "Ignoring project setup report from host %s for session %s",
+                host_id,
+                report.session_id,
+            )
+            return
+        await note_project_setup_finished(
+            conv, conversation_store, warning=report.warning, log_path=report.log_path
+        )
+
     async def _on_runner_exited(host_id: str, runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
@@ -4911,6 +4941,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                on_project_setup_finished=_on_project_setup_finished,
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,

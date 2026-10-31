@@ -1,14 +1,20 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
-import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { useIsSessionOwner } from "@/hooks/usePermissions";
+import { getProjectSetupLog, getSessionSignInLink, rerunProjectSetup } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
-vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSignInLink: vi.fn(),
+  rerunProjectSetup: vi.fn(),
+  getProjectSetupLog: vi.fn(),
+}));
+vi.mock("@/hooks/usePermissions", () => ({ useIsSessionOwner: vi.fn(() => true) }));
 
 afterEach(cleanup);
 
@@ -1398,5 +1404,70 @@ describe("ErrorBanner — info level", () => {
     render(<ErrorBanner message="boom" source="execution" code="runner_error" />);
     expect(screen.getByTestId("error-pill")).toHaveAttribute("data-level", "error");
     expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
+  });
+});
+
+describe("project setup notices", () => {
+  const renderNotice = (code: string, level?: "info") =>
+    render(
+      <ConversationScopeContext.Provider value="sess-setup">
+        <ErrorBanner message="Project setup notice" source="execution" code={code} level={level} />
+      </ConversationScopeContext.Provider>,
+    );
+  const rerunButton = () => screen.queryByTestId("error-rerun-project-setup");
+  const logButton = () => screen.queryByTestId("error-project-setup-log");
+
+  beforeEach(() => {
+    vi.mocked(useIsSessionOwner).mockReturnValue(true);
+    vi.mocked(rerunProjectSetup).mockReset();
+    vi.mocked(getProjectSetupLog).mockReset();
+  });
+
+  it.each([
+    ["project_env_failed", false, false],
+    ["project_setup_unsupported", false, false],
+    ["project_setup_failed", true, true],
+    ["project_setup_running", false, true],
+    ["project_setup_finished", false, true],
+  ])("%s offers rerun=%s log=%s", (code, hasRerun, hasLog) => {
+    renderNotice(code);
+    expect(rerunButton() !== null).toBe(hasRerun);
+    expect(logButton() !== null).toBe(hasLog);
+  });
+
+  it("hides the setup actions from a non-owner", () => {
+    vi.mocked(useIsSessionOwner).mockReturnValue(false);
+    renderNotice("project_setup_failed");
+    expect(rerunButton()).toBeNull();
+    expect(logButton()).toBeNull();
+  });
+
+  it("re-runs setup and shows a failure", async () => {
+    vi.mocked(rerunProjectSetup).mockRejectedValueOnce(new Error("host offline"));
+    renderNotice("project_setup_failed");
+    fireEvent.click(rerunButton()!);
+    expect(await screen.findByRole("alert")).toHaveTextContent("host offline");
+    expect(rerunButton()).toHaveTextContent("Re-run setup");
+
+    vi.mocked(rerunProjectSetup).mockResolvedValueOnce();
+    fireEvent.click(rerunButton()!);
+    await waitFor(() => expect(rerunButton()).toHaveTextContent("Setup re-running"));
+    expect(rerunProjectSetup).toHaveBeenCalledWith("sess-setup");
+  });
+
+  it("shows the worktree's setup log, or why it could not be read", async () => {
+    vi.mocked(getProjectSetupLog).mockResolvedValueOnce("npm ERR! missing script: ci");
+    renderNotice("project_setup_finished", "info");
+    fireEvent.click(logButton()!);
+    expect(await screen.findByTestId("project-setup-log-content")).toHaveTextContent(
+      "npm ERR! missing script: ci",
+    );
+    expect(getProjectSetupLog).toHaveBeenCalledWith("sess-setup");
+    cleanup();
+
+    vi.mocked(getProjectSetupLog).mockRejectedValueOnce(new Error("Forbidden"));
+    renderNotice("project_setup_running", "info");
+    fireEvent.click(logButton()!);
+    expect(await screen.findByTestId("project-setup-log-error")).toHaveTextContent("Forbidden");
   });
 });

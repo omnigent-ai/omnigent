@@ -99,6 +99,7 @@ from omnigent.inner.codex_executor import (
     codex_router_session_id,
     codex_routing_hook_skip_reason,
     materialize_codex_provider_config,
+    project_env_codex_config_overrides,
     read_codex_model_catalog,
     write_codex_hooks_file,
 )
@@ -2183,7 +2184,11 @@ def _build_native_codex_app_server_argv(
     :param launch_args: Args of a configured app-server wrapper, placed before
         everything else (see :func:`_configured_app_server_command`).
     """
-    overrides = [arg for override in config_overrides for arg in ("-c", override)]
+    overrides = [
+        arg
+        for override in (*config_overrides, *project_env_codex_config_overrides())
+        for arg in ("-c", override)
+    ]
     return [tagged_argv0, *launch_args, *overrides, "app-server", "--listen", listen_url]
 
 

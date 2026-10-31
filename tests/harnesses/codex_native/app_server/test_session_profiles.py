@@ -21,6 +21,7 @@ from omnigent.harnesses.codex_native.app_server import (
 from omnigent.inner.codex_executor import (
     _provider_codex_config_overrides,
 )
+from omnigent.project_setup import PROJECT_ENV_APPLIED_ENV_VAR
 from tests.harnesses.codex_native.app_server._support import (
     _PLAIN_TOOL_APPROVALS,
     _disable_codex_startup_rpc,
@@ -308,3 +309,20 @@ def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(provider_override,),
         )
+
+
+@pytest.mark.parametrize("project_env_applied", [False, True])
+def test_project_env_keeps_codex_tool_shells_off_login_shells(
+    monkeypatch: pytest.MonkeyPatch, project_env_applied: bool
+) -> None:
+    """A login shell's startup would move system dirs ahead of the project env's bin."""
+    if project_env_applied:
+        monkeypatch.setenv(PROJECT_ENV_APPLIED_ENV_VAR, "1")
+    else:
+        monkeypatch.delenv(PROJECT_ENV_APPLIED_ENV_VAR, raising=False)
+
+    argv = _build_native_codex_app_server_argv(
+        tagged_argv0="codex", listen_url="ws://127.0.0.1:1", config_overrides=["a=1"]
+    )
+
+    assert ("allow_login_shell=false" in argv) is project_env_applied

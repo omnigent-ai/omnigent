@@ -37,6 +37,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_FILESYSTEM_ATTACHMENTS,
 )
+from omnigent.project_setup import ProjectSetup
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -83,6 +84,8 @@ CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
+# The host runs ``HostLaunchRunnerFrame.project_setup`` before spawning the runner:
+CAP_PROJECT_SETUP = "project_setup"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -100,6 +103,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_WORKTREE_CREATE_BUDGET,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_PROJECT_SETUP,
 ]
 
 
@@ -158,6 +162,10 @@ class HostFrameKind(str, Enum):
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
+    PROJECT_SETUP_FINISHED = "host.project_setup_finished"
+    RERUN_PROJECT_SETUP = "host.rerun_project_setup"
+    READ_PROJECT_SETUP_LOG = "host.read_project_setup_log"
+    READ_PROJECT_SETUP_LOG_RESULT = "host.read_project_setup_log_result"
     RUNNER_STATUS = "host.runner_status"
     RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
@@ -326,6 +334,10 @@ class HostLaunchRunnerFrame:
         falls back to stopping every runner launched for ``session_id``; an
         empty tuple stops none, e.g. after /clear moved the old runner to
         another session.
+    :param project_setup: The session's project setup, sent only to hosts
+        advertising :data:`CAP_PROJECT_SETUP`. ``None`` when the project has none.
+    :param project_setup_invalid: Set by the decoder when the sent project
+        setup was malformed and dropped; the launch proceeds without it.
     """
 
     request_id: str
@@ -335,6 +347,8 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    project_setup: ProjectSetup | None = None
+    project_setup_invalid: bool = False
 
 
 @dataclass
@@ -360,6 +374,10 @@ class HostLaunchRunnerResultFrame:
         workspace missing and recreated it as an empty directory before
         spawning the runner, so the server can tell the user. ``False`` on
         failure and from older hosts that don't send it.
+    :param project_setup_warnings: Project setup failures the server shows on
+        the session; the runner launched regardless. Empty from older hosts.
+    :param project_setup_running: Worktree ``setup_commands`` started in the
+        background; a :class:`HostProjectSetupFinishedFrame` follows.
     """
 
     request_id: str
@@ -368,6 +386,8 @@ class HostLaunchRunnerResultFrame:
     error: str | None = None
     error_code: str | None = None
     workspace_recreated: bool = False
+    project_setup_warnings: tuple[str, ...] = ()
+    project_setup_running: bool = False
 
 
 @dataclass
@@ -426,6 +446,68 @@ class HostRunnerExitedFrame:
     runner_id: str
     error: str
     had_connected: bool | None = None
+
+
+@dataclass
+class HostReadProjectSetupLogFrame:
+    """Server → host: read the end of a worktree's latest project setup log.
+
+    The host picks the log from its own records for this worktree; the server
+    never names a file.
+
+    :param request_id: Correlates the result, e.g. ``"req_log_1"``.
+    :param workspace: The session's workspace on the host.
+    """
+
+    request_id: str
+    workspace: str
+
+
+@dataclass
+class HostReadProjectSetupLogResultFrame:
+    """Host → server: a worktree's project setup log.
+
+    :param request_id: Correlates to the :class:`HostReadProjectSetupLogFrame`.
+    :param content: The end of the log, or ``None`` when the worktree has none.
+    """
+
+    request_id: str
+    content: str | None = None
+
+
+@dataclass
+class HostRerunProjectSetupFrame:
+    """Server → host: run a session's worktree setup again, on request.
+
+    One-way; the host reports with :class:`HostProjectSetupFinishedFrame`.
+    The running agent is not restarted or held.
+
+    :param session_id: Session asking for the re-run, e.g. ``"conv_abc"``.
+    :param workspace: The session's workspace on the host.
+    :param project_setup: The project's current setup.
+    """
+
+    session_id: str
+    workspace: str
+    project_setup: ProjectSetup
+
+
+@dataclass
+class HostProjectSetupFinishedFrame:
+    """Host → server: a session's background worktree setup finished.
+
+    One-way report sent only by hosts advertising :data:`CAP_PROJECT_SETUP`.
+
+    :param session_id: Session whose launch started the setup, e.g. ``"conv_abc"``.
+    :param warning: What failed, e.g. ``"setup commands failed (exit 1)"``, or
+        ``None`` when they succeeded. Command output stays in the host log.
+    :param log_path: Host path of the full setup log, e.g.
+        ``"~/.omnigent/logs/project-setup/project-setup-....log"``.
+    """
+
+    session_id: str
+    warning: str | None = None
+    log_path: str | None = None
 
 
 @dataclass
@@ -1459,6 +1541,10 @@ HostFrame = (
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostProjectSetupFinishedFrame
+    | HostRerunProjectSetupFrame
+    | HostReadProjectSetupLogFrame
+    | HostReadProjectSetupLogResultFrame
     | HostRunnerStatusFrame
     | HostRunnerStatusResultFrame
     | HostStatFrame
@@ -1599,6 +1685,8 @@ def encode_host_frame(frame: HostFrame) -> str:
         }
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
+        if frame.project_setup is not None:
+            payload["project_setup"] = frame.project_setup.to_wire()
         return _encode_payload(payload)
     if isinstance(frame, HostLaunchRunnerResultFrame):
         return _encode_payload(
@@ -1610,6 +1698,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
                 "error_code": frame.error_code,
                 "workspace_recreated": frame.workspace_recreated,
+                "project_setup_warnings": list(frame.project_setup_warnings),
+                "project_setup_running": frame.project_setup_running,
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
@@ -1627,6 +1717,40 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostReadProjectSetupLogFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.READ_PROJECT_SETUP_LOG.value,
+                "request_id": frame.request_id,
+                "workspace": frame.workspace,
+            }
+        )
+    if isinstance(frame, HostReadProjectSetupLogResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.READ_PROJECT_SETUP_LOG_RESULT.value,
+                "request_id": frame.request_id,
+                "content": frame.content,
+            }
+        )
+    if isinstance(frame, HostRerunProjectSetupFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RERUN_PROJECT_SETUP.value,
+                "session_id": frame.session_id,
+                "workspace": frame.workspace,
+                "project_setup": frame.project_setup.to_wire(),
+            }
+        )
+    if isinstance(frame, HostProjectSetupFinishedFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PROJECT_SETUP_FINISHED.value,
+                "session_id": frame.session_id,
+                "warning": frame.warning,
+                "log_path": frame.log_path,
             }
         )
     if isinstance(frame, HostRunnerExitedFrame):
@@ -2424,6 +2548,14 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.READ_PROJECT_SETUP_LOG:
+            return _decode_read_project_setup_log(msg)
+        case HostFrameKind.READ_PROJECT_SETUP_LOG_RESULT:
+            return _decode_read_project_setup_log_result(msg)
+        case HostFrameKind.RERUN_PROJECT_SETUP:
+            return _decode_rerun_project_setup(msg)
+        case HostFrameKind.PROJECT_SETUP_FINISHED:
+            return _decode_project_setup_finished(msg)
         case HostFrameKind.RUNNER_STATUS:
             return _decode_runner_status(msg)
         case HostFrameKind.RUNNER_STATUS_RESULT:
@@ -2659,6 +2791,74 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     )
 
 
+def _decode_project_setup(raw: object) -> ProjectSetup | None:
+    """Validate a project setup payload.
+
+    :param raw: The frame's ``project_setup`` value.
+    :returns: The setup, or ``None`` when it carries no commands.
+    :raises ValueError: If the payload is malformed.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("project_setup must be an object")
+    return ProjectSetup.from_mapping(raw)
+
+
+def _decode_rerun_project_setup(msg: _JsonObject) -> HostRerunProjectSetupFrame:
+    """Decode a rerun-project-setup frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed frame.
+    :raises ValueError: If the project setup is missing or malformed.
+    """
+    setup = _decode_project_setup(msg.get("project_setup"))
+    if setup is None:
+        raise ValueError("rerun_project_setup frame requires setup commands")
+    return HostRerunProjectSetupFrame(
+        session_id=_required_str(msg, "session_id"),
+        workspace=_required_str(msg, "workspace"),
+        project_setup=setup,
+    )
+
+
+def _decode_read_project_setup_log(msg: _JsonObject) -> HostReadProjectSetupLogFrame:
+    """Decode a read-project-setup-log request.
+
+    :param msg: Decoded frame object.
+    :returns: Typed frame.
+    """
+    return HostReadProjectSetupLogFrame(
+        request_id=_required_str(msg, "request_id"),
+        workspace=_required_str(msg, "workspace"),
+    )
+
+
+def _decode_read_project_setup_log_result(
+    msg: _JsonObject,
+) -> HostReadProjectSetupLogResultFrame:
+    """Decode a read-project-setup-log result.
+
+    :param msg: Decoded frame object.
+    :returns: Typed frame.
+    """
+    return HostReadProjectSetupLogResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        content=_optional_nullable_str(msg, "content"),
+    )
+
+
+def _decode_project_setup_finished(msg: _JsonObject) -> HostProjectSetupFinishedFrame:
+    """Decode a project-setup-finished report.
+
+    :param msg: Decoded frame object.
+    :returns: Typed frame.
+    """
+    return HostProjectSetupFinishedFrame(
+        session_id=_required_str(msg, "session_id"),
+        warning=_optional_nullable_str(msg, "warning"),
+        log_path=_optional_nullable_str(msg, "log_path"),
+    )
+
+
 def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     """Decode a launch-runner frame.
 
@@ -2668,6 +2868,16 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     inference_config = msg.get("inference_config")
     if inference_config is not None and not isinstance(inference_config, dict):
         raise ValueError("inference_config must be an object or null")
+    # A malformed project setup (e.g. limits changed across versions) is dropped
+    # and reported, never allowed to fail the launch itself.
+    raw_setup = msg.get("project_setup")
+    project_setup: ProjectSetup | None = None
+    project_setup_invalid = False
+    if raw_setup is not None:
+        try:
+            project_setup = _decode_project_setup(raw_setup)
+        except ValueError:
+            project_setup_invalid = True
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
@@ -2681,6 +2891,8 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
             if "superseded_runner_ids" in msg
             else None
         ),
+        project_setup=project_setup,
+        project_setup_invalid=project_setup_invalid,
     )
 
 
@@ -2699,6 +2911,8 @@ def _decode_launch_runner_result(
         error=_optional_nullable_str(msg, "error"),
         error_code=_optional_nullable_str(msg, "error_code"),
         workspace_recreated=_optional_bool(msg, "workspace_recreated"),
+        project_setup_warnings=tuple(_optional_str_list(msg, "project_setup_warnings")),
+        project_setup_running=_optional_bool(msg, "project_setup_running"),
     )
 
 
