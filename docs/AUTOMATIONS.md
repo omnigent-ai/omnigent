@@ -28,7 +28,9 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 }
 ```
 
-`permission_mode` is available only for Claude Code (`claude-native`) agents. It accepts `default`, `auto`, `acceptEdits`, `plan`, `dontAsk`, or `bypassPermissions`; omitting it uses the agent default. Automations are unattended, so prompting modes such as `default` and `plan` can leave a run waiting for approval. Choose an auto-running mode only when its permission level is appropriate for the task.
+`permission_mode` is harness-specific, and the server rejects a mode the task's agent cannot launch with. Claude Code (`claude-native`) accepts `default`, `auto`, `acceptEdits`, `plan`, `dontAsk`, or `bypassPermissions`. Codex (`codex-native`) accepts only `bypassPermissions`, which starts the run in Codex's own non-interactive stance (`--dangerously-bypass-approvals-and-sandbox`); it has no graded equivalent of `acceptEdits` or `plan`, so those are rejected rather than silently ignored. Other harnesses do not accept the field. Omitting it uses the agent default.
+
+Automations are unattended, so prompting modes such as `default` and `plan` can leave a run waiting for approval — and on Codex the default stance means a file change parks on an approval nobody is there to answer. Choose an auto-running mode only when its permission level is appropriate for the task: `bypassPermissions` gives an unsupervised run full authority in its workspace.
 
 `max_cost_usd` is a positive per-firing budget. Each fired session gets its own cost-budget policy, which blocks subsequent requests and tool calls once recorded spend reaches the cap. It does not interrupt an in-progress model turn: spend can overshoot before the next check, and denying a native tool call does not terminate the turn. Omit the field to attach no automation-specific cap; other applicable policies still apply.
 

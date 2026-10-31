@@ -930,12 +930,12 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 
 
 @pytest.mark.asyncio
-async def test_permission_mode_omitted_for_non_claude_agent() -> None:
-    """A mis-stamped non-Claude row degrades to no --permission-mode flag.
+async def test_codex_bypass_permissions_becomes_the_codex_bypass_flag() -> None:
+    """A codex task's explicit bypass opt-in fires as Codex's own flag.
 
-    The injection is harness-gated fail-safe: even if a permission_mode somehow
-    persisted on a codex/cursor task, the fire must NOT inject the unknown flag
-    (which would break the launch) — it launches with the agent's own default.
+    Unattended runs have nobody to answer a file-change approval, so the mode is
+    translated to the stance Codex actually understands rather than Claude's
+    ``--permission-mode``, which codex would reject as an unknown flag.
     """
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
@@ -945,6 +945,47 @@ async def test_permission_mode_omitted_for_non_claude_agent() -> None:
 
     on_fire = build_on_fire(
         _claude_agent_deps(store, conv_store, harness="codex-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] == [
+        "--dangerously-bypass-approvals-and-sandbox"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "permission_mode"),
+    [
+        # Graded Claude modes have no codex equivalent, so there is nothing to
+        # translate — and guessing the bypass flag here would hand a task more
+        # authority than it asked for.
+        ("codex-native", "acceptEdits"),
+        ("codex-native", "plan"),
+        # A harness with no permission mapping at all.
+        ("cursor-native", "bypassPermissions"),
+    ],
+)
+async def test_permission_mode_omitted_for_unsupported_harness_mode(
+    harness: str, permission_mode: str
+) -> None:
+    """A mis-stamped row degrades to no permission flag at all.
+
+    The derivation is fail-safe: a combination the harness can't launch with is
+    dropped rather than injected (which would break the launch) or upgraded to a
+    bypass. The task runs with the agent's own default and keeps prompting.
+    """
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=permission_mode)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness=harness),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")

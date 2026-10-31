@@ -14,7 +14,10 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL
-from omnigent.server.routes._session_create_validation import validate_session_agent
+from omnigent.server.routes._session_create_validation import (
+    permission_mode_launch_args,
+    validate_session_agent,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -313,3 +316,31 @@ async def test_sandbox_preview_authorizes_a_shared_agent_like_binding(
     # Clients read the missing-agent reason from ``detail``.
     assert unknown.status_code == 404, unknown.text
     assert unknown.json() == {"detail": "Agent not found"}
+
+
+@pytest.mark.parametrize(
+    ("harness", "permission_mode", "expected"),
+    [
+        # Claude takes its vocabulary verbatim.
+        ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"]),
+        ("claude-native", "bypassPermissions", ["--permission-mode", "bypassPermissions"]),
+        # Codex names the same stance differently, and admits only that one mode.
+        ("codex-native", "bypassPermissions", ["--dangerously-bypass-approvals-and-sandbox"]),
+        ("codex-native", "acceptEdits", None),
+        # No mapping at all, an unresolved harness, and the agent's own default.
+        ("cursor-native", "bypassPermissions", None),
+        (None, "bypassPermissions", None),
+        ("claude-native", None, None),
+    ],
+)
+def test_permission_mode_launch_args_translates_per_harness(
+    harness: str | None, permission_mode: str | None, expected: list[str] | None
+) -> None:
+    """Each harness gets its own flag, and anything untranslatable gets none.
+
+    Returning ``None`` rather than guessing is what keeps a mis-stamped row from
+    breaking a launch with an unknown flag or silently gaining a bypass.
+    """
+    args = permission_mode_launch_args(harness=harness, permission_mode=permission_mode)
+
+    assert args == expected

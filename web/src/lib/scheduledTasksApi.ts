@@ -49,9 +49,12 @@ export interface ScheduledTask {
   modelOverride: string | null;
   reasoningEffort: string | null;
   /**
-   * Native-harness permission mode (Claude Code), e.g. `acceptEdits`, or `null`
-   * to use the agent's configured default. The server derives the runner's
-   * `--permission-mode` launch arg from it at fire time.
+   * Native-harness permission mode, e.g. `acceptEdits`, or `null` to use the
+   * agent's configured default. The server translates it into the harness's own
+   * launch arg at fire time: `--permission-mode <mode>` for Claude Code, and
+   * `--dangerously-bypass-approvals-and-sandbox` for a codex-native task that
+   * explicitly opted into `bypassPermissions`. Which modes a harness accepts is
+   * enforced server-side, so not every value is valid for every agent.
    */
   permissionMode: string | null;
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
@@ -126,7 +129,10 @@ export interface CreateScheduledTaskInput {
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
-  /** Native-harness permission mode (Claude Code); omit for the agent default. */
+  /**
+   * Native-harness permission mode; omit for the agent default. Claude Code
+   * takes its full vocabulary; codex-native takes only `bypassPermissions`.
+   */
   permissionMode?: string | null;
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
@@ -156,8 +162,9 @@ export interface UpdateScheduledTaskInput {
   /**
    * Rebind the task to a different agent, switching the harness its future
    * firings run. The server clears `modelOverride` / `reasoningEffort` /
-   * `permissionMode` on a switch (a model id is provider-bound, permission mode
-   * is Claude-only) unless the same PATCH resends them.
+   * `permissionMode` on a switch (a model id is provider-bound, and which
+   * permission modes are accepted is harness-bound) unless the same PATCH
+   * resends them.
    */
   agentId?: string;
   timezone?: string;
