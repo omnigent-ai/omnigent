@@ -402,6 +402,8 @@ from omnigent.server.subagent_activity import (
     record_claude_subagent_return,
     record_subagent_activity,
 )
+from omnigent.skills.policy import DEFAULT_POLICY as DEFAULT_SKILLS_POLICY
+from omnigent.skills.policy import SkillsMarketplacePolicy
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -10558,6 +10560,7 @@ async def _wake_parent_for_blocked_child(
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
     skill_store: SkillStore | None = None,
+    skills_policy: SkillsMarketplacePolicy = DEFAULT_SKILLS_POLICY,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -10644,6 +10647,7 @@ async def _wake_parent_for_blocked_child(
                 parent_conv,
                 skill_store=skill_store,
                 conversation_store=conversation_store,
+                policy=skills_policy,
             )
             if parent_agent is not None
             else None,
@@ -10664,6 +10668,7 @@ def configure_subagent_block_notifier(
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
     skill_store: SkillStore | None = None,
+    skills_policy: SkillsMarketplacePolicy = DEFAULT_SKILLS_POLICY,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -10710,6 +10715,7 @@ def configure_subagent_block_notifier(
             runner_router=runner_router,
             agent_store=agent_store,
             skill_store=skill_store,
+            skills_policy=skills_policy,
         )
 
     notifier = SubagentBlockNotifier(
@@ -12384,6 +12390,7 @@ async def _create_session_from_existing_agent(
                         conv,
                         skill_store=getattr(request.app.state, "skill_store", None),
                         conversation_store=conversation_store,
+                        policy=getattr(request.app.state, "skills_policy", DEFAULT_SKILLS_POLICY),
                     ),
                 )
                 if pending_background_title is not None:

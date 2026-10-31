@@ -63,6 +63,9 @@ from omnigent.stores.skill_store import (
 
 ORG_PRINCIPAL = "org"
 LOCAL_PRINCIPAL = "local"
+# A lock row that is no installer: its revision counts changes to the browse
+# list, which decide delivery when URL installs are off.
+SOURCES_KEY = "sources"
 # git's own name for the remote's default branch: what a source without a ref fetches.
 DEFAULT_REF = DEFAULT_BRANCH_REF
 # Names per IN-list, under every supported engine's parameter limit.
@@ -238,9 +241,11 @@ class SqlAlchemySkillStore(SkillStore):
                 created_at=now_epoch(),
             )
             session.add(row)
+            self._lock_principal(session, SOURCES_KEY).revision += 1
             session.flush()
             return _source_entity(row)
 
+        self._ensure_principal(SOURCES_KEY)
         try:
             return run_write_transaction(self._session_immediate, "add_skill_source", write)
         except IntegrityError:
@@ -305,8 +310,10 @@ class SqlAlchemySkillStore(SkillStore):
             if row is None:
                 return False
             session.delete(row)
+            self._lock_principal(session, SOURCES_KEY).revision += 1
             return True
 
+        self._ensure_principal(SOURCES_KEY)
         return run_write_transaction(self._session_immediate, "delete_skill_source", write)
 
     # ── installed skills ─────────────────────────────────────────────────
@@ -539,11 +546,16 @@ class SqlAlchemySkillStore(SkillStore):
                 found.extend(_skill_entity(row) for row in session.scalars(stmt))
         return found
 
-    def installed_revision(self, user_id: str | None) -> str:
-        """The org's and *user_id*'s principal revisions: two primary-key reads."""
+    def installed_revision(self, user_id: str | None, *, include_sources: bool = False) -> str:
+        """The org's and *user_id*'s principal revisions: primary-key reads only.
+
+        :param include_sources: Add the browse list's revision too, for a
+            policy under which a listed source decides delivery.
+        """
+        keys = _visible_principals(user_id) + ([SOURCES_KEY] if include_sources else [])
         with self._session("read_installed_skills_revision") as session:
             revisions = []
-            for principal in _visible_principals(user_id):
+            for principal in keys:
                 lock = session.get(SqlSkillPrincipal, (current_workspace_id(), principal))
                 revisions.append(0 if lock is None else lock.revision)
             return ".".join(str(revision) for revision in revisions)
