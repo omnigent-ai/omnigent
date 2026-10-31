@@ -480,8 +480,7 @@ class OpenCodeNativeForwarder:
                     connect_failures >= _MAX_CONNECT_FAILURES_DURING_TURN
                     and self.state.turn_active
                 ):
-                    await self._flush_pending_text()
-                    await self._end_turn(
+                    await self._end_all_session_turns(
                         status=_STATUS_FAILED, extra={"output": _SERVER_UNREACHABLE_OUTPUT}
                     )
                 attempt += 1
@@ -720,6 +719,13 @@ class OpenCodeNativeForwarder:
             self._turn_failure = dict(extra or {})
         if self._active_sessions:
             return
+        await self._end_all_session_turns(status=status, extra=extra)
+
+    async def _end_all_session_turns(
+        self, *, status: str = _STATUS_IDLE, extra: _JsonMapping | None = None
+    ) -> None:
+        """End the conversation turn; it failed if any root session failed."""
+        await self._flush_pending_text()
         if self._turn_failure is not None:
             status, extra = _STATUS_FAILED, self._turn_failure
         await self._end_turn(status=status, extra=extra)
@@ -1157,23 +1163,23 @@ class OpenCodeNativeForwarder:
         status, extra = _error_outcome(error)
         if _event_session_id(event) is None:
             # OpenCode can omit the session, so the error ends the whole turn.
-            await self._flush_pending_text()
-            await self._end_turn(status=status, extra=extra)
+            await self._end_all_session_turns(status=status, extra=extra)
             return
         await self._end_session_turn(self._event_root_session(event), status=status, extra=extra)
 
     async def _on_session_created(self, event: OpenCodeEvent) -> None:
-        """Handle ``session.created`` — follow a root session the TUI opened.
+        """Handle ``session.created`` — mirror a root session the TUI opened.
 
         Nothing else creates root sessions on this conversation's server after
-        launch, so a new one comes from the TUI (``/new`` or a fork).
+        launch, so a new one comes from the TUI (``/new`` or a fork). It becomes
+        the web target once the user prompts in it.
         """
         info = event.properties.get("info")
         if not isinstance(info, Mapping) or info.get("parentID"):
             return
         opencode_session_id = info.get("id")
         if isinstance(opencode_session_id, str) and opencode_session_id:
-            self._follow_session(opencode_session_id)
+            self._root_session_ids.add(opencode_session_id)
 
     async def _on_compaction_started(self, event: OpenCodeEvent) -> None:
         """Handle ``session.next.compaction.started`` (auto or manual).

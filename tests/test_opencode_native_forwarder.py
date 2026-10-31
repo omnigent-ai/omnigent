@@ -1274,20 +1274,37 @@ async def test_prompt_queued_during_streaming_reply_is_mirrored_after_that_reply
     ]
 
 
+_OVERLOADED = _event(
+    "session.error", error={"name": "APIError", "data": {"message": "overloaded"}}
+)
+_NEW_ROOT_IDLE = _event("session.idle", sessionID="ses_new")
+_SESSIONLESS_ABORT = OpenCodeEvent(
+    id=None,
+    type="session.error",
+    properties={"error": {"name": "MessageAbortedError", "data": {}}},
+    raw={},
+)
+
+
 @pytest.mark.parametrize(
-    ("first_root_end", "final_status", "final_output"),
+    ("first_root_end", "last_root_end", "final_status", "final_output"),
     [
-        pytest.param(_event("session.idle"), "idle", None, id="first-root-idle"),
+        pytest.param(_event("session.idle"), _NEW_ROOT_IDLE, "idle", None, id="first-root-idle"),
+        pytest.param(_OVERLOADED, _NEW_ROOT_IDLE, "failed", "overloaded", id="first-root-failed"),
         pytest.param(
-            _event("session.error", error={"name": "APIError", "data": {"message": "overloaded"}}),
+            _OVERLOADED,
+            _SESSIONLESS_ABORT,
             "failed",
             "overloaded",
-            id="first-root-failed",
+            id="first-root-failed-then-sessionless-abort",
         ),
     ],
 )
 async def test_root_sessions_streaming_at_once_keep_their_own_replies_and_turn(
-    first_root_end: OpenCodeEvent, final_status: str, final_output: str | None
+    first_root_end: OpenCodeEvent,
+    last_root_end: OpenCodeEvent,
+    final_status: str,
+    final_output: str | None,
 ) -> None:
     """TUI ``/new`` and a prompt there while the first session is still replying."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
@@ -1319,7 +1336,7 @@ async def test_root_sessions_streaming_at_once_keep_their_own_replies_and_turn(
     for event in (
         _text_part("prt_a2", "msg_4", "reply two, complete", **new),
         _step_finish("prt_f2", "msg_4", **new),
-        _event("session.idle", **new),
+        last_root_end,
     ):
         await fwd.handle_event(event)
     assert _message_texts(server.posts) == [
@@ -1371,7 +1388,7 @@ async def test_subagent_permission_request_goes_through_policy() -> None:
 
 
 async def test_root_session_the_user_prompts_in_becomes_the_web_target(tmp_path: Path) -> None:
-    """Web prompts follow TUI ``/new`` and the session picker; sub-agent sessions are skipped."""
+    """Web actions follow the root last prompted in the TUI, not a new or sub-agent session."""
     write_bridge_state(
         tmp_path,
         OpenCodeNativeBridgeState(
@@ -1385,8 +1402,9 @@ async def test_root_session_the_user_prompts_in_becomes_the_web_target(tmp_path:
         state = read_bridge_state(tmp_path)
         return state.opencode_session_id if state is not None else None
 
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
     await fwd.handle_event(_event("session.created", sessionID="ses_new", info={"id": "ses_new"}))
-    assert web_target() == "ses_new"
+    assert web_target() == _SESSION
     await fwd.handle_event(
         _event(
             "session.created",
@@ -1404,15 +1422,26 @@ async def test_root_session_the_user_prompts_in_becomes_the_web_target(tmp_path:
     await fwd.handle_event(
         _text_part("prt_child", "msg_child", "sub-agent prompt", sessionID="ses_child")
     )
-    assert web_target() == "ses_new"
+    assert web_target() == _SESSION
     assert _message_texts(server.posts) == []
 
+    new = {"sessionID": "ses_new"}
+    await fwd.handle_event(
+        _event("message.updated", info={"id": "msg_new", "role": "user"}, **new)
+    )
+    await fwd.handle_event(_text_part("prt_new", "msg_new", "prompt in new session", **new))
+    assert web_target() == "ses_new"
+
+    await fwd.handle_event(_event("session.idle"))
     await fwd.handle_event(
         _event("message.updated", info={"id": "msg_back", "role": "user", "sessionID": _SESSION})
     )
     await fwd.handle_event(_text_part("prt_back", "msg_back", "back in the first session"))
     assert web_target() == _SESSION
-    assert _message_texts(server.posts) == [("user", "back in the first session")]
+    assert _message_texts(server.posts) == [
+        ("user", "prompt in new session"),
+        ("user", "back in the first session"),
+    ]
 
 
 async def test_prompt_queued_behind_an_aborted_reply_is_still_mirrored() -> None:
