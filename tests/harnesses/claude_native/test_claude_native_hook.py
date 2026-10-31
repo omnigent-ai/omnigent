@@ -249,10 +249,12 @@ def test_session_start_hook_maps_workspace_hosted_server_to_ui_mount(
     }
 
 
+@pytest.mark.parametrize("snapshot_forbidden", [False, True])
 def test_clear_session_start_hook_rotates_before_printing_conversation_url(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    snapshot_forbidden: bool,
 ) -> None:
     """
     ``/clear`` SessionStart prints the URL for the replacement Omnigent session.
@@ -311,6 +313,12 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
             import httpx
 
             requests.append(("GET", url, None))
+            if snapshot_forbidden:
+                return httpx.Response(
+                    403,
+                    headers={"x-databricks-request-id": "00000000-0000-4000-8000-000000000001"},
+                    request=httpx.Request("GET", url, headers={"Authorization": "private token"}),
+                )
             return httpx.Response(
                 200,
                 json={
@@ -386,6 +394,17 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    if snapshot_forbidden:
+        assert json.loads(captured.err.split("diagnostics=", 1)[1]) == {
+            "rotation_stage": "read_snapshot",
+            "authorization_present": True,
+            "http_status": 403,
+            "server_request_id": "00000000-0000-4000-8000-000000000001",
+            "server_request_id_state": "uuid",
+        }
+        assert "private token" not in captured.err
+        assert requests == [("GET", "http://127.0.0.1:8787/v1/sessions/conv_old", None)]
+        return
     assert json.loads(captured.out) == {
         "systemMessage": "Open this session in Omnigent: http://127.0.0.1:8787/c/conv_new"
     }

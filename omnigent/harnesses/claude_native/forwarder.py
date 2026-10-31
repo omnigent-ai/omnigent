@@ -54,6 +54,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.harnesses.claude_native.rotation_diagnostics import rotation_failure_attributes
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
 from omnigent.models.model_metadata import concrete_reported_model
@@ -3475,12 +3476,16 @@ async def _maybe_rotate_session_on_clear(
             )
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
+        extra = debug_event("claude_native_clear_rotation_failed", session_id=session_id)
+        extra["attributes"] = (
+            rotation_failure_attributes(exc) if isinstance(exc, httpx.HTTPError) else {}
+        )
         _logger.exception(
             "Claude /clear rotation failed; consuming the clear hook to avoid a "
             "re-rotation loop. old_session=%s",
             session_id,
-            extra={"session_id": session_id},
+            extra=extra,
         )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)

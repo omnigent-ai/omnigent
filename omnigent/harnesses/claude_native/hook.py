@@ -416,7 +416,16 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
                 bridge_dir,
             )
     except httpx.HTTPError as exc:
-        print(f"omnigent claude clear hook: Omnigent rotation failed: {exc}", file=sys.stderr)
+        from omnigent.harnesses.claude_native.rotation_diagnostics import (
+            rotation_failure_attributes,
+        )
+
+        diagnostics = json.dumps(rotation_failure_attributes(exc), sort_keys=True)
+        print(
+            f"omnigent claude clear hook: Omnigent rotation failed: {exc}; "
+            f"diagnostics={diagnostics}",
+            file=sys.stderr,
+        )
         return None
     except RuntimeError as exc:
         print(f"omnigent claude clear hook: rotation failed: {exc}", file=sys.stderr)

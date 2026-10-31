@@ -264,6 +264,7 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
 async def test_clear_hook_transfer_failure_does_not_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A terminal-transfer failure during /clear must NOT spin into a session loop.
@@ -309,7 +310,11 @@ async def test_clear_hook_transfer_failure_does_not_loop(
             == "/v1/sessions/conv_old/resources/terminals/terminal_claude_main/transfer"
         ):
             # The failure that triggered the production loop.
-            return httpx.Response(400, json={"error": {"message": "Terminal already exists"}})
+            return httpx.Response(
+                400,
+                json={"error": {"message": "private terminal detail"}},
+                headers={"x-databricks-request-id": "00000000-0000-4000-8000-000000000001"},
+            )
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     transport = httpx.MockTransport(handler)
@@ -343,6 +348,19 @@ async def test_clear_hook_transfer_failure_does_not_loop(
     assert rotated_again is None
     # Exactly one replacement-session create — not one per poll.
     assert create_count == 1
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_native_clear_rotation_failed"
+    ]
+    assert record.attributes == {
+        "rotation_stage": "transfer_terminal",
+        "authorization_present": False,
+        "http_status": 400,
+        "server_request_id": "00000000-0000-4000-8000-000000000001",
+        "server_request_id_state": "uuid",
+    }
+    assert "private" not in repr(record.attributes)
 
 
 @pytest.mark.asyncio
