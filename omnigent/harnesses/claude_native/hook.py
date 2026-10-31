@@ -519,13 +519,15 @@ def _create_clear_replacement_session(
     )
     labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
 
-    create_resp = client.post(
-        f"{ap_server_url}/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
+    from omnigent.native._native_supersession import (
+        clear_replacement_create_body,
+        unfiled_clear_replacement_body,
     )
+
+    create_body = clear_replacement_create_body(old, agent_id=agent_id, labels=labels)
+    create_resp = client.post(f"{ap_server_url}/v1/sessions", json=create_body)
+    if (unfiled_body := unfiled_clear_replacement_body(create_body, create_resp)) is not None:
+        create_resp = client.post(f"{ap_server_url}/v1/sessions", json=unfiled_body)
     create_resp.raise_for_status()
     created = create_resp.json()
     if not isinstance(created, dict):
