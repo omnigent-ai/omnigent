@@ -51,8 +51,9 @@ def fulfill_json():
 def settle_for_snapshot():
     """Return a helper that settles time-dependent rendering before capture.
 
-    Waits for web fonts (so glyph metrics don't shift mid-capture) and kills the
-    blinking caret. The fonts expression must *return* the Promise so Playwright's
+    Waits for web fonts (so glyph metrics don't shift mid-capture), kills the
+    blinking caret, and pins the profile footer's host text, which carries the
+    test server's random port. The fonts expression must *return* the Promise so Playwright's
     sync API awaits it -- an arrow function calling ``.then()`` returns undefined
     and never waits.
 
@@ -62,5 +63,12 @@ def settle_for_snapshot():
     def _settle(page: Page) -> None:
         page.evaluate("document.fonts.ready")
         page.add_style_tag(content="* { caret-color: transparent !important; }")
+        # The sidebar's profile footer shows the server's host:port, and the
+        # test server listens on a random port.
+        page.evaluate(
+            """() => document
+                .querySelectorAll('[data-testid="sidebar-server-picker-host"]')
+                .forEach((host) => { host.textContent = "127.0.0.1:8000"; })"""
+        )
 
     return _settle

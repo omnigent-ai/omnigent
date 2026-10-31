@@ -235,7 +235,10 @@ export function SidebarServerPicker() {
               <span className="w-full truncate text-left font-medium text-ui text-foreground leading-4">
                 {userName}
               </span>
-              <span className="w-full truncate text-left text-sm text-muted-foreground leading-4">
+              <span
+                className="w-full truncate text-left text-sm text-muted-foreground leading-4"
+                data-testid="sidebar-server-picker-host"
+              >
                 {currentHost}
               </span>
             </span>
