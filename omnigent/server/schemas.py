@@ -5977,10 +5977,7 @@ class ProjectOrderResponse(BaseModel):
 
 
 class RecommendedProjectColorResponse(BaseModel):
-    """The color a new project would be auto-assigned.
-
-    :param color: A web theme palette id, the one the caller's projects use least.
-    """
+    """The color a new project would be auto-assigned: a web theme palette id."""
 
     color: str
 

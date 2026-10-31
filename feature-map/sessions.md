@@ -361,16 +361,6 @@ archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
 
-**Project color or emoji:** a project shows either an emoji or a folder in one
-of the theme palette colors. In New project and Rename project, click the tile
-beside the name to open the palette swatches and an emoji button; a new project
-starts on the color least like the colors other projects use. The project's
-new-chat landing tile opens the same picker and saves each pick immediately.
-Projects created any other way (a session moved to a new project name, an
-agent, the API) get the same automatic color. The color also tints the project
-folder in the session header, breadcrumb, project pickers and pinned-session
-flyout.
-
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
 the ⌘K / Ctrl+K palette or a link also lists down to that session, once the
