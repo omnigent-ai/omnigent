@@ -20,6 +20,7 @@ from omnigent.db.utils import _build_alembic_config, clear_engine_cache
 
 _PREVIOUS = "c8e4f2a6b901"
 _REVISION = "d3f7a1c9e2b4"
+_MERGE_REVISION = "b2e4f6a8c013"
 _TABLE = "omnigent_conversation_metadata"
 _SESSION_ID = bytes.fromhex("0123456789abcdef0123456789abcdef")
 
@@ -82,3 +83,42 @@ def test_downgrade_drops_the_column(database: tuple[str, sa.Engine]) -> None:
     assert "pull_requests" not in {
         column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
     }
+
+
+@pytest.mark.parametrize("starting_revision", ["base", "9e82957bd115", _REVISION])
+def test_merge_reconciles_both_schema_branches(
+    database: tuple[str, sa.Engine], starting_revision: str
+) -> None:
+    """Fresh databases and either deployed branch gain both schemas and one head."""
+    uri, engine = database
+    _migrate(uri, engine, "upgrade", starting_revision)
+    _migrate(uri, engine, "upgrade", _MERGE_REVISION)
+
+    assert "pull_requests" in {column["name"] for column in sa.inspect(engine).get_columns(_TABLE)}
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=_SESSION_ID,
+                name="ended",
+                prompt=b"p",
+                rrule="FREQ=DAILY;COUNT=2",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                created_at=1,
+                state=4,
+            )
+        )
+        assert (
+            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            == _MERGE_REVISION
+        )
+
+    _migrate(uri, engine, "downgrade", _REVISION)
+    with engine.connect() as conn:
+        assert set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars()) == {
+            "9e82957bd115",
+            _REVISION,
+        }
+        assert conn.execute(sa.select(tasks.c.state)).scalar_one() == 4
+    _migrate(uri, engine, "upgrade", _MERGE_REVISION)

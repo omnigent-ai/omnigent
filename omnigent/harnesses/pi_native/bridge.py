@@ -314,7 +314,9 @@ def enqueue_thinking_level_change(bridge_dir: Path, level: str) -> str:
     return change_id
 
 
-def enqueue_model_change(bridge_dir: Path, model: str) -> str:
+def enqueue_model_change(
+    bridge_dir: Path, model: str, *, thinking_level: str | None = None
+) -> str:
     """
     Queue a UI-originated model switch for the resident Pi extension.
 
@@ -328,6 +330,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     :param bridge_dir: Native Pi bridge directory.
     :param model: Model id to switch to, e.g.
         ``"databricks-claude-sonnet-4-6"``.
+    :param thinking_level: Explicit session effort to apply after the model switch.
     :returns: Opaque model-change id.
     """
     model_change_id = f"model_change_{uuid.uuid4().hex}"
@@ -337,6 +340,8 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
         "model": model,
         "created_at": time.time(),
     }
+    if thinking_level is not None:
+        payload["thinkingLevel"] = thinking_level
     _enqueue_payload(bridge_dir, model_change_id, payload)
     return model_change_id
 
@@ -373,7 +378,7 @@ def write_extension_files(
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
-    usage_baseline: dict[str, int] | None = None,
+    usage_baseline: dict[str, int | float] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -391,7 +396,7 @@ def write_extension_files(
         runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
         centralized server-side policy enforcement. ``None``/empty registers no
         tools (Pi falls back to its own built-in tool surface only).
-    :param usage_baseline: Server-recorded own-session cumulative tokens,
+    :param usage_baseline: Server-recorded own-session cumulative usage,
         excluding child sessions; ``None`` retains local-only restoration.
     :returns: ``(extension_path, config_path)``.
     """

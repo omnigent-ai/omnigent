@@ -69,6 +69,9 @@ def _shrink_window_and_open_sidebar(page: Page) -> Locator:
         "button", name="Close sidebar", exact=True
     ).click()
     expect(aside).to_have_attribute("data-collapsed", "true")
+    # Park the pointer over the chat: left where it is, it lands on the narrow
+    # header's "Open sidebar" toggle, and a slow run dwells long enough to peek.
+    page.mouse.move(_NARROW_VIEWPORT["width"] / 2, _NARROW_VIEWPORT["height"] / 2)
 
     page.set_viewport_size(_NARROW_VIEWPORT)
     open_sidebar = page.get_by_role("button", name="Open sidebar", exact=True)
@@ -142,3 +145,20 @@ def test_narrow_window_settings_back_row_clears_window_controls(
     assert not _intersects_window_controls(back.bounding_box()), (
         f"settings Back link {back.bounding_box()} sits under the window controls"
     )
+
+
+def test_narrowing_window_collapses_open_sidebar(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    base_url, session_id = seeded_session
+    page = _open_session_in_mac_shell(request, base_url, session_id)
+    aside = page.locator('aside[aria-label="Conversations"]')
+    expect(aside).not_to_have_attribute("data-collapsed", "true")
+
+    page.set_viewport_size(_NARROW_VIEWPORT)
+    _hold_for_recording(page)
+
+    expect(aside).to_have_attribute("data-collapsed", "true")
+    composer = page.get_by_role("textbox", name="Message the agent")
+    composer.click(timeout=5_000)
+    expect(composer).to_be_focused()
