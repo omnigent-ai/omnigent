@@ -72,8 +72,7 @@ def create_projects_router(
     ) -> dict[str, Any]:
         """Create a new, empty project owned by the caller.
 
-        A project created with neither an emoji nor a color is assigned the
-        palette color the caller's projects use least.
+        Without an emoji or color, it gets the caller's least-used palette color.
 
         :param request: The incoming request, used to identify the user.
         :param body: Project payload (name).
@@ -136,12 +135,7 @@ def create_projects_router(
 
     @router.get("/projects/recommended-color")
     async def get_recommended_project_color(request: Request) -> RecommendedProjectColorResponse:
-        """Recommend the color a new project would be auto-assigned.
-
-        :param request: The incoming request, used to identify the user.
-        :returns: The recommended palette id.
-        :raises OmnigentError: 401 if unauthenticated in multi-user mode.
-        """
+        """Return the color a new project would be auto-assigned."""
         user_id = require_user(request, auth_provider)
         color = await asyncio.to_thread(recommended_project_color, project_store, user_id)
         return RecommendedProjectColorResponse(color=color)
