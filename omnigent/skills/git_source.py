@@ -17,10 +17,12 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import IO
 from urllib.parse import urlsplit
 
 from omnigent.git_providers import EnvInstances, Instances
@@ -49,6 +51,8 @@ CLONE_TIMEOUT_S = 300
 CHECKOUT_POLL_S = 0.25
 # How long to wait for git to exit once its process group has been killed.
 KILL_WAIT_S = 5.0
+# What one git stream may write; diagnostics past it stop the clone.
+MAX_GIT_OUTPUT_BYTES = 1024 * 1024
 # A transfer slower than 1 KB/s for 30 s fails instead of waiting out the timeout.
 _LOW_SPEED_CONFIG = ("-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30")
 # The git executable; tests point it at a script.
@@ -282,7 +286,7 @@ def directory_pattern(path: str) -> str:
     return f"{literal_pattern(path)}/"
 
 
-def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+def _kill_process_group(proc: subprocess.Popen[bytes]) -> None:
     """Kill git and every helper it started (``git-remote-https``, ``index-pack``).
 
     A helper inherits git's pipes, so killing git alone leaves them open and a
@@ -295,19 +299,44 @@ def _kill_process_group(proc: subprocess.Popen[str]) -> None:
         proc.kill()
 
 
-def _drain_after_kill(proc: subprocess.Popen[str]) -> tuple[str, str]:
-    """Collect what a killed git wrote, giving up after :data:`KILL_WAIT_S`."""
-    try:
-        return proc.communicate(timeout=KILL_WAIT_S)
-    except subprocess.TimeoutExpired:
-        # Something outside the group still holds a pipe: stop reading.
-        for stream in (proc.stdout, proc.stderr):
-            if stream is not None:
-                with contextlib.suppress(OSError):
-                    stream.close()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=KILL_WAIT_S)
-        return "", ""
+class _BoundedPipe:
+    """Read a pipe on a thread, keeping at most *limit* bytes and counting the rest.
+
+    git's diagnostics come from the repository side, so they are bounded like
+    the checkout: once more than *limit* bytes arrive the caller stops git.
+    """
+
+    def __init__(self, stream: IO[bytes] | None, limit: int) -> None:
+        self._stream = stream
+        self._limit = limit
+        self._kept = bytearray()
+        self.total = 0
+        self._thread = threading.Thread(target=self._read, daemon=True)
+        self._thread.start()
+
+    def _read(self) -> None:
+        if self._stream is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            descriptor = self._stream.fileno()
+            while chunk := os.read(descriptor, 65536):
+                self.total += len(chunk)
+                room = self._limit - len(self._kept)
+                if room > 0:
+                    self._kept += chunk[:room]
+
+    @property
+    def over_limit(self) -> bool:
+        return self.total > self._limit
+
+    def text(self, timeout: float) -> str:
+        """What was kept, once the writer closes the pipe or *timeout* passes."""
+        self._thread.join(timeout)
+        if self._thread.is_alive() and self._stream is not None:
+            # Something outside the group still holds the pipe: stop reading.
+            with contextlib.suppress(OSError):
+                self._stream.close()
+        return self._kept.decode("utf-8", errors="replace")
 
 
 def _run_clone(
@@ -325,8 +354,9 @@ def _run_clone(
     A shallow clone or a blob filter does not bound what the server writes,
     since the checkout may fetch what the filter omitted; the watchdog does,
     and the finished checkout is measured once more, so a clone that crosses
-    the budget and exits before the next poll is refused too. git runs in its
-    own process group so a timeout kills its helpers with it.
+    the budget and exits before the next poll is refused too. git's output is
+    read with a bound of its own (:data:`MAX_GIT_OUTPUT_BYTES` per stream). git
+    runs in its own process group so a kill stops its helpers with it.
 
     :param deadline: ``time.monotonic()`` value to stop at; :data:`CLONE_TIMEOUT_S`
         from now when ``None``.
@@ -339,27 +369,34 @@ def _run_clone(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             env=env,
             # Its own process group, so a kill reaches git's helpers too.
             start_new_session=os.name == "posix",
         )
     except FileNotFoundError:
         raise GitSourceError("Installing from GitHub needs git on your PATH.") from None
+    out = _BoundedPipe(proc.stdout, MAX_GIT_OUTPUT_BYTES)
+    err = _BoundedPipe(proc.stderr, MAX_GIT_OUTPUT_BYTES)
     deadline = time.monotonic() + CLONE_TIMEOUT_S if deadline is None else deadline
     refusal: str | None = None
     timed_out = False
     while True:
         try:
-            stdout, stderr = proc.communicate(timeout=CHECKOUT_POLL_S)
+            proc.wait(timeout=CHECKOUT_POLL_S)
             break
         except subprocess.TimeoutExpired:
             refusal = _over_budget(dest, max_bytes, max_entries)
+            if refusal is None and (out.over_limit or err.over_limit):
+                refusal = "git wrote more output than this server accepts; refusing it."
             timed_out = time.monotonic() > deadline
             if refusal is not None or timed_out:
                 _kill_process_group(proc)
-                stdout, stderr = _drain_after_kill(proc)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=KILL_WAIT_S)
                 break
+    stdout, stderr = out.text(KILL_WAIT_S), err.text(KILL_WAIT_S)
+    if refusal is None and (out.over_limit or err.over_limit):
+        refusal = "git wrote more output than this server accepts; refusing it."
     refusal = refusal or _over_budget(dest, max_bytes, max_entries)
     if refusal is not None:
         raise GitSourceError(refusal)
