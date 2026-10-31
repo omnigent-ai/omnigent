@@ -1223,13 +1223,19 @@ async def _forward_claude_diagnostics(
     bridge_dir: Path,
     session_id: str,
     poll_interval_s: float,
-) -> AsyncIterator[Callable[[], FailureContext]]:
-    """Follow diagnostics independently of transcript discovery and HTTP progress."""
+) -> AsyncIterator[tuple[Callable[[], FailureContext], Callable[[], str | None]]]:
+    """Follow diagnostics independently of transcript discovery and HTTP progress.
+
+    Yields the metadata snapshot and the newest apiKeyHelper error line.
+    """
     if not harness_stderr_capture_enabled():
-        yield lambda: {
-            "diagnostic_capture_enabled": False,
-            "diagnostic_capture_state": "disabled",
-        }
+        yield (
+            lambda: {
+                "diagnostic_capture_enabled": False,
+                "diagnostic_capture_state": "disabled",
+            },
+            lambda: None,
+        )
         return
 
     follower = ClaudeDebugLogFollower(bridge_dir)
@@ -1260,7 +1266,7 @@ async def _forward_claude_diagnostics(
 
     task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
     try:
-        yield follower.health_snapshot
+        yield follower.health_snapshot, follower.latest_credential_helper_error
     finally:
         stop.set()
         # Let an in-flight thread finish before closing its descriptor. A second
@@ -1372,7 +1378,10 @@ async def forward_claude_transcript_to_session(
     from omnigent.cli_auth import open_server_client
 
     async with (
-        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s) as diagnostic_health,
+        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s) as (
+            diagnostic_health,
+            credential_helper_error,
+        ),
         open_server_client(
             base_url,
             headers=headers,
@@ -1591,6 +1600,7 @@ async def forward_claude_transcript_to_session(
                             # turn's id.
                             response_id=state.current_response_id,
                             diagnostic_health=diagnostic_health,
+                            credential_helper_error=credential_helper_error,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
@@ -3749,11 +3759,23 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
+# Claude's own text when its apiKeyHelper script fails; it tells a web user to run /status.
+_API_KEY_HELPER_FAILURE_TEXT = "Your apiKeyHelper script is failing"
+
+
+def _with_credential_helper_error(detail: str, helper_error: str | None) -> str:
+    """Name the helper's own error under Claude's generic helper-failure text."""
+    if helper_error is None or _API_KEY_HELPER_FAILURE_TEXT not in detail:
+        return detail
+    return f"{detail.rstrip()}\n\nThe helper reported: {helper_error}"
+
+
 def _stop_failure_detail(
     record: ClaudeHookRecord,
     *,
     session_id: str,
     transcript_context: FailureContext | None = None,
+    credential_helper_error: str | None = None,
 ) -> str | None:
     """
     Return the reason a ``StopFailure`` hook gives for its failed turn.
@@ -3761,18 +3783,24 @@ def _stop_failure_detail(
     When ``error_details`` is absent, prefer an explicit API error from the
     same response; only the category-or-nothing fallback is logged as a
     WARNING so the missing field stays observable in structured logs.
+    A failed apiKeyHelper keeps Claude's generic text and appends the
+    helper's own error line from the debug log.
 
     :param record: ``StopFailure`` hook record.
     :param session_id: Session id for structured warning logs on fallback.
     :param transcript_context: Explicit API-error evidence matched to this hook.
+    :param credential_helper_error: Newest helper stderr line, e.g.
+        ``"ERROR no access token. Run the login command."``, or ``None``.
     :returns: The error detail, a category-only fallback, or ``None``.
     """
     if record.failure_message is not None:
-        return record.failure_message
+        return _with_credential_helper_error(record.failure_message, credential_helper_error)
     if transcript_context is not None:
         message = transcript_context.get("native_error_message")
         if isinstance(message, str):
-            return _display_text(message, is_api_error=True)
+            return _with_credential_helper_error(
+                _display_text(message, is_api_error=True), credential_helper_error
+            )
     _logger.warning(
         "StopFailure hook carried no error_details; using fallback detail; "
         "session=%s event_cursor=%s category=%s",
@@ -4186,6 +4214,7 @@ async def _forward_available_status_events(
     compaction_retry_tracker: _PostRetryTracker | None = None,
     response_id: str | None = None,
     diagnostic_health: Callable[[], FailureContext] | None = None,
+    credential_helper_error: Callable[[], str | None] | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -4231,6 +4260,8 @@ async def _forward_available_status_events(
         turn-start ``running`` edge. ``None`` when no turn id is known
         (the status still posts, just without a turn association).
     :param diagnostic_health: Latest metadata-only diagnostic follower snapshot.
+    :param credential_helper_error: Newest apiKeyHelper stderr line from the
+        debug log, read when a turn fails; ``None`` when capture is off.
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
@@ -4689,7 +4720,12 @@ async def _forward_available_status_events(
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
                 failure_detail=_stop_failure_detail(
-                    record, session_id=session_id, transcript_context=transcript_context
+                    record,
+                    session_id=session_id,
+                    transcript_context=transcript_context,
+                    credential_helper_error=(
+                        credential_helper_error() if credential_helper_error is not None else None
+                    ),
                 )
                 if status == "failed"
                 else None,

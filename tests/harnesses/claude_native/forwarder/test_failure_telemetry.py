@@ -1102,3 +1102,73 @@ def test_hook_inference_fields_are_parsed_before_display_truncation(tmp_path: Pa
     assert record.failure_context["provider_error_type"] == "invalid_request_error"
     assert record.failure_context["provider_error_param"] == "user"
     assert len(record.failure_context["native_error_message"]) == 1024
+
+
+@pytest.mark.parametrize(
+    ("hook_detail", "helper_error", "expected"),
+    [
+        pytest.param(
+            "Your apiKeyHelper script is failing · This usually means you need to "
+            "re-authenticate with your provider · Run /status to see the script's error output",
+            "ERROR no credential was printed by the helper. Run the sign-in command.",
+            "Your apiKeyHelper script is failing · This usually means you need to "
+            "re-authenticate with your provider · Run /status to see the script's error output"
+            "\n\nThe helper reported: ERROR no credential was printed by the helper. "
+            "Run the sign-in command.",
+            id="generic-helper-failure-names-helper-error",
+        ),
+        pytest.param(
+            "Your apiKeyHelper script is failing · Run /status to see the script's error output",
+            None,
+            "Your apiKeyHelper script is failing · Run /status to see the script's error output",
+            id="no-debug-log-keeps-generic-text",
+        ),
+        pytest.param(
+            "Synthetic spend limit reached",
+            "ERROR unrelated helper line",
+            "Synthetic spend limit reached",
+            id="other-failures-are-not-annotated",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_failed_status_names_the_helper_error_only_for_helper_failures(
+    tmp_path: Path, hook_detail: str, helper_error: str | None, expected: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "native-session",
+            "error": "authentication_failed",
+            "error_details": hook_detail,
+        },
+    )
+    posted: list[dict[str, object]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        event = json.loads(request.content)
+        if event["type"] == "external_session_status":
+            posted.append(event["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_synthetic",
+            bridge_dir=bridge_dir,
+            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id="resp_synthetic",
+            credential_helper_error=(lambda: helper_error) if helper_error else None,
+        )
+
+    (failure,) = [data for data in posted if data.get("status") == "failed"]
+    assert failure["failure_detail"] == expected
