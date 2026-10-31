@@ -153,6 +153,9 @@ async def _serve(listen_url):
 
 
 args = sys.argv[1:]
+# Like Codex, accept -c overrides before the subcommand.
+while args[:1] == ["-c"]:
+    args = args[2:]
 if "--version" in args:
     print("codex-cli 0.0.0+{marker}")
 elif args and args[0] == "app-server" and "--listen" in args:
