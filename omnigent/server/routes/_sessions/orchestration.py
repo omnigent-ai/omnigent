@@ -17,7 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from typing import Any, Literal, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import httpx
 from fastapi import (
@@ -1533,6 +1533,7 @@ def _build_session_response(
         llm_model=llm_model,
         harness=harness,
         model_override=conv.model_override,
+        harness_override=conv.harness_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
         share_workspace_files=conv.share_workspace_files,
@@ -13518,6 +13519,88 @@ async def _run_runner_status_probe(
         _runner_status_probe_inflight.pop(session_id, None)
 
 
+class _SessionAgentIdentity(NamedTuple):
+    """The agent identity a session snapshot reports, before any reported model."""
+
+    #: Display name: the resolved spec's name, else the agent row's.
+    agent_name: str | None
+    #: The spec the session runs (the sub-agent's when it resolves), if loaded.
+    spec: AgentSpec | None
+    #: Whether a self-authenticated harness picks its own model.
+    harness_owns_model: bool
+
+    @property
+    def llm_model(self) -> str | None:
+        """The spec-pinned model, or ``None`` when the harness picks its own."""
+        if self.spec is None or self.harness_owns_model:
+            return None
+        return self.spec.executor.model
+
+
+def _resolve_session_agent_identity(
+    conv: Conversation,
+    *,
+    agent_store: AgentStore,
+    agent_cache: AgentCache,
+) -> _SessionAgentIdentity:
+    """
+    Resolve the bound agent's display name and spec the way the snapshot reports them.
+
+    Blocking: reads the agent row and, on a cold cache, fetches and parses the
+    bundle, so async callers run it in a worker thread.
+
+    :param conv: The session's conversation row.
+    :param agent_store: Store holding the bound agent row.
+    :param agent_cache: Cache that loads the agent's bundle spec.
+    :returns: The identity; every field is empty when no agent is bound.
+    """
+    agent = agent_store.get(conv.agent_id) if conv.agent_id is not None else None
+    if agent is None:
+        return _SessionAgentIdentity(agent_name=None, spec=None, harness_owns_model=False)
+    if agent.bundle_location is None:
+        return _SessionAgentIdentity(agent_name=agent.name, spec=None, harness_owns_model=False)
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+    except Exception:  # noqa: BLE001
+        # An unloadable bundle still has a row name worth showing.
+        _logger.debug("Agent bundle for session %s did not load", conv.id, exc_info=True)
+        return _SessionAgentIdentity(agent_name=agent.name, spec=None, harness_owns_model=False)
+    resolved_spec: AgentSpec = loaded.spec
+    if conv.sub_agent_name:
+        sub_spec = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+        if sub_spec is None:
+            # Unresolvable sub_agent_name — fall back to parent spec. A native
+            # sub-agent (e.g. Claude Code's general-purpose) is named by the
+            # CLI and never appears in the spec, so only warn for spec names.
+            wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY, "")
+            if not wrapper.endswith("-subagent"):
+                _logger.warning(
+                    "Sub-agent %r for session %s did not resolve in the parent "
+                    "spec; snapshot reports the parent's identity. Likely a "
+                    "renamed/removed sub-agent or stale session metadata.",
+                    conv.sub_agent_name,
+                    conv.id,
+                    extra={"session_id": conv.id},
+                )
+        else:
+            resolved_spec = sub_spec
+    # A self-authenticated harness (own-auth ACP) picks its own model: the
+    # spec's pin is not what the session runs, so claim neither it nor its
+    # context window.
+    effective_harness = conv.harness_override or _spec_harness(resolved_spec)
+    # Prefer the spec's name over the agent row's: a switch-created
+    # session-scoped clone is named "<builtin> (switch ag_…)" for row
+    # disambiguation, but clients display agent_name verbatim — the spec
+    # carries the clean identity (e.g. "claude-native-ui").
+    return _SessionAgentIdentity(
+        agent_name=resolved_spec.name or agent.name,
+        spec=resolved_spec,
+        harness_owns_model=harness_owns_its_credential(effective_harness),
+    )
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -13705,64 +13788,27 @@ async def _get_session_snapshot(
     llm_model: str | None = None
     context_window: int | None = None
     agent_name: str | None = None
-    harness_owns_model = False
     if agent_store is not None and agent_cache is not None and conv.agent_id is not None:
         try:
-            agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-            if agent is not None:
-                agent_name = agent.name
-                if agent.bundle_location is not None:
-                    # Offload to a worker thread: on a cold cache this fetches
-                    # the bundle from the artifact store and parses the spec —
-                    # blocking IO that would otherwise stall the single-worker
-                    # event loop on every page-load snapshot.
-                    loaded = await asyncio.to_thread(
-                        agent_cache.load,
-                        agent.id,
-                        agent.bundle_location,
-                        expand_env=agent.operator_authored,
-                    )
-                    resolved_spec: AgentSpec | None = loaded.spec
-                    if conv.sub_agent_name:
-                        _sub_spec = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
-                        if _sub_spec is None:
-                            # Unresolvable sub_agent_name — fall back to parent spec. A native
-                            # sub-agent (e.g. Claude Code's general-purpose) is named by the
-                            # CLI and never appears in the spec, so only warn for spec names.
-                            wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY, "")
-                            if not wrapper.endswith("-subagent"):
-                                _logger.warning(
-                                    "Sub-agent %r for session %s did not resolve in the parent "
-                                    "spec; snapshot reports the parent's identity. Likely a "
-                                    "renamed/removed sub-agent or stale session metadata.",
-                                    conv.sub_agent_name,
-                                    session_id,
-                                    extra={"session_id": session_id},
-                                )
-                        else:
-                            resolved_spec = _sub_spec
-                    if resolved_spec is not None:
-                        # A self-authenticated harness (own-auth ACP) picks its
-                        # own model: the spec's pin is not what the session
-                        # runs, so claim neither it nor its context window.
-                        effective_harness = conv.harness_override or _spec_harness(resolved_spec)
-                        harness_owns_model = harness_owns_its_credential(effective_harness)
-                        # Prefer the spec's name over the agent row's: a
-                        # switch-created session-scoped clone is named
-                        # "<builtin> (switch ag_…)" for row disambiguation,
-                        # but clients display agent_name verbatim — the spec
-                        # carries the clean identity (e.g. "claude-native-ui").
-                        if resolved_spec.name:
-                            agent_name = resolved_spec.name
-                        llm_model = None if harness_owns_model else resolved_spec.executor.model
-
-                        # Offload: may fetch a provider catalog (blocking IO).
-                        context_window = await asyncio.to_thread(
-                            resolve_effective_context_window,
-                            None if harness_owns_model else resolved_spec.executor.context_window,
-                            llm_model,
-                            model_override=conv.model_override,
-                        )
+            # Offload to a worker thread: on a cold cache this fetches the
+            # bundle from the artifact store and parses the spec — blocking IO
+            # that would otherwise stall the event loop on every snapshot.
+            identity = await asyncio.to_thread(
+                _resolve_session_agent_identity,
+                conv,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+            )
+            agent_name = identity.agent_name
+            if identity.spec is not None:
+                llm_model = identity.llm_model
+                # Offload: may fetch a provider catalog (blocking IO).
+                context_window = await asyncio.to_thread(
+                    resolve_effective_context_window,
+                    None if identity.harness_owns_model else identity.spec.executor.context_window,
+                    llm_model,
+                    model_override=conv.model_override,
+                )
         except Exception:  # noqa: BLE001
             pass
     # The harness's own report is the display authority: when a session has

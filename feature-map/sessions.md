@@ -50,7 +50,18 @@ the header menu), and each place is a separate entry point.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
-- `export`: Export in the header menu saves the transcript as a local file.
+- `export`: Export in the header menu downloads the session as an
+  `omnigent.transcript/1` file from `GET /v1/sessions/{id}/export`; the CLI
+  writes the same file with `omnigent session export` and reads it back with
+  `omnigent session import` (`docs/session-export.md`). A redacted export
+  (`--redact`, or `?content=none`) writes the session's shape with every
+  content field dropped and `redacted` in the header; import refuses it.
+  `--gzip` (or `?compress=gzip`) writes the same transcript compressed, which
+  import reads back by inspecting the file's bytes rather than its name. The
+  format is published as a JSON Schema for other tools. `--tree`
+  (or `?include=tree`) writes a session and its sub-agent sessions as one
+  bundle, which import restores as a tree. Messages that carried or named files
+  record them as artifact references (name, media type, size, digest).
 - `unread`: Mark as unread flags a session to revisit and survives a reload,
   including for the session being viewed. Its dot appears once the turn is
   idle; approval and error indicators can take precedence. A row showing the
@@ -586,7 +597,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
   seed the transcript into the spawned server's database; run them with plain
-  `uv run pytest`, outside `verify-env run`.
+  `uv run pytest`, outside `verify-env run`. The route and format are covered by
+  `tests/server/integration/test_sessions_export.py` and `tests/export/test_transcript.py`,
+  the CLI by `tests/host/test_cli_session_export.py` and
+  `tests/host/test_cli_session_import.py`.
 - **`unread`, sidebar row menu:**
   `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_mark_unread_lights_the_dot_and_persists_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty`.
