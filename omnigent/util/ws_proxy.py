@@ -22,7 +22,7 @@ import logging
 import os
 import socket
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from urllib.parse import unquote, urlsplit
 
 from omnigent_client._http import is_loopback_url
@@ -345,7 +345,7 @@ async def open_proxy_connect_socket(
     )
     try:
         # One overall deadline covers resolution, every address attempt and
-        # the handshake; the worker's own per-operation budget is secondary.
+        # the handshake; the uninterruptible worker spends the same budget.
         return await asyncio.wait_for(asyncio.shield(dial), timeout)
     except asyncio.CancelledError:
         # The worker thread cannot be interrupted; close any socket it still
@@ -388,9 +388,8 @@ def _connect_sync(
     :param target_host: Origin hostname the proxy must reach.
     :param target_port: Origin port.
     :param auth_header: Optional ``Proxy-Authorization`` value.
-    :param timeout: Budget, in seconds, for this worker's dial and handshake;
-        the dial applies it per resolved proxy address, and the awaiting
-        caller enforces the overall deadline.
+    :param timeout: Budget, in seconds, shared by this worker's dial and
+        handshake; the awaiting caller enforces the same deadline.
     :returns: The connected socket with its timeout cleared.
     :raises OSError: On dial failure, a refused/garbled CONNECT, or an
         exhausted budget.
@@ -409,7 +408,7 @@ def _connect_sync(
             )
         return remaining
 
-    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    sock = _dial_proxy(proxy_host, proxy_port, remaining_budget)
     try:
         request_lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
         if auth_header is not None:
@@ -435,7 +434,12 @@ def _connect_sync(
         status_text = status_parts[1]
         status_code = int(status_text) if status_text.isascii() and status_text.isdigit() else 0
         if not 200 <= status_code < 300:
-            raise OSError(f"proxy refused CONNECT to {authority}: {status_line!r}")
+            hint = (
+                "; the proxy must allow CONNECT to this port, or NO_PROXY must list the server"
+                if status_code in (403, 405)
+                else ""
+            )
+            raise OSError(f"proxy refused CONNECT to {authority}: {status_line!r}{hint}")
         if residue:
             # WebSocket is client-first: the origin cannot have spoken yet, so
             # early bytes mean a confused proxy — fail rather than desync.
@@ -447,3 +451,40 @@ def _connect_sync(
         with contextlib.suppress(OSError):
             sock.close()
         raise
+
+
+def _dial_proxy(host: str, port: int, remaining_budget: Callable[[], float]) -> socket.socket:
+    """Connect to the first reachable proxy address within the shared budget.
+
+    Unlike ``socket.create_connection``, which gives every resolved address the
+    full timeout, each attempt gets only what is left, so a blackholed proxy
+    cannot hold the worker thread past the caller's deadline. Name resolution
+    keeps the system resolver's own timeout, as asyncio's direct dial does.
+
+    :param host: Proxy hostname or address.
+    :param port: Proxy port.
+    :param remaining_budget: Returns the seconds left, raising
+        :class:`TimeoutError` once the budget is spent.
+    :returns: The connected socket.
+    :raises OSError: When resolution fails, every address fails, or the
+        budget runs out.
+    """
+    first_error: OSError | None = None
+    for family, sock_type, proto, _canonical_name, address in socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM
+    ):
+        sock = socket.socket(family, sock_type, proto)
+        try:
+            sock.settimeout(remaining_budget())
+            sock.connect(address)
+        except OSError as exc:
+            sock.close()
+            if isinstance(exc, TimeoutError):
+                raise  # the attempt spent the whole remaining budget
+            first_error = first_error or exc
+            continue
+        except BaseException:
+            sock.close()
+            raise
+        return sock
+    raise first_error or OSError(f"proxy host {host!r} resolved to no addresses")

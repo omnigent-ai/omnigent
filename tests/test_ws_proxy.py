@@ -219,26 +219,35 @@ async def test_connect_tunnel(userinfo):
 @pytest.mark.parametrize(
     ("reply", "error"),
     [
-        (b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", "refused CONNECT"),
+        (b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", "refused CONNECT.*Required'$"),
+        (b"HTTP/1.1 403 Forbidden\r\n\r\n", "refused CONNECT.*NO_PROXY must list the server"),
         (b"GARBAGE 200 OK\r\n\r\n", "non-HTTP response"),
         (b"HTTP/1.1 \xb200 OK\r\n\r\n", "refused CONNECT"),
         (b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 65607 + b"\r\n\r\n", "oversized"),
         (_OK + b"GARBAGE", "unexpected bytes"),
         (b"", "closed the connection"),
     ],
-    ids=["refused", "non-http", "non-decimal-status", "oversized", "trailing-bytes", "eof"],
+    ids=[
+        "refused",
+        "forbidden",
+        "non-http",
+        "non-decimal-status",
+        "oversized",
+        "trailing-bytes",
+        "eof",
+    ],
 )
 async def test_connect_error(monkeypatch, reply, error):
     from omnigent.util import ws_proxy
 
     dialed = []
-    create_connection = socket.create_connection
+    dial_proxy = ws_proxy._dial_proxy
 
-    def recording_create_connection(*args, **kwargs):
-        dialed.append(create_connection(*args, **kwargs))
+    def recording_dial_proxy(*args):
+        dialed.append(dial_proxy(*args))
         return dialed[-1]
 
-    monkeypatch.setattr(ws_proxy.socket, "create_connection", recording_create_connection)
+    monkeypatch.setattr(ws_proxy, "_dial_proxy", recording_dial_proxy)
     async with _connect_proxy(reply) as (port, _requests):
         with pytest.raises(OSError, match=error):
             await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=5)
@@ -353,8 +362,52 @@ async def test_connect_timeout_race_with_completed_dial(monkeypatch, dial_fails)
     assert sock is None or sock.fileno() == -1
 
 
+def test_proxy_dial_shares_one_budget_across_addresses(monkeypatch):
+    """A refused address falls through to the next; a blackholed one ends the dial."""
+    from omnigent.util import ws_proxy
+
+    addresses = [("192.0.2.1", 3128), ("192.0.2.2", 3128), ("192.0.2.3", 3128)]
+    attempts = []
+    opened = []
+
+    class FakeSocket:
+        def __init__(self, *_args):
+            self.timeout = None
+            self.closed = False
+            opened.append(self)
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, address):
+            attempts.append((address, self.timeout))
+            if address == addresses[0]:
+                time.sleep(0.1)
+                raise ConnectionRefusedError("refused by test proxy")
+            time.sleep(self.timeout)
+            raise TimeoutError("timed out")
+
+        def close(self):
+            self.closed = True
+
+    patched_socket = types.SimpleNamespace(**vars(socket))
+    patched_socket.getaddrinfo = lambda *_args, **_kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", address) for address in addresses
+    ]
+    patched_socket.socket = FakeSocket
+    monkeypatch.setattr(ws_proxy, "socket", patched_socket)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        ws_proxy._connect_sync("proxy.test", 3128, _TLS_HOST, 8000, None, 0.3)
+    assert time.monotonic() - started < 0.6
+    assert [address for address, _timeout in attempts] == addresses[:2]
+    assert attempts[1][1] < 0.25
+    assert all(sock.closed for sock in opened)
+
+
 async def test_connect_timeout_bounds_the_whole_handshake():
-    """A proxy that drips its CONNECT reply cannot stretch past the total budget."""
+    """A proxy that drips its CONNECT reply cannot hold the dial or its socket past the budget."""
+    drip_ended = asyncio.Event()
 
     async def drip(reader, writer):
         with contextlib.suppress(OSError, asyncio.IncompleteReadError):
@@ -366,6 +419,7 @@ async def test_connect_timeout_bounds_the_whole_handshake():
                 await writer.drain()
                 await asyncio.sleep(0.1)
         writer.close()
+        drip_ended.set()
 
     async with await asyncio.start_server(drip, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
@@ -373,6 +427,8 @@ async def test_connect_timeout_bounds_the_whole_handshake():
         with pytest.raises(TimeoutError):
             await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=0.5)
         assert time.monotonic() - started < 2
+        # The full reply takes ~4s to drip; ending sooner means the worker hung up.
+        await asyncio.wait_for(drip_ended.wait(), 1.5)
 
 
 def _self_signed_cert(directory: Path, hostname: str) -> Path:
