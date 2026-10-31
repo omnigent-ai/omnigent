@@ -126,7 +126,7 @@ function script() {
     if (url === "/v1/skill-sources" && method === "POST") return json(source, 201);
     if (url === "/v1/skill-sources/src1" && method === "DELETE" && state.failDeleteSource)
       return json({ error: { message: "This source is set in the server config" } }, 403);
-    const deleted = /^\/v1\/skill-sources\/(\w+)$/.exec(url);
+    const deleted = url.match(/^\/v1\/skill-sources\/(\w+)$/);
     if (deleted && method === "DELETE") {
       state.sources = state.sources.filter((s) => s.id !== deleted[1]);
       return new Response(null, { status: 204 });
