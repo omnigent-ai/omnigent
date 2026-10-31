@@ -10,7 +10,7 @@ scripted, and every assertion checks the request the mock actually received.
 Needs ``@opencode/cli`` in the supported range and ``tmux`` on ``PATH``; runs in
 mock mode only (no ``--llm-api-key``)::
 
-    npm install -g @opencode/cli@2.0.18
+    npm install -g @opencode/cli@2.0.32
     uv run pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v
 
 Set ``OMNIGENT_E2E_OPENCODE_REQUIRED=1`` (CI does) to fail instead of skip when

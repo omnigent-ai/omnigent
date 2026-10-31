@@ -68,7 +68,7 @@ def test_extra_cli_rows_match_harness_install_table() -> None:
     script = (_ROOT / "deploy/docker/install-harness-cli.sh").read_text()
 
     opencode = hi._HARNESS_INSTALL[hi.OPENCODE_KEY]
-    assert opencode.package == "@opencode/cli@~2.0.18"
+    assert opencode.package == "@opencode/cli@2.0.32"
     pkg, _, pin = opencode.package.rpartition("@")
     assert f"{pkg}@${{version:-{pin}}}" in script
     # v1 opencode-ai owns the same global `opencode` bin (npm EEXIST); this

@@ -11,7 +11,7 @@ forks and ``/clear`` through the server API.
 Opt-in and run manually before merging opencode-native changes (needs
 ``@opencode/cli`` 2.0.x on PATH). OpenCode's free models need no credentials::
 
-    npm install -g @opencode/cli@~2.0.18
+    npm install -g @opencode/cli@2.0.32
     OMNIGENT_E2E_OPENCODE_NATIVE=1 OMNIGENT_E2E_OPENCODE_MODEL=opencode/big-pickle \
     uv run pytest tests/e2e/test_host_opencode_native_e2e.py -v
 
@@ -64,7 +64,7 @@ from tests.e2e.helpers import POLL_INTERVAL_S
 pytestmark = pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_OPENCODE_NATIVE") != "1" or shutil.which("opencode") is None,
     reason=(
-        "opencode-native host e2e needs `opencode` 2.x (npm @opencode/cli@~2.0.18) + LLM creds; "
+        "opencode-native host e2e needs `opencode` 2.x (npm @opencode/cli@2.0.32) + LLM creds; "
         "set OMNIGENT_E2E_OPENCODE_NATIVE=1 (and pass --profile/--llm-api-key) to run"
     ),
 )

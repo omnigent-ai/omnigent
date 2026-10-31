@@ -1126,7 +1126,7 @@ def test_opencode_install_spec_pins_v2_cli() -> None:
     spec = hi.harness_install_spec(hi.OPENCODE_KEY)
     assert spec is not None
     assert spec.binary == "opencode"
-    assert spec.package == "@opencode/cli@~2.0.18"
+    assert spec.package == "@opencode/cli@2.0.32"
 
 
 def test_opencode_install_never_removes_v1_package() -> None:
@@ -1137,9 +1137,9 @@ def test_opencode_install_never_removes_v1_package() -> None:
     script = argv[2]
     assert "npm rm -g opencode-ai >" not in script
     assert script.index("npm ls -g opencode-ai") < script.index(
-        "npm install -g @opencode/cli@~2.0.18"
+        "npm install -g @opencode/cli@2.0.32"
     )
-    assert hi.harness_install_display(hi.OPENCODE_KEY) == ("npm install -g @opencode/cli@~2.0.18")
+    assert hi.harness_install_display(hi.OPENCODE_KEY) == ("npm install -g @opencode/cli@2.0.32")
 
 
 def _stub_opencode_version(monkeypatch: pytest.MonkeyPatch, version: str) -> None:
@@ -1174,7 +1174,7 @@ def test_install_harness_cli_runs_opencode_guard_and_install(
         "Popen",
         fake_installer(calls=calls, on_call=lambda: state.update(installed=True)),
     )
-    _stub_opencode_version(monkeypatch, "2.0.18")
+    _stub_opencode_version(monkeypatch, "2.0.32")
 
     assert hi.install_harness_cli(hi.OPENCODE_KEY) is True
     assert calls == [["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT]]
@@ -1237,7 +1237,7 @@ def test_opencode_install_script_installs_when_v1_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When ``npm ls -g opencode-ai`` fails (not installed), the script
-    proceeds straight to ``npm install -g @opencode/cli@~2.0.18``."""
+    proceeds straight to ``npm install -g @opencode/cli@2.0.32``."""
     npm_log = tmp_path / "npm-calls.log"
     fake_npm = tmp_path / "npm"
     fake_npm.write_text(
@@ -1255,7 +1255,7 @@ def test_opencode_install_script_installs_when_v1_absent(
 
     assert result.returncode == 0
     calls = npm_log.read_text().splitlines()
-    assert any(call.startswith("install -g @opencode/cli@~2.0.18") for call in calls)
+    assert any(call.startswith("install -g @opencode/cli@2.0.32") for call in calls)
 
 
 def test_install_harness_cli_runs_hermes_installer_then_rechecks(

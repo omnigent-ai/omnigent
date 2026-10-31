@@ -20,7 +20,7 @@ reports the harness as *outdated* until it is upgraded.
 ## Install and sign in
 
     npm rm -g opencode-ai            # only if OpenCode 1.x is installed
-    npm i -g @opencode/cli@~2.0.18
+    npm i -g @opencode/cli@2.0.32
     opencode auth login              # optional; free models need no sign-in
     omnigent opencode
 
@@ -131,7 +131,7 @@ replays the history as a text preamble instead.
 
 ## Troubleshooting
 
-- *Harness is outdated*: install `@opencode/cli@~2.0.18` as shown above.
+- *Harness is outdated*: install `@opencode/cli@2.0.32` as shown above.
 - *Auth-shaped turn error*: the model's provider needs a sign-in. Run
   `opencode auth login` on the host, or pick a free `opencode/…` model.
 - Diagnostics: set `OMNIGENT_HARNESS_STDERR_ENABLED=1` before starting the host

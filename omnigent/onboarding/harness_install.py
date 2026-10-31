@@ -133,9 +133,11 @@ _ANTIGRAVITY_MIN_VERSION = "1.1.13"
 
 # OpenCode native harness CLI (``opencode serve`` plus the ``--server`` TUI),
 # installed via the ``@opencode/cli`` npm package. No login/logout/status argv
-# is wired yet — readiness is binary-only until an auth check exists.
+# is wired yet — readiness is binary-only until an auth check exists. Pinned
+# exactly: OpenCode ships 2.0.x patches often, so a range would install an
+# untested release.
 OPENCODE_KEY = "opencode"
-_OPENCODE_PACKAGE = "@opencode/cli@~2.0.18"
+_OPENCODE_PACKAGE = "@opencode/cli@2.0.32"
 # v1 ``opencode-ai`` links the same global ``opencode`` bin and npm refuses to
 # overwrite another package's bin (EEXIST). Omnigent doesn't remove packages it
 # didn't install, so setup stops with a message instead of uninstalling it.

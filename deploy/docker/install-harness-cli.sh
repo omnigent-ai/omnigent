@@ -22,7 +22,7 @@
 # Why names instead of raw npm specs: the row knows HOW the harness ships.
 # Several harness CLIs are not npm packages at all (goose and jcode ship
 # single-binary vendor installers), and for the npm ones the row carries the
-# right package and default pin (e.g. opencode → @opencode/cli@~2.0.18, mirroring
+# right package and default pin (e.g. opencode → @opencode/cli@2.0.32, mirroring
 # omnigent/onboarding/harness_install.py — keep the two in sync). An unknown
 # name fails the build loudly instead of npm-installing an unrelated package
 # that happens to share the name.
@@ -37,7 +37,7 @@
 #
 # Supported rows — the CLI-gated harnesses NOT in the default image set (the
 # canonical list is _HARNESS_INSTALL in omnigent/onboarding/harness_install.py):
-#   opencode  → npm @opencode/cli (default pin ~2.0.18, as harness_install.py)
+#   opencode  → npm @opencode/cli (default pin 2.0.32, as harness_install.py)
 #   qwen      → npm @qwen-code/qwen-code
 #   goose     → vendor installer (aaif-goose/goose download_cli.sh), default
 #               pin 1.38.0 (mirroring _GOOSE_MIN_VERSION)
@@ -250,7 +250,7 @@ for spec in "$@"; do
             if npm ls -g opencode-ai --depth=0 >/dev/null 2>&1; then
                 die "OpenCode 1.x (opencode-ai) is installed and owns the global 'opencode' binary. Remove it first: npm rm -g opencode-ai"
             fi
-            install_npm "@opencode/cli@${version:-~2.0.18}" opencode
+            install_npm "@opencode/cli@${version:-2.0.32}" opencode
             ;;
         qwen)     install_npm "@qwen-code/qwen-code${version:+@$version}" qwen ;;
         goose)    install_goose "$version" ;;

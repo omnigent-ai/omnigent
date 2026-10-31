@@ -7289,7 +7289,7 @@ describe("NewChatLandingScreen", () => {
       harness: "opencode-native",
       readiness: "version-too-low",
       badgeName: "outdated",
-      warning: "OpenCode needs OpenCode 2.0 on machine-1 — run npm i -g @opencode/cli@~2.0.18",
+      warning: "OpenCode needs OpenCode 2.0 on machine-1 — run npm i -g @opencode/cli@2.0.32",
     },
     {
       id: "a_polly",

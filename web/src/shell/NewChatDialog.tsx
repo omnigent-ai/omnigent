@@ -885,7 +885,7 @@ function harnessWarningMessage(
     return (
       <>
         {agentName} needs OpenCode 2.0 on {hostName} — run{" "}
-        <code>npm i -g @opencode/cli@~2.0.18</code> (after <code>npm rm -g opencode-ai</code>) or{" "}
+        <code>npm i -g @opencode/cli@2.0.32</code> (after <code>npm rm -g opencode-ai</code>) or{" "}
         <code>omni setup</code> on that machine.
       </>
     );

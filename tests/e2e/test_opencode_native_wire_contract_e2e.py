@@ -9,7 +9,7 @@ and drives the provider-independent ``/api/*`` endpoints the harness relies on.
 Environment requirements (why this is opt-in, not pure-CI)
 ----------------------------------------------------------
 * Opt-in only: set ``OMNIGENT_E2E_OPENCODE_NATIVE=1`` and have ``opencode`` 2.0.x
-  on ``PATH`` (``npm i -g @opencode/cli@~2.0.18``). No login or model
+  on ``PATH`` (``npm i -g @opencode/cli@2.0.32``). No login or model
   credential is needed: server info, session create/get/list/context, the SSE
   stream, fork, interrupt, and the permission/form error paths are
   provider-independent.
@@ -41,7 +41,7 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_OPENCODE_NATIVE") != "1" or shutil.which("opencode") is None,
     reason=(
         "opencode-native wire-contract e2e needs `opencode` 2.0.x on PATH; "
-        "set OMNIGENT_E2E_OPENCODE_NATIVE=1 (and `npm i -g @opencode/cli@~2.0.18`) to run"
+        "set OMNIGENT_E2E_OPENCODE_NATIVE=1 (and `npm i -g @opencode/cli@2.0.32`) to run"
     ),
 )
 
