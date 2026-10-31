@@ -159,8 +159,11 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
 
     assert enters == (1 if stops else 5)
     if stops:
-        assert type(caught.value).__name__ == "ClaudeSubmitBlockedUnconfirmed"
-        assert "could not be confirmed" in str(caught.value)
+        assert isinstance(caught.value, bridge.ClaudeSubmitBlockedUnconfirmed)
+        assert caught.value.code == "prompt_blocked_by_hook"
+        assert str(caught.value) == (
+            "A hook blocked this message, so the agent did not run it. Hook reason: Refused."
+        )
     else:
         assert isinstance(caught.value, bridge.ClaudeMessageNotAccepted)
     records = [
@@ -199,7 +202,7 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
         )
         executor = ClaudeNativeExecutor(bridge_dir=tmp_path)
         monkeypatch.setattr(executor, "_inject_prompt", refused)
-        with caplog.at_level(logging.ERROR):
+        with caplog.at_level(logging.WARNING):
             events = [
                 event
                 async for event in executor.run_turn(
@@ -209,8 +212,8 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
         assert len(events) == 1
         assert isinstance(events[0], ExecutorError)
         assert events[0].undelivered is False
-        assert events[0].code is None
-        assert any(record.levelno == logging.ERROR for record in caplog.records)
+        assert events[0].code == "prompt_blocked_by_hook"
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
             pending_id
         ]
