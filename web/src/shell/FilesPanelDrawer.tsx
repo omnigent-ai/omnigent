@@ -17,6 +17,8 @@ import { useEffect, useRef } from "react";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { cn } from "@/lib/utils";
 import { FilesPanel } from "./FilesPanel";
+import { WorkspaceUploadProvider, WorkspaceUploadDropRoot, UploadsTray } from "./WorkspaceUploads";
+import { useParams } from "@/lib/routing";
 import type { ChangedSort } from "./FlatFileList";
 
 interface FilesPanelDrawerProps {
@@ -60,6 +62,7 @@ export function FilesPanelDrawer({
 }: FilesPanelDrawerProps) {
   const { panelWidth, handleProps, isDesktop } = useResizablePanel(open);
   const ref = useRef<HTMLElement>(null);
+  const { conversationId } = useParams<{ conversationId: string }>();
 
   useEffect(() => {
     if (!open) return;
@@ -106,16 +109,23 @@ export function FilesPanelDrawer({
           is set: it owns the header (title + X close button) and
           fills the parent's height. Mount it only while open so the
           folder tree initializes from the latest inline-panel state. */}
-      {open && (
-        <FilesPanel
-          onFileSelect={onFileSelect}
-          flatView={flatView}
-          showHidden={showHidden}
-          onShowHiddenChange={onShowHiddenChange}
-          sort={sort}
-          onSortChange={onSortChange}
-          onClose={onClose}
-        />
+      {conversationId && (
+        <WorkspaceUploadProvider sessionId={conversationId}>
+          {open && (
+            <WorkspaceUploadDropRoot>
+              <FilesPanel
+                onFileSelect={onFileSelect}
+                flatView={flatView}
+                showHidden={showHidden}
+                onShowHiddenChange={onShowHiddenChange}
+                sort={sort}
+                onSortChange={onSortChange}
+                onClose={onClose}
+              />
+            </WorkspaceUploadDropRoot>
+          )}
+          <UploadsTray visible={open} />
+        </WorkspaceUploadProvider>
       )}
     </aside>
   );
