@@ -27,6 +27,7 @@ never to the OpenCode HTTP port.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -39,6 +40,7 @@ from pathlib import Path
 import httpx
 from packaging.version import InvalidVersion, Version
 
+from omnigent.git_providers.github import gh_config_dir
 from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_DEFAULT_USERNAME,
     OPENCODE_SERVER_PASSWORD_ENV_VAR,
@@ -334,7 +336,9 @@ def filtered_server_env(
     Build the launch environment for ``opencode serve``.
 
     Per-session XDG dirs isolate OpenCode's state from the user's global
-    config; ``OPENCODE_SERVER_PASSWORD`` secures the loopback server. Only
+    config; ``GH_CONFIG_DIR`` keeps the GitHub CLI on the host's own login,
+    which that isolation would otherwise hide from the agent's shell;
+    ``OPENCODE_SERVER_PASSWORD`` secures the loopback server. Only
     provider/proxy env and operator-declared runner passthrough vars from the
     parent are passed through.
 
@@ -360,6 +364,11 @@ def filtered_server_env(
             or key in extra_names
         ):
             env[key] = value
+    # gh resolves its config under XDG_CONFIG_HOME, so the per-session override
+    # below would hide the host's `gh auth login`; pin gh to the host's dir.
+    # Without a home directory there is no host login to expose.
+    with contextlib.suppress(RuntimeError):
+        env["GH_CONFIG_DIR"] = gh_config_dir()
     env.update(extra_env or {})
     env["XDG_DATA_HOME"] = str(xdg_data_home_for_bridge_dir(bridge_dir))
     env["XDG_CONFIG_HOME"] = str(xdg_config_home_for_bridge_dir(bridge_dir))
