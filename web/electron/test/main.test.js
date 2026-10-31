@@ -5482,6 +5482,21 @@ describe("SSH connect IPC", () => {
 });
 
 describe("main-owned local host eligibility", () => {
+  it("denies local eligibility when the window loses its pinned origin or is destroyed", (t) => {
+    const h = loadNavigationHarness({ serverUrl: "https://server.example" });
+    t.after(h.cleanup);
+    h.api.createBrowserRegistryForWindow(h.win);
+    const eligible = h.browserRegistryDeps().allowsLocalhost;
+    const context = { hostIsThisMachine: true, sourceHostId: "local" };
+    assert.equal(eligible(context), true);
+    assert.equal(eligible({ ...context, revoked: true }), false);
+    h.api.windows.get(h.win).origin = null;
+    assert.equal(eligible(context), false);
+    h.api.windows.get(h.win).origin = "https://server.example";
+    h.win.isDestroyed = () => true;
+    assert.equal(eligible(context), false);
+  });
+
   it("ignores page-supplied eligibility and requires enrollment plus the protocol marker", (t) => {
     let live = true;
     const serverUrl = "https://server.example";

@@ -505,7 +505,12 @@ Main verifies this machine's current host identity and a live host daemon
 record enrolled with the window's server. That enrollment is the trust boundary:
 the server can already launch code here. The session host ID only routes the
 request. Both an updated desktop and web bundle are required; older web bundles
-remain public-only without destroying existing views.
+remain public-only without destroying existing public views.
+
+Eligibility is granted at navigation and re-checked at every navigation and agent
+read/action. A failed check revokes access before clearing the previous document;
+access stays revoked if clearing fails. Request and redirect checks use the
+in-memory grant and window trust gates, keeping disk reads off the request path.
 
 Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.

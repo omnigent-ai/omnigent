@@ -81,7 +81,7 @@ function createBrowserViewRegistry({
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
-  allowsLocalhost = () => false,
+  allowsLocalhost: contextAllowsLocalhost = () => false,
   // (hostname, partition) => Promise<string[]> for the agent DNS check, and
   // (url, partition) => Promise<string> ("DIRECT" or a PAC-style proxy list).
   resolveHost = lookupHostAddresses,
@@ -98,6 +98,35 @@ function createBrowserViewRegistry({
     const generation = Symbol();
     pendingNavigations.set(conversationId, generation);
     return () => pendingNavigations.get(conversationId) === generation;
+  }
+  const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
+
+  function needsAgentViewRevocation(entry, nextContext) {
+    const context = entry?.agentContext;
+    return (
+      context?.hostIsThisMachine === true &&
+      (context.revoked ||
+        !nextContext?.hostIsThisMachine ||
+        nextContext.sourceHostId !== context.sourceHostId)
+    );
+  }
+
+  async function revokeAgentView(conversationId, isCurrent = beginAgentNavigation(conversationId)) {
+    const entry = get(conversationId);
+    const context = entry?.agentContext;
+    if (!context) return { ok: true };
+    context.revoked = true;
+    try {
+      await entry.view.webContents.loadURL("about:blank");
+      if (!isCurrent() || get(conversationId) !== entry || entry.agentContext !== context) {
+        return { ok: false, error: "navigation superseded or closed" };
+      }
+      entry.agentContext = null;
+      entry.lastRequestedUrl = "about:blank";
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Unable to clear the previous browser page" };
+    }
   }
   let activeConversationId = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
@@ -479,6 +508,9 @@ function createBrowserViewRegistry({
 
   function openOrNavigate(conversationId, url, bounds, opts) {
     const force = !!(opts && opts.force);
+    if (needsAgentViewRevocation(get(conversationId), opts?.agentContext)) {
+      return { ok: false, error: "Previous browser page must be cleared before navigating" };
+    }
     // Agent-driven nav (opts.agent) is gated by an allowlist (see
     // browserUrlPolicy) so the model can't point the view at file:// /
     // metadata / loopback / private hosts and exfiltrate via screenshot. URL-bar
@@ -661,6 +693,8 @@ function createBrowserViewRegistry({
     getOrCreate,
     openOrNavigate,
     beginAgentNavigation,
+    needsAgentViewRevocation,
+    revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
     shouldCancelAgentRequest,
     agentRequestHeaders,

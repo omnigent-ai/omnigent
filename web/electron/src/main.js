@@ -3924,6 +3924,7 @@ function createBrowserRegistryForWindow(win) {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
     allowsLocalhost: (context) => {
+      if (context?.revoked || win.isDestroyed() || !pinnedOrigin(win)) return false;
       const target = windowArcaServerUrl(win);
       return (
         isArcaAgentContext(arcaIdentities.get(target), context, {

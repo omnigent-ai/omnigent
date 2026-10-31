@@ -395,6 +395,7 @@ function registerBrowserIpc({
     const entry = gated.registry.get(args?.conversationId);
     if (!entry) return { error: "No browser view" };
     const context = entry.agentContext;
+    if (context?.revoked) return { error: "The previous browser page is no longer available" };
     if (context?.hostIsThisMachine === true) {
       const opts = args?.opts;
       if (
@@ -404,17 +405,12 @@ function registerBrowserIpc({
       ) {
         return { error: "Current session host is required to read this browser view" };
       }
-      if (opts.sourceHostId !== context.sourceHostId) {
-        try {
-          await entry.view.webContents.loadURL("about:blank");
-          // Keep reads gated until the old document has finished unloading.
-          if (entry.agentContext === context) {
-            entry.agentContext = null;
-            entry.lastRequestedUrl = "about:blank";
-          }
-        } catch {
-          // Retain the privilege gate if the view could not be cleared.
-        }
+      const currentContext = getAgentContextForEvent(event, opts);
+      if (
+        opts.sourceHostId !== context.sourceHostId ||
+        currentContext?.hostIsThisMachine !== true
+      ) {
+        await gated.registry.revokeAgentView(args.conversationId);
         return { error: "Session host changed; the previous browser page is no longer available" };
       }
     }
@@ -435,8 +431,13 @@ function registerBrowserIpc({
     const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
     const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
     const navigate = async (registry) => {
-      // Main derives navigation eligibility from the window and routing options.
+      // Main validates the renderer-supplied host; opts only route.
       const agentContext = getAgentContextForEvent(event, opts);
+      if (registry.needsAgentViewRevocation?.(registry.get(conversationId), agentContext)) {
+        const cleared = await registry.revokeAgentView(conversationId, isCurrent);
+        if (!isCurrent()) return cancelled;
+        if (!cleared.ok) return cleared;
+      }
       if (url) {
         const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
         if (!isCurrent()) return cancelled;
