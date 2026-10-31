@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 
 from omnigent.git_providers import EnvInstances, Instances
 from omnigent.git_providers.github import GitHubProvider
-from omnigent.skills.limits import MAX_SOURCE_PATH_CHARS
+from omnigent.skills.limits import MAX_PATH_CHARS, MAX_SOURCE_PATH_CHARS
 
 # ``owner/repo`` and ``github:`` shorthands mean github.com; a URL, or a bare
 # ``host/owner/repo`` (the form ``allowed_sources`` uses; a GitHub owner has no
@@ -34,11 +34,13 @@ from omnigent.skills.limits import MAX_SOURCE_PATH_CHARS
 _GITHUB_SOURCE_RE = re.compile(
     r"^(?:github:|https://(?P<host>[A-Za-z0-9.-]+)/|(?P<bare_host>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)/)?"
     r"(?P<owner>\w[\w.-]*)/(?P<repo>\w[\w.-]*?)(?:\.git)?"
-    r"(?:/tree/(?P<tree_ref>[^/@]+))?(?P<subpath>(?:/\w[\w.-]*)*)/?(?:@(?P<name>[\w.-]+))?$"
+    r"(?:/tree/(?P<tree_ref>[^/@]+))?(?P<subpath>(?:/(?!\.\.?(?:[/@]|/?$))[\w.-]+)*)/?"
+    r"(?:@(?P<name>[\w.-]+))?$"
 )
 DEFAULT_HOST = "github.com"
-# A repository directory: the same segments ``_GITHUB_SOURCE_RE`` accepts.
-_SOURCE_PATH_RE = re.compile(r"\w[\w.-]*(?:/\w[\w.-]*)*")
+# A source directory: the segments ``_GITHUB_SOURCE_RE`` accepts, dot-led ones
+# such as ``.agents`` included (``.`` and ``..`` are refused separately).
+_SOURCE_PATH_RE = re.compile(r"[\w.-]+(?:/[\w.-]+)*")
 
 LFS_POINTER = b"version https://git-lfs.github.com/spec/"
 
@@ -103,21 +105,37 @@ def parse_github_source(source: str, *, instances: Instances | None = None) -> G
     )
 
 
-def normalize_source_path(path: str | None) -> str:
-    """A repository directory in POSIX form, ``""`` for the root.
+def repository_path(path: str | None, *, max_chars: int = MAX_PATH_CHARS) -> str:
+    """A directory inside a repository in POSIX form, ``""`` for the root.
 
-    :raises GitSourceError: When it leaves the repository, uses characters a
-        GitHub path link cannot carry, or is too long to store.
+    Any directory name the catalog can index is accepted (an installed skill's
+    stored path is one), but never ``.``, ``..``, an empty segment or NUL.
+
+    :raises GitSourceError: When it leaves the repository or exceeds *max_chars*.
     """
     cleaned = (path or "").strip().strip("/")
     if not cleaned:
         return ""
-    if not _SOURCE_PATH_RE.fullmatch(cleaned) or ".." in PurePosixPath(cleaned).parts:
+    parts = cleaned.split("/")
+    if "\x00" in cleaned or any(part in ("", ".", "..") for part in parts):
         raise GitSourceError(f"{cleaned!r} is not a directory inside the repository.")
-    if len(cleaned) > MAX_SOURCE_PATH_CHARS:
-        raise GitSourceError(
-            f"A source directory is limited to {MAX_SOURCE_PATH_CHARS} characters."
-        )
+    if len(cleaned) > max_chars:
+        raise GitSourceError(f"A repository directory is limited to {max_chars} characters.")
+    return cleaned
+
+
+def normalize_source_path(path: str | None) -> str:
+    """A source's directory in POSIX form, ``""`` for the root.
+
+    Stricter than :func:`repository_path`: only the characters a GitHub path
+    link carries, and short enough for the source's unique key.
+
+    :raises GitSourceError: When it leaves the repository, uses other
+        characters, or is too long to store.
+    """
+    cleaned = repository_path(path, max_chars=MAX_SOURCE_PATH_CHARS)
+    if cleaned and not _SOURCE_PATH_RE.fullmatch(cleaned):
+        raise GitSourceError(f"{cleaned!r} is not a directory inside the repository.")
     return cleaned
 
 

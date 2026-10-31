@@ -445,3 +445,18 @@ def test_a_sparse_clone_checks_out_only_what_it_selects(
         text=True,
     ).stdout.split()
     assert f"?{big}" in missing
+
+
+def test_hidden_root_directories_are_valid_paths_but_traversal_is_not() -> None:
+    # .agents and .claude are catalog layouts; a link into them parses, and an
+    # installed path may use any indexed name, but never . or .. segments.
+    linked = git_source.parse_github_source("https://github.com/a/b/tree/main/.claude/skills")
+    assert linked is not None and linked.subpath == ".claude/skills"
+    assert git_source.normalize_source_path(".agents/skills") == ".agents/skills"
+    assert git_source.repository_path("skills/[team]/review") == "skills/[team]/review"
+    for bad in ("a/../b", ".", "a//b"):
+        with pytest.raises(git_source.GitSourceError):
+            git_source.repository_path(bad)
+    with pytest.raises(git_source.GitSourceError):
+        git_source.normalize_source_path("skills/[team]")
+    assert git_source.parse_github_source("acme/skills/../x") is None
