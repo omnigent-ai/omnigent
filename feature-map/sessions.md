@@ -356,10 +356,20 @@ the automation's page for the automations list. With automations off for the
 caller, the session is deleted alone and its automation pauses at its next run.
 
 **Project folder:** right-click its header or open its three-dot menu, then
-choose Rename project. Start typing as soon as the dialog opens. Delete project
+choose Edit project. Start typing as soon as the dialog opens. Delete project
 archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
+
+**Project color or emoji:** a project shows either an emoji or a folder in one
+of the theme palette colors. New project and Edit project show the palette
+swatches and an Emoji button under the name; a new project starts on the
+recommended color (the one least like the colors other projects use), and
+clicking it again resets to the default. Projects created any other way (a
+session moved to a new project name, an agent, the API) get the same color.
+The color also tints the project folder in the session header, breadcrumb,
+project pickers and pinned-session flyout. The project's new-chat landing tile
+opens the same picker from its pencil and saves each pick immediately.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
