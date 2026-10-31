@@ -9,7 +9,7 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
-- `siblings`: **+ Add new agent** creates a private, fresh conversation in the
+- `siblings`: **Add Agent** creates a private, fresh conversation in the
   same sidebar family. Its composer offers ordinary hosts/new sandboxes and
   only the clicked member's ephemeral host, preselected. Siblings have one
   indentation level with curved connectors and are absent from the Agents panel.
@@ -194,7 +194,7 @@ the header menu), and each place is a separate entry point.
 ## How to get to it (user POV)
 
 - For siblings, open an owned active session's sidebar kebab, right-click menu,
-  or header menu and choose **+ Add new agent**. Mobile row/header menus offer
+  or header menu and choose **Add Agent**. Mobile row/header menus offer
   the same action. Select a host in the composer and send the first message.
 
 **Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a

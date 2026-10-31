@@ -78,6 +78,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                         await expect(row).to_be_visible()
                         await row.hover()
                         await row.get_by_test_id("conversation-actions").click()
+                        await page.screenshot(path=str(evidence / "add-agent-menu.png"))
                         await page.get_by_test_id("add-sibling-session").click()
                         await expect(
                             page.get_by_test_id("sibling-composer-context")
@@ -342,6 +343,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                         await cdp.send(
                             "Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []}
                         )
+                        await phone.screenshot(path=str(evidence / "mobile-add-agent-menu.png"))
                         await phone.get_by_test_id("add-sibling-session").click()
                         await expect(
                             phone.get_by_test_id("sibling-composer-context")

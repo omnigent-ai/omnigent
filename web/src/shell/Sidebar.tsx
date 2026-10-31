@@ -4314,13 +4314,6 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
-      {isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
-        <C.Item asChild data-testid="add-sibling-session">
-          <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
-            <PlusIcon className="size-3.5" />+ Add new agent
-          </Link>
-        </C.Item>
-      )}
       <SessionActionMenuItem
         Item={C.Item}
         data-testid="fork-conversation"
@@ -4355,6 +4348,14 @@ function ConversationMenuItems({
             Only the session owner can rename this session
           </TooltipContent>
         </Tooltip>
+      )}
+      {isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
+        <C.Item asChild data-testid="add-sibling-session">
+          <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
+            <PlusIcon className="size-3.5" />
+            Add Agent
+          </Link>
+        </C.Item>
       )}
       {/* Every row offers one read-state action: "Mark as unread" re-lights
           the pink dot so a session can be flagged to revisit (including the

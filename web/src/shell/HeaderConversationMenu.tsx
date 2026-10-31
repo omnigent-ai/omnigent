@@ -267,15 +267,6 @@ export function HeaderConversationMenu({
           Share
         </DropdownMenuItem>
       )}
-      {!isArchived && info !== "loading" && info.sibling_sessions && (
-        <DropdownMenuItem
-          data-testid="add-sibling-session"
-          className={itemClass}
-          onSelect={() => navigate(`/?sibling=${encodeURIComponent(conversation.id)}`)}
-        >
-          <PlusIcon className="size-3.5" />+ Add new agent
-        </DropdownMenuItem>
-      )}
       {canFork && (
         <SessionActionMenuItem
           data-testid="header-fork-conversation"
@@ -319,6 +310,16 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
+      {!isArchived && info !== "loading" && info.sibling_sessions && (
+        <DropdownMenuItem
+          data-testid="add-sibling-session"
+          className={itemClass}
+          onSelect={() => navigate(`/?sibling=${encodeURIComponent(conversation.id)}`)}
+        >
+          <PlusIcon className="size-3.5" />
+          Add Agent
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}
