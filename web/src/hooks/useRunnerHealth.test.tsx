@@ -22,7 +22,9 @@ const fetchMock = vi.fn();
 const pollUnsubscribes: (() => void)[] = [];
 
 /** Subscribes to polls until the test ends, even if it fails first. */
-function listenToPolls(listener: (liveness: Map<string, SessionLiveness>) => void): () => void {
+function listenToPolls(
+  listener: (liveness: Map<string, SessionLiveness>, scheduled: boolean) => void,
+): () => void {
   const unsubscribe = onRunnerHealthPolled(listener);
   pollUnsubscribes.push(unsubscribe);
   return unsubscribe;
@@ -213,6 +215,29 @@ describe("useRunnerHealth", () => {
     act(() => refreshRunnerHealth());
     await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(true));
     expect(heard).toHaveBeenCalledOnce();
+  });
+
+  it("tells listeners which polls the poll interval ran", async () => {
+    vi.useFakeTimers();
+    try {
+      const heard = vi.fn();
+      listenToPolls(heard);
+      fetchMock.mockResolvedValue(
+        mockHealth({ conv_a: { runner_online: false, host_online: false } }),
+      );
+      const sessions = [input("conv_a")];
+      renderHook(() => useRunnerHealth(sessions));
+      const scheduledFlags = () => heard.mock.calls.map(([, scheduled]) => scheduled);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      act(() => refreshRunnerHealth());
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(scheduledFlags()).toEqual([false, false]);
+
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(scheduledFlags()).toEqual([false, false, true]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("still reports a poll to later listeners when an earlier one throws", async () => {

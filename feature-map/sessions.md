@@ -372,10 +372,11 @@ asleep, **Reconnect host** in the composer's host menu has the server wake the
 sandbox and start the agent without sending a message, in the browser too.
 The host status dot in the composer chip and its menu spins while the sandbox
 starts and turns green once it is online. A toast appears only when the wake
-fails or, after the server answers, three host health checks still find the
-host offline. Those checks count only once the server stops reporting launch
-progress. If the server reports the launch failed or waiting on the user, the
-dot stops and Reconnect host returns.
+fails or, after the server answers, three regular host health checks still
+find the host offline. Extra checks, such as the one run right after the
+server answers, don't count. The checks count only once the server stops
+reporting launch progress. If the server reports the launch failed or waiting
+on the user, the dot stops and Reconnect host returns.
 Reloading during the wake keeps it spinning, with the stage (for example
 "Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
 stays in the menu then, in case that stage never finishes.

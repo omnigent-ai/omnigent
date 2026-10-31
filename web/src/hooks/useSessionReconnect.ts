@@ -15,7 +15,7 @@ import { retrySession } from "@/lib/sessionsApi";
 import type { SandboxStatus } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 
-/** How many health polls may report a woken sandbox's host offline before the wake gives up. */
+/** How many scheduled health polls may report a woken sandbox's host offline before it gives up. */
 export const SANDBOX_WAKE_ONLINE_GRACE_POLLS = 3;
 
 /** Identifies a reported launch stage by value; snapshots rebuild the object. */
@@ -145,14 +145,15 @@ export function useSessionReconnect({
     if (sandboxWake === "awaiting_online" && hostOnline === true) setSandboxWake(null);
   }, [sandboxWake, hostOnline]);
 
-  // Count polls, not time, since `/health` backs off on failures. The count waits
-  // for the launch to stop reporting progress, and starts from zero then.
+  // Count the interval's polls, not time, since `/health` backs off on failures; a
+  // refresh or dialog's extra polls could use up the count in seconds. The count
+  // waits for the launch to stop reporting progress, and starts from zero then.
   useEffect(() => {
     if (sandboxWake !== "awaiting_online" || launchInProgress || !sessionId) return;
     let offlinePolls = 0;
-    return onRunnerHealthPolled((liveness) => {
+    return onRunnerHealthPolled((liveness, scheduled) => {
       const session = liveness.get(sessionId);
-      if (!session || session.host_online === true) return;
+      if (!scheduled || !session || session.host_online === true) return;
       offlinePolls += 1;
       if (offlinePolls !== SANDBOX_WAKE_ONLINE_GRACE_POLLS) return;
       setSandboxWake(null);

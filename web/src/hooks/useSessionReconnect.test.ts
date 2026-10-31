@@ -21,11 +21,13 @@ import { useChatStore } from "@/store/chatStore";
 import { SANDBOX_WAKE_ONLINE_GRACE_POLLS, useSessionReconnect } from "./useSessionReconnect";
 
 const healthPollListeners = vi.hoisted(
-  () => new Set<(liveness: Map<string, SessionLiveness>) => void>(),
+  () => new Set<(liveness: Map<string, SessionLiveness>, scheduled: boolean) => void>(),
 );
 vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn() }));
 vi.mock("@/hooks/useRunnerHealth", () => ({
-  onRunnerHealthPolled: (listener: (liveness: Map<string, SessionLiveness>) => void) => {
+  onRunnerHealthPolled: (
+    listener: (liveness: Map<string, SessionLiveness>, scheduled: boolean) => void,
+  ) => {
     healthPollListeners.add(listener);
     return () => healthPollListeners.delete(listener);
   },
@@ -58,15 +60,18 @@ function hostRow(hostId: string, status: Host["status"]): Host {
 /** Finishes `count` `/health` polls that report `sessionId`'s host as `hostOnline`. */
 function finishHealthPolls(
   count: number,
-  hostOnline: boolean | null = false,
-  sessionId = "session",
+  {
+    hostOnline = false,
+    sessionId = "session",
+    scheduled = true,
+  }: { hostOnline?: boolean | null; sessionId?: string; scheduled?: boolean } = {},
 ) {
   const liveness = new Map([
     [sessionId, { runner_online: false, host_online: hostOnline, host_version: null }],
   ]);
   for (let poll = 0; poll < count; poll += 1) {
     act(() => {
-      for (const listener of [...healthPollListeners]) listener(liveness);
+      for (const listener of [...healthPollListeners]) listener(liveness, scheduled);
     });
   }
 }
@@ -555,7 +560,9 @@ describe("useSessionReconnect", () => {
       });
       // Polls backed off to the 60s ceiling don't run out a deadline between them.
       act(() => vi.advanceTimersByTime(3 * 60_000));
-      finishHealthPolls(3, false, "other-session");
+      finishHealthPolls(3, { sessionId: "other-session" });
+      // Extra polls from a refresh or a dialog don't use up the count.
+      finishHealthPolls(3, { scheduled: false });
       expect(result.current.sandboxStarting).toBe(true);
       // Two offline polls keep it starting; the third ends it.
       finishHealthPolls(2);
@@ -563,7 +570,7 @@ describe("useSessionReconnect", () => {
       rerender({ hostOnline: null });
       expect(result.current.sandboxStarting).toBe(true);
       expect(toast.error).not.toHaveBeenCalled();
-      finishHealthPolls(1, null);
+      finishHealthPolls(1, { hostOnline: null });
       expect(result.current.sandboxStarting).toBe(false);
       expect(toast.error).toHaveBeenCalledExactlyOnceWith(
         "The sandbox didn't come online. Try Reconnect host again.",
@@ -599,7 +606,7 @@ describe("useSessionReconnect", () => {
       expect(result.current.sandboxStarting).toBe(true);
       if (ending === "the host comes online") {
         // The poll that reads online reaches the hook before the liveness it feeds.
-        finishHealthPolls(1, true);
+        finishHealthPolls(1, { hostOnline: true });
         rerender({ ...asleepSandbox, hostOnline: true });
       } else {
         rerender({ ...asleepSandbox, sessionId: "other-session", hostOnline: false });
