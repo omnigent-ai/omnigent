@@ -10,11 +10,12 @@ import { SettingsSkillsSection } from "./SettingsSkillsSection";
 import { authenticatedFetch } from "@/lib/identity";
 import type { InstalledSkill, SkillCatalog, SkillSource } from "@/lib/skillsApi";
 
-const flags = { feature: true, admin: true, urlInstall: true };
+const flags = { feature: true, admin: true, urlInstall: true, singleUser: false };
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     features: { skills_marketplace: flags.feature },
     skills_marketplace: { url_install: flags.urlInstall },
+    single_user: flags.singleUser,
   }),
 }));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => flags.admin }));
@@ -186,6 +187,7 @@ beforeEach(() => {
   flags.feature = true;
   flags.admin = true;
   flags.urlInstall = true;
+  flags.singleUser = false;
   state.installed = [review];
   state.sources = [source];
   state.moreSources = null;
@@ -516,6 +518,17 @@ describe("SettingsSkillsSection", () => {
     expect(screen.queryByTestId("skill-source-input")).toBeNull();
     expect(screen.queryByRole("button", { name: /Remove source/ })).toBeNull();
     expect(screen.getByTestId("skill-url-input")).toBeInTheDocument();
+  });
+
+  it("gives the single user of a local runtime the admin controls the server allows", async () => {
+    // The local runtime's own identity has no admin grant, but the server treats it as admin.
+    flags.admin = false;
+    flags.singleUser = true;
+    renderSection();
+    openBrowse();
+    await screen.findByTestId("skill-source-src1");
+    expect(screen.getByTestId("skill-source-input")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove source acme/skills" })).toBeInTheDocument();
   });
 
   it("keeps a config source in place and drops Add from URL when the server says so", async () => {

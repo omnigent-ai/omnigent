@@ -1,7 +1,11 @@
 import { useMemo, useRef, useState } from "react";
 import { PackageIcon, PlusIcon, RefreshCwIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { skillUrlInstallEnabled, skillsMarketplaceEnabled } from "@/lib/capabilities";
+import {
+  isSingleUserMode,
+  skillUrlInstallEnabled,
+  skillsMarketplaceEnabled,
+} from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,7 +44,8 @@ const shortCommit = (commit: string | null) => (commit ? commit.slice(0, 7) : nu
 
 export function SettingsSkillsSection() {
   const info = useServerInfo();
-  const isAdmin = useIsAdmin();
+  // The local single-user runtime administers the marketplace, as the server allows.
+  const isAdmin = useIsAdmin() || isSingleUserMode(info);
   const [tab, setTab] = useState("installed");
   if (!skillsMarketplaceEnabled(info)) return null;
   return (

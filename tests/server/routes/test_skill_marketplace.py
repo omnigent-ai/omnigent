@@ -547,6 +547,21 @@ async def test_the_local_single_user_administers_the_marketplace(
         )
         assert org.status_code == 201, org.text
         assert (await client.delete(f"/v1/skill-sources/{source.json()['id']}")).status_code == 204
+        # The managed local runtime can sign the user in as their own identity,
+        # which has no admin grant; the single user still administers.
+        assert not SqlAlchemyPermissionStore(db_uri).is_admin("bob@example.com")
+        mine = await client.post("/v1/skill-sources", json={"source": "acme/skills"}, headers=BOB)
+        assert mine.status_code == 201, mine.text
+        org_body = {"source": "acme/skills", "names": ["triage"], "scope": "org"}
+        installed = await client.post("/v1/installed-skills", json=org_body, headers=BOB)
+        assert installed.status_code == 201, installed.text
+        local_org_skill = org.json()["data"][0]["id"]
+        toggled = await client.patch(
+            f"/v1/installed-skills/{local_org_skill}", json={"enabled": False}, headers=BOB
+        )
+        assert toggled.status_code == 200, toggled.text
+        removed = await client.delete(f"/v1/skill-sources/{mine.json()['id']}", headers=BOB)
+        assert removed.status_code == 204, removed.text
 
 
 @pytest.mark.asyncio

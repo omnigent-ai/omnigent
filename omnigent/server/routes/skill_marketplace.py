@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from omnigent.entities import InstalledSkill, SkillSource
 from omnigent.entities.skill import SkillScope
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import AuthProvider, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -217,8 +217,8 @@ def _skill_object(skill: InstalledSkill) -> InstalledSkillObject:
 
 
 async def _is_admin(user_id: str | None, permission_store: PermissionStore | None) -> bool:
-    """Single-user mode (no permission store) is all-admin, like the other admin gates."""
-    if permission_store is None:
+    """The single user (no permission store, or the local single-user runtime) is admin."""
+    if permission_store is None or local_single_user_enabled():
         return True
     return user_id is not None and await asyncio.to_thread(permission_store.is_admin, user_id)
 
