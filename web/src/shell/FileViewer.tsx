@@ -11,6 +11,7 @@
 
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
 import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
+import { OpenInSplitButton, useOpenInActions } from "./OpenInMenu";
 import {
   dismissFilePosition,
   isFilePositionDismissed,
@@ -81,6 +82,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
 import { useFileDiff } from "@/hooks/useFileDiff";
+import { useInertRef } from "@/hooks/useInertRef";
 import {
   type Comment,
   useAddComment,
@@ -434,8 +436,11 @@ function FileViewerBody({
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
+  const onScreen = open && isActiveViewport && mediaActive;
   // Video playback reads the complete binary on demand, never the capped JSON preview.
-  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path);
+  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path, {
+    visible: onScreen,
+  });
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -474,6 +479,7 @@ function FileViewerBody({
   const setViewerRoot = useCallback((el: HTMLElement | null) => {
     viewerRootRef.current = el;
   }, []);
+  const setFramedViewerRoot = useInertRef<HTMLElement>(!open, setViewerRoot);
   const [contentWidth, setContentWidth] = useState<number | null>(null);
   // Tracks the in-progress comment textarea body. Used by MarkdownCommentPlugin
   // to decide whether to preserve the pending mark when the user clicks away.
@@ -795,6 +801,7 @@ function FileViewerBody({
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
   const revealTarget = useRevealTarget(path);
+  const openInActions = useOpenInActions(isDeletedFile ? null : path);
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -1134,6 +1141,8 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
+    /** Keep the default action directly available beside its app picker. */
+    splitMenu?: boolean;
   }
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
@@ -1278,12 +1287,8 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // A single "⋯" menu folds the view controls that were previously separate
-  // top-level icons: Find in file and Download (all views), plus the diff-only
-  // toggles (wrap lines, whitespace changes). Grouping them frees toolbar width
-  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
-  // diff-settings menu. The toggles keep the menu open; actions close it as they
-  // hand off.
+  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
+  // whitespace toggle to save toolbar width; toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1312,7 +1317,9 @@ function FileViewerBody({
       onSelect: downloadFile,
     });
   }
-  if (viewMode === "diff") {
+  // One wrap preference covers the source editor and the diff. Other views
+  // (rich Markdown, previews, the Shiki source view) already wrap.
+  if (isMonacoFindSurface && (diffViewActive || !isDeletedFile)) {
     settingsMenu.push({
       key: "wrap-lines",
       label: "Wrap lines",
@@ -1322,6 +1329,8 @@ function FileViewerBody({
       keepOpen: true,
       onSelect: () => setWrapLines((prev) => !prev),
     });
+  }
+  if (viewMode === "diff") {
     settingsMenu.push({
       key: "hide-whitespace",
       label: "Hide whitespace changes",
@@ -1351,6 +1360,15 @@ function FileViewerBody({
     ),
     onSelect: copyFileLink,
   });
+  if (openInActions.length) {
+    toolbarActions.push({
+      key: "open-in",
+      label: "Open in…",
+      icon: null,
+      menu: openInActions,
+      splitMenu: true,
+    });
+  }
 
   const showNavButtons = currentNavIdx !== -1 && navigableFiles.length > 1 && !!onNavigateTo;
   const {
@@ -1380,7 +1398,9 @@ function FileViewerBody({
   // measurement clone so it stays out of the tab order / a11y tree.
   const renderActionButtons = (interactive: boolean) =>
     toolbarActions.map((action) =>
-      action.menu ? (
+      action.splitMenu && action.menu ? (
+        <OpenInSplitButton key={action.key} actions={action.menu} interactive={interactive} />
+      ) : action.menu ? (
         // A settings menu: one trigger opening a list of independent items
         // (toggles + actions). Toggles carry `keepOpen` so the menu stays open
         // as the user flips them; actions close it on select.
@@ -1621,37 +1641,58 @@ function FileViewerBody({
               )}
             </span>
           )}
-          {/* Responsive action switcher: inline icon buttons until they no
-              longer fit (decided by useToolbarOverflow from the header width),
-              then a single "⋯" menu with the same options. The offscreen clone
-              below measures the full row's natural width. */}
+          {/* Collapse overflowing actions into "⋯", keeping the Open in split
+              button visible. The offscreen clone measures the full row. */}
           <div className="flex items-center justify-end gap-1">
             {toolbarCollapsed ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
-                    <MoreHorizontalIcon className="size-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-auto min-w-40">
-                  {toolbarActions.map((action) =>
-                    action.options ? (
-                      // A mutually-exclusive picker (e.g. view mode) collapses to
-                      // a nested submenu so its "selected choice" semantics — one
-                      // highlighted option — stay intact.
-                      <DropdownMenuSub key={action.key}>
-                        <DropdownMenuSubTrigger className="whitespace-nowrap">
-                          {action.icon}
-                          {action.tooltip ?? action.label}
-                        </DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent>
-                          {action.options.map((option) => (
+              <>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
+                      <MoreHorizontalIcon className="size-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-auto min-w-40">
+                    {toolbarActions
+                      .filter((action) => !action.splitMenu)
+                      .map((action) =>
+                        action.options ? (
+                          // Keep view-mode choices grouped in a submenu.
+                          <DropdownMenuSub key={action.key}>
+                            <DropdownMenuSubTrigger className="whitespace-nowrap">
+                              {action.icon}
+                              {action.tooltip ?? action.label}
+                            </DropdownMenuSubTrigger>
+                            <DropdownMenuSubContent>
+                              {action.options.map((option) => (
+                                <DropdownMenuItem
+                                  key={option.key}
+                                  className={cn(
+                                    "whitespace-nowrap",
+                                    option.active && "bg-muted dark:bg-muted/50",
+                                  )}
+                                  onSelect={(e) => {
+                                    if (option.keepOpen) e.preventDefault();
+                                    option.onSelect();
+                                  }}
+                                >
+                                  {option.icon}
+                                  {option.label}
+                                  {option.active && !option.noActiveCheck && (
+                                    <CheckIcon className="ml-auto size-4" />
+                                  )}
+                                </DropdownMenuItem>
+                              ))}
+                            </DropdownMenuSubContent>
+                          </DropdownMenuSub>
+                        ) : action.menu ? (
+                          // The settings menu's items are already independent
+                          // toggles/actions, so flatten them straight into this "⋯"
+                          // overflow rather than nesting a "⋯"-in-"⋯" submenu.
+                          action.menu.map((option) => (
                             <DropdownMenuItem
                               key={option.key}
-                              className={cn(
-                                "whitespace-nowrap",
-                                option.active && "bg-muted dark:bg-muted/50",
-                              )}
+                              className="whitespace-nowrap"
                               onSelect={(e) => {
                                 if (option.keepOpen) e.preventDefault();
                                 option.onSelect();
@@ -1663,42 +1704,22 @@ function FileViewerBody({
                                 <CheckIcon className="ml-auto size-4" />
                               )}
                             </DropdownMenuItem>
-                          ))}
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
-                    ) : action.menu ? (
-                      // The settings menu's items are already independent
-                      // toggles/actions, so flatten them straight into this "⋯"
-                      // overflow rather than nesting a "⋯"-in-"⋯" submenu.
-                      action.menu.map((option) => (
-                        <DropdownMenuItem
-                          key={option.key}
-                          className="whitespace-nowrap"
-                          onSelect={(e) => {
-                            if (option.keepOpen) e.preventDefault();
-                            option.onSelect();
-                          }}
-                        >
-                          {option.icon}
-                          {option.label}
-                          {option.active && !option.noActiveCheck && (
-                            <CheckIcon className="ml-auto size-4" />
-                          )}
-                        </DropdownMenuItem>
-                      ))
-                    ) : (
-                      <DropdownMenuItem
-                        key={action.key}
-                        className="whitespace-nowrap"
-                        onSelect={action.onSelect}
-                      >
-                        {action.icon}
-                        {action.tooltip ?? action.label}
-                      </DropdownMenuItem>
-                    ),
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
+                          ))
+                        ) : (
+                          <DropdownMenuItem
+                            key={action.key}
+                            className="whitespace-nowrap"
+                            onSelect={action.onSelect}
+                          >
+                            {action.icon}
+                            {action.tooltip ?? action.label}
+                          </DropdownMenuItem>
+                        ),
+                      )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <OpenInSplitButton actions={openInActions} />
+              </>
             ) : (
               renderActionButtons(true)
             )}
@@ -1726,6 +1747,19 @@ function FileViewerBody({
         </div>
       </div>
 
+      {fileQuery.isRefetchError && !isDeletedFile && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground"
+        >
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          <span>
+            Couldn&apos;t refresh this file (
+            {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
+            ). Showing the last loaded version.
+          </span>
+        </div>
+      )}
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
         <div
           ref={contentAreaRef}
@@ -1811,13 +1845,14 @@ function FileViewerBody({
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
               panelOpen={open}
-              mediaActive={open && isActiveViewport && mediaActive}
+              mediaActive={onScreen}
               searchOpen={searchOpen}
               setSearchOpen={setSearchOpen}
               searchFocusNonce={searchFocusNonce}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
               markdownSourceFallback={markdownSourceFallback ?? false}
+              wrapLines={wrapLines}
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
@@ -1948,7 +1983,7 @@ function FileViewerBody({
 
   return (
     <aside
-      ref={setViewerRoot}
+      ref={setFramedViewerRoot}
       data-testid="file-viewer"
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
@@ -1962,7 +1997,6 @@ function FileViewerBody({
       )}
       aria-hidden={!open}
       data-collapsed={!open || undefined}
-      inert={!open}
     >
       {/* Resize handle — desktop only (mobile is full-screen overlay) */}
       {isDesktop && (

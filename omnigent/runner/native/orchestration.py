@@ -12,8 +12,10 @@ import asyncio
 import contextlib
 import dataclasses
 import errno
+import functools
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -21,7 +23,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -66,6 +68,7 @@ from omnigent.errors import (
 )
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
@@ -95,6 +98,7 @@ from omnigent.runner.resource_registry import (
     PI_NATIVE_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    redacted_terminal_output,
 )
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
@@ -423,10 +427,13 @@ async def _observe_terminal_interactive(
     """Emit one semantic event when a native TUI can accept a message."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
+    last_screen: str | None = None
     try:
         while True:
             result = await instance.read()
             screen = result.get("screen")
+            if isinstance(screen, str):
+                last_screen = screen
             if isinstance(screen, str) and is_interactive(screen):
                 _logger.info(
                     "Native terminal became interactive: session=%s harness=%s terminal_id=%s",
@@ -466,6 +473,9 @@ async def _observe_terminal_interactive(
                 terminal_instance_id=instance.diagnostic_id,
                 readiness_signal=readiness_signal,
                 reason=type(exc).__name__,
+                # What held the TUI back (a dialog, an auth error) is otherwise
+                # only on the pane.
+                terminal_last_output=redacted_terminal_output(last_screen),
             ),
         )
 
@@ -628,6 +638,10 @@ class _CodexNativeLaunchConfig:
         ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
         app-server threads (no approval prompts, no command sandbox). Default
         ``False``. See issue #657.
+    :param plan_mode: ``True`` when the session's
+        ``omnigent.codex_native.collaboration_mode`` label is ``"plan"``, e.g.
+        armed on the New Session screen. The launched thread is then switched
+        into Plan mode before web turns can reach it. Default ``False``.
     :param auto_harness: ``True`` when the session started in Smart Routing's
         auto-harness mode (``omnigent.routing.auto_harness`` label or a
         ``harness_override`` of ``"auto"``), so the router may re-route its
@@ -665,6 +679,7 @@ class _CodexNativeLaunchConfig:
     fork_source_external_id: str | None
     fork_carry_history: bool
     bypass_sandbox: bool
+    plan_mode: bool = False
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
@@ -717,7 +732,7 @@ class _PiNativeLaunchConfig:
     fork_carry_history: bool = False
     model_override: str | None = None
     reasoning_effort: str | None = None
-    native_usage_baseline: dict[str, int] | None = None
+    native_usage_baseline: dict[str, int | float] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1310,12 +1325,21 @@ async def _pi_native_launch_config(
         "cumulative_output_tokens",
         "cumulative_cache_read_input_tokens",
     )
-    native_usage_baseline = (
+    native_usage_baseline: dict[str, int | float] | None = (
         {key: int(baseline[key]) for key in usage_fields}
         if isinstance(baseline, dict)
         and all(type(baseline.get(key)) is int and baseline[key] >= 0 for key in usage_fields)
         else None
     )
+    if native_usage_baseline is not None and isinstance(baseline, dict):
+        cost = baseline.get("cumulative_cost_usd")
+        if (
+            isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and math.isfinite(cost)
+            and cost >= 0
+        ):
+            native_usage_baseline["cumulative_cost_usd"] = cost
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
@@ -1426,6 +1450,7 @@ async def _codex_native_launch_config(
     from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -1441,6 +1466,7 @@ async def _codex_native_launch_config(
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
     bypass_sandbox = False
+    plan_mode = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -1451,6 +1477,7 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        plan_mode = labels.get(CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY) == "plan"
         # The executor reads this label's bridge directory, so launch into it too.
         _bid = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
         if isinstance(_bid, str) and _bid:
@@ -1472,6 +1499,7 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
+        plan_mode=plan_mode,
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
@@ -2726,8 +2754,8 @@ async def _auto_create_pi_terminal(
     # already have. Skipped when the user pinned their own provider/model via
     # terminal_launch_args. When no usable provider is configured Pi falls
     # back to its own login, but a spec/session-pinned model still passes
-    # through as ``--model``. Writes a managed per-session Pi config dir,
-    # never touching the user's global ``~/.pi/agent``.
+    # through as ``--model``. Session model configuration stays separate;
+    # supported user resources are linked into the session agent directory.
     credential_warning: str | None = None
     effort_notice: str | None = None
     model_notice: str | None = None
@@ -2762,6 +2790,7 @@ async def _auto_create_pi_terminal(
                 provider,
                 launch_config.reasoning_effort,
                 selection=spec_model,
+                global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -2798,6 +2827,11 @@ async def _auto_create_pi_terminal(
         agent_dir=agent_dir,
     )
     pi_args.extend(provider_args)
+    from omnigent.harnesses.pi_native.auth_command import AUTH_DIR_ENV, refresh_model_auth
+
+    model_auth_dir = Path(pi_env[AUTH_DIR_ENV]) if AUTH_DIR_ENV in pi_env else None
+    if model_auth_dir is not None:
+        await refresh_model_auth(model_auth_dir, workspace=launch_config.workspace)
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -2892,13 +2926,19 @@ async def _auto_create_pi_terminal(
         )
     # TUI-typed turns bypass the executor's per-turn bearer refresh. Pi has no
     # transcript forwarder, so its slot owns this task until relaunch/teardown.
-    if auth_token:
-        from omnigent.harnesses.pi_native.auth_refresh import supervise_pi_auth_refresh
+    if auth_token or model_auth_dir is not None:
+        from omnigent.harnesses.pi_native.auth_refresh import supervise_pi_credentials
 
         _register_auto_forwarder_task(
             session_id,
             asyncio.create_task(
-                supervise_pi_auth_refresh(bridge_dir, launch_config.server_url),
+                supervise_pi_credentials(
+                    bridge_dir,
+                    launch_config.server_url,
+                    auth_dir=model_auth_dir,
+                    workspace=launch_config.workspace,
+                    refresh_bridge=bool(auth_token),
+                ),
                 name=f"pi-auth-refresh-{session_id}",
             ),
         )
@@ -5648,6 +5688,7 @@ async def _auto_create_codex_terminal(
     # Routing session (pinned or auto) gets the extended catalog. A plain
     # session keeps codex's bundled catalog and never pays the probe.
     app_server.env.update(codex_extended_catalog_env(launch_config.routing_enabled))
+    app_server.env.update(resource_registry.client_surface_env(session_id))
     # First-message model routing. Advertised in the same bridge dir the
     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of
     # its own), and live before the app-server starts because the hook can
@@ -5743,6 +5784,18 @@ async def _auto_create_codex_terminal(
             _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             raise
 
+    apply_plan_mode = (
+        functools.partial(
+            _apply_codex_launch_plan_mode,
+            bridge_dir=bridge_dir,
+            codex_ws_url=codex_ws_url,
+            model=_codex_launch.model,
+            effort=launch_config.reasoning_effort,
+        )
+        if launch_config.plan_mode
+        else None
+    )
+
     # Register the Codex TUI as a streamable terminal resource attached to
     # the app-server started above (``--remote`` over its loopback ws
     # endpoint). Without this the session can have a working chat path
@@ -5784,6 +5837,9 @@ async def _auto_create_codex_terminal(
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
+            if apply_plan_mode is not None:
+                # A resumed thread comes back in Default mode, like its effort.
+                await apply_plan_mode(launch_config.external_session_id)
             # Publish after resume repair so live settings cannot interleave it.
             write_bridge_state(
                 bridge_dir,
@@ -5817,6 +5873,8 @@ async def _auto_create_codex_terminal(
         with contextlib.suppress(Exception):
             await app_server.close()
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        await _shutdown_session_router_async(session_id, _codex_router)
+        await _shutdown_session_turn_router_async(session_id, _codex_turn_router)
         raise
 
     # Known-thread resumes publish bridge state before the terminal starts;
@@ -5856,6 +5914,7 @@ async def _auto_create_codex_terminal(
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
+                apply_plan_mode=apply_plan_mode,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -6085,6 +6144,39 @@ async def _record_agent_startup_pending(
     )
 
 
+async def _apply_codex_launch_plan_mode(
+    thread_id: str,
+    *,
+    bridge_dir: Path,
+    codex_ws_url: str,
+    model: str | None,
+    effort: str | None,
+) -> None:
+    """Enable Plan before exposing the bridge, or stop queued turns with the cause."""
+    from omnigent.harnesses.codex_native.app_server import apply_codex_thread_collaboration_mode
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_model,
+        write_bridge_startup_error,
+    )
+
+    try:
+        model = model or await asyncio.to_thread(read_codex_config_model, bridge_dir)
+        if not model:
+            raise RuntimeError("no model is known for the thread")
+        await apply_codex_thread_collaboration_mode(
+            codex_ws_url, thread_id, "plan", model=model, effort=effort
+        )
+    except Exception as exc:
+        # Never execute a queued implementation request after its Plan switch failed.
+        message = (
+            "Could not enable Codex Plan mode. Restart the session and send the message again."
+        )
+        write_bridge_startup_error(
+            bridge_dir, message, code="codex_plan_mode_failed", title="Plan mode could not start"
+        )
+        raise RuntimeError(message) from exc
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -6098,6 +6190,7 @@ async def _codex_discover_thread_and_forward(
     terminal_instance: TerminalInstance | None = None,
     login_required: bool = False,
     thread_start_timeout_seconds: float | None = None,
+    apply_plan_mode: Callable[[str], Awaitable[None]] | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -6145,6 +6238,9 @@ async def _codex_discover_thread_and_forward(
         cause (see :func:`_record_agent_startup_pending`) and the wait
         continues without a deadline; only a pane exit or an ended event
         stream tears down.
+    :param apply_plan_mode: Switches the discovered thread into Plan mode, or
+        ``None``. Awaited before the bridge state is written, because the
+        executor gates the first queued web turn on that state.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -6391,6 +6487,8 @@ async def _codex_discover_thread_and_forward(
             # The user signed in (or the TUI otherwise started a thread):
             # the pre-recorded fail-fast cause no longer applies.
             clear_bridge_startup_error(bridge_dir)
+        if apply_plan_mode is not None:
+            await apply_plan_mode(thread_id)
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
@@ -8107,6 +8205,46 @@ def _native_terminal_start_failure_cause(exc: BaseException) -> str:
     return class_name
 
 
+# The server keeps this many characters of a start error in the session's error label.
+_PERSISTED_ERROR_MESSAGE_MAX_LEN = 256
+_ERROR_ID_SUFFIX_LEN = len(f" Error ID: err_{'0' * 32}.")
+
+
+def _allowed_models_text(allowed_models: Sequence[str], budget: int) -> str:
+    """
+    List as many quoted allowed models as fit in ``budget`` characters, and at least one.
+
+    :param allowed_models: Ordered model IDs, e.g. ``("model-a", "model-b")``.
+    :param budget: Characters available for the list, e.g. ``100``.
+    :returns: e.g. ``"'model-a', and 1 more"``, or ``"none"`` for an empty list.
+    """
+    quoted = [repr(model) for model in allowed_models]
+    for count in range(len(quoted), 0, -1):
+        hidden = len(quoted) - count
+        text = ", ".join(quoted[:count]) + (f", and {hidden} more" if hidden else "")
+        if count == 1 or len(text) <= budget:
+            return text
+    return "none"
+
+
+def _native_terminal_configuration_message(exc: BaseException) -> str | None:
+    """
+    Return the client-safe remedy for a start failure only the user can fix.
+
+    :param exc: Exception raised by the native terminal creation path.
+    :returns: The message to show verbatim, or ``None`` for other failures.
+    """
+    if isinstance(exc, ModelNotAllowedError):
+        budget = _PERSISTED_ERROR_MESSAGE_MAX_LEN - _ERROR_ID_SUFFIX_LEN
+        prefix = f"{exc.message}. Allowed models: "
+        message = f"{prefix}{_allowed_models_text(exc.allowed_models, budget - len(prefix) - 1)}."
+        # The label keeps a message's start, so an oversized one gives up its start instead.
+        return message if len(message) <= budget else "…" + message[1 - budget :]
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED:
+        return exc.message
+    return None
+
+
 def _native_terminal_start_error_payload(
     exc: BaseException, runtime_name: str, *, session_id: str
 ) -> dict[str, str]:
@@ -8127,9 +8265,7 @@ def _native_terminal_start_error_payload(
         if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
         else None
     )
-    configuration_error = (
-        isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-    )
+    configuration_message = _native_terminal_configuration_message(exc)
     os_error = _os_error_with_errno(exc)
     extra = debug_event(
         "native_terminal_start_failed",
@@ -8137,7 +8273,7 @@ def _native_terminal_start_error_payload(
         error_id=error_id,
         runtime=runtime_name,
         code=ErrorCode.HARNESS_NOT_CONFIGURED
-        if configuration_error
+        if configuration_message is not None
         else lifecycle_code or _NATIVE_TERMINAL_START_FAILED_CODE,
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
@@ -8153,23 +8289,27 @@ def _native_terminal_start_error_payload(
         else None,
         # Expected lifecycle and configuration errors have no stack, so
         # preserve their category explicitly for the log sink.
-        error_category=exc.category.value
-        if isinstance(exc, OmnigentError) and (lifecycle_code is not None or configuration_error)
-        else None,
+        error_category=ErrorCategory.CONFIG.value
+        if configuration_message is not None
+        else (
+            exc.category.value
+            if isinstance(exc, OmnigentError) and lifecycle_code is not None
+            else None
+        ),
         error_impact=ErrorImpact.BLOCKING.value,
     )
-    if isinstance(exc, OmnigentError) and configuration_error:
+    if configuration_message is not None:
         _logger.warning(
             "Native %s configuration needs attention; error_id=%s: %s",
             runtime_name,
             error_id,
-            exc.message,
+            configuration_message,
             extra=extra,
         )
         return {
-            "code": exc.code,
+            "code": ErrorCode.HARNESS_NOT_CONFIGURED,
             "error_id": error_id,
-            "message": f"{exc.message} Error ID: {error_id}.",
+            "message": f"{configuration_message} Error ID: {error_id}.",
         }
     if lifecycle_code is not None:
         # Expected session-lifecycle condition: a required session resource was
@@ -8345,10 +8485,9 @@ def _native_terminal_start_error_response(
         with an ``error`` object carrying the real failure message.
     """
     status_code = 500
-    if isinstance(exc, OmnigentError) and (
-        exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
-        or exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-    ):
+    if _native_terminal_configuration_message(exc) is not None:
+        status_code = 412
+    elif isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES:
         status_code = exc.http_status
     error = _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
     return JSONResponse(
@@ -8756,7 +8895,8 @@ async def _auto_create_claude_terminal(
         agent ships a ``skills/`` directory, resolved by the caller
         (which has the runner's spec resolver). Threaded to
         :func:`augment_claude_args` so Claude Code discovers bundled
-        skills via ``--plugin-dir``. ``None`` adds no plugin args.
+        skills via ``--plugin-dir``. ``None`` uses a bridge-owned bundle
+        for the built-in skill.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -9443,6 +9583,11 @@ async def _auto_create_claude_terminal(
         launch_metadata.auto_harness,
         router_started=subagent_router_dir is not None,
     )
+    if bundle_dir is None:
+        # Reuse the bridge's owned directory across retries and terminal transfers.
+        # Its dead-owner cleanup also reclaims these generated skill links.
+        bundle_dir = bridge_dir / "skill-bundle"
+        _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -10258,18 +10403,37 @@ async def _launch_kimi(ctx: NativeLaunchContext) -> SessionResourceView:
 
 
 async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
-    """Adapter: build the codex-native terminal from a launch context."""
-    return await _auto_create_codex_terminal(
-        ctx.session_id,
-        ctx.resource_registry,
-        ctx.publish_event,
-        bundle_dir=ctx.bundle_dir,
-        skills_filter=ctx.skills_filter,
-        agent_spec=ctx.agent_spec,
-        server_client=ctx.server_client,
-        session_init=ctx.session_init,
-        ensure_comment_relay=ctx.ensure_comment_relay,
-    )
+    """Adapter: build the codex-native terminal from a launch context.
+
+    A resume refused because another app-server still writes the thread (a
+    replaced runner's launch racing this one) is retried once: the retry's
+    same-session cleanup reaps that app-server before resuming again.
+    """
+    from omnigent.harnesses.codex_native.app_server import is_active_writer_error
+
+    async def launch() -> SessionResourceView:
+        return await _auto_create_codex_terminal(
+            ctx.session_id,
+            ctx.resource_registry,
+            ctx.publish_event,
+            bundle_dir=ctx.bundle_dir,
+            skills_filter=ctx.skills_filter,
+            agent_spec=ctx.agent_spec,
+            server_client=ctx.server_client,
+            session_init=ctx.session_init,
+            ensure_comment_relay=ctx.ensure_comment_relay,
+        )
+
+    try:
+        return await launch()
+    except Exception as exc:
+        if not is_active_writer_error(exc):
+            raise
+        _logger.warning(
+            "Codex thread for session=%s still has another writer; reaping it and retrying",
+            ctx.session_id,
+        )
+        return await launch()
 
 
 async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
@@ -10444,9 +10608,7 @@ async def _launch_native_terminal(
             )
             return True
         except Exception as exc:
-            if not (
-                isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-            ):
+            if _native_terminal_configuration_message(exc) is None:
                 _logger.exception(
                     "Failed to auto-create %s terminal for %s",
                     agent.terminal_name,
@@ -10609,9 +10771,7 @@ async def _ensure_native_terminal(
                     exc,
                     extra={"session_id": ctx.session_id},
                 )
-            elif not (
-                isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-            ):
+            elif _native_terminal_configuration_message(exc) is None:
                 _logger.exception(
                     "%s terminal ensure failed for session=%s",
                     agent.display_name,
