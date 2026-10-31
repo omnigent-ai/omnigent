@@ -110,8 +110,11 @@ async def test_runner_is_trusted_for_other_owned_sessions_it_hosts(auth_client, 
     assert (await _send(auth_client, sibling, target)).get("queued") is True
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
-    permissions.grant("bob", sibling["id"], LEVEL_READ)
-    assert "Shared sessions cannot" in (await _send(auth_client, sibling, target))["detail"]
+    permissions.grant("bob", sibling["id"], LEVEL_EDIT)
+    assert (
+        "Sessions shared for editing cannot"
+        in (await _send(auth_client, sibling, target))["detail"]
+    )
 
 
 @pytest.mark.parametrize("batch", [False, True])
@@ -141,9 +144,7 @@ async def test_peer_message_tracks_runner_startup(auth_client, peers, monkeypatc
     "condition",
     [
         "flag_off",
-        "shared_read",
         "shared_edit",
-        "public",
         "other_owner",
         "admin",
         "missing_binding",
@@ -207,7 +208,7 @@ async def test_sharing_during_receiver_startup_blocks_delivery(
     permissions.ensure_user("bob")
 
     async def share_while_starting(*args, **kwargs):
-        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
 
     monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", share_while_starting)
     result = await _send(auth_client, source, target)
@@ -231,9 +232,11 @@ async def test_child_inherits_source_sharing(auth_client, peers, db_uri):
     assert (await _send(auth_client, child, target)).get("queued") is True
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
-    permissions.grant("bob", source["id"], LEVEL_READ)
+    permissions.grant("bob", source["id"], LEVEL_EDIT)
     captured.clear()
-    assert "Shared sessions cannot" in (await _send(auth_client, child, target))["detail"]
+    assert (
+        "Sessions shared for editing cannot" in (await _send(auth_client, child, target))["detail"]
+    )
     assert not captured.get("posts")
 
 
@@ -267,12 +270,15 @@ async def test_side_chat_inherits_sharing_for_new_controls(
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     shared_id = source["id"] if share == "source" else side["id"]
-    permissions.grant("bob", shared_id, LEVEL_READ)
+    permissions.grant("bob", shared_id, LEVEL_EDIT)
     store = SqlAlchemyConversationStore(db_uri)
     before_sessions = {s.id for s in store.list_conversations().data}
     before_grants = permissions.list_for_user("alice")
     captured.clear()
-    assert "Shared sessions cannot" in (await _send(auth_client, manager, target))["detail"]
+    assert (
+        "Sessions shared for editing cannot"
+        in (await _send(auth_client, manager, target))["detail"]
+    )
     for placement in ("same_host", "managed"):
         result = json.loads(
             await execute_tool(
@@ -282,7 +288,7 @@ async def test_side_chat_inherits_sharing_for_new_controls(
                 conversation_id=manager["id"],
             )
         )
-        assert "Shared sessions cannot" in result["detail"], result
+        assert "Sessions shared for editing cannot" in result["detail"], result
     assert not captured.get("posts")
     assert {s.id for s in store.list_conversations().data} == before_sessions
     assert permissions.list_for_user("alice") == before_grants
@@ -462,7 +468,7 @@ async def test_creation_refuses_before_launch(
     if condition == "shared":
         permissions = SqlAlchemyPermissionStore(db_uri)
         permissions.ensure_user("bob")
-        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
     elif condition == "binding":
         auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "wrong"
     store = SqlAlchemyConversationStore(db_uri)
@@ -479,7 +485,7 @@ async def test_creation_refuses_before_launch(
     )
     expected = {
         "flag_off": "Session orchestration is disabled",
-        "shared": "Shared sessions cannot",
+        "shared": "Sessions shared for editing cannot",
         "binding": "requires the sender's bound runner",
     }[condition]
     assert expected in result["detail"], result
@@ -867,7 +873,7 @@ async def test_startup_queue_admission_and_replay(
         result = await accepts(*args)
         assert result is True
         if share_before_admission:
-            permissions.grant("bob", source["id"], LEVEL_READ)
+            permissions.grant("bob", source["id"], LEVEL_EDIT)
         return result
 
     monkeypatch.setattr(startup, "accepts", check_startup)
@@ -875,19 +881,22 @@ async def test_startup_queue_admission_and_replay(
     pending = store.list_pending_inputs(target["id"])
     assert not captured.get("posts")
     if share_before_admission:
-        assert "Shared sessions cannot" in result["detail"]
+        assert "Sessions shared for editing cannot" in result["detail"]
         assert pending == []
     else:
         assert result["queued"] is True
         assert len(pending) == 1
-        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
         await startup._deliver(auth_app, target["id"], pending[0])
         await startup._deliver(auth_app, target["id"], pending[0])
         delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
         assert len(delivered) == 1
         assert f"[Message from session {source['id']}]" in json.dumps(delivered)
         assert store.list_pending_inputs(target["id"]) == []
-        assert "Shared sessions cannot" in (await _send(auth_client, source, target))["detail"]
+        assert (
+            "Sessions shared for editing cannot"
+            in (await _send(auth_client, source, target))["detail"]
+        )
 
 
 @pytest.mark.parametrize("two_replica_stack", ["authenticated"], indirect=True)
@@ -1170,3 +1179,111 @@ async def test_same_host_creation_across_replicas(
         assert worker.parent_conversation_id is None
         assert worker.host_id == host_id and worker.workspace == "/worker"
         assert len(launches) == 1 and launches[0].session_id == worker.id
+
+
+@pytest.mark.parametrize("bundled", [False, True])
+async def test_siblings_are_private_roots_and_owner_only_in_lists(
+    auth_client, auth_app, peers, db_uri, bundled
+):
+    from omnigent.server.sharing_settings import DefaultPublicSessions
+    from omnigent.stores.conversation_store import SESSION_FAMILY_LABEL_KEY
+    from tests.server.integration.test_sessions_permissions import build_agent_bundle
+
+    source, _, _ = peers
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("reader")
+    permissions.grant("reader", source["id"], LEVEL_READ)
+    auth_app.state.default_public_sessions = lambda: DefaultPublicSessions.ALL
+    metadata = {"sibling_source_id": source["id"], "title": "Private sibling"}
+    if bundled:
+        response = await auth_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(name="sibling-agent"),
+                    "application/gzip",
+                )
+            },
+        )
+        sibling_id = response.json().get("session_id")
+    else:
+        response = await auth_client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
+        )
+        sibling_id = response.json().get("id")
+    assert response.status_code == 201, response.text
+    store = SqlAlchemyConversationStore(db_uri)
+    sibling = store.get_conversation(sibling_id)
+    assert sibling.parent_conversation_id is None and sibling.root_conversation_id == sibling.id
+    assert sibling.labels[SESSION_FAMILY_LABEL_KEY] == source["id"]
+    assert [grant.user_id for grant in permissions.list_for_session(sibling_id)[0]] == ["alice"]
+    assert store.list_child_conversation_ids_by_parent([source["id"]])[source["id"]] == []
+    snapshot = await auth_client.get(f"/v1/sessions/{sibling_id}")
+    assert snapshot.json()["family"]["id"] == source["id"]
+    listing = await auth_client.get(
+        "/v1/sessions", params={"limit": 1, "search_query": "Private sibling"}
+    )
+    assert {row["id"] for row in listing.json()["data"]} == {source["id"], sibling_id}
+    reader = {"X-Forwarded-Email": "reader"}
+    snapshot = await auth_client.get(f"/v1/sessions/{source['id']}", headers=reader)
+    assert snapshot.status_code == 200
+    assert not snapshot.json().get("family")
+    assert SESSION_FAMILY_LABEL_KEY not in snapshot.json()["labels"]
+    for endpoint, body in [
+        (f"/v1/sessions/{source['id']}", {"labels": {SESSION_FAMILY_LABEL_KEY: sibling_id}})
+    ]:
+        assert (await auth_client.patch(endpoint, json=body)).status_code == 400
+    permissions.grant("reader", source["id"], LEVEL_EDIT)
+    response = await auth_client.post(
+        "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
+    )
+    assert response.status_code == 403, response.text
+
+
+async def test_read_only_shared_source_can_orchestrate_after_many_readers(
+    auth_client, peers, db_uri
+):
+    source, target, _ = peers
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for index in range(105):
+        reader = f"reader-{index:03}"
+        permissions.ensure_user(reader)
+        permissions.grant(reader, source["id"], LEVEL_READ)
+    assert (await _send(auth_client, source, target)).get("queued") is True
+    permissions.ensure_user("z-editor")
+    permissions.grant("z-editor", source["id"], LEVEL_EDIT)
+    assert "shared for editing" in (await _send(auth_client, source, target))["detail"]
+
+
+async def test_family_project_removal_precedes_archive(auth_client, peers, db_uri):
+    source, _, _ = peers
+    response = await auth_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source["agent_id"],
+            "sibling_source_id": source["id"],
+        },
+    )
+    assert response.status_code == 201, response.text
+    sibling_id = response.json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_conversation_project(source["id"], "a" * 32)
+    refused = await auth_client.patch(f"/v1/sessions/{sibling_id}", json={"project_id": ""})
+    assert refused.status_code == 409, refused.text
+    removed = await auth_client.patch(
+        f"/v1/sessions/{source['id']}",
+        json={
+            "archived": True,
+            "project_id": "",
+            "labels": {"omni_project": ""},
+        },
+    )
+    assert removed.status_code == 200, removed.text
+    assert store.get_conversation(source["id"]).archived
+    assert not store.get_conversation(sibling_id).archived
+    assert store.get_conversation(sibling_id).project_id is None
+    store.update_conversation(sibling_id, archived=True)
+    snapshot = (await auth_client.get(f"/v1/sessions/{source['id']}")).json()
+    assert snapshot["family"]["representative_id"] == source["id"]

@@ -183,6 +183,9 @@ SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
+SESSION_FAMILY_LABEL_KEY = "omnigent.session_family_id"
+FAMILY_PIN_LABEL_PREFIX = "omnigent.family_pinned."
+MAX_SESSION_FAMILY_MEMBERS = 100
 
 
 # Labels that must NOT cross into a new session context — deliberately
@@ -236,6 +239,7 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # ``REQUESTED_HOST_ID_LABEL_KEY`` (cross-checked by a store test).
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
+    SESSION_FAMILY_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
@@ -1383,6 +1387,18 @@ class ConversationStore(ABC):
         """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
         raise NotImplementedError
 
+    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+        """Assign a freshly created session to its source's family before launch."""
+        raise NotImplementedError
+
+    def get_session_family(self, session_id: str) -> list[Conversation]:
+        """Return family members in stable creation order, including archived members."""
+        raise NotImplementedError
+
+    def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
+        """Pin a representative's family without changing individual session pins."""
+        raise NotImplementedError
+
     @abstractmethod
     def set_conversation_project(
         self,
@@ -1401,7 +1417,6 @@ class ConversationStore(ABC):
         :returns: ``True`` if a metadata row was updated; ``False`` if the
             conversation has no metadata row.
         """
-        ...
 
     @abstractmethod
     def increment_session_usage(
@@ -1767,6 +1782,7 @@ class ConversationStore(ABC):
         conversation_id: str,
         *,
         expected_host_id: str | None = None,
+        expected_sandbox_id: str | None = None,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -2245,6 +2261,7 @@ class ConversationStore(ABC):
         workspace: str,
         exclude_conversation_id: str,
         include_subdirectories: bool = False,
+        include_archived: bool = False,
     ) -> bool:
         """
         Is another non-archived conversation sitting in this ``(host_id, workspace)``?

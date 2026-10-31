@@ -274,7 +274,15 @@ export interface BackgroundTaskInfo {
   command?: string;
 }
 
+export interface SessionFamily {
+  id: string;
+  representative_id: string | null;
+  pinned: boolean;
+  pinned_at?: string | null;
+}
+
 export interface Session {
+  family?: SessionFamily | null;
   sandboxProfile?: SandboxProfile | null;
   projectId?: string | null;
   id: string;

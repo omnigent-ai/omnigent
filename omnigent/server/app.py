@@ -273,6 +273,7 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_session_modes: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
+    sibling_sessions: bool = True
     request_managed_sandbox_host_id: bool = True
     # A managed fork accepts ``workspaces``; older servers reject the field.
     session_fork_workspaces: bool = True
@@ -2169,7 +2170,7 @@ def create_app(
             # backstop. Persistent scheduling separately recovers expired startups.
 
         managed_sandbox_reaper: ManagedSandboxReaper | None = None
-        if sandbox_config is not None and sandbox_config.reaper.enabled:
+        if sandbox_config is not None:
             if host_store is None:
                 _logger.warning(
                     "Managed sandbox reaper is enabled but no host store is configured; "
@@ -2179,6 +2180,7 @@ def create_app(
                 managed_sandbox_reaper = ManagedSandboxReaper(
                     host_store=host_store,
                     sandbox_config=sandbox_config,
+                    reap_offline=sandbox_config.reaper.enabled,
                 )
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
@@ -2261,6 +2263,7 @@ def create_app(
         else None
     )
     app.state.startup_inputs = startup_inputs
+    app.state.permission_store = permission_store
     app.state.host_store = host_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
@@ -3621,6 +3624,7 @@ def create_app(
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
+                "sibling_sessions": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "agent_install": agent_store.supports_user_agents,

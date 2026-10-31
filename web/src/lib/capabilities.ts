@@ -78,6 +78,7 @@ export type FeatureValues = Record<string, boolean>;
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  sibling_sessions?: boolean;
   accounts_enabled: boolean;
   /**
    * True only on an explicit single-user local runtime
@@ -480,6 +481,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const smartRoutingEnabled = data.smart_routing_enabled === true;
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
+          sibling_sessions: data.sibling_sessions === true,
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,

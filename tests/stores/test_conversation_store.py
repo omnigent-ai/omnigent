@@ -9245,3 +9245,70 @@ def test_profiled_host_binding_rejects_stale_rollback_state(conversation_store, 
             expected_binding=previous,
         )
     assert conversation_store.get_profile_host_binding(conversation.id) == current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split_database", [False, True])
+async def test_sibling_family_lifecycle(tmp_path, split_database):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omnigent.errors import OmnigentError
+    from omnigent.stores.conversation_store import (
+        FAMILY_PIN_LABEL_PREFIX,
+        SESSION_FAMILY_LABEL_KEY,
+        pinned_label_key,
+    )
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation(conversation_id="1" * 32, title="Coordinator")
+    first = store.create_conversation(conversation_id="2" * 32, title="Research")
+    second = store.create_conversation(conversation_id="3" * 32, title="Implementation")
+    store.set_labels(source.id, {pinned_label_key("alice"): "123"})
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(store.add_new_sibling, source.id, member.id, user_id="alice")
+            for member in (first, second)
+        ]
+        for future in futures:
+            future.result()
+    family = store.get_session_family(first.id)
+    assert [member.id for member in family] == [source.id, first.id, second.id]
+    assert all(member.labels[SESSION_FAMILY_LABEL_KEY] == source.id for member in family)
+    assert all(
+        member.parent_conversation_id is None and member.root_conversation_id == member.id
+        for member in family
+    )
+    assert all(FAMILY_PIN_LABEL_PREFIX + "alice" in member.labels for member in family)
+    assert pinned_label_key("alice") not in family[0].labels
+    store.set_labels(first.id, {pinned_label_key("alice"): "234"})
+    store.set_family_pin(source.id, "", user_id="alice")
+    assert store.get_conversation(first.id).labels[pinned_label_key("alice")] == "234"
+    project_id = "4" * 32
+    with pytest.raises(OmnigentError, match="representative"):
+        store.set_conversation_project(first.id, project_id)
+    store.set_conversation_project(source.id, project_id)
+    assert all(member.project_id == project_id for member in store.get_session_family(second.id))
+    store.update_conversation(source.id, archived=True)
+    store.set_family_pin(first.id, "345", user_id="alice")
+    assert await store.delete_conversation(source.id)
+    assert [member.id for member in store.get_session_family(second.id)] == [first.id, second.id]
+    assert store.get_conversation(second.id).labels[FAMILY_PIN_LABEL_PREFIX + "alice"] == "345"
+
+
+@pytest.mark.parametrize("key", ["omnigent.session_family_id", "omnigent.family_pinned.alice"])
+def test_generic_label_writes_cannot_reassign_family(conversation_store, key: str) -> None:
+    from omnigent.errors import OmnigentError
+
+    store = conversation_store
+    source = store.create_conversation()
+    for operation in (
+        lambda: store.create_conversation(labels={key: source.id}),
+        lambda: store.set_labels(source.id, {key: source.id}),
+        lambda: store.update_conversation_with_changes(source.id, label_updates={key: source.id}),
+        lambda: store.delete_label(source.id, key),
+    ):
+        with pytest.raises(OmnigentError, match="server-owned"):
+            operation()

@@ -3582,14 +3582,23 @@ async def _execute_session_create(
         "title": args.get("title"),
     }
     create_requested = False
+    info_data: dict[str, object] = {}
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
-        if placement == "managed":
-            from omnigent.runner.session_requests import post_on_host
-
+        if placement != "child":
             info = await server_client.get("/v1/info")
             info.raise_for_status()
             info_data = info.json()
+            if info_data.get("sibling_sessions") is not True:
+                return json.dumps(
+                    {
+                        "error": "This server does not support sibling sessions; "
+                        "no session was created."
+                    }
+                )
+        if placement == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
             if selection.get("sandbox_profile_id"):
                 features = info_data.get("features") if isinstance(info_data, dict) else None
                 if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:
@@ -3657,7 +3666,8 @@ async def _execute_session_create(
     if placement != "child":
         handle: dict[str, object] = {
             "conversation_id": data["id"],
-            "kind": "default",
+            "kind": "sibling",
+            "family": data.get("family"),
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
@@ -5336,6 +5346,7 @@ async def _session_get_info_via_rest(
             "host_id": snap.get("host_id"),
             "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
+            "family": snap.get("family"),
             "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
                 CREATED_BY_SESSION_LABEL_KEY
             ),
@@ -6501,6 +6512,7 @@ async def _collect_global_sessions(
                 "runner_id": r.get("runner_id"),
                 "runner_online": _RUNNER_ONLINE_SIZING_PLACEHOLDER,
                 "parent_session_id": r.get("parent_session_id"),
+                "family": r.get("family"),
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),

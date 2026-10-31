@@ -3869,6 +3869,7 @@ def register_events_routes(
                 delete_branch=True,
                 host_registry=getattr(request.app.state, "host_registry", None),
                 reason="session-delete",
+                host_store=getattr(request.app.state, "host_store", None),
                 expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                 conversation_store=conversation_store,
                 exclude_conversation_id=conv.id,
@@ -3945,7 +3946,9 @@ def register_events_routes(
         # sandbox_id and are never touched.
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
-            bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
+            bound_host = await asyncio.to_thread(
+                host_store_for_managed.get_host, conv.host_id, include_deleted=True
+            )
             if bound_host is not None and bound_host.sandbox_provider is not None:
                 from omnigent.server.managed_hosts import terminate_managed_host
 
@@ -3957,6 +3960,7 @@ def register_events_routes(
                     # still deletes the row and revokes the token.
                     getattr(request.app.state, "sandbox_config", None),
                     capture_logs=capture_logs,
+                    only_if_unused=True,
                 )
         try:
             import time as _time

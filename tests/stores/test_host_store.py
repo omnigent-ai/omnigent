@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +50,131 @@ def _set_updated_at(db_uri: str, host_id: str, value: int) -> None:
     with Session(engine) as session:
         session.execute(update(SqlHost).where(SqlHost.host_id == host_id).values(updated_at=value))
         session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archived", [False, True])
+async def test_session_delete_keeps_shared_sandbox_until_last_binding(
+    host_store: HostStore, db_uri: str, archived: bool
+) -> None:
+    host_id = uuid.uuid4().hex
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    first = conversations.create_conversation(host_id=host_id, workspace="/work")
+    other = conversations.create_conversation(host_id=host_id, workspace="/work")
+    if archived:
+        conversations.update_conversation(other.id, archived=True)
+    snapshot = host_store.get_host(host_id)
+    assert snapshot is not None
+    assert host_store.delete_host(host_id, only_if_unused=True, expected_host=snapshot) is None
+    assert await conversations.delete_conversation(first.id)
+    assert host_store.get_host(host_id) is not None
+    assert conversations.get_conversation(other.id).host_id == host_id
+    assert await conversations.delete_conversation(other.id)
+    assert host_store.get_host(host_id) is None
+    pending = host_store.get_host(host_id, include_deleted=True)
+    assert pending is not None and pending.deleted_at is not None
+    assert pending.sandbox_id == "shared-sandbox"
+    with pytest.raises(OmnigentError, match="being deleted"):
+        conversations.create_conversation(
+            conversation_id=first.id, host_id=host_id, workspace="/work", labels={"test": "1"}
+        )
+    assert conversations.get_conversation(first.id) is None
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+@pytest.mark.parametrize("uploaded_agent", [False, True])
+def test_last_session_delete_races_new_binding(tmp_path, split_database, uploaded_agent):
+    uri = f"sqlite:///{tmp_path / 'metadata.db'}"
+    conversations = SqlAlchemyConversationStore(
+        uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+    hosts = HostStore(uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    first = conversations.create_conversation(host_id=host_id, workspace="/work")
+    barrier = threading.Barrier(2)
+
+    def admit(*, race=True):
+        if race:
+            barrier.wait(timeout=5)
+        try:
+            if uploaded_agent:
+                return conversations.create_session_with_agent(
+                    agent_id=uuid.uuid4().hex,
+                    agent_description=None,
+                    agent_name="new",
+                    agent_bundle_location="/tmp/test-bundle",
+                    host_id=host_id,
+                    workspace="/work",
+                    labels={"test": "1"},
+                ).conversation.id
+            return conversations.create_conversation(
+                host_id=host_id, workspace="/work", labels={"test": "1"}
+            ).id
+        except OmnigentError as exc:
+            assert exc.code == ErrorCode.CONFLICT
+            return None
+
+    def remove():
+        barrier.wait(timeout=5)
+        assert asyncio.run(conversations.delete_conversation(first.id))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        admitted = pool.submit(admit)
+        removed = pool.submit(remove)
+        survivor = admitted.result(timeout=15)
+        removed.result(timeout=15)
+    remaining = conversations.list_conversations(limit=10).data
+    assert [row.id for row in remaining] == ([survivor] if survivor else [])
+    if survivor:
+        assert hosts.get_host(host_id) is not None
+        assert hosts.resolve_launch_token(host_id, "shared-token") is not None
+        assert asyncio.run(conversations.delete_conversation(survivor))
+    assert hosts.get_host(host_id) is None
+    assert admit(race=False) is None
+    assert conversations.list_conversations(limit=10).data == []
+
+
+def test_automatic_cleanup_cannot_delete_replacement_generation(
+    host_store: HostStore,
+) -> None:
+    host_id = uuid.uuid4().hex
+    stale = host_store.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="old-token",
+        provider="modal",
+        sandbox_id="old",
+        token_expires_at=now_epoch() + 1000,
+    )
+    host_store.replace_managed_host_sandbox(
+        host_id=host_id,
+        user_id="alice",
+        token="replacement-token",
+        provider="modal",
+        sandbox_id="replacement",
+        token_expires_at=now_epoch() + 1000,
+    )
+    assert host_store.delete_host(host_id, only_if_unused=True, expected_host=stale) is None
+    assert host_store.get_host(host_id).sandbox_id == "replacement"
 
 
 @pytest.mark.parametrize("provider", [None, "kubernetes", "agent_sandbox", "modal", "lakebox"])
@@ -1866,3 +1992,92 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+def test_recovery_fences_expired_attempts_and_connected_hosts(host_store: HostStore) -> None:
+    host = host_store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="shared",
+        user_id="alice",
+        token="initial",
+        provider="modal",
+        sandbox_id="old",
+        token_expires_at=now_epoch() + 1000,
+    )
+    assert host_store.claim_managed_recovery(host, "first")
+    assert not host_store.claim_managed_recovery(host, "second")
+    host_store.update_managed_recovery(host.host_id, "first", finished=True)
+    with pytest.raises(ValueError, match="failed or expired"):
+        host_store.managed_recovery_result(host.host_id)
+    assert host_store.claim_managed_recovery(host, "second")
+    assert not host_store.update_managed_recovery(host.host_id, "first", finished=True)
+    with pytest.raises(ValueError, match="superseded"):
+        host_store.replace_managed_host_sandbox(
+            host_id=host.host_id,
+            user_id="alice",
+            token="loser",
+            provider="modal",
+            sandbox_id="loser",
+            token_expires_at=now_epoch() + 1000,
+            recovery_token="first",
+        )
+    replacement = host_store.replace_managed_host_sandbox(
+        host_id=host.host_id,
+        user_id="alice",
+        token="winner",
+        provider="modal",
+        sandbox_id="winner",
+        token_expires_at=now_epoch() + 1000,
+        recovery_token="second",
+    )
+    assert replacement is not None
+    host_store.upsert_on_connect(host_id=host.host_id, name=host.name, user_id="alice")
+    assert not host_store.detach_stale_managed_sandbox(
+        host.host_id,
+        sandbox_id="winner",
+        expected_updated_at=replacement.updated_at,
+        expected_token="winner",
+    )
+    host_store.revoke_launch_token(host.host_id, expected_token="loser")
+    assert host_store.resolve_launch_token(host.host_id, "winner") is not None
+
+
+@pytest.mark.asyncio
+async def test_deleted_automation_session_retains_reusable_sandbox(db_uri: str) -> None:
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    task = tasks.create(
+        scheduled_task_id=uuid.uuid4().hex,
+        timezone="UTC",
+        name="daily",
+        prompt="check",
+        rrule="FREQ=DAILY",
+        user_id="alice",
+        agent_id=uuid.uuid4().hex,
+        session_mode="continue",
+    )
+    host_store = HostStore(db_uri)
+    host_id = continued_sandbox_host_id(task.id, current_workspace_id())
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="automation",
+        user_id="alice",
+        token="retained",
+        provider="modal",
+        sandbox_id="retained",
+        token_expires_at=now_epoch() + 1000,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session = conversations.create_conversation(
+        host_id=host_id,
+        workspace="/work",
+        labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
+    )
+    assert await conversations.delete_conversation(session.id)
+    assert host_store.delete_host(host_id, only_if_unused=True) is None
+    assert host_store.get_host(host_id) is not None
+    tasks.delete(task.id)
+    assert host_store.delete_host(host_id, only_if_unused=True) is not None
