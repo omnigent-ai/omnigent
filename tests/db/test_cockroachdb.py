@@ -33,6 +33,15 @@ def _crdb_engine(db_uri: str) -> Engine:
 def test_cockroachdb_bootstrap_is_at_head(db_uri: str) -> None:
     engine = _crdb_engine(db_uri)
     assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+    metadata = "omnigent_conversation_metadata"
+    assert {"live_status_version", "live_error_state"} <= {
+        column["name"] for column in inspect(engine).get_columns(metadata)
+    }
+    assert {
+        "ck_conv_meta_live_version_size",
+        "ck_conv_meta_live_error_size",
+        "ck_conv_meta_live_error_version",
+    } <= {check["name"] for check in inspect(engine).get_check_constraints(metadata)}
 
 
 def test_cockroachdb_uses_read_committed(db_uri: str) -> None:
