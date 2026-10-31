@@ -1059,12 +1059,14 @@ describe("Composer slash-command menu", () => {
     return { clearContext, onSend: props.onSend };
   }
 
-  it.each(["claude-native", "codex-native", "claude-sdk"] as const)(
+  it.each([
+    ["claude-native", { session_event_types: ["message", "clear"] }],
+    ["codex-native", { session_event_types: ["message", "clear"] }],
+    ["claude-sdk", { session_event_types: ["message", "clear"], session_claude_sdk_clear: true }],
+  ] as const)(
     "%s /clear runs the clear control when the server accepts it",
-    (harness) => {
-      const { clearContext, onSend } = renderClearComposer(harness, {
-        session_event_types: ["message", "clear"],
-      });
+    (harness, advertised) => {
+      const { clearContext, onSend } = renderClearComposer(harness, advertised);
       fireEvent.click(screen.getByTestId("slash-menu-item-clear"));
       expect(clearContext).toHaveBeenCalledOnce();
       expect(onSend).not.toHaveBeenCalled();
@@ -1076,6 +1078,8 @@ describe("Composer slash-command menu", () => {
     ["claude-native", { session_event_types: ["message"] }],
     ["codex-native", {}],
     ["claude-sdk", { session_event_types: ["message"] }],
+    // An older server lists "clear" for native sessions but can't clear claude-sdk.
+    ["claude-sdk", { session_event_types: ["message", "clear"] }],
     ["claude-native", "loading"],
   ] as const)("%s sends a typed /clear as text when server info is %o", (harness, advertised) => {
     const { clearContext, onSend } = renderClearComposer(harness, advertised);
