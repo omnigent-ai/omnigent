@@ -205,6 +205,9 @@ def test_clone_limits_are_operator_configurable(caplog: pytest.LogCaptureFixture
     ) == (2048 * MIB, 200_000, 900)
     assert any("clone_timeout is not a known limit" in r.getMessage() for r in caplog.records)
     # A value that is not a positive number keeps that default rather than lifting the bound.
-    for bad in (0, -1, True, "1000", None):
+    for bad in (0, -1, True, "1000", None, 0.5, float("inf"), float("nan")):
         kept = SkillsMarketplacePolicy.from_config({"limits": {"checkout_entries": bad}})
         assert kept.clone_limits.checkout_entries == DEFAULT_CLONE_LIMITS.checkout_entries
+    for bad in (float("inf"), float("nan"), -2.0):
+        kept = SkillsMarketplacePolicy.from_config({"limits": {"clone_timeout_s": bad}})
+        assert kept.clone_limits.timeout_s == DEFAULT_CLONE_LIMITS.timeout_s

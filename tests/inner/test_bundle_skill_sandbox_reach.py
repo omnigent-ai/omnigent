@@ -190,3 +190,34 @@ async def test_sys_terminal_and_native_terminals_pass_the_agents_skill_directori
             additional_read_roots=_agent_skill_roots(agent),
         )
     assert seen[-1] == [skill.skill_dir]
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_os_tool_grants_the_specs_skill_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The non-shared branch of runner tool dispatch builds its own environment.
+    from omnigent.inner import os_env
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    _bundle, skill = _bundle_with_skill(tmp_path)
+    granted: list[list[Path]] = []
+
+    def capture(spec: object, *, additional_read_roots: list[Path] = (), **_kwargs: object):  # type: ignore[no-untyped-def]
+        granted.append(list(additional_read_roots))
+        return
+
+    monkeypatch.setattr(os_env, "create_os_environment", capture)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    agent = AgentSpec(
+        spec_version=1,
+        name="skills",
+        os_env=OSEnvSpec(type="caller_process", cwd=str(workspace)),
+        skills=[skill],
+    )
+    result = await _execute_os_env_tool(
+        "sys_os_read", {"path": str(skill.skill_dir)}, agent_spec=agent, conversation_id="c1"
+    )
+    assert "unable to create" in result
+    assert granted == [[skill.skill_dir]]

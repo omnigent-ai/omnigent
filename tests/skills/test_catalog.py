@@ -34,6 +34,17 @@ def test_marketplace_indexes_in_repo_plugins_and_reports_the_rest(marketplace_re
         ("changelog", "docs", "plugins/docs/skills/changelog"),
     ]
 
+    # A small but deeply nested manifest is a note, not a failed index.
+    from tests._helpers.skill_repos import write_skill
+
+    write_skill(marketplace_repo / "skills", "kept", "Root skill")
+    (marketplace_repo / ".claude-plugin" / "marketplace.json").write_text(
+        "[" * 100_000 + "]" * 100_000
+    )
+    skipped = []
+    assert [e.name for e in index_checkout(marketplace_repo, skipped=skipped)] == ["kept"]
+    assert any("marketplace.json: unreadable" in note for note in skipped)
+
 
 def test_empty_or_missing_layouts_index_nothing(tmp_path: Path) -> None:
     assert index_checkout(tmp_path) == []
