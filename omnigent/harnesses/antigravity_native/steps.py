@@ -602,15 +602,16 @@ def output_text_delta_event(
     :param final: ``True`` only on a terminal delta for the message; the
         streaming reader emits incremental deltas with ``False`` and relies on
         the committed ``message`` (not a ``final`` delta) to close the block.
-    :param index: Chunk ordinal within the message, STRICTLY INCREASING across
-        the message's deltas. The server's in-flight buffer
-        (:mod:`omnigent.runtime.inflight_text`) drops any chunk whose index does
-        not exceed the last one it accepted, so a constant value silences every
-        delta after the first — the message then keeps a truncated buffer, never
-        sees its ``final`` chunk, and is replayed to every later subscriber as a
-        cut-off duplicate. The reader passes a per-step chunk count, which only
-        ever grows; the forwarded byte offset does NOT qualify, because a
-        shorter post-moderation rewrite moves it backwards.
+    :param index: Chunk ordinal within the message: 0, 1, 2, … with no gaps or
+        repeats. The server's in-flight buffer
+        (:mod:`omnigent.runtime.inflight_text`) rebuilds the message in index
+        order and drops a repeated index, so a constant value silences every
+        delta after the first — the message keeps a truncated buffer, never
+        sees its ``final`` chunk, and is replayed to every later subscriber as
+        a cut-off duplicate; a gap keeps it from matching its committed text.
+        The reader passes a per-step chunk count; the forwarded byte offset
+        does NOT qualify, because it skips values and a shorter
+        post-moderation rewrite moves it backwards.
     :returns: One ``external_output_text_delta`` event.
     """
     return OutboundEvent(
