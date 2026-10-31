@@ -2669,9 +2669,27 @@ async def _run_bound_turn(
     tool_callables: dict[str, ToolCallable] | None,
 ) -> str | None:
     """Send one prompt on a bound session and return the final assistant text."""
-    from omnigent_client import SessionsChat
+    from omnigent_client import SessionsChat, StreamHooks
+    from omnigent_client._tool_handler import ResponseEndCtx
 
     session_files = client.files.for_session(bound.id)
+    # ``SessionsChat.query`` ends quietly on ``response.failed`` and returns
+    # whatever text streamed before it, so a turn that failed after emitting an
+    # error as text (the Claude CLI's "apiKeyHelper script is failing") would
+    # print as a reply and exit 0. Record the turn's own failure to raise it.
+    turn_failures: list[ClientOmnigentError] = []
+
+    def _note_failed_turn(ctx: ResponseEndCtx) -> None:
+        if ctx.status != "failed":
+            return
+        error = ctx.response.error
+        turn_failures.append(
+            ClientOmnigentError(
+                error.message if error is not None and error.message else "turn failed",
+                code=error.code if error is not None else None,
+            )
+        )
+
     chat = SessionsChat(
         namespace=client.sessions,
         files_uploader=session_files.upload,
@@ -2679,6 +2697,7 @@ async def _run_bound_turn(
         session=bound,
         tool_callables=tool_callables,
         agent_tools_getter=client._fetch_agent_tools,
+        hooks=StreamHooks(on_response_end=_note_failed_turn),
     )
     # A transport-level runner disconnect publishes ``session.status:
     # failed`` for every session pinned to that runner (server
@@ -2749,6 +2768,10 @@ async def _run_bound_turn(
             "(subscribe-after-post race: the terminal event was lost and "
             "the runner appears not to have completed either)."
         ) from None
+    if turn_failures:
+        # Not reconciled: the transcript can hold the failed turn's error text
+        # as a completed assistant item, which would read as a reply.
+        raise turn_failures[0]
     all_text_parts: list[str] = []
     if result.text:
         all_text_parts.append(result.text)
