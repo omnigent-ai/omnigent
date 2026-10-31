@@ -5,6 +5,7 @@ import { logout } from "@/lib/accountsApi";
 import { withBasePath } from "@/lib/basePath";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { CompactShortcutKeys, settingsShortcutKeys } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -257,6 +258,7 @@ export function SidebarServerPicker() {
             >
               <SettingsIcon className="size-4 shrink-0" />
               Settings
+              <CompactShortcutKeys keys={settingsShortcutKeys()} className="ml-auto pl-4" />
             </Link>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
