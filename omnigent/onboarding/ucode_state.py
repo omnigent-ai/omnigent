@@ -63,9 +63,10 @@ class UcodeWorkspaceState:
         :data:`omnigent.harnesses.claude_native.main._UCODE_CLAUDE_CUSTOM_TIER`) to the
         newer Sonnet generation, offered as an opt-in alongside the default
         ``"sonnet"`` tier, for workspaces that serve both side by side.
-    :param fable_enabled: Whether the user opted into ucode's premium Fable
-        family. Live refreshes preserve this policy instead of exposing Fable
-        merely because the workspace advertises it.
+    :param fable_enabled: Whether ucode exposes the premium Fable family: an
+        older ucode's explicit ``fable_enabled`` flag, otherwise whether model
+        discovery recorded a ``fable`` model. Live refreshes preserve this
+        policy instead of exposing Fable merely because the workspace advertises it.
     :param codex_models: Ordered list of Codex model ids available on this
         workspace, e.g. ``["databricks-gpt-5-5"]``.
     :param base_urls: Mapping of tool name to base URL,
@@ -142,6 +143,22 @@ def _parse_agent_state(raw: object) -> UcodeAgentState:
     )
 
 
+def _load_state_root() -> dict[str, object] | None:
+    """Return the top-level object from ``~/.ucode/state.json``, or ``None``.
+
+    :returns: The parsed JSON object, or ``None`` when the file is missing,
+        unreadable, or not a JSON object.
+    """
+    if not _STATE_PATH.exists():
+        return None
+    try:
+        raw = json.loads(_STATE_PATH.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        _logger.debug("Could not read %s: %s", _STATE_PATH, exc)
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
 def read_ucode_state(workspace_url: str) -> UcodeWorkspaceState | None:
     """Return the ucode workspace state for *workspace_url*, or ``None``.
 
@@ -154,15 +171,8 @@ def read_ucode_state(workspace_url: str) -> UcodeWorkspaceState | None:
         e.g. ``"https://example.databricks.com"``.
     :returns: Parsed :class:`UcodeWorkspaceState`, or ``None``.
     """
-    if not _STATE_PATH.exists():
-        return None
-    try:
-        raw = json.loads(_STATE_PATH.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
-        _logger.debug("Could not read %s: %s", _STATE_PATH, exc)
-        return None
-
-    if not isinstance(raw, dict):
+    raw = _load_state_root()
+    if raw is None:
         return None
 
     workspaces = raw.get("workspaces")
@@ -225,14 +235,8 @@ def read_current_ucode_state() -> UcodeWorkspaceState | None:
     :returns: Parsed :class:`UcodeWorkspaceState`, or ``None`` when no
         usable workspace entry exists.
     """
-    if not _STATE_PATH.exists():
-        return None
-    try:
-        raw = json.loads(_STATE_PATH.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
-        _logger.debug("Could not read %s: %s", _STATE_PATH, exc)
-        return None
-    if not isinstance(raw, dict):
+    raw = _load_state_root()
+    if raw is None:
         return None
     workspaces = raw.get("workspaces")
     if not isinstance(workspaces, dict) or not workspaces:
@@ -245,3 +249,17 @@ def read_current_ucode_state() -> UcodeWorkspaceState | None:
         if isinstance(workspace_url, str):
             return read_ucode_state(workspace_url)
     return None
+
+
+def read_ucode_config_scope() -> str | None:
+    """Return the settings scope ucode last configured, or ``None``.
+
+    ``ucode configure --user`` records ``"user"`` and ``--global`` (the
+    default) records ``"global"``; older ucode releases record nothing.
+
+    :returns: The recorded scope, e.g. ``"user"``, or ``None`` when
+        state.json is missing or has no scope.
+    """
+    raw = _load_state_root()
+    scope = raw.get("config_scope") if raw is not None else None
+    return scope if isinstance(scope, str) else None
