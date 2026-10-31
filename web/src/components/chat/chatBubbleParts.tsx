@@ -1295,9 +1295,12 @@ export function KeepBottomOnResize() {
       const contentGrew = el.scrollHeight > scrollHeight;
       clientHeight = el.clientHeight;
       scrollHeight = el.scrollHeight;
-      const following = state.isAtBottom && !state.escapedFromLock;
-      if (!wasBottomLocked || isSelecting() || !(viewportResized || (contentGrew && following)))
-        return;
+      // Rechecked by the follow-up frame: the reader may scroll away or start selecting first.
+      const shouldPin = () =>
+        wasBottomLocked &&
+        !isSelecting() &&
+        (viewportResized || (contentGrew && state.isAtBottom && !state.escapedFromLock));
+      if (!shouldPin()) return;
       // Gecko delivers this callback before the frame paints, but the
       // library's scrollToBottom always lands a frame later (it defers
       // through a rAF promise), so the resize paints with the transcript
@@ -1312,6 +1315,7 @@ export function KeepBottomOnResize() {
       if (frame !== null) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         frame = null;
+        if (!shouldPin()) return;
         el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 1);
         scrollToBottom("instant");
       });

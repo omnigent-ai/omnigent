@@ -231,6 +231,12 @@ describe("KeepBottomOnResize", () => {
     fireEvent.scroll(scrollRoot);
     act(() => resize?.());
     expect(metrics.scrollTop).toBe(1341);
+
+    // A scroll up before the follow-up frame runs is kept.
+    metrics.scrollTop = 1100;
+    fireEvent.scroll(scrollRoot);
+    flushFrames();
+    expect(metrics.scrollTop).toBe(1100);
   });
 
   it("keeps following after a shrink clamps the reader before its resize callback", () => {
@@ -298,6 +304,12 @@ describe("KeepBottomOnResize", () => {
     fireEvent.pointerUp(scrollRoot);
     metrics.scrollHeight = 2042;
     act(() => resize?.());
+    expect(metrics.scrollTop).toBe(1391);
+
+    // A drag that starts before the follow-up frame runs holds that frame too.
+    fireEvent.pointerDown(scrollRoot);
+    metrics.scrollHeight = 2063;
+    flushFrames();
     expect(metrics.scrollTop).toBe(1391);
     document.getSelection()!.removeAllRanges();
     scrollRoot.remove();
