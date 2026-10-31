@@ -5378,10 +5378,9 @@
         "type": "object"
       },
       "RecommendedProjectColorResponse": {
-        "description": "The color a new project would be auto-assigned.",
+        "description": "The color a new project would be auto-assigned: a web theme palette id.",
         "properties": {
           "color": {
-            "description": "A web theme palette id, the one the caller's projects use least.",
             "title": "Color",
             "type": "string"
           }
@@ -13581,7 +13580,7 @@
         ]
       },
       "post": {
-        "description": "Create a new, empty project owned by the caller.\n\nA project created with neither an emoji nor a color is assigned the\npalette color the caller's projects use least.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
+        "description": "Create a new, empty project owned by the caller.\n\nWithout an emoji or color, it gets the caller's least-used palette color.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
         "operationId": "create_project_v1_projects_post",
         "requestBody": {
           "content": {
@@ -13687,7 +13686,7 @@
     },
     "/v1/projects/recommended-color": {
       "get": {
-        "description": "Recommend the color a new project would be auto-assigned.\n\n**Returns:** The recommended palette id.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
+        "description": "Return the color a new project would be auto-assigned.",
         "operationId": "get_recommended_project_color_v1_projects_recommended_color_get",
         "responses": {
           "200": {

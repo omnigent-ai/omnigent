@@ -118,10 +118,7 @@ export async function createProject(name: string, config?: ProjectConfig): Promi
   return (await res.json()) as Project;
 }
 
-/**
- * The color the server would auto-assign to a new project: the one most
- * different from the caller's projects' colors.
- */
+/** The color the server would auto-assign to a new project. */
 export async function getRecommendedProjectColor(): Promise<string> {
   const res = await authenticatedFetch("/v1/projects/recommended-color");
   if (!res.ok) throw new Error(await readError(res));

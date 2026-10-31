@@ -1,12 +1,5 @@
-// Project appearance: a project is marked by an emoji or a palette color, never
-// both. Exports:
-//   - `EmojiPicker`: a themed emoji-mart picker, code-split so its ~600KB
-//     dataset never lands in the main bundle (loaded on first open).
-//   - `ProjectAppearanceButton`: the mark tile beside a project name field,
-//     opening the color / emoji picker on click (create and rename dialogs).
-//   - `ProjectAppearanceTile`: the preview of a project's mark.
-//   - `ProjectLandingIcon`: the big project-header icon on the new-chat landing,
-//     whose picker applies a new mark immediately.
+// A project is marked by an emoji or a palette color, never both. emoji-mart is
+// code-split so its ~600KB dataset loads only on first open.
 
 import {
   type CSSProperties,
@@ -68,11 +61,7 @@ export function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }
   );
 }
 
-/**
- * The server's recommended color for a new project: the one most different
- * from the colors the caller's projects use. Undefined until it loads; keyed
- * under `projects` so every project-list refresh refreshes it too.
- */
+/** Keyed under `projects` so every project-list refresh refreshes it too. */
 export function useRecommendedProjectColor(): string | undefined {
   const { data } = useQuery({
     queryKey: ["projects", "recommended-color"],
@@ -82,7 +71,6 @@ export function useRecommendedProjectColor(): string | undefined {
   return isProjectColor(data) ? data : undefined;
 }
 
-/** Preview of a project's mark: the emoji, else a folder in its color. */
 export function ProjectAppearanceTile({
   appearance,
   size,
@@ -118,11 +106,6 @@ export function ProjectAppearanceTile({
   );
 }
 
-/**
- * Popover body for picking a project's mark: an emoji button that swaps in
- * the emoji grid, then the palette swatches. Picking either replaces the other and
- * closes the popover via `onClose`.
- */
 function ProjectAppearancePopoverContent({
   value,
   onChange,
@@ -235,10 +218,6 @@ function ProjectAppearancePopoverContent({
   );
 }
 
-/**
- * The mark tile beside a project name field; clicking it opens the color /
- * emoji picker. Used by the New project and Rename project dialogs.
- */
 export function ProjectAppearanceButton({
   value,
   onChange,
