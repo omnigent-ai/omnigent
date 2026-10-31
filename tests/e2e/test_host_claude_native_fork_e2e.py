@@ -986,3 +986,140 @@ def test_clear_claude_sdk_continues_empty_on_the_same_host(
             http_client, session_id=cleared_id, marker="NOCODEWORD", timeout=180.0
         )
         assert word not in reply, f"cleared claude-sdk session recalled {word!r}: {reply!r}"
+
+
+def _prompt_item_id(client: httpx.Client, *, session_id: str, fragment: str) -> str:
+    """
+    Return the id of *session_id*'s user prompt containing *fragment*.
+
+    :param client: HTTP client pointed at the test server.
+    :param session_id: Session to search.
+    :param fragment: Text the prompt contains, e.g. a planted code word.
+    :returns: The prompt's item id.
+    """
+    resp = client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 100, "order": "asc", "type": "message"},
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    for item in resp.json()["data"]:
+        texts = [part.get("text", "") for part in item.get("content", [])]
+        if item.get("role") == "user" and any(fragment in text for text in texts):
+            return str(item["id"])
+    raise AssertionError(f"no user prompt containing {fragment!r} in {session_id}")
+
+
+def _recall_code_words(client: httpx.Client, *, session_id: str, expected: str) -> str:
+    """Ask for every planted code word and return the reply naming *expected*."""
+    _send_user_message(
+        client,
+        session_id=session_id,
+        text=(
+            "List every code word I gave you earlier in this conversation, separated by "
+            "spaces, and nothing else."
+        ),
+    )
+    return _poll_for_assistant_marker(
+        client, session_id=session_id, marker=expected, timeout=180.0
+    )
+
+
+def _rewind_and_check_placement(
+    client: httpx.Client, *, source_id: str, item_id: str, prompt_fragment: str
+) -> str:
+    """
+    Rewind *source_id* to *item_id* and check the fork's placement and notice.
+
+    :returns: The rewound session's id.
+    """
+    # /rewind refuses a running turn.
+    _wait_until_idle(client, session_id=source_id)
+    resp = client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": item_id}, timeout=60.0)
+    assert resp.status_code == 200, resp.text
+    rewound_id = str(resp.json()["session_id"])
+    assert prompt_fragment in resp.json()["prompt"]
+    source = client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
+    rewound = client.get(f"/v1/sessions/{rewound_id}", timeout=30.0).json()
+    assert (rewound["runner_id"], rewound["host_id"], rewound["workspace"]) == (
+        source["runner_id"],
+        source["host_id"],
+        source["workspace"],
+    )
+    items = client.get(
+        f"/v1/sessions/{source_id}/items", params={"limit": 5, "order": "desc"}, timeout=30.0
+    ).json()["data"]
+    assert any(f"/c/{rewound_id}" in _assistant_text(item) for item in items), items
+    return rewound_id
+
+
+def test_rewind_claude_native_resumes_only_the_earlier_history(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    ``/rewind`` in a claude-native session resumes Claude without the later turns.
+
+    The truncated fork drops the source's native-session directive, so the
+    runner rebuilds Claude's transcript from the kept items. A regression
+    that resumed the source's full transcript would let Claude recall the
+    dropped code word; one that launched fresh would forget the kept one.
+    """
+    workspace = tmp_path / "rewind_native_ws"
+    workspace.mkdir()
+    kept = f"KEPTWORD_{uuid.uuid4().hex[:6].upper()}"
+    dropped = f"DROPWORD_{uuid.uuid4().hex[:6].upper()}"
+
+    with _workspaces_trusted_in_claude_config([workspace]):
+        with _host_daemon(tmp_path, live_server):
+            host_id = _online_host_id(http_client, timeout=30.0)
+            agent_id = _claude_native_agent_id(http_client)
+            source_id = _create_native_session(
+                http_client, agent_id=agent_id, host_id=host_id, workspace=workspace
+            )
+            _plant_code_words(http_client, session_id=source_id, words=[kept, dropped])
+            _wait_for_external_session_id(http_client, session_id=source_id, timeout=60.0)
+
+            rewound_id = _rewind_and_check_placement(
+                http_client,
+                source_id=source_id,
+                item_id=_prompt_item_id(http_client, session_id=source_id, fragment=dropped),
+                prompt_fragment=dropped,
+            )
+
+            reply = _recall_code_words(http_client, session_id=rewound_id, expected=kept)
+            assert dropped not in reply, (
+                f"rewound claude-native session recalled the dropped word {dropped!r}: {reply!r}"
+            )
+
+
+def test_rewind_claude_sdk_keeps_only_the_earlier_turns(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    claude-sdk ``/rewind`` keeps only the turns before the chosen prompt.
+
+    The SDK replays the Omnigent transcript into a fresh client, so the
+    model's recall shows exactly which history the rewound session carries.
+    """
+    workspace = tmp_path / "rewind_sdk_ws"
+    workspace.mkdir()
+    kept = f"KEPTWORD_{uuid.uuid4().hex[:6].upper()}"
+    dropped = f"DROPWORD_{uuid.uuid4().hex[:6].upper()}"
+
+    with _host_daemon(tmp_path, live_server):
+        host_id = _online_host_id(http_client, timeout=30.0)
+        source_id = _create_sdk_session_on_host(http_client, host_id=host_id, workspace=workspace)
+        _plant_code_words(http_client, session_id=source_id, words=[kept, dropped])
+
+        rewound_id = _rewind_and_check_placement(
+            http_client,
+            source_id=source_id,
+            item_id=_prompt_item_id(http_client, session_id=source_id, fragment=dropped),
+            prompt_fragment=dropped,
+        )
+        reply = _recall_code_words(http_client, session_id=rewound_id, expected=kept)
+        assert dropped not in reply, f"rewound claude-sdk session recalled {dropped!r}: {reply!r}"
