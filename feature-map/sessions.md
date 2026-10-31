@@ -149,7 +149,8 @@ the header menu), and each place is a separate entry point.
   across deep links and reloads.
 - `canvas-navigation`: Canvas uses the same collapsed-sidebar button and hover
   preview as other pages, including the macOS titlebar controls. Opening it
-  reveals the shared destinations, including Usage when enabled.
+  reveals the shared destinations, including Usage when enabled. The board
+  header's Home link returns to the new-session page without opening it.
 - `canvas-create`: the plus button on Main or a project opens the new-session
   composer; sending returns to that board with the new session selected.
 - `canvas-session-health`: an opened Canvas session receives host health and
@@ -326,7 +327,8 @@ host-dependent unlink behavior.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
-cards. Choosing Canvas in the sidebar returns to the selected board.
+cards. Choosing Canvas in the sidebar returns to the selected board. Home in
+the board header returns to the new-session page while navigation is collapsed.
 Drag the divider to resize, or focus it and use Left/Right arrows to
 adjust the split and Home/End to reach its limits. Double-click the divider to
 restore the default split. Focus the session to use the full area; Escape
@@ -974,7 +976,10 @@ plain `uv run pytest`, which starts a private server for the test.
   Canvas, then reloads to confirm the selected project remains remembered.
   macOS title-bar clearance, sidebar opening from the titlebar toggle or mobile
   hamburger, and conversation focus/return at wide and narrow widths run in
-  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`.
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`;
+  at both widths it also checks the board's Home link clears the title bar and
+  returns home after the board is restored, beside the conversation at the wide
+  width. `web/src/pages/CanvasPage.test.tsx` checks that link targets `/`.
   This Chromium journey emulates the macOS preload bridge and user agent; it
   verifies the app's layout around the title bar, not native traffic-light rendering.
   `web/src/embed.test.tsx` checks that the compiled Canvas clearance selector
@@ -1036,10 +1041,11 @@ plain `uv run pytest`, which starts a private server for the test.
   embedded and sits under the status bar in the native apps.
 - Canvas is feature-gated, including conversation deep links. Its browser
   tests enable that flag explicitly; they do not enable it on a deployed app.
-- Canvas entry collapses navigation once. Selecting another card must not
-  collapse navigation that the user has manually expanded. Card dragging must
-  not open a session. Workspace must not hide the canvas or change session
-  focus; both panels resize to leave room for the conversation controls.
+- Canvas entry collapses navigation once, so the board keeps its own Home link.
+  Selecting another card must not collapse navigation that the user has
+  manually expanded. Card dragging must not open a session. Workspace must not
+  hide the canvas or change session focus; both panels resize to leave room for
+  the conversation controls.
 
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
