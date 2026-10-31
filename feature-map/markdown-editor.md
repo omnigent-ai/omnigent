@@ -243,8 +243,15 @@ instead of treating one comparison clip as complete feature verification.
 - Reference-style links (`[text][label]`, `[text][]`, `[text]`) save in that
   form while their URL, title and label still match a definition; otherwise
   they save inline. Link definition lines show read-only, like footnotes.
+- Saves write top-level blocks the user did not change from the file's source,
+  byte-for-byte; only edited blocks are re-serialized, so an edit inside a list
+  or table rewrites that whole list or table. Changed definitions, or a kept
+  block that would read differently beside its new neighbour (indented code
+  after a list, an unclosed fence), re-serialize the whole file, so an unrelated
+  block's syntax can still change after a deletion. An edited block is separated from
+  its neighbours by exactly one blank line. `web/src/shell/markdownSourceBlocks.ts`.
 - Load measurements do not establish typing latency. Dirty detection compares
-  immutable editor documents; autosave still serializes the whole document.
+  immutable editor documents; autosave writes edited blocks only.
   Changes that serialize identically become clean when autosave checks them.
 - Setext-heading detection uses a line scanner with marked 17 interruption
   rules. Compatibility tests compare it with upstream; remove the workaround

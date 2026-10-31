@@ -1232,10 +1232,8 @@ def _claude_settings_payload(
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
     """Read the ``env`` block of Claude Code's user ``settings.json``.
 
-    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
-    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
-    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
-    relative value is relative to the CLI's working directory.
+    The file is located by
+    :func:`omnigent.onboarding.ambient.read_claude_user_settings`.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
@@ -1243,14 +1241,10 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
         ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
         when the file is missing, unreadable, or has no ``env`` object.
     """
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = pathlib.Path(configured) if configured else pathlib.Path.home() / ".claude"
-    settings_path = pathlib.Path(cwd or "") / config_dir / "settings.json"
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    env = settings.get("env") if isinstance(settings, dict) else None
+    from omnigent.onboarding.ambient import read_claude_user_settings
+
+    settings = read_claude_user_settings(cwd)
+    env = settings.get("env") if settings is not None else None
     if not isinstance(env, dict):
         return {}
     return {

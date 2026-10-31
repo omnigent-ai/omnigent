@@ -41,6 +41,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
+    from omnigent.onboarding.sandboxes.profiles import (
+        ProviderSandboxProfile,
+        SandboxProfileContext,
+    )
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
@@ -956,6 +960,35 @@ class SandboxHostLauncher(SandboxLifecycle):
     class directly and override :meth:`start_host` without needing any exec
     transport.
     """
+
+    manages_profiles: ClassVar[bool] = False
+    """Own profile discovery, permissions, and configuration; mirror in registry metadata."""
+
+    supports_sandbox_profile_lookup: ClassVar[bool] = False
+    """Whether sandbox-scoped discovery returns the durable assigned revision."""
+
+    def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile]:
+        """Return only profiles currently authorized for the trusted caller context.
+
+        Use bounded provider I/O, including explicit network timeouts. This
+        synchronous hook must not provision resources or perform launch preflight.
+        Return public metadata only; keep configuration and access rules private.
+        """
+        raise self._capability_error("list provider-managed sandbox profiles")
+
+    def select_profile(
+        self, context: SandboxProfileContext, profile: ProviderSandboxProfile
+    ) -> None:
+        """Re-authorize an exact revision and configure this launcher for its use.
+
+        Re-read current access and settings using bounded provider I/O. Raise
+        SandboxProfileAccessDenied for revoked access or SandboxProfileChanged
+        if the requested revision is unavailable; never silently use a newer one.
+        Configure this instance before prepare_for_launch, prepare, provision,
+        or resume. Do not provision resources or perform launch preflight here.
+        A previous list_profiles result is not proof of current authorization.
+        """
+        raise self._capability_error("select provider-managed sandbox profiles")
 
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.

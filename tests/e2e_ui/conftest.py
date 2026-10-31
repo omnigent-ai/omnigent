@@ -2801,6 +2801,7 @@ def _create_native_codex_session(
     runner_id: str,
     *,
     model: str | None = None,
+    labels: dict[str, str] | None = None,
 ) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
@@ -2824,6 +2825,7 @@ def _create_native_codex_session(
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
     :param model: Optional Codex model to pin in the wrapper spec.
+    :param labels: Extra session labels set at create, before Codex launches.
     :returns: The new session/conversation id.
     """
     # Keep workspace session-local; runner-wide cwd changes other file surfaces.
@@ -2832,7 +2834,7 @@ def _create_native_codex_session(
         base_url,
         harness="codex",
         model=model,
-        metadata={"workspace": str(_REPO_ROOT)},
+        metadata={"workspace": str(_REPO_ROOT), "labels": labels or {}},
     )
     session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
@@ -2932,18 +2934,22 @@ def native_codex_mock_session(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
 ) -> Iterator[tuple[str, str]]:
     """A real Codex CLI using an explicitly configured mock provider.
 
     Workflow-owned runners reuse their startup config; standalone tests install
-    a temporary mock provider regardless of ambient credentials.
+    a temporary mock provider regardless of ambient credentials. Indirect fixture
+    parameters supply session labels before Codex launches.
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(
         mock_llm_server_url, "codex", workflow_owned=bool(_server_state.get("workflow_owned"))
     ):
-        session_id = _create_native_codex_session(live_server, runner_id)
+        session_id = _create_native_codex_session(
+            live_server, runner_id, labels=getattr(request, "param", None)
+        )
         try:
             yield (live_server, session_id)
         finally:

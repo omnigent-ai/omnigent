@@ -3980,6 +3980,162 @@ describe("Sidebar view options", () => {
     expect(usePullRequestInfoMock).toHaveBeenCalledWith("conv_gh");
   });
 
+  it.each([
+    {
+      merge_state_status: "DIRTY",
+      checks: { failing: 0, pending: 0 },
+      label: "Merge conflicts",
+      icon: "git-compare-arrows",
+    },
+    {
+      merge_state_status: "BLOCKED",
+      checks: { failing: 1, pending: 1 },
+      label: "Checks failing",
+      icon: "circle-x",
+    },
+    {
+      merge_state_status: "BLOCKED",
+      checks: { failing: 0, pending: 1 },
+      label: "Checks running",
+      icon: "circle-dot",
+    },
+    {
+      merge_state_status: "CLEAN",
+      checks: { failing: 0, pending: 0 },
+      label: "Ready to merge",
+      icon: "circle-check",
+    },
+  ])(
+    "keeps live PR status when a newer stored summary has the same lifecycle: $label",
+    async ({ label, icon, ...status }) => {
+      const url = "https://github.com/omnigent-ai/omnigent/pull/419";
+      const checkedAt = Date.now() / 1000 - 600;
+      usePullRequestInfoMock.mockReturnValue({
+        dataUpdatedAt: (checkedAt - 60) * 1000,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: { url, number: 419, state: "OPEN", is_draft: false, ...status },
+        },
+      });
+      mockConversations([
+        conv("conv_gh", "Codex", {
+          workspace: "/Users/me/omnigent",
+          pull_request: {
+            url,
+            provider: "github",
+            repository: "omnigent-ai/omnigent",
+            number: 419,
+            state: "open",
+            state_checked_at: checkedAt,
+          },
+        }),
+      ]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      const row = await screen.findByTestId("session-tooltip-pr");
+      expect(row).toHaveTextContent(`PR#419 · ${label}`);
+      expect(row).not.toHaveTextContent("as of");
+      expect(row.querySelector(`.lucide-${icon}`)).toBeInTheDocument();
+    },
+  );
+
+  it.each([{ isError: true }, { isEnabled: false }])(
+    "keeps cached lifecycle without stale merge readiness when live info is unavailable: %j",
+    async (queryState) => {
+      usePullRequestInfoMock.mockReturnValue({
+        ...queryState,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: { number: 419, state: "OPEN", is_draft: false, merge_state_status: "CLEAN" },
+        },
+      });
+      mockConversations([conv("conv_gh", "Codex", { workspace: "/Users/me/omnigent" })]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      expect(await screen.findByTestId("session-tooltip-pr")).toHaveTextContent(/^PR#419 · Open$/);
+    },
+  );
+
+  it.each([
+    {
+      storedNumber: 419,
+      storedState: "MERGED",
+      storedDraft: false,
+      liveState: "OPEN",
+      expected: "Merged",
+    },
+    {
+      storedNumber: 420,
+      storedState: "MERGED",
+      storedDraft: false,
+      liveState: "OPEN",
+      expected: "Ready to merge",
+    },
+    {
+      storedNumber: 419,
+      storedState: "OPEN",
+      storedDraft: true,
+      liveState: "OPEN",
+      expected: "Draft",
+    },
+    {
+      storedNumber: 419,
+      storedState: "OPEN",
+      storedDraft: false,
+      liveState: "CLOSED",
+      expected: "Open",
+    },
+  ])(
+    "uses a newer stored lifecycle only for the same PR: $storedNumber",
+    async ({ storedNumber, storedState, storedDraft, liveState, expected }) => {
+      const now = Date.now();
+      usePullRequestInfoMock.mockReturnValue({
+        dataUpdatedAt: now - 10_000,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: {
+            url: "https://github.com/omnigent-ai/omnigent/pull/419",
+            number: 419,
+            state: liveState,
+            is_draft: false,
+            merge_state_status: "CLEAN",
+          },
+        },
+      });
+      mockConversations([
+        conv("conv_gh", "Codex", {
+          workspace: "/Users/me/omnigent",
+          pull_request: {
+            url: `https://github.com/omnigent-ai/omnigent/pull/${storedNumber}`,
+            provider: "github",
+            repository: "omnigent-ai/omnigent",
+            number: storedNumber,
+            state: storedState,
+            is_draft: storedDraft,
+            state_checked_at: now / 1000,
+          },
+        }),
+      ]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      expect(await screen.findByTestId("session-tooltip-pr")).toHaveTextContent(
+        `PR#419 · ${expected}`,
+      );
+    },
+  );
+
   it("shows the tracked PR number when gh can't resolve its state", async () => {
     // gh unauthenticated: `pr` is null, but the association carries the number.
     usePullRequestInfoMock.mockReturnValue({
