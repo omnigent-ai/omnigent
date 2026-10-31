@@ -6,12 +6,18 @@
 // and assert exactly which ids reach `setWatched`.
 
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
-import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
+import {
+  InfiniteQueryObserver,
+  QueryClient,
+  QueryClientProvider,
+  QueryObserver,
+} from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  clearRecentlyCreated,
   clearSessionTombstones,
   useArchiveConversation,
   type Conversation,
@@ -115,6 +121,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  clearRecentlyCreated();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -468,6 +475,106 @@ describe("SessionUpdatesProvider archive tombstone", () => {
 });
 
 describe("SessionUpdatesProvider list invalidation", () => {
+  function renameInvalidatesLists(searchCached: boolean): boolean {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      if (searchCached) {
+        // The renamed row isn't in this search list yet; only a refetch can add it.
+        client.setQueryData(["conversations", "alp", false], {
+          pages: [{ data: [], first_id: null, last_id: null, has_more: false }],
+          pageParams: [undefined],
+        } satisfies ConversationsInfiniteData);
+      }
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+
+      act(() =>
+        frameHandler()({ type: "changed", items: [{ ...conv("conv_a"), title: "alpha" }] }),
+      );
+      act(() => vi.advanceTimersByTime(300));
+
+      return invalidate.mock.calls.some(([filters]) => filters?.queryKey?.[0] === "conversations");
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("refetches the lists on a rename while a search list is cached", () => {
+    expect(renameInvalidatesLists(true)).toBe(true);
+  });
+
+  it("patches a rename in place when no search list is cached", () => {
+    expect(renameInvalidatesLists(false)).toBe(false);
+  });
+
+  it("places a row bumped on Mine's second page into the palette list without a refetch", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      client.setQueryData(["conversations", "", false, null, "mine"], {
+        pages: [
+          {
+            data: [conv("conv_a"), conv("conv_b")],
+            first_id: "conv_a",
+            last_id: "conv_b",
+            has_more: true,
+          },
+          { data: [conv("conv_old")], first_id: "conv_old", last_id: "conv_old", has_more: false },
+        ],
+        pageParams: [undefined, "conv_b"],
+      } satisfies ConversationsInfiniteData);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+
+      act(() =>
+        frameHandler()({ type: "changed", items: [{ ...conv("conv_old"), updated_at: 99 }] }),
+      );
+      act(() => vi.advanceTimersByTime(300));
+
+      const palette = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(palette?.pages[0].data.find((row) => row.id === "conv_old")?.updated_at).toBe(99);
+      expect(
+        invalidate.mock.calls.some(([filters]) => filters?.queryKey?.[0] === "conversations"),
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a pushed row's status and updated_at in the loaded folder page", async () => {
+    vi.useFakeTimers();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const folder = observeTwoPageFolder(client);
+    try {
+      renderProvider(client, ["/"]);
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [{ ...folderRow("conv_mid"), status: "running", updated_at: 10 }],
+        }),
+      );
+      await act(() => vi.advanceTimersByTimeAsync(300));
+
+      const cached = client.getQueryData<ConversationsInfiniteData>([
+        "project-sessions",
+        "Sprint 42",
+        "updated_at",
+        false,
+      ]);
+      const rows = cached?.pages.flatMap((page) => page.data);
+      expect(rows?.find((row) => row.id === "conv_mid")).toMatchObject({
+        status: "running",
+        updated_at: 10,
+      });
+    } finally {
+      folder.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("invalidates the archived-project-names scan on a remote removal", () => {
     // Another client archiving/relabeling/deleting must refresh the Archived
     // view's project picker — only local mutations invalidate it otherwise.
@@ -486,6 +593,72 @@ describe("SessionUpdatesProvider list invalidation", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+function folderRow(id: string): Conversation {
+  return { ...conv(id), title: id };
+}
+
+function observeTwoPageFolder(client: QueryClient) {
+  const fetchedCursors: (string | undefined)[] = [];
+  const pages: ConversationsPage[] = [
+    {
+      data: [folderRow("conv_new"), folderRow("conv_mid")],
+      first_id: "conv_new",
+      last_id: "conv_mid",
+      has_more: true,
+    },
+    { data: [folderRow("conv_old")], first_id: "conv_old", last_id: "conv_old", has_more: false },
+  ];
+  const observer = new InfiniteQueryObserver(client, {
+    queryKey: ["project-sessions", "Sprint 42", "updated_at", false],
+    queryFn: ({ pageParam }: { pageParam: string | undefined }) => {
+      fetchedCursors.push(pageParam);
+      return Promise.resolve(pageParam ? pages[1] : pages[0]);
+    },
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last: ConversationsPage) =>
+      last.has_more ? (last.last_id ?? undefined) : undefined,
+    initialData: { pages, pageParams: [undefined, "conv_mid"] },
+    staleTime: Infinity,
+  });
+  return { fetchedCursors, stop: observer.subscribe(() => {}) };
+}
+
+describe("SessionUpdatesProvider loaded folder pages", () => {
+  async function folderFetchesAfterFrame(item: Record<string, unknown>) {
+    vi.useFakeTimers();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const folder = observeTwoPageFolder(client);
+    try {
+      renderProvider(client, ["/"]);
+      act(() => frameHandler()({ type: "changed", items: [item] }));
+      await act(() => vi.advanceTimersByTimeAsync(300));
+      return folder.fetchedCursors;
+    } finally {
+      folder.stop();
+      vi.useRealTimers();
+    }
+  }
+
+  it("patches a cached row's status and updated_at without refetching the folder", async () => {
+    const fetched = await folderFetchesAfterFrame({
+      ...folderRow("conv_mid"),
+      status: "running",
+      updated_at: 10,
+    });
+    expect(fetched).toEqual([]);
+  });
+
+  it("does not refetch the folder for a sub-agent row the list never returns", async () => {
+    const fetched = await folderFetchesAfterFrame({
+      ...folderRow("conv_child"),
+      parent_session_id: "conv_new",
+      status: "running",
+      updated_at: 10,
+    });
+    expect(fetched).toEqual([]);
   });
 });
 
