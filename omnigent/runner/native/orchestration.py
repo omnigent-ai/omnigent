@@ -5714,7 +5714,9 @@ async def _auto_create_codex_terminal(
         from omnigent.harnesses.codex_native.main import _find_codex_rollout
 
         try:
-            resume_rollout = _find_codex_rollout(codex_home, launch_config.external_session_id)
+            resume_rollout = await asyncio.to_thread(
+                _find_codex_rollout, codex_home, launch_config.external_session_id
+            )
             # The rollout was written above, so a missing one is codex still
             # indexing it or skipping a file it cannot read: retry, then reset.
             for retry_delay_s in (*_CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S, None):

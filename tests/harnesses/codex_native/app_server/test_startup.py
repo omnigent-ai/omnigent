@@ -1183,20 +1183,23 @@ async def test_session_app_server_launches_through_the_configured_wrapper(
 
 @dataclass
 class _ConfigReadStartupClient(_FakeStartupClient):
-    """Startup client answering ``config/read`` with an effective provider, or failing."""
+    """Startup client whose ``config/read`` answers a provider, fails, or stalls."""
 
     effective_provider: str | None = None
+    read_stalls: bool = False
     requests: list[tuple[str, dict[str, object]]] = field(default_factory=list)
 
     async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.requests.append((method, params))
+        if self.read_stalls:
+            await asyncio.Event().wait()
         if method != "config/read" or self.effective_provider is None:
             raise RuntimeError("config/read unavailable")
         return {"result": {"config": {"model_provider": self.effective_provider}}}
 
 
 @pytest.mark.parametrize(
-    ("version", "overrides", "effective_provider", "expected_overrides", "reads"),
+    ("version", "overrides", "effective_provider", "expected_overrides", "reads", "read_stalls"),
     [
         pytest.param(
             (0, 166, 0),
@@ -1204,6 +1207,7 @@ class _ConfigReadStartupClient(_FakeStartupClient):
             "Databricks",
             ['model_provider="Databricks"', 'model="m"'],
             1,
+            False,
             id="managed_provider_wins",
         ),
         pytest.param(
@@ -1212,6 +1216,7 @@ class _ConfigReadStartupClient(_FakeStartupClient):
             "Databricks",
             ['model_provider="Databricks"'],
             1,
+            False,
             id="unknown_version",
         ),
         pytest.param(
@@ -1220,6 +1225,7 @@ class _ConfigReadStartupClient(_FakeStartupClient):
             "omnigent_databricks",
             ['model_provider="omnigent_databricks"'],
             1,
+            False,
             id="pin_already_effective",
         ),
         pytest.param(
@@ -1228,7 +1234,17 @@ class _ConfigReadStartupClient(_FakeStartupClient):
             None,
             ['model_provider="omnigent_databricks"'],
             1,
+            False,
             id="read_fails",
+        ),
+        pytest.param(
+            (0, 166, 0),
+            ['model_provider="omnigent_databricks"'],
+            None,
+            ['model_provider="omnigent_databricks"'],
+            1,
+            True,
+            id="read_stalls",
         ),
         pytest.param(
             (0, 165, 0),
@@ -1236,6 +1252,7 @@ class _ConfigReadStartupClient(_FakeStartupClient):
             "Databricks",
             ['model_provider="omnigent_databricks"'],
             0,
+            False,
             id="before_provider_check",
         ),
         pytest.param(
@@ -1244,6 +1261,7 @@ class _ConfigReadStartupClient(_FakeStartupClient):
             "Databricks",
             ['model="m"'],
             0,
+            False,
             id="no_pin",
         ),
     ],
@@ -1257,15 +1275,23 @@ async def test_start_pins_the_terminal_to_codex_effective_model_provider(
     effective_provider: str | None,
     expected_overrides: list[str],
     reads: int,
+    read_stalls: bool,
 ) -> None:
     """A managed provider outranks the launch pin, so the TUI must start its thread under it."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(source_home))
     _set_codex_version(monkeypatch, version)
-    startup_client = _ConfigReadStartupClient(effective_provider=effective_provider)
+    monkeypatch.setattr(
+        codex_native_app_server, "_MODEL_PROVIDER_READ_TIMEOUT_SECONDS", budget(0.05)
+    )
+    startup_client = _ConfigReadStartupClient(
+        effective_provider=effective_provider, read_stalls=read_stalls
+    )
 
     async def _ready(_self: CodexNativeAppServer) -> _ConfigReadStartupClient:
         return startup_client

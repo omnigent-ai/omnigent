@@ -900,6 +900,55 @@ def test_preload_codex_thread_surfaces_refusals_it_cannot_restamp(
 
 
 @pytest.mark.parametrize(
+    ("first_record", "replace_fails", "raised"),
+    [
+        (b'{"type":"turn_context","payload":{}}', False, ValueError),
+        (b"not json", False, ValueError),
+        (b'{"type":"session_meta","payload":{"model_provider":"p"}}', True, OSError),
+    ],
+    ids=["not_session_meta", "unparseable_record", "replace_fails"],
+)
+def test_preload_codex_thread_keeps_rollout_when_restamp_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    first_record: bytes,
+    replace_fails: bool,
+    raised: type[Exception],
+) -> None:
+    """A rollout that cannot be restamped stays intact and the resume is not retried."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = first_record + b'\n{"type":"response_item","payload":{}}\n'
+    rollout.write_bytes(original)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    if replace_fails:
+
+        def _fail_replace(*_args: object) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(codex_native_app_server.os, "replace", _fail_replace)
+
+    with pytest.raises(raised):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="omnigent_databricks",
+                rollout_path=rollout,
+            )
+        )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [rollout]
+    assert fake_client.closed
+
+
+@pytest.mark.parametrize(
     ("exc", "expected"),
     [
         (
