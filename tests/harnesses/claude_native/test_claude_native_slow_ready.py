@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -17,6 +18,8 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge
+from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+from omnigent.inner.executor import ExecutorError, TurnComplete
 
 _TERMINAL = r"""
 import json
@@ -43,7 +46,21 @@ if startup in {"dead", "dead-no-status"}:
     print("Startup failed", flush=True)
     raise SystemExit(1)
 print("Starting Claude Code...", flush=True)
-time.sleep(1.0)
+if startup == "background-progress":
+    transcript = Path(sys.argv[5])
+    for text in ("Worker progress", "Worker finished"):
+        if text == "Worker finished":
+            while not gate_started.with_suffix(".ready").exists():
+                time.sleep(0.01)
+        with transcript.open("a") as handle:
+            handle.write(json.dumps({
+                "type": "assistant", "uuid": text, "sessionId": "native-session",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": text}
+                ]}
+            }) + "\n")
+else:
+    time.sleep(1.0)
 draft = "\n".join(f"OLD {index}" for index in range(8)) if startup.startswith("stale-") else ""
 box = _InputBox("bash" if startup == "stale-shell-frame" else "prompt", draft)
 
@@ -103,6 +120,7 @@ while True:
         "exit-after-ready",
         "stale-frame",
         "stale-shell-frame",
+        "background-progress",
     ],
 )
 @pytest.mark.timeout(20)
@@ -118,6 +136,7 @@ def test_first_message_survives_slow_terminal_startup(
     )
     gate_started = tmp_path / "gate-started"
     delivered = tmp_path / "delivered.json"
+    transcript = tmp_path / "native.jsonl"
     terminal = tmp_path / "terminal.py"
     terminal.write_text(_TERMINAL)
     original_wait = bridge._wait_for_claude_prompt_ready
@@ -141,7 +160,10 @@ def test_first_message_survives_slow_terminal_startup(
         bridge_dir: Path | None = None,
     ) -> None:
         started_at.append(time.monotonic())
-        gate_started.touch()
+        if startup != "background-progress":
+            gate_started.touch()
+        else:
+            timeout_s = 0.5
         original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
         if startup == "exit-after-ready":
             subprocess.run(
@@ -152,6 +174,17 @@ def test_first_message_survives_slow_terminal_startup(
             )
 
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", observe_wait)
+    if startup == "background-progress":
+        monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.5)
+        original_capture = bridge._capture_pane
+
+        def capture(socket_path: str, target: str, **kwargs: object) -> str:
+            pane = original_capture(socket_path, target, **kwargs)
+            if started_at:
+                gate_started.touch()
+            return pane
+
+        monkeypatch.setattr(bridge, "_capture_pane", capture)
     with tempfile.TemporaryDirectory(prefix="claude-ready-", dir="/tmp") as socket_dir:
         socket_path = Path(socket_dir) / "tmux.sock"
         tmux = ["tmux", "-S", str(socket_path)]
@@ -163,6 +196,7 @@ def test_first_message_survives_slow_terminal_startup(
                 str(delivered),
                 startup,
                 str(Path(__file__).resolve().parents[3]),
+                str(transcript),
             ]
         )
         try:
@@ -199,7 +233,58 @@ def test_first_message_survives_slow_terminal_startup(
                     time.sleep(0.05)
             bridge_dir = tmp_path / "bridge"
             bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="main")
-            if startup == "slow":
+            if startup == "background-progress":
+                transcript.write_text("")
+                bridge.record_hook_event(
+                    bridge_dir,
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": "native-session",
+                        "transcript_path": str(transcript),
+                        "background_tasks": [{"type": "subagent", "status": "running"}],
+                    },
+                )
+
+                async def send() -> list[object]:
+                    return [
+                        event
+                        async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+                            messages=[{"role": "user", "content": "FOLLOW_UP_ONCE"}],
+                            tools=[],
+                            system_prompt="",
+                        )
+                    ]
+
+                events = asyncio.run(send())
+                assert len(events) == 1 and isinstance(events[0], ExecutorError)
+                assert events[0].undelivered is True
+                assert bridge._claude_pane_state(str(socket_path), "main").alive
+                assert events[0].title == "Message not delivered"
+                assert not delivered.exists()
+                result = bridge.read_transcript_items_from_offset(
+                    transcript, 0, start_line=0, agent_name="claude"
+                )
+                assert len(result.items) == 1
+                assert "Worker progress" in json.dumps(result.items[0].data)
+                # Recover the composer, then retry the same unsent message once.
+                gate_started.with_suffix(".ready").touch()
+                deadline = time.monotonic() + 5
+                while "❯" not in bridge._capture_pane(str(socket_path), "main"):
+                    assert time.monotonic() < deadline
+                    time.sleep(0.02)
+                assert asyncio.run(send()) == [TurnComplete(response=None)]
+                assert json.loads(delivered.read_text()) == [["prompt", "FOLLOW_UP_ONCE"]]
+                completion = bridge.read_transcript_items_from_offset(
+                    transcript,
+                    result.byte_offset,
+                    start_line=result.line_cursor,
+                    agent_name="claude",
+                )
+                assert len(completion.items) == 1
+                assert "Worker finished" in json.dumps(completion.items[0].data)
+                bridge.kill_session(bridge_dir)
+                assert bridge._claude_pane_state(str(socket_path), "main").alive is False
+            elif startup == "slow":
                 bridge.inject_user_message(
                     bridge_dir, content="FIRST_PROMPT_DELIVERED", timeout_s=0.3
                 )
