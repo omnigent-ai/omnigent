@@ -460,9 +460,19 @@ it(
       assert.equal(moved.ok, false, JSON.stringify(moved));
       assert.match(moved.error, /blocked/i);
       assert.equal(previewLoads, loadsBeforeMove, "a moved session sends no loopback request");
+      assert.equal(
+        await electronApp.evaluate((_electron, sessionId) => {
+          return global.omnigentTestBrowserRegistries[0].get(sessionId).view.webContents.getURL();
+        }, backend.sessionId),
+        "about:blank",
+        "a moved session removes the previous local document",
+      );
       await window.goto(`${backend.serverUrl}/c/${backend.otherSessionId}`);
       await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
-      const denied = await action(backend.otherSessionId);
+      const denied = await eventually(async () => {
+        const result = await action(backend.otherSessionId);
+        return result.error === "no browser renderer is connected" ? null : result;
+      }, "remote session browser relay");
       assert.equal(denied.ok, false, JSON.stringify(denied));
       assert.match(denied.error, /blocked/i);
     } finally {
