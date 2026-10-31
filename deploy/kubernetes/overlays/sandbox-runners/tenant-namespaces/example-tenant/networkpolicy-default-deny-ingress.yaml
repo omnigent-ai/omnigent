@@ -1,0 +1,13 @@
+---
+# No Pod in the tenant namespace accepts ingress, so a runner can never reach
+# another tenant's runner. Egress stays open: the host must dial the server.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: omnigent-u-alice
+  labels:
+    omnigent.ai/tenant: alice
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
