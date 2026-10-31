@@ -27,10 +27,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import {
-  ProjectAppearanceButton,
-  useRecommendedProjectColor,
-} from "@/components/ProjectIconPicker";
+import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
 import { useCreateProject, useProjects } from "@/hooks/useConversations";
 import { useCloneHostRepository, useCreateHostDirectory } from "@/hooks/useHostFilesystem";
 import type { Host } from "@/hooks/useHosts";
@@ -181,6 +178,8 @@ function friendlyCloneError(error: unknown): string {
 
 const NO_COMMANDS: PaletteCommand[] = [];
 
+const UNMARKED: ProjectAppearance = { icon: null, color: null };
+
 /**
  * "New project" control in the Projects group header. Opens a dialog that
  * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
@@ -208,13 +207,8 @@ export function NewProjectButton({
 }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
-  // The picked mark; null until the user picks, so the recommended color stays
-  // live (it can change as the project list loads).
-  const [picked, setPicked] = useState<ProjectAppearance | null>(null);
-  const recommendedColor = useRecommendedProjectColor();
-  // Until the recommendation loads nothing is checked; creating then leaves
-  // the color to the server, which picks the same recommendation.
-  const appearance = picked ?? { icon: null, color: recommendedColor ?? null };
+  // With nothing picked, the server assigns the least-used color on create.
+  const [appearance, setAppearance] = useState<ProjectAppearance>(UNMARKED);
   // Where the project runs: a host id, or a sandbox choice (see sandboxHostChoice).
   const [runOn, setRunOn] = useState<string | null>(null);
   // A host the user picked, as opposed to the default: only a pick is saved for a name-only project.
@@ -404,7 +398,7 @@ export function NewProjectButton({
           submissionGeneration.current += 1;
           setOpen(false);
           setName("");
-          setPicked(null);
+          setAppearance(UNMARKED);
           setRunOn(null);
           runOnPicked.current = false;
           setSourceMode("folder");
@@ -439,7 +433,7 @@ export function NewProjectButton({
   const openDialog = () => {
     submissionGeneration.current += 1;
     setName("");
-    setPicked(null);
+    setAppearance(UNMARKED);
     setRunOn(hostId);
     runOnPicked.current = false;
     setSourceMode("folder");
@@ -511,7 +505,7 @@ export function NewProjectButton({
           <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
             <ProjectAppearanceButton
               value={appearance}
-              onChange={setPicked}
+              onChange={setAppearance}
               testId="new-project-icon"
             />
             <input
