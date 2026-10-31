@@ -27,6 +27,7 @@ import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversatio
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
+import { cn } from "@/lib/utils";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
@@ -57,20 +58,28 @@ function Field({
   label,
   hint,
   htmlFor,
+  stacked = false,
   children,
 }: {
   label: string;
   hint?: string;
   htmlFor?: string;
+  /** Put the control full width under its label, e.g. for a script editor. */
+  stacked?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+    <div
+      className={cn(
+        "flex flex-col gap-1.5",
+        !stacked && "sm:flex-row sm:items-start sm:justify-between sm:gap-4",
+      )}
+    >
       <label htmlFor={htmlFor} className="flex flex-col pt-1.5">
         <span className="font-medium text-ui">{label}</span>
         {hint && <span className="text-muted-foreground text-sm">{hint}</span>}
       </label>
-      <div className="sm:w-64">{children}</div>
+      <div className={stacked ? undefined : "sm:w-64"}>{children}</div>
     </div>
   );
 }
@@ -419,7 +428,8 @@ export function ProjectSettingsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         onClick={(e) => e.stopPropagation()}
-        className="sm:max-w-lg"
+        // Scrolls when tall (e.g. long scripts), so Save stays reachable.
+        className="max-h-[85vh] overflow-y-auto sm:max-w-lg"
         // Keep a nested dropdown's dismiss (pick an option, or click the modal
         // body while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.
@@ -700,11 +710,13 @@ export function ProjectSettingsDialog({
             label="Environment commands"
             hint="Shell script run before every session starts; the environment it sets reaches the agent (e.g. conda activate)."
             htmlFor="project-settings-env-commands"
+            stacked
           >
             <Textarea
               id="project-settings-env-commands"
               data-testid="project-settings-env-commands"
-              className="font-mono"
+              className="max-h-64 font-mono whitespace-pre"
+              spellCheck={false}
               placeholder="conda activate my-env"
               value={envCommands}
               onChange={(e) => setEnvCommands(e.target.value)}
@@ -716,11 +728,13 @@ export function ProjectSettingsDialog({
             label="Worktree setup"
             hint="Shell script run once per new git worktree (e.g. installs); stops at the first failing command. $OMNIGENT_ROOT_PATH is the main checkout."
             htmlFor="project-settings-setup-commands"
+            stacked
           >
             <Textarea
               id="project-settings-setup-commands"
               data-testid="project-settings-setup-commands"
-              className="font-mono"
+              className="max-h-64 font-mono whitespace-pre"
+              spellCheck={false}
               placeholder={'cp "$OMNIGENT_ROOT_PATH/.env" .env\nnpm ci'}
               value={setupCommands}
               onChange={(e) => setSetupCommands(e.target.value)}

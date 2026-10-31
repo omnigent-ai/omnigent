@@ -515,6 +515,9 @@ Other connection providers alone do not enable the managed MCP picker.
   line, and parallel-setup cases in `web/src/shell/ProjectSettingsDialog.test.tsx`;
   `tests/e2e/test_host_project_setup_e2e.py::test_project_setup_applies_to_a_real_host_session`
   runs both scripts on a real host.
+  `tests/e2e_ui/sessions/test_project_setup_ui.py` drives the dialog, the
+  notice headlines, the log and a re-run in the browser, with two sessions
+  sharing one setup run.
 - **`project-setup`, Re-run setup / View setup log:** notice-code, owner and
   error cases in `web/src/components/blocks/StatusBlocks.test.tsx`; server and
   host paths in

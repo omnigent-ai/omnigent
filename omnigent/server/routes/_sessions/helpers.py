@@ -6269,6 +6269,7 @@ async def _append_launch_notice(
     code: str,
     message: str,
     level: Literal["error", "info"],
+    title: str | None = None,
 ) -> None:
     """
     Persist and publish a transcript notice about a runner launch.
@@ -6281,12 +6282,16 @@ async def _append_launch_notice(
     :param code: Notice code, e.g. ``"workspace_recreated"``.
     :param message: User-facing text.
     :param level: ``"info"`` for a heads-up, ``"error"`` for something that failed.
+    :param title: Short headline shown collapsed, e.g. ``"Project setup failed"``;
+        the message is shown when expanded.
     """
     try:
         item = NewConversationItem(
             type="error",
             response_id=generate_task_id(),
-            data=ErrorData(source="execution", code=code, message=message, level=level),
+            data=ErrorData(
+                source="execution", code=code, message=message, level=level, title=title
+            ),
         )
         persisted = await asyncio.to_thread(conversation_store.append, conv.id, [item])
     except Exception:  # noqa: BLE001
@@ -6352,6 +6357,7 @@ async def note_launch_project_setup(
             conv,
             conversation_store,
             code=PROJECT_SETUP_UNSUPPORTED_NOTICE_CODE,
+            title="Host too old for project setup",
             message=(
                 "This session's project has setup commands, but its host is too old "
                 "to run them. Update Omnigent on the host to apply them."
@@ -6368,6 +6374,7 @@ async def note_launch_project_setup(
                 conv,
                 conversation_store,
                 code=PROJECT_ENV_FAILED_NOTICE_CODE,
+                title="Project env commands failed",
                 message=f"Project env commands did not apply: {warning}",
                 level="error",
             )
@@ -6401,6 +6408,7 @@ async def note_project_setup_running(
         conv,
         conversation_store,
         code=PROJECT_SETUP_RUNNING_NOTICE_CODE,
+        title="Project setup running",
         message=message,
         level="info",
     )
@@ -6427,6 +6435,7 @@ async def note_project_setup_finished(
             conv,
             conversation_store,
             code=PROJECT_SETUP_FINISHED_NOTICE_CODE,
+            title="Project setup finished",
             message=f"Project setup commands finished.{log_hint}",
             level="info",
         )
@@ -6435,6 +6444,7 @@ async def note_project_setup_finished(
         conv,
         conversation_store,
         code=PROJECT_SETUP_FAILED_NOTICE_CODE,
+        title="Project setup failed",
         message=f"Project setup failed: {warning}{log_hint}",
         level="error",
     )
