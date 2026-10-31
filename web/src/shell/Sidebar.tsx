@@ -5406,7 +5406,7 @@ function ConversationRowImpl({
       }}
       className={cn(
         "group relative",
-        familyIndented && "ml-5",
+        familyIndented && "ml-9",
         familyExpanded !== undefined && "pl-4",
         isDragging && "opacity-40",
       )}
