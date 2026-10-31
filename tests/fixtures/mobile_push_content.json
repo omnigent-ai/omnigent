@@ -1,0 +1,7 @@
+[
+  {"input": {"kind": "completed", "title": "Build app", "reason": null, "preview": null}, "output": ["Build app", "Agent finished and is ready for your input."]},
+  {"input": {"kind": "needs_input", "title": "", "reason": null, "preview": null}, "output": ["New session", "Agent is asking for your input."]},
+  {"input": {"kind": "failed", "title": "Build app", "reason": null, "preview": null}, "output": ["Build app", "Agent stopped with an error."]},
+  {"input": {"kind": "failed", "title": "Build app", "reason": "Runner unavailable", "preview": null}, "output": ["Build app", "Agent stopped with an error: Runner unavailable"]},
+  {"input": {"kind": "completed", "title": "Build app", "reason": null, "preview": "All done"}, "output": ["Build app", "Agent finished and is ready for your input.\nAll done"]}
+]
