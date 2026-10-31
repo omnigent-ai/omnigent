@@ -21,6 +21,7 @@ from omnigent.skills.catalog import MARKETPLACE_MANIFEST, CatalogEntry, index_ch
 from omnigent.skills.git_source import (
     GitSourceError,
     SparseCheckout,
+    check_ref,
     checkout_commit,
     clone_github_source,
     directory_pattern,
@@ -138,6 +139,7 @@ def resolve_source(
             "Only GitHub repositories are supported: use owner/repo, host/owner/repo, "
             "a github.com URL, or a URL on a GitHub Enterprise host this server knows."
         )
+    check_ref(ref or parsed.ref)
     return ResolvedSource(
         url=parsed.clone_url,
         ref=ref or parsed.ref,

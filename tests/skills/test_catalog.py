@@ -235,3 +235,14 @@ def test_a_link_to_a_skills_folder_lists_its_skills_and_an_empty_catalog_says_wh
     skipped: list[str] = []
     assert index_checkout(repo / "docs", skipped=skipped, prefix="docs") == []
     assert skipped and skipped[-1].startswith("no skills found under docs")
+
+
+def test_a_skill_under_a_line_break_is_listed_as_skipped(tmp_path: Path) -> None:
+    from tests._helpers.skill_repos import write_skill
+
+    repo = tmp_path / "repo"
+    write_skill(repo / "skills" / "team\nwide", "review", "Review")
+    write_skill(repo / "skills", "lint", "Lint")
+    skipped: list[str] = []
+    assert [e.name for e in index_checkout(repo, skipped=skipped)] == ["lint"]
+    assert any("line break" in note for note in skipped)
