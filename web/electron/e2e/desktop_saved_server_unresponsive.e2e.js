@@ -29,6 +29,16 @@ async function shellState(electronApp) {
   });
 }
 
+async function pageAt(electronApp, url) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const page = electronApp.windows().find((candidate) => candidate.url() === url);
+    if (page || Date.now() > deadline) return page;
+    // oxlint-disable-next-line no-await-in-loop -- Playwright sees the navigation after the main process
+    await sleep(100);
+  }
+}
+
 it(
   "leaves the loading screen when the saved server accepts connections but never answers",
   {
@@ -47,35 +57,41 @@ it(
     });
     const serverUrl = `http://127.0.0.1:${hungServer.address().port}`;
 
-    const { electronApp, userDataDir, stopDisplayCapture } = await launchDesktop({
-      recordDir,
-      serverUrl,
-      waitForShell: false,
-    });
     let state;
     try {
-      const deadline = Date.now() + LEAVE_LOADING_WITHIN_MS;
-      for (;;) {
-        // oxlint-disable-next-line no-await-in-loop -- poll the shell until it settles
-        state = await shellState(electronApp);
-        if (state.shellUrl && !state.loadingIndicatorVisible) break;
-        if (Date.now() > deadline) break;
-        // oxlint-disable-next-line no-await-in-loop -- poll interval
-        await sleep(500);
-      }
-      if (state.shellUrl && !state.loadingIndicatorVisible) {
-        const shell = electronApp.windows().find((page) => page.url() === state.shellUrl);
-        await shell.getByText("ERR_TIMED_OUT (-7)").waitFor({ state: "visible", timeout: 10_000 });
-        // Keep the outcome on screen for the recording.
-        await sleep(2_000);
+      const { electronApp, userDataDir, stopDisplayCapture } = await launchDesktop({
+        recordDir,
+        serverUrl,
+        waitForShell: false,
+      });
+      try {
+        const deadline = Date.now() + LEAVE_LOADING_WITHIN_MS;
+        for (;;) {
+          // oxlint-disable-next-line no-await-in-loop -- poll the shell until it settles
+          state = await shellState(electronApp);
+          if (state.shellUrl && !state.loadingIndicatorVisible) break;
+          if (Date.now() > deadline) break;
+          // oxlint-disable-next-line no-await-in-loop -- poll interval
+          await sleep(500);
+        }
+        if (state.shellUrl && !state.loadingIndicatorVisible) {
+          const shell = await pageAt(electronApp, state.shellUrl);
+          assert.ok(shell, `no Playwright page for ${state.shellUrl}`);
+          await shell
+            .getByText("ERR_TIMED_OUT (-7)")
+            .waitFor({ state: "visible", timeout: 10_000 });
+          // Keep the outcome on screen for the recording.
+          await sleep(2_000);
+        }
+      } finally {
+        await electronApp.close();
+        await stopDisplayCapture();
+        saveRecording(recordDir, "saved-server-unresponsive");
+        fs.rmSync(userDataDir, { recursive: true, force: true });
       }
     } finally {
-      await electronApp.close();
-      await stopDisplayCapture();
-      saveRecording(recordDir, "saved-server-unresponsive");
       for (const socket of sockets) socket.destroy();
       hungServer.close();
-      fs.rmSync(userDataDir, { recursive: true, force: true });
     }
     assert.ok(
       state.shellUrl && !state.loadingIndicatorVisible,

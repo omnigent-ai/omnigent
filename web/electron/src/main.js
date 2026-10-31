@@ -2341,7 +2341,12 @@ function loadServerDocument(win, target, current) {
   const committed = () => clearTimeout(timer);
   const timedOut = new Promise((_resolve, reject) => {
     timer = setTimeout(() => {
-      if (!current()) return;
+      if (!current()) {
+        // Stop the stale load so a late response can't commit under the newer attempt.
+        reject(Object.assign(new Error("Connection superseded"), { name: "AbortError" }));
+        if (!win.isDestroyed()) contents.stop();
+        return;
+      }
       const message = `ERR_TIMED_OUT (${ERR_TIMED_OUT}) loading '${target}'`;
       reject(Object.assign(new Error(message), { code: "ERR_TIMED_OUT", errno: ERR_TIMED_OUT }));
       contents.stop();

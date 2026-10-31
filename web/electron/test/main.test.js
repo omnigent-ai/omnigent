@@ -5012,6 +5012,25 @@ describe("server response deadline (src/main.js)", () => {
     assert.equal(await pending, server);
     assert.equal(h.calls.loading.at(-1).action, "hide");
   });
+
+  it("stops a superseded load at its deadline without returning to setup", async (t) => {
+    let stalled;
+    const reachedLoad = new Promise((resolve) => {
+      stalled = resolve;
+    });
+    const h = stalledHarness(t, () => {
+      stalled();
+      return new Promise(() => {});
+    });
+    const pending = h.api.loadServerUrl(h.win, server);
+    await reachedLoad;
+    // A newer attempt that has not navigated yet, e.g. still signing in.
+    h.api.pinWindow(h.win, "https://other.example");
+    await assert.rejects(pending, { name: "AbortError" });
+    assert.equal(h.stops, 1);
+    await wait(0);
+    assert.deepEqual(h.calls.loadFile, []);
+  });
 });
 
 describe("OIDC system-browser sign-in wiring", () => {
