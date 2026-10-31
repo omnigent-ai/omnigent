@@ -35,21 +35,27 @@ def _openshell_config() -> dict:
 
 def test_host_image_venv_is_writable_by_openshell_sandbox_user() -> None:
     """OpenShell execs run as ``sandbox`` and pip-install Omnigent wheels into /opt/venv."""
-    instructions = _stage_instructions("host")
-    venv_writes = [
-        index
-        for index, line in enumerate(instructions)
-        if re.match(r"COPY\b.*\s/opt/venv$", line) or re.match(r"RUN\b.*\bpip install\b", line)
-    ]
-    ownership_grants = [
-        index
-        for index, line in enumerate(instructions)
-        if re.match(r"COPY\b.*--chown=(sandbox|1000660000)\b.*\s/opt/venv$", line)
-        or re.match(r"RUN\b.*\bchown\b.*\b(sandbox|1000660000)\b.*\s/opt/venv\b", line)
-    ]
+    venv_writes: list[tuple[int, int]] = []
+    ownership_grants: list[tuple[int, int]] = []
+    # (instruction, offset) positions, so a chown chained before pip install does not count.
+    for index, line in enumerate(_stage_instructions("host")):
+        if re.match(r"COPY\b.*\s/opt/venv$", line):
+            venv_writes.append((index, 0))
+            if re.match(r"COPY\b.*--chown=(sandbox|1000660000)\b", line):
+                ownership_grants.append((index, 0))
+        elif re.match(r"RUN\b", line):
+            venv_writes += [
+                (index, match.start()) for match in re.finditer(r"\bpip install\b", line)
+            ]
+            ownership_grants += [
+                (index, match.start())
+                for match in re.finditer(
+                    r"\bchown\b[^&;|]*\b(sandbox|1000660000)\b[^&;|]*\s/opt/venv\b", line
+                )
+            ]
 
     assert venv_writes
-    assert ownership_grants and ownership_grants[-1] >= venv_writes[-1]
+    assert ownership_grants and max(ownership_grants) >= max(venv_writes)
 
 
 def _server_sdk_config_home(container: dict) -> str:

@@ -367,6 +367,7 @@ def test_proxy_dial_shares_one_budget_across_addresses(monkeypatch):
     from omnigent.util import ws_proxy
 
     addresses = [("192.0.2.1", 3128), ("192.0.2.2", 3128), ("192.0.2.3", 3128)]
+    clock = [100.0]
     attempts = []
     opened = []
 
@@ -382,9 +383,9 @@ def test_proxy_dial_shares_one_budget_across_addresses(monkeypatch):
         def connect(self, address):
             attempts.append((address, self.timeout))
             if address == addresses[0]:
-                time.sleep(0.1)
+                clock[0] += 1.0
                 raise ConnectionRefusedError("refused by test proxy")
-            time.sleep(self.timeout)
+            clock[0] += self.timeout
             raise TimeoutError("timed out")
 
         def close(self):
@@ -396,12 +397,11 @@ def test_proxy_dial_shares_one_budget_across_addresses(monkeypatch):
     ]
     patched_socket.socket = FakeSocket
     monkeypatch.setattr(ws_proxy, "socket", patched_socket)
-    started = time.monotonic()
+    monkeypatch.setattr(ws_proxy, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
     with pytest.raises(TimeoutError):
-        ws_proxy._connect_sync("proxy.test", 3128, _TLS_HOST, 8000, None, 0.3)
-    assert time.monotonic() - started < 0.6
-    assert [address for address, _timeout in attempts] == addresses[:2]
-    assert attempts[1][1] < 0.25
+        ws_proxy._connect_sync("proxy.test", 3128, _TLS_HOST, 8000, None, 3.0)
+    assert attempts == [(addresses[0], 3.0), (addresses[1], 2.0)]
+    assert clock[0] == 103.0
     assert all(sock.closed for sock in opened)
 
 
