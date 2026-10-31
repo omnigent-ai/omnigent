@@ -3067,6 +3067,50 @@ async def test_events_model_change_fails_and_logs_when_the_prompt_never_renders(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("launch_model", "expected_status"),
+    [
+        ("claude-opus-4-7", 204),
+        ("CLAUDE-OPUS-4-7", 204),
+        ("claude-opus-4-7[1m]", 503),
+        ("claude-sonnet-4-6", 503),
+        (None, 503),
+    ],
+    ids=["same", "same-other-case", "long-context-variant", "other-model", "unrecorded"],
+)
+async def test_events_model_change_on_a_pane_booting_on_the_pick_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    launch_model: str | None,
+    expected_status: int,
+) -> None:
+    """A pane that is still booting on the picked model needs no ``/model``.
+
+    Its input box never rendered, so the launch pin is the model it comes up
+    on; only a pane launched on another model fails the switch.
+    """
+    typed: list[str] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        raise claude_native_bridge.ClaudePromptTimeout(
+            "Claude Code terminal did not become ready within 9.0s"
+        )
+
+    monkeypatch.setattr(
+        claude_native_bridge, "read_launch_model", lambda _bridge_dir: launch_model
+    )
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=lambda _bridge_dir, *, command, **_kwargs: typed.append(command),
+        status=lambda _bridge_dir: None,
+    )
+
+    assert resp.status_code == expected_status, resp.text
+    assert typed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "event",
     [{"type": "effort_change", "effort": "high"}, {"type": "compact"}],
     ids=["effort_change", "compact"],

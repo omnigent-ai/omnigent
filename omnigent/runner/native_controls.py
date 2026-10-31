@@ -1326,6 +1326,7 @@ def build_native_controls(
             confirm_dialog_if_open,
             inject_slash_command,
             read_claude_status_model,
+            read_launch_model,
             read_model_env,
             read_model_picker_values,
             wait_for_input_ready,
@@ -1452,6 +1453,18 @@ def build_native_controls(
             ),
         )
         if wait_error is not None:
+            # A pane still booting on the picked model needs no ``/model``: its
+            # input box never rendered, so nothing moved it off the launch pin.
+            launch_model = await asyncio.to_thread(read_launch_model, bridge_dir)
+            if (
+                isinstance(wait_error, ClaudePromptTimeout)
+                and launch_model
+                and launch_model.lower()
+                in {
+                    value.lower() for value in (selected_model, resolved_model, model_arg) if value
+                }
+            ):
+                return Response(status_code=204)
             return _model_failed(wait_error)
         baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
         # Verify against the statusLine snapshot the forwarder already polls:
