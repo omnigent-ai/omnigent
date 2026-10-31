@@ -144,53 +144,33 @@ async def test_rename_missing_project_404(project_client: httpx.AsyncClient) -> 
     assert resp.status_code == 404
 
 
-async def test_create_without_config_assigns_a_color(project_client: httpx.AsyncClient) -> None:
-    """A project created without a config field gets only an auto-assigned color."""
-    body = (await project_client.post("/v1/projects", json={"name": "P"})).json()
-    assert body["config"] == {"color": "omni"}
-
-
-async def test_create_assigns_distinct_colors_but_not_beside_an_emoji_or_color(
+async def test_create_assigns_the_recommended_color_unless_marked(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """Auto-assigned colors avoid used ones; an emoji or color skips assignment."""
+    """Unmarked projects get the recommended (least-used) color; an emoji or color is kept."""
     first = (await project_client.post("/v1/projects", json={"name": "A"})).json()
+    recommended = (await project_client.get("/v1/projects/recommended-color")).json()["color"]
     second = (await project_client.post("/v1/projects", json={"name": "B"})).json()
-    emoji = (
-        await project_client.post("/v1/projects", json={"name": "E", "config": {"icon": "🔥"}})
-    ).json()
-    picked = (
-        await project_client.post("/v1/projects", json={"name": "C", "config": {"color": "nord"}})
-    ).json()
-    assert first["config"]["color"] != second["config"]["color"]
-    assert emoji["config"] == {"icon": "🔥"}
-    assert picked["config"] == {"color": "nord"}
-
-
-async def test_recommended_color_excludes_the_given_project(
-    project_client: httpx.AsyncClient,
-) -> None:
-    """The recommendation avoids used colors, ignoring an excluded project's own."""
-    only = (await project_client.post("/v1/projects", json={"name": "A"})).json()
-    resp = await project_client.get("/v1/projects/recommended-color")
-    assert resp.status_code == 200
-    assert resp.json()["color"] != only["config"]["color"]
-    excluded = await project_client.get(
-        "/v1/projects/recommended-color", params={"exclude_project_id": only["id"]}
-    )
-    assert excluded.json() == {"color": only["config"]["color"]}
+    emoji = await project_client.post("/v1/projects", json={"name": "E", "config": {"icon": "🔥"}})
+    assert first["config"] == {"color": "omni"}
+    assert second["config"] == {"color": recommended} == {"color": "dracula"}
+    assert emoji.json()["config"] == {"icon": "🔥"}
 
 
 async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClient) -> None:
     """A config passed on create round-trips through the create + get responses."""
-    cfg = {"host_id": "host_abc", "workspace": "/work/repo", "model": "claude-opus-4-8"}
+    cfg = {
+        "host_id": "host_abc",
+        "workspace": "/work/repo",
+        "model": "claude-opus-4-8",
+        "color": "nord",
+    }
     created = (
         await project_client.post("/v1/projects", json={"name": "Configured", "config": cfg})
     ).json()
-    # The server adds a color, since the config carries neither emoji nor color.
-    assert created["config"] == {**cfg, "color": "omni"}
+    assert created["config"] == cfg
     fetched = (await project_client.get(f"/v1/projects/{created['id']}")).json()
-    assert fetched["config"] == {**cfg, "color": "omni"}
+    assert fetched["config"] == cfg
 
 
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:

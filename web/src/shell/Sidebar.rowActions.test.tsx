@@ -353,16 +353,20 @@ describe("quick pin/unpin hover button", () => {
     }
   });
 
-  it("preselects the server's recommended color in the new-project dialog", async () => {
+  it("preselects the server's recommended color behind the new-project icon", async () => {
     renderSidebar();
     fireEvent.click(screen.getByTestId("new-project"));
-
+    // The picker is not shown until the icon beside the name is clicked.
+    expect(screen.queryByRole("radio")).toBeNull();
+    // Let the recommendation load first, so the tile previews the chosen color.
     await waitFor(() =>
-      expect(screen.getByRole("radio", { name: "Nord" })).toHaveAttribute("aria-checked", "true"),
+      expect(screen.getByTestId("new-project-icon").querySelector("svg")).toHaveStyle({
+        color: "#5e81ac",
+      }),
     );
-    expect(screen.getByTestId("project-appearance-caption")).toHaveTextContent(
-      "Nord (recommended)",
-    );
+
+    fireEvent.click(screen.getByTestId("new-project-icon"));
+    expect(screen.getByRole("radio", { name: "Nord" })).toHaveAttribute("aria-checked", "true");
   });
 
   it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {

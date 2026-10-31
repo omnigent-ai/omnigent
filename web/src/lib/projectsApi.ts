@@ -120,16 +120,10 @@ export async function createProject(name: string, config?: ProjectConfig): Promi
 
 /**
  * The color the server would auto-assign to a new project: the one most
- * different from the caller's other projects' colors. `excludeProjectId`
- * leaves that project's own color out, to recommend a replacement for it.
+ * different from the caller's projects' colors.
  */
-export async function getRecommendedProjectColor(
-  excludeProjectId?: string | null,
-): Promise<string> {
-  const query = excludeProjectId
-    ? `?exclude_project_id=${encodeURIComponent(excludeProjectId)}`
-    : "";
-  const res = await authenticatedFetch(`/v1/projects/recommended-color${query}`);
+export async function getRecommendedProjectColor(): Promise<string> {
+  const res = await authenticatedFetch("/v1/projects/recommended-color");
   if (!res.ok) throw new Error(await readError(res));
   return ((await res.json()) as { color: string }).color;
 }

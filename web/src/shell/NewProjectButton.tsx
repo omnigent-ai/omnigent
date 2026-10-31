@@ -11,8 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
-  ProjectAppearancePicker,
-  ProjectAppearanceTile,
+  ProjectAppearanceButton,
   useRecommendedProjectColor,
 } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
@@ -87,10 +86,15 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
               Create an empty project, then file sessions into it from a session's menu.
             </DialogDescription>
           </DialogHeader>
-          {/* One combined control: the mark preview (left) + name (right) share
-              a single border, so it reads as a single input. */}
+          {/* One combined control: the mark tile (left) + name (right) share a
+              single border, so it reads as a single input. The tile opens the
+              color / emoji picker. */}
           <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-            <ProjectAppearanceTile appearance={appearance} size="sm" />
+            <ProjectAppearanceButton
+              value={appearance}
+              onChange={setPicked}
+              testId="new-project-icon"
+            />
             <input
               autoFocus
               className="w-full bg-transparent px-3 py-2 text-ui outline-none"
@@ -105,7 +109,6 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
               }}
             />
           </div>
-          <ProjectAppearancePicker value={appearance} onChange={setPicked} />
           {createProject.isError && (
             <p className="text-ui text-destructive" role="alert">
               {(createProject.error as Error).message}

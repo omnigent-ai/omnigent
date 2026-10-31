@@ -5381,7 +5381,7 @@
         "description": "The color a new project would be auto-assigned.",
         "properties": {
           "color": {
-            "description": "A web theme palette id, the one most different from the colors the caller's other projects use.",
+            "description": "A web theme palette id, the one the caller's projects use least.",
             "title": "Color",
             "type": "string"
           }
@@ -13581,7 +13581,7 @@
         ]
       },
       "post": {
-        "description": "Create a new, empty project owned by the caller.\n\nA project created with neither an emoji nor a color is assigned the\ncolor most different from the caller's other projects' colors.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
+        "description": "Create a new, empty project owned by the caller.\n\nA project created with neither an emoji nor a color is assigned the\npalette color the caller's projects use least.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
         "operationId": "create_project_v1_projects_post",
         "requestBody": {
           "content": {
@@ -13687,27 +13687,8 @@
     },
     "/v1/projects/recommended-color": {
       "get": {
-        "description": "Recommend a color for a new project, or a replacement for one.\n\n**Returns:** The recommended palette id.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
+        "description": "Recommend the color a new project would be auto-assigned.\n\n**Returns:** The recommended palette id.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
         "operationId": "get_recommended_project_color_v1_projects_recommended_color_get",
-        "parameters": [
-          {
-            "description": "A project whose own color is left out, when recommending a replacement for it.",
-            "in": "query",
-            "name": "exclude_project_id",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Exclude Project Id"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -13718,16 +13699,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Get Recommended Project Color",
