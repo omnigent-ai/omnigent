@@ -348,13 +348,15 @@ describe("quick pin/unpin hover button", () => {
     }
   });
 
-  it("tints the new-project icon selector with the active theme accent", () => {
+  it("opens the new-project picker from the icon, with nothing preselected", () => {
     renderSidebar();
     fireEvent.click(screen.getByTestId("new-project"));
+    expect(screen.queryByRole("radio")).toBeNull();
 
-    const iconSelector = screen.getByTestId("new-project-icon");
-    expect(iconSelector).toHaveClass("bg-primary/10");
-    expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
+    fireEvent.click(screen.getByTestId("new-project-icon"));
+    const radios = screen.getAllByRole("radio");
+    expect(radios.length).toBeGreaterThan(0);
+    for (const radio of radios) expect(radio).toHaveAttribute("aria-checked", "false");
   });
 
   it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
