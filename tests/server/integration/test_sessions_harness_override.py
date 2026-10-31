@@ -117,10 +117,13 @@ async def test_create_with_harness_override_persists_and_snapshot_reflects(
         "GET snapshot lost the harness override — the column did not "
         "persist or _resolve_harness stopped preferring it."
     )
+    listed = (await client.get("/v1/sessions")).json()["data"]
+    assert next(item for item in listed if item["id"] == body["id"])["harness"] == override
 
 
 async def test_create_without_harness_override_reports_spec_default(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No override → the snapshot reports the spec's declared harness.
 
@@ -135,6 +138,32 @@ async def test_create_without_harness_override_reports_spec_default(
     assert resp.status_code == 201, resp.text
     # The test bundle declares claude-sdk (see build_agent_bundle).
     assert resp.json().get("harness") == "claude-sdk"
+    override = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "initial_items": [], "harness_override": "pi"},
+    )
+    assert override.status_code == 201, override.text
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    def reject_single_agent_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("The session list must batch its agent metadata reads")
+
+    monkeypatch.setattr(SqlAlchemyAgentStore, "get", reject_single_agent_read)
+    listed = (await client.get("/v1/sessions")).json()["data"]
+    assert next(item for item in listed if item["id"] == resp.json()["id"])["harness"] == (
+        "claude-sdk"
+    )
+
+    def unavailable_bundle(*args: object, **kwargs: object) -> None:
+        raise httpx.ConnectError("Artifact service unavailable")
+
+    monkeypatch.setattr(AgentCache, "load", unavailable_bundle)
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200
+    listed_by_id = {item["id"]: item for item in response.json()["data"]}
+    assert "harness" not in listed_by_id[resp.json()["id"]]
+    assert listed_by_id[override.json()["id"]]["harness"] == "pi"
 
 
 async def test_create_harness_override_alias_canonicalizes(

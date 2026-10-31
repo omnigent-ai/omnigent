@@ -27,6 +27,11 @@ const {
 
 const DEFAULT_CAP = 10;
 
+// Map WebSocket handshakes onto the HTTP URL rules.
+function httpUrlForWebSocket(url) {
+  return url.replace(/^ws(s?):/, "http$1:");
+}
+
 /**
  * Storage partition shared by one conversation's browser views. Without an
  * explicit partition, Electron places the view on
@@ -81,7 +86,7 @@ function createBrowserViewRegistry({
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
-  isArcaAgentContext = () => false,
+  allowsLocalhost: contextAllowsLocalhost = () => false,
   // (hostname, partition) => Promise<string[]> for the agent DNS check, and
   // (url, partition) => Promise<string> ("DIRECT" or a PAC-style proxy list).
   resolveHost = lookupHostAddresses,
@@ -98,6 +103,35 @@ function createBrowserViewRegistry({
     const generation = Symbol();
     pendingNavigations.set(conversationId, generation);
     return () => pendingNavigations.get(conversationId) === generation;
+  }
+  const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
+
+  function needsAgentViewRevocation(entry, nextContext) {
+    const context = entry?.agentContext;
+    return (
+      context?.hostIsThisMachine === true &&
+      (context.revoked ||
+        !nextContext?.hostIsThisMachine ||
+        nextContext.sourceHostId !== context.sourceHostId)
+    );
+  }
+
+  async function revokeAgentView(conversationId, isCurrent = beginAgentNavigation(conversationId)) {
+    const entry = get(conversationId);
+    const context = entry?.agentContext;
+    if (!context) return { ok: true };
+    context.revoked = true;
+    try {
+      await entry.view.webContents.loadURL("about:blank");
+      if (!isCurrent() || get(conversationId) !== entry || entry.agentContext !== context) {
+        return { ok: false, error: "navigation superseded or closed" };
+      }
+      entry.agentContext = null;
+      entry.lastRequestedUrl = "about:blank";
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Unable to clear the previous browser page" };
+    }
   }
   let activeConversationId = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
@@ -218,7 +252,7 @@ function createBrowserViewRegistry({
       }
       if (entry.agentNavLocked) {
         const verdict = isAgentNavigationAllowed(url, {
-          allowLocalhost: isArcaAgentContext(entry.agentContext),
+          allowLocalhost: allowsLocalhost(entry.agentContext),
         });
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
@@ -285,7 +319,7 @@ function createBrowserViewRegistry({
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
       const verdict = isAgentNavigationAllowed(targetUrl, {
-        allowLocalhost: isArcaAgentContext(entry.agentContext),
+        allowLocalhost: allowsLocalhost(entry.agentContext),
       });
       if (!verdict.ok) {
         try {
@@ -385,54 +419,79 @@ function createBrowserViewRegistry({
     });
   }
 
-  // DNS-aware check for an agent's first hop. openOrNavigate stays synchronous
-  // (literal checks only), so browserIpc awaits this before it: a name that
-  // resolves internally fails with an error instead of creating a blank view.
-  function checkAgentNavigationFor(conversationId, url, agentContext) {
-    const partition = agentPartition(partitionScope, conversationId);
+  function checkAgentNavigationWithPolicy(url, { allowLocalhost, partition }) {
     return checkAgentNavigation(url, {
-      allowLocalhost: isArcaAgentContext(agentContext),
+      allowLocalhost,
       resolveHost: (hostname) => resolveHost(hostname, partition),
     });
   }
 
-  function agentLockedEntryFor(webContentsId) {
+  // The IPC first hop uses the same partition resolver as network preflight.
+  function checkAgentNavigationFor(conversationId, url, agentContext) {
+    return checkAgentNavigationWithPolicy(url, {
+      allowLocalhost: allowsLocalhost(agentContext),
+      partition: agentPartition(partitionScope, conversationId),
+    });
+  }
+
+  function entryForWebContents(webContentsId) {
     for (const entry of entries.values()) {
-      let id;
       try {
-        id = entry.view.webContents.id;
+        if (entry.view.webContents.id === webContentsId) return entry;
       } catch {
         continue; // destroyed
       }
-      if (id === webContentsId) return entry.agentNavLocked ? entry : null;
     }
     return null;
   }
 
-  // SECURITY (SSRF): network-layer half of the agent guard, wired by main.js
-  // to webRequest.onBeforeRequest for document requests on these views'
-  // partitions. Resolves true to cancel. Unlike the will-* guards it sees every
-  // hop — redirects, window-open loads, history navigations — and can wait on
-  // DNS, so a public name pointing at an internal address is refused too.
-  async function shouldCancelAgentRequest({ webContentsId, url }) {
-    const entry = agentLockedEntryFor(webContentsId);
-    if (!entry) return false; // user-driven or unattributed: permissive
-    const verdict = await checkAgentNavigationFor(entry.conversationId, url, entry.agentContext);
+  function requestPolicyFor(webContentsId, partition) {
+    const entry = entryForWebContents(webContentsId);
+    if (entry) {
+      return entry.agentNavLocked
+        ? {
+            allowLocalhost: allowsLocalhost(entry.agentContext),
+            conversationId: entry.conversationId,
+            partition: partition ?? agentPartition(partitionScope, entry.conversationId),
+          }
+        : null;
+    }
+    if (!partition) return null;
+    // Workers may lack a registered view. Every partition owner must grant
+    // loopback; orphaned workers and partitions with blank tabs are public-only.
+    const owners = [...entries.values()].filter(
+      (owner) => agentPartition(partitionScope, owner.conversationId) === partition,
+    );
+    return {
+      allowLocalhost:
+        owners.length > 0 &&
+        owners.every((owner) => owner.agentNavLocked && allowsLocalhost(owner.agentContext)),
+      partition,
+    };
+  }
+
+  // Resolve named hosts in the owning partition before any request is sent.
+  // IP literals and eligible exact-loopback hosts need only the URL check.
+  async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+    const policy = requestPolicyFor(webContentsId, partition);
+    if (!policy) return false;
+    const policyUrl = httpUrlForWebSocket(url);
+    const verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
     if (verdict.ok) return false;
-    sendToRenderer("browser-nav-blocked", {
-      conversationId: entry.conversationId,
-      url,
-      error: verdict.error,
-    });
+    if (policy.conversationId) {
+      sendToRenderer("browser-nav-blocked", {
+        conversationId: policy.conversationId,
+        url,
+        error: verdict.error,
+      });
+    }
     return true;
   }
 
-  // Wired to webRequest.onBeforeSendHeaders. A pure HTTP-cache hit reports no
-  // connected address (Chromium's HttpCache::Transaction::GetRemoteEndpoint),
-  // so agent documents skip cache reads (`no-cache`, per http_cache_util's
-  // GetLoadFlagsForExtraHeaders) and every response checked below carries one.
-  function agentRequestHeaders({ webContentsId, requestHeaders }) {
-    if (!agentLockedEntryFor(webContentsId)) return {};
+  // Cache hits can omit the connected IP, so guarded HTTP requests bypass
+  // cache reads with no-cache while preserving the page's existing directives.
+  function agentRequestHeaders({ webContentsId, requestHeaders }, partition) {
+    if (!requestPolicyFor(webContentsId, partition)) return {};
     const headers = {};
     const directives = new Map(); // lowercased → as sent, keeping e.g. no-store
     for (const [name, value] of Object.entries(requestHeaders ?? {})) {
@@ -451,34 +510,43 @@ function createBrowserViewRegistry({
     return { requestHeaders: { ...headers, "Cache-Control": [...directives.values()].join(", ") } };
   }
 
-  // Check Chromium's connected endpoint to catch DNS rebinding.
-  // Electron 42 supplies details.ip despite stale typings.
-  async function shouldCancelAgentResponse({ webContentsId, url, ip }) {
-    const entry = agentLockedEntryFor(webContentsId);
-    if (!entry) return false;
-    const verdict = isAgentConnectionAllowed(url, ip, {
-      allowLocalhost: isArcaAgentContext(entry.agentContext),
-    });
+  // IP-less WebSocket upgrades repeat the partition DNS check, not endpoint
+  // verification; DNS may change between the check and connection.
+  async function shouldCancelAgentResponse(
+    { webContentsId, url, ip, resourceType, statusCode },
+    partition,
+  ) {
+    const policy = requestPolicyFor(webContentsId, partition);
+    if (!policy) return false;
+    const policyUrl = httpUrlForWebSocket(url);
+    const verdict =
+      !ip && resourceType === "webSocket" && statusCode === 101
+        ? await checkAgentNavigationWithPolicy(policyUrl, policy)
+        : isAgentConnectionAllowed(policyUrl, ip, policy);
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress).
-    const partition = agentPartition(partitionScope, entry.conversationId);
     const proxied =
       !!ip &&
-      (await isProxyAddress(ip, await resolveProxy(url, partition), (hostname) =>
-        resolveHost(hostname, partition),
+      (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (hostname) =>
+        resolveHost(hostname, policy.partition),
       ));
     if (proxied) return false;
-    sendToRenderer("browser-nav-blocked", {
-      conversationId: entry.conversationId,
-      url,
-      error: verdict.error,
-    });
+    if (policy.conversationId) {
+      sendToRenderer("browser-nav-blocked", {
+        conversationId: policy.conversationId,
+        url,
+        error: verdict.error,
+      });
+    }
     return true;
   }
 
   function openOrNavigate(conversationId, url, bounds, opts) {
     const force = !!(opts && opts.force);
+    if (needsAgentViewRevocation(get(conversationId), opts?.agentContext)) {
+      return { ok: false, error: "Previous browser page must be cleared before navigating" };
+    }
     // Agent-driven nav (opts.agent) is gated by an allowlist (see
     // browserUrlPolicy) so the model can't point the view at file:// /
     // metadata / loopback / private hosts and exfiltrate via screenshot. URL-bar
@@ -486,7 +554,7 @@ function createBrowserViewRegistry({
     // rejected nav creates no blank view.
     if (opts && opts.agent && url) {
       const verdict = isAgentNavigationAllowed(url, {
-        allowLocalhost: isArcaAgentContext(opts.agentContext),
+        allowLocalhost: allowsLocalhost(opts.agentContext),
       });
       if (!verdict.ok) {
         return { ok: false, error: verdict.error };
@@ -661,6 +729,8 @@ function createBrowserViewRegistry({
     getOrCreate,
     openOrNavigate,
     beginAgentNavigation,
+    needsAgentViewRevocation,
+    revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
     shouldCancelAgentRequest,
     agentRequestHeaders,

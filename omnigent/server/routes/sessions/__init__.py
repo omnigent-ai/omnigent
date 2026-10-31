@@ -160,6 +160,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.session_pull_requests import PullRequestRefresher
 from omnigent.util.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -174,6 +175,7 @@ from omnigent.util.reasoning_effort import (
 # objects. The mutable caches are shared by reference across the package.
 # isort: off
 from omnigent.server.routes._sessions.common import (
+    CLIENT_SESSION_EVENT_TYPES as CLIENT_SESSION_EVENT_TYPES,
     COST_CONTROL_OVERRIDE_VALUES as COST_CONTROL_OVERRIDE_VALUES,
     _ALLOWED_EVENT_TYPES as _ALLOWED_EVENT_TYPES,
     _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S as _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
@@ -625,6 +627,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _create_session_from_bundle as _create_session_from_bundle,
     _create_session_from_existing_agent as _create_session_from_existing_agent,
     _drive_terminal_resolved_elicitation as _drive_terminal_resolved_elicitation,
+    _drive_terminal_resolved_elicitation_from_store as _drive_terminal_resolved_elicitation_from_store,
     _enrich_terminal_status_with_subagent_output as _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready as _ensure_native_terminal_ready,
     _ensure_runner_relay as _ensure_runner_relay,
@@ -816,6 +819,7 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    pull_request_refresher: PullRequestRefresher | None = None,
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
@@ -886,6 +890,8 @@ def create_sessions_router(
     :param background_title_coordinator: Optional app-owned coordinator for
         semantic title generation after first-turn forwarding. ``None`` disables
         background titles in focused router tests.
+    :param pull_request_refresher: The app-owned refresher of stored session
+        PRs; ``None`` builds one for this router, as focused router tests do.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -902,6 +908,8 @@ def create_sessions_router(
     from omnigent.server.routes.sessions.routes_resources import register_resources_routes
     from omnigent.server.routes.sessions.routes_ui import register_ui_routes
 
+    if pull_request_refresher is None:
+        pull_request_refresher = PullRequestRefresher()
     register_core_routes(
         router,
         conversation_store=conversation_store,
@@ -919,6 +927,7 @@ def create_sessions_router(
         host_registry=host_registry,
         project_store=project_store,
         background_title_coordinator=background_title_coordinator,
+        pull_request_refresher=pull_request_refresher,
     )
 
     register_hooks_routes(
@@ -950,6 +959,7 @@ def create_sessions_router(
         permission_store=permission_store,
         host_registry=host_registry,
         register_initial_file_upload=register_initial_file_upload,
+        pull_request_refresher=pull_request_refresher,
     )
 
     register_ui_routes(
