@@ -120,4 +120,23 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
         args=("acp",),
         omnigent_mcp=False,
     ),
+    # Mirror (Reflection AI's ``mirror`` CLI,
+    # https://github.com/reflection-oss/mirror-beta) drives ``mirror acp``. Ships
+    # as a wheel via its curl installer (not npm or PyPI) and signs in on its own
+    # interactive first run, which saves the Reflection API key and records the
+    # usage and folder notices for the project directory; Omnigent stores no
+    # credential. Its ACP server ignores ``mcpServers`` in ``session/new``
+    # (MCP is configured in Mirror itself), so the Omnigent MCP server is not
+    # offered.
+    "mirror": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Mirror",
+            "mirror",
+            None,
+            install_hint="install from https://github.com/reflection-oss/mirror-beta",
+            auth_hint="run `mirror` once in the project directory to sign in and accept notices",
+        ),
+        args=("acp",),
+        omnigent_mcp=False,
+    ),
 }
