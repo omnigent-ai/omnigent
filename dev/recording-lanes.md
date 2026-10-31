@@ -69,7 +69,8 @@ Recording is **best-effort**:
   stood up", a multi-process journey, a flaky boot, a bug that is an absence —
   is insufficient.
 - Text-only CLI output is not a reason to skip recording. A missing recording
-  from an earlier run is not a reason either.
+  from an earlier run is not a reason either. Do not claim there is no visible
+  surface when your own pane capture or screenshot shows the symptom.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
   Explain the gap and continue with the available evidence.
 
@@ -78,7 +79,8 @@ Recording is **best-effort**:
 Every declared recording includes `capture_mode`, which records how the product
 surface was filmed. Use `playwright_ui` for browser-page capture, `electron` for
 the desktop harness, `vhs_user_command` for a VHS tape that types the real user
-command, and `screen` for a direct device/screen capture. For every lane, save
+command (or the `terminal` lane's observer attach), and `screen` for a direct
+device/screen capture. For every lane, save
 the selected raw capture as `recordings/<slug>/raw/<kind>-<facet>.<ext>`;
 reserve `recordings/<slug>/<kind>-<facet>.mp4` for the captioned render.
 Declare only the finished clip after following "Finishing a clip" below.
@@ -250,10 +252,23 @@ coverage; missing footage does not change which tests belong in the PR.
 
 ## `terminal` facets
 
-The pane renders inside the web app, so record it the same way as `web`: the
-Playwright test drives the session page with the terminal view shown, and the
-pane's contents land in the browser video. Save `tmux capture-pane -e` text dumps
-alongside as machine-checkable evidence.
+The pane normally renders inside the web app, so record it the same way as
+`web`: the Playwright test drives the session page with the terminal view shown,
+and the pane's contents land in the browser video. Save `tmux capture-pane -e`
+text dumps alongside as machine-checkable evidence.
+
+**A pane capture that shows the symptom means the facet must be filmed**, even
+when the defect is a runner-side leak or a failed background request. When the
+app can no longer open the pane (for example, a leaked pane whose Omnigent
+session was deleted while its tmux pane still runs), author an observer VHS tape.
+It uses the `cli` section's `Output`, `raw/` and render steps but types only the
+attach, not a user journey; declare it with `capture_mode: vhs_user_command`.
+Attach to the exact socket path and target your own probe used, quoted in the
+`Type` line, never another run's or user's socket, without sending input or
+updating the session environment: `tmux -S <socket> attach -E -r -t <target>`.
+Caption that the clip attaches to the pane outside the app, and end a `before`
+clip on `Wait+Screen /<symptom text>/`: a plain `Wait` checks only the last
+line, which is tmux's status bar by default.
 
 **For a native-harness pane** (claude/codex/cursor/goose/hermes/kiro/… — the bug
 is in a real harness CLI's output), don't hand-roll the launch: the existing
