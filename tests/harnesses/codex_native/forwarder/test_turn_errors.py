@@ -974,7 +974,33 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
+@pytest.mark.parametrize(
+    ("message", "expected_output"),
+    [
+        ("model stream broke", "model stream broke"),
+        (
+            "Incomplete response returned, reason: max_output_tokens",
+            "Incomplete response returned, reason: max_output_tokens\n\n"
+            "The model reached its response length limit. Ask it to continue or split "
+            "the request into smaller parts.",
+        ),
+        (
+            "Incomplete response returned, reason: content_filter",
+            "Incomplete response returned, reason: content_filter",
+        ),
+        (
+            "Invalid max_output_tokens configuration",
+            "Invalid max_output_tokens configuration",
+        ),
+        (
+            "Failed to shutdown thread persistence",
+            "Failed to shutdown thread persistence",
+        ),
+    ],
+)
+async def test_post_turn_status_edge_surfaces_generic_error_output(
+    message: str, expected_output: str
+) -> None:
     """A failed edge with a generic error surfaces the message as output.
 
     The reason must reach the server (as ``output``) rather than being dropped;
@@ -986,7 +1012,7 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
         turn_id="turn_123",
         source="turn/completed:turn-error",
         error=fwd._CodexTerminalError(
-            message="model stream broke",
+            message=message,
             kind=fwd._CODEX_ERROR_KIND_GENERIC,
         ),
     )
@@ -998,7 +1024,9 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
     assert body["type"] == "external_session_status"
     data = body["data"]
     assert data["status"] == "failed"
-    assert data["output"] == "model stream broke"
+    assert data["output"] == expected_output
+    assert edge.error is not None
+    assert edge.error.message == message
     # Generic errors do not demand re-auth.
     assert "reauth_required" not in data
 
