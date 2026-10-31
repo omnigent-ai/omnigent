@@ -17,8 +17,12 @@ per-module health waits share a single source of truth.
 from __future__ import annotations
 
 import configparser
+import re
+import time
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 # Polling cadence for server-health and response-poll loops. 0.1s
 # was empirically the sweet spot — tighter feedback than the prior
@@ -99,3 +103,56 @@ def final_assistant_text(body: dict[str, Any]) -> str:
                 if text:
                     parts.append(text)
     return "\n\n".join(parts)
+
+
+def _scan_home_logs_for(home: Path, pattern: re.Pattern[str], *, session_id: str) -> str | None:
+    """Find the signature in this session's runner logs, excluding earlier retries."""
+    for log_path in home.rglob(f"runner-{session_id}-*.log"):
+        try:
+            text = log_path.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if pattern.search(line):
+                return line
+    return None
+
+
+def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 45.0) -> None:
+    """Poll ``GET /v1/hosts`` until *host_id* is online.
+
+    :param client: HTTP client pointed at the server.
+    :param host_id: Host id to wait for.
+    :param timeout: Max seconds to wait.
+    :raises AssertionError: If the host never appears online.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = client.get("/v1/hosts")
+            if resp.status_code == 200:
+                for host in resp.json().get("hosts", []):
+                    if host["host_id"] == host_id and host["status"] == "online":
+                        return
+        except httpx.ConnectError:
+            pass
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
+
+
+def _terminal_resource_present(client: httpx.Client, session_id: str) -> bool:
+    """Return whether the session currently exposes a ``terminal`` resource.
+
+    The managed main terminal shows up in ``GET /v1/sessions/{id}/resources``
+    (the runner-authoritative inventory the web UI renders as the Terminal
+    pane). When the terminal exits it is removed (``session.resource.deleted``),
+    so a transition present -> absent is the user-visible "terminal disappeared".
+
+    :param client: HTTP client pointed at the server.
+    :param session_id: Session/conversation id.
+    :returns: ``True`` while a terminal resource is listed.
+    """
+    resp = client.get(f"/v1/sessions/{session_id}/resources", timeout=30.0)
+    if resp.status_code != 200:
+        return False
+    return any(item.get("type") == "terminal" for item in resp.json().get("data", []))
