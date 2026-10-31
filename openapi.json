@@ -3666,6 +3666,8 @@
         "properties": {
           "names": {
             "items": {
+              "maxLength": 64,
+              "minLength": 1,
               "type": "string"
             },
             "maxItems": 20,
