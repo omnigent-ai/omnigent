@@ -74,8 +74,9 @@ object NativeBridgeScript {
               ".chat-composer-form{padding-bottom:calc(0.75rem + " + B + ") !important}",
               ".chat-composer-form.terminal-first-composer-form{padding-bottom:0.25rem !important}",
               ".terminal-first-switcher-container{padding-bottom:calc(0.35rem + " + B + ") !important}",
-              // Drawers/panels span full height — clear both bars.
-              ":is(.conversations-sidebar,[data-testid=\"file-viewer\"],[data-testid=\"files-panel-drawer\"],[data-testid=\"terminals-panel\"],[data-testid=\"subagents-panel-drawer\"],[data-testid=\"todos-panel-drawer\"]){padding-top:" + T + " !important;padding-bottom:" + B + " !important}",
+              // Rails, drawers and panels span full height — clear both bars. Panels
+              // nested in the Workspace rail already sit inside its clearance.
+              ":is(aside[aria-label=\"Workspace\"],.conversations-sidebar,[data-testid=\"file-viewer\"],[data-testid=\"files-panel-drawer\"],[data-testid=\"terminals-panel\"],[data-testid=\"subagents-panel-drawer\"],[data-testid=\"todos-panel-drawer\"]):not(aside[aria-label=\"Workspace\"] *){padding-top:" + T + " !important;padding-bottom:" + B + " !important}",
             ].join("");
             (document.head || document.documentElement).appendChild(style);
           };
