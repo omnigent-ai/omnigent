@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -31,7 +32,7 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -67,6 +68,7 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runner.launch_failure import is_rate_limit_error
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -105,7 +107,9 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
+    TurnRetrying,
     classify_tool_result,
     describe_exception,
 )
@@ -176,6 +180,7 @@ _WORKER_PREPARE_CLEANUP_TIMEOUT_SECONDS = 12.0
 _WORKER_SPAWN_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 7.0
 _STDERR_CHUNK_LIMIT = 65536
+_STDERR_RING_LINES = 20
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
@@ -543,6 +548,33 @@ def _unwrap_provider_error_json(text: str) -> str:
                 return f"{provider_message.strip()} (error_code={error_code})"
             return provider_message.strip()
     return text
+
+
+_CODEX_USAGE_LIMIT_ERRORS = frozenset({"usageLimitExceeded", "usage_limit_exceeded"})
+_CODEX_RATE_LIMIT_ERRORS = frozenset({"rateLimitExceeded", "rate_limit_exceeded"})
+_CODEX_USAGE_LIMIT_TITLE = "Codex usage limit reached"
+_RATE_LIMIT_ERROR_CODE = "rate_limit_exceeded"
+_FAILED_TURN_COMPLETION_TIMEOUT_S = 5.0
+
+
+def _codex_error_info(params: object) -> tuple[str | None, int | None]:
+    """
+    Read the ``codexErrorInfo`` classification of an app-server ``error`` frame.
+
+    :param params: The frame's ``params``, e.g. ``{"error": {"codexErrorInfo":
+        {"responseTooManyFailedAttempts": {"httpStatusCode": 429}}}}``.
+    :returns: The variant name and its upstream HTTP status, e.g.
+        ``("responseTooManyFailedAttempts", 429)`` or ``("usageLimitExceeded", None)``.
+    """
+    inner = params.get("error") if isinstance(params, dict) else None
+    info = inner.get("codexErrorInfo") if isinstance(inner, dict) else None
+    if isinstance(info, str):
+        return info, None
+    if isinstance(info, dict) and len(info) == 1:
+        ((variant, payload),) = info.items()
+        status = payload.get("httpStatusCode") if isinstance(payload, dict) else None
+        return variant, status if isinstance(status, int) else None
+    return None, None
 
 
 class _Process(Protocol):
@@ -2836,11 +2868,19 @@ class _CodexAppServerSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
+        # Provider Codex resolved for the thread, e.g. "openai" under a ChatGPT login.
+        self._thread_provider: str | None = None
+        # Set when a rate-limited turn ended with no output and its input stays in the thread.
+        self._resumable_failed_turn = False
+        self._turn_retry_wake: asyncio.Event | None = None
         # Last requested override on this thread; None means its original default.
         self._applied_effort: str | None = None
         self._default_effort: str | None = None
         self._thread_model: str | None = None
         self._recent_stderr: list[str] = []
+        # Stderr since the current turn/start; ``_recent_stderr`` outlives turns
+        # and keeps launch-time warnings, which must not be blamed on a turn.
+        self._turn_stderr: list[str] = []
         # Auth-class gateway rejection tracking, read off the CLI's stderr so a
         # turn that emits no events fails fast with the real cause instead of
         # stalling to the idle watchdog. ``_pending`` holds a parsed fatal
@@ -3159,6 +3199,8 @@ class _CodexAppServerSession:
         if self._loop is not None and self._loop is not current_loop:
             self._close_cross_loop()
             return
+        if self._turn_retry_wake is not None:
+            self._turn_retry_wake.set()
 
         task = self._cleanup_task
         if task is None or task.done():
@@ -3635,6 +3677,106 @@ class _CodexAppServerSession:
         sandbox: str,
         reasoning_effort: str | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
+        """Run one turn, retrying a rate limit that ended it before any output."""
+        retries = 0
+        while True:
+            self._resumable_failed_turn = False
+            produced_output = False
+            rate_limited = False
+            attempt = self._run_turn_attempt(
+                messages=messages,
+                tools=tools,
+                system_prompt=system_prompt,
+                model=model,
+                cwd=cwd,
+                sandbox=sandbox,
+                reasoning_effort=reasoning_effort,
+                resume_failed_turn=retries > 0,
+            )
+            async with aclosing(attempt):
+                async for event in attempt:
+                    if (
+                        isinstance(event, ExecutorError)
+                        and self._resumable_failed_turn
+                        and not produced_output
+                        and retries < self._retry_policy.max_retries
+                    ):
+                        rate_limited = True
+                        continue
+                    produced_output = True
+                    yield event
+            if not rate_limited:
+                return
+            retries += 1
+            # Jitter applies after the policy's cap; keep each wait within the cap.
+            delay = min(
+                self._retry_policy.compute_backoff_delay(retries), self._retry_policy.backoff_max_s
+            )
+            logger.info(
+                "Codex turn rate limited before output; retry %d/%d in %.1fs (thread_id=%s)",
+                retries,
+                self._retry_policy.max_retries,
+                delay,
+                self.thread_id,
+            )
+            # Armed before the notice so an interrupt sent while it is handled still lands.
+            wake = asyncio.Event()
+            self._turn_retry_wake = wake
+            try:
+                yield TurnRetrying(
+                    attempt=retries + 1,
+                    max_attempts=self._retry_policy.max_retries + 1,
+                    delay_seconds=delay,
+                    code=_RATE_LIMIT_ERROR_CODE,
+                    message=f"Rate limited, retrying in {delay:.0f}s",
+                )
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(wake.wait(), timeout=delay)
+            finally:
+                self._turn_retry_wake = None
+            if wake.is_set() or self._closing:
+                yield TurnCancelled()
+                return
+
+    async def _await_failed_turn_completed(self, turn_id: str) -> bool:
+        """Consume the ``turn/completed`` Codex sends after a turn's terminal ``error``."""
+        deadline = time.monotonic() + _FAILED_TURN_COMPLETION_TIMEOUT_S
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                message = await asyncio.wait_for(self._events.get(), timeout=remaining)
+            except TimeoutError:
+                return False
+            if isinstance(message, HarnessTransportClosedError):
+                self._events.put_nowait(message)
+                return False
+            self._record_event(message)
+            params = message.get("params")
+            turn = params.get("turn") if isinstance(params, dict) else None
+            if (
+                message.get("method") == "turn/completed"
+                and isinstance(turn, dict)
+                and turn.get("id") == turn_id
+            ):
+                return True
+        return False
+
+    def _thread_uses_builtin_provider(self) -> bool:
+        from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+
+        return self._thread_provider in CODEX_BUILTIN_PROVIDERS
+
+    async def _run_turn_attempt(
+        self,
+        *,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        model: str | None,
+        cwd: str,
+        sandbox: str,
+        reasoning_effort: str | None,
+        resume_failed_turn: bool,
+    ) -> AsyncGenerator[ExecutorEvent, None]:
         await self.start()
         assert self._proc is not None
         if self._containment_confirmed:
@@ -3682,6 +3824,12 @@ class _CodexAppServerSession:
             # below fails loud for a protocol violation instead of
             # silently carrying an empty-string thread id.
             self.thread_id = raw_thread_id if isinstance(raw_thread_id, str) else None
+            raw_provider = response.get("result", {}).get("modelProvider")
+            self._thread_provider = (
+                raw_provider
+                if isinstance(raw_provider, str) and raw_provider
+                else self._thread_model_provider
+            )
             # Fresh thread: forget the prior thread's applied effort so the
             # settings update below re-sends it for this thread.
             self._applied_effort = None
@@ -3699,8 +3847,12 @@ class _CodexAppServerSession:
             self._last_turn_usage = None
 
         assert self.thread_id is not None
+        # The failed turn already recorded its input in the thread; resending it duplicates it.
+        resume_failed_turn = resume_failed_turn and not is_new_thread
         latest_user_content = _extract_latest_user_content(messages)
-        goal_objective = _goal_objective_from_content(latest_user_content)
+        goal_objective = (
+            None if resume_failed_turn else _goal_objective_from_content(latest_user_content)
+        )
         if goal_objective is not None:
             # Reject over-long objectives here so the app-server's raw
             # JSON-RPC -32600 error never reaches the user.
@@ -3725,7 +3877,10 @@ class _CodexAppServerSession:
                     message["content"] = goal_objective
                     break
         prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
-        if isinstance(prompt, list):
+        turn_input: list[CodexParams]
+        if resume_failed_turn:
+            turn_input = []
+        elif isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
             turn_input = [{"type": "text", "text": prompt}]
@@ -3769,6 +3924,9 @@ class _CodexAppServerSession:
         if effort_via_turn_start:
             turn_params["effort"] = effort
             turn_params["summary"] = "detailed"
+        # Best-effort scope: the stderr reader is asynchronous, so a late line
+        # from the previous turn can still land after this clear.
+        self._turn_stderr.clear()
         start_response = await self._request(
             "turn/start",
             turn_params,
@@ -4213,8 +4371,33 @@ class _CodexAppServerSession:
                     # codex harness, an invalid profile) gets a full
                     # diagnostic trail.
                     detail = _format_codex_error_params(params)
-                    if self._recent_stderr:
-                        detail = f"{detail}; stderr: {' | '.join(self._recent_stderr[-5:])}"
+                    error_kind, http_status = _codex_error_info(params)
+                    usage_limited = error_kind in _CODEX_USAGE_LIMIT_ERRORS
+                    rate_limited = not usage_limited and (
+                        error_kind in _CODEX_RATE_LIMIT_ERRORS
+                        or http_status == 429
+                        or is_rate_limit_error(detail)
+                    )
+                    if self._turn_stderr:
+                        detail = f"{detail}; stderr: {' | '.join(self._turn_stderr[-5:])}"
+                    if usage_limited:
+                        yield ExecutorError(
+                            message=detail,
+                            code="budget_exhausted",
+                            title=_CODEX_USAGE_LIMIT_TITLE,
+                        )
+                        return
+                    if rate_limited:
+                        # Codex applies the retry policy to custom providers itself,
+                        # but built-in providers fail on the first 429.
+                        self._resumable_failed_turn = (
+                            self._thread_uses_builtin_provider()
+                            and await self._await_failed_turn_completed(active_turn_id)
+                        )
+                        yield ExecutorError(
+                            message=detail, retryable=True, code=_RATE_LIMIT_ERROR_CODE
+                        )
+                        return
                     # method==error from the app server is a runtime
                     # failure (often a tool-execution or provider issue,
                     # e.g. a bash printf failure); treat as retryable.
@@ -4255,6 +4438,9 @@ class _CodexAppServerSession:
         return True
 
     async def interrupt_turn(self) -> bool:
+        if self._turn_retry_wake is not None:
+            self._turn_retry_wake.set()
+            return True
         if self.thread_id is None or self.active_turn_id is None:
             return False
         await self._request(
@@ -4461,13 +4647,17 @@ class _CodexAppServerSession:
                     continue
                 if len(text) >= _STDERR_CHUNK_LIMIT:
                     text = text[:_STDERR_CHUNK_LIMIT] + "...[truncated]"
-                self._recent_stderr.append(text)
-                if len(self._recent_stderr) > 20:
-                    self._recent_stderr.pop(0)
+                self._record_stderr(text)
                 logger.debug("codex app-server stderr: %s", text)
                 self._note_stderr_gateway_error(text)
         except asyncio.CancelledError:
             raise
+
+    def _record_stderr(self, text: str) -> None:
+        for lines in (self._recent_stderr, self._turn_stderr):
+            lines.append(text)
+            if len(lines) > _STDERR_RING_LINES:
+                lines.pop(0)
 
     def _note_stderr_gateway_error(self, text: str) -> None:
         """Attribute (and, when fatal, arm fast-fail for) a gateway rejection.

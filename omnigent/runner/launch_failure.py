@@ -35,6 +35,7 @@ __all__ = [
     "diagnose_codex_provider_auth_failure",
     "diagnose_model_unavailable",
     "is_codex_provider_auth_failure",
+    "is_rate_limit_error",
 ]
 
 # A Codex turn failed while compacting on the thread's previous model, not the selected one.
@@ -306,6 +307,23 @@ _SHELL_PROGRAMS = frozenset({"sh", "bash", "zsh", "dash"})
 # Persisted error labels hold 256 characters.
 _LABEL_LIMIT = 256
 
+# Auth rejections are never rate limits, even when their text mentions limits.
+_AUTH_REJECTION_STATUSES = {"401", "403"}
+
+
+def _http_status(message: str) -> str | None:
+    match = _NATIVE_ERROR_HTTP_STATUS.search(message)
+    return match.group(1) if match else None
+
+
+def is_rate_limit_error(message: str) -> bool:
+    """Whether turn error text reports a model rate limit (an HTTP 429 status or a
+    rate-limit phrase) rather than an auth rejection that merely mentions limits."""
+    status = _http_status(message)
+    if status in _AUTH_REJECTION_STATUSES:
+        return False
+    return status == "429" or _RATE_LIMIT_ERROR.search(message) is not None
+
 
 def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies the cause.
@@ -340,11 +358,10 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return "client_update_required"
     if detect_request_size_overflow(message) is not None:
         return "context_length_exceeded"
-    status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
-    status = status_match.group(1) if status_match else None
-    if status in {"401", "403"}:
+    status = _http_status(message)
+    if status in _AUTH_REJECTION_STATUSES:
         return code
-    if status == "429" or _RATE_LIMIT_ERROR.search(message):
+    if is_rate_limit_error(message):
         return "rate_limit_exceeded"
     if (
         status in _TRANSIENT_UPSTREAM_STATUSES
