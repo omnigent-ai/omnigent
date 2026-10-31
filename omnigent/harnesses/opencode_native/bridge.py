@@ -706,6 +706,24 @@ def update_active_message_id(
     )
 
 
+def update_opencode_session_id(bridge_dir: Path, opencode_session_id: str) -> None:
+    """
+    Point web prompts, interrupts and compaction at another OpenCode session.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param opencode_session_id: OpenCode session id, e.g. ``"ses_abc123"``.
+    :returns: None.
+    """
+    state = read_bridge_state(bridge_dir)
+    if state is None:
+        return
+    import dataclasses
+
+    write_bridge_state(
+        bridge_dir, dataclasses.replace(state, opencode_session_id=opencode_session_id)
+    )
+
+
 def update_last_event_id(bridge_dir: Path, last_event_id: str) -> None:
     """
     Record the last SSE event id seen by the forwarder.

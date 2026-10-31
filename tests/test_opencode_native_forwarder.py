@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
+from omnigent.harnesses.opencode_native.bridge import (
+    OpenCodeNativeBridgeState,
+    read_bridge_state,
+    write_bridge_state,
+)
 from omnigent.harnesses.opencode_native.client import OpenCodeEvent
 
 _SESSION = "ses_1"
@@ -1166,3 +1172,199 @@ async def test_question_asked_dedupes_concurrent_same_request() -> None:
     assert fwd._question_tasks["que_1"] is task
     await task
     assert opencode.question_replies == [("que_1", [["A"]])]
+
+
+def _message_texts(posts: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, str]]:
+    items = [b["data"] for _u, b in posts if b["type"] == "external_conversation_item"]
+    return [
+        (it["item_data"]["role"], it["item_data"]["content"][0]["text"])
+        for it in items
+        if it["item_type"] == "message"
+    ]
+
+
+def _text_part(part_id: str, message_id: str, text: str, **props: Any) -> OpenCodeEvent:
+    part = {"id": part_id, "messageID": message_id, "type": "text", "text": text}
+    return _event("message.part.updated", part=part, **props)
+
+
+def _step_finish(part_id: str, message_id: str) -> OpenCodeEvent:
+    part = {"id": part_id, "messageID": message_id, "type": "step-finish", "reason": "stop"}
+    return _event("message.part.updated", part=part)
+
+
+async def test_prompt_queued_during_streaming_reply_is_mirrored_after_that_reply() -> None:
+    """Event order captured from ``opencode serve`` 1.18.33 with a second prompt sent mid-reply."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    for event in (
+        _event("message.updated", info={"id": "msg_u1", "role": "user"}),
+        _text_part("prt_u1", "msg_u1", "prompt one"),
+        _event("session.status", status={"type": "busy"}),
+        _event(
+            "message.updated", info={"id": "msg_a1", "role": "assistant", "parentID": "msg_u1"}
+        ),
+        _event("message.updated", info={"id": "msg_u2", "role": "user"}),
+        _text_part("prt_u2", "msg_u2", "prompt two"),
+        _text_part("prt_a1", "msg_a1", ""),
+        _text_part("prt_a1", "msg_a1", "reply one"),
+        _step_finish("prt_f1", "msg_a1"),
+        _event(
+            "message.updated",
+            info={
+                "id": "msg_a1",
+                "role": "assistant",
+                "parentID": "msg_u1",
+                "time": {"completed": 2},
+            },
+        ),
+        _event("session.status", status={"type": "busy"}),
+        _event(
+            "message.updated", info={"id": "msg_a2", "role": "assistant", "parentID": "msg_u2"}
+        ),
+        _text_part("prt_a2", "msg_a2", "reply two"),
+        _step_finish("prt_f2", "msg_a2"),
+        _event(
+            "message.updated",
+            info={
+                "id": "msg_a2",
+                "role": "assistant",
+                "parentID": "msg_u2",
+                "time": {"completed": 3},
+            },
+        ),
+        _event("session.status", status={"type": "idle"}),
+        _event("session.idle"),
+    ):
+        await fwd.handle_event(event)
+    assert _message_texts(server.posts) == [
+        ("user", "prompt one"),
+        ("assistant", "reply one"),
+        ("user", "prompt two"),
+        ("assistant", "reply two"),
+    ]
+
+
+async def test_prompt_in_session_created_from_tui_reaches_web_transcript() -> None:
+    """After TUI ``/new``, prompts in the new top-level session still reach the web chat."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.created", sessionID="ses_new", info={"id": "ses_new", "title": "New session"}
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "message.updated",
+            sessionID="ses_new",
+            info={"id": "msg_new", "role": "user", "sessionID": "ses_new"},
+        )
+    )
+    await fwd.handle_event(
+        _text_part("prt_new", "msg_new", "prompt after new", sessionID="ses_new")
+    )
+    assert _message_texts(server.posts) == [("user", "prompt after new")]
+
+
+async def test_subagent_permission_request_goes_through_policy() -> None:
+    """Child-session ``permission.asked`` shape captured from a ``task`` sub-agent's bash call."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    seen: list[Any] = []
+
+    async def allow(normalized: Any) -> dict[str, Any]:
+        seen.append(normalized)
+        return {"decision": "allow"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=allow)
+    await fwd.handle_event(
+        _event(
+            "session.created",
+            sessionID="ses_child",
+            info={
+                "id": "ses_child",
+                "parentID": _SESSION,
+                "title": "Run echo hi (@general subagent)",
+            },
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "permission.asked",
+            id="per_child",
+            sessionID="ses_child",
+            permission="bash",
+            patterns=["echo hi"],
+            metadata={"command": "echo hi"},
+            always=["echo *"],
+            tool={"messageID": "msg_child", "callID": "call_child"},
+        )
+    )
+    assert [normalized["action"] for normalized in seen] == ["bash"]
+    assert opencode.replies == [("per_child", {"reply": "once", "message": "omnigent-policy"})]
+
+
+async def test_root_session_the_user_prompts_in_becomes_the_web_target(tmp_path: Path) -> None:
+    """Web prompts follow TUI ``/new`` and the session picker; sub-agent sessions are skipped."""
+    write_bridge_state(
+        tmp_path,
+        OpenCodeNativeBridgeState(
+            session_id="conv_1", server_base_url="http://127.0.0.1:1", opencode_session_id=_SESSION
+        ),
+    )
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+
+    def web_target() -> str | None:
+        state = read_bridge_state(tmp_path)
+        return state.opencode_session_id if state is not None else None
+
+    await fwd.handle_event(_event("session.created", sessionID="ses_new", info={"id": "ses_new"}))
+    assert web_target() == "ses_new"
+    await fwd.handle_event(
+        _event(
+            "session.created",
+            sessionID="ses_child",
+            info={"id": "ses_child", "parentID": "ses_new"},
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "message.updated",
+            sessionID="ses_child",
+            info={"id": "msg_child", "role": "user", "sessionID": "ses_child"},
+        )
+    )
+    await fwd.handle_event(
+        _text_part("prt_child", "msg_child", "sub-agent prompt", sessionID="ses_child")
+    )
+    assert web_target() == "ses_new"
+    assert _message_texts(server.posts) == []
+
+    await fwd.handle_event(
+        _event("message.updated", info={"id": "msg_back", "role": "user", "sessionID": _SESSION})
+    )
+    await fwd.handle_event(_text_part("prt_back", "msg_back", "back in the first session"))
+    assert web_target() == _SESSION
+    assert _message_texts(server.posts) == [("user", "back in the first session")]
+
+
+async def test_prompt_queued_behind_an_aborted_reply_is_still_mirrored() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    for event in (
+        _event("message.updated", info={"id": "msg_u1", "role": "user"}),
+        _text_part("prt_u1", "msg_u1", "prompt one"),
+        _event("session.status", status={"type": "busy"}),
+        _event("message.updated", info={"id": "msg_a1", "role": "assistant"}),
+        _event("message.updated", info={"id": "msg_u2", "role": "user"}),
+        _text_part("prt_u2", "msg_u2", "prompt two"),
+        _text_part("prt_a1", "msg_a1", "partial reply"),
+        _event("session.error", error={"name": "MessageAbortedError", "data": {}}),
+    ):
+        await fwd.handle_event(event)
+    assert _message_texts(server.posts) == [
+        ("user", "prompt one"),
+        ("assistant", "partial reply"),
+        ("user", "prompt two"),
+    ]

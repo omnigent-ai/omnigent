@@ -22,6 +22,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     update_active_message_id,
     update_last_event_id,
     update_model_override,
+    update_opencode_session_id,
     user_opencode_config_paths,
     write_bridge_state,
     write_cost_popup_config,
@@ -106,6 +107,20 @@ def test_update_active_message_id(bridge_dir: Path) -> None:
     assert loaded is not None
     assert loaded.active_message_id is None
     assert loaded.status == "idle"
+
+
+def test_update_opencode_session_id_keeps_other_fields(bridge_dir: Path) -> None:
+    write_bridge_state(bridge_dir, _state(bridge_dir, model_override="anthropic/claude-opus-4"))
+    update_opencode_session_id(bridge_dir, "ses_new")
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded == _state(
+        bridge_dir, opencode_session_id="ses_new", model_override="anthropic/claude-opus-4"
+    )
+
+
+def test_update_opencode_session_id_without_state_is_noop(bridge_dir: Path) -> None:
+    update_opencode_session_id(bridge_dir, "ses_new")
+    assert read_bridge_state(bridge_dir) is None
 
 
 def test_update_model_override(bridge_dir: Path) -> None:

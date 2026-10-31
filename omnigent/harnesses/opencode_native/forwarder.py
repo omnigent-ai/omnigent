@@ -30,7 +30,10 @@ from urllib.parse import quote
 
 import httpx
 
-from omnigent.harnesses.opencode_native.bridge import update_active_message_id
+from omnigent.harnesses.opencode_native.bridge import (
+    update_active_message_id,
+    update_opencode_session_id,
+)
 from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeClientError,
@@ -84,6 +87,24 @@ _OPENCODE_REAUTH_HINT = (
 
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
+
+# OpenCode's prompt loop starts another step after these finish reasons.
+_CONTINUING_FINISH_REASONS = frozenset({"tool-calls", "unknown"})
+# Refused connections mean ``opencode serve`` is gone; five spans ~12 s of backoff.
+_MAX_CONNECT_FAILURES_DURING_TURN = 5
+_SERVER_UNREACHABLE_OUTPUT = "The OpenCode server stopped responding, so this turn cannot finish."
+# Every session on the per-conversation ``opencode serve`` (``task`` sub-agents,
+# TUI ``/new``) acts for this conversation, so these are handled for any session.
+_ANY_SESSION_EVENT_TYPES = frozenset(
+    {
+        "session.created",
+        "permission.asked",
+        "permission.v2.asked",
+        "question.asked",
+        "question.replied",
+        "question.rejected",
+    }
+)
 
 _JsonMapping: TypeAlias = Mapping[str, object]
 
@@ -142,12 +163,63 @@ def _message_is_complete(info: Mapping[str, Any] | None) -> bool:
     return isinstance(time_info.get("completed"), (int, float))
 
 
+def _event_session_id(event: OpenCodeEvent) -> object:
+    """Return the OpenCode session id an event names, or ``None``."""
+    props = event.properties
+    session_id = props.get("sessionID") or props.get("session_id")
+    info = props.get("info")
+    if session_id is None and isinstance(info, Mapping):
+        session_id = info.get("id")
+    return session_id
+
+
+def _error_outcome(error: object) -> tuple[str, _JsonObject | None]:
+    """Map an OpenCode turn error to its terminal status and edge fields.
+
+    A ``MessageAbortedError`` is a user interrupt, so the turn ends idle.
+    """
+    name = error.get("name") if isinstance(error, Mapping) else None
+    data = error.get("data") if isinstance(error, Mapping) else None
+    if name == _MESSAGE_ABORTED_ERROR:
+        return _STATUS_IDLE, None
+    message = data.get("message") if isinstance(data, Mapping) else None
+    if not isinstance(message, str) or not message.strip():
+        message = "OpenCode session ended with an error."
+    status_code = data.get("statusCode") if isinstance(data, Mapping) else None
+    is_auth = name == "ProviderAuthError" or (name == "APIError" and status_code in (401, 403))
+    extra: _JsonObject = {"output": message.strip()}
+    if is_auth:
+        extra["output"] = f"{message.strip()}\n\n{_OPENCODE_REAUTH_HINT}"
+        extra["reauth_required"] = True
+    return _STATUS_FAILED, extra
+
+
+def _settled_turn_outcome(messages: list[Any]) -> tuple[str, _JsonObject | None] | None:
+    """Return how the turn ended if persisted history shows it finished, else ``None``.
+
+    OpenCode's prompt loop stops once the newest message is an assistant reply
+    that failed, or completed with a finish reason that does not start a step.
+    """
+    last = messages[-1] if messages else None
+    info = last.get("info") if isinstance(last, Mapping) else None
+    if not isinstance(info, Mapping) or info.get("role") != "assistant":
+        return None
+    error = info.get("error")
+    if isinstance(error, Mapping):
+        return _error_outcome(error)
+    if not _message_is_complete(info) or info.get("finish") in _CONTINUING_FINISH_REASONS:
+        return None
+    return _STATUS_IDLE, None
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's SSE stream into Omnigent events.
 
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :param opencode_session_id: OpenCode session id to filter on.
+    :param opencode_session_id: OpenCode session the conversation launched
+        with. Root sessions the TUI creates later are mirrored too, and the
+        one the user last prompted in becomes the web prompt target.
     :param opencode_client: Client connected to the ``opencode serve``
         server (for SSE + permission replies).
     :param server_client: HTTP client for the Omnigent server (event posts).
@@ -183,6 +255,8 @@ class OpenCodeNativeForwarder:
     ) -> None:
         self._session_id = session_id
         self._opencode_session_id = opencode_session_id
+        self._key_scope = opencode_session_id
+        self._root_session_ids = {opencode_session_id}
         self._opencode = opencode_client
         self._server = server_client
         self._bridge_dir = bridge_dir
@@ -219,6 +293,10 @@ class OpenCodeNativeForwarder:
         self._active_message_id: str | None = None
         self._running_response_id: str | None = None
         self._question_tasks: dict[str, asyncio.Task[None]] = {}
+        # Incomplete assistant message, and user text parts of prompts queued
+        # behind it (partID -> part); they are mirrored once that reply is.
+        self._streaming_assistant_id: str | None = None
+        self._held_user_parts: dict[str, _JsonMapping] = {}
 
     async def seed_dedupe_from_history(self) -> None:
         """
@@ -294,6 +372,8 @@ class OpenCodeNativeForwarder:
                 self._msg_role[message_id] = role
                 if role == "assistant" and info_map is not None:
                     self._record_assistant_usage(message_id, info_map)
+                    if not _message_is_complete(info_map):
+                        await self._note_assistant_progress(message_id, info_map)
             parts = message.get("parts")
             if not isinstance(parts, list):
                 continue
@@ -315,12 +395,19 @@ class OpenCodeNativeForwarder:
                     await self._handle_file_part(part)
             if role == "assistant" and _message_is_complete(info_map):
                 await self._flush_pending_text()
+                if isinstance(message_id, str) and info_map is not None:
+                    await self._note_assistant_progress(message_id, info_map)
         try:
             await self._post_session_usage()
         except Exception:  # usage re-post is best effort.
             _logger.debug(
                 "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
             )
+        # The stream does not replay a ``session.idle`` / ``session.error`` it missed.
+        outcome = _settled_turn_outcome(messages) if self.state.turn_active else None
+        if outcome is not None:
+            status, extra = outcome
+            await self._end_turn(status=status, extra=extra)
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -335,11 +422,15 @@ class OpenCodeNativeForwarder:
         disconnect window. The dedupe set ensures that items posted before the
         drop are never duplicated.
 
+        A turn still running after repeated refused connections ends as failed,
+        since a dead ``opencode serve`` never reports its end.
+
         :param max_reconnects: Reconnect cap (``None`` = unbounded); used
             by tests to bound the loop.
         """
         attempt = 0
         backoff = 0.5
+        connect_failures = 0
         try:
             while True:
                 if attempt == 0:
@@ -349,13 +440,25 @@ class OpenCodeNativeForwarder:
                 try:
                     await self._consume_once()
                     # Clean stream end (server closed): reconnect.
+                    connect_failures = 0
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # reconnect on any transient SSE failure.
+                except Exception as exc:  # reconnect on any transient SSE failure.
+                    connect_failures = (
+                        connect_failures + 1 if isinstance(exc, httpx.ConnectError) else 0
+                    )
                     _logger.warning(
                         "OpenCode forwarder SSE error for session=%s; reconnecting",
                         self._session_id,
                         exc_info=True,
+                    )
+                if (
+                    connect_failures >= _MAX_CONNECT_FAILURES_DURING_TURN
+                    and self.state.turn_active
+                ):
+                    await self._flush_pending_text()
+                    await self._end_turn(
+                        status=_STATUS_FAILED, extra={"output": _SERVER_UNREACHABLE_OUTPUT}
                     )
                 attempt += 1
                 if max_reconnects is not None and attempt > max_reconnects:
@@ -387,7 +490,7 @@ class OpenCodeNativeForwarder:
 
         :param event: A decoded OpenCode SSE event.
         """
-        if not self._event_targets_session(event):
+        if event.type not in _ANY_SESSION_EVENT_TYPES and not self._event_targets_session(event):
             return
         handler = _HANDLERS.get(event.type)
         if handler is None:
@@ -403,22 +506,28 @@ class OpenCodeNativeForwarder:
 
     def _event_targets_session(self, event: OpenCodeEvent) -> bool:
         """
-        Return whether *event* belongs to this forwarder's session.
+        Return whether *event* belongs to a mirrored root session.
 
         Events without a session id (e.g. ``server.connected``) pass
-        through so readiness/global signals are not dropped.
+        through so readiness/global signals are not dropped. Sub-agent
+        (child) sessions are not mirrored.
 
         :param event: A decoded OpenCode event.
         :returns: ``True`` when the event should be handled.
         """
-        props = event.properties
-        session_id = props.get("sessionID") or props.get("session_id")
-        info = props.get("info")
-        if session_id is None and isinstance(info, Mapping):
-            session_id = info.get("id")
+        session_id = _event_session_id(event)
         if session_id is None:
             return True
-        return bool(session_id == self._opencode_session_id)
+        return session_id in self._root_session_ids
+
+    def _follow_session(self, opencode_session_id: str) -> None:
+        """Target *opencode_session_id*, the root session the TUI is now on."""
+        if opencode_session_id == self._opencode_session_id:
+            return
+        self._root_session_ids.add(opencode_session_id)
+        self._opencode_session_id = opencode_session_id
+        if self._bridge_dir is not None:
+            update_opencode_session_id(self._bridge_dir, opencode_session_id)
 
     # --- dedupe / keys ---------------------------------------------------
 
@@ -427,9 +536,9 @@ class OpenCodeNativeForwarder:
         Build a session-scoped dedupe key.
 
         :param parts: Key segments, e.g. ``("text", "prt_1")``.
-        :returns: ``"opencode:<sessionID>:<part>:..."``.
+        :returns: ``"opencode:<launch sessionID>:<part>:..."``.
         """
-        return "opencode:" + ":".join((self._opencode_session_id, *parts))
+        return "opencode:" + ":".join((self._key_scope, *parts))
 
     # --- posting helpers -------------------------------------------------
 
@@ -571,6 +680,8 @@ class OpenCodeNativeForwarder:
         response; a caller may pass extra fields (e.g. ``output`` /
         ``reauth_required`` on a ``failed`` edge), which are merged on top.
         """
+        self._streaming_assistant_id = None
+        await self._release_held_user_parts()
         self.state.turn_active = False
         # Reasoning deltas are per-turn; drop the per-part offsets so the map
         # can't grow across a long-lived session (the next turn's reasoning
@@ -609,7 +720,11 @@ class OpenCodeNativeForwarder:
         if not isinstance(message_id, str) or not isinstance(role, str):
             return
         self._msg_role[message_id] = role
+        session_id = _event_session_id(event)
+        if role == "user" and isinstance(session_id, str):
+            self._follow_session(session_id)
         if role == "assistant":
+            await self._note_assistant_progress(message_id, info)
             error = info.get("error")
             # OpenCode can update an aborted message after its turn ended; that must
             # not reopen the turn.
@@ -676,23 +791,63 @@ class OpenCodeNativeForwarder:
             text,
         )
 
-    async def _post_user_text_part(self, part: _JsonMapping) -> None:
+    async def _post_user_text_part(self, part: _JsonMapping, *, hold: bool = True) -> None:
         """Post a user message immediately so it precedes its assistant reply.
 
         Unlike assistant text (accumulated + flushed on step end), a user part
         is complete on arrival and must land at its own earlier position, so we
-        post it eagerly, deduped by part id.
+        post it eagerly, deduped by part id. A prompt queued while an earlier
+        reply is still streaming is held until that reply is mirrored.
         """
         part_id = part.get("id")
         text = part.get("text")
         message_id = part.get("messageID")
         if not isinstance(part_id, str) or not isinstance(text, str) or not text:
             return
+        if (
+            hold
+            and self._streaming_assistant_id is not None
+            and isinstance(message_id, str)
+            and message_id > self._streaming_assistant_id
+        ):
+            self._held_user_parts[part_id] = part
+            return
         if not self.state.mark(self._key("user-text", part_id)):
             return
         await self._post_user_text(
             text, message_id=message_id if isinstance(message_id, str) else None
         )
+
+    async def _release_held_user_parts(self, *, before: str | None = None) -> None:
+        """Post held prompts in message order (only those older than *before*)."""
+        held = sorted(
+            self._held_user_parts.items(), key=lambda item: str(item[1].get("messageID"))
+        )
+        for part_id, part in held:
+            if before is not None and str(part.get("messageID")) > before:
+                continue
+            del self._held_user_parts[part_id]
+            await self._post_user_text_part(part, hold=False)
+
+    async def _note_assistant_progress(self, message_id: str, info: _JsonMapping) -> None:
+        """Track the streaming assistant reply that later prompts must follow.
+
+        OpenCode ids sort by creation time, so a user message newer than the
+        streaming reply was queued behind it.
+        """
+        current = self._streaming_assistant_id
+        if _message_is_complete(info) or isinstance(info.get("error"), Mapping):
+            if message_id == current:
+                await self._flush_pending_text()
+                self._streaming_assistant_id = None
+                await self._release_held_user_parts()
+            return
+        if current is not None and message_id <= current:
+            return
+        if current is not None:
+            await self._flush_pending_text()
+        await self._release_held_user_parts(before=message_id)
+        self._streaming_assistant_id = message_id
 
     async def _flush_pending_text(self) -> None:
         """Finalize accumulated assistant text parts as durable chat items."""
@@ -930,21 +1085,21 @@ class OpenCodeNativeForwarder:
         error = event.properties.get("error")
         _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
         await self._flush_pending_text()
-        name = error.get("name") if isinstance(error, Mapping) else None
-        data = error.get("data") if isinstance(error, Mapping) else None
-        if name == _MESSAGE_ABORTED_ERROR:
-            await self._end_turn()
+        status, extra = _error_outcome(error)
+        await self._end_turn(status=status, extra=extra)
+
+    async def _on_session_created(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.created`` — follow a root session the TUI opened.
+
+        Nothing else creates root sessions on this conversation's server after
+        launch, so a new one comes from the TUI (``/new`` or a fork).
+        """
+        info = event.properties.get("info")
+        if not isinstance(info, Mapping) or info.get("parentID"):
             return
-        message = data.get("message") if isinstance(data, Mapping) else None
-        if not isinstance(message, str) or not message.strip():
-            message = "OpenCode session ended with an error."
-        status_code = data.get("statusCode") if isinstance(data, Mapping) else None
-        is_auth = name == "ProviderAuthError" or (name == "APIError" and status_code in (401, 403))
-        extra: _JsonObject = {"output": message.strip()}
-        if is_auth:
-            extra["output"] = f"{message.strip()}\n\n{_OPENCODE_REAUTH_HINT}"
-            extra["reauth_required"] = True
-        await self._end_turn(status=_STATUS_FAILED, extra=extra)
+        opencode_session_id = info.get("id")
+        if isinstance(opencode_session_id, str) and opencode_session_id:
+            self._follow_session(opencode_session_id)
 
     async def _on_compaction_started(self, event: OpenCodeEvent) -> None:
         """Handle ``session.next.compaction.started`` (auto or manual).
@@ -1293,6 +1448,7 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.status": OpenCodeNativeForwarder._on_session_status,
     "session.idle": OpenCodeNativeForwarder._on_session_idle,
     "session.error": OpenCodeNativeForwarder._on_session_error,
+    "session.created": OpenCodeNativeForwarder._on_session_created,
     # Context compaction lifecycle → the web UI's compaction marker. Verified
     # against a real ``opencode serve`` (1.17.7): auto-compaction emits the
     # ``session.next.compaction.{started,ended}`` pair; an explicit
