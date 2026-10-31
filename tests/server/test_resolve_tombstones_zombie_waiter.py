@@ -19,10 +19,12 @@ recur) can never inherit the stale approval.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 
 import pytest
 
+from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.server.routes import sessions as S
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
@@ -38,7 +40,7 @@ def _params(message: str) -> ElicitationRequestParams:
 @pytest.mark.asyncio
 async def test_resolve_of_live_future_also_tombstones_the_verdict():
     sid = "conv_zombie_waiter"
-    eid = "elicit_codex_33333333333333333333333333333333"
+    eid = "elicit_claude_33333333333333333333333333333333"
     fingerprint = S._harness_elicitation_request_fingerprint(_params("Overwrite?"))
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
     S._harness_elicitation_registry[eid] = future
@@ -69,6 +71,21 @@ async def test_resolve_of_live_future_also_tombstones_the_verdict():
         assert tomb.result.content == {"ok": "go"}
         # The answered question's fingerprint rides along for reuse safety.
         assert tomb.request_fingerprint == fingerprint
+        # The hook abandons the zombie only when its read cap expires, and a lapsed
+        # token costs one more connect after the re-mint; the verdict must outlive both.
+        repark_delay_s = (
+            claude_native_hook._PERMISSION_POLL_READ_TIMEOUT_S
+            + claude_native_hook._PERMISSION_RETRY_INITIAL_BACKOFF_S
+            + 2 * claude_native_hook._PERMISSION_CONNECT_TIMEOUT_S
+        )
+        S._harness_pre_resolved_elicitations[eid] = dataclasses.replace(
+            tomb, created_at=tomb.created_at - repark_delay_s
+        )
+        adopted = S._consume_pre_resolved_harness_elicitation(sid, eid, fingerprint)
+        assert adopted is not None and adopted.result == tomb.result, (
+            "the verdict expired before the claude-native hook re-parked the "
+            "abandoned poll, so the answer never reaches the terminal"
+        )
     finally:
         S._harness_elicitation_registry.pop(eid, None)
         S._harness_elicitation_owners.pop(eid, None)
