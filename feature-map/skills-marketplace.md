@@ -16,6 +16,9 @@ Settings → Skills lets a user browse repositories of skills, install the ones 
 
 ## How to get to it (user POV)
 
+- Desktop (web and the Electron shell): Settings → Customize → Skills, at `/settings/skills`. Back at the top of the settings nav returns to the conversation or page you came from.
+- Mobile web: the settings nav is a full-screen overlay; tap Skills to open the section, and Back in the nav returns to the conversation list.
+- `/settings/skills` directly (a bookmark or link): with the feature off the route falls back to Settings → General instead of rendering, and the Skills entry is absent from Customize.
 - Settings → Skills → Browse: pick a source on the left, search, Install on a card; or paste a repository under Add from URL and Preview skills.
 - Settings → Skills → Installed: toggle, Update, Remove, or click a name to read its SKILL.md.
 - New session: type `/` in the composer; installed skills are listed with their repository as the source.
@@ -53,7 +56,7 @@ Preconditions: start the isolated instance with `OMNIGENT_FEATURES=skills_market
 - The content route answers 404 when a skill's stored copy is gone and 409 when it cannot be read, both saying to update or remove the skill; an update that loses a race with a removal drops the object it had stored.
 - Browse: **Refresh** re-fetches a source's catalog past the server's cache; a source removal that is refused says why beside the source; installing from a URL preview marks the card without re-fetching; the slash menu names the repository an installed skill came from.
 - A ref must be a branch or tag. A commit SHA cannot be shallow-cloned by name and fails with a hint.
-- A running session keeps the skills it started with; installs show up on the next session start.
+- A running session picks up installs, updates, removals, enablement, source and policy changes on its next turn (the session's agent revision moves, so the runner refetches the bundle); an open terminal or native TUI harness keeps the skills it launched with until the terminal restarts.
 - Lists are paged (50 per page by default, 200 at most); Settings shows Load more when a page follows.
 - When a user and the org both install the same name, the user's copy wins for that user.
 - Turning the feature off keeps installed rows but stops every reader: the routes, discovery and served bundles.
