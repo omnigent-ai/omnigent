@@ -31,7 +31,7 @@ const TILE_SIZES = {
 };
 
 /** A themed emoji-mart picker. Calls `onSelect` with the chosen unicode glyph. */
-export function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }) {
+function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }) {
   const mode = useResolvedThemeMode();
   return (
     <Suspense fallback={<div className="h-[420px] w-[352px]" aria-hidden />}>
@@ -50,7 +50,7 @@ export function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }
   );
 }
 
-export function ProjectAppearanceTile({
+function ProjectAppearanceTile({
   appearance,
   size,
   className,

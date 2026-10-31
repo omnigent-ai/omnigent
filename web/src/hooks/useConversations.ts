@@ -68,6 +68,7 @@ import {
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
+import { type ProjectAppearance, withProjectAppearance } from "@/lib/projectColors";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
@@ -2739,8 +2740,8 @@ export function useDeleteProject() {
 export function useCreateProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ name, icon, color }: { name: string; icon?: string; color?: string }) =>
-      apiCreateProject(name, icon ? { icon } : color ? { color } : undefined),
+    mutationFn: ({ name, appearance }: { name: string; appearance: ProjectAppearance }) =>
+      apiCreateProject(name, withProjectAppearance({}, appearance)),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },

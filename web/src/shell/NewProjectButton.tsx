@@ -33,11 +33,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
     const trimmed = name.trim();
     if (trimmed === "") return;
     createProject.mutate(
-      {
-        name: trimmed,
-        icon: appearance.icon ?? undefined,
-        color: appearance.color ?? undefined,
-      },
+      { name: trimmed, appearance },
       {
         onSuccess: (project) => {
           setOpen(false);
