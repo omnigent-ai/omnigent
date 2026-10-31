@@ -1,13 +1,14 @@
 """Regression guard for the Debby example's GPT head.
 
 Debby's "GPT" sub-agent must run on the ``codex`` harness, not
-``openai-agents``. The openai-agents harness treats an unpinned model as a
-Databricks model (``is_databricks_model = model is None`` in
-``omnigent/inner/openai_agents_sdk_executor.py``) and, with no
-``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` in the environment, silently falls
-back to ambient Databricks credentials — routing the "GPT" head through the
-Databricks gateway instead of OpenAI. The ``codex`` harness is GPT-only, uses
-OpenAI's native auth, and has no such unpinned-model Databricks fallback.
+``openai-agents``. ``codex`` is the GPT-native harness: it speaks OpenAI's
+Responses API and uses OpenAI's own auth, so an unpinned model resolves to the
+configured provider's default GPT model. This head was originally pinned to
+``codex`` to dodge an ``openai-agents`` bug where an unpinned model opted into
+ambient Databricks credentials; that bug is fixed (see
+``allow_ambient_databricks`` in ``omnigent/inner/openai_agents_sdk_executor.py``,
+which opts in only for explicit ``databricks-`` model names), but ``codex``
+remains the right harness for a GPT head on its own merits.
 
 This is a non-live parse-only check so it runs in the default suite (the
 dir-shaped example's own e2e coverage lives under ``tests/e2e``, which is
@@ -27,11 +28,11 @@ _PACKAGED_DEBBY_DIR = _REPO_ROOT / "omnigent" / "resources" / "examples" / "debb
 
 
 def test_debby_gpt_head_uses_codex_not_openai_agents() -> None:
-    """The GPT head runs on ``codex`` and never silently routes to Databricks.
+    """The GPT head runs on ``codex``, the GPT-native harness.
 
-    If this flips back to ``openai-agents`` with no pinned model, Debby's GPT
-    head falls back to ambient Databricks credentials for any user with a
-    Databricks profile configured — the exact bug this example was fixed for.
+    ``codex`` speaks OpenAI's Responses API and uses OpenAI's own auth. If this
+    flips to ``openai-agents``, Debby's "GPT" head is no longer guaranteed to
+    resolve a GPT model from an OpenAI-compatible provider.
     """
     spec = parse(_DEBBY_DIR)
     by_name = {sub.name: sub for sub in spec.sub_agents}
@@ -41,8 +42,8 @@ def test_debby_gpt_head_uses_codex_not_openai_agents() -> None:
 
     assert gpt.executor.harness_kind == "codex", (
         f"Debby's GPT head must run on the 'codex' harness; got "
-        f"{gpt.executor.harness_kind!r}. 'openai-agents' with no pinned model "
-        f"silently falls back to ambient Databricks credentials."
+        f"{gpt.executor.harness_kind!r}. Only 'codex' guarantees this head "
+        f"resolves a GPT model from an OpenAI-Responses-API provider."
     )
 
     # Belt-and-suspenders: the GPT head must not pin a Databricks model or
