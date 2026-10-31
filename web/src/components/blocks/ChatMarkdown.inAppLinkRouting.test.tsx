@@ -13,6 +13,10 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   isNativeShell: () => true,
 }));
 
+vi.mock("@/lib/fetchSessionHostId", () => ({
+  fetchSessionHostId: vi.fn().mockResolvedValue("local-host"),
+}));
+
 const LINK = "https://example.com/page";
 let openOrNavigate: ReturnType<typeof vi.fn>;
 
@@ -56,13 +60,15 @@ it.each([
   ["plain click", {}],
   ["cmd-click", { metaKey: true }],
   ["ctrl-click", { ctrlKey: true }],
-])("routes an opted-in %s into a new in-app browser tab", (_label, init) => {
+])("routes an opted-in %s into a new in-app browser tab", async (_label, init) => {
   expect(clickLink(LINK, init).defaultPrevented).toBe(true);
-  expect(openOrNavigate).toHaveBeenCalledWith(
-    expect.stringMatching(/^browser-tab:conv-1:[^:]+$/),
-    LINK,
-    undefined,
-    { agent: true },
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenCalledWith(
+      expect.stringMatching(/^browser-tab:conv-1:[^:]+$/),
+      LINK,
+      undefined,
+      { agent: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
+    ),
   );
 });
 

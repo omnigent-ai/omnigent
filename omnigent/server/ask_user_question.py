@@ -53,10 +53,7 @@ def structured_ask_user_question(tool_input: Any) -> dict[str, Any] | None:
                 description = opt.get("description")
                 if isinstance(description, str) and description:
                     option["description"] = description
-                # ``preview`` is an optional richer snippet some
-                # Claude builds attach to an option (rendered as a
-                # <pre> below the option list when selected). Ride
-                # it through verbatim so the UI can surface it.
+                # Optional per-option preview snippet; pass through verbatim for the UI.
                 preview = opt.get("preview")
                 if isinstance(preview, str) and preview:
                     option["preview"] = preview

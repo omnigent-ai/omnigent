@@ -36,7 +36,7 @@ on:
   workflow_dispatch:
     inputs:
       parallelism:
-        description: "Number of pytest workers per UI shard and for browser-contract (-n flag). Empty uses the E2E_UI_PARALLELISM repository variable, else 1 (serial)."
+        description: "Number of pytest workers per shard (-n flag). Empty uses the E2E_UI_PARALLELISM repository variable, else 1 (serial)."
         required: false
         default: ""
 
@@ -158,14 +158,19 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  browser-contract:
-    name: Browser Contract UI
-    # Keep this as a separately visible required-style check. It deliberately
-    # omits the server, runner, harness CLIs, bubblewrap, tmux, and sidecar.
+  browser-contract-shard:
+    name: Browser Contract UI (shard ${{ matrix.shard_id }}/2)
+    # It deliberately omits the server, runner, harness CLIs, bubblewrap, tmux,
+    # and sidecar. The tests are CPU-bound rendering, so they split across
+    # runners rather than xdist workers sharing one runner's CPUs.
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}' && (needs.setup.outputs.ui == 'full' || needs.setup.outputs.ui == 'dependency')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_id: [0, 1]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -195,6 +200,7 @@ jobs:
       # ci.yml skips UI-only changes, so check here that the verify-omnigent
       # feature map still names tests that exist after UI test renames.
       - name: Check verify-omnigent feature map
+        if: matrix.shard_id == 0
         run: uv run pytest tests/dev/test_verify_omnigent_feature_map.py -q
 
       - name: Cache Playwright browsers
@@ -218,22 +224,18 @@ jobs:
       - name: Run browser-contract tests
         env:
           UI_SCOPE: ${{ needs.setup.outputs.ui }}
-          # Same worker count as the UI shards: dispatch input, else the
-          # E2E_UI_PARALLELISM repository variable (unset on fork PRs), else serial.
-          PARALLELISM_INPUT: ${{ inputs.parallelism || vars.E2E_UI_PARALLELISM || '1' }}
+          SHARD_ID: ${{ matrix.shard_id }}
         run: |
-          if ! [[ "$PARALLELISM_INPUT" =~ ^[1-9]$ ]]; then
-            echo "Invalid parallelism input: $PARALLELISM_INPUT (expected 1-9)" >&2
-            exit 1
-          fi
           targets=(tests/browser_ui)
-          extra_args=()
+          extra_args=(--shard-id="$SHARD_ID" --num-shards=2)
           if [[ "$UI_SCOPE" == "dependency" ]]; then
+            # Both required smoke files stay on one shard so the check sees them.
+            if [[ "$SHARD_ID" != 0 ]]; then
+              echo "Dependency smoke runs on shard 0 only."
+              exit 0
+            fi
             targets=(tests/browser_ui/chat/test_transcript_rendering.py tests/browser_ui/files/test_markdown_editor_journey.py)
             extra_args=(-p tests._helpers.required_tests)
-          elif [[ "$PARALLELISM_INPUT" -gt 1 ]]; then
-            # Each worker serves its own copy of the built SPA on a free port.
-            extra_args=(-n "$PARALLELISM_INPUT" --dist=loadfile)
           fi
           time uv run pytest "${targets[@]}" "${extra_args[@]}" \
             -v --tb=long --showlocals -r a \
@@ -247,10 +249,23 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: browser-contract-playwright-${{ github.run_id }}
+          name: browser-contract-playwright-${{ github.run_id }}-shard${{ matrix.shard_id }}
           path: test-results/
           retention-days: 3
           if-no-files-found: ignore
+
+  browser-contract:
+    name: Browser Contract UI
+    # The required check: it passes only when every browser-contract shard did.
+    needs: [setup, browser-contract-shard]
+    if: always() && needs.setup.outputs.matrix != '{"include":[]}' && (needs.setup.outputs.ui == 'full' || needs.setup.outputs.ui == 'dependency')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every shard to pass
+        env:
+          SHARD_RESULT: ${{ needs.browser-contract-shard.result }}
+        run: test "$SHARD_RESULT" = success
 
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
@@ -531,7 +546,7 @@ jobs:
   result:
     name: E2E UI result
     if: always()
-    needs: [setup, build-sidecar, browser-contract, e2e-ui]
+    needs: [setup, build-sidecar, browser-contract-shard, browser-contract, e2e-ui]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

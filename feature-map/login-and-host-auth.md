@@ -54,6 +54,19 @@ be able to write resources without a separate Omnigent account.
   fails with the login command instead. States: missing Databricks SDK extra,
   missing Databricks CLI, first browser login followed by host registration,
   and a saved login reused on the next invocation.
+- `desktop-ssh-connect`: in the desktop app (macOS and Linux), **Connect a host**
+  connects a machine the user reaches over SSH. The app runs the system `ssh`
+  with the user's config, runs `omnigent login` there with the sign-in callback
+  port forwarded to the laptop, then starts `omnigent host --background`.
+  States: consent, trusting a new host key, a key passphrase or password,
+  installing omnigent when it is missing, finishing in the browser (with a
+  confirmation code on OIDC servers), connected (the new host selected),
+  already connected, connected but the new host unconfirmed (the dialog stays
+  open to pick it from the host list), closing the window mid sign-in (nothing
+  left running on the machine), a sign-in link the machine shouldn't print
+  (refused, no browser), and failures, shown only in the app's own window.
+  Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
+  Databricks-managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -89,9 +102,13 @@ be able to write resources without a separate Omnigent account.
 **CLI sign-in:** `omnigent login <server-url>`.
 
 **Host:** `omnigent host <server-url>` (or `--server`), `omnigent host ""` for a
-local server, `--background`, `--no-open`, `--non-interactive`, and the
+local server, `--background`, `--no-open`, `--open-in-desktop` (or
+`OMNIGENT_HOST_OPEN_IN_DESKTOP=1`), `--non-interactive`, and the
 management commands `status`, `stop`, `stop-session`, `reset-id`, `enable`,
-and `disable`.
+and `disable`. With `--open-in-desktop`, a supported desktop app accepts
+the request before navigating or asking for consent. If it cannot accept within
+five seconds, the browser opens instead. URLs with base paths or selectors keep
+their original destination in the browser. `--no-open` suppresses both.
 
 **Web:** a harness that needs sign-in is marked in the harness picker, and a
 session whose host went offline offers reconnect (see [sessions](./sessions.md)).
@@ -100,7 +117,11 @@ session whose host went offline offers reconnect (see [sessions](./sessions.md))
 server; relaunching the app, New Window, deep links, and switching servers on a
 signed-in server; the app's sign-out in Settings, **Server → Sign Out of Server**
 in the native menu, and **Sign out of <server>** in the sidebar server picker (Databricks and OIDC servers; the next Connect opens
-the browser, which is how a user switches accounts).
+the browser, which is how a user switches accounts). To connect a machine over SSH,
+use the SSH field under the `omni host` command (desktop app only; not yet on
+Windows): **Connect new host** in a new session's host menu, or the clone dialog
+(from the header or the reconnect dialog's Clone tab) when no host is online or
+under **Connect another host from your terminal**. Each selects the new host.
 
 **iOS:** Connect on the connect screen to an OIDC server; a server picked in the
 native server menu or the sidebar server picker; relaunching the app, deep links,
@@ -163,6 +184,17 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/host/test_connect.py::test_watch_runner_reports_refused_credentials_as_sign_in`
   (plain `uv run pytest`) checks the sign-in instruction before a connection
   and an ordinary runner fault after one.
+- **`desktop-ssh-connect`:**
+  `tests/e2e/test_desktop_ssh_connect.py::test_ssh_connect_signs_in_through_forward_and_starts_host`
+  runs the app's production connect code against a real `sshd`, with the laptop
+  side in an unprivileged network namespace, through the real omnigent and
+  Databricks CLIs and the mock workspace. It needs Linux with `unshare -rn`,
+  `sshd`, node, openssl and the Databricks CLI; CI runners lack `sshd` and the
+  Databricks CLI, so it skips there. The window's states render from
+  `web/electron/ssh-connect/index.html` with a stub `window.sshConnect` bridge.
+  The SSH field needs the desktop app (`just electron-dev`) on a server that
+  serves this web build. A real Databricks sign-in needs a real remote machine
+  and workspace.
 - **`databricks-credential-kind`:** needs a real workspace and one test
   profile of each kind. No e2e covers the host daemon against a real workspace.
 - **`host-lifecycle`:** run `omnigent host --help` and the management commands
