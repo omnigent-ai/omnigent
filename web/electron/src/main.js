@@ -597,9 +597,9 @@ let reconnectDelaysMs = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 // than two minutes to come back after wake (e.g. a GlobalProtect sign-in).
 // `let` so wiring tests can shrink it via testApi.setReconnectSlowDelayMs.
 let reconnectSlowDelayMs = 60_000;
-// IP access list refusals right after wake are usually the VPN still connecting, so
-// the overlay says the network is blocked only once they have lasted this long.
-// `let` so wiring tests can shrink it via testApi.setBlockedHintDelayMs.
+// A silent reconnect's IP access list refusals are usually the VPN still connecting
+// after wake or idle, so the overlay says the network is blocked only once they have
+// lasted this long. `let` so wiring tests can shrink it via testApi.setBlockedHintDelayMs.
 let blockedHintDelayMs = 30_000;
 
 /**
@@ -944,11 +944,13 @@ const UNREACHABLE_NET_ERRORS = new Set([
 ]);
 
 // Pending silent reconnects behind the overlay: win → { serverUrl, returnUrl,
-// attempt, timer, hint, finalMessage, network, blocked, blockedSince }.
+// attempt, timer, hint, finalMessage, network, blocked, blockedHintAt, hintTimer }.
 const reconnects = new WeakMap();
 
 function cancelReconnect(win) {
-  clearTimeout(reconnects.get(win)?.timer);
+  const state = reconnects.get(win);
+  clearTimeout(state?.timer);
+  clearTimeout(state?.hintTimer);
   reconnects.delete(win);
   reconnectOverlay.hide(win);
 }
@@ -981,33 +983,38 @@ function stopReconnect(win) {
  * false once the schedule runs out. `finalMessage` is what Cancel shows. A
  * `network` failure (unreachable, or blocked by the IP access list) never runs
  * out: past the fast schedule it retries every reconnectSlowDelayMs. A `blocked`
- * failure's hint waits until the refusals have lasted blockedHintDelayMs.
+ * failure's hint waits until the refusals have lasted blockedHintDelayMs, unless
+ * they started with an explicit Connect.
  */
 function scheduleReconnect(
   win,
   serverUrl,
   returnUrl,
-  { hint, finalMessage, network = false, blocked = false },
+  { hint, finalMessage, network = false, blocked = false, interactive = false },
 ) {
   restartReconnectsOnWake();
   const previous = reconnects.get(win);
   const same = previous?.serverUrl === serverUrl;
   clearTimeout(previous?.timer);
+  clearTimeout(previous?.hintTimer);
   const attempt = same ? previous.attempt : 0;
   const delayMs = reconnectDelaysMs[attempt] ?? (network ? reconnectSlowDelayMs : undefined);
   if (delayMs === undefined) return false;
   const now = Date.now();
+  const previousHintAt = same ? previous.blockedHintAt : null;
+  const blockedHintAt = interactive ? now : (previousHintAt ?? now + blockedHintDelayMs);
   const state = {
     serverUrl,
     // Never logged: it can name a conversation.
     returnUrl: returnUrl ?? (same ? previous.returnUrl : undefined) ?? serverUrl,
     attempt: attempt + 1,
     timer: null,
+    hintTimer: null,
     hint,
     finalMessage,
     network,
     blocked,
-    blockedSince: blocked ? ((same ? previous.blockedSince : null) ?? now) : null,
+    blockedHintAt: blocked ? blockedHintAt : null,
   };
   const origin = originOf(serverUrl);
   console.log("[omnigent] databricks auth: reconnect scheduled", {
@@ -1033,8 +1040,13 @@ function scheduleReconnect(
   };
   state.timer = setTimeout(fire, delayMs);
   reconnects.set(win, state);
-  const holdHint = blocked && now - state.blockedSince < blockedHintDelayMs;
-  reconnectOverlay.show(win, holdHint ? "" : hint);
+  const hintDelayMs = blocked ? state.blockedHintAt - now : 0;
+  reconnectOverlay.show(win, hintDelayMs > 0 ? "" : hint);
+  if (hintDelayMs > 0) {
+    state.hintTimer = setTimeout(() => {
+      if (reconnects.get(win) === state) reconnectOverlay.show(win, hint);
+    }, hintDelayMs);
+  }
   return true;
 }
 
@@ -1057,7 +1069,7 @@ function restartReconnectsOnWake() {
         reason,
       });
       state.attempt = 0;
-      state.blockedSince = null;
+      state.blockedHintAt = null;
       if (!scheduleReconnect(win, state.serverUrl, state.returnUrl, state)) stopReconnect(win);
     }
   };
@@ -1087,7 +1099,12 @@ function unreachableMessage(serverUrl, blocked = false) {
 
 const UNAVAILABLE_HINT = "Databricks isn't responding.";
 
-function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedReturnUrl } = {}) {
+function showDatabricksAuthRequired(
+  win,
+  failedUrl,
+  error,
+  { returnUrl: failedReturnUrl, interactive = false } = {},
+) {
   if (win.isDestroyed()) return;
   diagnostics.record("auth_required", {
     origin: originOf(failedUrl),
@@ -1134,6 +1151,7 @@ function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedRe
       finalMessage: message,
       network: unreachable,
       blocked,
+      interactive,
     });
   if (!retrying) showConnectFailure(win, serverUrl, message);
 }
@@ -2254,9 +2272,10 @@ async function loadServerUrl(
           } else {
             // The account URL's workspace was unreachable: reconnect to that workspace.
             const workspaceUrl = error.storedOrigin && databricksWorkspaceUiUrl(error.storedOrigin);
-            if (workspaceUrl) {
-              showDatabricksAuthRequired(win, workspaceUrl, error, { returnUrl: workspaceUrl });
-            } else showDatabricksAuthRequired(win, serverUrl, error, { returnUrl: target });
+            showDatabricksAuthRequired(win, workspaceUrl || serverUrl, error, {
+              returnUrl: workspaceUrl || target,
+              interactive,
+            });
           }
         }
         throw error;

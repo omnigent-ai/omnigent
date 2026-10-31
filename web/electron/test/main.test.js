@@ -1924,7 +1924,7 @@ describe("Databricks auth mode wiring", () => {
         });
         t.after(h.cleanup);
         h.api.setReconnectDelaysMs(retries);
-        // The wording an IP access list refusal shows once it has lasted.
+        // Show the blocked-network hint right away so its wording can be asserted.
         h.api.setBlockedHintDelayMs(0);
         if (failure) {
           // oxlint-disable-next-line no-await-in-loop
@@ -3954,6 +3954,26 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     }
   }
 
+  it("waits again for the blocked-network hint after an unreachable retry", async (t) => {
+    const failures = [
+      Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+      new TypeError("fetch failed"),
+      Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+    ];
+    // The unreachable stretch outlasts the first blocked wait.
+    const h = browserHarness(t, [10, 200, 60_000], {
+      ensureSession: async () => {
+        throw failures.shift();
+      },
+    });
+    h.api.setBlockedHintDelayMs(100);
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    await until(() => h.calls.auth.length === 3, "the second blocked retry");
+    await until(() => h.overlay.hint === blocked, "the blocked-network hint");
+    assert.deepEqual(h.overlay.shows, ["", unreachable, "", blocked]);
+    h.api.cancelReconnect(h.win);
+  });
+
   it("returns a failed deep link to its conversation", async (t) => {
     let first = true;
     const h = browserHarness(t, [25], {
@@ -4134,6 +4154,32 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     assert.equal(network.browserSignIns, 0);
   });
 
+  it("shows the blocked-network hint when the wait ends, between retries", async (t) => {
+    const { h, network } = await connected(t, [60_000]);
+    h.api.setBlockedHintDelayMs(30);
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    assert.equal(h.overlay.hint, "");
+    await until(() => h.overlay.hint === `${blocked}.`, "the blocked-network hint");
+    // Connect and the blocked renewal only: the next retry is a minute away.
+    assert.equal(network.sessionCreates, 2);
+    h.api.cancelReconnect(h.win);
+  });
+
+  it("drops the pending blocked-network hint once the reconnect succeeds", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    h.api.setBlockedHintDelayMs(100);
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 2, "the reconnect");
+    await wait(150);
+    assert.equal(h.overlay.hint, null);
+    assert.deepEqual(h.overlay.shows, [""]);
+  });
+
   it("keeps retrying when Connect is clicked off the VPN, then reconnects", async (t) => {
     const { h, network } = await connected(t, [30, 30, 30]);
     h.api.registerIpc();
@@ -4152,11 +4198,15 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       requestId: "connect",
     });
     assert.equal(result.reconnecting, true);
-    // Connect off the VPN puts the overlay over the setup page and restarts the loop.
-    assert.equal(h.overlay.hint, "");
+    // Connect off the VPN puts the overlay over the setup page and restarts the loop,
+    // saying right away that the network is blocked.
+    assert.equal(h.overlay.hint, `${blocked}.`);
+    const sinceConnect = h.overlay.shows.length - 1;
     assert.equal(h.calls.loadFile.length, 1);
     // The loop restarted: another blocked background attempt follows Connect.
     await until(() => network.sessionCreates === 4, "a blocked retry after Connect");
+    await until(() => h.overlay.shows.length > sinceConnect + 1, "the retry's overlay");
+    assert.deepEqual(new Set(h.overlay.shows.slice(sinceConnect)), new Set([`${blocked}.`]));
 
     network.verdict = "allow";
     await until(() => h.calls.loadURL.length === 2, "the reconnect");
@@ -4219,7 +4269,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     h.api.setReconnectSlowDelayMs(20);
     network.verdict = "blocked";
     assert.equal((await connect()).reconnecting, true);
-    assert.equal(h.overlay.hint, "");
+    assert.equal(h.overlay.hint, `${blocked}.`);
     await until(() => network.sessionCreates === 2, "a blocked retry");
     network.verdict = "allow";
     await until(() => h.calls.loadURL.length === 1, "the reconnect");
