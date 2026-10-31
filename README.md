@@ -351,7 +351,7 @@ login it wrote to disk. That also means `--model` is refused rather than
 silently dropped: both run their account-default model. To pin one, configure an
 `acp:` agent whose command passes the vendor's own model flag.
 
-Use the vendor login rather than an API key. A builtin ACP row has no
+Use the vendor login rather than an API key. A built-in ACP row has no
 `env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
 credential allowlist, so exporting it in your shell does not reach the agent.
 If you need the key route, pass it explicitly with
