@@ -48,6 +48,14 @@ def _check_member(member: tarfile.TarInfo) -> None:
         raise SkillTarballError(f"unsafe path: {member.name!r}")
 
 
+def is_root_manifest(member_name: str) -> bool:
+    """Whether a tar member is the skill's own ``SKILL.md`` (``./`` prefixes allowed).
+
+    Compares path parts, so a ``.SKILL.md`` or ``x/SKILL.md`` is never taken for it.
+    """
+    return [part for part in PurePosixPath(member_name).parts if part != "."] == ["SKILL.md"]
+
+
 def validate_skill_tarball(data: bytes) -> UnpackedSize:
     """Reject links, traversal, bombs, and a tarball without a root ``SKILL.md``.
 
@@ -63,10 +71,7 @@ def validate_skill_tarball(data: bytes) -> UnpackedSize:
             total += member.size
             if entries > MAX_SKILL_ENTRIES or total > MAX_SKILL_BYTES:
                 raise SkillTarballError("skill is too large")
-            if member.isfile() and PurePosixPath(member.name).as_posix() in {
-                "SKILL.md",
-                "./SKILL.md",
-            }:
+            if member.isfile() and is_root_manifest(member.name):
                 has_manifest = True
     if not has_manifest:
         raise SkillTarballError("skill tarball has no SKILL.md at its root")

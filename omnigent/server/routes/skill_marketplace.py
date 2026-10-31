@@ -35,7 +35,12 @@ from omnigent.skills.limits import (
     MAX_NAMES_PER_INSTALL,
     MAX_SOURCE_PATH_CHARS,
 )
-from omnigent.skills.overlay import SkillTarballError, UnpackedSize, validate_skill_tarball
+from omnigent.skills.overlay import (
+    SkillTarballError,
+    UnpackedSize,
+    is_root_manifest,
+    validate_skill_tarball,
+)
 from omnigent.skills.policy import DEFAULT_POLICY, SkillPolicyError, SkillsMarketplacePolicy
 from omnigent.skills.service import (
     FetchedCatalog,
@@ -725,7 +730,7 @@ def _read_skill_markdown(tarball: bytes) -> str:
     """The archive's ``SKILL.md``, or ``""``; raises like :mod:`tarfile` on a bad archive."""
     with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:*") as tf:
         for member in tf:
-            if member.isfile() and member.name.lstrip("./") == "SKILL.md":
+            if member.isfile() and is_root_manifest(member.name):
                 handle = tf.extractfile(member)
                 return handle.read().decode("utf-8", errors="replace") if handle else ""
     return ""

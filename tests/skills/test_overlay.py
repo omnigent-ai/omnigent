@@ -142,3 +142,12 @@ def test_overlay_targets_a_child_agents_directory() -> None:
     ]
     assert bundle_skill_names(merged, prefix="agents/child/") == {"own", "review"}
     assert bundle_skill_names(merged) == set()
+
+
+def test_only_the_root_skill_md_is_the_manifest() -> None:
+    from omnigent.skills.overlay import is_root_manifest
+
+    assert is_root_manifest("SKILL.md") and is_root_manifest("./SKILL.md")
+    assert not is_root_manifest(".SKILL.md") and not is_root_manifest("docs/SKILL.md")
+    with pytest.raises(SkillTarballError, match=r"no SKILL\.md at its root"):
+        validate_skill_tarball(_tar({".SKILL.md": b"decoy"}))

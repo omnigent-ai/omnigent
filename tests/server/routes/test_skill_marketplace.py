@@ -391,6 +391,14 @@ async def test_content_names_a_missing_or_unreadable_stored_copy(market) -> None
     skill_id = installed.json()["data"][0]["id"]
     location = await _location(app, skill_id)
 
+    # A decoy whose name only strips to SKILL.md character by character is not the manifest.
+    artifact_store.put(
+        location,
+        skill_tarball({".SKILL.md": b"decoy", "./SKILL.md": b"---\nname: review\n---\nreal"}),
+    )
+    shown = await client.get(f"/v1/installed-skills/{skill_id}/content")
+    assert shown.json()["markdown"].endswith("real")
+
     artifact_store.put(location, b"not a tarball")
     unreadable = await client.get(f"/v1/installed-skills/{skill_id}/content")
     assert unreadable.status_code == 409
