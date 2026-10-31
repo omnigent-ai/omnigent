@@ -1,0 +1,51 @@
+name: Merge Ready expiry
+
+# Invalidate expired green statuses through the gate's lightweight expiry path.
+# Legacy statuses still need a full evaluation; the gate owns all status updates.
+# Dispatch at most 50 PRs per sweep, prioritizing expired deadlines over backfill.
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: List all candidates and deferred count without reevaluating them.
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: merge-ready-expiry
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+      actions: write
+    steps:
+      - name: Check out trusted sweep
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts/merge-ready
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Reevaluate expired green statuses
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        with:
+          retries: 3
+          script: |
+            const sweep = require("./.github/scripts/merge-ready/sweep.js");
+            await sweep({
+              github, context, core,
+              dryRun: context.eventName !== "schedule" && process.env.DRY_RUN !== "false",
+            });

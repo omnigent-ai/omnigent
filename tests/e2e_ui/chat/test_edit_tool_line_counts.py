@@ -1,6 +1,6 @@
-"""E2E: real ``sys_os_edit`` outcomes cross the server and runner into edit rows.
+"""E2E: real ``sys_os_edit`` and ``sys_os_write`` outcomes cross the server and runner into rows.
 
-An applied edit shows line counts after its title; a missed edit shows its error when expanded.
+Applied edits and new-file writes show line counts; a missed edit shows its error when expanded.
 """
 
 from __future__ import annotations
@@ -37,13 +37,14 @@ _GREETING = (
 )
 _OLD_LINES = '    print("Hello, " + name)\n    print("Welcome back")\n    print("See you soon")\n'
 _NEW_LINES = '    message = f"Hello, {name}! Welcome back."\n    print(message)\n'
+_NOTES = "# Notes\n\n- Greeting tidied.\n"
 
 _AGENT_YAML = """\
 spec_version: 1
 name: {name}
 prompt: |
   You are a deterministic test assistant. When asked to tidy the greeting you
-  call sys_os_edit twice and then reply with one short sentence.
+  call sys_os_edit twice and sys_os_write once, then reply with one short sentence.
 
 executor:
   model: {model}
@@ -58,12 +59,8 @@ os_env:
 """
 
 
-def _edit_call(call_id: str, arguments: dict[str, str]) -> dict[str, object]:
-    return {
-        "tool_calls": [
-            {"call_id": call_id, "name": "sys_os_edit", "arguments": json.dumps(arguments)}
-        ]
-    }
+def _tool_call(call_id: str, name: str, arguments: dict[str, str]) -> dict[str, object]:
+    return {"tool_calls": [{"call_id": call_id, "name": name, "arguments": json.dumps(arguments)}]}
 
 
 @pytest.fixture
@@ -72,7 +69,7 @@ def edit_session(
     runner_id: str,
     mock_llm_server_url: str,
 ) -> Iterator[tuple[str, str, Path]]:
-    """A runner-bound session whose turn applies one edit and fails another.
+    """A runner-bound session whose turn applies one edit, fails another and writes a new file.
 
     :returns: ``(base_url, session_id, workspace)``.
     """
@@ -85,13 +82,18 @@ def edit_session(
         configure_mock_llm(
             mock_llm_server_url,
             [
-                _edit_call(
+                _tool_call(
                     "call_edit_greeting",
+                    "sys_os_edit",
                     {"path": "greet.py", "oldText": _OLD_LINES, "newText": _NEW_LINES},
                 ),
-                _edit_call(
+                _tool_call(
                     "call_edit_settings",
+                    "sys_os_edit",
                     {"path": "settings.py", "oldText": "DEBUG = True", "newText": "DEBUG = False"},
+                ),
+                _tool_call(
+                    "call_write_notes", "sys_os_write", {"path": "notes.md", "content": _NOTES}
                 ),
             ],
             key=model,
@@ -121,7 +123,7 @@ def test_edit_rows_show_line_counts_and_diff(
     request: pytest.FixtureRequest,
     edit_session: tuple[str, str, Path],
 ) -> None:
-    """An applied edit shows its line counts; a failed edit's error waits behind the expand."""
+    """Applied edits and new files show line counts; a failed edit's error waits behind expand."""
     base_url, session_id, workspace = edit_session
     # Open the recorded page only after the session and runner are ready.
     page: Page = request.getfixturevalue("page")
@@ -129,11 +131,12 @@ def test_edit_rows_show_line_counts_and_diff(
 
     composer = page.get_by_placeholder(_COMPOSER)
     expect(composer).to_be_visible(timeout=30_000)
-    composer.fill("Tidy the greeting and turn off debug.")
+    composer.fill("Tidy the greeting, turn off debug and write notes.")
     page.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator(_ASSISTANT, has_text=_REPLY).first).to_be_visible(timeout=90_000)
     assert (workspace / "greet.py").read_text() == _GREETING.replace(_OLD_LINES, _NEW_LINES)
     assert (workspace / "settings.py").read_text() == "DEBUG = False\n"
+    assert (workspace / "notes.md").read_text() == _NOTES
 
     worked = page.get_by_test_id("turn-worked-fold")
     expect(worked).to_be_visible(timeout=30_000)
@@ -177,3 +180,10 @@ def test_edit_rows_show_line_counts_and_diff(
     expect(failure).to_contain_text(re.compile(r"Could not find oldText in '.*settings\.py'"))
     failed.click()
     expect(failure).not_to_be_visible()
+
+    # The runner's write record says the file is new, so every line counts as added.
+    written = page.locator('[data-slot="collapsible-trigger"]', has_text="notes.md").first
+    expect(written.get_by_test_id("tool-line-counts")).to_have_text("+3")
+    written.click()
+    new_file = written.locator("xpath=..").locator('[data-language="diff"]')
+    expect(new_file).to_contain_text("+- Greeting tidied.")

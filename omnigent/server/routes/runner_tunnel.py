@@ -28,7 +28,7 @@ from typing import cast
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from omnigent.debug_logging import debug_event, set_current_user_id
+from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
@@ -235,6 +235,7 @@ def create_runner_tunnel_router(
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    admit_managed_runner: Callable[[str], bool] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
@@ -255,6 +256,8 @@ def create_runner_tunnel_router(
     :param on_runner_connect: Optional async callback fired when a
         runner tunnel is established. Receives the ``runner_id`` and connection.
         Used to re-assign sessions on runner reconnect.
+    :param admit_managed_runner: Optional binding-token admission check before
+        registration, used by sandbox profiles to fence stale-runner replacement.
     :param auth_provider: Optional auth provider for user identity
         extraction. When set, runner listing is scoped to the
         caller's own runners and tunnel registration records
@@ -350,6 +353,7 @@ def create_runner_tunnel_router(
             and session.owner != user_id
         ):
             online = False
+        add_audit_attrs(runner_id=runner_id, runner_online=online)
         result: dict[str, str | bool] = {"runner_id": runner_id, "online": online}
         if not online and runner_exit_reports is not None:
             # Host-daemon report that the runner process died (exit code
@@ -499,6 +503,7 @@ def create_runner_tunnel_router(
             auth_provider=auth_provider,
             is_loopback=is_loopback,
         )
+        binding_token_owner = tunnel_owner is None and auth_provider is not None
         if tunnel_owner is None and auth_provider is not None:
             # A server-managed sandbox runner authenticates with a
             # server-minted binding token (the token-binding gate above
@@ -527,6 +532,7 @@ def create_runner_tunnel_router(
         session: RunnerSession | None = None
         ended_by: str | None = None
         peer_close_code: int | None = None
+        receive_task: asyncio.Task[None] | None = None
         owned: list[asyncio.Task[None]] = []
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
@@ -590,6 +596,13 @@ def create_runner_tunnel_router(
             #    (and an unauthenticated non-loopback peer already
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
+            if (
+                binding_token_owner
+                and admit_managed_runner is not None
+                and not await asyncio.to_thread(admit_managed_runner, runner_id)
+            ):
+                await ws.close(code=4004, reason="runner binding was replaced")
+                return
             session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
             session.diagnostics.settings.update(
                 tunnel_side="server",
@@ -751,6 +764,14 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
+                # A sender failure can win exception handling while receive has the
+                # actual peer close. Preserve it for lifecycle reconciliation.
+                if receive_task is not None and not receive_task.cancelled():
+                    receive_error = receive_task.exception()
+                    if isinstance(receive_error, WebSocketDisconnect):
+                        peer_close_code = receive_error.code
+                        session.peer_close_reason = receive_error.reason or None
+                        shutdown_state.note_tunnel_close_code(peer_close_code)
                 # Snapshot before deregister records its own cleanup close on the session.
                 session.ended = TunnelEnd(
                     at=ended_at,

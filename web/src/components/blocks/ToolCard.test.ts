@@ -530,6 +530,47 @@ describe("ToolCard registered views", () => {
     expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/a.py (each match)+1-1");
   });
 
+  it("shows a write that created its file like an edit, counted and all added", async () => {
+    // WHY: a new file's every line is an addition, so it reads the same as an edit.
+    await registerRealView("Write");
+    const { container } = renderCard({
+      name: "Write",
+      arguments: { file_path: "/repo/notes.md", content: "# Notes\n\n- one\n" },
+      output: "File created successfully at: /repo/notes.md",
+      state: "output-available",
+    });
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(trigger.textContent).toBe("Write /repo/notes.md+3");
+    expect(within(screen.getByTestId("tool-line-counts")).getByText("+3")).toHaveClass(
+      "text-green-600",
+    );
+    fireEvent.click(trigger);
+    expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
+    const body = container.querySelector<HTMLElement>('[data-slot="collapsible-content"]')!;
+    expect(within(body).getByText("+3").parentElement?.textContent).toBe(
+      "/repo/notes.md (new file)+3",
+    );
+    expect(body.textContent).toContain("+- one");
+    expect(screen.queryByText("Content")).toBeNull();
+  });
+
+  it("shows a write over an existing file as its content, with no counts", async () => {
+    await registerRealView("Write");
+    const { container } = renderCard({
+      name: "Write",
+      arguments: { file_path: "/repo/notes.md", content: "# Notes\n" },
+      output: "The file /repo/notes.md has been updated successfully.",
+      state: "output-available",
+    });
+    expect(screen.queryByTestId("tool-line-counts")).toBeNull();
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("/repo/notes.md (whole file written)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy file" })).toBeInTheDocument();
+    const body = container.querySelector<HTMLElement>('[data-slot="collapsible-content"]')!;
+    expect(body.textContent).toContain("# Notes");
+    expect(body.textContent).not.toContain("+# Notes");
+  });
+
   it.each([
     {
       producer: "Codex declined patch",
