@@ -714,7 +714,11 @@ async def test_subagent_idle_observation_preserves_timing_and_deduplication(
             await tick()
             if supports_idle or cycle == 0:
                 count += 1
-                assert status_events[-1] == {"type": "subagent.status", "data": {"idle": True}}
+                # The child's last message has no turn-ending stop reason.
+                assert status_events[-1] == {
+                    "type": "subagent.status",
+                    "data": {"idle": True, "turn_completed": False},
+                }
             await tick()
             state = forwarder._read_subagent_forward_state(bridge_dir)
             await tick()
@@ -875,6 +879,169 @@ async def test_subagent_idle_observation_retries_and_resumes_existing_checkpoint
         else [{"type": "subagent.status", "data": {"idle": True}}] * 2
     )
     assert state.subagents["idle-worker"].last_status == "idle"
+
+
+_CHILD_TOOL_CALL = {
+    "isSidechain": True,
+    "type": "assistant",
+    "uuid": "child-call",
+    "message": {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_sleep",
+                "name": "Bash",
+                "input": {"command": "sleep 45"},
+            }
+        ],
+        "stop_reason": "tool_use",
+    },
+}
+_CHILD_TOOL_RESULT = {
+    "isSidechain": True,
+    "type": "user",
+    "uuid": "child-result",
+    "message": {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "toolu_sleep", "content": "ok"}],
+    },
+}
+_CHILD_FINAL_REPLY = {
+    "isSidechain": True,
+    "type": "assistant",
+    "uuid": "child-reply",
+    "message": {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "The check passed."}],
+        "stop_reason": "end_turn",
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("records", "turn_completed"),
+    [
+        pytest.param([_CHILD_TOOL_CALL], False, id="waiting-on-tool-call"),
+        pytest.param(
+            [_CHILD_TOOL_CALL, _CHILD_TOOL_RESULT], False, id="tool-result-pending-reply"
+        ),
+        pytest.param(
+            [_CHILD_TOOL_CALL, _CHILD_TOOL_RESULT, _CHILD_FINAL_REPLY], True, id="final-reply"
+        ),
+    ],
+)
+async def test_subagent_idle_observation_reports_whether_child_turn_ended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    records: list[dict[str, Any]],
+    turn_completed: bool,
+) -> None:
+    now = 1000.0
+    monkeypatch.setattr(
+        forwarder, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic)
+    )
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="worker",
+        agent_type="general-purpose",
+        description="slow check",
+        tool_use_id="toolu_worker",
+        transcript_records=records,
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "worker": forwarder.SubagentEntry(
+                subagent_id="worker", child_conversation_id="conv_child"
+            )
+        }
+    )
+    status_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": "item"} for _ in body])
+        status_events.append(body)
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _tick in range(2):
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(),
+                item_retry_tracker=forwarder._PostRetryTracker(),
+                status_retry_tracker=forwarder._PostRetryTracker(),
+            )
+            now += forwarder._SUBAGENT_IDLE_THRESHOLD_S + 0.001
+
+    assert status_events[-1] == {
+        "type": "subagent.status",
+        "data": {"idle": True, "turn_completed": turn_completed},
+    }
+    restored = forwarder._read_subagent_forward_state(bridge_dir)
+    assert restored.subagents["worker"].turn_completed is turn_completed
+
+
+async def test_session_rotation_settles_children_still_marked_working(tmp_path: Path) -> None:
+    """After ``/clear`` or a fork the old children are no longer read, so none may stay working."""
+    bridge_dir = tmp_path / "bridge"
+    entries = [
+        forwarder.SubagentEntry(
+            subagent_id="running", child_conversation_id="conv_running", last_status="running"
+        ),
+        forwarder.SubagentEntry(
+            subagent_id="mid-tool",
+            child_conversation_id="conv_mid_tool",
+            last_status="idle",
+            turn_completed=False,
+        ),
+        forwarder.SubagentEntry(
+            subagent_id="done",
+            child_conversation_id="conv_done",
+            last_status="idle",
+            turn_completed=True,
+        ),
+        forwarder.SubagentEntry(
+            subagent_id="older-idle", child_conversation_id="conv_older_idle", last_status="idle"
+        ),
+        forwarder.SubagentEntry(
+            subagent_id="failed", child_conversation_id="conv_failed", last_status="failed"
+        ),
+        forwarder.SubagentEntry(subagent_id="undiscovered", child_conversation_id=""),
+    ]
+    forwarder._write_subagent_forward_state(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={entry.subagent_id: entry for entry in entries}),
+    )
+    posted: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(503 if "conv_running" in request.url.path else 202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._settle_rotated_subagents(
+            client, bridge_dir, forwarder._SubagentStatusCapability()
+        )
+
+    idle = {"type": "subagent.status", "data": {"idle": True}}
+    assert posted == [
+        ("/v1/sessions/conv_running/events", idle),
+        ("/v1/sessions/conv_mid_tool/events", idle),
+    ]
 
 
 @pytest.mark.asyncio

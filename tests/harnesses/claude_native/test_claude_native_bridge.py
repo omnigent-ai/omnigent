@@ -1542,6 +1542,161 @@ def test_native_agent_tool_result_carries_only_completion_provenance(
     assert response_id == "active"
 
 
+@pytest.mark.parametrize(
+    "tool_use_result,task_id",
+    [
+        ({"stdout": "", "interrupted": False, "backgroundTaskId": "bh5h2361s"}, "bh5h2361s"),
+        ({"stdout": "ok", "interrupted": False}, None),
+        ({"backgroundTaskId": ""}, None),
+    ],
+)
+def test_bash_tool_result_carries_background_task_id(
+    tmp_path: Path, tool_use_result: dict[str, Any], task_id: str | None
+) -> None:
+    _, _, items = _read_native_user(
+        tmp_path,
+        [{"type": "tool_result", "tool_use_id": "tool-1", "content": "Running in background"}],
+        toolUseResult=tool_use_result,
+    )
+    [item] = items
+    assert item.item_type == "function_call_output"
+    assert item.background_task_id == task_id
+
+
+@pytest.mark.parametrize(
+    "content,interrupts_turn",
+    [
+        ("[Request interrupted by user]", True),
+        ([{"type": "text", "text": "[Request interrupted by user]"}], True),
+        ([{"type": "text", "text": "[Request interrupted by user for tool use]"}], True),
+        ("Why did you print [Request interrupted by user]?", False),
+        (
+            [
+                {"type": "text", "text": "[Request interrupted by user]"},
+                {"type": "text", "text": "try again"},
+            ],
+            False,
+        ),
+        ("stop", False),
+    ],
+)
+def test_interrupt_record_marks_turn_interrupted(
+    tmp_path: Path, content: object, interrupts_turn: bool
+) -> None:
+    _, _, items = _read_native_user(tmp_path, content)
+    [item] = items
+    assert item.interrupts_turn is interrupts_turn
+
+
+_SHELL_NOTIFICATION = (
+    "<task-notification>\n<task-id>bh5h2361s</task-id>\n<status>{status}</status>\n"
+    '<summary>Background command "Long background job" {status}</summary>\n'
+    "</task-notification>"
+)
+
+
+@pytest.mark.parametrize("queued", [None, "task-notification"])
+@pytest.mark.parametrize(
+    "status,finished",
+    [
+        ("completed", ("bh5h2361s",)),
+        ("failed", ("bh5h2361s",)),
+        ("killed", ("bh5h2361s",)),
+        ("running", ()),
+    ],
+)
+def test_task_notification_reports_finished_task_ids(
+    tmp_path: Path, queued: str | None, status: str, finished: tuple[str, ...]
+) -> None:
+    _, _, items = _read_native_user(
+        tmp_path, _SHELL_NOTIFICATION.format(status=status), queued=queued
+    )
+    if queued and not finished:
+        assert items == []
+        return
+    [item] = items
+    assert item.data["is_meta"] is True
+    assert item.finished_task_ids == finished
+    assert item.interrupts_turn is False
+
+
+@pytest.mark.parametrize(
+    "entries,turn_completed",
+    [
+        ([], None),
+        ([{"type": "custom-title", "customTitle": "Renamed"}], None),
+        ([{"type": "user", "message": {"role": "user", "content": "go"}}], False),
+        (
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Done."}],
+                        "stop_reason": "end_turn",
+                    },
+                }
+            ],
+            True,
+        ),
+        (
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Checking."},
+                            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+                        ],
+                        "stop_reason": "tool_use",
+                    },
+                }
+            ],
+            False,
+        ),
+        (
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Partial"}],
+                        "stop_reason": None,
+                    },
+                }
+            ],
+            False,
+        ),
+        (
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Done."}],
+                        "stop_reason": "end_turn",
+                    },
+                },
+                {"type": "custom-title", "customTitle": "Renamed"},
+            ],
+            True,
+        ),
+    ],
+)
+def test_transcript_read_reports_whether_latest_turn_completed(
+    tmp_path: Path, entries: list[dict[str, Any]], turn_completed: bool | None
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("".join(_transcript_line(entry) for entry in entries))
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_turn_completed is turn_completed
+
+
 def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
     """
     An ``isCompactSummary`` user record is flagged, not rendered as a bubble.

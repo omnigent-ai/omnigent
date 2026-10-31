@@ -297,6 +297,7 @@ from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
 from omnigent.server.subagent_activity import (
+    claude_subagent_returned,
     native_subagent_terminal_status,
     record_subagent_activity,
 )
@@ -1122,7 +1123,8 @@ def register_events_routes(
           starting/steering a task.
         - ``"subagent.status"`` with ``data.idle=true`` publishes idle status
           for transcript inactivity without forwarding a completion
-          to the runner.
+          to the runner. ``data.turn_completed=false`` skips it until the
+          parent records the child's result.
         - ``"external_model_change"`` persists a terminal-observed
           model switch to ``model_override`` and publishes a
           ``session.model`` SSE event so the web picker reflects it.
@@ -2341,6 +2343,11 @@ def register_events_routes(
             )
             if body.type == _SUBAGENT_STATUS_TYPE:
                 # A transcript lull publishes idle but is not a runner completion.
+                if body.data.get("turn_completed") is False and not (
+                    await claude_subagent_returned(conv, conversation_store)
+                ):
+                    # The child is waiting on a tool call, so it is still working.
+                    return {"queued": False}
                 _publish_status(
                     session_id,
                     "idle",

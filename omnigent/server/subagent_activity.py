@@ -136,6 +136,14 @@ async def _recorded_completion_status(
     return None
 
 
+async def claude_subagent_returned(child: Conversation, store: ConversationStore) -> bool:
+    """Whether the parent already holds this Claude child's final result."""
+    if child.parent_conversation_id is None:
+        return False
+    status = await _recorded_completion_status(child.parent_conversation_id, child, store)
+    return status is not None
+
+
 def _native_request_id(child_id: str, turn_id: str, store: ConversationStore) -> str | None:
     """Find the request preceding this response, skipping native context turns."""
     after: str | None = None
@@ -347,6 +355,11 @@ async def _record_claude_subagent_return(
                     turn_id=child.labels.get("omnigent.claude_native.tool_use_id") or child.id,
                     status=status,
                 )
+                if isinstance(item, ConversationItem) and not item.deduplicated:
+                    from omnigent.server.routes._sessions.helpers import _publish_status
+
+                    # A child waiting on a tool call stays working until its result returns.
+                    _publish_status(child.id, "idle")
         if not page.has_more or page.last_id is None:
             return
         after = page.last_id

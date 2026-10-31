@@ -243,6 +243,70 @@ async def test_subagent_idle_publishes_status_without_completion(
     route.telemetry.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("turn_fields", "status_after_lull"),
+    [
+        pytest.param({"turn_completed": False}, "running", id="waiting-on-tool-call"),
+        pytest.param({"turn_completed": True}, "idle", id="turn-completed"),
+        pytest.param({}, "idle", id="older-forwarder"),
+    ],
+)
+async def test_claude_child_lull_mid_tool_call_stays_working_until_result_returns(
+    status_route: _StatusRoute, turn_fields: dict[str, bool], status_after_lull: str
+) -> None:
+    route = status_route
+    route.store.set_labels(
+        route.child_id,
+        {
+            "omnigent.claude_native.subagent_id": "agent-1",
+            "omnigent.claude_native.tool_use_id": "tool-1",
+        },
+    )
+
+    async def post_lull() -> None:
+        response = await route.client.post(
+            f"/v1/sessions/{route.child_id}/events",
+            json={"type": "subagent.status", "data": {"idle": True, **turn_fields}},
+        )
+        assert response.status_code == 202, response.text
+        assert response.json() == {"queued": False}
+        await _flush_live_state()
+
+    await post_lull()
+    assert common._session_status_cache[route.child_id] == status_after_lull
+    conv = route.store.get_conversation(route.child_id)
+    assert conv is not None and conv.live_status == status_after_lull
+
+    response = await route.client.post(
+        f"/v1/sessions/{route.parent_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "source_id": "child-result",
+                "response_id": "parent-turn",
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "is_meta": True,
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<task-notification><task-id>agent-1</task-id>"
+                            "<status>completed</status></task-notification>",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    assert common._session_status_cache[route.child_id] == "idle"
+
+    await post_lull()
+    assert common._session_status_cache[route.child_id] == "idle"
+
+
 @pytest.mark.parametrize("fail_idle_top_level", [False, True])
 async def test_offline_sweep_refreshes_child_status_after_idle_observation(
     status_route: _StatusRoute, fail_idle_top_level: bool

@@ -14,6 +14,7 @@ import pytest
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeHookRecord,
+    ClaudeTranscriptItem,
     record_hook_event,
 )
 from tests.harnesses.claude_native.forwarder._support import (
@@ -513,6 +514,283 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
             ],
         },
     }
+
+
+_LONG_JOB_SHELL = {
+    "id": "bh5h2361s",
+    "type": "shell",
+    "status": "running",
+    "description": "Long background job",
+    "command": "sleep 120",
+}
+_LAUNCH_LONG_JOB = [
+    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "start the job"}},
+    {
+        "type": "assistant",
+        "uuid": "a1",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bg",
+                    "name": "Bash",
+                    "input": {
+                        "command": "sleep 120",
+                        "description": "Long background job",
+                        "run_in_background": True,
+                    },
+                }
+            ],
+        },
+    },
+    {
+        "type": "user",
+        "uuid": "r1",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bg",
+                    "content": "Command running in background with ID: bh5h2361s.",
+                }
+            ],
+        },
+        "toolUseResult": {"stdout": "", "interrupted": False, "backgroundTaskId": "bh5h2361s"},
+    },
+]
+_INTERRUPT = {
+    "type": "user",
+    "uuid": "i1",
+    "message": {
+        "role": "user",
+        "content": [{"type": "text", "text": "[Request interrupted by user]"}],
+    },
+}
+_LONG_JOB_FINISHED = {
+    "type": "attachment",
+    "uuid": "n1",
+    "attachment": {
+        "type": "queued_command",
+        "commandMode": "task-notification",
+        "prompt": (
+            "<task-notification>\n<task-id>bh5h2361s</task-id>\n<status>completed</status>\n"
+            "</task-notification>"
+        ),
+    },
+}
+
+
+async def _forward_items_then_interrupted_tally(
+    tmp_path: Path,
+    entries: list[dict[str, Any]],
+    dedupe: forwarder._ForwardDedupeState,
+) -> list[dict[str, Any]]:
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        await forwarder._forward_interrupted_turn_tally(
+            client,
+            session_id="conv_abc",
+            dedupe=dedupe,
+            retry_tracker=forwarder._PostRetryTracker(),
+        )
+    return [body["data"] for body in posted if body["type"] == "external_session_status"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entries,statuses",
+    [
+        pytest.param(
+            [*_LAUNCH_LONG_JOB, _INTERRUPT],
+            [
+                {
+                    "status": "idle",
+                    "background_task_count": 1,
+                    "background_tasks": [_LONG_JOB_SHELL],
+                }
+            ],
+            id="interrupted-with-shell-running",
+        ),
+        pytest.param(
+            [*_LAUNCH_LONG_JOB, _LONG_JOB_FINISHED, _INTERRUPT],
+            [{"status": "idle", "background_task_count": 0}],
+            id="interrupted-after-shell-finished",
+        ),
+        pytest.param(
+            [
+                *_LAUNCH_LONG_JOB,
+                _INTERRUPT,
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "next"}},
+            ],
+            [],
+            id="follow-up-prompt-opens-a-turn-whose-stop-reports",
+        ),
+        pytest.param(
+            [_LAUNCH_LONG_JOB[0], _INTERRUPT],
+            [],
+            id="interrupted-without-background-launch",
+        ),
+    ],
+)
+async def test_interrupted_turn_posts_background_shell_tally(
+    tmp_path: Path, entries: list[dict[str, Any]], statuses: list[dict[str, Any]]
+) -> None:
+    """
+    Escape ends a turn without a ``Stop`` hook, so the forwarder reports the shells itself.
+
+    Claude's status file only says a shell is alive; without this count the
+    background-task indicator stays empty while ``sleep`` keeps running.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+
+    assert await _forward_items_then_interrupted_tally(tmp_path, entries, dedupe) == statuses
+    assert dedupe.interrupted_turn_pending is False
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_tally_adds_launches_to_last_stop_count(tmp_path: Path) -> None:
+    earlier_shell = {**_LONG_JOB_SHELL, "id": "earlier", "command": "tail -f app.log"}
+    dedupe = forwarder._ForwardDedupeState()
+    forwarder._reset_background_tally(dedupe, count=2, tasks=[earlier_shell])
+
+    statuses = await _forward_items_then_interrupted_tally(
+        tmp_path, [*_LAUNCH_LONG_JOB, _INTERRUPT], dedupe
+    )
+
+    assert statuses == [
+        {
+            "status": "idle",
+            "background_task_count": 3,
+            "background_tasks": [earlier_shell, _LONG_JOB_SHELL],
+        }
+    ]
+
+
+def test_background_launch_from_an_ended_turn_is_already_in_stop_count() -> None:
+    dedupe = forwarder._ForwardDedupeState()
+    launch = ClaudeTranscriptItem(
+        source_id="r1:0:function_call_output",
+        item_type="function_call_output",
+        data={"call_id": "toolu_bg", "output": "Command running in background"},
+        response_id="resp_ended",
+        background_task_id="bh5h2361s",
+    )
+
+    forwarder._note_background_shell_signals(
+        launch, dedupe, ended_response_ids=("resp_ended", None)
+    )
+
+    assert (dedupe.background_task_count, dedupe.background_tally_changed) == (0, False)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_tally_retries_after_transient_failure() -> None:
+    dedupe = forwarder._ForwardDedupeState(
+        background_task_count=1,
+        background_tasks=(_LONG_JOB_SHELL,),
+        background_tally_changed=True,
+        interrupted_turn_pending=True,
+    )
+    retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+    responses = [httpx.Response(503), httpx.Response(202, json={})]
+    posted: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content.decode("utf-8"))["data"])
+        return responses.pop(0)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        for _attempt in range(3):
+            await forwarder._forward_interrupted_turn_tally(
+                client, session_id="conv_abc", dedupe=dedupe, retry_tracker=retry_tracker
+            )
+
+    expected = {
+        "status": "idle",
+        "background_task_count": 1,
+        "background_tasks": [_LONG_JOB_SHELL],
+    }
+    assert posted == [expected, expected]
+    assert dedupe.interrupted_turn_pending is False
+
+
+_CI_WAIT_SHELL = {**_LONG_JOB_SHELL, "id": "abc123", "description": "Wait for CI"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event,count,tasks",
+    [("Stop", 1, (_CI_WAIT_SHELL,)), ("StopFailure", 0, ())],
+)
+async def test_turn_end_hook_replaces_transcript_background_tally(
+    tmp_path: Path, event: str, count: int, tasks: tuple[dict[str, object], ...]
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": event,
+            "session_id": "claude-session",
+            "background_tasks": [_CI_WAIT_SHELL],
+        },
+    )
+    dedupe = forwarder._ForwardDedupeState(
+        background_task_count=1,
+        background_tasks=(_LONG_JOB_SHELL,),
+        background_tally_changed=True,
+        interrupted_turn_pending=True,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://test",
+    ) as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_abc"
+        )
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id="resp_turn_1",
+        )
+
+    assert (dedupe.background_task_count, dedupe.background_tasks) == (count, tasks)
+    assert (dedupe.background_tally_changed, dedupe.interrupted_turn_pending) == (False, False)
 
 
 @pytest.mark.asyncio
