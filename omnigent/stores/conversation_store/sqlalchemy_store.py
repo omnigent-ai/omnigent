@@ -5346,6 +5346,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -5464,6 +5465,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             response is the source's last one the copy is equivalent to a
             full fork, so the directive is kept. ``None`` (default)
             copies the full history.
+        :param before_item_id: When set, copy only the items positioned
+            before this item, e.g. ``"msg_abc123"``; the item and everything
+            after it are dropped. Always a truncation, so the
+            external-session directive is skipped. Mutually exclusive with
+            *up_to_response_id*.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -5481,7 +5487,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
         :raises ValueError: If *up_to_response_id* is set but no item in
-            the source conversation has that ``response_id``.
+            the source conversation has that ``response_id``, if
+            *before_item_id* names no source item, or if both are set.
         """
         return self._fork_conversation_with_id(
             generate_conversation_id(),
@@ -5505,6 +5512,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             resume_source_native_session=resume_source_native_session,
             presentation_labels=presentation_labels,
             up_to_response_id=up_to_response_id,
+            before_item_id=before_item_id,
             project_id=project_id,
             file_id_map=file_id_map,
             created_by=created_by,
@@ -5534,6 +5542,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -5644,6 +5653,23 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 ).scalar_one()
                 truncated = cutoff_position < last_position
+            if before_item_id is not None:
+                if up_to_response_id is not None:
+                    raise ValueError("up_to_response_id and before_item_id are mutually exclusive")
+                before_position = session.execute(
+                    select(SqlConversationItem.position).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == source_conversation_id,
+                        SqlConversationItem.id == before_item_id,
+                    )
+                ).scalar_one_or_none()
+                if before_position is None:
+                    raise ValueError(
+                        f"item not found in conversation "
+                        f"{source_conversation_id!r}: {before_item_id!r}"
+                    )
+                cutoff_position = before_position - 1
+                truncated = True
 
             # Copy items ordered by position so the fork preserves
             # the original chronological order.

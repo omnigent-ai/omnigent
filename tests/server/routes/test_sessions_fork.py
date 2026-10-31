@@ -193,6 +193,7 @@ class _ConversationStore:
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
         project_id: str | None = None,
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,
@@ -227,6 +228,8 @@ class _ConversationStore:
         :param up_to_response_id: Truncation point, e.g. ``"resp_a"``.
             Mirrors the real store: ``None`` copies everything; a value
             matching no item's ``response_id`` raises ValueError.
+        :param before_item_id: Continuation cutoff; recorded only (the
+            fork route never sets it).
         :param project_id: First-class project the fork is filed into
             (route passes the source's project only when the forker
             owns it), or ``None`` for unfiled.
@@ -259,6 +262,7 @@ class _ConversationStore:
                 "resume_source_native_session": resume_source_native_session,
                 "presentation_labels": presentation_labels,
                 "up_to_response_id": up_to_response_id,
+                "before_item_id": before_item_id,
                 "project_id": project_id,
                 "file_id_map": file_id_map,
                 "created_by": created_by,
