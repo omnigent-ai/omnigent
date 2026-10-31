@@ -95,7 +95,7 @@ function makeSyncResult(
     discardAndApplyExternal: vi.fn(),
     dismissExternalUpdate: vi.fn(),
     markSaved: vi.fn(),
-    reconcileServerContent: vi.fn().mockReturnValue(false),
+    beginServerCheck: vi.fn(() => () => "write"),
     ...overrides,
   };
 }
