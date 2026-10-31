@@ -68,6 +68,32 @@ def _point_codex_auth_check_at(
         )
 
 
+@pytest.mark.parametrize("override", ["present", "missing", "unset"])
+def test_picker_resolves_the_codex_binary_selected_for_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: str
+) -> None:
+    from omnigent import _platform
+    from omnigent.inner.codex_executor import _find_codex_cli
+
+    path_binary = tmp_path / "codex"
+    pinned_binary = tmp_path / "pinned-codex"
+    for binary in (path_binary, pinned_binary):
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    if override != "unset":
+        monkeypatch.setenv(
+            "OMNIGENT_CODEX_PATH",
+            str(pinned_binary if override == "present" else tmp_path / "missing-codex"),
+        )
+
+    expected = str(pinned_binary if override == "present" else path_binary)
+    assert _find_codex_cli() == expected
+    assert codex_native._find_codex_cli() == expected
+
+
 def test_codex_auth_unavailable_reason_binary_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
