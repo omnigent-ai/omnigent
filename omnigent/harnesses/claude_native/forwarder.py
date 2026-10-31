@@ -976,6 +976,8 @@ class _ForwardDedupeState:
     # since Claude fires no ``Stop`` hook to carry its own count then.
     background_task_count: int = 0
     background_tasks: tuple[dict[str, object], ...] = ()
+    # Ids of counted shells, including ones the detail limit leaves out.
+    background_task_ids: frozenset[str] = frozenset()
     background_tally_changed: bool = False
     interrupted_turn_pending: bool = False
     # Recent Bash call inputs by call id, naming the shell its launch result starts.
@@ -1368,6 +1370,9 @@ async def forward_claude_transcript_to_session(
     session_event_batch_capability = _SessionEventBatchCapability()
     delta_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
+    # Children owed an idle after /clear or a fork; kept across rotation resets.
+    rotation_settles: dict[str, None] = {}
+    rotation_settle_retries = _PostRetryTracker()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1454,8 +1459,16 @@ async def forward_claude_transcript_to_session(
                     if rotation is not None:
                         await _cancel_subagent_forward_task(subagent_task)
                         subagent_task = None
+                        rotation_settles.update(
+                            dict.fromkeys(
+                                await asyncio.to_thread(_rotated_subagents_to_settle, bridge_dir)
+                            )
+                        )
                         await _settle_rotated_subagents(
-                            client, bridge_dir, subagent_status_capability
+                            client,
+                            rotation_settles,
+                            subagent_status_capability,
+                            rotation_settle_retries,
                         )
                         # Tell the superseded (old) conversation it was cleared:
                         # persist a notice linking to the rotated-to session and
@@ -1515,8 +1528,16 @@ async def forward_claude_transcript_to_session(
                     if rotation is not None:
                         await _cancel_subagent_forward_task(subagent_task)
                         subagent_task = None
+                        rotation_settles.update(
+                            dict.fromkeys(
+                                await asyncio.to_thread(_rotated_subagents_to_settle, bridge_dir)
+                            )
+                        )
                         await _settle_rotated_subagents(
-                            client, bridge_dir, subagent_status_capability
+                            client,
+                            rotation_settles,
+                            subagent_status_capability,
+                            rotation_settle_retries,
                         )
                         session_id = rotation
                         state = None
@@ -1551,6 +1572,13 @@ async def forward_claude_transcript_to_session(
                         cost_cache = {}
                         await asyncio.sleep(poll_interval_s)
                         continue
+                    if rotation_settles:
+                        await _settle_rotated_subagents(
+                            client,
+                            rotation_settles,
+                            subagent_status_capability,
+                            rotation_settle_retries,
+                        )
                     if not external_session_id_mirrored:
                         external_session_id_mirrored = await _maybe_mirror_external_session_id(
                             client=client,
@@ -4925,29 +4953,47 @@ async def _cancel_subagent_forward_task(
         _logger.exception("Claude child-history worker failed during cleanup")
 
 
+def _rotated_subagents_to_settle(bridge_dir: Path) -> list[str]:
+    """Return children of the rotated-away session that may still show as working."""
+    state = _read_subagent_forward_state(bridge_dir)
+    return [
+        entry.child_conversation_id
+        for entry in state.subagents.values()
+        if entry.child_conversation_id
+        and entry.last_status != "failed"
+        and not (entry.last_status == "idle" and entry.turn_completed is not False)
+    ]
+
+
 async def _settle_rotated_subagents(
     client: httpx.AsyncClient,
-    bridge_dir: Path,
+    pending: dict[str, None],
     status_capability: _SubagentStatusCapability,
+    retry_tracker: _PostRetryTracker,
 ) -> None:
-    """Settle children of the rotated-away session; their transcripts are no longer read."""
-    state = await asyncio.to_thread(_read_subagent_forward_state, bridge_dir)
-    for entry in state.subagents.values():
-        if (
-            not entry.child_conversation_id
-            or entry.last_status == "failed"
-            or (entry.last_status == "idle" and entry.turn_completed is not False)
-        ):
+    """Settle children of rotated-away sessions; their transcripts are no longer read."""
+    for child_id in list(pending):
+        retry_key = f"rotation-settle:{child_id}"
+        if retry_tracker.retry_delay_s(retry_key) is not None:
             continue
         try:
-            await status_capability.post_idle(client, session_id=entry.child_conversation_id)
-        except httpx.HTTPError:
+            await status_capability.post_idle(client, session_id=child_id)
+        except httpx.HTTPError as exc:
+            decision = retry_tracker.record_failure(retry_key, exc, session_id=child_id)
+            if decision.exhausted:
+                pending.pop(child_id, None)
             _logger.warning(
-                "Could not settle claude-native sub-agent after session rotation; child=%s",
-                entry.child_conversation_id,
-                exc_info=True,
-                extra={"session_id": entry.child_conversation_id},
+                "Could not settle claude-native sub-agent after session rotation; "
+                "child=%s attempt=%s exhausted=%s http_status=%s",
+                child_id,
+                decision.attempts,
+                decision.exhausted,
+                _http_status_for_log(exc),
+                extra={"session_id": child_id},
             )
+            continue
+        retry_tracker.clear(retry_key)
+        pending.pop(child_id, None)
 
 
 def _promote_pending_settle(
@@ -5238,6 +5284,7 @@ def _note_background_shell_signals(
         if task_id is None or item.response_id in ended_response_ids:
             return
         dedupe.background_task_count += 1
+        dedupe.background_task_ids |= {task_id}
         detail = _normalize_background_task(
             {**arguments, "id": task_id, "type": "shell", "status": "running"}
         )
@@ -5247,12 +5294,14 @@ def _note_background_shell_signals(
         return
     if item.item_type != "message" or item.data.get("role") != "user":
         return
-    for task_id in item.finished_task_ids:
-        remaining = tuple(task for task in dedupe.background_tasks if task.get("id") != task_id)
-        if len(remaining) < len(dedupe.background_tasks):
-            dedupe.background_tasks = remaining
-            dedupe.background_task_count = max(0, dedupe.background_task_count - 1)
-            dedupe.background_tally_changed = True
+    # Sub-agents also send task notifications; only counted shells lower the tally.
+    for task_id in set(item.finished_task_ids) & dedupe.background_task_ids:
+        dedupe.background_task_ids -= {task_id}
+        dedupe.background_tasks = tuple(
+            task for task in dedupe.background_tasks if task.get("id") != task_id
+        )
+        dedupe.background_task_count = max(0, dedupe.background_task_count - 1)
+        dedupe.background_tally_changed = True
     # Any other user record opens a turn that settles the tally itself.
     dedupe.interrupted_turn_pending = item.interrupts_turn
 
@@ -5266,6 +5315,9 @@ def _reset_background_tally(
     """Adopt the count and detail a turn-end hook edge delivered."""
     dedupe.background_task_count = count
     dedupe.background_tasks = tuple(tasks or ())
+    dedupe.background_task_ids = frozenset(
+        task_id for task in dedupe.background_tasks if isinstance(task_id := task.get("id"), str)
+    )
     dedupe.background_tally_changed = False
     dedupe.interrupted_turn_pending = False
 

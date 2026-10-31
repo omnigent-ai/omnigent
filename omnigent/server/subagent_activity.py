@@ -358,7 +358,7 @@ async def _record_claude_subagent_return(
                 if isinstance(item, ConversationItem) and not item.deduplicated:
                     from omnigent.server.routes._sessions.helpers import _publish_status
 
-                    # A child waiting on a tool call stays working until its result returns.
+                    # Its result is recorded, so a child held working by a tool call is done.
                     _publish_status(child.id, "idle")
         if not page.has_more or page.last_id is None:
             return

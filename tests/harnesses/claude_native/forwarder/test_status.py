@@ -709,6 +709,40 @@ def test_background_launch_from_an_ended_turn_is_already_in_stop_count() -> None
     assert (dedupe.background_task_count, dedupe.background_tally_changed) == (0, False)
 
 
+def test_background_finish_lowers_count_only_for_counted_shells(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forwarder, "_BACKGROUND_TASK_FORWARD_LIMIT", 1)
+    dedupe = forwarder._ForwardDedupeState()
+    forwarder._reset_background_tally(
+        dedupe, count=1, tasks=[{**_LONG_JOB_SHELL, "id": "earlier"}]
+    )
+    launch = ClaudeTranscriptItem(
+        source_id="r1:0:function_call_output",
+        item_type="function_call_output",
+        data={"call_id": "toolu_bg", "output": "Command running in background"},
+        response_id="resp_1",
+        background_task_id="bh5h2361s",
+    )
+    forwarder._note_background_shell_signals(launch, dedupe, ended_response_ids=())
+    assert (dedupe.background_task_count, len(dedupe.background_tasks)) == (2, 1)
+
+    counts = []
+    for task_id in ("agent-1", "bh5h2361s", "earlier"):
+        finished = ClaudeTranscriptItem(
+            source_id=f"{task_id}:notification",
+            item_type="message",
+            data={"role": "user", "content": []},
+            response_id="resp_1",
+            finished_task_ids=(task_id,),
+        )
+        forwarder._note_background_shell_signals(finished, dedupe, ended_response_ids=())
+        counts.append(dedupe.background_task_count)
+
+    assert counts == [2, 1, 0]
+    assert dedupe.background_tasks == ()
+
+
 @pytest.mark.asyncio
 async def test_interrupted_turn_tally_retries_after_transient_failure() -> None:
     dedupe = forwarder._ForwardDedupeState(

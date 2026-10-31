@@ -152,6 +152,7 @@ async def status_route(
     ("optional", "wire_fields", "count", "tasks"),
     [
         pytest.param({}, {}, 2, [_BACKGROUND_TASK], id="bare"),
+        pytest.param({"turn_completed": True}, {}, 2, [_BACKGROUND_TASK], id="turn-completed"),
         pytest.param(
             {
                 "response_id": "resp_turn",
@@ -243,16 +244,8 @@ async def test_subagent_idle_publishes_status_without_completion(
     route.telemetry.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("turn_fields", "status_after_lull"),
-    [
-        pytest.param({"turn_completed": False}, "running", id="waiting-on-tool-call"),
-        pytest.param({"turn_completed": True}, "idle", id="turn-completed"),
-        pytest.param({}, "idle", id="older-forwarder"),
-    ],
-)
 async def test_claude_child_lull_mid_tool_call_stays_working_until_result_returns(
-    status_route: _StatusRoute, turn_fields: dict[str, bool], status_after_lull: str
+    status_route: _StatusRoute,
 ) -> None:
     route = status_route
     route.store.set_labels(
@@ -266,16 +259,16 @@ async def test_claude_child_lull_mid_tool_call_stays_working_until_result_return
     async def post_lull() -> None:
         response = await route.client.post(
             f"/v1/sessions/{route.child_id}/events",
-            json={"type": "subagent.status", "data": {"idle": True, **turn_fields}},
+            json={"type": "subagent.status", "data": {"idle": True, "turn_completed": False}},
         )
         assert response.status_code == 202, response.text
         assert response.json() == {"queued": False}
         await _flush_live_state()
 
     await post_lull()
-    assert common._session_status_cache[route.child_id] == status_after_lull
+    assert common._session_status_cache[route.child_id] == "running"
     conv = route.store.get_conversation(route.child_id)
-    assert conv is not None and conv.live_status == status_after_lull
+    assert conv is not None and conv.live_status == "running"
 
     response = await route.client.post(
         f"/v1/sessions/{route.parent_id}/events",

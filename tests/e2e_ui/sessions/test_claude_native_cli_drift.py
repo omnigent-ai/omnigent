@@ -19,6 +19,7 @@ from playwright.sync_api import Locator, Page, expect
 
 from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+from tests._helpers.browser import user_page
 from tests.e2e_ui.chat.test_claude_native_permission_switch_from_dont_ask import (
     _render_terminal,
     _terminal_id,
@@ -60,12 +61,13 @@ def _session_page(
         tmp_path_factory,
         terminal_launch_args=["--dangerously-skip-permissions"],
     ) as (base_url, session_id):
-        browser = request.getfixturevalue("browser")
-        context = browser.new_context(**request.getfixturevalue("browser_context_args"))
-        try:
-            yield base_url, session_id, context.new_page()
-        finally:
-            context.close()
+        context_args = request.getfixturevalue("browser_context_args")
+        with user_page(
+            request.getfixturevalue("browser"),
+            headers=context_args.pop("extra_http_headers", {}),
+            **context_args,
+        ) as page:
+            yield base_url, session_id, page
 
 
 def _open_chat(page: Page, base_url: str, session_id: str) -> Locator:
@@ -249,6 +251,7 @@ def test_subagent_in_long_tool_call_stays_working(
 
         samples: list[dict] = []
         bash_served_at: float | None = None
+        last_sleeping_at: float | None = None
         drift_since: float | None = None
         terminal_open = False
         cli_screen = ""
@@ -260,6 +263,8 @@ def test_subagent_in_long_tool_call_stays_working(
             if bash_served_at is None and requests_log.contains(_LULL_CHILD):
                 bash_served_at = now
             sleeping = bash_served_at is not None and not requests_log.contains(_LULL_SLEEP_RESULT)
+            if sleeping:
+                last_sleeping_at = now
             samples.append(
                 {
                     "since_send_s": round(now - sent_at, 2),
@@ -283,6 +288,10 @@ def test_subagent_in_long_tool_call_stays_working(
 
         _report("lull", {"parent_id": parent_id, "child_id": child_id, "samples": samples})
         assert bash_served_at is not None, "the sub-agent never started its Bash call"
+        assert (
+            last_sleeping_at is not None
+            and last_sleeping_at - bash_served_at >= _LULL_DRIFT_HOLD_S
+        ), f"the sub-agent's Bash call returned within {_LULL_DRIFT_HOLD_S}s, before the lull"
         assert drift_since is None, (
             f"the sub-agent row showed {samples[-1]['ui_activity']!r} for "
             f"{_LULL_DRIFT_HOLD_S}s while its `sleep 20` was still running; CLI:\n{cli_screen}"
@@ -349,8 +358,15 @@ def test_background_shell_count_after_turn_ends(
         if interrupted:
             _open_terminal(page)
             page.keyboard.press("Escape")
-            time.sleep(2)
-            cli_screen = _cli_screen(base_url, session_id)
+
+            def interrupted_screen() -> str | None:
+                screen = _cli_screen(base_url, session_id)
+                idle = _session(base_url, session_id).get("status") == "idle"
+                return screen if idle and "Interrupted" in screen else None
+
+            cli_screen = str(
+                _wait_for(interrupted_screen, timeout=30, what="Esc to interrupt the turn")
+            )
             _select_view_mode(page, "Chat")
         else:
             expect(_assistant_reply(page, continuation["text"])).to_be_visible(timeout=60_000)
@@ -383,18 +399,22 @@ def test_background_shell_count_after_turn_ends(
 _CLEAR_PARENT = "CLI_DRIFT_CLEAR_PARENT: start the background check agent."
 _CLEAR_CHILD = "CLI_DRIFT_CLEAR_CHILD_TASK: run the twenty second background check and report."
 _CLEAR_REPLY = "Started the background check before clearing."
-# The child's sleep ends ~20 s after it starts; give it a further 60 s to settle.
+# Covers the child's 20 s sleep plus settle time, measured from /clear.
 _CLEAR_SETTLE_S = 90
 
 
 def _session_ids(base_url: str) -> set[str]:
-    response = httpx.get(f"{base_url}/v1/sessions", params={"limit": 50}, timeout=10.0)
+    response = httpx.get(
+        f"{base_url}/v1/sessions", params={"limit": 50, "visibility": "all"}, timeout=10.0
+    )
     response.raise_for_status()
     return {session["id"] for session in response.json()["data"]}
 
 
 def _rotated_session(base_url: str, existing: set[str], agent_id: str) -> str | None:
-    response = httpx.get(f"{base_url}/v1/sessions", params={"limit": 50}, timeout=10.0)
+    response = httpx.get(
+        f"{base_url}/v1/sessions", params={"limit": 50, "visibility": "all"}, timeout=10.0
+    )
     response.raise_for_status()
     for session in response.json()["data"]:
         labels = session.get("labels") or {}
@@ -458,12 +478,20 @@ def test_background_subagent_settles_after_clear(
         child_id = child["id"]
         agent_id = _session(base_url, old_id)["agent_id"]
         existing = _session_ids(base_url)
+        _wait_for(
+            lambda: next(c for c in _children(base_url, old_id) if c["id"] == child_id)["busy"],
+            timeout=30,
+            what="the background sub-agent to be working before /clear",
+        )
         _type_into_cli(page, "/clear")
         cleared_at = time.time()
         new_id = _wait_for(
             lambda: _rotated_session(base_url, existing, agent_id),
             timeout=60,
             what="the session /clear rotates to",
+        )
+        request.addfinalizer(
+            lambda: httpx.delete(f"{base_url}/v1/sessions/{new_id}", timeout=10.0)
         )
         rotated_url = re.compile(rf"/c/{re.escape(new_id)}")
         try:
@@ -478,7 +506,7 @@ def test_background_subagent_settles_after_clear(
             "subagent-status-avatar"
         )
         samples: list[dict] = []
-        while time.time() - cleared_at < _CLEAR_SETTLE_S:
+        while not samples or time.time() - cleared_at < _CLEAR_SETTLE_S:
             snapshot = next(c for c in _children(base_url, old_id) if c["id"] == child_id)
             samples.append(
                 {
@@ -491,6 +519,11 @@ def test_background_subagent_settles_after_clear(
                     "working_indicator": page.get_by_test_id("working-indicator").count() > 0,
                 }
             )
+            if (
+                samples[-1]["ui_activity"] in ("done", "idle")
+                and samples[-1]["old_status"] == "idle"
+            ):
+                break
             time.sleep(1)
         cli_screen = _cli_screen(base_url, new_id)
 

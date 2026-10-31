@@ -1025,23 +1025,35 @@ async def test_session_rotation_settles_children_still_marked_working(tmp_path: 
         forwarder.SubagentForwardState(subagents={entry.subagent_id: entry for entry in entries}),
     )
     posted: list[tuple[str, dict[str, Any]]] = []
+    outage = True
 
     def handler(request: httpx.Request) -> httpx.Response:
         posted.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(503 if "conv_running" in request.url.path else 202, json={})
+        return httpx.Response(503 if outage and "conv_running" in request.url.path else 202)
 
+    pending = dict.fromkeys(forwarder._rotated_subagents_to_settle(bridge_dir))
+    retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    capability = forwarder._SubagentStatusCapability()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
-        await forwarder._settle_rotated_subagents(
-            client, bridge_dir, forwarder._SubagentStatusCapability()
+        await forwarder._settle_rotated_subagents(client, pending, capability, retry_tracker)
+        assert list(pending) == ["conv_running"]
+        # The rotation caller drops the old checkpoint; the failed settle must outlive it.
+        forwarder._write_subagent_forward_state(
+            bridge_dir, forwarder.SubagentForwardState(subagents={})
         )
+        outage = False
+        await forwarder._settle_rotated_subagents(client, pending, capability, retry_tracker)
 
     idle = {"type": "subagent.status", "data": {"idle": True}}
     assert posted == [
         ("/v1/sessions/conv_running/events", idle),
         ("/v1/sessions/conv_mid_tool/events", idle),
+        ("/v1/sessions/conv_running/events", idle),
     ]
+    assert pending == {}
+    assert not retry_tracker.has_retry_state("rotation-settle:conv_running")
 
 
 @pytest.mark.asyncio
