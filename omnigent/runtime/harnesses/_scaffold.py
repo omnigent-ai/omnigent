@@ -1954,6 +1954,7 @@ class HarnessApp:
                 # Authoritative per-turn cost reported by the harness (e.g. Copilot
                 # AI credits); preferred over the catalog estimate. None if absent.
                 cost_usd=u.get("cost_usd"),
+                pricing_requests=u.get("pricing_requests"),
             )
         response = ResponseObject(
             id=ctx.response_id,

@@ -419,3 +419,132 @@ def test_get_model_context_window_encoded_and_offline_fallback(
     assert get_model_context_window("claude-opus-4-8[1m]") == 1_000_000
     assert get_model_context_window("anthropic/claude-opus-4-8[1m]") == 1_000_000
     assert get_model_context_window("uncatalogued-model") == 128_000
+
+
+@pytest.mark.parametrize(
+    "model,input_rate,output_rate,cache_rate",
+    [
+        ("gpt-6-astra", 10, 50, 1),
+        ("gpt-6-sol", 2, 10, 0.2),
+        ("gpt-6.1-sol", 2, 10, 0.1),
+    ],
+)
+@pytest.mark.parametrize(
+    "input_tokens,cached,output_tokens,multiplier",
+    [
+        (271_999, 0, 100, 1),
+        (272_000, 0, 100, 1),
+        (272_001, 0, 100, 2),
+        (20_000, 280_000, 100, 2),
+        (100, 0, 300_000, 1),
+    ],
+)
+def test_catalog_long_context_prices_whole_request(
+    monkeypatch: pytest.MonkeyPatch,
+    input_tokens: int,
+    cached: int,
+    output_tokens: int,
+    multiplier: int,
+    model: str,
+    input_rate: float,
+    output_rate: float,
+    cache_rate: float,
+) -> None:
+    from omnigent.onboarding import providers
+
+    monkeypatch.setattr(
+        providers,
+        "_fetch_provider_catalog",
+        lambda _: {
+            "models": {
+                model: {
+                    "pricing": {
+                        "input_per_million_tokens": input_rate,
+                        "output_per_million_tokens": output_rate,
+                        "cache_read_per_million_tokens": cache_rate,
+                        "long_context": [
+                            {
+                                "threshold_tokens": 272_000,
+                                "input_per_million_tokens": input_rate * 2,
+                                "output_per_million_tokens": output_rate * 1.5,
+                                "cache_read_per_million_tokens": cache_rate * 2,
+                            }
+                        ],
+                    }
+                },
+            }
+        },
+    )
+    pricing = fetch_model_pricing(f"openai/{model}")
+    assert pricing is not None
+    usage = {
+        "input_tokens": input_tokens,
+        "cache_read_input_tokens": cached,
+        "output_tokens": output_tokens,
+        "request_input_tokens": input_tokens + cached,
+    }
+    expected = (input_tokens * input_rate + cached * cache_rate) * multiplier / 1_000_000
+    expected += output_tokens * output_rate * (1.5 if multiplier == 2 else 1) / 1_000_000
+    assert compute_llm_cost(usage, pricing) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "tier",
+    [
+        None,
+        "invalid",
+        {},
+        {"threshold_tokens": 272_000, "input_per_million_tokens": 4},
+        {"threshold_tokens": True, "input_per_million_tokens": 4, "output_per_million_tokens": 15},
+        {
+            "threshold_tokens": 272_000,
+            "input_per_million_tokens": -4,
+            "output_per_million_tokens": 15,
+        },
+        {
+            "threshold_tokens": 272_000,
+            "input_per_million_tokens": 4,
+            "output_per_million_tokens": float("nan"),
+        },
+    ],
+)
+def test_invalid_catalog_tiers_are_not_guessed(tier: object) -> None:
+    from omnigent.onboarding.providers import _long_context_pricing
+
+    assert _long_context_pricing({"long_context": [tier]}) == ()
+
+
+def test_highest_matching_catalog_threshold_wins() -> None:
+    from omnigent.onboarding.providers import _long_context_pricing
+
+    tiers = _long_context_pricing(
+        {
+            "long_context": [
+                {
+                    "threshold_tokens": 200,
+                    "input_per_million_tokens": 4,
+                    "output_per_million_tokens": 6,
+                },
+                {
+                    "threshold_tokens": 100,
+                    "input_per_million_tokens": 2,
+                    "output_per_million_tokens": 3,
+                },
+            ]
+        }
+    )
+    assert [tier.threshold_tokens for tier in tiers] == [100, 200]
+    pricing = ModelPricing(
+        1,
+        1,
+        long_context=tuple(
+            (tier.threshold_tokens, ModelPricing(tier.input_price, tier.output_price))
+            for tier in tiers
+        ),
+    )
+    assert (
+        compute_llm_cost(
+            {"input_tokens": 201, "output_tokens": 1, "request_input_tokens": 201}, pricing
+        )
+        == 810
+    )

@@ -1725,7 +1725,6 @@ def _accumulate_session_usage(
             priced = True
         else:
             from omnigent.llms.context_window import (
-                compute_llm_cost,
                 fetch_model_pricing_with_provider,
             )
             from omnigent.onboarding.provider_config import load_config
@@ -1744,7 +1743,9 @@ def _accumulate_session_usage(
                 # rates. Pass the validated locals, not the raw response usage
                 # — a forged negative / non-finite count must not reach the
                 # cost sum (compute_llm_cost multiplies without a lower bound).
-                cost_delta = compute_llm_cost(
+                from omnigent.llms.codex_usage import compute_itemized_cost
+
+                cost_delta = compute_itemized_cost(
                     {
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
@@ -1752,6 +1753,7 @@ def _accumulate_session_usage(
                         "cache_creation_input_tokens": cache_creation_input_tokens,
                     },
                     pricing,
+                    usage_obj.get("pricing_requests"),
                 )
 
     # Build the delta dict and atomically apply it to the persisted
@@ -1993,7 +1995,6 @@ def _persist_native_cumulative_usage(
     elif has_tokens:
         if isinstance(model_name, str) and model_name:
             from omnigent.llms.context_window import (
-                compute_llm_cost,
                 fetch_model_pricing_with_provider,
             )
             from omnigent.onboarding.provider_config import load_config
@@ -2015,7 +2016,18 @@ def _persist_native_cumulative_usage(
                 # Monotonic, like the explicit-cost branch: token totals are
                 # also client-SET, so a lowered token report can't drop the
                 # priced cost below the persisted figure.
-                current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
+                from omnigent.llms.codex_usage import native_cost_with_requests
+
+                current["total_cost_usd"] = native_cost_with_requests(
+                    data,
+                    current,
+                    old_tokens,
+                    old_cost,
+                    pricing,
+                    pricing_for_model=lambda model: fetch_model_pricing_with_provider(
+                        model, provider_config=provider_config, harness=harness
+                    ),
+                )
 
     # ADD this report's growth (new - old) to the active model, not the whole
     # cumulative total, so per-model buckets sum to the flat total across model
