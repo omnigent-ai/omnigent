@@ -782,6 +782,48 @@ def test_inject_user_message_via_tui_happy_path(
     assert submit == ["tmux", "-S", "/tmp/ex/tmux.sock", "send-keys", "-t", "main", "Enter"]
 
 
+def test_inject_user_message_via_tui_dismisses_startup_notice_banner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """An agy startup notice banner ('esc to dismiss') is auto-dismissed with Escape."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "Reply with exactly WORKING"
+    captured: list[list[str]] = []
+    tui = {
+        "pane": (
+            "┃ Verbosity is now medium by default, so tool calls and thoughts roll up into\n"
+            "┃ summaries. You can change your preferred verbosity anytime in /config >\n"
+            "┃ Verbosity.\n"
+            "┃ esc to dismiss"
+        )
+    }
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Escape":
+            tui["pane"] = "> \n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "> \nesc to cancel"
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert any(cmd[-1] == "Escape" for cmd in captured), (
+        "expected Escape key to dismiss notice banner"
+    )
+
+
 def test_inject_user_message_via_tui_resends_enter_when_coalesced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1709,6 +1751,62 @@ def test_seed_isolated_agy_home_synthetic_onboarding_does_not_downgrade_enterpri
     assert onboarding.get("onboardingComplete") is True
     if "enterpriseOnboardingComplete" in onboarding:
         assert onboarding["enterpriseOnboardingComplete"] is True
+
+
+def test_seed_isolated_agy_home_copies_real_nux_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's real nux_state.json is copied into the isolated Gemini dir."""
+    fake_home = tmp_path / "real-home"
+    real_nux = fake_home / ".gemini" / "antigravity-cli" / "cache" / "nux_state.json"
+    real_nux.parent.mkdir(parents=True)
+    real_state = {"dismissed": [12, 51]}
+    real_nux.write_text(json.dumps(real_state), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    nux_path = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "nux_state.json"
+    assert nux_path.is_file()
+    assert json.loads(nux_path.read_text(encoding="utf-8")) == real_state
+
+
+def test_seed_isolated_agy_home_tolerates_absent_real_nux_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing real nux_state.json seeds cleanly without raising or creating a file."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    nux_path = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "nux_state.json"
+    assert not nux_path.exists()
+
+
+def test_seed_isolated_agy_home_never_clobbers_existing_isolated_nux_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-seeding an existing bridge dir never overwrites per-session nux_state.json."""
+    fake_home = tmp_path / "real-home"
+    real_nux = fake_home / ".gemini" / "antigravity-cli" / "cache" / "nux_state.json"
+    real_nux.parent.mkdir(parents=True)
+    real_nux.write_text(json.dumps({"dismissed": [1]}), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_nux = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "nux_state.json"
+    iso_nux.parent.mkdir(parents=True)
+    iso_nux.write_text(json.dumps({"dismissed": [2]}), encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+    assert json.loads(iso_nux.read_text(encoding="utf-8")) == {"dismissed": [2]}
 
 
 def test_seed_isolated_agy_home_tolerates_missing_credential(
