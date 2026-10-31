@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 import sys
+import uuid
 
 import httpx
 from playwright.sync_api import Page, expect
@@ -97,6 +98,49 @@ def test_command_palette_opens_and_switches_session(
     expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=10_000)
     # The palette closes on select.
     expect(page.get_by_test_id("command-palette-input")).to_have_count(0)
+
+
+def test_new_session_asks_for_a_project_first(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """With a project present, "New session" opens the project picker first.
+
+    The picker is on by default (``omnigent:new-chat-project-prompt`` unset), so
+    this test is the one place that leaves the preference alone: the sidebar's
+    New session link opens the palette on its "Start a new session in…" step,
+    "No project" opens the plain composer, and a project opens ``/?project=``.
+    """
+    base_url, session_id = seeded_session
+    project = f"e2e-pick-{uuid.uuid4().hex[:6]}"
+    resp = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omni_project": project}},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+    new_session_link = page.get_by_role("link", name=re.compile(r"New session", re.IGNORECASE))
+    picker_input = page.get_by_placeholder("Start a new session in…")
+    picker = page.get_by_role("dialog")
+
+    new_session_link.first.click()
+    expect(picker_input).to_be_visible(timeout=30_000)
+    expect(picker.get_by_text("No project", exact=True)).to_be_visible()
+    expect(picker.get_by_text(project, exact=True)).to_be_visible()
+    # The route has not changed: the picker sits in front of the open session.
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+
+    picker.get_by_text("No project", exact=True).click()
+    expect(page).to_have_url(re.compile(r"/$"))
+    expect(picker_input).to_have_count(0)
+
+    new_session_link.first.click()
+    expect(picker_input).to_be_visible()
+    picker.get_by_text(project, exact=True).click()
+    expect(page).to_have_url(re.compile(rf"/\?project={re.escape(project)}$"))
+    expect(picker_input).to_have_count(0)
 
 
 def test_command_palette_chord_with_a_terminal_focused(

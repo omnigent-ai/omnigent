@@ -56,6 +56,7 @@ from playwright.async_api import Request, Route, async_playwright, expect
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests._helpers.picker_routes import OWN_AGENTS
 from tests._helpers.polling import poll_until_async
+from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
@@ -365,6 +366,8 @@ async def _register_common_routes(
         else:
             await route.continue_()
 
+    # The shared server may hold projects; keep New session on the plain composer.
+    await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
     await page.route("**/v1/hosts", handle_hosts)
     # Fake hosts have no backend probes; tests with catalogs or git repos override these.
     await page.route(
@@ -1107,6 +1110,7 @@ async def _drive_landing_clears_after_navigating_away(
 
             page.on("response", note_create_response)
 
+            await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
