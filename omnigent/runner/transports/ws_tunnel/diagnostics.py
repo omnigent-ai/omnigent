@@ -20,6 +20,8 @@ _logger = logging.getLogger(__name__)
 _SAMPLE_INTERVAL_S = 5.0
 _SLOW_OPERATION_S = 1.0
 _REPORT_INTERVAL_S = 60.0
+# Periodic health row while connected, so a silent runner shows its last loop state.
+_LIVENESS_INTERVAL_S = 300.0
 _MAX_TRACKED_SENDS = 64
 _MAX_TRACKED_PINGS = 8
 # A healthy peer's last frame can predate a local stall by up to one ping
@@ -169,6 +171,8 @@ class TunnelDiagnostics:
         self._sampler_failed = False
         self._report: Callable[[], None] | None = None
         self._next_report_at = 0.0
+        self._liveness_report: Callable[[], None] | None = None
+        self._next_liveness_at = 0.0
         self._frozen: TunnelDiagnosticAttrs | None = None
         self._frozen_at = 0.0
 
@@ -178,10 +182,19 @@ class TunnelDiagnostics:
 
     @contextlib.asynccontextmanager
     async def monitoring(
-        self, report: Callable[[], None], *, connection_id: str | None = None
+        self,
+        report: Callable[[], None],
+        *,
+        connection_id: str | None = None,
+        liveness_report: Callable[[], None] | None = None,
     ) -> AsyncIterator[None]:
-        """Sample scheduling delays and report slow operations at most once/minute."""
+        """Sample scheduling delays and report slow operations at most once/minute.
+
+        ``liveness_report`` is called every ``_LIVENESS_INTERVAL_S`` while connected.
+        """
         self._report = report
+        self._liveness_report = liveness_report
+        self._next_liveness_at = self._clock() + _LIVENESS_INTERVAL_S
         self._loop_due_at = self._clock() + _SAMPLE_INTERVAL_S
         task = asyncio.create_task(self._monitor(connection_id), name="tunnel-diagnostics")
         try:
@@ -193,6 +206,7 @@ class TunnelDiagnostics:
                 task.cancel()
                 self._loop_due_at = None
                 self._report = None
+                self._liveness_report = None
                 await asyncio.gather(task, return_exceptions=True)
 
     async def _monitor(self, connection_id: str | None) -> None:
@@ -206,6 +220,7 @@ class TunnelDiagnostics:
                 oldest_send = min(self._active_sends.values(), default=now)
                 if max(lag, now - oldest_send) >= _SLOW_OPERATION_S:
                     self._maybe_report(now)
+                self._maybe_report_liveness(now)
         except Exception:
             # A dead sampler must not look like an ever-growing scheduling delay.
             self._loop_due_at = None
@@ -227,6 +242,16 @@ class TunnelDiagnostics:
             # Diagnostic sinks must not interfere with socket I/O or cleanup.
             with contextlib.suppress(Exception):
                 self._report()
+
+    def _maybe_report_liveness(self, now: float) -> None:
+        if (
+            self._liveness_report is not None
+            and self._frozen is None
+            and now >= self._next_liveness_at
+        ):
+            self._next_liveness_at = now + _LIVENESS_INTERVAL_S
+            with contextlib.suppress(Exception):
+                self._liveness_report()
 
     def frame_received(self) -> None:
         self._observed_at["last_received_frame"] = self._clock()
