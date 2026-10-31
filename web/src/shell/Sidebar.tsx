@@ -5839,7 +5839,7 @@ function ConversationRowImpl({
           dragListeners?.onTouchStart?.(event);
         }
       }}
-      className={cn("group relative", familyIndented && "ml-5", isDragging && "opacity-40")}
+      className={cn("group relative", familyIndented && "ml-9", isDragging && "opacity-40")}
       data-sibling-session={familyIndented || undefined}
     >
       {familyIndented && (

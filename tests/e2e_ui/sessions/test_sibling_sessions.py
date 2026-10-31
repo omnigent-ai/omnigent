@@ -136,6 +136,18 @@ async def _drive(rig: ManagedReplicas) -> None:
                     await expect(
                         page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
                     ).to_have_attribute("data-sibling-session", "true")
+                    representative_label = (
+                        await page.locator(f'li[data-sidebar-session-id="{source_id}"]')
+                        .get_by_text("Coordinator", exact=True)
+                        .bounding_box()
+                    )
+                    sibling_label = (
+                        await page.locator(f'li[data-sidebar-session-id="{sibling_id}"]')
+                        .get_by_text("Research the API", exact=True)
+                        .bounding_box()
+                    )
+                    assert representative_label and sibling_label
+                    assert sibling_label["x"] >= representative_label["x"] + 16
                     await page.screenshot(path=str(evidence / "siblings-two-sandboxes.png"))
                     # The clicked member's sandbox is the only ephemeral host in its picker.
                     row = page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
