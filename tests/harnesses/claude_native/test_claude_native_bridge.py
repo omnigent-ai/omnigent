@@ -1629,6 +1629,20 @@ def test_task_notification_reports_finished_task_ids(
         (
             [
                 {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "[Request interrupted by user for tool use]"}
+                        ],
+                    },
+                }
+            ],
+            True,
+        ),
+        (
+            [
+                {
                     "type": "assistant",
                     "message": {
                         "role": "assistant",
@@ -1667,6 +1681,19 @@ def test_task_notification_reports_finished_task_ids(
                 }
             ],
             False,
+        ),
+        (
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "The context is full."}],
+                        "stop_reason": "model_context_window_exceeded",
+                    },
+                }
+            ],
+            True,
         ),
         (
             [

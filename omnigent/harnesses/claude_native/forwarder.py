@@ -4824,6 +4824,7 @@ async def _forward_available_status_events(
             dedupe,
             count=0 if status == "failed" else record.background_task_count,
             tasks=None if status == "failed" else record.background_tasks,
+            task_ids=() if status == "failed" else record.background_task_ids,
         )
         if response_id is not None:
             # The turn ended — record its id as a pending settle so a later
@@ -5311,17 +5312,12 @@ def _reset_background_tally(
     *,
     count: int,
     tasks: Sequence[dict[str, object]] | None,
+    task_ids: Sequence[str],
 ) -> None:
-    """Adopt the count and detail a turn-end hook edge delivered."""
+    """Adopt the count, detail and shell ids a turn-end hook edge delivered."""
     dedupe.background_task_count = count
     dedupe.background_tasks = tuple(tasks or ())
-    detail_ids = frozenset(
-        task_id for task in dedupe.background_tasks if isinstance(task_id := task.get("id"), str)
-    )
-    # Ids counted earlier may be the shells a truncated detail list leaves out.
-    if count > len(detail_ids):
-        detail_ids |= dedupe.background_task_ids
-    dedupe.background_task_ids = detail_ids
+    dedupe.background_task_ids = frozenset(task_ids)
     dedupe.background_tally_changed = False
     dedupe.interrupted_turn_pending = False
 

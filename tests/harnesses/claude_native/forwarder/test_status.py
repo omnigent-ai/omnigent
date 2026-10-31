@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+import omnigent.harnesses.claude_native.bridge as bridge
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeHookRecord,
@@ -677,7 +678,9 @@ async def test_interrupted_turn_posts_background_shell_tally(
 async def test_interrupted_turn_tally_adds_launches_to_last_stop_count(tmp_path: Path) -> None:
     earlier_shell = {**_LONG_JOB_SHELL, "id": "earlier", "command": "tail -f app.log"}
     dedupe = forwarder._ForwardDedupeState()
-    forwarder._reset_background_tally(dedupe, count=2, tasks=[earlier_shell])
+    forwarder._reset_background_tally(
+        dedupe, count=2, tasks=[earlier_shell], task_ids=["earlier", "other"]
+    )
 
     statuses = await _forward_items_then_interrupted_tally(
         tmp_path, [*_LAUNCH_LONG_JOB, _INTERRUPT], dedupe
@@ -709,14 +712,22 @@ def test_background_launch_from_an_ended_turn_is_already_in_stop_count() -> None
     assert (dedupe.background_task_count, dedupe.background_tally_changed) == (0, False)
 
 
-@pytest.mark.parametrize("stop_with_truncated_detail", [False, True], ids=["no-stop", "stop"])
+@pytest.mark.parametrize(
+    "stop",
+    [None, "after-launch", "before-launch-delivery"],
+    ids=["no-stop", "stop-after-launch", "launch-delivered-after-its-stop"],
+)
 def test_background_finish_lowers_count_only_for_counted_shells(
-    monkeypatch: pytest.MonkeyPatch, stop_with_truncated_detail: bool
+    monkeypatch: pytest.MonkeyPatch, stop: str | None
 ) -> None:
     monkeypatch.setattr(forwarder, "_BACKGROUND_TASK_FORWARD_LIMIT", 1)
     earlier = {**_LONG_JOB_SHELL, "id": "earlier"}
     dedupe = forwarder._ForwardDedupeState()
-    forwarder._reset_background_tally(dedupe, count=1, tasks=[earlier])
+    forwarder._reset_background_tally(dedupe, count=1, tasks=[earlier], task_ids=["earlier"])
+    if stop == "before-launch-delivery":
+        forwarder._reset_background_tally(
+            dedupe, count=2, tasks=[earlier], task_ids=["earlier", "bh5h2361s"]
+        )
     launch = ClaudeTranscriptItem(
         source_id="r1:0:function_call_output",
         item_type="function_call_output",
@@ -724,9 +735,12 @@ def test_background_finish_lowers_count_only_for_counted_shells(
         response_id="resp_1",
         background_task_id="bh5h2361s",
     )
-    forwarder._note_background_shell_signals(launch, dedupe, ended_response_ids=())
-    if stop_with_truncated_detail:
-        forwarder._reset_background_tally(dedupe, count=2, tasks=[earlier])
+    ended_response_ids = ("resp_1",) if stop == "before-launch-delivery" else ()
+    forwarder._note_background_shell_signals(launch, dedupe, ended_response_ids=ended_response_ids)
+    if stop == "after-launch":
+        forwarder._reset_background_tally(
+            dedupe, count=2, tasks=[earlier], task_ids=["earlier", "bh5h2361s"]
+        )
     assert (dedupe.background_task_count, len(dedupe.background_tasks)) == (2, 1)
 
     counts = []
@@ -781,6 +795,28 @@ async def test_interrupted_turn_tally_retries_after_transient_failure() -> None:
 _CI_WAIT_SHELL = {**_LONG_JOB_SHELL, "id": "abc123", "description": "Wait for CI"}
 
 
+async def _forward_hook_edges(bridge_dir: Path, dedupe: forwarder._ForwardDedupeState) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://test",
+    ) as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_abc"
+        )
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id="resp_turn_1",
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event,count,tasks",
@@ -806,29 +842,37 @@ async def test_turn_end_hook_replaces_transcript_background_tally(
         interrupted_turn_pending=True,
     )
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
-        base_url="http://test",
-    ) as client:
-        hook_state = await forwarder._ensure_hook_state(
-            bridge_dir, start_at_end=False, session_id="conv_abc"
-        )
-        await forwarder._forward_available_status_events(
-            client=client,
-            session_id="conv_abc",
-            bridge_dir=bridge_dir,
-            state=hook_state,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            task_subjects={},
-            task_statuses={},
-            task_order=[],
-            response_id="resp_turn_1",
-        )
+    await _forward_hook_edges(bridge_dir, dedupe)
 
     assert (dedupe.background_task_count, dedupe.background_tasks) == (count, tasks)
     assert dedupe.background_task_ids == {task["id"] for task in tasks}
     assert (dedupe.background_tally_changed, dedupe.interrupted_turn_pending) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_publishes_finish_of_shell_past_stop_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_BACKGROUND_TASK_FORWARD_LIMIT", 1)
+    record_hook_event(
+        tmp_path / "bridge",
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "background_tasks": [_CI_WAIT_SHELL, _LONG_JOB_SHELL],
+        },
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    await _forward_hook_edges(tmp_path / "bridge", dedupe)
+    assert (dedupe.background_task_count, dedupe.background_tasks) == (2, (_CI_WAIT_SHELL,))
+
+    statuses = await _forward_items_then_interrupted_tally(
+        tmp_path, [_LONG_JOB_FINISHED, _INTERRUPT], dedupe
+    )
+
+    assert statuses == [
+        {"status": "idle", "background_task_count": 1, "background_tasks": [_CI_WAIT_SHELL]}
+    ]
 
 
 @pytest.mark.asyncio

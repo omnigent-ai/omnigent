@@ -253,6 +253,7 @@ def test_subagent_in_long_tool_call_stays_working(
         bash_served_at: float | None = None
         last_sleeping_at: float | None = None
         drift_since: float | None = None
+        drift_held = False
         terminal_open = False
         cli_screen = ""
         while time.time() - sent_at < 150:
@@ -282,6 +283,7 @@ def test_subagent_in_long_tool_call_stays_working(
                 _open_terminal(page)
                 terminal_open = True
             if drift_since is not None and now - drift_since >= _LULL_DRIFT_HOLD_S:
+                drift_held = True
                 cli_screen = _cli_screen(base_url, parent_id)
                 break
             time.sleep(0.25)
@@ -292,7 +294,7 @@ def test_subagent_in_long_tool_call_stays_working(
             last_sleeping_at is not None
             and last_sleeping_at - bash_served_at >= _LULL_DRIFT_HOLD_S
         ), f"the sub-agent's Bash call returned within {_LULL_DRIFT_HOLD_S}s, before the lull"
-        assert drift_since is None, (
+        assert not drift_held, (
             f"the sub-agent row showed {samples[-1]['ui_activity']!r} for "
             f"{_LULL_DRIFT_HOLD_S}s while its `sleep 20` was still running; CLI:\n{cli_screen}"
         )
@@ -311,7 +313,7 @@ def test_subagent_settles_after_esc_interrupts_its_tool_call(
     tmp_path_factory: pytest.TempPathFactory,
     claude_managed_settings: None,
 ) -> None:
-    """Esc during a sub-agent's long tool call must not leave the child working forever."""
+    """A sub-agent backgrounded by Esc stays working until its tool call returns, then settles."""
     _require_real_claude()
     mock_url = mock_llm_server_url
     reset_mock_llm(mock_url)
@@ -363,13 +365,28 @@ def test_subagent_settles_after_esc_interrupts_its_tool_call(
 
         def esc_screen() -> str | None:
             screen = _cli_screen(base_url, parent_id)
-            return screen if re.search(r"Backgrounded agent|Interrupted", screen) else None
+            return screen if "Backgrounded agent" in screen else None
 
-        cli_screen = str(_wait_for(esc_screen, timeout=30, what="Esc to reach the CLI"))
+        cli_screen = str(_wait_for(esc_screen, timeout=30, what="Esc to background the sub-agent"))
         _select_view_mode(page, "Chat")
         avatar = _agents_row(_open_agents_tab(page), child_id).get_by_test_id(
             "subagent-status-avatar"
         )
+        drift_since: float | None = None
+        sleep_ends_by = time.time() + 60
+        while not requests_log.contains(_ESC_SLEEP_RESULT) and time.time() < sleep_ends_by:
+            now = time.time()
+            drift_since = (
+                None if avatar.get_attribute("data-activity") == "working" else drift_since or now
+            )
+            if drift_since is not None and now - drift_since >= _LULL_DRIFT_HOLD_S:
+                raise AssertionError(
+                    "the backgrounded sub-agent stopped showing working while its sleep ran; "
+                    f"CLI:\n{cli_screen}"
+                )
+            time.sleep(0.25)
+            requests_log.refresh()
+        assert requests_log.contains(_ESC_SLEEP_RESULT), "the backgrounded sleep never returned"
         try:
             expect(avatar).to_have_attribute(
                 "data-activity", re.compile("^(done|idle)$"), timeout=60_000
@@ -377,7 +394,7 @@ def test_subagent_settles_after_esc_interrupts_its_tool_call(
         except AssertionError as error:
             raise AssertionError(
                 f"the sub-agent still shows {avatar.get_attribute('data-activity')!r} 60s after "
-                f"Esc; CLI:\n{cli_screen}"
+                f"its backgrounded sleep returned; CLI:\n{cli_screen}"
             ) from error
         assert _session(base_url, child_id).get("status") == "idle"
 

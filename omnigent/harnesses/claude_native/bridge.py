@@ -1072,6 +1072,8 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param background_task_ids: Ids of every counted shell, including those
+        past the detail limit, so their finish notifications can be matched.
     :param failure_category: ``StopFailure`` error category, e.g.
         ``"rate_limit"``. ``None`` for other events or when absent.
     :param failure_message: ``StopFailure`` raw API error detail from the
@@ -1099,6 +1101,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    background_task_ids: tuple[str, ...] = ()
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
@@ -4062,6 +4065,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status = "completed"
     background_task_count = 0
     background_tasks: list[_JsonObject] | None = None
+    background_task_ids: tuple[str, ...] = ()
     if event_name == "Stop" and isinstance(payload, dict):
         raw_bg = payload.get("background_tasks")
         if isinstance(raw_bg, list):
@@ -4080,6 +4084,13 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 )
             ]
             background_task_count = len(running)
+            background_task_ids = tuple(
+                task_id
+                for task in running
+                if isinstance(task, dict)
+                and isinstance(task_id := task.get("id"), str)
+                and task_id
+            )
             # Detail for the UI. Non-dict / field-less entries drop out here
             # but still count above, so the tally can't under-count.
             details = [
@@ -4148,6 +4159,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        background_task_ids=background_task_ids,
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,
@@ -8820,7 +8832,8 @@ def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:
     return None
 
 
-_TURN_ENDING_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "max_tokens", "refusal"})
+# Stop reasons that leave the turn open; any other reason ends it.
+_TURN_CONTINUING_STOP_REASONS = frozenset({"tool_use", "pause_turn"})
 
 
 def _turn_completed_from_transcript_entry(entry: _JsonObject) -> bool | None:
@@ -8829,16 +8842,20 @@ def _turn_completed_from_transcript_entry(entry: _JsonObject) -> bool | None:
 
     :param entry: One decoded transcript JSONL record.
     :returns: ``True`` for an assistant reply that stopped without
-        requesting a tool, ``False`` for any other conversation message
-        (a tool call, a streamed fragment, or user/tool-result input), and
-        ``None`` for metadata records that say nothing about the turn.
+        requesting a tool or for Claude's interrupt record, ``False`` for any
+        other conversation message (a tool call, a streamed fragment, or
+        user/tool-result input), and ``None`` for metadata records that say
+        nothing about the turn.
     """
     message = entry.get("message")
     if not isinstance(message, dict):
         return None
     role = message.get("role")
     if role == "user":
-        return False
+        content = message.get("content")
+        if isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict):
+            content = content[0].get("text")
+        return _is_interrupt_record_text(content)
     if role != "assistant":
         return None
     content = message.get("content")
@@ -8846,7 +8863,8 @@ def _turn_completed_from_transcript_entry(entry: _JsonObject) -> bool | None:
         isinstance(block, dict) and block.get("type") == "tool_use" for block in content
     ):
         return False
-    return message.get("stop_reason") in _TURN_ENDING_STOP_REASONS
+    stop_reason = message.get("stop_reason")
+    return bool(stop_reason) and stop_reason not in _TURN_CONTINUING_STOP_REASONS
 
 
 def read_claude_context_state(bridge_dir: Path) -> _JsonObject | None:
