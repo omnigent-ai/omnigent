@@ -158,6 +158,7 @@ from omnigent.host.project_setup_runner import (
     claim_worktree_setup,
     clear_setup_marker,
     kill_running_project_commands,
+    pending_setup_marker,
     prepare_project_env,
     run_worktree_setup,
 )
@@ -221,6 +222,7 @@ from omnigent.runner.identity import (
     runner_sign_in_is_pending,
     token_bound_runner_id,
 )
+from omnigent.runner.project_setup_gate import PROJECT_SETUP_MARKER_ENV_VAR
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
@@ -2153,6 +2155,7 @@ class HostProcess:
         project_setup_warnings, project_env_delta = await self._apply_project_env(
             frame, workspace, env
         )
+        await self._gate_on_worktree_setup(frame, workspace, env)
 
         # Embed the session id so operators can find all logs for a session
         # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep
@@ -2309,12 +2312,44 @@ class HostProcess:
             )
         except Exception as exc:
             _logger.exception("Project env commands crashed for %s", workspace)
-            crash = f"project env commands crashed on the host ({type(exc).__name__}: {exc})"
+            crash = f"project env commands crashed on the host ({type(exc).__name__})"
             return [crash], EnvDelta()
         apply_env_delta(env, outcome.env_delta)
         for warning in outcome.warnings:
             _logger.warning("Project env for session %s: %s", frame.session_id, warning)
         return outcome.warnings, outcome.env_delta
+
+    async def _gate_on_worktree_setup(
+        self,
+        frame: HostLaunchRunnerFrame,
+        workspace: Path,
+        env: dict[str, str],
+    ) -> None:
+        """Make the runner hold its turns until the worktree's setup has finished.
+
+        The runner waits for the setup marker, which whichever launch runs the
+        setup writes when it ends. Projects with ``parallel_setup`` are not held.
+
+        :param frame: The launch request carrying ``project_setup``.
+        :param workspace: The session workspace.
+        :param env: Runner environment, updated in place.
+        """
+        setup = ProjectSetup.from_mapping(frame.project_setup) if frame.project_setup else None
+        if setup is None or not setup.setup_commands:
+            return
+
+        def pending() -> Path | None:
+            if frame.force_project_setup:
+                clear_setup_marker(str(workspace))
+            return pending_setup_marker(str(workspace))
+
+        try:
+            marker = await self._run_host_subprocess_in_thread(pending)
+        except Exception:
+            _logger.exception("Could not check project setup state for %s", workspace)
+            return
+        if marker is not None and not setup.parallel_setup:
+            env[PROJECT_SETUP_MARKER_ENV_VAR] = str(marker)
 
     async def _start_worktree_setup(
         self,
@@ -2337,13 +2372,10 @@ class HostProcess:
         session_id = frame.session_id
         commands = setup.setup_commands
 
-        def claim() -> Path | None:
-            if frame.force_project_setup:
-                clear_setup_marker(str(workspace))
-            return claim_worktree_setup(commands, workspace=str(workspace))
-
         try:
-            git_dir = await self._run_host_subprocess_in_thread(claim)
+            git_dir = await self._run_host_subprocess_in_thread(
+                lambda: claim_worktree_setup(workspace=str(workspace))
+            )
         except Exception:
             _logger.exception("Could not check project setup state for %s", workspace)
             return False
@@ -2367,13 +2399,13 @@ class HostProcess:
                 report = HostProjectSetupFinishedFrame(
                     session_id=session_id,
                     warning=result.warning,
-                    log_path=str(result.log_path),
+                    log_path=display_log_path(result.log_path) if result.log_path else None,
                 )
             except Exception as exc:
                 _logger.exception("Project setup crashed for %s", workspace)
                 report = HostProjectSetupFinishedFrame(
                     session_id=session_id,
-                    warning=f"project setup crashed on the host ({type(exc).__name__}: {exc})",
+                    warning=f"project setup crashed on the host ({type(exc).__name__})",
                 )
             await self._report_project_setup(report)
 

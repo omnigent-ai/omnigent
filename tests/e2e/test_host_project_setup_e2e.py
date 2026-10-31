@@ -42,7 +42,7 @@ pytestmark = [
 _SHELL_RC = (
     'fakeenv_activate() { export FAKEENV_NAME="$1"; export PATH="$HOME/fakeenv/bin:$PATH"; }\n'
 )
-_PROBE = 'echo "FAKEENV=$FAKEENV_NAME PATH=$PATH"'
+_PROBE = 'echo "FAKEENV=$FAKEENV_NAME PATH=$PATH SETUP=$(cat setup-done 2>/dev/null)"'
 
 
 def _repo_with_worktree(root: Path) -> tuple[Path, Path]:
@@ -145,6 +145,7 @@ def test_project_setup_applies_to_a_real_host_session(
                 "setup_commands": [
                     'echo "$OMNIGENT_ROOT_PATH" > setup-root.txt',
                     "echo ran >> setup-runs.txt",
+                    "sleep 3 && echo yes > setup-done",
                 ],
             },
         },
@@ -181,9 +182,10 @@ def test_project_setup_applies_to_a_real_host_session(
         poll_until(lambda: _runner_online(http_client, runner_id), timeout_s=60)
         bind_session_runner(http_client.patch, live_server, session_id, runner_id)
 
-        # First launch: the env reaches the agent and setup runs in the background.
+        # First launch: the env reaches the agent, whose turn waits for setup.
         stdout = _probe_env(http_client, mock_llm_server_url, model, session_id)
         assert "FAKEENV=proj-e2e" in stdout and f"{home}/fakeenv/bin:" in stdout, stdout
+        assert "SETUP=yes" in stdout, stdout
         poll_until(
             lambda: _notice(http_client, session_id, "project_setup_finished"), timeout_s=60
         )
@@ -206,4 +208,5 @@ def test_project_setup_applies_to_a_real_host_session(
         assert "FAKEENV= " in stdout, stdout
         failed = _notice(http_client, session_id, "project_setup_failed")
         assert failed is not None and failed["level"] == "error", failed
-        assert "fakeenv_missing" in failed["message"], failed
+        # The notice names the exit code and host log, never the command output.
+        assert "exit 127" in failed["message"] and "log:" in failed["message"], failed

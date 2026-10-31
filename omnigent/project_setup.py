@@ -6,6 +6,7 @@ A project's ``config`` may carry two command lists that prepare its sessions:
   environment changes they make (``conda activate``, ``nvm use``) are applied
   to the agent.
 - ``setup_commands`` run once per git worktree (copying ``.env``, installs).
+  The agent's turns wait for them unless ``parallel_setup`` is set.
 
 The server validates them when a project is saved and sends them to the host
 with each runner launch; the host executes them (see
@@ -21,6 +22,7 @@ from typing import Any
 
 ENV_COMMANDS_KEY = "env_commands"
 SETUP_COMMANDS_KEY = "setup_commands"
+PARALLEL_SETUP_KEY = "parallel_setup"
 
 #: Upper bounds that keep a project config and its launch frame small.
 MAX_COMMANDS_PER_LIST = 20
@@ -65,11 +67,25 @@ def validate_project_setup_config(config: Mapping[str, Any]) -> None:
     """
     _validated_commands(config.get(ENV_COMMANDS_KEY), ENV_COMMANDS_KEY)
     _validated_commands(config.get(SETUP_COMMANDS_KEY), SETUP_COMMANDS_KEY)
+    _validated_flag(config.get(PARALLEL_SETUP_KEY), PARALLEL_SETUP_KEY)
+
+
+def _validated_flag(value: object, key: str) -> bool:
+    """
+    Validate an optional boolean setting.
+
+    :raises ValueError: If the value is set and not a boolean.
+    """
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false")
+    return value
 
 
 def commands_digest(commands: Sequence[str]) -> str:
     """
-    Stable fingerprint of a command list, used to detect config edits.
+    Stable fingerprint of a command list, recorded with a worktree's setup run.
 
     :param commands: Commands in run order, e.g. ``("npm ci",)``.
     :returns: Hex SHA-256 digest.
@@ -90,10 +106,13 @@ class ProjectSetup:
         every launch, e.g. ``("conda activate proj",)``.
     :param setup_commands: One-shot commands run once per git worktree, e.g.
         ``("npm ci",)``.
+    :param parallel_setup: Let the agent's turns start while ``setup_commands``
+        still run, instead of waiting for them.
     """
 
     env_commands: tuple[str, ...] = ()
     setup_commands: tuple[str, ...] = ()
+    parallel_setup: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> ProjectSetup | None:
@@ -107,16 +126,18 @@ class ProjectSetup:
         setup = cls(
             env_commands=_validated_commands(raw.get(ENV_COMMANDS_KEY), ENV_COMMANDS_KEY),
             setup_commands=_validated_commands(raw.get(SETUP_COMMANDS_KEY), SETUP_COMMANDS_KEY),
+            parallel_setup=_validated_flag(raw.get(PARALLEL_SETUP_KEY), PARALLEL_SETUP_KEY),
         )
         return setup if setup.env_commands or setup.setup_commands else None
 
-    def to_wire(self) -> dict[str, list[str]]:
+    def to_wire(self) -> dict[str, Any]:
         """
         Serialize for the ``host.launch_runner`` frame.
 
-        :returns: ``{"env_commands": [...], "setup_commands": [...]}``.
+        :returns: ``{"env_commands": [...], "setup_commands": [...], "parallel_setup": bool}``.
         """
         return {
             ENV_COMMANDS_KEY: list(self.env_commands),
             SETUP_COMMANDS_KEY: list(self.setup_commands),
+            PARALLEL_SETUP_KEY: self.parallel_setup,
         }

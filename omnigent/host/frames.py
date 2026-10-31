@@ -346,7 +346,7 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
-    project_setup: dict[str, list[str]] | None = None
+    project_setup: dict[str, Any] | None = None
     force_project_setup: bool = False
 
 

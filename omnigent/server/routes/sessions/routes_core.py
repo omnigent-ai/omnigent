@@ -899,6 +899,7 @@ def register_core_routes(
                 unsupported=project_setup.unsupported,
                 warnings=launch_result.get("project_setup_warnings", ()),
                 running=launch_result.get("project_setup_running", False),
+                agent_waits=project_setup.agent_waits,
             )
         return runner_id, launch_failed
 

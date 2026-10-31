@@ -13,7 +13,6 @@ import pytest
 
 from omnigent.host import project_setup_runner
 from omnigent.host.project_setup_runner import (
-    SETUP_MARKER_NAME,
     EnvDelta,
     EnvProbeCache,
     apply_env_delta,
@@ -21,6 +20,7 @@ from omnigent.host.project_setup_runner import (
     clear_setup_marker,
     compute_env_delta,
     kill_running_project_commands,
+    pending_setup_marker,
     prepare_project_env,
     probe_env_delta,
     run_worktree_setup,
@@ -64,6 +64,16 @@ def linked_worktree(tmp_path: Path) -> Path:
     return worktree
 
 
+def _run_claimed_setup(worktree: Path, commands: tuple[str, ...]) -> str | None:
+    """Claim and run a worktree's setup; return its warning."""
+    git_dir = claim_worktree_setup(workspace=str(worktree))
+    assert git_dir is not None
+    result = run_worktree_setup(
+        commands, git_dir=git_dir, workspace=str(worktree), session_id="conv_1", env={}
+    )
+    return result.warning
+
+
 def test_env_delta_keeps_project_changes_and_drops_noise_and_wiring() -> None:
     before = {"PATH": "/usr/bin", "PWD": "/a", "VIRTUAL_ENV": "/old", "HOME": "/h"}
     after = {
@@ -81,16 +91,17 @@ def test_env_delta_keeps_project_changes_and_drops_noise_and_wiring() -> None:
     assert delta.unset_vars == frozenset({"VIRTUAL_ENV"})
 
 
-def test_apply_env_delta_never_overrides_runner_wiring() -> None:
-    env = {"RUNNER_ID": "real", "VIRTUAL_ENV": "/old", "PATH": "/usr/bin"}
+def test_apply_env_delta_merges_path_and_never_overrides_runner_wiring() -> None:
+    env = {"RUNNER_ID": "real", "VIRTUAL_ENV": "/old", "PATH": "/pinned/bin:/usr/bin"}
     delta = EnvDelta(
-        set_vars={"PATH": "/conda/bin", "RUNNER_ID": "spoofed"},
+        set_vars={"PATH": "/conda/bin:/usr/bin", "RUNNER_ID": "spoofed"},
         unset_vars=frozenset({"VIRTUAL_ENV", "RUNNER_ID"}),
     )
 
     apply_env_delta(env, delta)
 
-    assert env == {"RUNNER_ID": "real", "PATH": "/conda/bin"}
+    # The project's order wins; the runner's pinned entry stays reachable.
+    assert env == {"RUNNER_ID": "real", "PATH": "/conda/bin:/usr/bin:/pinned/bin"}
 
 
 def test_probe_captures_exports_from_the_users_shell(
@@ -107,17 +118,17 @@ def test_probe_captures_exports_from_the_users_shell(
     assert delta.set_vars["PATH"].startswith("/project/bin:")
 
 
-def test_probe_failure_is_a_warning_with_the_output(
+def test_probe_failure_warning_points_to_the_log_without_the_output(
     bash_login_shell: None, tmp_path: Path
 ) -> None:
     delta, warning = probe_env_delta(
-        ("echo 'no such env' >&2; false", "export NEVER_RUNS=1"), workspace=str(tmp_path)
+        ("echo 'token=s3cret' >&2; false", "export NEVER_RUNS=1"), workspace=str(tmp_path)
     )
 
     assert delta is None
-    assert warning is not None
-    assert "exit 1" in warning
-    assert "no such env" in warning
+    assert warning is not None and "exit 1" in warning and "log:" in warning
+    # Warnings are shown in shared sessions, so command output stays in the host log.
+    assert "s3cret" not in warning
 
 
 def test_probe_that_hangs_is_killed_within_its_timeout(
@@ -138,6 +149,20 @@ def test_non_posix_login_shell_skips_env_commands(
 
     assert delta is None
     assert warning is not None and "bash or zsh" in warning
+
+
+def test_login_shell_comes_from_the_account_when_shell_is_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.setattr(
+        "pwd.getpwuid", lambda _uid: SimpleNamespace(pw_shell=shutil.which("bash"))
+    )
+
+    delta, warning = probe_env_delta(("export FROM_ACCOUNT_SHELL=1",), workspace=str(tmp_path))
+
+    assert warning is None
+    assert delta is not None and delta.set_vars["FROM_ACCOUNT_SHELL"] == "1"
 
 
 def test_successful_probe_is_reused_until_the_commands_change(
@@ -164,101 +189,72 @@ def test_successful_probe_is_reused_until_the_commands_change(
     assert calls == [("export A=1",), ("export A=2",)]
 
 
-def test_setup_runs_once_per_worktree_and_again_after_an_edit(
+def test_setup_runs_once_per_worktree_even_after_the_commands_change(
     bash_login_shell: None, linked_worktree: Path
 ) -> None:
-    commands = ("echo run >> setup.log", 'test -d "$OMNIGENT_ROOT_PATH/.git"')
+    marker = pending_setup_marker(str(linked_worktree))
+    assert marker is not None and not marker.exists()
 
-    git_dir = claim_worktree_setup(commands, workspace=str(linked_worktree))
-    assert git_dir is not None
-    result = run_worktree_setup(
-        commands, git_dir=git_dir, workspace=str(linked_worktree), session_id="conv_1", env={}
-    )
-    assert result.warning is None
-
-    assert claim_worktree_setup(commands, workspace=str(linked_worktree)) is None
-    edited = (*commands, "echo edited >> setup.log")
-    git_dir = claim_worktree_setup(edited, workspace=str(linked_worktree))
-    assert git_dir is not None
-    run_worktree_setup(
-        edited, git_dir=git_dir, workspace=str(linked_worktree), session_id="conv_2", env={}
+    warning = _run_claimed_setup(
+        linked_worktree, ("echo ran >> setup.log", 'test -d "$OMNIGENT_ROOT_PATH/.git"')
     )
 
-    assert (linked_worktree / "setup.log").read_text().splitlines() == ["run", "run", "edited"]
-    marker = json.loads((git_dir / SETUP_MARKER_NAME).read_text())
-    assert marker["status"] == "succeeded"
+    assert warning is None
+    assert json.loads(marker.read_text())["status"] == "succeeded"
     # The marker lives in the worktree's private git dir, not the checkout.
-    assert not (linked_worktree / SETUP_MARKER_NAME).exists()
+    assert marker.parent.parent.parent.name == ".git"
+    # An edited list does not re-run where an agent may already be working.
+    assert pending_setup_marker(str(linked_worktree)) is None
+    assert claim_worktree_setup(workspace=str(linked_worktree)) is None
+    assert (linked_worktree / "setup.log").read_text().split() == ["ran"]
 
 
-def test_failed_setup_stops_records_the_failure_and_can_be_forced_again(
+def test_failed_setup_names_the_step_records_it_and_can_be_forced_again(
     bash_login_shell: None, linked_worktree: Path
 ) -> None:
-    commands = ("echo broken install >&2; exit 3", "touch never-ran")
-
-    git_dir = claim_worktree_setup(commands, workspace=str(linked_worktree))
-    assert git_dir is not None
-    result = run_worktree_setup(
-        commands, git_dir=git_dir, workspace=str(linked_worktree), session_id=None, env={}
+    warning = _run_claimed_setup(
+        linked_worktree, ("true", "echo 'token=s3cret' >&2; exit 3", "touch never-ran")
     )
 
-    assert result.warning is not None
-    assert "exit 3" in result.warning and "broken install" in result.warning
+    assert warning == "setup command 2 of 3 failed (exit 3)"
     assert not (linked_worktree / "never-ran").exists()
-    # A failed run is recorded, so resuming the session does not retry it...
-    assert claim_worktree_setup(commands, workspace=str(linked_worktree)) is None
+    # Recorded, so a waiting runner proceeds and resuming does not retry it...
+    assert claim_worktree_setup(workspace=str(linked_worktree)) is None
     # ...until the user asks for a re-run.
     assert clear_setup_marker(str(linked_worktree)) is True
-    assert claim_worktree_setup(commands, workspace=str(linked_worktree)) is not None
+    assert claim_worktree_setup(workspace=str(linked_worktree)) is not None
 
 
 def test_concurrent_launches_in_one_worktree_run_setup_once(linked_worktree: Path) -> None:
-    commands = ("true",)
-
-    first = claim_worktree_setup(commands, workspace=str(linked_worktree))
-    second = claim_worktree_setup(commands, workspace=str(linked_worktree))
+    first = claim_worktree_setup(workspace=str(linked_worktree))
+    second = claim_worktree_setup(workspace=str(linked_worktree))
 
     assert first is not None
     assert second is None
     run_worktree_setup(
-        commands, git_dir=first, workspace=str(linked_worktree), session_id=None, env={}
+        ("true",), git_dir=first, workspace=str(linked_worktree), session_id=None, env={}
     )
 
 
 def test_setup_is_skipped_outside_a_linked_worktree(linked_worktree: Path, tmp_path: Path) -> None:
-    main_checkout = tmp_path / "repo"
-
-    assert claim_worktree_setup(("true",), workspace=str(main_checkout)) is None
-    assert claim_worktree_setup(("true",), workspace=str(tmp_path)) is None
+    assert claim_worktree_setup(workspace=str(tmp_path / "repo")) is None
+    assert claim_worktree_setup(workspace=str(tmp_path)) is None
 
 
 def test_setup_interrupted_by_host_shutdown_runs_again_next_launch(
     bash_login_shell: None, linked_worktree: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(project_setup_runner, "_shutting_down", threading.Event())
-    commands = ("sleep 30",)
-    git_dir = claim_worktree_setup(commands, workspace=str(linked_worktree))
-    assert git_dir is not None
-    killer = threading.Timer(0.5, kill_running_project_commands)
-    killer.start()
+    threading.Timer(0.5, kill_running_project_commands).start()
 
-    result = run_worktree_setup(
-        commands, git_dir=git_dir, workspace=str(linked_worktree), session_id=None, env={}
-    )
+    warning = _run_claimed_setup(linked_worktree, ("sleep 30",))
 
-    assert result.warning == "interrupted by host shutdown"
-    assert claim_worktree_setup(commands, workspace=str(linked_worktree)) is not None
+    assert warning == "interrupted by host shutdown"
+    assert claim_worktree_setup(workspace=str(linked_worktree)) is not None
 
 
-def test_login_shell_comes_from_the_account_when_shell_is_unset(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_a_finished_host_shutdown_does_not_mark_later_setups_interrupted(
+    bash_login_shell: None, linked_worktree: Path
 ) -> None:
-    monkeypatch.delenv("SHELL", raising=False)
-    monkeypatch.setattr(
-        "pwd.getpwuid", lambda _uid: SimpleNamespace(pw_shell=shutil.which("bash"))
-    )
+    kill_running_project_commands()
 
-    delta, warning = probe_env_delta(("export FROM_ACCOUNT_SHELL=1",), workspace=str(tmp_path))
-
-    assert warning is None
-    assert delta is not None and delta.set_vars["FROM_ACCOUNT_SHELL"] == "1"
+    assert _run_claimed_setup(linked_worktree, ("true",)) is None

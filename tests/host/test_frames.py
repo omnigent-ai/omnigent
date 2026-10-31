@@ -965,7 +965,11 @@ def test_launch_runner_project_setup_round_trips_and_is_absent_for_older_peers()
         binding_token="tok",
         workspace="/w",
         session_id="conv_p",
-        project_setup={"env_commands": ["conda activate proj"], "setup_commands": ["npm ci"]},
+        project_setup={
+            "env_commands": ["conda activate proj"],
+            "setup_commands": ["npm ci"],
+            "parallel_setup": True,
+        },
         force_project_setup=True,
     )
     assert decode_host_frame(encode_host_frame(frame)) == frame

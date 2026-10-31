@@ -166,6 +166,30 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("offers the parallel-setup switch only with setup commands, and saves it", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    expect(screen.queryByTestId("project-settings-parallel-setup")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("project-settings-setup-commands"), {
+      target: { value: "npm ci" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-parallel-setup"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        setup_commands: ["npm ci"],
+        parallel_setup: true,
+      }),
+    );
+  });
+
   it("drops a command list cleared to blank", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",

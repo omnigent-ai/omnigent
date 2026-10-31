@@ -7,7 +7,10 @@ Two phases, both best-effort (a failure becomes a warning, never a failed launch
    and after the commands; only the *delta* is applied to the runner, so the
    runner env allowlist still keeps the rest of the user's shell env out.
 2. ``setup_commands`` run once per linked git worktree, recorded by a marker
-   in the worktree's private git dir. Editing the list re-runs them.
+   in the worktree's private git dir. Re-running takes an explicit request.
+
+Warnings name the failing step, exit code and host log; command output stays in
+the host log, since warnings are shown in a session others may read.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from pathlib import Path
 
 from omnigent._platform import IS_WINDOWS, _resolve_interactive_shell, default_shell_argv
 from omnigent.host.git_worktree import WorktreeError, _main_work_tree, _run_git
-from omnigent.process_logging import open_process_log_file
+from omnigent.process_logging import display_log_path, open_process_log_file
 from omnigent.project_setup import SETUP_BUDGET_S, ProjectSetup, commands_digest
 
 _logger = logging.getLogger(__name__)
@@ -40,8 +43,8 @@ ENV_PROBE_TIMEOUT_S = 7.0
 ENV_PROBE_SLOW_S = 2.0
 #: How long a successful probe is reused for the same workspace and commands.
 ENV_PROBE_CACHE_TTL_S = 600.0
-#: Output lines quoted in a failure warning.
-_WARNING_TAIL_LINES = 40
+#: Output lines copied to the host log for a failure.
+_LOG_TAIL_LINES = 40
 
 SETUP_MARKER_NAME = "omnigent-setup.json"
 
@@ -126,11 +129,25 @@ def apply_env_delta(env: dict[str, str], delta: EnvDelta) -> None:
     :param delta: Changes from :func:`compute_env_delta`.
     """
     for key in delta.unset_vars:
-        if not key.startswith(_PROTECTED_ENV_PREFIXES):
+        if not key.startswith(_PROTECTED_ENV_PREFIXES) and key != "PATH":
             env.pop(key, None)
     for key, value in delta.set_vars.items():
-        if not key.startswith(_PROTECTED_ENV_PREFIXES):
-            env[key] = value
+        if key.startswith(_PROTECTED_ENV_PREFIXES):
+            continue
+        env[key] = _merge_paths(value, env.get("PATH", "")) if key == "PATH" else value
+
+
+def _merge_paths(project_path: str, base_path: str) -> str:
+    """
+    Keep the project's ``PATH`` order first, then base entries it lacks.
+
+    Activation puts its bin dir first; base entries the runner was started
+    with (e.g. a pinned tool dir) stay reachable instead of being dropped.
+    """
+    entries = [entry for entry in project_path.split(os.pathsep) if entry]
+    seen = set(entries)
+    entries += [entry for entry in base_path.split(os.pathsep) if entry and entry not in seen]
+    return os.pathsep.join(entries)
 
 
 def _user_shell() -> str | None:
@@ -156,7 +173,7 @@ def _user_shell() -> str | None:
     return _resolve_interactive_shell(name)
 
 
-def _tail(text: str, lines: int = _WARNING_TAIL_LINES) -> str:
+def _tail(text: str, lines: int = _LOG_TAIL_LINES) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
@@ -171,8 +188,12 @@ def _kill_group(process: subprocess.Popen[bytes]) -> None:
 #: Project command processes alive now, so host shutdown can stop them.
 _live_processes: set[subprocess.Popen[bytes]] = set()
 _live_processes_lock = threading.Lock()
-#: Set at host shutdown: an interrupted setup records no marker, so it re-runs.
-_shutting_down = threading.Event()
+#: Commands killed by host shutdown; their setup records no marker, so it re-runs.
+_interrupted_processes: set[subprocess.Popen[bytes]] = set()
+
+
+class InterruptedByShutdownError(Exception):
+    """A project command was killed because the host is shutting down."""
 
 
 def kill_running_project_commands() -> None:
@@ -180,9 +201,9 @@ def kill_running_project_commands() -> None:
 
     Each command runs in its own session, so it would otherwise outlive the host.
     """
-    _shutting_down.set()
     with _live_processes_lock:
         processes = list(_live_processes)
+        _interrupted_processes.update(processes)
     for process in processes:
         _kill_group(process)
 
@@ -194,6 +215,7 @@ def _run_bounded(
     Run a command in its own process group, appending its output to a file.
 
     :returns: The exit code, or ``None`` when it timed out and was killed.
+    :raises InterruptedByShutdownError: If host shutdown killed it.
     """
     with open(output_path, "ab") as output:
         process = subprocess.Popen(
@@ -208,13 +230,18 @@ def _run_bounded(
         with _live_processes_lock:
             _live_processes.add(process)
         try:
-            return process.wait(timeout=max(timeout, 0.1))
+            exit_code: int | None = process.wait(timeout=max(timeout, 0.1))
         except subprocess.TimeoutExpired:
             _kill_group(process)
-            return None
+            exit_code = None
         finally:
             with _live_processes_lock:
                 _live_processes.discard(process)
+                interrupted = process in _interrupted_processes
+                _interrupted_processes.discard(process)
+        if interrupted:
+            raise InterruptedByShutdownError
+        return exit_code
 
 
 def _probe_script(commands: tuple[str, ...], before_path: str, after_path: str) -> str:
@@ -231,6 +258,17 @@ def _read_env_dump(path: str) -> dict[str, str]:
     with open(path, "rb") as dump:
         entries = dump.read().decode("utf-8", errors="surrogateescape").split("\0")
     return dict(entry.split("=", 1) for entry in entries if "=" in entry)
+
+
+def _keep_failure_output(output_path: Path, prefix: str) -> str:
+    """Copy a failed probe's output into a host log and return its display path."""
+    log_path, log_file = open_process_log_file("project-setup", prefix=prefix)
+    with log_file:
+        if output_path.exists():
+            log_file.write(output_path.read_bytes())
+    output = output_path.read_text(errors="replace") if output_path.exists() else ""
+    _logger.warning("Project env commands failed; output tail:\n%s", _tail(output))
+    return display_log_path(log_path)
 
 
 def probe_env_delta(
@@ -265,13 +303,14 @@ def probe_env_delta(
             output_path=output_path,
         )
         elapsed = time.monotonic() - started
-        output = output_path.read_text(errors="replace") if output_path.exists() else ""
         if elapsed > ENV_PROBE_SLOW_S:
             _logger.warning("Project env commands took %.1fs in %s", elapsed, workspace)
-        if exit_code is None:
-            return None, f"project env commands timed out after {timeout:.0f}s\n{_tail(output)}"
-        if exit_code != 0 or not os.path.exists(after_path):
-            return None, f"project env commands failed (exit {exit_code})\n{_tail(output)}"
+        if exit_code is None or exit_code != 0 or not os.path.exists(after_path):
+            outcome = (
+                f"timed out after {timeout:.0f}s" if exit_code is None else f"exit {exit_code}"
+            )
+            log = _keep_failure_output(output_path, "project-env-")
+            return None, f"project env commands failed ({outcome}); log: {log}"
         try:
             before, after = _read_env_dump(before_path), _read_env_dump(after_path)
         except OSError as exc:
@@ -339,12 +378,19 @@ def clear_setup_marker(workspace: str) -> bool:
     return True
 
 
-def _setup_already_ran(marker: Path, digest: str) -> bool:
-    try:
-        recorded = json.loads(marker.read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(recorded, dict) and recorded.get("commands_sha256") == digest
+def pending_setup_marker(workspace: str) -> Path | None:
+    """
+    Return the marker a worktree's setup will write, or ``None`` if none is due.
+
+    A runner given this path waits for it before its first turn.
+
+    :param workspace: Session workspace.
+    :returns: The marker path for a linked worktree whose setup has not run yet.
+    """
+    git_dir = linked_worktree_git_dir(workspace)
+    if git_dir is None or (git_dir / SETUP_MARKER_NAME).exists():
+        return None
+    return git_dir / SETUP_MARKER_NAME
 
 
 #: Worktree git dirs whose setup is running now, so two sessions starting in
@@ -353,21 +399,22 @@ _running_setups: set[Path] = set()
 _running_setups_lock = threading.Lock()
 
 
-def claim_worktree_setup(commands: tuple[str, ...], *, workspace: str) -> Path | None:
+def claim_worktree_setup(*, workspace: str) -> Path | None:
     """
     Decide whether this launch should run the worktree's setup, and claim it.
 
-    :param commands: The project's ``setup_commands``.
+    Setup runs once per worktree: editing the commands does not re-run it in
+    a worktree that already ran them, where an agent may be working.
+
     :param workspace: Session workspace.
     :returns: The claimed worktree git dir, to pass to :func:`run_worktree_setup`;
-        ``None`` when the workspace is not a linked worktree, this version of
-        the setup already ran, or another launch is running it.
+        ``None`` when the workspace is not a linked worktree, its setup already
+        ran, or another launch is running it.
     """
-    git_dir = linked_worktree_git_dir(workspace)
-    if git_dir is None or _setup_already_ran(
-        git_dir / SETUP_MARKER_NAME, commands_digest(commands)
-    ):
+    marker = pending_setup_marker(workspace)
+    if marker is None:
         return None
+    git_dir = marker.parent
     with _running_setups_lock:
         if git_dir in _running_setups:
             return None
@@ -380,12 +427,12 @@ class WorktreeSetupResult:
     """
     Outcome of a worktree's setup run.
 
-    :param warning: Failure description with output tail, or ``None`` on success.
+    :param warning: Failing step and exit code, or ``None`` on success.
     :param log_path: Full output log on the host.
     """
 
     warning: str | None
-    log_path: Path
+    log_path: Path | None
 
 
 def run_worktree_setup(
@@ -401,9 +448,9 @@ def run_worktree_setup(
     Run a claimed worktree's ``setup_commands`` and record the marker.
 
     Blocking for up to ``budget_s``; the host runs it in the background after
-    the runner starts. Execution stops at the first failing command, and the
-    marker is written either way so a broken install does not re-run on every
-    launch (editing the commands re-runs them).
+    the runner starts. Execution stops at the first failing command. The marker
+    is written whatever the outcome, since a waiting runner proceeds on it; only
+    host shutdown leaves it unwritten, so the next launch runs setup again.
 
     :param commands: Commands in order.
     :param git_dir: Worktree git dir from :func:`claim_worktree_setup`.
@@ -414,15 +461,36 @@ def run_worktree_setup(
     :returns: The outcome and log path.
     """
     try:
-        return _run_claimed_setup(commands, git_dir, workspace, session_id, env, budget_s)
+        result = _run_claimed_setup(commands, workspace, session_id, env, budget_s)
+    except InterruptedByShutdownError:
+        return WorktreeSetupResult(warning="interrupted by host shutdown", log_path=None)
+    except Exception as exc:
+        _logger.exception("Project setup crashed in %s", workspace)
+        result = WorktreeSetupResult(
+            warning=f"project setup crashed on the host ({type(exc).__name__})", log_path=None
+        )
     finally:
         with _running_setups_lock:
             _running_setups.discard(git_dir)
+    _write_marker(git_dir, commands, result)
+    return result
+
+
+def _write_marker(git_dir: Path, commands: tuple[str, ...], result: WorktreeSetupResult) -> None:
+    record = {
+        "commands_sha256": commands_digest(commands),
+        "status": "failed" if result.warning else "succeeded",
+        "finished_at": int(time.time()),
+        "log_path": str(result.log_path) if result.log_path else None,
+    }
+    try:
+        (git_dir / SETUP_MARKER_NAME).write_text(json.dumps(record))
+    except OSError:
+        _logger.warning("Could not record project setup marker in %s", git_dir, exc_info=True)
 
 
 def _run_claimed_setup(
     commands: tuple[str, ...],
-    git_dir: Path,
     workspace: str,
     session_id: str | None,
     env: dict[str, str],
@@ -447,7 +515,7 @@ def _run_claimed_setup(
     # A login shell restores the user's PATH (e.g. Homebrew from .zprofile),
     # which a daemon started by launchd or systemd often lacks.
     shell = None if IS_WINDOWS else _user_shell()
-    for command in commands:
+    for step, command in enumerate(commands, start=1):
         exit_code = _run_bounded(
             [shell, "-l", "-c", command] if shell else default_shell_argv(command),
             cwd=workspace,
@@ -459,21 +527,14 @@ def _run_claimed_setup(
             outcome = (
                 f"timed out after {budget_s:.0f}s" if exit_code is None else f"exit {exit_code}"
             )
-            output = log_path.read_text(errors="replace")
-            warning = f"setup command `{command}` failed ({outcome})\n{_tail(output)}"
+            _logger.warning(
+                "Project setup step %d failed in %s; output tail:\n%s",
+                step,
+                workspace,
+                _tail(log_path.read_text(errors="replace")),
+            )
+            warning = f"setup command {step} of {len(commands)} failed ({outcome})"
             break
-    if _shutting_down.is_set():
-        return WorktreeSetupResult(warning="interrupted by host shutdown", log_path=log_path)
-    record = {
-        "commands_sha256": commands_digest(commands),
-        "status": "failed" if warning else "succeeded",
-        "finished_at": int(time.time()),
-        "log_path": str(log_path),
-    }
-    try:
-        (git_dir / SETUP_MARKER_NAME).write_text(json.dumps(record))
-    except OSError:
-        _logger.warning("Could not record project setup marker in %s", git_dir, exc_info=True)
     return WorktreeSetupResult(warning=warning, log_path=log_path)
 
 

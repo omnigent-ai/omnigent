@@ -6327,6 +6327,7 @@ async def note_project_setup_on_launch(
     unsupported: bool,
     warnings: Sequence[str],
     running: bool = False,
+    agent_waits: bool = True,
 ) -> None:
     """
     Tell the user how a launch applied the project's setup.
@@ -6334,8 +6335,10 @@ async def note_project_setup_on_launch(
     :param conv: The launched session.
     :param conversation_store: Store used for the durable append.
     :param unsupported: The host is too old to run project setup.
-    :param warnings: Failures the host reported, e.g. a conda error.
-    :param running: Worktree setup commands started in the background.
+    :param warnings: Failures the host reported, e.g. a conda env that is missing.
+    :param running: Worktree setup commands started on the host.
+    :param agent_waits: The agent's turns wait for the setup to finish
+        (the project did not opt into ``parallel_setup``).
     """
     messages = [PROJECT_SETUP_UNSUPPORTED_NOTICE] if unsupported else []
     messages.extend(f"Project env commands did not apply: {warning}" for warning in warnings)
@@ -6354,6 +6357,9 @@ async def note_project_setup_on_launch(
             code=PROJECT_SETUP_RUNNING_NOTICE_CODE,
             message=(
                 "Project setup commands are running for this worktree. The agent "
+                "will start when they finish."
+                if agent_waits
+                else "Project setup commands are running for this worktree. The agent "
                 "can start now; installs may still be in progress."
             ),
             level="info",
@@ -6631,6 +6637,7 @@ async def _launch_runner_on_host_locked(
             unsupported=False,
             warnings=result.get("project_setup_warnings", ()),
             running=result.get("project_setup_running", False),
+            agent_waits=project_setup.agent_waits,
         )
         return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 

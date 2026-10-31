@@ -5057,13 +5057,14 @@ async def test_project_setup_reaches_the_host_and_its_outcome_reaches_the_sessio
         },
     )
 
-    assert launch_frame.project_setup == config
+    assert launch_frame.project_setup == {**config, "parallel_setup": False}
     notices = await _notices(client, session_id)
     assert [(n["code"], n["level"]) for n in notices] == [
         ("project_setup_failed", "error"),
         ("project_setup_running", "info"),
     ]
     assert "exit 1" in str(notices[0]["message"])
+    assert "will start when they finish" in str(notices[1]["message"])
 
     await comm.send_input(
         {

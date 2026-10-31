@@ -23,14 +23,14 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation, Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import CAP_PROJECT_SETUP
-from omnigent.project_setup import ProjectSetup
+from omnigent.project_setup import PARALLEL_SETUP_KEY, ProjectSetup
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
@@ -201,8 +201,13 @@ class LaunchProjectSetup:
         :data:`CAP_PROJECT_SETUP`; the caller should tell the user.
     """
 
-    wire: dict[str, list[str]] | None = None
+    wire: dict[str, Any] | None = None
     unsupported: bool = False
+
+    @property
+    def agent_waits(self) -> bool:
+        """Whether the agent's turns wait for the worktree setup to finish."""
+        return not (self.wire or {}).get(PARALLEL_SETUP_KEY, False)
 
 
 def _owned_project(project_id: str, owner: str | None) -> Project | None:

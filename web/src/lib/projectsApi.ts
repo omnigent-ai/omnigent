@@ -64,10 +64,12 @@ export interface ProjectConfig {
    */
   env_commands?: string[];
   /**
-   * Commands run once per new git worktree, in the background after the
-   * session starts (e.g. installs). Re-run when the list changes.
+   * Commands run once per new git worktree (e.g. installs). The agent's turns
+   * wait for them unless `parallel_setup` is set.
    */
   setup_commands?: string[];
+  /** Let the agent start while `setup_commands` still run. Unset = wait. */
+  parallel_setup?: boolean;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

@@ -1515,6 +1515,7 @@ def create_hosts_router(
             unsupported=project_setup.unsupported,
             warnings=result.get("project_setup_warnings", ()),
             running=result.get("project_setup_running", False),
+            agent_waits=project_setup.agent_waits,
         )
         return {
             "runner_id": runner_id,

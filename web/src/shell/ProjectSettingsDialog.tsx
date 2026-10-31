@@ -167,6 +167,7 @@ export function ProjectSettingsDialog({
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [envCommands, setEnvCommands] = useState("");
   const [setupCommands, setSetupCommands] = useState("");
+  const [parallelSetup, setParallelSetup] = useState(false);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
   // DialogContent, so their dismiss (pick an option / click the body while
@@ -221,6 +222,7 @@ export function ProjectSettingsDialog({
     setWorkspaceOpen(false);
     setEnvCommands(commandsToText(c.env_commands));
     setSetupCommands(commandsToText(c.setup_commands));
+    setParallelSetup(c.parallel_setup === true);
   }, [open, stored, loadFailed, launch]);
 
   const onSubmit = (e: FormEvent) => {
@@ -277,6 +279,9 @@ export function ProjectSettingsDialog({
     const setupList = commandsFromText(setupCommands);
     if (setupList.length > 0) config.setup_commands = setupList;
     else delete config.setup_commands;
+    // Only meaningful with setup commands; unset keeps the default (agent waits).
+    if (setupList.length > 0 && parallelSetup) config.parallel_setup = true;
+    else delete config.parallel_setup;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -707,7 +712,7 @@ export function ProjectSettingsDialog({
 
           <Field
             label="Worktree setup"
-            hint="Run once per new git worktree, in the background (e.g. installs). $OMNIGENT_ROOT_PATH is the main checkout. One per line."
+            hint="Run once per new git worktree (e.g. installs). $OMNIGENT_ROOT_PATH is the main checkout. One per line."
             htmlFor="project-settings-setup-commands"
           >
             <Textarea
@@ -720,6 +725,22 @@ export function ProjectSettingsDialog({
               disabled={isLoading}
             />
           </Field>
+
+          {commandsFromText(setupCommands).length > 0 && (
+            <Field
+              label="Start agent during setup"
+              hint="Let the agent start before worktree setup finishes, instead of waiting for it."
+            >
+              <div className="flex sm:justify-end">
+                <Switch
+                  data-testid="project-settings-parallel-setup"
+                  checked={parallelSetup}
+                  onCheckedChange={setParallelSetup}
+                  disabled={isLoading}
+                />
+              </div>
+            </Field>
+          )}
 
           {loadFailed && (
             <p
