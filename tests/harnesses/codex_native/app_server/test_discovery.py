@@ -6,7 +6,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -60,7 +60,11 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
         listen_url: str,
         env: dict[str, str],
         cwd: Path,
+        config_overrides: tuple[str, ...] = (),
+        launch_args: tuple[str, ...] = (),
     ) -> object:
+        assert not config_overrides
+        assert not launch_args
         assert codex_path == "/test/codex"
         assert listen_url.startswith("ws://127.0.0.1:")
         assert cwd.is_dir()
@@ -258,7 +262,9 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
         env: dict[str, str],
         cwd: Path,
         config_overrides: tuple[str, ...] = (),
+        launch_args: tuple[str, ...] = (),
     ) -> object:
+        assert not launch_args
         captured["codex_path"] = codex_path
         captured["env"] = dict(env)
         captured["cwd"] = cwd
@@ -386,7 +392,9 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
         env: dict[str, str],
         cwd: Path,
         config_overrides: tuple[str, ...] = (),
+        launch_args: tuple[str, ...] = (),
     ) -> object:
+        assert not launch_args
         captured["env"] = dict(env)
         captured["config_overrides"] = list(config_overrides)
 
@@ -875,3 +883,117 @@ async def test_codex_config_read_preserves_unrelated_errors() -> None:
     with pytest.raises(CodexAppServerResponseError):
         await app_server._read_codex_probe_default(client)
     client.request.assert_awaited_once()
+
+
+@pytest.mark.parametrize("outcome", ["inherited", "unsupported", "timeout", "cancelled"])
+async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    home = tmp_path / "private-home"
+    inherited = {
+        "Inherited.Provider": {
+            "base_url": "https://workspace.cloud.databricks.com/ai-gateway/codex/v1",
+            "auth": {"command": "inherited-secret-helper"},
+            "http_headers": {"User-Agent": "ucode/1 codex/1", "Authorization": "inherited-secret"},
+        }
+    }
+    client = AsyncMock(spec=CodexAppServerClient)
+    client.request.return_value = {"result": {"config": {"model_providers": inherited}}}
+    if outcome == "timeout":
+
+        async def stalled_request(*args: object) -> None:
+            await asyncio.Future()
+
+        client.request.side_effect = stalled_request
+        monkeypatch.setattr(app_server, "_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS", 0.01)
+    elif outcome != "inherited":
+        client.request.side_effect = {
+            "unsupported": CodexAppServerResponseError({"code": -32601}),
+            "cancelled": asyncio.CancelledError(),
+        }[outcome]
+    discovery = Mock()
+    started = AsyncMock(return_value=discovery)
+    stopped = AsyncMock()
+    monkeypatch.setattr(app_server, "_allocate_loopback_port", lambda: 12345)
+    monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", started)
+    monkeypatch.setattr(app_server, "_wait_for_discovery_listener", AsyncMock())
+    monkeypatch.setattr(app_server, "_stop_codex_model_discovery_process", stopped)
+    monkeypatch.setattr(app_server, "CodexAppServerClient", lambda **kwargs: client)
+    overrides = [
+        'model_provider="local"',
+        'model_providers.local={name="Local",base_url="https://other.test",'
+        'auth={command="local-secret-helper"}}',
+    ]
+    prepare = app_server.prepare_codex_provider_config(
+        home,
+        overrides,
+        codex_path="/codex",
+        cwd=tmp_path,
+        env={"PATH": "/test-bin"},
+        client_surface="desktop",
+        app_server_command=("/wrapped/codex", "--policy", "custom-policy"),
+    )
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await prepare
+    else:
+        assert await prepare == overrides[:1]
+    started.assert_awaited_once_with(
+        codex_path="/wrapped/codex",
+        listen_url="ws://127.0.0.1:12345",
+        env={"PATH": "/test-bin", "CODEX_HOME": str(home)},
+        cwd=tmp_path,
+        config_overrides=overrides[:1],
+        launch_args=["--policy", "custom-policy"],
+    )
+    client.request.assert_awaited_once_with(
+        "config/read", {"includeLayers": False, "cwd": str(tmp_path)}
+    )
+    client.close.assert_awaited_once()
+    stopped.assert_awaited_once_with(discovery)
+    text = (home / "config.toml").read_text()
+    providers = tomllib.loads(text)["model_providers"]
+    assert providers["local"]["auth"] == {"command": "local-secret-helper"}
+    if outcome == "inherited":
+        assert providers["Inherited.Provider"]["http_headers"] == {
+            "Databricks-Custom-Coding-Agent": "codex",
+            "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug",
+        }
+        assert "base_url" not in providers["Inherited.Provider"]
+    else:
+        assert "Inherited.Provider" not in providers
+    assert "inherited-secret" not in text
+
+
+@pytest.mark.parametrize(
+    ("overrides", "app_server_command", "probed"),
+    [
+        (['model_provider="openai"'], (), False),
+        (['model_provider="openai"'], ("/wrapped/codex",), True),
+        (['model="gpt-5.5"'], (), True),
+    ],
+    ids=["omnigent-picked", "launcher-wrapper", "codex-picked"],
+)
+async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: list[str],
+    app_server_command: tuple[str, ...],
+    probed: bool,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    started = AsyncMock(side_effect=OSError("probe started"))
+    monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", started)
+    result = await app_server.prepare_codex_provider_config(
+        tmp_path / "home",
+        overrides,
+        codex_path="/codex",
+        cwd=tmp_path,
+        env={},
+        app_server_command=app_server_command,
+    )
+    assert result == overrides
+    assert started.await_count == int(probed)

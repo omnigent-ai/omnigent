@@ -158,6 +158,7 @@ async def test_background_title_uses_isolated_codex_process(
         "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
         "HARNESS_CODEX_SKILLS_FILTER": '"none"',
         "HARNESS_CODEX_SKILLS_DIR": "",
+        "OMNIGENT_CLIENT_SURFACE": "unknown",
     }
     assert _build_harness_spawn_env(env)["HARNESS_CODEX_SKILLS_DIR"] == ""
     assert process_manager.released == [process_key]
@@ -1156,7 +1157,10 @@ async def test_background_title_dispatches_any_registered_harness(
     }
     [context] = captured
     assert context.harness == "community-example"
-    assert context.spawn_env == {"EXAMPLE_MODEL": "example-model"}
+    assert context.spawn_env == {
+        "EXAMPLE_MODEL": "example-model",
+        "OMNIGENT_CLIENT_SURFACE": "unknown",
+    }
     assert context.model_override == "example-model"
     assert process_manager.get_client_calls == []
     assert process_manager.released == []

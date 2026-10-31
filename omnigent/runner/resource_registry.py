@@ -567,10 +567,14 @@ class SessionResourceRegistry:
                 surface if surface is not None and surface in CLIENT_SURFACES else "unknown"
             )
 
+    def client_surface(self, session_id: str) -> str:
+        """Return the session's creating interface, e.g. ``"web"``, or ``"unknown"``."""
+        with self._lock:
+            return self._client_surfaces.get(session_id, "unknown")
+
     def client_surface_env(self, session_id: str) -> dict[str, str]:
         """Build launch metadata without inheriting another session's client identity."""
-        with self._lock:
-            return {CLIENT_SURFACE_ENV_VAR: self._client_surfaces.get(session_id, "unknown")}
+        return {CLIENT_SURFACE_ENV_VAR: self.client_surface(session_id)}
 
     def set_terminal_activity_publisher(
         self,

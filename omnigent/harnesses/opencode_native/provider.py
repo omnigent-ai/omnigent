@@ -165,7 +165,9 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
     }
 
 
-def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, object]:
+def _with_gateway_attribution(
+    config: Mapping[str, object], *, client_surface: str | None = None
+) -> Mapping[str, object]:
     """
     Add usage-attribution headers to each model of a Unity Gateway provider.
 
@@ -201,13 +203,16 @@ def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, obje
                         headers if isinstance(headers, Mapping) else None,
                         OPENCODE_AGENT,
                         base_url,
+                        client_surface=client_surface,
                     ),
                 }
         stamped[provider_id] = {**provider, "models": stamped_models}
     return {**config, "provider": stamped}
 
 
-def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:
+def write_opencode_provider_config(
+    xdg_config_home: Path, config: Mapping[str, object], *, client_surface: str | None = None
+) -> Path:
     """
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).
 
@@ -221,7 +226,14 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     cfg_dir = xdg_config_home / "opencode"
     cfg_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = cfg_dir / "opencode.json"
-    payload = json.dumps(_with_gateway_attribution(config), indent=2, sort_keys=True) + "\n"
+    payload = (
+        json.dumps(
+            _with_gateway_attribution(config, client_surface=client_surface),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     fd, tmp_name = tempfile.mkstemp(prefix="opencode.json.", dir=str(cfg_dir))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
