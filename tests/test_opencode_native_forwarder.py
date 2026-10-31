@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
+from omnigent.harnesses.opencode_native.bridge import (
+    OpenCodeNativeBridgeState,
+    read_bridge_state,
+    write_bridge_state,
+)
 from omnigent.harnesses.opencode_native.client import OpenCodeEvent
 
 _SESSION = "ses_1"
@@ -295,6 +302,21 @@ async def test_session_error_generic_posts_failed_without_reauth() -> None:
     assert "reauth_required" not in status
 
 
+async def test_session_error_without_session_id_ends_turn_after_tui_new() -> None:
+    """OpenCode can omit ``sessionID`` on ``session.error``; the running turn still fails."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_event("session.created", sessionID="ses_new", info={"id": "ses_new"}))
+    error = {"name": "APIError", "data": {"message": "upstream boom"}}
+    await fwd.handle_event(
+        OpenCodeEvent(id=None, type="session.error", properties={"error": error}, raw={})
+    )
+    statuses = _status_edges(server.posts)
+    assert [status["status"] for status in statuses] == ["running", "failed"]
+    assert statuses[-1]["output"] == "upstream boom"
+
+
 async def test_session_error_message_aborted_takes_idle_path() -> None:
     """A MessageAbortedError is a user interrupt → the normal idle path."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
@@ -569,21 +591,23 @@ async def test_permission_asked_dedupes() -> None:
     assert len(opencode.replies) == 1
 
 
-async def test_event_for_other_session_ignored() -> None:
+@pytest.mark.parametrize("top_level_session_id", [True, False], ids=["top-level", "part-only"])
+async def test_event_for_other_session_ignored(top_level_session_id: bool) -> None:
+    """Another session's parts are not mirrored and do not keep the turn running."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        OpenCodeEvent(
-            id=None,
-            type="message.part.updated",
-            properties={
-                "sessionID": "ses_OTHER",
-                "part": {"id": "p", "messageID": "m", "type": "text", "text": "x"},
-            },
-            raw={},
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    for part_type in ("step-start", "text"):
+        part = {"id": part_type, "messageID": "m", "sessionID": "ses_OTHER", "type": part_type}
+        properties: dict[str, Any] = {"part": {**part, "text": "x"}}
+        if top_level_session_id:
+            properties["sessionID"] = "ses_OTHER"
+        await fwd.handle_event(
+            OpenCodeEvent(id=None, type="message.part.updated", properties=properties, raw={})
         )
-    )
-    assert server.posts == []
+    await fwd.handle_event(_event("session.idle"))
+    assert _message_texts(server.posts) == []
+    assert [edge["status"] for edge in _status_edges(server.posts)] == ["running", "idle"]
 
 
 async def test_unknown_event_is_ignored() -> None:
@@ -924,7 +948,13 @@ def _hook_post(server: _RecordingServerClient) -> dict[str, Any] | None:
     return None
 
 
-async def test_question_asked_accept_single_select_replies() -> None:
+_ROOT_OR_SUBAGENT = pytest.mark.parametrize(
+    "session_id", [_SESSION, "ses_child"], ids=["root", "subagent"]
+)
+
+
+@_ROOT_OR_SUBAGENT
+async def test_question_asked_accept_single_select_replies(session_id: str) -> None:
     """A single-select web verdict → reply_question with the chosen label list.
 
     The asked event carries the request id under ``id``; the question is parked
@@ -938,6 +968,7 @@ async def test_question_asked_accept_single_select_replies() -> None:
         _event(
             "question.asked",
             id="que_1",
+            sessionID=session_id,
             tool="question",
             questions=[
                 {
@@ -1034,7 +1065,8 @@ async def test_question_asked_empty_verdict_rejects() -> None:
     assert _hook_post(server) is not None
 
 
-async def test_question_replied_cancels_pending_task_and_clears_card() -> None:
+@_ROOT_OR_SUBAGENT
+async def test_question_replied_cancels_pending_task_and_clears_card(session_id: str) -> None:
     """``question.replied`` (TUI answered) cancels the park and withdraws the card.
 
     ``replied`` keys the id as ``requestID`` (not ``id``). It must cancel the
@@ -1049,7 +1081,9 @@ async def test_question_replied_cancels_pending_task_and_clears_card() -> None:
 
     pending: asyncio.Task[None] = asyncio.create_task(_never())
     fwd._question_tasks["que_1"] = pending
-    await fwd.handle_event(_event("question.replied", requestID="que_1", answers=[["A"]]))
+    await fwd.handle_event(
+        _event("question.replied", requestID="que_1", sessionID=session_id, answers=[["A"]])
+    )
     # The parked task was cancelled and removed from the registry.
     assert "que_1" not in fwd._question_tasks
     with contextlib.suppress(asyncio.CancelledError):
@@ -1064,11 +1098,12 @@ async def test_question_replied_cancels_pending_task_and_clears_card() -> None:
     assert opencode.question_rejects == []
 
 
-async def test_question_rejected_clears_card() -> None:
+@_ROOT_OR_SUBAGENT
+async def test_question_rejected_clears_card(session_id: str) -> None:
     """``question.rejected`` (TUI declined) withdraws the web card."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("question.rejected", requestID="que_9"))
+    await fwd.handle_event(_event("question.rejected", requestID="que_9", sessionID=session_id))
     resolved = next(
         b["data"] for _u, b in server.posts if b["type"] == "external_elicitation_resolved"
     )
@@ -1166,3 +1201,273 @@ async def test_question_asked_dedupes_concurrent_same_request() -> None:
     assert fwd._question_tasks["que_1"] is task
     await task
     assert opencode.question_replies == [("que_1", [["A"]])]
+
+
+def _message_texts(posts: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, str]]:
+    items = [b["data"] for _u, b in posts if b["type"] == "external_conversation_item"]
+    return [
+        (it["item_data"]["role"], it["item_data"]["content"][0]["text"])
+        for it in items
+        if it["item_type"] == "message"
+    ]
+
+
+def _text_part(part_id: str, message_id: str, text: str, **props: Any) -> OpenCodeEvent:
+    part = {"id": part_id, "messageID": message_id, "type": "text", "text": text}
+    return _event("message.part.updated", part=part, **props)
+
+
+def _step_finish(part_id: str, message_id: str, **props: Any) -> OpenCodeEvent:
+    part = {"id": part_id, "messageID": message_id, "type": "step-finish", "reason": "stop"}
+    return _event("message.part.updated", part=part, **props)
+
+
+async def test_prompt_queued_during_streaming_reply_is_mirrored_after_that_reply() -> None:
+    """Event order captured from ``opencode serve`` 1.18.33 with a second prompt sent mid-reply."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    for event in (
+        _event("message.updated", info={"id": "msg_u1", "role": "user"}),
+        _text_part("prt_u1", "msg_u1", "prompt one"),
+        _event("session.status", status={"type": "busy"}),
+        _event(
+            "message.updated", info={"id": "msg_a1", "role": "assistant", "parentID": "msg_u1"}
+        ),
+        _event("message.updated", info={"id": "msg_u2", "role": "user"}),
+        _text_part("prt_u2", "msg_u2", "prompt two"),
+        _text_part("prt_a1", "msg_a1", ""),
+        _text_part("prt_a1", "msg_a1", "reply one"),
+        _step_finish("prt_f1", "msg_a1"),
+        _event(
+            "message.updated",
+            info={
+                "id": "msg_a1",
+                "role": "assistant",
+                "parentID": "msg_u1",
+                "time": {"completed": 2},
+            },
+        ),
+        _event("session.status", status={"type": "busy"}),
+        _event(
+            "message.updated", info={"id": "msg_a2", "role": "assistant", "parentID": "msg_u2"}
+        ),
+        _text_part("prt_a2", "msg_a2", "reply two"),
+        _step_finish("prt_f2", "msg_a2"),
+        _event(
+            "message.updated",
+            info={
+                "id": "msg_a2",
+                "role": "assistant",
+                "parentID": "msg_u2",
+                "time": {"completed": 3},
+            },
+        ),
+        _event("session.status", status={"type": "idle"}),
+        _event("session.idle"),
+    ):
+        await fwd.handle_event(event)
+    assert _message_texts(server.posts) == [
+        ("user", "prompt one"),
+        ("assistant", "reply one"),
+        ("user", "prompt two"),
+        ("assistant", "reply two"),
+    ]
+
+
+_OVERLOADED = _event(
+    "session.error", error={"name": "APIError", "data": {"message": "overloaded"}}
+)
+_NEW_ROOT_IDLE = _event("session.idle", sessionID="ses_new")
+_SESSIONLESS_ABORT = OpenCodeEvent(
+    id=None,
+    type="session.error",
+    properties={"error": {"name": "MessageAbortedError", "data": {}}},
+    raw={},
+)
+
+
+@pytest.mark.parametrize(
+    ("first_root_end", "last_root_end", "final_status", "final_output"),
+    [
+        pytest.param(_event("session.idle"), _NEW_ROOT_IDLE, "idle", None, id="first-root-idle"),
+        pytest.param(_OVERLOADED, _NEW_ROOT_IDLE, "failed", "overloaded", id="first-root-failed"),
+        pytest.param(
+            _OVERLOADED,
+            _SESSIONLESS_ABORT,
+            "failed",
+            "overloaded",
+            id="first-root-failed-then-sessionless-abort",
+        ),
+    ],
+)
+async def test_root_sessions_streaming_at_once_keep_their_own_replies_and_turn(
+    first_root_end: OpenCodeEvent,
+    last_root_end: OpenCodeEvent,
+    final_status: str,
+    final_output: str | None,
+) -> None:
+    """TUI ``/new`` and a prompt there while the first session is still replying."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    new = {"sessionID": "ses_new"}
+    for event in (
+        _event("message.updated", info={"id": "msg_1", "role": "user"}),
+        _text_part("prt_u1", "msg_1", "prompt one"),
+        _event("message.updated", info={"id": "msg_2", "role": "assistant"}),
+        _text_part("prt_a1", "msg_2", "reply one, partial"),
+        _event("session.created", info={"id": "ses_new"}, **new),
+        _event("message.updated", info={"id": "msg_3", "role": "user", **new}, **new),
+        _text_part("prt_u2", "msg_3", "prompt in new session", **new),
+    ):
+        await fwd.handle_event(event)
+    assert _message_texts(server.posts)[-1] == ("user", "prompt in new session")
+
+    for event in (
+        _event("message.updated", info={"id": "msg_4", "role": "assistant"}, **new),
+        _text_part("prt_a2", "msg_4", "reply two, partial", **new),
+        _text_part("prt_a1", "msg_2", "reply one, complete"),
+        _step_finish("prt_f1", "msg_2"),
+        first_root_end,
+    ):
+        await fwd.handle_event(event)
+    statuses = [b["data"] for _u, b in server.posts if b["type"] == "external_session_status"]
+    assert [status["status"] for status in statuses] == ["running"]
+
+    for event in (
+        _text_part("prt_a2", "msg_4", "reply two, complete", **new),
+        _step_finish("prt_f2", "msg_4", **new),
+        last_root_end,
+    ):
+        await fwd.handle_event(event)
+    assert _message_texts(server.posts) == [
+        ("user", "prompt one"),
+        ("user", "prompt in new session"),
+        ("assistant", "reply one, complete"),
+        ("assistant", "reply two, complete"),
+    ]
+    statuses = [b["data"] for _u, b in server.posts if b["type"] == "external_session_status"]
+    assert [status["status"] for status in statuses] == ["running", final_status]
+    assert statuses[-1].get("output") == final_output
+
+
+async def test_subagent_permission_request_goes_through_policy() -> None:
+    """Child-session ``permission.asked`` shape captured from a ``task`` sub-agent's bash call."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    seen: list[Any] = []
+
+    async def allow(normalized: Any) -> dict[str, Any]:
+        seen.append(normalized)
+        return {"decision": "allow"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=allow)
+    await fwd.handle_event(
+        _event(
+            "session.created",
+            sessionID="ses_child",
+            info={
+                "id": "ses_child",
+                "parentID": _SESSION,
+                "title": "Run echo hi (@general subagent)",
+            },
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "permission.asked",
+            id="per_child",
+            sessionID="ses_child",
+            permission="bash",
+            patterns=["echo hi"],
+            metadata={"command": "echo hi"},
+            always=["echo *"],
+            tool={"messageID": "msg_child", "callID": "call_child"},
+        )
+    )
+    assert [normalized["action"] for normalized in seen] == ["bash"]
+    assert opencode.replies == [("per_child", {"reply": "once", "message": "omnigent-policy"})]
+
+
+async def test_root_session_the_user_prompts_in_becomes_the_web_target(tmp_path: Path) -> None:
+    """Web actions follow the root last prompted in the TUI, not a new or sub-agent session.
+
+    A later update to an earlier prompt, as OpenCode sends after its reply, does not move it.
+    """
+    write_bridge_state(
+        tmp_path,
+        OpenCodeNativeBridgeState(
+            session_id="conv_1", server_base_url="http://127.0.0.1:1", opencode_session_id=_SESSION
+        ),
+    )
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+
+    def web_target() -> str | None:
+        state = read_bridge_state(tmp_path)
+        return state.opencode_session_id if state is not None else None
+
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_0", "role": "user"}))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_event("session.created", sessionID="ses_new", info={"id": "ses_new"}))
+    assert web_target() == _SESSION
+    await fwd.handle_event(
+        _event(
+            "session.created",
+            sessionID="ses_child",
+            info={"id": "ses_child", "parentID": "ses_new"},
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "message.updated",
+            sessionID="ses_child",
+            info={"id": "msg_child", "role": "user", "sessionID": "ses_child"},
+        )
+    )
+    await fwd.handle_event(
+        _text_part("prt_child", "msg_child", "sub-agent prompt", sessionID="ses_child")
+    )
+    assert web_target() == _SESSION
+    assert _message_texts(server.posts) == []
+
+    new = {"sessionID": "ses_new"}
+    await fwd.handle_event(
+        _event("message.updated", info={"id": "msg_new", "role": "user"}, **new)
+    )
+    await fwd.handle_event(_text_part("prt_new", "msg_new", "prompt in new session", **new))
+    assert web_target() == "ses_new"
+
+    await fwd.handle_event(_event("session.idle"))
+    await fwd.handle_event(
+        _event("message.updated", info={"id": "msg_0", "role": "user", "summary": {"diffs": []}})
+    )
+    assert web_target() == "ses_new"
+    await fwd.handle_event(
+        _event("message.updated", info={"id": "msg_back", "role": "user", "sessionID": _SESSION})
+    )
+    await fwd.handle_event(_text_part("prt_back", "msg_back", "back in the first session"))
+    assert web_target() == _SESSION
+    assert _message_texts(server.posts) == [
+        ("user", "prompt in new session"),
+        ("user", "back in the first session"),
+    ]
+
+
+async def test_prompt_queued_behind_an_aborted_reply_is_still_mirrored() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    for event in (
+        _event("message.updated", info={"id": "msg_u1", "role": "user"}),
+        _text_part("prt_u1", "msg_u1", "prompt one"),
+        _event("session.status", status={"type": "busy"}),
+        _event("message.updated", info={"id": "msg_a1", "role": "assistant"}),
+        _event("message.updated", info={"id": "msg_u2", "role": "user"}),
+        _text_part("prt_u2", "msg_u2", "prompt two"),
+        _text_part("prt_a1", "msg_a1", "partial reply"),
+        _event("session.error", error={"name": "MessageAbortedError", "data": {}}),
+    ):
+        await fwd.handle_event(event)
+    assert _message_texts(server.posts) == [
+        ("user", "prompt one"),
+        ("assistant", "partial reply"),
+        ("user", "prompt two"),
+    ]

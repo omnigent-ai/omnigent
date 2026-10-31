@@ -22,6 +22,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     update_active_message_id,
     update_last_event_id,
     update_model_override,
+    update_opencode_session_id,
     user_opencode_config_paths,
     write_bridge_state,
     write_cost_popup_config,
@@ -106,6 +107,73 @@ def test_update_active_message_id(bridge_dir: Path) -> None:
     assert loaded is not None
     assert loaded.active_message_id is None
     assert loaded.status == "idle"
+
+
+def test_update_opencode_session_id_keeps_other_fields(bridge_dir: Path) -> None:
+    write_bridge_state(bridge_dir, _state(bridge_dir, model_override="anthropic/claude-opus-4"))
+    update_opencode_session_id(bridge_dir, "ses_new")
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded == _state(
+        bridge_dir, opencode_session_id="ses_new", model_override="anthropic/claude-opus-4"
+    )
+
+
+@pytest.mark.parametrize(
+    "first_update", ["model", "target"], ids=["model-read-first", "target-read-first"]
+)
+def test_concurrent_target_and_model_updates_both_persist(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, first_update: str
+) -> None:
+    """A web target switch racing a model change keeps both, whichever reads state first."""
+    write_bridge_state(bridge_dir, _state(bridge_dir))
+    updates = {
+        "model": lambda: update_model_override(bridge_dir, "openai/gpt-5"),
+        "target": lambda: update_opencode_session_id(bridge_dir, "ses_new"),
+    }
+    first_read_done = threading.Event()
+    release_first_update = threading.Event()
+    real_read_bridge_state = bridge.read_bridge_state
+    errors: list[BaseException] = []
+
+    def _pause_first_update_after_read(path: Path) -> OpenCodeNativeBridgeState | None:
+        state = real_read_bridge_state(path)
+        if threading.current_thread().name == first_update:
+            first_read_done.set()
+            if not release_first_update.wait(timeout=5.0):
+                raise TimeoutError("test did not release the first update")
+        return state
+
+    def _run_update(name: str) -> None:
+        try:
+            updates[name]()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(bridge, "read_bridge_state", _pause_first_update_after_read)
+    second_update = "target" if first_update == "model" else "model"
+    first_thread = threading.Thread(target=_run_update, args=(first_update,), name=first_update)
+    second_thread = threading.Thread(target=_run_update, args=(second_update,), name=second_update)
+    first_thread.start()
+    try:
+        assert first_read_done.wait(timeout=5.0)
+        second_thread.start()
+        second_thread.join(timeout=0.2)
+    finally:
+        release_first_update.set()
+        first_thread.join(timeout=5.0)
+        second_thread.join(timeout=5.0)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    assert read_bridge_state(bridge_dir) == _state(
+        bridge_dir, opencode_session_id="ses_new", model_override="openai/gpt-5"
+    )
+
+
+def test_update_opencode_session_id_without_state_is_noop(bridge_dir: Path) -> None:
+    update_opencode_session_id(bridge_dir, "ses_new")
+    assert read_bridge_state(bridge_dir) is None
 
 
 def test_update_model_override(bridge_dir: Path) -> None:
