@@ -60,16 +60,37 @@ pytestmark = [
 _ROOT = Path(__file__).resolve().parents[3]
 
 
+def _echo_reply_token(body: bytes) -> str:
+    """Default mock-model strategy: answer with the ``Reply agy-e2e-…`` token in the prompt."""
+    request = json.loads(body)
+    for content in reversed(request.get("contents", [])):
+        if content.get("role") != "user":
+            continue
+        text = "\n".join(part.get("text", "") for part in content.get("parts", []))
+        matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})\.", text)
+        if matches:
+            return matches[-1]
+    return "Ready."
+
+
 @pytest.fixture
 def antigravity_model(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, built_spa: None
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    built_spa: None,
 ) -> Iterator[list[str] | None]:
-    """Build with the caller's HOME before isolating agy credentials."""
+    """Build with the caller's HOME before isolating agy credentials.
+
+    Indirect parametrization may supply a ``(request_body: bytes) -> str`` reply
+    strategy for the mock model; the default echoes the prompt's reply token.
+    """
     if os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "mock":
         assert gemini_auth_has_credential(), "set GEMINI_API_KEY or sign in with `agy`, then rerun"
         yield None
         return
 
+    reply_for: Callable[[bytes], str] = getattr(request, "param", None) or _echo_reply_token
     replies: list[str] = []
 
     class GeminiHandler(BaseHTTPRequestHandler):
@@ -81,17 +102,8 @@ def antigravity_model(
             if not streaming and ":generateContent" not in self.path:
                 self.send_error(404)
                 return
-            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            reply = "Ready."
-            for content in reversed(request.get("contents", [])):
-                if content.get("role") != "user":
-                    continue
-                text = "\n".join(part.get("text", "") for part in content.get("parts", []))
-                matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})\.", text)
-                if matches:
-                    reply = matches[-1]
-                    replies.append(reply)
-                    break
+            reply = reply_for(self.rfile.read(int(self.headers["Content-Length"])))
+            replies.append(reply)
             response = {
                 "candidates": [
                     {
