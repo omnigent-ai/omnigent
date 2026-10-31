@@ -1,33 +1,22 @@
 // A project is marked by an emoji or a palette color, never both. emoji-mart is
 // code-split so its ~600KB dataset loads only on first open.
 
-import {
-  type CSSProperties,
-  type RefObject,
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
-import { CheckIcon, FolderIcon, Loader2Icon, PencilIcon, SmilePlusIcon } from "lucide-react";
+import { type CSSProperties, lazy, Suspense, useEffect, useRef, useState } from "react";
+import { CheckIcon, FolderIcon, PencilIcon, SmilePlusIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
-import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { useQuery } from "@tanstack/react-query";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useUpdateProjectConfig } from "@/hooks/useConversations";
 import { readableForeground } from "@/lib/customTheme";
 import {
   PROJECT_COLORS,
   type ProjectAppearance,
-  isProjectColor,
   projectAppearance,
   projectColorValue,
   withProjectAppearance,
 } from "@/lib/projectColors";
-import { getRecommendedProjectColor, type ProjectConfig } from "@/lib/projectsApi";
+import type { ProjectConfig } from "@/lib/projectsApi";
 import { cn } from "@/lib/utils";
 
 // Both the picker component and its dataset are dynamically imported so they
@@ -59,16 +48,6 @@ export function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }
       />
     </Suspense>
   );
-}
-
-/** Keyed under `projects` so every project-list refresh refreshes it too. */
-export function useRecommendedProjectColor(): string | undefined {
-  const { data } = useQuery({
-    queryKey: ["projects", "recommended-color"],
-    queryFn: () => getRecommendedProjectColor(),
-    staleTime: 30_000,
-  });
-  return isProjectColor(data) ? data : undefined;
 }
 
 export function ProjectAppearanceTile({
@@ -106,132 +85,57 @@ export function ProjectAppearanceTile({
   );
 }
 
-function ProjectAppearancePopoverContent({
-  value,
-  onChange,
-  onClose,
-  triggerRef,
-  disabled,
-  align,
-}: {
-  value: ProjectAppearance;
-  onChange: (appearance: ProjectAppearance) => void;
-  onClose: () => void;
-  /** The control that opened the popover; a click on it is not "outside". */
-  triggerRef: RefObject<HTMLElement | null>;
-  disabled: boolean;
-  align: "start" | "center";
-}) {
-  const mode = useResolvedThemeMode();
-  const [showEmoji, setShowEmoji] = useState(false);
-  // emoji-mart preventDefaults pointer events, so Radix never sees a click
-  // elsewhere (e.g. in an enclosing dialog) as outside; close on it ourselves.
-  useEffect(() => {
-    const closeOnOutsidePointer = (event: PointerEvent) => {
-      const target = event.target as Element | null;
-      if (target?.closest('[data-slot="popover-content"]')) return;
-      if (triggerRef.current?.contains(target)) return;
-      onClose();
-    };
-    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
-    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
-  }, [onClose, triggerRef]);
-  const pick = (next: ProjectAppearance) => {
-    onChange(next);
-    onClose();
-  };
-
-  return (
-    <PopoverContent
-      align={align}
-      // Publish the collision-aware available viewport height (capped at the
-      // picker's natural size) so the .emoji-picker-popover rule in index.css
-      // shrinks emoji-mart to fit and scrolls it internally.
-      collisionPadding={8}
-      style={
-        {
-          "--emoji-picker-height": "min(420px, var(--radix-popover-content-available-height))",
-        } as CSSProperties
-      }
-      className={cn(
-        "emoji-picker-popover w-auto",
-        showEmoji &&
-          "flex max-h-[var(--radix-popover-content-available-height)] flex-col overflow-hidden p-0",
-      )}
-      // A Dialog's scroll lock preventDefaults wheel events over the emoji
-      // grid's shadow DOM; stop them reaching it so the grid scrolls.
-      onWheel={(event) => event.stopPropagation()}
-    >
-      {showEmoji ? (
-        <EmojiPicker onSelect={(native) => pick({ icon: native, color: null })} />
-      ) : (
-        <div className="flex items-center gap-2" data-testid="project-appearance">
-          <Button
-            type="button"
-            variant={value.icon ? "secondary" : "ghost"}
-            size="icon-sm"
-            aria-label="Choose an emoji"
-            aria-pressed={Boolean(value.icon)}
-            data-testid="project-emoji-button"
-            disabled={disabled}
-            onClick={() => setShowEmoji(true)}
-          >
-            {value.icon ? (
-              <span className="text-base leading-none">{value.icon}</span>
-            ) : (
-              <SmilePlusIcon className="size-4" />
-            )}
-          </Button>
-          <span aria-hidden className="h-5 w-px bg-border" />
-          <div role="radiogroup" aria-label="Project color" className="flex gap-2">
-            {PROJECT_COLORS.map((option) => {
-              const checked = !value.icon && value.color === option.id;
-              return (
-                <button
-                  key={option.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={checked}
-                  aria-label={option.label}
-                  data-testid={`project-color-${option.id}`}
-                  disabled={disabled}
-                  onClick={() => pick({ icon: null, color: option.id })}
-                  className={cn(
-                    "flex size-6 items-center justify-center rounded-full ring-1 ring-foreground/10 outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50",
-                    checked && "ring-2 ring-foreground/40 ring-offset-2 ring-offset-background",
-                  )}
-                  style={{ backgroundColor: option[mode] }}
-                >
-                  {checked && (
-                    <CheckIcon
-                      className="size-3.5"
-                      style={{ color: readableForeground(option[mode]) }}
-                    />
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
-    </PopoverContent>
-  );
-}
-
+/**
+ * The mark tile that opens the emoji / color picker. Pass `open` and
+ * `onOpenChange` to also open it from elsewhere.
+ */
 export function ProjectAppearanceButton({
   value,
   onChange,
   disabled = false,
+  size = "sm",
   testId,
+  open: controlledOpen,
+  onOpenChange,
 }: {
   value: ProjectAppearance;
   onChange: (appearance: ProjectAppearance) => void;
   disabled?: boolean;
+  size?: keyof typeof TILE_SIZES;
   testId: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const mode = useResolvedThemeMode();
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const [showEmoji, setShowEmoji] = useState(false);
+  const open = controlledOpen ?? uncontrolledOpen;
+  const setOpen = (next: boolean) => {
+    if (!next) setShowEmoji(false);
+    setUncontrolledOpen(next);
+    onOpenChange?.(next);
+  };
+  const pick = (next: ProjectAppearance) => {
+    onChange(next);
+    setOpen(false);
+  };
+  // Inside a modal Dialog, Radix doesn't report a click elsewhere in the
+  // dialog as outside the popover, so close on it ourselves.
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const close = useCallback(() => setOpen(false), []);
+  const closeRef = useRef(() => setOpen(false));
+  closeRef.current = () => setOpen(false);
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target as Element | null;
+      if (target?.closest('[data-slot="popover-content"]')) return;
+      if (triggerRef.current?.contains(target)) return;
+      closeRef.current();
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+  }, [open]);
+
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
@@ -241,21 +145,87 @@ export function ProjectAppearanceButton({
           aria-label="Change project icon"
           data-testid={testId}
           disabled={disabled}
-          className="shrink-0 cursor-pointer outline-none disabled:cursor-default disabled:opacity-50"
+          className={cn(
+            "shrink-0 cursor-pointer outline-none disabled:cursor-default",
+            size === "lg" ? "rounded-xl" : "disabled:opacity-50",
+          )}
         >
-          <ProjectAppearanceTile appearance={value} size="sm" />
+          <ProjectAppearanceTile appearance={value} size={size} />
         </button>
       </PopoverTrigger>
-      {open && (
-        <ProjectAppearancePopoverContent
-          value={value}
-          onChange={onChange}
-          onClose={close}
-          triggerRef={triggerRef}
-          disabled={disabled}
-          align="start"
-        />
-      )}
+      <PopoverContent
+        align={size === "lg" ? "center" : "start"}
+        // Publish the collision-aware available viewport height (capped at the
+        // picker's natural size) so the .emoji-picker-popover rule in index.css
+        // shrinks emoji-mart to fit and scrolls it internally.
+        collisionPadding={8}
+        style={
+          {
+            "--emoji-picker-height": "min(420px, var(--radix-popover-content-available-height))",
+          } as CSSProperties
+        }
+        className={cn(
+          "emoji-picker-popover w-auto",
+          showEmoji &&
+            "flex max-h-[var(--radix-popover-content-available-height)] flex-col overflow-hidden p-0",
+        )}
+        // A Dialog's scroll lock preventDefaults wheel events over the emoji
+        // grid's shadow DOM; stop them reaching it so the grid scrolls.
+        onWheel={(event) => event.stopPropagation()}
+      >
+        {showEmoji ? (
+          <EmojiPicker onSelect={(native) => pick({ icon: native, color: null })} />
+        ) : (
+          <div className="flex items-center gap-2" data-testid="project-appearance">
+            <Button
+              type="button"
+              variant={value.icon ? "secondary" : "ghost"}
+              size="icon-sm"
+              aria-label="Choose an emoji"
+              aria-pressed={Boolean(value.icon)}
+              data-testid="project-emoji-button"
+              disabled={disabled}
+              onClick={() => setShowEmoji(true)}
+            >
+              {value.icon ? (
+                <span className="text-base leading-none">{value.icon}</span>
+              ) : (
+                <SmilePlusIcon className="size-4" />
+              )}
+            </Button>
+            <span aria-hidden className="h-5 w-px bg-border" />
+            <div role="radiogroup" aria-label="Project color" className="flex gap-2">
+              {PROJECT_COLORS.map((option) => {
+                const checked = !value.icon && value.color === option.id;
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={checked}
+                    aria-label={option.label}
+                    data-testid={`project-color-${option.id}`}
+                    disabled={disabled}
+                    onClick={() => pick({ icon: null, color: option.id })}
+                    className={cn(
+                      "flex size-6 items-center justify-center rounded-full ring-1 ring-foreground/10 outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50",
+                      checked && "ring-2 ring-foreground/40 ring-offset-2 ring-offset-background",
+                    )}
+                    style={{ backgroundColor: option[mode] }}
+                  >
+                    {checked && (
+                      <CheckIcon
+                        className="size-3.5"
+                        style={{ color: readableForeground(option[mode]) }}
+                      />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </PopoverContent>
     </Popover>
   );
 }
@@ -283,14 +253,10 @@ export function ProjectLandingIcon({
   configReady: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const anchorRef = useRef<HTMLSpanElement>(null);
-  const close = useCallback(() => setOpen(false), []);
   const update = useUpdateProjectConfig();
-  const appearance = projectAppearance(config);
+  // Show the picked mark while its save is in flight, so the tile changes once.
+  const appearance = projectAppearance(update.isPending ? update.variables.config : config);
 
-  const openPicker = () => {
-    if (configReady) setOpen(true);
-  };
   const save = (next: ProjectAppearance) => {
     if (!configReady) return;
     update.mutate({
@@ -301,7 +267,7 @@ export function ProjectLandingIcon({
   };
 
   return (
-    <span ref={anchorRef} className="group/icon relative flex h-16 shrink-0 items-center">
+    <span className="group/icon relative flex h-16 shrink-0 items-center">
       {/* Edit affordance, revealed above the tile on hover. */}
       <div className="absolute -top-1 left-1/2 flex -translate-x-1/2 -translate-y-full items-center gap-0.5 rounded-lg bg-popover p-0.5 opacity-0 shadow-menu ring-1 ring-foreground/10 transition-opacity focus-within:opacity-100 group-hover/icon:opacity-100">
         <Button
@@ -311,40 +277,20 @@ export function ProjectLandingIcon({
           aria-label="Change project icon"
           data-testid="project-icon-edit"
           disabled={!configReady}
-          onClick={openPicker}
+          onClick={() => setOpen(true)}
         >
           <PencilIcon className="size-3.5" />
         </Button>
       </div>
-      <Popover open={open} onOpenChange={setOpen}>
-        <PopoverAnchor asChild>
-          <button
-            type="button"
-            aria-label="Project icon"
-            data-testid="project-icon-tile"
-            onClick={openPicker}
-            className="cursor-pointer rounded-xl"
-          >
-            {update.isPending ? (
-              <span className="flex size-14 items-center justify-center rounded-xl bg-muted">
-                <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
-              </span>
-            ) : (
-              <ProjectAppearanceTile appearance={appearance} size="lg" />
-            )}
-          </button>
-        </PopoverAnchor>
-        {open && (
-          <ProjectAppearancePopoverContent
-            value={appearance}
-            onChange={save}
-            onClose={close}
-            triggerRef={anchorRef}
-            disabled={!configReady}
-            align="center"
-          />
-        )}
-      </Popover>
+      <ProjectAppearanceButton
+        value={appearance}
+        onChange={save}
+        disabled={!configReady}
+        size="lg"
+        testId="project-icon-tile"
+        open={open}
+        onOpenChange={setOpen}
+      />
     </span>
   );
 }

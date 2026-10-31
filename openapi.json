@@ -5377,20 +5377,6 @@
         "title": "ReasoningTextDeltaEvent",
         "type": "object"
       },
-      "RecommendedProjectColorResponse": {
-        "description": "The color a new project would be auto-assigned: a web theme palette id.",
-        "properties": {
-          "color": {
-            "title": "Color",
-            "type": "string"
-          }
-        },
-        "required": [
-          "color"
-        ],
-        "title": "RecommendedProjectColorResponse",
-        "type": "object"
-      },
       "ResetSessionModelOverrideRequest": {
         "additionalProperties": false,
         "description": "Reset a launch-time model selection only while that selection is current.",
@@ -13679,28 +13665,6 @@
           }
         },
         "summary": "Save Project Order",
-        "tags": [
-          "projects"
-        ]
-      }
-    },
-    "/v1/projects/recommended-color": {
-      "get": {
-        "description": "Return the color a new project would be auto-assigned.",
-        "operationId": "get_recommended_project_color_v1_projects_recommended_color_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RecommendedProjectColorResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Get Recommended Project Color",
         "tags": [
           "projects"
         ]

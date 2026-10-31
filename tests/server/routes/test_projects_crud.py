@@ -144,16 +144,15 @@ async def test_rename_missing_project_404(project_client: httpx.AsyncClient) -> 
     assert resp.status_code == 404
 
 
-async def test_create_assigns_the_recommended_color_unless_marked(
+async def test_create_assigns_the_least_used_color_unless_marked(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """Unmarked projects get the recommended (least-used) color; an emoji or color is kept."""
+    """Unmarked projects get the least-used color; an emoji is kept."""
     first = (await project_client.post("/v1/projects", json={"name": "A"})).json()
-    recommended = (await project_client.get("/v1/projects/recommended-color")).json()["color"]
     second = (await project_client.post("/v1/projects", json={"name": "B"})).json()
     emoji = await project_client.post("/v1/projects", json={"name": "E", "config": {"icon": "🔥"}})
     assert first["config"] == {"color": "omni"}
-    assert second["config"] == {"color": recommended} == {"color": "dracula"}
+    assert second["config"] == {"color": "dracula"}
     assert emoji.json()["config"] == {"icon": "🔥"}
 
 

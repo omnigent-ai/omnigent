@@ -5367,12 +5367,6 @@ class ProjectOrderResponse(BaseModel):
     ordered_project_ids: list[str] | None
 
 
-class RecommendedProjectColorResponse(BaseModel):
-    """The color a new project would be auto-assigned: a web theme palette id."""
-
-    color: str
-
-
 class ProjectObject(BaseModel):
     """
     A first-class project (see ``designs/PROJECTS_PRD.md``).

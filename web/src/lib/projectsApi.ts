@@ -118,13 +118,6 @@ export async function createProject(name: string, config?: ProjectConfig): Promi
   return (await res.json()) as Project;
 }
 
-/** The color the server would auto-assign to a new project. */
-export async function getRecommendedProjectColor(): Promise<string> {
-  const res = await authenticatedFetch("/v1/projects/recommended-color");
-  if (!res.ok) throw new Error(await readError(res));
-  return ((await res.json()) as { color: string }).color;
-}
-
 /** Rename a project (O(1) — members reference the id, not the name string). */
 export async function renameProject(id: string, name: string): Promise<Project> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
