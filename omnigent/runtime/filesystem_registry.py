@@ -585,6 +585,10 @@ class FilesystemRegistry(ABC):
 
     # ── Concrete: snapshot (no-op default) ────────────────────────
 
+    def needs_snapshot(self, path: str) -> bool:
+        """Whether an observed edit still needs an original outside Git."""
+        return False
+
     def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
         """Seed a pre-write snapshot for *path*.
 
@@ -707,7 +711,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # before the first write/edit operation on that path this session.
         # Seeded by ``seed_snapshot`` (called from the PUT/PATCH handlers)
         # so the diff endpoint can return the true pre-modification state.
-        self._snapshots: dict[str, str] = {}
+        self._snapshots: dict[str, str | None] = {}
         self._snapshots_lock = threading.Lock()
         # Per-session snapshot ownership: session_id → set of normalized paths
         # registered by that session.  Used by ``unregister_conversation`` to
@@ -741,6 +745,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             return
         if _is_ephemeral(norm):
             return
+        with self._snapshots_lock:
+            self._snapshots.setdefault(norm, "" if operation == "created" else None)
+            self._snapshot_sessions.setdefault(session_id, set()).add(norm)
         bytes_: int | None = None
         modified_at: int | None = None
         if operation != "deleted":
@@ -887,6 +894,13 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             return None
         with self._snapshots_lock:
             return self._snapshots.get(norm)
+
+    def needs_snapshot(self, path: str) -> bool:
+        norm = _normalize_path(path, self._cwd)
+        if norm is None or Path(norm).is_absolute() or _is_ephemeral(norm):
+            return False
+        with self._snapshots_lock:
+            return norm not in self._snapshots
 
     def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
         """Seed a pre-write snapshot for *path* if one does not already exist.
@@ -1460,6 +1474,9 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
     """
 
     _run_repository_git: GitCommandRunner | None = None
+
+    def needs_snapshot(self, path: str) -> bool:
+        return self._owner(path) is None and super().needs_snapshot(path)
 
     def with_git_runner(self, run_git: GitCommandRunner) -> MultiRepositoryFilesystemRegistry:
         """Bind one request's executor while sharing the existing fallback history."""

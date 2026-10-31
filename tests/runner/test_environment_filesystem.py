@@ -1420,6 +1420,7 @@ def app_with_registry(
 
     reg = app.state.filesystem_registry
     # Seed change events via the public API: hello.txt modified, gone.py deleted.
+    reg.seed_snapshot("hello.txt", "before content")
     reg.record_change("hello.txt", "modified", "conv_test")
     reg.record_change("gone.py", "deleted", "conv_test")
     return app
@@ -1692,11 +1693,6 @@ async def test_diff_endpoint_returns_before_and_after_for_modified_file(
     :param app_with_registry: Runner app with hello.txt seeded as 'modified'.
     """
 
-    reg = app_with_registry.state.filesystem_registry
-    # Seed the pre-modification snapshot so get_baseline has something to return.
-    # This simulates what the PUT/PATCH handlers do before overwriting the file.
-    reg.seed_snapshot("hello.txt", "before content")
-
     transport = httpx.ASGITransport(app=app_with_registry)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
         resp = await client.get(
@@ -1783,6 +1779,7 @@ async def test_diff_endpoint_returns_null_after_for_deleted_file(
     # Deleted file → after must be null; a non-null value means the endpoint
     # tried to read a file that no longer exists instead of short-circuiting.
     assert body["after"] is None, f"Expected after=None for deleted file, got {body['after']!r}."
+    assert body["baseline_state"] == "unknown"
 
 
 @pytest.mark.asyncio
