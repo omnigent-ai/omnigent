@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from omnigent.entities import InstalledSkill
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
 from omnigent.runtime.agent_cache import AgentCache
@@ -17,10 +19,21 @@ from omnigent.server.routes._auth_helpers import require_access_and_level, requi
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
+from omnigent.server.skill_injection import (
+    SkillDeliveryError,
+    bundle_loaded,
+    effective_installed_skills,
+    session_target,
+    skill_allowed,
+)
+from omnigent.skills.git_source import repository_label
+from omnigent.skills.overlay import reserved_install_names
+from omnigent.skills.policy import DEFAULT_POLICY
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.skill_store import SkillStore
 
 _SKILLS_TIMEOUT_S = 15.0
 
@@ -42,6 +55,7 @@ def create_skills_router(
     agent_cache: AgentCache | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    skill_store: SkillStore | None = None,
 ) -> APIRouter:
     """Build the discovery route, mounted under ``/v1``."""
     router = APIRouter()
@@ -70,6 +84,13 @@ def create_skills_router(
         agent_version = sub_agent_name = None
         spec: AgentSpec | None = None
         host = None
+        # Installed skills belong to a session's owner and follow the spec that
+        # governs the session; pre-session discovery is the caller's own.
+        installed_owner = user_id
+        installed_known = True
+        installed_spec: AgentSpec | None = None
+        # The extracted bundle directory installs go into; None when unknown.
+        installed_dir: Path | None = None
         if session_id is not None:
             if any(value is not None for value in (host_id, harness, path, agent_id)):
                 raise HTTPException(
@@ -99,6 +120,19 @@ def create_skills_router(
                 str(agent.version),
                 conv.sub_agent_name,
             )
+            if skill_store is not None:
+                installed_owner = await asyncio.to_thread(
+                    conversation_store.get_session_owner, conv.id, owner_only=True
+                )
+                # Unresolved ownership on a multi-user server lists nobody's installs.
+                installed_known = installed_owner is not None or permission_store is None
+                session_bundle = await asyncio.to_thread(bundle_loaded, agent_cache, agent)
+                target = session_target(
+                    session_bundle.spec if session_bundle is not None else None, sub_agent_name
+                )
+                installed_spec = target.spec
+                if session_bundle is not None:
+                    installed_dir = session_bundle.workdir / target.prefix
         else:
             if host_id is None or harness is None or path is None:
                 raise HTTPException(
@@ -127,6 +161,8 @@ def create_skills_router(
                     expand_env=agent.operator_authored,
                 )
                 spec, agent_version = loaded.spec, str(agent.version)
+                installed_spec = spec
+                installed_dir = loaded.workdir
 
         conn = host_registry.get(host_id)
         if conn is None:
@@ -160,16 +196,44 @@ def create_skills_router(
         if spec is not None and result.agent_id != agent_id:
             raise HTTPException(status_code=502, detail="update the host to discover agent skills")
         skills = [SkillSummary.model_validate(skill) for skill in result.skills]
+        # Hidden bundled skills also reserve their names against collisions,
+        # from the spec the session runs: the host already lists them itself.
+        reserving = installed_spec if installed_spec is not None else spec
+        bundled = {skill.name for skill in reserving.skills} if reserving is not None else set()
+        # What delivery will not add: the overlay's rule over the same bundle.
+        not_installable = bundled | (
+            reserved_install_names(installed_dir) if installed_dir is not None else set()
+        )
         if spec is not None:
-            # Hidden bundled skills also reserve their names against host collisions.
-            reserved = {skill.name for skill in spec.skills}
             skills = [
                 SkillSummary(
                     name=skill.name, description=skill.description, display_name=skill.display_name
                 )
                 for skill in spec.skills
                 if skill.user_invocable
-            ] + [skill for skill in skills if skill.name not in reserved]
+            ] + [skill for skill in skills if skill.name not in bundled]
+        if skill_store is not None and installed_known:
+            try:
+                installed = await asyncio.to_thread(
+                    effective_installed_skills,
+                    skill_store,
+                    installed_owner,
+                    policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
+                )
+            except SkillDeliveryError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+            # Runtime precedence is bundle, then installed, then host: an
+            # installed skill is delivered as bundle content and shadows the
+            # host's, so the menu shows the installed one.
+            added = installed_skill_summaries(installed, installed_spec, not_installable)
+            # Hidden installs take their name at runtime too, so they shadow
+            # host skills although the menu does not list them.
+            shadowed = {
+                skill.name
+                for skill in installed
+                if skill.name not in not_installable and skill_allowed(installed_spec, skill)
+            }
+            skills = [skill for skill in skills if skill.name not in shadowed] + added
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router
@@ -223,3 +287,31 @@ async def request_host_skills(
         ) from exc
     finally:
         host_conn.pending_skills.pop(request_id, None)
+
+
+def installed_skill_summaries(
+    installed: list[InstalledSkill], spec: AgentSpec | None, bundled: set[str]
+) -> list[SkillSummary]:
+    """Installed skills the menu should list: allowed by the spec and not bundled.
+
+    *installed* is already enabled-only and one per name
+    (:func:`effective_installed_skills`); a bundled skill of the same name
+    wins, a host skill of the same name loses. A skill whose frontmatter says
+    ``user-invocable: false`` is left out, as a bundled one is: the agent still
+    receives it, the user is just never offered it.
+    """
+    out: list[SkillSummary] = []
+    for skill in installed:
+        if not skill.user_invocable:
+            continue
+        if skill.name in bundled or not skill_allowed(spec, skill):
+            continue
+        out.append(
+            SkillSummary(
+                name=skill.name,
+                description=skill.description,
+                display_name=skill.display_name,
+                source=repository_label(skill.source_url),
+            )
+        )
+    return out

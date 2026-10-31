@@ -19,7 +19,7 @@ import re
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -41,6 +41,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.async_utils import run_sync_cleanup
+from omnigent.inner.bundle_skills import skill_resource_roots
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
@@ -1145,7 +1146,11 @@ class SessionResourceRegistry:
             effective_spec = self._effective_primary_spec(session_id, spec_os_env)
             env = create_os_environment(
                 effective_spec,
-                additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+                additional_read_roots=[
+                    self._codex_skills_dir_locked(session_id),
+                    # Bundle skills live under the temp directory bwrap hides.
+                    *skill_resource_roots(getattr(agent_spec, "skills", ())),
+                ],
             )
             if env is not None:
                 return env
@@ -1240,6 +1245,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """Launch a terminal required for the owning session to execute.
 
@@ -1260,6 +1266,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            additional_read_roots=additional_read_roots,
         )
 
     async def launch_auxiliary_terminal(
@@ -1273,6 +1280,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -1293,6 +1301,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            additional_read_roots=additional_read_roots,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -1307,6 +1316,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
@@ -1330,6 +1340,7 @@ class SessionResourceRegistry:
                 parent_os_env=parent_os_env,
                 cwd_override=cwd_override,
                 sandbox_override=sandbox_override,
+                additional_read_roots=additional_read_roots,
                 **program_status_args,
             )
         except TerminalExitedDuringLaunch as exc:

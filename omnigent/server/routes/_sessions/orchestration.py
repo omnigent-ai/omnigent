@@ -69,7 +69,6 @@ from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
-from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -391,6 +390,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
+from omnigent.server.skill_injection import session_agent_revision
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,
@@ -402,6 +402,8 @@ from omnigent.server.subagent_activity import (
     record_claude_subagent_return,
     record_subagent_activity,
 )
+from omnigent.skills.policy import DEFAULT_POLICY as DEFAULT_SKILLS_POLICY
+from omnigent.skills.policy import SkillsMarketplacePolicy
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -425,6 +427,7 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.sandbox_profile_store import PROFILE_LABEL_PREFIX, public_profile
+from omnigent.stores.skill_store import SkillStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.anon import current_anon_user_id as _tel_current_anon
@@ -10556,6 +10559,8 @@ async def _wake_parent_for_blocked_child(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    skill_store: SkillStore | None = None,
+    skills_policy: SkillsMarketplacePolicy = DEFAULT_SKILLS_POLICY,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -10637,7 +10642,13 @@ async def _wake_parent_for_blocked_child(
             file_store=None,
             artifact_store=None,
             runner_router=runner_router,
-            agent_revision=mcp_selection_revision(parent_agent.bundle_location, parent_conv.labels)
+            agent_revision=await session_agent_revision(
+                parent_agent.bundle_location,
+                parent_conv,
+                skill_store=skill_store,
+                conversation_store=conversation_store,
+                policy=skills_policy,
+            )
             if parent_agent is not None
             else None,
         )
@@ -10656,6 +10667,8 @@ def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    skill_store: SkillStore | None = None,
+    skills_policy: SkillsMarketplacePolicy = DEFAULT_SKILLS_POLICY,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -10701,6 +10714,8 @@ def configure_subagent_block_notifier(
             conversation_store=conversation_store,
             runner_router=runner_router,
             agent_store=agent_store,
+            skill_store=skill_store,
+            skills_policy=skills_policy,
         )
 
     notifier = SubagentBlockNotifier(
@@ -12370,7 +12385,13 @@ async def _create_session_from_existing_agent(
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
-                    agent_revision=mcp_selection_revision(agent.bundle_location, conv.labels),
+                    agent_revision=await session_agent_revision(
+                        agent.bundle_location,
+                        conv,
+                        skill_store=getattr(request.app.state, "skill_store", None),
+                        conversation_store=conversation_store,
+                        policy=getattr(request.app.state, "skills_policy", DEFAULT_SKILLS_POLICY),
+                    ),
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule(expected_seed_title=conv.title)

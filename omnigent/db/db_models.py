@@ -29,7 +29,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
 from omnigent.db.compression import CompressedText
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
@@ -1703,3 +1703,241 @@ class SqlScheduledTaskRun(OmnigentBase):
             "id",
         ),
     )
+
+
+class BoundedString(TypeDecorator[str]):
+    """A ``VARCHAR(n)`` whose limit holds on every engine and every write path.
+
+    SQLite ignores a declared length, and an attribute validator is skipped by
+    a bulk write (``Session.execute(insert(Model), rows)``), so the check sits
+    at the bind boundary every write passes through. Lengths are characters, so
+    the widest column here (1024) stores at most 4 KiB of UTF-8, well under the
+    16 KiB stored-value limit.
+
+    ``exact=True`` also pins MySQL to ``utf8mb4_bin``, for an identity column
+    whose default collation would fold ``Main`` and ``main`` into one key: a
+    git ref, a repository path, a skill name and a principal are all
+    case-sensitive.
+    """
+
+    impl = String
+    cache_ok = True
+
+    def __init__(self, length: int, *, exact: bool = False) -> None:
+        super().__init__(length)
+        self.length = length
+        self.exact = exact
+
+    def load_dialect_impl(self, dialect: Any) -> Any:
+        length = self.length
+        if self.exact and dialect.name == "mysql":
+            return dialect.type_descriptor(
+                MySQLVarchar(length, charset="utf8mb4", collation="utf8mb4_bin")
+            )
+        return dialect.type_descriptor(String(length))
+
+    def process_bind_param(self, value: str | None, dialect: object) -> str | None:
+        del dialect
+        limit = self.length
+        if value is not None and len(value) > limit:
+            raise ValueError(f"value of {len(value)} characters is longer than {limit}")
+        return value
+
+
+class SqlSkillSource(OmnigentBase):
+    """
+    SQLAlchemy model for the ``skill_sources`` table.
+
+    A git repository the skills marketplace browses (see
+    ``omnigent.skills``). Rows are added by administrators; deleting one
+    leaves the skills already installed from it in place.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`).
+    :param url: Clone URL, e.g. ``"https://github.com/acme/skills.git"``.
+    :param ref: Branch or tag to fetch; ``"HEAD"`` (git's name for the
+        remote's default branch) when none was chosen, so the identity is unique.
+    :param path: Directory inside the repository the catalog is indexed from,
+        POSIX form; ``""`` for the repository root.
+    :param name: Label shown in the UI.
+    :param created_by: User who added the source, or ``None`` in single-user mode.
+    :param created_at: Unix epoch seconds at row creation.
+    """
+
+    __tablename__ = "skill_sources"
+    __table_args__ = (
+        # Keyset pagination over (created_at, id); ends in the primary key.
+        Index("ix_skill_sources_order", "workspace_id", "created_at", "id"),
+        # One row per repository, ref and path: replicas seeding the same source
+        # at startup collide here instead of leaving a duplicate. The three
+        # columns total 710 characters, within MySQL's 3072-byte key at utf8mb4.
+        Index("ux_skill_sources_identity", "workspace_id", "url", "ref", "path", unique=True),
+    )
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    url: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
+    ref: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
+    path: Mapped[str] = mapped_column(BoundedString(200, exact=True), nullable=False)
+    name: Mapped[str] = mapped_column(BoundedString(256), nullable=False)
+    created_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    @validates("url", "ref", "path", "name", "created_by")
+    def _within_declared_length(self, key: str, value: str | None) -> str | None:
+        return _within_declared_length(self, key, value)
+
+
+def _within_declared_length(row: OmnigentBase, key: str, value: str | None) -> str | None:
+    """Name the offending field as soon as it is set, before any statement runs.
+
+    :class:`BoundedString` is what actually enforces the limit, on every write
+    path; this only turns the failure into a field-named error at construction
+    or assignment, where the caller can still see which value was too long.
+    """
+    column_type = row.__table__.c[key].type
+    if not isinstance(column_type, BoundedString):
+        raise TypeError(f"{key} is not a BoundedString column")
+    limit = column_type.length
+    if value is not None and len(value) > limit:
+        raise ValueError(f"{key} is longer than {limit} characters")
+    return value
+
+
+class SqlInstalledSkill(OmnigentBase):
+    """
+    SQLAlchemy model for the ``installed_skills`` table.
+
+    A skill fetched from a repository and stored as a tarball in the artifact
+    store; the session agent-contents route folds enabled rows into the
+    served bundle so every harness discovers them as bundle skills.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`).
+    :param name: Invocation identifier, the skill's directory name.
+    :param display_name: Human-facing label from the frontmatter, or ``None``.
+    :param description: One-line summary from the frontmatter.
+    :param source_url: Clone URL the skill came from.
+    :param ref: Branch or tag it was fetched at, or ``None``.
+    :param commit: Commit it was packaged from, or ``None`` when unknown.
+    :param path: Skill directory inside the repository, POSIX form.
+    :param scope: ``"user"`` (one user's install) or ``"org"`` (everyone).
+        Stored as a stable int code (see omnigent.db.enum_codecs
+        INSTALLED_SKILL_SCOPE); the store converts at the row↔entity boundary.
+    :param principal: Who the row belongs to, never absent: ``"org"`` for an
+        org-scoped row, ``"local"`` for the single local user's own, or
+        ``"user:<owner_user_id>"``. Partitions every read and makes the identity
+        unique on every engine; ``owner_user_id`` stays the plain, nullable id.
+    :param owner_user_id: The installing user for a user-scoped row, else ``None``.
+    :param bundle_location: Artifact-store key of the skill tarball.
+    :param bundle_bytes: Bytes of the skill's files once unpacked, so a
+        principal's delivery budget, sized to what a runner unpacks, is a
+        bounded sum rather than a read of every artifact.
+    :param bundle_entries: Files and directories in the tarball, for the same budget.
+    :param enabled: Whether sessions receive the skill.
+    :param user_invocable: Whether the skill's own ``SKILL.md`` offers it to the
+        user (``user-invocable: false`` marks an internal orchestration skill).
+        Stored so a menu can filter without opening every stored tarball; the
+        skill is delivered to the agent either way.
+    :param installed_by: User who installed it, or ``None`` in single-user mode.
+    :param installed_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    """
+
+    __tablename__ = "installed_skills"
+    __table_args__ = (
+        # One row per (principal, name): concurrent installs collide here
+        # instead of leaving a duplicate; its prefix also serves the lookups by name.
+        Index("ux_installed_skills_identity", "workspace_id", "principal", "name", unique=True),
+        # Principal-scoped keyset pagination over (installed_at, id); ends in the primary key.
+        Index(
+            "ix_installed_skills_principal_order",
+            "workspace_id",
+            "principal",
+            "installed_at",
+            "id",
+        ),
+        CheckConstraint("scope IN (1, 2)", name="ck_installed_skills_scope"),
+    )
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    name: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(BoundedString(256), nullable=True)
+    description: Mapped[str] = mapped_column(BoundedString(1024), nullable=False)
+    source_url: Mapped[str] = mapped_column(BoundedString(255), nullable=False)
+    ref: Mapped[str | None] = mapped_column(BoundedString(255), nullable=True)
+    commit: Mapped[str | None] = mapped_column(BoundedString(64), nullable=True)
+    path: Mapped[str] = mapped_column(BoundedString(1024), nullable=False)
+    scope: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    principal: Mapped[str] = mapped_column(BoundedString(133, exact=True), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
+    bundle_location: Mapped[str] = mapped_column(BoundedString(512), nullable=False)
+    bundle_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    bundle_entries: Mapped[int] = mapped_column(Integer, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    user_invocable: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    installed_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
+    installed_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    @validates(
+        "name",
+        "display_name",
+        "description",
+        "source_url",
+        "ref",
+        "commit",
+        "path",
+        "principal",
+        "owner_user_id",
+        "bundle_location",
+        "installed_by",
+    )
+    def _within_declared_length(self, key: str, value: str | None) -> str | None:
+        return _within_declared_length(self, key, value)
+
+
+class SqlSkillPrincipal(OmnigentBase):
+    """
+    SQLAlchemy model for the ``skill_principals`` table.
+
+    One row per principal that has installed skills (see
+    :class:`SqlInstalledSkill`). The store locks this row for the length of
+    a write, so a principal's quota is checked and its rows written under one
+    lock on every engine, including a principal with no rows yet. The totals
+    live here, maintained by the same transactions, so a quota check is one
+    locked read rather than a scan of the principal's rows.
+
+    :param principal: ``"org"``, ``"local"`` or ``"user:<owner_user_id>"``.
+    :param installed_count: Rows the principal holds in ``installed_skills``.
+    :param enabled_bytes: Sum of ``bundle_bytes`` over its enabled rows.
+    :param enabled_entries: Sum of ``bundle_entries`` over its enabled rows.
+    :param revision: Incremented by every write to the principal's installs,
+        so a running session can tell its delivered set is out of date.
+    :param created_at: Unix epoch seconds at row creation.
+    """
+
+    __tablename__ = "skill_principals"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        default=current_workspace_id,
+    )
+    principal: Mapped[str] = mapped_column(BoundedString(133, exact=True), primary_key=True)
+    installed_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    enabled_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    enabled_entries: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    @validates("principal")
+    def _within_declared_length(self, key: str, value: str | None) -> str | None:
+        return _within_declared_length(self, key, value)

@@ -584,6 +584,8 @@ export interface SkillSummary {
   description: string;
   /** Frontmatter ``name`` label, e.g. ``"Triage Issues"``; absent from older servers. */
   display_name?: string | null;
+  /** Repository an installed marketplace skill came from (``owner/repo``); null or absent otherwise. */
+  source?: string | null;
 }
 
 /** A host's discovered catalog plus the sources it could not read. */

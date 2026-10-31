@@ -117,6 +117,12 @@ from omnigent.process_logging import (
     env_truthy,
     process_log_dir_reference,
 )
+from omnigent.skills.git_source import (
+    GitSourceError,
+    clone_github_source,
+    parse_github_source,
+    tar_untrusted_dir,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.server_url import ServerUrl
 from omnigent.util.server_url import org_id_from_url as _org_id_from_url
@@ -4811,6 +4817,9 @@ def server(
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+
+    skill_store = SqlAlchemySkillStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
     preference_store = None
     if authority_id is not None:
@@ -5028,6 +5037,7 @@ def server(
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
+        skill_store=skill_store,
         project_store=project_store,
         preference_store=preference_store,
         auth_provider=auth_provider,
@@ -12342,24 +12352,16 @@ def agent_grp() -> None:
     """
 
 
-_GITHUB_SOURCE_RE = re.compile(
-    r"^(?:github:|https://github\.com/)?"
-    r"(?P<owner>\w[\w.-]*)/(?P<repo>\w[\w.-]*?)(?:\.git)?"
-    r"(?:/tree/(?P<tree_ref>[^/@]+))?(?P<subpath>(?:/\w[\w.-]*)*)/?(?:@(?P<name>[\w.-]+))?$"
-)
-
-
 def _parse_github_source(source: str) -> tuple[str, str | None, str, str | None] | None:
     """``(clone_url, ref, subpath, agent_name)`` for ``owner/repo[/path][@agent]`` or a URL.
 
-    As in ``npx skills add``, ``@name`` picks one agent; a ref comes from ``/tree/<ref>``
-    (a branch or tag without ``/``; commit SHAs can't be shallow-cloned by name).
+    The parsing lives in :mod:`omnigent.skills.git_source`, shared with the
+    skills marketplace; this keeps the CLI's tuple shape.
     """
-    m = _GITHUB_SOURCE_RE.match(source)
-    if m is None:
+    parsed = parse_github_source(source)
+    if parsed is None:
         return None
-    url = f"https://github.com/{m['owner']}/{m['repo']}.git"
-    return url, m["tree_ref"], m["subpath"].strip("/"), m["name"]
+    return parsed.clone_url, parsed.ref, parsed.subpath, parsed.name
 
 
 def _find_agent_dirs(root: Path) -> list[Path]:
@@ -12387,69 +12389,20 @@ def _agent_dir_name(agent_dir: Path) -> str:
     return name if isinstance(name, str) and name else agent_dir.name
 
 
-_LFS_POINTER = b"version https://git-lfs.github.com/spec/"
-
-
 def _bundle_untrusted_dir(source: Path) -> bytes:
-    """Tar an agent directory from a remote repo as is.
-
-    Unlike :func:`_bundle`, ``${VAR}`` references are left unexpanded so a
-    repo can't pull this shell's secrets into its config, and symlinks are
-    refused so it can't pull in files from outside the checkout. ``.git`` is
-    skipped, and Git LFS pointers (never downloaded) are refused.
-    """
-    import io
-    import tarfile
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for file_path in sorted(source.rglob("*")):
-            rel = file_path.relative_to(source)
-            if ".git" in rel.parts:
-                continue
-            if file_path.is_symlink():
-                raise _agent_cli_error(
-                    f"{_printable(str(rel))} is a symlink; refusing to install "
-                    "an agent with symlinks from a remote repo."
-                )
-            if file_path.is_file():
-                with file_path.open("rb") as fh:
-                    if fh.read(len(_LFS_POINTER)) == _LFS_POINTER:
-                        raise _agent_cli_error(
-                            f"{_printable(str(rel))} is stored in Git LFS, which "
-                            "`omnigent agent add` doesn't download."
-                        )
-                tf.add(str(file_path), arcname=str(rel))
-    return buf.getvalue()
+    """Tar an agent directory from a remote repo as is (see :func:`tar_untrusted_dir`)."""
+    try:
+        return tar_untrusted_dir(source, what="an agent")
+    except GitSourceError as exc:
+        raise _agent_cli_error(str(exc)) from None
 
 
 def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
     """Shallow-clone without submodules, hooks, or credential prompts."""
-    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
-           "-c", "protocol.https.allow=always", "clone", "--depth", "1",
-           "--no-recurse-submodules", "--quiet"]  # fmt: skip
-    if ref:
-        cmd += ["--branch", ref]
     try:
-        proc = subprocess.run(
-            [*cmd, "--", clone_url, str(dest)],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
-            check=False,
-            timeout=300,
-        )
-    except FileNotFoundError:
-        raise _agent_cli_error("Installing from GitHub needs git on your PATH.") from None
-    except subprocess.TimeoutExpired:
-        raise _agent_cli_error(f"Timed out cloning {clone_url}.") from None
-    if proc.returncode != 0:
-        hint = (
-            "\n(Only branch and tag names work as a ref, not commit SHAs.)"
-            if ref and re.fullmatch(r"[0-9a-f]{7,40}", ref)
-            else ""
-        )
-        raise _agent_cli_error(f"Could not clone {clone_url}: {proc.stderr.strip()}{hint}")
+        clone_github_source(clone_url, ref, dest)
+    except GitSourceError as exc:
+        raise _agent_cli_error(str(exc)) from None
 
 
 def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[explicit-any]  # httpx.Client
@@ -12900,7 +12853,6 @@ def debug_logs(
       # Show the full latest CLI diagnostics log
       omnigent debug logs --type cli -n 0
     """
-    import re
     import subprocess
 
     from omnigent.host.local_server import _local_data_dir

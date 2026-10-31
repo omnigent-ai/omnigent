@@ -419,3 +419,44 @@ describe("picker curation", () => {
     expect(pickerCuration(info({})).defaultAgentName).toBeNull();
   });
 });
+
+describe("resolveServerInfo skills_marketplace", () => {
+  it("reads an older server, which reports neither the feature nor the block", async () => {
+    // Settings must hide Skills rather than offer routes that answer 404.
+    const parsed = await probe({});
+    const { skillsMarketplaceEnabled, skillUrlInstallEnabled } = await import("./capabilities");
+
+    expect(parsed.skills_marketplace).toBeNull();
+    expect(skillsMarketplaceEnabled(parsed)).toBe(false);
+    // With no block there is no policy to read, so the URL form is not withheld.
+    expect(skillUrlInstallEnabled(parsed)).toBe(true);
+  });
+
+  it.each([
+    [{ url_install: false }, false],
+    [{ url_install: true }, true],
+    // Anything but an explicit false leaves the form offered.
+    [{}, true],
+    [{ url_install: "no" }, true],
+  ])("reads the url_install policy off %j as %j", async (block, offered) => {
+    const parsed = await probe({
+      features: { skills_marketplace: true },
+      skills_marketplace: block,
+    });
+    const { skillsMarketplaceEnabled, skillUrlInstallEnabled } = await import("./capabilities");
+
+    expect(skillsMarketplaceEnabled(parsed)).toBe(true);
+    expect(skillUrlInstallEnabled(parsed)).toBe(offered);
+  });
+
+  it.each([null, "on", 7])("ignores a block that is not an object: %j", async (block) => {
+    const parsed = await probe({
+      features: { skills_marketplace: true },
+      skills_marketplace: block,
+    });
+    const { skillUrlInstallEnabled } = await import("./capabilities");
+
+    expect(parsed.skills_marketplace).toBeNull();
+    expect(skillUrlInstallEnabled(parsed)).toBe(true);
+  });
+});

@@ -1,0 +1,250 @@
+"""Carry installed skills into a session as bundle skills.
+
+A runner fetches its agent bundle from the server and discovers
+``skills/<name>/SKILL.md`` inside it, for every harness. Adding an installed
+skill under that path in the served bundle therefore needs no runner or
+harness change. The bundle's own skills always win a name collision.
+"""
+
+from __future__ import annotations
+
+import gzip
+import io
+import tarfile
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+
+from omnigent.skills.limits import MAX_SKILL_BYTES, MAX_SKILL_ENTRIES
+
+
+class SkillTarballError(Exception):
+    """A stored skill tarball is not safe to unpack into a bundle."""
+
+
+@dataclass(frozen=True)
+class UnpackedSize:
+    """What a tarball becomes once a runner unpacks it: file bytes and entries."""
+
+    bytes: int
+    entries: int
+
+    def __add__(self, other: UnpackedSize) -> UnpackedSize:
+        return UnpackedSize(self.bytes + other.bytes, self.entries + other.entries)
+
+
+def _open(data: bytes) -> tarfile.TarFile:
+    try:
+        return tarfile.open(fileobj=io.BytesIO(data), mode="r:*")
+    except (tarfile.ReadError, tarfile.CompressionError) as exc:
+        raise SkillTarballError(f"invalid tarball: {exc}") from exc
+
+
+def _check_member(member: tarfile.TarInfo) -> None:
+    if not (member.isfile() or member.isdir()):
+        raise SkillTarballError(f"unsupported entry type: {member.name!r}")
+    path = PurePosixPath(member.name)
+    if path.is_absolute() or ".." in path.parts:
+        raise SkillTarballError(f"unsafe path: {member.name!r}")
+
+
+def is_root_manifest(member_name: str) -> bool:
+    """Whether a tar member is the skill's own ``SKILL.md`` (``./`` prefixes allowed).
+
+    Compares path parts, so a ``.SKILL.md`` or ``x/SKILL.md`` is never taken for it.
+    """
+    return [part for part in PurePosixPath(member_name).parts if part != "."] == ["SKILL.md"]
+
+
+def validate_skill_tarball(data: bytes) -> UnpackedSize:
+    """Reject links, traversal, bombs, and a tarball without a root ``SKILL.md``.
+
+    :returns: Its unpacked size, as counted against the delivery budgets.
+    :raises SkillTarballError: With a user-facing reason.
+    """
+    total = entries = 0
+    has_manifest = False
+    with _open(data) as tf:
+        for member in tf:
+            _check_member(member)
+            entries += 1
+            total += member.size
+            if entries > MAX_SKILL_ENTRIES or total > MAX_SKILL_BYTES:
+                raise SkillTarballError("skill is too large")
+            if member.isfile() and is_root_manifest(member.name):
+                has_manifest = True
+    if not has_manifest:
+        raise SkillTarballError("skill tarball has no SKILL.md at its root")
+    return UnpackedSize(bytes=total, entries=entries)
+
+
+def unpacked_size(data: bytes) -> UnpackedSize:
+    """File bytes and entries of any tarball, such as an agent bundle, as a runner unpacks it."""
+    total = entries = 0
+    with _open(data) as tf:
+        for member in tf:
+            entries += 1
+            if member.isfile():
+                total += member.size
+    return UnpackedSize(bytes=total, entries=entries)
+
+
+def _prefix_parts(prefix: str) -> list[str]:
+    return [part for part in PurePosixPath(prefix).parts if part not in ("", ".")]
+
+
+def bundle_skill_names(bundle_bytes: bytes, *, prefix: str = "") -> set[str]:
+    """Directory names of every ``SKILL.md`` under ``<prefix>skills/``, at any depth.
+
+    The parser names a skill after its directory, so ``skills/team/triage``
+    is ``triage``. Callers that have the parsed agent spec should pass its
+    canonical names to :func:`overlay_skills` as well; this scan is the
+    fallback for a bundle whose spec is unavailable.
+
+    :param prefix: The agent directory to look under: ``""`` for the root,
+        ``agents/<dir>/`` for a child.
+    """
+    lead = _prefix_parts(prefix)
+    names: set[str] = set()
+    with _open(bundle_bytes) as tf:
+        for member in tf:
+            parts = [part for part in PurePosixPath(member.name).parts if part != "."]
+            if parts[: len(lead)] != lead:
+                continue
+            rest = parts[len(lead) :]
+            if len(rest) >= 3 and rest[0] == "skills" and rest[-1] == "SKILL.md":
+                names.add(rest[-2])
+    return names
+
+
+def bundle_skill_directories(bundle_bytes: bytes, *, prefix: str = "") -> set[str]:
+    """Names directly under ``<prefix>skills/``: skills and namespace folders alike.
+
+    An installed skill named after a namespace folder would put a
+    ``SKILL.md`` in it, and the parser would then take the folder for a skill
+    and stop looking inside, hiding the bundle's own skills there.
+    """
+    lead = _prefix_parts(prefix)
+    paths: list[tuple[list[str], bool]] = []
+    with _open(bundle_bytes) as tf:
+        for member in tf:
+            parts = [part for part in PurePosixPath(member.name).parts if part != "."]
+            if parts[: len(lead)] == lead:
+                paths.append((parts[len(lead) :], member.isdir()))
+    return _skill_directories(paths)
+
+
+def reserved_install_names(agent_dir: Path) -> set[str]:
+    """What :func:`overlay_skills` will not add into an extracted agent directory.
+
+    The same rule as the overlay applies to an archive (every name directly
+    under ``skills/`` plus every ``SKILL.md`` directory below it), so a menu
+    built from the extracted bundle offers exactly what delivery adds.
+
+    :param agent_dir: The directory holding the agent's ``skills/``: the
+        bundle root, or ``agents/<dir>/`` inside it for a child.
+    """
+    skills_dir = agent_dir / "skills"
+    if skills_dir.is_symlink() or not skills_dir.is_dir():
+        return set()
+    paths: list[tuple[list[str], bool]] = []
+    for path in skills_dir.rglob("*"):
+        rest = ["skills", *path.relative_to(skills_dir).parts]
+        paths.append((rest, path.is_dir() and not path.is_symlink()))
+    names = _skill_directories(paths)
+    names.update(rest[-2] for rest, _ in paths if len(rest) >= 3 and rest[-1] == "SKILL.md")
+    return names
+
+
+def _skill_directories(paths: list[tuple[list[str], bool]]) -> set[str]:
+    """Names directly under ``skills/`` among ``(parts, is_dir)`` paths relative to an agent."""
+    return {
+        rest[1]
+        for rest, is_dir in paths
+        if len(rest) >= 2 and rest[0] == "skills" and (len(rest) > 2 or is_dir)
+    }
+
+
+def overlay_skills(
+    bundle_bytes: bytes,
+    skills: Sequence[tuple[str, bytes]],
+    *,
+    reserved: Collection[str] = (),
+    prefix: str = "",
+) -> bytes:
+    """Return *bundle_bytes* with each ``(name, tarball)`` added as ``<prefix>skills/<name>/``.
+
+    A name the target directory already has, or one in *reserved* (the parsed
+    spec's canonical skill names), is left alone. The archive is rebuilt once
+    for all skills, with a fixed gzip timestamp so the same inputs give the
+    same bytes and the runner's content-addressed cache hits. An unsafe
+    tarball raises rather than being skipped, so a bad row is noticed instead
+    of silently missing from the menu.
+
+    :param prefix: Where the session's spec lives: ``""`` for the root agent,
+        ``agents/<dir>/`` for a child, which the runner reads instead of the root.
+    """
+    return overlay_skills_within(bundle_bytes, skills, reserved=reserved, prefix=prefix)[0]
+
+
+def overlay_skills_within(
+    bundle_bytes: bytes,
+    skills: Sequence[tuple[str, bytes]],
+    *,
+    reserved: Collection[str] = (),
+    prefix: str = "",
+    limit: UnpackedSize | None = None,
+) -> tuple[bytes, list[str]]:
+    """:func:`overlay_skills`, adding only the skills that keep the result within *limit*.
+
+    The agent's own files are counted as they are copied, so the bundle is
+    read once; a skill that would take the unpacked total past *limit* is
+    left out, and later, smaller ones may still fit.
+
+    :param limit: What the merged bundle may unpack to, or ``None`` for no bound.
+    :returns: The bundle, and the names left out for the limit, in *skills* order.
+    """
+    if not skills:
+        return bundle_bytes, []
+    lead = _prefix_parts(prefix)
+    present = (
+        bundle_skill_names(bundle_bytes, prefix=prefix)
+        | bundle_skill_directories(bundle_bytes, prefix=prefix)
+        | set(reserved)
+    )
+    used = UnpackedSize(0, 0)
+    skipped: list[str] = []
+    out = io.BytesIO()
+    with (
+        _open(bundle_bytes) as src,
+        gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as packed,
+        tarfile.open(fileobj=packed, mode="w") as dst,
+    ):
+        for member in src:
+            used += UnpackedSize(member.size if member.isfile() else 0, 1)
+            dst.addfile(member, src.extractfile(member) if member.isfile() else None)
+        for name, data in skills:
+            if name in present:
+                continue
+            size = validate_skill_tarball(data)
+            after = used + size
+            if limit is not None and (after.bytes > limit.bytes or after.entries > limit.entries):
+                skipped.append(name)
+                continue
+            used = after
+            with _open(data) as skill:
+                for member in skill:
+                    rel = PurePosixPath(member.name)
+                    parts = [p for p in rel.parts if p != "."]
+                    if not parts:
+                        continue
+                    copied = tarfile.TarInfo(
+                        name=str(PurePosixPath(*lead, "skills", name, *parts))
+                    )
+                    copied.size = member.size
+                    copied.mode = member.mode
+                    copied.mtime = member.mtime
+                    copied.type = member.type
+                    dst.addfile(copied, skill.extractfile(member) if member.isfile() else None)
+            present.add(name)
+    return out.getvalue(), skipped

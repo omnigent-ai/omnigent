@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import tarfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -35,6 +37,8 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+from tests._helpers.skill_repos import skill_tarball
 from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle
 
@@ -74,6 +78,7 @@ def skills_app(db_uri: str, tmp_path: Path):
         HostHelloFrame(version="test", frame_protocol_version=1, name="host"),
         owner="owner",
     )
+    skills = SqlAlchemySkillStore(db_uri)
     app = FastAPI()
     app.state.host_store = hosts
     app.state.agent_cache = AgentCache(artifacts, tmp_path / "cache")
@@ -87,6 +92,8 @@ def skills_app(db_uri: str, tmp_path: Path):
         host_registry=registry,
         auth_provider=_Auth(),
         permission_store=permissions,
+        agent_cache=app.state.agent_cache,
+        skill_store=skills,
     )
     app.include_router(router, prefix="/v1")
     app.include_router(
@@ -98,6 +105,7 @@ def skills_app(db_uri: str, tmp_path: Path):
             agent_cache=app.state.agent_cache,
             auth_provider=_Auth(),
             permission_store=permissions,
+            skill_store=skills,
         ),
         prefix="/v1",
     )
@@ -154,7 +162,14 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
     assert response.status_code == (200 if acknowledged else 502)
     if acknowledged:
         assert response.json() == {
-            "skills": [{"name": "child-review", "description": "Review", "display_name": None}],
+            "skills": [
+                {
+                    "name": "child-review",
+                    "description": "Review",
+                    "display_name": None,
+                    "source": None,
+                }
+            ],
             "warnings": [warning],
         }
     else:
@@ -205,11 +220,23 @@ async def test_session_target_cannot_be_overridden(skills_app, overrides: dict[s
 
 @pytest.mark.parametrize("skill_filter", ["all", "none", ["allowed"]])
 async def test_presession_catalog_matches_filtered_invocations(
-    presession_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skill_filter: str | list[str]
+    presession_app,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skill_filter: str | list[str],
 ) -> None:
     app, _, conn, _, agent, _ = presession_app
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-    for name in ("bundled", "hidden", "allowed", "denied"):
+    for name in ("bundled", "allowed"):
+        _install_personal_skill(db_uri, tmp_path, "owner", name, description=f"Installed {name}")
+    # A hidden install still takes its name at runtime, so the host's "secret"
+    # it shadows must not be offered either.
+    _install_personal_skill(db_uri, tmp_path, "owner", "secret", user_invocable=False)
+    # The bundle's helper-only skills/lib/ keeps an install named "lib" out of
+    # the served archive, so the menu must not offer it.
+    _install_personal_skill(db_uri, tmp_path, "owner", "lib", description="Installed lib")
+    for name in ("bundled", "hidden", "allowed", "denied", "secret"):
         directory = tmp_path / ".claude" / "skills" / name
         directory.mkdir(parents=True)
         (directory / "SKILL.md").write_text(
@@ -226,7 +253,21 @@ async def test_presession_catalog_matches_filtered_invocations(
             ),
         ],
     )
-    monkeypatch.setattr(app.state.agent_cache, "load", lambda *a, **kw: SimpleNamespace(spec=spec))
+    bundle_dir = tmp_path / "bundle"
+    bundle_files = {
+        "config.yaml": b"name: agent\n",
+        "skills/bundled/SKILL.md": b"---\nname: bundled\ndescription: b\n---\n",
+        "skills/hidden/SKILL.md": b"---\nname: hidden\ndescription: h\n---\n",
+        "skills/lib/helper.py": b"HELPER = 1\n",
+    }
+    for relative, data in bundle_files.items():
+        (bundle_dir / relative).parent.mkdir(parents=True, exist_ok=True)
+        (bundle_dir / relative).write_bytes(data)
+    monkeypatch.setattr(
+        app.state.agent_cache,
+        "load",
+        lambda *a, **kw: SimpleNamespace(spec=spec, workdir=bundle_dir),
+    )
     from omnigent.server.routes.builtin_agents import _to_agent_object as builtin_agent_object
     from omnigent.server.routes.sessions.routes_permissions import (
         _to_agent_object as session_agent_object,
@@ -277,12 +318,46 @@ async def test_presession_catalog_matches_filtered_invocations(
         response = await task
     assert response.status_code == 200
     expected = resolve_session_skills(spec, (tmp_path,), None)
-    assert response.json()["skills"] == [
-        {"name": s.name, "description": s.description, "display_name": s.display_name}
+    # Runtime loads installed skills as bundle content ahead of the host's, so
+    # the menu shows the installed "allowed" over the host's, never over "bundled".
+    installed = {
+        "name": "allowed",
+        "description": "Installed allowed",
+        "display_name": None,
+        "source": "acme/skills",
+    }
+    listed = [
+        {
+            "name": s.name,
+            "description": s.description,
+            "display_name": s.display_name,
+            "source": None,
+        }
         for s in expected
+        if s.name not in ("allowed", "secret")
     ]
-    assert "hidden" not in {s["name"] for s in response.json()["skills"]}
+    if any(s.name == "allowed" for s in expected):
+        listed.append(installed)
+    assert response.json()["skills"] == listed
+    menu = {s["name"] for s in response.json()["skills"]}
+    assert {"hidden", "secret", "lib"}.isdisjoint(menu)
     assert response.json()["warnings"] == []
+    # The archive a session would be served agrees with the menu.
+    from omnigent.server.skill_injection import with_installed_skills
+    from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+
+    served = with_installed_skills(
+        skill_tarball(bundle_files),
+        owner_id="owner",
+        skill_store=SqlAlchemySkillStore(db_uri),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    with tarfile.open(fileobj=io.BytesIO(served), mode="r:gz") as tf:
+        names = tf.getnames()
+    delivered = {name.split("/")[1] for name in names if name.startswith("skills/")}
+    assert "skills/lib/helper.py" in names and "skills/lib/SKILL.md" not in names
+    for name in ("allowed", "secret"):
+        assert name in delivered
 
 
 async def test_presession_discovery_rejects_private_agent(
@@ -392,3 +467,247 @@ async def test_managed_host_bundle_token_is_bound_to_session_host(
         assert response.headers["X-Agent-Id"] == agent.id
         assert response.headers["X-Agent-Version"] == str(agent.version)
         assert response.headers["Cache-Control"] == "no-store"
+
+
+def _install_personal_skill(
+    db_uri: str,
+    tmp_path: Path,
+    owner: str | None,
+    name: str,
+    *,
+    description: str | None = None,
+    scope: str = "user",
+    user_invocable: bool = True,
+) -> None:
+    """An install for *owner* (``None``: the local user, or everyone with ``scope="org"``)."""
+    LocalArtifactStore(str(tmp_path / "artifacts")).put(
+        f"skills/{name}.tar.gz",
+        skill_tarball({"SKILL.md": f"---\nname: {name}\ndescription: {name}\n---\n".encode()}),
+    )
+    SqlAlchemySkillStore(db_uri).install(
+        name=name,
+        display_name=None,
+        description=description or name,
+        source_url="https://github.com/acme/skills.git",
+        ref=None,
+        commit=None,
+        path=f"skills/{name}",
+        scope=scope,  # type: ignore[arg-type]
+        owner_user_id=owner,
+        bundle_location=f"skills/{name}.tar.gz",
+        bundle_bytes=1,
+        installed_by=owner,
+        user_invocable=user_invocable,
+    )
+
+
+def _child_session(skills_app, db_uri: str, tmp_path: Path):  # type: ignore[no-untyped-def]
+    """An agent with a real child under ``agents/child/`` and a session running that child."""
+    _app, _registry, conn, _conv, _agent, _hosts = skills_app
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    artifacts.put(
+        "family",
+        build_agent_bundle(
+            "family",
+            sub_agents=[
+                {
+                    "name": "child",
+                    "skills": [{"name": "kid", "description": "Bundled kid", "content": "x"}],
+                }
+            ],
+        ),
+    )
+    agents = SqlAlchemyAgentStore(db_uri)
+    agent = agents.create(
+        "8f2c1e0d4b6a4c1e9a7d5b3f2e1c0a9b", name="family", bundle_location="family"
+    )
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=agent.id,
+        host_id=conn.host_id,
+        workspace="/actual/workspace",
+        sub_agent_name="child",
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    # The reader is granted first; the owner lookup ranks by level, not order
+    # (the store's own tests cover that ranking at scale).
+    permissions.grant("reader", conv.id, LEVEL_READ)
+    permissions.grant("owner", conv.id, LEVEL_OWNER)
+    permissions.grant("editor", conv.id, LEVEL_EDIT)
+    return agent, conv
+
+
+@pytest.mark.parametrize("skill_filter", ["all", "none"])
+async def test_session_catalog_lists_the_owners_installed_skills_under_the_agents_filter(
+    skills_app, db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skill_filter: str
+) -> None:
+    # A shared editor asking for a child session's menu gets the owner's installs,
+    # never their own, and only when the child's own spec allows skills at all.
+    app, _, conn, _, _, _ = skills_app
+    agent, conv = _child_session(skills_app, db_uri, tmp_path)
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
+    _install_personal_skill(db_uri, tmp_path, "editor", "editors-skill")
+    # user-invocable: false in its own SKILL.md — delivered, never offered.
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-internal", user_invocable=False)
+    # Collides with the child's own bundled skill: the bundle wins, as at delivery.
+    _install_personal_skill(db_uri, tmp_path, "owner", "kid", description="Installed kid")
+    loaded = app.state.agent_cache.load(agent.id, agent.bundle_location)
+    child = next(s for s in loaded.spec.sub_agents if s.name == "child")
+    spec = replace(loaded.spec, sub_agents=[replace(child, skills_filter=skill_filter)])
+    monkeypatch.setattr(
+        app.state.agent_cache,
+        "load",
+        lambda *a, **kw: SimpleNamespace(spec=spec, workdir=loaded.workdir),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        task = asyncio.create_task(
+            client.get(
+                "/v1/skills", params={"session_id": conv.id}, headers={"x-test-user": "editor"}
+            )
+        )
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
+        assert isinstance(frame, HostSkillsFrame) and frame.sub_agent_name == "child"
+        conn.pending_skills[frame.request_id].set_result(
+            HostSkillsResultFrame(
+                frame.request_id,
+                "ok",
+                skills=[{"name": "child-review", "description": "Review"}],
+                session_id=conv.id,
+            )
+        )
+        response = await task
+    assert response.status_code == 200, response.text
+    listed = response.json()["skills"]
+    names = [s["name"] for s in listed]
+    assert "child-review" in names and "editors-skill" not in names
+    assert ("owners-skill" in names) is (skill_filter == "all")
+    # Left out under either filter, as a bundled internal skill is.
+    assert "owners-internal" not in names
+    assert not any(s["name"] == "kid" and s["source"] == "acme/skills" for s in listed)
+    if skill_filter == "all":
+        owners = next(s for s in response.json()["skills"] if s["name"] == "owners-skill")
+        assert owners["source"] == "acme/skills"
+
+
+async def test_the_runner_resolves_the_served_bundle_and_discovers_the_skill(
+    skills_app, db_uri: str, tmp_path: Path
+) -> None:
+    # The bytes the route serves, taken the rest of the way through the runner's
+    # own fetch, extract and cache path rather than parsed in the test.
+    from omnigent.runner._entry import _AgentSpecCache, _resolve_agent_spec_from_server
+
+    app, _, _, _, _, hosts = skills_app
+    agent, conv = _child_session(skills_app, db_uri, tmp_path)
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
+    hosts.register_managed_host(
+        host_id=conv.host_id,
+        name="sandbox",
+        user_id="owner",
+        token="valid",
+        provider="modal",
+        sandbox_id="sandbox",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        served = await client.get(
+            f"/v1/sessions/{conv.id}/agent/contents",
+            headers={MANAGED_HOST_TOKEN_HEADER: "valid"},
+        )
+    assert served.status_code == 200, served.text
+    carried = {
+        name: value
+        for name, value in served.headers.items()
+        if name.lower().startswith("x-agent-")
+    }
+
+    cache = _AgentSpecCache(tmp_path / "spec-cache")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=served.content, headers=carried)
+        ),
+        base_url="http://runner.test",
+    ) as runner_client:
+        resolved = await _resolve_agent_spec_from_server(runner_client, cache, agent.id, conv.id)
+        again = await _resolve_agent_spec_from_server(runner_client, cache, agent.id, conv.id)
+
+    assert resolved is not None and again is not None
+    # The second resolution reuses the extracted directory rather than re-extracting.
+    assert again.workdir == resolved.workdir
+    child = next(s for s in resolved.spec.sub_agents if s.name == "child")
+    assert "owners-skill" in {skill.name for skill in child.skills}
+
+
+async def test_bundle_download_carries_personal_skills_only_for_the_runner_and_the_owner(
+    skills_app, db_uri: str, tmp_path: Path
+) -> None:
+    # Personal installs are private: the runner (a managed host, or the owner's
+    # own fetch) gets them in the bundle; a shared reader or editor downloading
+    # the bundle gets the agent's own files only. The session runs a child, so
+    # the skills land where the runner reads that child's spec from.
+    app, _, _, _, _, hosts = skills_app
+    agent, conv = _child_session(skills_app, db_uri, tmp_path)
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-internal", user_invocable=False)
+    _install_personal_skill(db_uri, tmp_path, None, "shared-skill", scope="org")
+    _install_personal_skill(db_uri, tmp_path, None, "local-skill")
+    # A session nobody owns (shared with an editor only) on the same child agent.
+    unowned = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=agent.id,
+        host_id=conv.host_id,
+        workspace="/actual/workspace",
+        sub_agent_name="child",
+    )
+    SqlAlchemyPermissionStore(db_uri).grant("editor", unowned.id, LEVEL_EDIT)
+    hosts.register_managed_host(
+        host_id=conv.host_id,
+        name="sandbox",
+        user_id="owner",
+        token="valid",
+        provider="modal",
+        sandbox_id="sandbox",
+        token_expires_at=int(time.time()) + 3600,
+    )
+
+    def names(data: bytes) -> list[str]:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            return tf.getnames()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for headers, expected in (
+            ({"x-test-user": "owner"}, True),
+            ({MANAGED_HOST_TOKEN_HEADER: "valid"}, True),
+            ({"x-test-user": "editor"}, False),
+            ({"x-test-user": "reader"}, False),
+        ):
+            response = await client.get(f"/v1/sessions/{conv.id}/agent/contents", headers=headers)
+            assert response.status_code == 200, (headers, response.text)
+            delivered = names(response.content)
+            assert ("agents/child/skills/owners-skill/SKILL.md" in delivered) is expected, headers
+            assert ("agents/child/skills/shared-skill/SKILL.md" in delivered) is expected, headers
+            # Hidden from the menu, still delivered: the agent is what uses it.
+            assert ("agents/child/skills/owners-internal/SKILL.md" in delivered) is expected, (
+                headers
+            )
+            assert "skills/owners-skill/SKILL.md" not in delivered
+            # The local user's own install is nobody's on a multi-user server.
+            assert "agents/child/skills/local-skill/SKILL.md" not in delivered
+        # With no owner to resolve, even the runner's fetch carries no installs:
+        # neither the local user's nor everyone's, rather than guessing an owner.
+        response = await client.get(
+            f"/v1/sessions/{unowned.id}/agent/contents",
+            headers={MANAGED_HOST_TOKEN_HEADER: "valid"},
+        )
+        assert response.status_code == 200, response.text
+        delivered = names(response.content)
+        assert "agents/child/skills/kid/SKILL.md" in delivered  # the bundle's own
+        assert not any(
+            f"agents/child/skills/{name}/SKILL.md" in delivered
+            for name in ("owners-skill", "shared-skill", "local-skill")
+        )

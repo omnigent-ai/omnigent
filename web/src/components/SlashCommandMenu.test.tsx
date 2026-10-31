@@ -205,6 +205,18 @@ describe("skill display names", () => {
     ).toBe("Review code");
     expect(skillMenuDescription({ name: "ste", description: "", display_name: "STE" })).toBe("STE");
   });
+
+  it("names the repository an installed marketplace skill came from", () => {
+    expect(
+      skillMenuDescription({ name: "review", description: "Review code", source: "acme/skills" }),
+    ).toBe("Review code (from acme/skills)");
+    expect(skillMenuDescription({ name: "review", description: "", source: "acme/skills" })).toBe(
+      "from acme/skills",
+    );
+    expect(skillMenuDescription({ name: "review", description: "Review code", source: null })).toBe(
+      "Review code",
+    );
+  });
 });
 
 describe("skill display name matching", () => {

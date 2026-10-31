@@ -751,6 +751,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.skill_store import SkillStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
@@ -823,6 +824,7 @@ def create_sessions_router(
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
+    skill_store: SkillStore | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -1023,6 +1025,7 @@ def create_sessions_router(
         permission_store=permission_store,
         agent_cache=agent_cache,
         host_registry=host_registry,
+        skill_store=skill_store,
     )
 
     return router

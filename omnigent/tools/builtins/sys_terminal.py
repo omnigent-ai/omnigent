@@ -35,6 +35,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent.inner.bundle_skills import skill_resource_roots
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec
@@ -694,6 +695,8 @@ class SysTerminalLaunchTool(Tool):
                     # precedence flows through parent_os_env.
                     cwd_override=validated.cwd_override,
                     sandbox_override=validated.sandbox_override,
+                    # Bundle skills sit under the temp directory bwrap hides.
+                    additional_read_roots=skill_resource_roots(self._spec.skills or ()),
                 )
             )
         except (RuntimeError, OSError, ValueError) as exc:

@@ -1,0 +1,1380 @@
+"""The skills marketplace routes and the bundle injection, against a fixture repository.
+
+The fetcher's clone is replaced with a copy of a repository on disk, so no
+network and no git; everything else (store, artifact store, routes) is real.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import logging
+import tarfile
+import threading
+from dataclasses import replace
+from pathlib import Path
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from omnigent.db.utils import generate_agent_id
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
+from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.skill_injection import effective_installed_skills, with_installed_skills
+from omnigent.skills.limits import MAX_INSTALLED_PER_OWNER, MAX_PAGE
+from omnigent.skills.service import SkillFetcher
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.skill_store import SkillValueError
+from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+from tests._helpers.skill_repos import copying_cloner, skill_tarball, write_skill
+
+ALICE = {"X-Forwarded-Email": "alice@example.com"}
+BOB = {"X-Forwarded-Email": "bob@example.com"}
+
+REPO_URL = "https://github.com/acme/skills.git"
+
+
+@pytest.fixture()
+def repo(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    write_skill(root / "skills", "review", "Review a diff")
+    write_skill(root / "skills", "triage", "Triage issues")
+    return root
+
+
+def _fetcher(repo: Path) -> SkillFetcher:
+    return SkillFetcher(clone=copying_cloner(repo))
+
+
+def _build(
+    db_uri: str,
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    auth: bool = False,
+    server_config: dict[str, object] | None = None,
+) -> tuple[FastAPI, LocalArtifactStore]:
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    flags = FeatureFlags(frozenset({Feature.SKILLS_MARKETPLACE}) if enabled else frozenset())
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        skill_store=SqlAlchemySkillStore(db_uri),
+        feature_flags=flags,
+        permission_store=SqlAlchemyPermissionStore(db_uri) if auth else None,
+        auth_provider=UnifiedAuthProvider(source="header") if auth else None,
+        server_config=server_config,
+    )
+    return app, artifact_store
+
+
+def _bind_session(db_uri: str, artifact_store: LocalArtifactStore, bundle: bytes) -> str:
+    """An agent with *bundle* and a session bound to it; returns the session id."""
+    agent_id = generate_agent_id()
+    artifact_store.put(f"agents/{agent_id}.tar.gz", bundle)
+    SqlAlchemyAgentStore(db_uri).create(agent_id, "bundled", f"agents/{agent_id}.tar.gz")
+    return SqlAlchemyConversationStore(db_uri).create_conversation(agent_id=agent_id, title="s").id
+
+
+@pytest.fixture()
+async def market(db_uri: str, tmp_path: Path, repo: Path, runtime_init: None):
+    app, artifact_store = _build(db_uri, tmp_path)
+    app.state.skill_fetcher = _fetcher(repo)
+    app.state.skill_fetcher_repo = repo
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client, app, artifact_store
+
+
+@pytest.mark.asyncio
+async def test_sources_catalog_and_install_round_trip(market) -> None:
+    client, app, artifact_store = market
+
+    created = await client.post("/v1/skill-sources", json={"source": "acme/skills"})
+    assert created.status_code == 201, created.text
+    source = created.json()
+    assert source["url"] == REPO_URL and source["name"] == "acme/skills"
+    listed = (await client.get("/v1/skill-sources")).json()
+    assert [s["id"] for s in listed["data"]] == [source["id"]] and listed["has_more"] is False
+
+    catalog = await client.get(f"/v1/skill-sources/{source['id']}/catalog")
+    assert catalog.status_code == 200, catalog.text
+    assert [
+        (s["name"], s["description"], s["installed_id"]) for s in catalog.json()["skills"]
+    ] == [
+        ("review", "Review a diff", None),
+        ("triage", "Triage issues", None),
+    ]
+
+    installed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert installed.status_code == 201, installed.text
+    row = installed.json()["data"][0]
+    assert (row["name"], row["source"], row["scope"], row["enabled"]) == (
+        "triage",
+        "acme/skills",
+        "user",
+        True,
+    )
+    first_location = await _location(app, row["id"])
+    assert artifact_store.exists(first_location)
+
+    # Reinstalling changed content keeps the id, stores the new object and drops the old one.
+    repo_dir = app.state.skill_fetcher_repo
+    (repo_dir / "skills" / "triage" / "notes.txt").write_text("changed\n")
+    again = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert again.status_code == 201 and again.json()["data"][0]["id"] == row["id"]
+    second_location = await _location(app, row["id"])
+    assert second_location != first_location
+    assert artifact_store.exists(second_location) and not artifact_store.exists(first_location)
+
+    # The catalog now marks it, and the listing and content routes see it.
+    catalog = (await client.get(f"/v1/skill-sources/{source['id']}/catalog")).json()
+    assert {s["name"]: s["installed_id"] for s in catalog["skills"]} == {
+        "review": None,
+        "triage": row["id"],
+    }
+    assert [s["name"] for s in (await client.get("/v1/installed-skills")).json()["data"]] == [
+        "triage"
+    ]
+    content = await client.get(f"/v1/installed-skills/{row['id']}/content")
+    assert content.json()["markdown"].startswith("---\nname: triage")
+
+    disabled = await client.patch(f"/v1/installed-skills/{row['id']}", json={"enabled": False})
+    assert disabled.json()["enabled"] is False
+    updated = await client.post(f"/v1/installed-skills/{row['id']}/update")
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["id"] == row["id"]
+
+    assert (await client.delete(f"/v1/installed-skills/{row['id']}")).status_code == 204
+    assert (await client.get(f"/v1/installed-skills/{row['id']}/content")).status_code == 404
+    assert (await client.delete(f"/v1/skill-sources/{source['id']}")).status_code == 204
+    assert (await client.delete(f"/v1/skill-sources/{source['id']}")).status_code == 404
+
+
+async def _location(app: FastAPI, skill_id: str) -> str:
+    return app.state.skill_store.get(skill_id).bundle_location
+
+
+@pytest.mark.asyncio
+async def test_a_source_directory_is_browsed_installed_and_updated(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    # A repository directory in the link was dropped, so skills under it could
+    # not be reached and a link to one skill showed the root catalog instead.
+    mono = tmp_path / "mono"
+    write_skill(mono / "skills", "root-only", "Root")
+    write_skill(mono / "team-a" / "skills", "lint", "Lint")
+    app, _ = _build(db_uri, tmp_path)
+    app.state.skill_fetcher = _fetcher(mono)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/v1/skill-sources", json={"source": "https://github.com/acme/mono/tree/main/team-a"}
+        )
+        assert created.status_code == 201, created.text
+        source = created.json()
+        assert (source["path"], source["ref"], source["name"]) == (
+            "team-a",
+            "main",
+            "acme/mono (team-a)",
+        )
+        # The root is a separate source of the same repository and ref.
+        root = await client.post("/v1/skill-sources", json={"source": "acme/mono", "ref": "main"})
+        assert root.json()["id"] != source["id"] and root.json()["path"] == ""
+
+        catalog = (await client.get(f"/v1/skill-sources/{source['id']}/catalog")).json()
+        assert catalog["path"] == "team-a"
+        assert [s["name"] for s in catalog["skills"]] == ["lint"]
+        installed = await client.post(
+            "/v1/installed-skills",
+            json={
+                "source": catalog["url"],
+                "ref": catalog["ref"],
+                "path": catalog["path"],
+                "names": ["lint"],
+            },
+        )
+        assert installed.status_code == 201, installed.text
+        row = installed.json()["data"][0]
+        assert row["path"] == "team-a/skills/lint"
+        updated = await client.post(f"/v1/installed-skills/{row['id']}/update")
+        assert updated.status_code == 200, updated.text
+        # The skill moves within the repository: the update follows it by name.
+        (mono / "team-a" / "skills" / "ops").mkdir()
+        (mono / "team-a" / "skills" / "lint").rename(mono / "team-a" / "skills" / "ops" / "lint")
+        moved = await client.post(f"/v1/installed-skills/{row['id']}/update")
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["path"] == "team-a/skills/ops/lint"
+        (mono / "team-a" / "skills" / "ops" / "lint").rename(mono / "team-a" / "skills" / "lint")
+
+        # Skills in the hidden-root layouts install from the root and update:
+        # their stored paths start with a dot, which source paths refused.
+        write_skill(mono / ".agents" / "skills", "agents-review", "Agents layout")
+        write_skill(mono / ".claude" / "skills", "claude-review", "Claude layout")
+        for name, stored in (
+            ("agents-review", ".agents/skills/agents-review"),
+            ("claude-review", ".claude/skills/claude-review"),
+        ):
+            hidden = await client.post(
+                "/v1/installed-skills",
+                json={"source": "acme/mono", "ref": "main", "names": [name]},
+            )
+            assert hidden.status_code == 201, hidden.text
+            assert hidden.json()["data"][0]["path"] == stored
+            (mono / stored / "notes.txt").write_text("changed upstream\n")
+            refreshed = await client.post(
+                f"/v1/installed-skills/{hidden.json()['data'][0]['id']}/update"
+            )
+            assert refreshed.status_code == 200, refreshed.text
+            assert refreshed.json()["path"] == stored
+        # A link straight to the skills folder, the one people paste, lists its skills.
+        folder = await client.post(
+            "/v1/skill-catalog",
+            json={"source": "https://github.com/acme/mono/tree/main/team-a/skills"},
+        )
+        assert [s["name"] for s in folder.json()["skills"]] == ["lint"]
+        # A link to one skill's directory previews just that skill.
+        single = await client.post(
+            "/v1/skill-catalog",
+            json={"source": "https://github.com/acme/mono/tree/main/team-a/skills/lint"},
+        )
+        assert [s["name"] for s in single.json()["skills"]] == ["lint"]
+        bad = await client.post(
+            "/v1/skill-catalog", json={"source": "acme/mono", "path": "../etc"}
+        )
+        assert bad.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_preview_from_url_and_bad_sources(market) -> None:
+    client, _app, _ = market
+    preview = await client.post(
+        "/v1/skill-catalog", json={"source": "https://github.com/acme/skills"}
+    )
+    assert preview.status_code == 200
+    assert [s["name"] for s in preview.json()["skills"]] == ["review", "triage"]
+
+    rejected = await client.post(
+        "/v1/skill-catalog", json={"source": "https://gitlab.com/acme/skills"}
+    )
+    assert rejected.status_code == 400
+    assert "Only GitHub" in rejected.json()["error"]["message"]
+
+    missing = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["nope"]}
+    )
+    assert missing.status_code == 400
+    assert "No such skill" in missing.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_lists_paginate_with_a_continuation_cursor(market) -> None:
+    client, _app, _ = market
+    installed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review", "triage"]}
+    )
+    assert installed.status_code == 201
+    first = (await client.get("/v1/installed-skills?limit=1")).json()
+    assert len(first["data"]) == 1 and first["has_more"] is True
+    second = (await client.get(f"/v1/installed-skills?limit=1&after={first['last_id']}")).json()
+    assert len(second["data"]) == 1 and second["has_more"] is False
+    assert {first["data"][0]["name"], second["data"][0]["name"]} == {"review", "triage"}
+    # The cursor row removed between the two reads: the next page still follows.
+    assert (
+        await client.delete(f"/v1/installed-skills/{first['data'][0]['id']}")
+    ).status_code == 204
+    again = (await client.get(f"/v1/installed-skills?limit=1&after={first['last_id']}")).json()
+    assert [s["name"] for s in again["data"]] == [second["data"][0]["name"]]
+    assert (await client.get("/v1/installed-skills?after=" + "0" * 32)).status_code == 400
+    overflow = "9" * 19 + "." + "0" * 32
+    assert (await client.get(f"/v1/installed-skills?after={overflow}")).status_code == 400
+    assert (await client.get(f"/v1/skill-sources?after={overflow}")).status_code == 400
+    assert (await client.get("/v1/installed-skills?limit=0")).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_cleans_up_after_a_removal_or_another_update_wins(market) -> None:
+    client, app, artifact_store = market
+    store = app.state.skill_store
+    installed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    skill_id = installed.json()["data"][0]["id"]
+    first_location = await _location(app, skill_id)
+    real_update = store.update
+    stored: list[str] = []
+    real_put = artifact_store.put
+
+    def recording_put(key: str, data: bytes) -> None:
+        stored.append(key)
+        real_put(key, data)
+
+    artifact_store.put = recording_put  # type: ignore[method-assign]
+
+    # Another request moved the row's tarball while this update was fetching:
+    # the object replaced under the lock is dropped, not the one read earlier.
+    def update_after_a_rival(skill: str, **kwargs):  # type: ignore[no-untyped-def]
+        rival = real_update(
+            skill,
+            commit=None,
+            bundle_location="skills/rival.tar.gz",
+            bundle_bytes=1,
+            bundle_entries=1,
+            description="d",
+            display_name=None,
+        )
+        assert rival is not None and rival.replaced_location == first_location
+        artifact_store.put("skills/rival.tar.gz", b"rival")
+        return real_update(skill, **kwargs)
+
+    store.update = update_after_a_rival
+    (app.state.skill_fetcher_repo / "skills" / "triage" / "notes.txt").write_text("v2\n")
+    updated = await client.post(f"/v1/installed-skills/{skill_id}/update")
+    assert updated.status_code == 200, updated.text
+    final_location = await _location(app, skill_id)
+    assert final_location not in {first_location, "skills/rival.tar.gz"}
+    assert not artifact_store.exists("skills/rival.tar.gz") and artifact_store.exists(
+        final_location
+    )
+
+    # The row was removed while this update was fetching: 404, and the object
+    # the request had already stored is not left behind.
+    def update_after_a_removal(skill: str, **kwargs):  # type: ignore[no-untyped-def]
+        assert store.delete(skill) is not None
+        return real_update(skill, **kwargs)
+
+    store.update = update_after_a_removal
+    (app.state.skill_fetcher_repo / "skills" / "triage" / "notes.txt").write_text("v3\n")
+    stored.clear()
+    assert (await client.post(f"/v1/installed-skills/{skill_id}/update")).status_code == 404
+    assert len(stored) == 1 and not artifact_store.exists(stored[0])
+
+
+@pytest.mark.asyncio
+async def test_a_failed_install_leaves_no_object_it_created(market) -> None:
+    client, app, artifact_store = market
+    real_put = artifact_store.put
+    stored: list[str] = []
+
+    def put_then_fail_on_the_second(key: str, data: bytes) -> None:
+        if len(stored) == 1:
+            raise OSError("artifact store is full")
+        stored.append(key)
+        real_put(key, data)
+
+    # The second tarball cannot be stored: the first one is dropped rather than
+    # left behind, since no row was written for either.
+    artifact_store.put = put_then_fail_on_the_second  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="is full"):
+        await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review", "triage"]}
+        )
+    assert len(stored) == 1 and not artifact_store.exists(stored[0])
+    assert (await client.get("/v1/installed-skills")).json()["data"] == []
+
+    # Two installs of identical content race: the batch that fails afterwards
+    # cleans up only its own objects, so the install that committed still reads.
+    artifact_store.put = real_put  # type: ignore[method-assign]
+    real_install = app.state.skill_store.install_many
+    failing_batch_waiting = threading.Event()
+    release_failing_batch = threading.Event()
+
+    def refuse_the_batch_after_a_rival_commits(items, **kwargs):  # type: ignore[no-untyped-def]
+        if len(items) == 1:
+            return real_install(items, **kwargs)
+        failing_batch_waiting.set()
+        assert release_failing_batch.wait(timeout=10)
+        raise SkillValueError("installing these would exceed the byte budget")
+
+    app.state.skill_store.install_many = refuse_the_batch_after_a_rival_commits
+    failing = asyncio.create_task(
+        client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review", "triage"]}
+        )
+    )
+    assert await asyncio.to_thread(failing_batch_waiting.wait, 10)
+    committed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    release_failing_batch.set()
+    assert (await failing).status_code == 400
+    app.state.skill_store.install_many = real_install
+    assert committed.status_code == 201, committed.text
+    skill_id = committed.json()["data"][0]["id"]
+    assert artifact_store.exists(await _location(app, skill_id))
+    assert (await client.get(f"/v1/installed-skills/{skill_id}/content")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_content_names_a_missing_or_unreadable_stored_copy(market) -> None:
+    client, app, artifact_store = market
+    installed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    skill_id = installed.json()["data"][0]["id"]
+    location = await _location(app, skill_id)
+
+    # A decoy whose name only strips to SKILL.md character by character is not the manifest.
+    artifact_store.put(
+        location,
+        skill_tarball({".SKILL.md": b"decoy", "./SKILL.md": b"---\nname: review\n---\nreal"}),
+    )
+    shown = await client.get(f"/v1/installed-skills/{skill_id}/content")
+    assert shown.json()["markdown"].endswith("real")
+
+    artifact_store.put(location, b"not a tarball")
+    unreadable = await client.get(f"/v1/installed-skills/{skill_id}/content")
+    assert unreadable.status_code == 409
+    assert "cannot be read" in unreadable.json()["error"]["message"]
+
+    artifact_store.delete(location)
+    missing = await client.get(f"/v1/installed-skills/{skill_id}/content")
+    assert missing.status_code == 404
+    assert "update or remove" in missing.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_metadata_is_rejected_before_anything_is_written(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
+) -> None:
+    write_skill(repo / "skills", "wordy", "é" * 1025)
+    app, _artifacts = _build(db_uri, tmp_path)
+    app.state.skill_fetcher = _fetcher(repo)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # The catalog never offers it, and asking for it by name is refused.
+        catalog = (await client.post("/v1/skill-catalog", json={"source": "acme/skills"})).json()
+        assert "wordy" not in [s["name"] for s in catalog["skills"]]
+        res = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["wordy"]}
+        )
+        assert res.status_code == 400
+        assert (await client.get("/v1/installed-skills")).json()["data"] == []
+    assert not list((tmp_path / "artifacts").rglob("*.tar.gz"))
+
+
+@pytest.mark.asyncio
+async def test_feature_off_hides_routes_discovery_and_delivery_for_existing_installs(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    # Install while the feature is on, then boot without it: the rows stay, but
+    # nothing reads them.
+    store = SqlAlchemySkillStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    artifacts.put(
+        "skills/review.tar.gz",
+        skill_tarball(
+            {"SKILL.md": b"---\nname: review\n---\n", "notes.txt": b"supporting file\n"}
+        ),
+    )
+    store.install(
+        name="review",
+        display_name=None,
+        description="d",
+        source_url=REPO_URL,
+        ref=None,
+        commit=None,
+        path="skills/review",
+        scope="org",
+        owner_user_id=None,
+        bundle_location="skills/review.tar.gz",
+        bundle_bytes=1,
+        installed_by=None,
+    )
+    bundle = skill_tarball(
+        {"config.yaml": b"name: bundled\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"}
+    )
+    session_id = _bind_session(db_uri, artifacts, bundle)
+
+    for enabled in (True, False):
+        app, _ = _build(db_uri, tmp_path, enabled=enabled)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            assert (await client.get("/v1/info")).json()["features"][
+                "skills_marketplace"
+            ] is enabled
+            assert (await client.get("/v1/installed-skills")).status_code == (
+                200 if enabled else 404
+            )
+            contents = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+            assert contents.status_code == 200
+            # With the feature on, the real agent-contents route carries the
+            # installed skill with its supporting file next to the bundle's own.
+            assert _names(contents.content) == (
+                [
+                    "config.yaml",
+                    "skills/own/SKILL.md",
+                    "skills/review/SKILL.md",
+                    "skills/review/notes.txt",
+                ]
+                if enabled
+                else ["config.yaml", "skills/own/SKILL.md"]
+            )
+        assert (app.state.skill_store is not None) is enabled
+
+
+@pytest.mark.asyncio
+async def test_the_local_single_user_administers_the_marketplace(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `omnigent server` builds a permission store even for its one local user,
+    # who is in no admins list: that user resolves to the reserved "local"
+    # identity, which the permissions migration creates as an administrator.
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    app, _ = _build(db_uri, tmp_path, auth=True)
+    app.state.skill_fetcher = _fetcher(repo)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        source = await client.post("/v1/skill-sources", json={"source": "acme/skills"})
+        assert source.status_code == 201, source.text
+        org = await client.post(
+            "/v1/installed-skills",
+            json={"source": "acme/skills", "names": ["review"], "scope": "org"},
+        )
+        assert org.status_code == 201, org.text
+        assert (await client.delete(f"/v1/skill-sources/{source.json()['id']}")).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_authorization_boundaries(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
+    app, _ = _build(db_uri, tmp_path, auth=True)
+    app.state.skill_fetcher = _fetcher(repo)
+    carol = {"X-Forwarded-Email": "carol@example.com"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        SqlAlchemyPermissionStore(db_uri).ensure_user("alice@example.com", is_admin=True)
+
+        # Sources: admin only.
+        denied = await client.post(
+            "/v1/skill-sources", json={"source": "acme/skills"}, headers=BOB
+        )
+        assert denied.status_code == 403
+        created = await client.post(
+            "/v1/skill-sources", json={"source": "acme/skills"}, headers=ALICE
+        )
+        assert created.status_code == 201
+        source_id = created.json()["id"]
+        assert (
+            await client.delete(f"/v1/skill-sources/{source_id}", headers=BOB)
+        ).status_code == 403
+
+        # Org installs: admin only; a user installs for themselves.
+        org_body = {"source": "acme/skills", "names": ["review"], "scope": "org"}
+        assert (
+            await client.post("/v1/installed-skills", json=org_body, headers=BOB)
+        ).status_code == 403
+        mine = await client.post(
+            "/v1/installed-skills",
+            json={"source": "acme/skills", "names": ["review"]},
+            headers=BOB,
+        )
+        assert mine.status_code == 201
+        bob_skill = mine.json()["data"][0]["id"]
+        shared = await client.post(
+            "/v1/installed-skills",
+            json={"source": "acme/skills", "names": ["triage"], "scope": "org"},
+            headers=ALICE,
+        )
+        assert shared.status_code == 201
+        org_skill = shared.json()["data"][0]["id"]
+
+        async def names(headers: dict[str, str]) -> set[str]:
+            res = await client.get("/v1/installed-skills", headers=headers)
+            return {s["name"] for s in res.json()["data"]}
+
+        # Visibility: own plus the org's; a third user sees the org's only and cannot reach Bob's.
+        assert await names(BOB) == {"review", "triage"}
+        assert await names(carol) == {"triage"}
+        assert (
+            await client.get(f"/v1/installed-skills/{bob_skill}/content", headers=carol)
+        ).status_code == 404
+        patch = {"enabled": False}
+        assert (
+            await client.patch(f"/v1/installed-skills/{bob_skill}", json=patch, headers=carol)
+        ).status_code == 404
+
+        # Mutating an org skill: admin only, even though every user can see it.
+        assert (
+            await client.patch(f"/v1/installed-skills/{org_skill}", json=patch, headers=BOB)
+        ).status_code == 403
+        assert (
+            await client.post(f"/v1/installed-skills/{org_skill}/update", headers=BOB)
+        ).status_code == 403
+        assert (
+            await client.delete(f"/v1/installed-skills/{org_skill}", headers=BOB)
+        ).status_code == 403
+        assert (
+            await client.patch(f"/v1/installed-skills/{org_skill}", json=patch, headers=ALICE)
+        ).status_code == 200
+        # An admin may manage another user's install by id.
+        assert (
+            await client.delete(f"/v1/installed-skills/{bob_skill}", headers=ALICE)
+        ).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_installs_are_capped_per_owner_and_delivery_is_bounded(
+    market, db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import skill_injection
+    from omnigent.server.routes import skill_marketplace
+    from omnigent.stores.skill_store import sqlalchemy_store
+
+    client, _app, artifact_store = market
+    monkeypatch.setattr(skill_marketplace, "MAX_INSTALLED_PER_OWNER", 1)
+    monkeypatch.setattr(sqlalchemy_store, "MAX_INSTALLED_PER_OWNER", 1)
+    first = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    assert first.status_code == 201
+    # Reinstalling the same name replaces it and does not count; a new name is over the cap.
+    assert (
+        await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+    ).status_code == 201
+    capped = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert capped.status_code == 400 and "At most 1 skills" in capped.text
+    # A batch is all or nothing: one name over the cap installs neither.
+    assert len(list((tmp_path / "artifacts").rglob("*.tar.gz"))) == 1
+    assert [s["name"] for s in (await client.get("/v1/installed-skills")).json()["data"]] == [
+        "review"
+    ]
+
+    # The byte budget is enforced when a set would become undeliverable, at
+    # install, update and enable time, so a later session launch cannot fail.
+    monkeypatch.setattr(skill_marketplace, "MAX_INSTALLED_PER_OWNER", 10)
+    monkeypatch.setattr(sqlalchemy_store, "MAX_INSTALLED_PER_OWNER", 10)
+    review = first.json()["data"][0]
+    # Room for one tarball of about this size (the two fixtures differ by a few
+    # bytes of gzip output), never for two.
+    budget = review["bundle_bytes"] + 64
+    monkeypatch.setattr(sqlalchemy_store, "MAX_DELIVERY_BYTES_PER_SCOPE", budget)
+    over = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert over.status_code == 400 and "would exceed" in over.text
+    assert len(list((tmp_path / "artifacts").rglob("*.tar.gz"))) == 1
+    # Disabling frees the budget; enabling again must fit.
+    disabled = await client.patch(f"/v1/installed-skills/{review['id']}", json={"enabled": False})
+    assert disabled.status_code == 200
+    triage = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert triage.status_code == 201
+    enable = await client.patch(f"/v1/installed-skills/{review['id']}", json={"enabled": True})
+    assert enable.status_code == 400 and "Enabling review" in enable.text
+    update = await client.post(f"/v1/installed-skills/{review['id']}/update")
+    assert update.status_code == 200  # the disabled row's size is not counted
+
+    # Delivery keeps a backstop: exceeding it is an error the caller sees
+    # rather than a skill silently missing from the bundle.
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
+    assert "skills/triage/SKILL.md" in _names(
+        (await client.get(f"/v1/sessions/{session_id}/agent/contents")).content
+    )
+    monkeypatch.setattr(skill_injection, "MAX_DELIVERY_BYTES", 10)
+    over = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+    assert over.status_code == 400 and "Installed skills exceed" in over.text
+
+
+@pytest.mark.asyncio
+async def test_installs_and_delivery_hold_to_what_a_runner_unpacks(
+    market, db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The runner unpacks a session's bundle within fixed byte and entry limits;
+    # a set of skills past them stopped every session from starting.
+    from omnigent.server import skill_injection
+    from omnigent.stores.skill_store import sqlalchemy_store
+
+    client, _app, artifact_store = market
+    review = (
+        await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+    ).json()["data"][0]
+    # Counted unpacked: SKILL.md and notes.txt, and their bytes rather than the gzip's.
+    skill_md = "---\nname: review\ndescription: Review a diff\n---\nDo review.\n"
+    assert review["bundle_entries"] == 2
+    assert review["bundle_bytes"] == len(skill_md) + len("supporting file\n")
+
+    monkeypatch.setattr(sqlalchemy_store, "MAX_DELIVERY_ENTRIES_PER_SCOPE", 3)
+    over = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert over.status_code == 400 and "would exceed 3 files" in over.text
+    monkeypatch.setattr(sqlalchemy_store, "MAX_DELIVERY_ENTRIES_PER_SCOPE", 4)
+    assert (
+        await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+        )
+    ).status_code == 201
+
+    # The agent's own files count too. When they leave too little room, the
+    # skills that do not fit are left out with a warning; the session still starts.
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
+    url = f"/v1/sessions/{session_id}/agent/contents"
+    served = _names((await client.get(url)).content)
+    assert {"skills/review/SKILL.md", "skills/triage/SKILL.md"} <= set(served)
+    monkeypatch.setattr(skill_injection, "RUNNER_UNPACK_ENTRIES", 4)
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.skill_injection"):
+        trimmed = await client.get(url)
+    assert trimmed.status_code == 200
+    names = _names(trimmed.content)
+    # Room for the agent's file and one two-file skill; which one is row order.
+    kept = [n for n in ("review", "triage") if f"skills/{n}/SKILL.md" in names]
+    assert "config.yaml" in names and len(kept) == 1
+    left_out = ({"review", "triage"} - set(kept)).pop()
+    assert any(f"left installed skills {left_out} out" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_served_bundle_is_merged_once_per_input_set(market, db_uri: str) -> None:
+    # Every runner fetch rebuilt the archive, decompressing the agent bundle and
+    # every installed skill again.
+    client, app, artifact_store = market
+    installed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
+    url = f"/v1/sessions/{session_id}/agent/contents"
+    location = await _location(app, installed.json()["data"][0]["id"])
+    reads: list[str] = []
+    real_get = artifact_store.get
+
+    def counting_get(key: str) -> bytes | None:
+        reads.append(key)
+        return real_get(key)
+
+    artifact_store.get = counting_get  # type: ignore[method-assign]
+    first = (await client.get(url)).content
+    second = (await client.get(url)).content
+    assert first == second and reads.count(location) == 1
+    # A change to the installed set is a new merge.
+    skill_id = installed.json()["data"][0]["id"]
+    await client.patch(f"/v1/installed-skills/{skill_id}", json={"enabled": False})
+    assert "skills/review/SKILL.md" not in _names((await client.get(url)).content)
+    artifact_store.get = real_get  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_a_fetch_in_flight_refuses_a_second_from_the_same_account(market) -> None:
+    import asyncio
+
+    client, app, _ = market
+    started = asyncio.Event()
+    release = asyncio.Event()
+    real_package = app.state.skill_fetcher.package
+
+    def slow_package(*args, **kwargs):  # type: ignore[no-untyped-def]
+        loop.call_soon_threadsafe(started.set)
+        asyncio.run_coroutine_threadsafe(release.wait(), loop).result(timeout=5)
+        return real_package(*args, **kwargs)
+
+    loop = asyncio.get_running_loop()
+    app.state.skill_fetcher.package = slow_package
+    first = asyncio.create_task(
+        client.post("/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]})
+    )
+    await asyncio.wait_for(started.wait(), 5)
+    second = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert second.status_code == 409 and "still running" in second.text
+    release.set()
+    assert (await first).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_an_over_long_or_empty_name_is_refused_as_bad_input(market) -> None:
+    # An over-long name reached the store unchecked and answered 500.
+    client, _app, _ = market
+    for name in ("a" * 65, ""):
+        refused = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": [name]}
+        )
+        assert refused.status_code == 422, refused.text
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_request_keeps_its_fetch_slot_until_the_clone_ends(market) -> None:
+    import threading
+
+    # The clone runs in a thread a cancelled request cannot stop; releasing the
+    # slot on cancel let an account start clone after clone behind the cap.
+    client, app, _ = market
+    entered = threading.Event()
+    finish = threading.Event()
+    real_package = app.state.skill_fetcher.package
+
+    def slow_package(*args, **kwargs):  # type: ignore[no-untyped-def]
+        entered.set()
+        assert finish.wait(timeout=10)
+        return real_package(*args, **kwargs)
+
+    app.state.skill_fetcher.package = slow_package
+    body = {"source": "acme/skills", "names": ["review"]}
+    abandoned = asyncio.create_task(client.post("/v1/installed-skills", json=body))
+    assert await asyncio.to_thread(entered.wait, 5)
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+    # The clone is still running, so the account's next fetch is refused.
+    again = await client.post("/v1/installed-skills", json=body)
+    assert again.status_code == 409 and "still running" in again.text
+    finish.set()
+    app.state.skill_fetcher.package = real_package
+    for _ in range(100):
+        retried = await client.post("/v1/installed-skills", json=body)
+        if retried.status_code != 409:
+            break
+        await asyncio.sleep(0.05)
+    assert retried.status_code == 201, retried.text
+
+
+def test_effective_skills_read_every_page_and_stop_at_the_delivery_limit(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import skill_injection
+    from omnigent.stores.skill_store import SkillInstall
+
+    store = SqlAlchemySkillStore(db_uri)
+    # The loop below pages; a principal's whole set has to be readable that way,
+    # so its row cap must fit in one page of the real limits.
+    assert MAX_INSTALLED_PER_OWNER <= MAX_PAGE
+    monkeypatch.setattr(skill_injection, "MAX_PAGE", 2)
+    monkeypatch.setattr(skill_injection, "MAX_DELIVERED_SKILLS", 5)
+    items = [
+        SkillInstall(
+            name=f"s{i}",
+            display_name=None,
+            description="d",
+            source_url=REPO_URL,
+            ref=None,
+            commit=None,
+            path=f"skills/s{i}",
+            bundle_location=f"skills/s{i}.tar.gz",
+            bundle_bytes=1,
+            bundle_entries=1,
+        )
+        for i in range(5)
+    ]
+    store.install_many(items, scope="org", owner_user_id=None, installed_by=None)
+    # Five rows across three pages of two: every one is returned.
+    assert sorted(s.name for s in effective_installed_skills(store, "alice")) == [
+        f"s{i}" for i in range(5)
+    ]
+    # The last row of page one is removed before page two is read, as a
+    # concurrent removal would: the walk still reaches every remaining row.
+    real_list = store.list_for_user
+    removed: list[str] = []
+
+    def list_then_remove_the_cursor_row(user_id, *, limit, after=None):  # type: ignore[no-untyped-def]
+        page = real_list(user_id, limit=limit, after=after)
+        if after is None:
+            removed.append(page.data[-1].name)
+            assert store.delete(page.data[-1].id) is not None
+        return page
+
+    store.list_for_user = list_then_remove_the_cursor_row  # type: ignore[method-assign]
+    delivered = sorted(s.name for s in effective_installed_skills(store, "alice"))
+    del store.list_for_user
+    assert len(removed) == 1 and delivered == [f"s{i}" for i in range(5)]
+    # One row past the delivery limit raises instead of silently stopping.
+    store.install_many(
+        [
+            replace(
+                items[0], name=name, path=f"skills/{name}", bundle_location=f"skills/{name}.tar.gz"
+            )
+            for name in (removed[0], "s5")
+        ],
+        scope="org",
+        owner_user_id=None,
+        installed_by=None,
+    )
+    with pytest.raises(skill_injection.SkillDeliveryError, match="More than 5"):
+        effective_installed_skills(store, "alice")
+
+
+# ── bundle injection ──
+
+
+def _names(data: bytes) -> list[str]:
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        return sorted(tf.getnames())
+
+
+def test_served_bundle_carries_the_owners_enabled_skills(db_uri: str, tmp_path: Path) -> None:
+    store = SqlAlchemySkillStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    bundle = skill_tarball(
+        {"config.yaml": b"name: a\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"}
+    )
+
+    def install(name: str, owner: str | None, scope: str = "user", enabled: bool = True) -> None:
+        artifacts.put(
+            f"skills/{name}.tar.gz",
+            skill_tarball({"SKILL.md": f"---\nname: {name}\n---\n".encode()}),
+        )
+        row = store.install(
+            name=name,
+            display_name=None,
+            description=name,
+            source_url=REPO_URL,
+            ref=None,
+            commit=None,
+            path=f"skills/{name}",
+            scope=scope,
+            owner_user_id=owner,
+            bundle_location=f"skills/{name}.tar.gz",
+            bundle_bytes=1,
+            installed_by=owner,
+        )
+        if not enabled:
+            store.set_enabled(row.id, False)
+
+    install("mine", "alice")
+    install("shared", None, scope="org")
+    install("theirs", "bob")
+    install("off", "alice", enabled=False)
+    install("own", "alice")  # collides with the bundle's own skill; the bundle wins
+    install("deep", "alice")  # collides with a namespaced bundle skill; the bundle wins too
+    # A name the runner's validator refuses would fail the whole spec: it is skipped.
+    install("bad_name", "alice")
+    bundle = skill_tarball(
+        {
+            "config.yaml": b"name: a\n",
+            "skills/own/SKILL.md": b"---\nname: own\n---\n",
+            "skills/team/deep/SKILL.md": b"---\nname: deep\n---\n",
+        }
+    )
+
+    merged = with_installed_skills(
+        bundle, owner_id="alice", skill_store=store, artifact_store=artifacts
+    )
+    assert _names(merged) == [
+        "config.yaml",
+        "skills/mine/SKILL.md",
+        "skills/own/SKILL.md",
+        "skills/shared/SKILL.md",
+        "skills/team/deep/SKILL.md",
+    ]
+    # An unreadable tarball drops only that skill. It was rewritten in place,
+    # which a real install never does, so the served-bundle cache is cleared.
+    from omnigent.server import skill_injection
+
+    skill_injection._overlay_cache.clear()
+    artifacts.put("skills/shared.tar.gz", b"not a tarball")
+    merged = with_installed_skills(
+        bundle, owner_id="alice", skill_store=store, artifact_store=artifacts
+    )
+    assert "skills/shared/SKILL.md" not in _names(merged) and "skills/mine/SKILL.md" in _names(
+        merged
+    )
+
+
+@pytest.mark.parametrize("org_first", [True, False])
+def test_a_users_install_wins_over_the_orgs_whatever_the_order(
+    db_uri: str, org_first: bool
+) -> None:
+    store = SqlAlchemySkillStore(db_uri)
+
+    def install(scope: str) -> None:
+        store.install(
+            name="review",
+            display_name=None,
+            description=f"{scope} copy",
+            source_url=REPO_URL,
+            ref=None,
+            commit=None,
+            path="skills/review",
+            scope=scope,
+            owner_user_id="alice" if scope == "user" else None,
+            bundle_location=f"skills/{scope}.tar.gz",
+            bundle_bytes=1,
+            installed_by="alice",
+        )
+
+    for scope in ("org", "user") if org_first else ("user", "org"):
+        install(scope)
+
+    effective = effective_installed_skills(store, "alice")
+    assert [(s.name, s.scope, s.description) for s in effective] == [
+        ("review", "user", "user copy")
+    ]
+    # Someone without their own copy gets the org's.
+    assert [s.scope for s in effective_installed_skills(store, "bob")] == ["org"]
+
+
+@pytest.mark.asyncio
+async def test_turning_url_installs_off_stops_serving_what_was_installed_by_url(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
+) -> None:
+    # allowed_sources was re-checked at delivery but allow_url_install was not,
+    # so switching URL installs off kept serving every skill installed by URL.
+    app, artifact_store = _build(db_uri, tmp_path)
+    app.state.skill_fetcher = _fetcher(repo)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (
+            await client.post("/v1/skill-sources", json={"source": "acme/skills"})
+        ).status_code == 201
+        for source, name in (("acme/skills", "review"), ("acme/unlisted", "triage")):
+            installed = await client.post(
+                "/v1/installed-skills", json={"source": source, "names": [name]}
+            )
+            assert installed.status_code == 201, installed.text
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
+
+    closed = {"skills_marketplace": {"allow_url_install": False}}
+    app, _ = _build(db_uri, tmp_path, server_config=closed)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        served = _names((await client.get(f"/v1/sessions/{session_id}/agent/contents")).content)
+        assert "skills/review/SKILL.md" in served
+        assert "skills/triage/SKILL.md" not in served
+
+
+@pytest.mark.asyncio
+async def test_server_policy_binds_sources_url_installs_and_delivery(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
+) -> None:
+    # Single-user mode is all-admin, so every refusal below is one an admin gets.
+    config = {
+        "skills_marketplace": {
+            "sources": [
+                {"url": "https://github.com/acme/skills", "name": "Acme"},
+                # git's name for the default branch, written out by the operator.
+                {"url": "https://github.com/acme/pinned", "ref": "HEAD", "name": "Pinned"},
+            ],
+            "allowed_sources": ["github.com/acme/*"],
+            "allow_url_install": False,
+        }
+    }
+    app, artifact_store = _build(db_uri, tmp_path, server_config=config)
+    app.state.skill_fetcher = _fetcher(repo)
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+    ):
+        assert (await client.get("/v1/info")).json()["skills_marketplace"] == {
+            "url_install": False
+        }
+
+        # The config's source is seeded at startup, labelled, and not removable here.
+        listed = (await client.get("/v1/skill-sources")).json()["data"]
+        assert sorted((s["url"], s["name"], s["managed"]) for s in listed) == [
+            ("https://github.com/acme/pinned.git", "Pinned", True),
+            (REPO_URL, "Acme", True),
+        ]
+        source_id = next(s["id"] for s in listed if s["url"] == REPO_URL)
+        pinned_id = next(s["id"] for s in listed if s["url"] != REPO_URL)
+        assert (await client.delete(f"/v1/skill-sources/{source_id}")).status_code == 403
+        assert (await client.delete(f"/v1/skill-sources/{pinned_id}")).status_code == 403
+        assert (await client.get(f"/v1/skill-sources/{source_id}/catalog")).status_code == 200
+
+        # allowed_sources binds the admin too.
+        refused = await client.post("/v1/skill-sources", json={"source": "other/skills"})
+        assert refused.status_code == 403 and "not an allowed skill source" in refused.text
+
+        # URL installs off: previewing or installing needs a listed source.
+        preview = await client.post("/v1/skill-catalog", json={"source": "acme/more"})
+        assert preview.status_code == 403 and "disabled on this server" in preview.text
+        unlisted = {"source": "acme/more", "names": ["review"]}
+        assert (await client.post("/v1/installed-skills", json=unlisted)).status_code == 403
+        installed = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+        assert installed.status_code == 201, installed.text
+        skill_id = installed.json()["data"][0]["id"]
+        assert (await client.post(f"/v1/installed-skills/{skill_id}/update")).status_code == 200
+        contents = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+        assert "skills/review/SKILL.md" in _names(contents.content)
+
+    # Tighten the policy: the row stays, but the skill is neither served nor updatable,
+    # and the source, no longer in the config, is an ordinary one an admin may remove.
+    tighter = {"skills_marketplace": {"allowed_sources": ["github.com/trusted/*"]}}
+    app, _ = _build(db_uri, tmp_path, server_config=tighter)
+    app.state.skill_fetcher = _fetcher(repo)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.post(f"/v1/installed-skills/{skill_id}/update")).status_code == 403
+        assert (await client.get(f"/v1/skill-sources/{source_id}/catalog")).status_code == 403
+        contents = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+        assert "skills/review/SKILL.md" not in _names(contents.content)
+        assert (await client.get("/v1/installed-skills")).json()["data"][0]["id"] == skill_id
+        assert (await client.delete(f"/v1/skill-sources/{source_id}")).status_code == 204
+
+
+def test_a_bundle_namespace_folder_is_a_reserved_install_name(tmp_path: Path) -> None:
+    # Discovery reserves what the overlay will not add: every name directly
+    # under the bundle's skills/, and every SKILL.md directory below it.
+    from omnigent.skills.overlay import bundle_skill_directories, reserved_install_names
+
+    files = {
+        "skills/team/triage/SKILL.md": b"---\nname: triage\n---\n",
+        "skills/lint/SKILL.md": b"---\nname: lint\n---\n",
+        "skills/lib/helper.py": b"x = 1\n",
+    }
+    for relative, data in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_bytes(data)
+    assert reserved_install_names(tmp_path) == {"team", "triage", "lint", "lib"}
+    assert bundle_skill_directories(skill_tarball(files)) == {"team", "lint", "lib"}
+
+
+def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None:
+    # With URL installs off, delivery read every source page to decide which
+    # installs came from a listed one, so its work grew with the source count.
+    import sqlalchemy as sa
+
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.skills.policy import SkillsMarketplacePolicy
+
+    store = SqlAlchemySkillStore(db_uri)
+    store.add_source(url=REPO_URL, ref=None, path="", name="acme", created_by=None)
+    store.install(
+        name="review",
+        display_name=None,
+        description="d",
+        source_url=REPO_URL,
+        ref=None,
+        commit=None,
+        path="skills/review",
+        scope="org",
+        owner_user_id=None,
+        bundle_location="skills/review.tar.gz",
+        bundle_bytes=1,
+        installed_by=None,
+    )
+    policy = SkillsMarketplacePolicy(allow_url_install=False)
+    engine = get_or_create_engine(db_uri)
+    statements: list[str] = []
+
+    def count(*args: object) -> None:
+        statements.append(str(args[2]))
+
+    def delivery_statements() -> int:
+        statements.clear()
+        sa.event.listen(engine, "before_cursor_execute", count)
+        try:
+            assert [s.name for s in effective_installed_skills(store, "alice", policy=policy)] == [
+                "review"
+            ]
+        finally:
+            sa.event.remove(engine, "before_cursor_execute", count)
+        return len(statements)
+
+    before = delivery_statements()
+    for index in range(450):  # more than two pages of sources
+        store.add_source(
+            url=f"https://github.com/other/r{index}.git",
+            ref=None,
+            path="",
+            name=f"r{index}",
+            created_by=None,
+        )
+    assert delivery_statements() == before
+
+
+@pytest.mark.asyncio
+async def test_a_marketplace_change_reaches_a_warm_sessions_next_turn(
+    market, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A running session kept its cached spec, since nothing about its agent
+    # changed, while its menu listed the newly installed skill. The turn's
+    # revision now carries the owner's installs, so the runner rebuilds the
+    # spec (as it does for any new revision) on the next turn.
+    import json
+
+    client, _app, artifact_store = market
+    forwarded: list[str] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content)["agent_revision"])
+        return httpx.Response(202, json={"queued": True})
+
+    async def to_fake_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        return runner_client
+
+    async def relay_ready(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    from tests.server.helpers import build_agent_bundle
+
+    session_id = _bind_session(db_uri, artifact_store, build_agent_bundle("warm"))
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as runner_client:
+        monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", to_fake_runner)
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._ensure_runner_relay_ready", relay_ready
+        )
+
+        async def turn() -> str:
+            sent = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert sent.status_code == 202, sent.text
+            return forwarded[-1]
+
+        warm = await turn()
+        assert await turn() == warm  # nothing changed: the runner keeps its spec
+        installed = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+        assert installed.status_code == 201, installed.text
+        after_install = await turn()
+        assert after_install != warm
+        skill_id = installed.json()["data"][0]["id"]
+        await client.patch(f"/v1/installed-skills/{skill_id}", json={"enabled": False})
+        after_disable = await turn()
+        assert after_disable not in (warm, after_install)
+
+
+@pytest.mark.asyncio
+async def test_source_and_policy_changes_reach_a_warm_sessions_next_turn(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With URL installs off the browse list decides delivery, and the policy
+    # always does, so both have to move the revision a warm runner compares.
+    import json
+
+    from tests.server.helpers import build_agent_bundle
+
+    forwarded: list[str] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content)["agent_revision"])
+        return httpx.Response(202, json={"queued": True})
+
+    async def to_fake_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        return runner_client
+
+    async def relay_ready(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", to_fake_runner)
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", relay_ready)
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+    listed_only = {"skills_marketplace": {"allow_url_install": False}}
+    app, artifact_store = _build(db_uri, tmp_path, server_config=listed_only)
+    app.state.skill_fetcher = _fetcher(repo)
+    session_id = _bind_session(db_uri, artifact_store, build_agent_bundle("warm"))
+
+    async def turn(client: httpx.AsyncClient) -> str:
+        sent = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+        assert sent.status_code == 202, sent.text
+        return forwarded[-1]
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(runner), base_url="http://r"
+        ) as runner_client,
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client,
+    ):
+        source = (await client.post("/v1/skill-sources", json={"source": "acme/skills"})).json()
+        installed = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+        assert installed.status_code == 201, installed.text
+        listed = await turn(client)
+        assert await turn(client) == listed
+        # Removing the source stops delivering the skill; the revision moves.
+        assert (await client.delete(f"/v1/skill-sources/{source['id']}")).status_code == 204
+        removed = await turn(client)
+        assert removed != listed
+        # Adding it back makes the skill deliverable again; so does the revision.
+        assert (
+            await client.post("/v1/skill-sources", json={"source": "acme/skills"})
+        ).status_code == 201
+        readded = await turn(client)
+        assert readded not in (listed, removed)
+
+    # The same database under another policy: nothing else changed, the revision does.
+    tighter = {"skills_marketplace": {"allow_url_install": False, "allowed_sources": ["x/y/z"]}}
+    app, _ = _build(db_uri, tmp_path, server_config=tighter)
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(runner), base_url="http://r"
+        ) as runner_client,
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client,
+    ):
+        assert await turn(client) != readded
+
+
+def test_a_skills_filter_selects_an_install_by_its_label_too(db_uri: str, tmp_path: Path) -> None:
+    # Host skills match a skills: list by command or frontmatter label; installs
+    # follow the same contract, so a list written with the label keeps them.
+    from omnigent.server.skill_injection import SessionTarget
+    from omnigent.spec.types import AgentSpec
+
+    store = SqlAlchemySkillStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    for name, label in (("review", "Code Review"), ("triage", None)):
+        artifacts.put(
+            f"skills/{name}.tar.gz",
+            skill_tarball({"SKILL.md": f"---\nname: {name}\ndescription: d\n---\n".encode()}),
+        )
+        store.install(
+            name=name,
+            display_name=label,
+            description="d",
+            source_url=REPO_URL,
+            ref=None,
+            commit=None,
+            path=f"skills/{name}",
+            scope="user",
+            owner_user_id="alice",
+            bundle_location=f"skills/{name}.tar.gz",
+            bundle_bytes=1,
+            installed_by="alice",
+        )
+    spec = AgentSpec(spec_version=1, name="a", skills_filter=["Code Review"])
+    merged = with_installed_skills(
+        skill_tarball({"config.yaml": b"name: a\n"}),
+        owner_id="alice",
+        skill_store=store,
+        artifact_store=artifacts,
+        target=SessionTarget(spec, ""),
+    )
+    names = _names(merged)
+    assert "skills/review/SKILL.md" in names and "skills/triage/SKILL.md" not in names

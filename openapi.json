@@ -913,6 +913,78 @@
         "title": "CancelledEvent",
         "type": "object"
       },
+      "CatalogSkill": {
+        "description": "One skill a repository offers, with the caller's installs of it if any.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "installed_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installed Id"
+          },
+          "installed_scopes": {
+            "default": [],
+            "items": {
+              "enum": [
+                "user",
+                "org"
+              ],
+              "type": "string"
+            },
+            "title": "Installed Scopes",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugin"
+          }
+        },
+        "required": [
+          "name",
+          "display_name",
+          "description",
+          "path",
+          "plugin",
+          "installed_id"
+        ],
+        "title": "CatalogSkill",
+        "type": "object"
+      },
       "ChildSessionList": {
         "description": "Paginated list of child sessions; `data` is a page of `ChildSessionSummary`.",
         "properties": {
@@ -3589,6 +3661,270 @@
         "title": "IncompleteEvent",
         "type": "object"
       },
+      "InstallSkillsRequest": {
+        "description": "Installs are all-or-nothing: a refused name leaves nothing installed.",
+        "properties": {
+          "names": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Names",
+            "type": "array"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "scope": {
+            "default": "user",
+            "enum": [
+              "user",
+              "org"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "source": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "names"
+        ],
+        "title": "InstallSkillsRequest",
+        "type": "object"
+      },
+      "InstalledSkillContentResponse": {
+        "properties": {
+          "markdown": {
+            "title": "Markdown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "markdown"
+        ],
+        "title": "InstalledSkillContentResponse",
+        "type": "object"
+      },
+      "InstalledSkillList": {
+        "description": "One page; pass `last_id`, an opaque cursor, as `after` for the next.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/InstalledSkillObject"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "InstalledSkillList",
+        "type": "object"
+      },
+      "InstalledSkillObject": {
+        "description": "An installed skill as the UI lists it.",
+        "properties": {
+          "bundle_bytes": {
+            "format": "int64",
+            "title": "Bundle Bytes",
+            "type": "integer"
+          },
+          "bundle_entries": {
+            "format": "int64",
+            "title": "Bundle Entries",
+            "type": "integer"
+          },
+          "commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "installed_at": {
+            "format": "int64",
+            "title": "Installed At",
+            "type": "integer"
+          },
+          "installed_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installed By"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "owner_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner User Id"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "scope": {
+            "enum": [
+              "user",
+              "org"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "source_url": {
+            "title": "Source Url",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "display_name",
+          "description",
+          "source_url",
+          "source",
+          "ref",
+          "commit",
+          "path",
+          "scope",
+          "owner_user_id",
+          "bundle_bytes",
+          "bundle_entries",
+          "enabled",
+          "installed_by",
+          "installed_at",
+          "updated_at"
+        ],
+        "title": "InstalledSkillObject",
+        "type": "object"
+      },
+      "InstalledSkillPatch": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "InstalledSkillPatch",
+        "type": "object"
+      },
       "LaunchRunnerRequest": {
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
@@ -6220,6 +6556,16 @@
           "single_user": {
             "title": "Single User",
             "type": "boolean"
+          },
+          "skills_marketplace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SkillsMarketplaceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "smart_routing_enabled": {
             "title": "Smart Routing Enabled",
@@ -9715,6 +10061,103 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "SkillCatalogRequest": {
+        "properties": {
+          "path": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "source": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "SkillCatalogRequest",
+        "type": "object"
+      },
+      "SkillCatalogResponse": {
+        "properties": {
+          "commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit"
+          },
+          "path": {
+            "default": "",
+            "title": "Path",
+            "type": "string"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogSkill"
+            },
+            "title": "Skills",
+            "type": "array"
+          },
+          "skipped": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Skipped",
+            "type": "array"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "ref",
+          "commit",
+          "skills",
+          "skipped"
+        ],
+        "title": "SkillCatalogResponse",
+        "type": "object"
+      },
       "SkillContentResponse": {
         "properties": {
           "content": {
@@ -9748,6 +10191,155 @@
         "title": "SkillContentResponse",
         "type": "object"
       },
+      "SkillSourceCreate": {
+        "description": "`source` is `owner/repo` or a GitHub URL; `ref` a branch or tag.\n\n`path` is the directory to index; a `/tree/<ref>/<dir>` link supplies it too.",
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "source": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "SkillSourceCreate",
+        "type": "object"
+      },
+      "SkillSourceList": {
+        "description": "One page; pass `last_id`, an opaque cursor, as `after` for the next.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSourceObject"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "SkillSourceList",
+        "type": "object"
+      },
+      "SkillSourceObject": {
+        "description": "A repository the marketplace browses.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "managed": {
+            "default": false,
+            "title": "Managed",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "default": "",
+            "title": "Path",
+            "type": "string"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "url",
+          "ref",
+          "name",
+          "created_by",
+          "created_at"
+        ],
+        "title": "SkillSourceObject",
+        "type": "object"
+      },
       "SkillSummary": {
         "description": "Safe subset of a discovered skill for API exposure.\n\nSurfaces the skill name and one-line description so clients\n(e.g. the web composer's slash-command menu) can list which\nskills the session has access to. The full skill `content`\nis intentionally omitted \u2014 it's only loaded server-side when\nthe harness invokes the skill, and it can be large.",
         "properties": {
@@ -9772,6 +10364,17 @@
             "description": "Invocation identifier (the skill's directory name), e.g. `\"triage-issues\"`, typed as `/triage-issues`.",
             "title": "Name",
             "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
           }
         },
         "required": [
@@ -9779,6 +10382,20 @@
           "description"
         ],
         "title": "SkillSummary",
+        "type": "object"
+      },
+      "SkillsMarketplaceInfo": {
+        "description": "The parts of the operator's skills marketplace policy the Settings page shows.",
+        "properties": {
+          "url_install": {
+            "title": "Url Install",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "url_install"
+        ],
+        "title": "SkillsMarketplaceInfo",
         "type": "object"
       },
       "SkillsResponse": {
@@ -13222,6 +13839,281 @@
         "summary": "Info",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/v1/installed-skills": {
+      "get": {
+        "description": "A page of the org's installed skills plus the caller's own.",
+        "operationId": "list_installed_skills_v1_installed_skills_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Installed Skills",
+        "tags": [
+          "skills"
+        ]
+      },
+      "post": {
+        "description": "Fetch the named skills from a repository and install them, all or none.",
+        "operationId": "install_skills_v1_installed_skills_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallSkillsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Install Skills",
+        "tags": [
+          "skills"
+        ]
+      }
+    },
+    "/v1/installed-skills/{skill_id}": {
+      "delete": {
+        "description": "Remove an installed skill and its stored tarball.",
+        "operationId": "delete_installed_skill_v1_installed_skills__skill_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "skill_id",
+            "required": true,
+            "schema": {
+              "title": "Skill Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Installed Skill",
+        "tags": [
+          "skills"
+        ]
+      },
+      "patch": {
+        "description": "Enable or disable a skill without removing it.",
+        "operationId": "patch_installed_skill_v1_installed_skills__skill_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "skill_id",
+            "required": true,
+            "schema": {
+              "title": "Skill Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstalledSkillPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Installed Skill",
+        "tags": [
+          "skills"
+        ]
+      }
+    },
+    "/v1/installed-skills/{skill_id}/content": {
+      "get": {
+        "description": "The stored `SKILL.md` of an installed skill.",
+        "operationId": "installed_skill_content_v1_installed_skills__skill_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "skill_id",
+            "required": true,
+            "schema": {
+              "title": "Skill Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillContentResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Installed Skill Content",
+        "tags": [
+          "skills"
+        ]
+      }
+    },
+    "/v1/installed-skills/{skill_id}/update": {
+      "post": {
+        "description": "Refetch the skill from its directory in its repository, at the same ref.",
+        "operationId": "update_installed_skill_v1_installed_skills__skill_id__update_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "skill_id",
+            "required": true,
+            "schema": {
+              "title": "Skill Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Installed Skill",
+        "tags": [
+          "skills"
         ]
       }
     },
@@ -19459,6 +20351,239 @@
         "summary": "Set Sharing",
         "tags": [
           "sharing"
+        ]
+      }
+    },
+    "/v1/skill-catalog": {
+      "post": {
+        "description": "The skills an arbitrary GitHub repository offers (the Add from URL path).",
+        "operationId": "preview_skill_catalog_v1_skill_catalog_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillCatalogRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillCatalogResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Skill Catalog",
+        "tags": [
+          "skills"
+        ]
+      }
+    },
+    "/v1/skill-sources": {
+      "get": {
+        "description": "A page of the repositories the marketplace browses.",
+        "operationId": "list_skill_sources_v1_skill_sources_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillSourceList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Skill Sources",
+        "tags": [
+          "skills"
+        ]
+      },
+      "post": {
+        "description": "Add a repository to browse (administrators only, within `allowed_sources`).",
+        "operationId": "add_skill_source_v1_skill_sources_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillSourceCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillSourceObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Skill Source",
+        "tags": [
+          "skills"
+        ]
+      }
+    },
+    "/v1/skill-sources/{source_id}": {
+      "delete": {
+        "description": "Remove a repository from the browse list; installed skills stay.",
+        "operationId": "delete_skill_source_v1_skill_sources__source_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Skill Source",
+        "tags": [
+          "skills"
+        ]
+      }
+    },
+    "/v1/skill-sources/{source_id}/catalog": {
+      "get": {
+        "description": "The skills a configured source offers, marking the caller's installs.",
+        "operationId": "skill_source_catalog_v1_skill_sources__source_id__catalog_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillCatalogResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Skill Source Catalog",
+        "tags": [
+          "skills"
         ]
       }
     },
