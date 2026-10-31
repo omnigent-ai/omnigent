@@ -6893,10 +6893,9 @@ async def _auto_create_antigravity_terminal(
     # per-session isolated Gemini dir. This avoids clobbering the user's
     # interactive ~/.gemini/config/mcp_config.json and avoids the concurrency
     # footgun of one shared bridge-specific config file. The relay subprocess is
-    # the same shared ``serve-mcp`` claude/codex/cursor use. Offloaded to a thread
-    # (file I/O) and done BEFORE terminal launch so agy sees the config on its
-    # first MCP scan.
-    await asyncio.to_thread(write_mcp_config, bridge_dir)
+    # the same shared ``serve-mcp`` claude/codex/cursor use. Written after the
+    # relay starts (below) and BEFORE terminal launch, so agy sees the config on
+    # its first MCP scan.
     env_overrides = {
         **env_overrides,
         **await asyncio.to_thread(
@@ -6934,6 +6933,9 @@ async def _auto_create_antigravity_terminal(
             explicit_bridge_dir=bridge_dir,
             await_notify=False,
         )
+    # Only the started relay knows the agent's proxied MCP tool names, so the agy
+    # config is written after it (agy surfaces exactly the names in enabledTools).
+    await asyncio.to_thread(write_mcp_config, bridge_dir)
 
     _logger.info(
         "Antigravity terminal auto-create starting: session=%s workspace=%s resume=%s "

@@ -1447,11 +1447,69 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert "sys_terminal_launch" in server["enabledTools"]
     assert "sys_list_models" in server["enabledTools"]
     assert server["enabledTools"] == sorted(server["enabledTools"])
+    # An agent's proxied MCP tools join the builtin floor.
+    with_extras = build_mcp_config(
+        tmp_path,
+        python_executable="python-test",
+        extra_tools=["issue_tracker__create_issue"],
+    )
+    enabled = with_extras["mcpServers"]["omnigent"]["enabledTools"]
+    assert "issue_tracker__create_issue" in enabled
+    assert "sys_session_send" in enabled
+    assert enabled == sorted(enabled)
     assert server["env"]["TMPDIR"]
     # The relay's HOME is pinned to the runner's real home so its bridge-root
     # validation matches where the bridge dir lives, even if a future agy launch
     # path customizes process environment.
     assert server["env"]["HOME"] == str(Path.home())
+
+
+@pytest.mark.asyncio
+async def test_write_mcp_config_enables_agent_mcp_tools_from_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent's own MCP tools reach agy's ``enabledTools`` via the relay.
+
+    agy surfaces ONLY the tool names listed in ``enabledTools``, so an agent
+    that declares ``mcp_servers`` stays invisible to the model unless the
+    proxied tool names are listed there. Those names exist only once the relay
+    has discovered them, so the relay's ``tool_relay.json`` advertisement is
+    merged into the builtin floor.
+    """
+    import asyncio
+
+    from omnigent.harnesses.claude_native.bridge import (
+        prepare_bridge_dir as prepare_relay_bridge_dir,
+    )
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "relay-root"
+    )
+    bridge_dir = prepare_relay_bridge_dir("agy-mcp-tools", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[
+            {"name": "sys_session_list", "description": "", "parameters": {}},
+            # Proxied from a ``stdio`` entry in the agent spec's ``mcp_servers``.
+            {"name": "issue_tracker__create_issue", "description": "", "parameters": {}},
+        ],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
+    finally:
+        relay.close()
+
+    config = json.loads(path.read_text(encoding="utf-8"))
+    enabled = config["mcpServers"]["omnigent"]["enabledTools"]
+    assert "issue_tracker__create_issue" in enabled
+    assert "sys_session_list" in enabled
+    assert "sys_os_shell" in enabled
+    assert enabled == sorted(enabled)
 
 
 def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path) -> None:

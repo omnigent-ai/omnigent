@@ -3594,6 +3594,13 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
 
     async def _recording_relay(session_id_arg: str, **kwargs: Any) -> None:
         relay_calls.append({"session_id": session_id_arg, **kwargs})
+        # The started relay advertises the builtins plus the agent's proxied MCP
+        # tools; agy surfaces only what ``enabledTools`` names.
+        relay_dir = cast(Path, kwargs["explicit_bridge_dir"])
+        (relay_dir / "tool_relay.json").write_text(
+            json.dumps({"tools": [{"name": "issue_tracker__create_issue"}]}),
+            encoding="utf-8",
+        )
 
     captured_spec: dict[str, Any] = {}
 
@@ -3665,6 +3672,9 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     ]
     assert str(bridge_dir) in server["args"]
     assert "sys_session_create" in server["enabledTools"]
+    # The relay's MCP proxy tools (the agent's ``mcp_servers``) ride along, which
+    # needs the config written after the relay starts.
+    assert "issue_tracker__create_issue" in server["enabledTools"]
     # The bridge token the shared relay needs was written into the bridge dir.
     assert (bridge_dir / "bridge.json").is_file()
 

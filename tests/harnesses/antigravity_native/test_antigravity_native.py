@@ -649,6 +649,16 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
         captured_env.update(body["spec"]["env"])
         return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
 
+    # A relay already advertising this session's tools (the runner starts it for
+    # the session) carries the agent's proxied MCP tools; agy surfaces only what
+    # ``enabledTools`` names.
+    running_bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+    running_bridge_dir.mkdir(parents=True, exist_ok=True)
+    (running_bridge_dir / "tool_relay.json").write_text(
+        json.dumps({"tools": [{"name": "issue_tracker__create_issue"}]}),
+        encoding="utf-8",
+    )
+
     async with _mock_client(_capture_handler) as client:
         await _mod._launch_and_record(
             client,
@@ -673,7 +683,10 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     # The relay config + token exist, so the wrapped agy can reach the sys_* tools.
     relay_config = iso_gemini / "config" / "mcp_config.json"
     payload = json.loads(relay_config.read_text(encoding="utf-8"))
-    assert "sys_session_create" in payload["mcpServers"]["omnigent"]["enabledTools"]
+    enabled_tools = payload["mcpServers"]["omnigent"]["enabledTools"]
+    assert "sys_session_create" in enabled_tools
+    assert "issue_tracker__create_issue" in enabled_tools
+    assert enabled_tools == sorted(enabled_tools)
     assert (bridge_dir / "bridge.json").is_file()
     # The survey/trust seeds landed in the isolated dir, never the user's own file.
     iso_settings = json.loads(

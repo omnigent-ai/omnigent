@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -364,12 +365,16 @@ def _agy_orphan_retention_expired(bridge_dir: Path) -> bool:
 _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
+_TOOL_RELAY_FILE = "tool_relay.json"
 _MCP_SERVER_NAME = "omnigent"
-# agy auto-approves a relay tool when it is named in the server's ``enabledTools``
-# allowlist (agy's per-server MCP schema; mirrors cursor's ``autoApprove``).
-# Omnigent's own TOOL_CALL policy + elicitation gate still applies on the server
-# side, so auto-approving the agy-side MCP gate only avoids a hidden in-terminal
-# prompt blocking the call before Omnigent ever sees it.
+# agy both auto-approves and surfaces ONLY the tools named in the server's
+# ``enabledTools`` allowlist (agy's per-server MCP schema; mirrors cursor's
+# ``autoApprove``). Omnigent's own TOOL_CALL policy + elicitation gate still
+# applies on the server side, so auto-approving the agy-side MCP gate only avoids
+# a hidden in-terminal prompt blocking the call before Omnigent ever sees it.
+# This is the floor for the relay's builtins; the agent's own ``mcp_servers``
+# tools are discovered at runtime and merged in per session (see
+# :func:`relay_tool_names`) because agy has no wildcard.
 _AGY_ENABLED_TOOLS = [
     "list_comments",
     "sys_add_policy",
@@ -473,10 +478,39 @@ def agy_gemini_dir(bridge_dir: Path) -> Path:
     return agy_home_dir(bridge_dir) / ".gemini"
 
 
+def relay_tool_names(bridge_dir: Path) -> list[str]:
+    """Return the tool names the session's Omnigent relay currently advertises.
+
+    The relay serves the spec-gated builtins plus the proxied tools of the
+    agent's own ``mcp_servers`` (``omnigent/runner/app.py``) and records the
+    result in ``tool_relay.json``. A proxied tool name exists only once the relay
+    has discovered it, so this advertisement is the one pre-launch source for it.
+
+    :param bridge_dir: Native Antigravity bridge directory whose relay
+        advertisement to read.
+    :returns: Advertised tool names, or an empty list when no relay has started
+        (or left a readable advertisement) yet.
+    """
+    try:
+        relay = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    tools = relay.get("tools") if isinstance(relay, dict) else None
+    if not isinstance(tools, list):
+        return []
+    names: list[str] = []
+    for tool in tools:
+        name = tool.get("name") if isinstance(tool, dict) else None
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
 def build_mcp_config(
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
+    extra_tools: Iterable[str] = (),
 ) -> dict[str, object]:
     """Build agy's ``mcp_config.json`` payload for the Omnigent relay server.
 
@@ -498,6 +532,8 @@ def build_mcp_config(
         config points at.
     :param python_executable: Python interpreter for the relay command;
         defaults to the current interpreter (``sys.executable``).
+    :param extra_tools: Tool names to enable beyond the builtin floor — the
+        agent's proxied MCP tools, as advertised by the relay.
     :returns: The ``mcp_config.json`` payload as a dict.
     """
     python = python_executable or sys.executable
@@ -513,7 +549,7 @@ def build_mcp_config(
                     "--bridge-dir",
                     str(bridge_dir),
                 ],
-                "enabledTools": list(_AGY_ENABLED_TOOLS),
+                "enabledTools": sorted({*_AGY_ENABLED_TOOLS, *extra_tools}),
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
                     # Pin the relay to the RUNNER's real home so its bridge-root
@@ -560,7 +596,9 @@ def write_mcp_config(
     per-session and not the user's real ``~/.gemini``, this never clobbers the
     user's interactive agy config and two concurrent sessions never share one
     config. Mirrors cursor #742's :func:`omnigent.harnesses.cursor_native.bridge.write_mcp_config`,
-    adapted to agy's hidden ``--gemini_dir`` flag.
+    adapted to agy's hidden ``--gemini_dir`` flag. Call this AFTER the relay has
+    started, so the agent's proxied MCP tools are already advertised and land in
+    ``enabledTools``.
 
     :param bridge_dir: Native Antigravity bridge directory (holds ``bridge.json``
         and the isolated agy Gemini dir).
@@ -572,7 +610,11 @@ def write_mcp_config(
     config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = config_dir / _MCP_CONFIG_FILE
-    payload = build_mcp_config(bridge_dir, python_executable=python_executable)
+    payload = build_mcp_config(
+        bridge_dir,
+        python_executable=python_executable,
+        extra_tools=relay_tool_names(bridge_dir),
+    )
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
