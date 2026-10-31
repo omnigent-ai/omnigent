@@ -15,7 +15,6 @@ import {
   SparklesIcon,
   type LucideIcon,
 } from "lucide-react";
-import { OMNIGENT_ATTRIBUTION } from "@/components/scheduled/triggerTemplates";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { useViewerId } from "@/hooks/useViewerId";
@@ -56,7 +55,8 @@ const EXAMPLES: Example[] = [
     title: "Answer product questions",
     summary: "A Slack bot for your product question channel.",
     rrule: "FREQ=HOURLY",
-    prompt: `Read the top-level messages posted in #product-questions in the last two hours. For each question with no reply yet, answer it in the thread from our product docs and release notes, and link your sources. If you aren't sure, say so and tag @product-oncall instead of guessing. End each reply with "${OMNIGENT_ATTRIBUTION}".`,
+    prompt:
+      "Read the top-level messages posted in #product-questions in the last two hours. For each question with no reply yet, answer it in the thread from our product docs and release notes, and link your sources. If you aren't sure, say so and tag @product-oncall instead of guessing.",
     needs: "a Slack MCP server",
     icon: HashIcon,
   },
@@ -65,7 +65,8 @@ const EXAMPLES: Example[] = [
     title: "Triage new pages",
     summary: "A first look at each PagerDuty incident for the on-call engineer.",
     rrule: "FREQ=HOURLY",
-    prompt: `List the PagerDuty incidents on the Payments API service triggered in the last two hours. For each one without a note from you, read the alert, check recent deploys, error logs and dashboards, and add a note with the likely cause, the evidence and a suggested first step. End the note with "${OMNIGENT_ATTRIBUTION}". Don't acknowledge, reassign or resolve incidents.`,
+    prompt:
+      "List the PagerDuty incidents on the Payments API service triggered in the last two hours. For each one without a note from you, read the alert, check recent deploys, error logs and dashboards, and add a note with the likely cause, the evidence and a suggested first step. Don't acknowledge, reassign or resolve incidents.",
     needs: "a PagerDuty MCP server and access to your logs and dashboards",
     icon: SirenIcon,
   },
@@ -74,7 +75,8 @@ const EXAMPLES: Example[] = [
     title: "Merge Dependabot updates",
     summary: "A daily security sweep of dependency updates.",
     rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-    prompt: `List the open pull requests in acme/web opened by dependabot[bot]. Merge each one that bumps a patch or minor version and passes every check. Leave the rest open with a comment saying why: a major version, a failing check or a merge conflict. End each comment with "${OMNIGENT_ATTRIBUTION}". Reply with what you merged and what needs a person.`,
+    prompt:
+      "List the open pull requests in acme/web opened by dependabot[bot]. Merge each one that bumps a patch or minor version and passes every check. Leave the rest open with a comment saying why: a major version, a failing check or a merge conflict. Reply with what you merged and what needs a person.",
     needs: "the GitHub CLI or a GitHub MCP server allowed to merge",
     icon: ShieldCheckIcon,
   },
@@ -342,8 +344,7 @@ function ExamplesView({
         </h2>
       </DialogTitle>
       <DialogDescription className="mt-3 text-sm leading-relaxed">
-        Copy a prompt and schedule, then swap in your own channel, service or repo. The agent needs
-        the tools each one lists where the automation runs.
+        Practical examples of what you can automate.
       </DialogDescription>
       <ul aria-label="Example automations" className="my-6 grid gap-4 md:grid-cols-3">
         {EXAMPLES.map((example) => (

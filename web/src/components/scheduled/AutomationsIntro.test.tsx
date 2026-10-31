@@ -99,8 +99,6 @@ describe("Automations first-visit introduction", () => {
     expect(items[0]).toHaveTextContent("Read the top-level messages posted in #product-questions");
     expect(items[1]).toHaveTextContent("List the PagerDuty incidents on the Payments API service");
     expect(items[2]).toHaveTextContent("opened by dependabot[bot]");
-    // Each one posts with the owner's account, so its prompt signs what it posts.
-    for (const item of items) expect(item).toHaveTextContent('"Sent with Omnigent"');
     expect(within(examples).getByRole("heading", { name: "Example automations" })).toHaveFocus();
     expect(localStorage.length).toBe(0);
 
