@@ -353,6 +353,63 @@ def test_deregister_noop_for_unknown() -> None:
     registry.deregister("host_nonexistent")
 
 
+def test_deregister_with_matching_guard_removes_entry() -> None:
+    """
+    Verify the generation guard removes the entry when it matches.
+
+    The ``True`` return is how the tunnel handler learns it still owns
+    the rest of the disconnect cleanup (the set-offline write).
+    """
+    registry = HostRegistry()
+    conn = registry.register("host_bb1", FakeWebSocket(), _make_hello(), owner="bob")
+
+    assert registry.deregister("host_bb1", conn=conn) is True
+    assert registry.get("host_bb1") is None
+
+
+def test_deregister_without_guard_pops_unconditionally() -> None:
+    """
+    Verify an unguarded deregister still removes whatever is registered.
+
+    Callers holding no connection reference must keep the old behaviour,
+    so the guard has to stay strictly opt-in.
+    """
+    registry = HostRegistry()
+    registry.register("host_bb3", FakeWebSocket(), _make_hello(), owner="bob")
+    registry.register("host_bb3", FakeWebSocket(), _make_hello(), owner="bob")
+
+    assert registry.deregister("host_bb3") is True
+    assert registry.get("host_bb3") is None
+    # Nothing left to remove on a second call.
+    assert registry.deregister("host_bb3") is False
+
+
+def test_deregister_guard_keys_off_the_connection_workspace() -> None:
+    """
+    Verify a guarded deregister stays inside the connection's workspace.
+
+    One stable host_id can be live in two workspaces. The guard resolves
+    the key from the connection itself, so cleanup for one workspace must
+    not evict the other's tunnel even when the caller's ambient workspace
+    is the other one.
+    """
+    registry = HostRegistry()
+    host_id = "00112233445566778899aabbccddeeff"
+    with workspace_scope(111):
+        conn_a = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+    with workspace_scope(222):
+        conn_b = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+
+    # Ambient workspace is 222, but the guard names workspace 111's conn.
+    with workspace_scope(222):
+        assert registry.deregister(host_id, conn=conn_a) is True
+
+    with workspace_scope(111):
+        assert registry.get(host_id) is None
+    with workspace_scope(222):
+        assert registry.get(host_id) is conn_b
+
+
 def test_online_host_ids() -> None:
     """
     Verify that online_host_ids returns all registered hosts

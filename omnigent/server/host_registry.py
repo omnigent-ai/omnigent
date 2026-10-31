@@ -724,7 +724,8 @@ class HostRegistry:
 
         :param host_id: Host identifier to remove, in any accepted
             spelling (see :func:`_canonical_host_id`).
-        :param workspace_id: Tenant partition; defaults to
+        :param workspace_id: Tenant partition; defaults to the
+            connection's own workspace when *conn* is given, otherwise
             :func:`current_workspace_id`.
         :param conn: Optional generation guard, as on
             :meth:`TunnelRegistry.deregister`. When given, the entry is
@@ -734,7 +735,12 @@ class HostRegistry:
             caller is superseded and must not flip the host's durable
             row offline — that row describes the live reconnect.
         """
-        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        if workspace_id is not None:
+            ws_id = workspace_id
+        elif conn is not None:
+            ws_id = conn.workspace_id
+        else:
+            ws_id = current_workspace_id()
         with self._lock:
             key = (ws_id, _canonical_host_id(host_id))
             current = self._hosts.get(key)
