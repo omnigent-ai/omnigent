@@ -12,4 +12,22 @@ function isHostThisMachine({ hostId, serverUrl }, cli = require("./omnigent_cli"
   return !recordHostId || recordHostId === hostId;
 }
 
-module.exports = { isHostThisMachine, SESSION_HOST_PROTOCOL };
+/** Cache local identity/enrollment checks for at most one second per host/server pair. */
+function createHostThisMachineChecker({ cli, now = Date.now } = {}) {
+  const snapshots = new Map();
+  return ({ hostId, serverUrl }) => {
+    if (!hostId) return false;
+    const timestamp = now();
+    const key = JSON.stringify([hostId, serverUrl]);
+    const cached = snapshots.get(key);
+    if (cached && timestamp < cached.expiresAt) return cached.eligible;
+    for (const [cachedKey, snapshot] of snapshots) {
+      if (timestamp >= snapshot.expiresAt) snapshots.delete(cachedKey);
+    }
+    const eligible = isHostThisMachine({ hostId, serverUrl }, cli);
+    snapshots.set(key, { eligible, expiresAt: timestamp + 1000 });
+    return eligible;
+  };
+}
+
+module.exports = { createHostThisMachineChecker, isHostThisMachine, SESSION_HOST_PROTOCOL };
