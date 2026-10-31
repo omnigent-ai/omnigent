@@ -436,6 +436,7 @@ from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    is_session_closed,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -953,7 +954,9 @@ async def _archive_stop(
     alone leaves a host-spawned session's dedicated runner connected,
     which keeps ``runner_online`` true and hangs a later message on
     "working" against a dead pane — the failure
-    :func:`_stop_session_host_runner` exists to prevent.
+    :func:`_stop_session_host_runner` exists to prevent. A closed
+    session whose runner stays up instead has its runner session
+    deleted, which frees its terminal and harness bridge.
 
     Every step is best-effort: a wedged, offline, or already-stopped
     runner must not leave the session un-archived.
@@ -1011,11 +1014,12 @@ async def _archive_stop(
     _pending_archive_stops.pop(session_id, None)
 
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    runner_stopped = False
     if conv.host_id and conv.runner_id:
         try:
             # A sub-agent riding an ancestor's runner leaves it up for the owner.
             if await _owns_host_runner(conv, conversation_store):
-                await _stop_host_runner_intentionally(
+                runner_stopped = await _stop_host_runner_intentionally(
                     session_id,
                     conv.host_id,
                     conv.runner_id,
@@ -1025,6 +1029,23 @@ async def _archive_stop(
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Archive host-runner teardown failed for %s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+    if not runner_stopped and is_session_closed(conv.labels, conv.title):
+        # An idle closed session gets no stop, and a shared runner stays up, so
+        # release the session's own harness resources; the transcript is kept.
+        try:
+            runner_client = await _get_runner_client(session_id, runner_router, conversation=conv)
+            if runner_client is not None:
+                cleanup_resp = await runner_client.delete(
+                    f"/v1/sessions/{session_id}", timeout=60.0
+                )
+                cleanup_resp.raise_for_status()
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Archive resource release failed for closed session %s",
                 session_id,
                 exc_info=True,
                 extra={"session_id": session_id},
@@ -12534,9 +12555,10 @@ async def _child_session_summaries_from_conversations(
     children: list[Conversation],
     parent_session_id: str,
     conv_store: ConversationStore,
+    agent_store: AgentStore,
 ) -> list[ChildSessionSummary]:
     """
-    Build child summaries with one batched message-preview lookup.
+    Build child summaries with batched message-preview and agent lookups.
 
     ``ChildSessionSummary.last_message_preview`` needs the latest visible
     message per child. Loading those by calling ``list_items`` once per
@@ -12549,16 +12571,17 @@ async def _child_session_summaries_from_conversations(
         ``list_conversations(kind="sub_agent")``.
     :param parent_session_id: Parent session id, e.g. ``"conv_parent987"``.
     :param conv_store: Conversation store used for the batched message read.
+    :param agent_store: Agent store used to resolve each child's agent name.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
     if not children:
         return []
     child_ids = [child.id for child in children]
-    message_items_by_child = await asyncio.to_thread(
-        conv_store.list_latest_message_items_for_conversations,
-        child_ids,
-        10,
+    agent_ids = list({child.agent_id for child in children if child.agent_id is not None})
+    message_items_by_child, agent_names = await asyncio.gather(
+        asyncio.to_thread(conv_store.list_latest_message_items_for_conversations, child_ids, 10),
+        asyncio.to_thread(agent_store.get_names, agent_ids),
     )
     previews = {
         child_id: _latest_message_preview(message_items)
@@ -12569,6 +12592,7 @@ async def _child_session_summaries_from_conversations(
             child,
             parent_session_id,
             previews.get(child.id),
+            agent_name=agent_names.get(child.agent_id) if child.agent_id else None,
         )
         for child in children
     ]

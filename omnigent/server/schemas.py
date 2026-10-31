@@ -871,11 +871,10 @@ class ChildSessionSummary(BaseModel):
         e.g. ``"ag_abc123"``. ``None`` if the child has no tasks
         yet (rare — ``_spawn_one`` creates a task atomically with
         the conversation).
-    :param agent_name: Agent type recorded on the latest task,
-        e.g. ``"researcher"``. Mirrors the ``tool`` prefix in
-        ``title`` and is provided alongside it because the title
-        is a denormalized string while ``agent_name`` is the
-        durable per-task value.
+    :param agent_name: Name of the agent bound by ``agent_id``,
+        e.g. ``"codex-native-ui"``. Unlike ``tool``, it does not
+        depend on the title, so a child created with a free-form
+        title still reports its agent. ``None`` when unresolved.
     :param current_task_id: Latest task id for the child
         (newest by ``created_at``), e.g. ``"task_abc123"``.
         ``None`` if no tasks exist.

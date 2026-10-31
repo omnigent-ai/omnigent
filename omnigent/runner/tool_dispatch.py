@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -3227,17 +3228,7 @@ async def _send_to_existing_session(
             }
         )
     display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
-    parsed = _parse_session_title(display_title)
-    # A sys_session_create child keeps its verbatim title and has no
-    # sub_agent_name, so when the title does not parse as "<agent>:<title>"
-    # the identity comes from the snapshot's agent fields instead.
-    agent_label = (
-        parsed.agent
-        or _optional_string(snap_data.get("sub_agent_name"))
-        or _optional_string(snap_data.get("agent_name"))
-        or "agent"
-    )
-    instance_title = parsed.title if parsed.title is not None else (display_title or "")
+    agent_label, instance_title, _ = _snapshot_agent_title(snap_data)
     existing_work = _subagent_work.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status == "launching":
         # No active turn to inject into yet; a send now could race a parallel
@@ -5025,6 +5016,31 @@ def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
     return _ParsedTitle(agent=head, title=tail)
 
 
+def _snapshot_agent_title(snapshot: _JsonObject) -> tuple[str, str, _ParsedTitle]:
+    """
+    Return a child session's ``(agent, title)`` identity from its snapshot.
+
+    Uses the ``"<agent>:<title>"`` title when it has one. A
+    ``sys_session_create`` child keeps its verbatim title and has no
+    ``sub_agent_name``, so its agent comes from the snapshot's agent fields.
+
+    :param snapshot: ``GET /v1/sessions/{id}`` body, e.g.
+        ``{"title": "LeakRepro", "agent_name": "codex-native-ui"}``.
+    :returns: The agent label, the instance title, and the parsed title,
+        e.g. ``("codex-native-ui", "LeakRepro", _ParsedTitle(None, None))``.
+    """
+    display_title = title_without_closed_marker(_optional_string(snapshot.get("title")))
+    parsed = _parse_session_title(display_title)
+    agent = (
+        parsed.agent
+        or _optional_string(snapshot.get("sub_agent_name"))
+        or _optional_string(snapshot.get("agent_name"))
+        or "agent"
+    )
+    title = parsed.title if parsed.title is not None else (display_title or "")
+    return agent, title, parsed
+
+
 def _truncate_activity(
     text: str | None,
     *,
@@ -6351,8 +6367,8 @@ async def _collect_sub_agents(
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
 
     Returns ``[{"agent", "title", "conversation_id"}, ...]``, skipping
-    closed and titleless/colonless rows so they never re-surface to the
-    LLM. Includes the caller's own children and, when the caller is
+    closed rows so they never re-surface to the LLM. Includes the
+    caller's own children and, when the caller is
     itself a child (e.g. a user-added agent), its parent (surfaced as
     ``agent="main"``) and its siblings — so an added agent can still
     discover ``main`` and its session-mates. Best-effort: a failed
@@ -6520,9 +6536,11 @@ def _child_rows_to_entries(
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
 
-    Skips closed and titleless/colonless rows. The server already
-    parses ``tool``/``session_name`` from the title (including the
-    ``"ui:<agent>:<label>"`` form), so those are reused.
+    Skips closed rows. The server already parses ``tool``/``session_name``
+    from a ``"<agent>:<title>"`` title (including the
+    ``"ui:<agent>:<label>"`` form), so those are reused. A
+    ``sys_session_create`` child keeps its verbatim title (or none), so it
+    is listed under that title with the row's ``agent_name``.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
@@ -6531,12 +6549,18 @@ def _child_rows_to_entries(
     for row in rows:
         title = _optional_string(row.get("title"))
         labels = _string_mapping(row.get("labels"))
-        if not title or ":" not in title or is_session_closed(labels, title):
+        if is_session_closed(labels, title):
             continue
+        if title is not None and ":" in title:
+            agent = _optional_string(row.get("tool"))
+            instance_title = _optional_string(row.get("session_name"))
+        else:
+            agent = _optional_string(row.get("agent_name"))
+            instance_title = title or None
         entries.append(
             {
-                "agent": _optional_string(row.get("tool")),
-                "title": _optional_string(row.get("session_name")),
+                "agent": agent,
+                "title": instance_title,
                 "conversation_id": _optional_string(row.get("id")),
             }
         )
@@ -6754,7 +6778,8 @@ async def _session_close_via_rest(
     On success marks the child with ``omnigent.closed=true`` and
     rewrites its internal title to ``"<agent>:<title>:closed:<id>"`` so
     future ``sys_session_send`` calls with the same ``(agent, title)``
-    create a fresh child.
+    create a fresh child. A ``sys_session_create`` child's verbatim title
+    keeps its text before the marker; an untitled child keeps no title.
 
     :param args: Parsed tool arguments; requires ``conversation_id``.
     :param conversation_id: The calling session's own id, e.g.
@@ -6780,21 +6805,23 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
-    if parsed.agent is None or parsed.title is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    agent, title, parsed = _snapshot_agent_title(target_snap)
+    patch_body: _JsonObject = {
+        "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+        # archived=True triggers the server's _spawn_archive_stop reaper,
+        # which stops the child's harness / tmux / bridge cluster.
+        # Without this the child's OS-process cluster is never reaped.
+        "archived": True,
+    }
+    tombstone = f"{parsed.agent}:{parsed.title}" if parsed.agent is not None else title
+    if tombstone:
+        # Trim the kept text so the unique suffix fits the title length limit.
+        suffix = f"{_CLOSED_TITLE_INFIX}{target_id}"
+        patch_body["title"] = tombstone[: USER_SESSION_TITLE_MAX_CHARS - len(suffix)] + suffix
     try:
         patch = await server_client.patch(
             f"{_session_url(target_id)}",
-            json={
-                "title": new_title,
-                "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
-                # archived=True triggers the server's _spawn_archive_stop reaper,
-                # which stops the child's harness / tmux / bridge cluster.
-                # Without this the child's OS-process cluster is never reaped.
-                "archived": True,
-            },
+            json=patch_body,
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -6805,8 +6832,8 @@ async def _session_close_via_rest(
         {
             "closed": True,
             "conversation_id": target_id,
-            "agent": parsed.agent,
-            "title": parsed.title,
+            "agent": agent,
+            "title": title,
         }
     )
 

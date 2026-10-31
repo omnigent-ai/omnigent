@@ -984,7 +984,7 @@
                 "type": "null"
               }
             ],
-            "description": "Agent type recorded on the latest task, e.g. `\"researcher\"`. Mirrors the `tool` prefix in `title` and is provided alongside it because the title is a denormalized string while `agent_name` is the durable per-task value.",
+            "description": "Name of the agent bound by `agent_id`, e.g. `\"codex-native-ui\"`. Unlike `tool`, it does not depend on the title, so a child created with a free-form title still reports its agent. `None` when unresolved.",
             "title": "Agent Name"
           },
           "busy": {
