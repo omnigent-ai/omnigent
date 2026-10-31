@@ -37,6 +37,7 @@ from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MODEL = "gpt-5.4-mini"
+_ALTERNATE_MODEL = "gpt-5.5"
 
 
 def _wait(check, description: str, timeout: float = 60):
@@ -64,7 +65,9 @@ async def _resume_settings(transport: str, thread_id: str) -> dict:
 
 @pytest.mark.posix_only
 @pytest.mark.timeout(240)
-@pytest.mark.parametrize("selection", ["changed-default", "unchanged-default", "agent-pinned"])
+@pytest.mark.parametrize(
+    "selection", ["changed-default", "unchanged-default", "agent-pinned", "model-pick"]
+)
 def test_connected_codex_resume_routes_to_configured_provider(
     tmp_path: Path,
     isolated_mock_llm_server_url: str,
@@ -184,7 +187,13 @@ def test_connected_codex_resume_routes_to_configured_provider(
                     return value
             return None
 
-        def round_trip(prompt: str, expected_provider: str, terminal: dict | None = None) -> None:
+        def round_trip(
+            prompt: str,
+            expected_provider: str,
+            terminal: dict | None = None,
+            *,
+            expected_model: str = _MODEL,
+        ) -> None:
             def captured_requests():
                 captured = {
                     name: [
@@ -236,7 +245,7 @@ def test_connected_codex_resume_routes_to_configured_provider(
                 f"request counts={counts}"
             )
             assert not requests[next(name for name in providers if name != expected_provider)]
-            assert requests[expected_provider][-1]["model"] == _MODEL
+            assert requests[expected_provider][-1]["model"] == expected_model
             assert requests[expected_provider][-1]["reasoning"]["effort"] == "high"
             if prompt != first_prompt:
                 assert first_prompt in json.dumps(requests[expected_provider][-1]["input"])
@@ -260,18 +269,25 @@ def test_connected_codex_resume_routes_to_configured_provider(
             lambda: not client.get(f"/v1/runners/{stack.runner_id}/status").json()["online"],
             "stopped runner",
         )
-        select_provider("legacy" if selection == "unchanged-default" else "current")
+        if selection == "model-pick":
+            client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"model_override": _ALTERNATE_MODEL},
+            ).raise_for_status()
+        select_provider(
+            "legacy" if selection in {"unchanged-default", "model-pick"} else "current"
+        )
         stack.runner = None
         stack.start_runner(env=native_env, cwd=_REPO_ROOT)
         terminal = ensure_terminal()
         resumed = _wait(state, "resumed Codex thread")
         assert resumed.thread_id == original.thread_id
         expected = "current" if selection == "changed-default" else "legacy"
-        round_trip(f"provider-probe-{uuid.uuid4().hex}", expected)
         after = asyncio.run(_resume_settings(resumed.socket_path, resumed.thread_id))
         assert after["modelProvider"] == expected
+        expected_model = _ALTERNATE_MODEL if selection == "model-pick" else _MODEL
+        assert after["model"] == expected_model
         for field in (
-            "model",
             "reasoningEffort",
             "cwd",
             "approvalPolicy",
@@ -280,5 +296,8 @@ def test_connected_codex_resume_routes_to_configured_provider(
             "runtimeWorkspaceRoots",
         ):
             assert after[field] == before[field], f"resume changed {field}"
-        round_trip(f"provider-probe-{uuid.uuid4().hex}", expected, terminal)
+        round_trip(f"provider-probe-{uuid.uuid4().hex}", expected, expected_model=expected_model)
+        round_trip(
+            f"provider-probe-{uuid.uuid4().hex}", expected, terminal, expected_model=expected_model
+        )
         assert (source_home / "config.toml").read_text() == source_config
