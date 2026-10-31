@@ -34,7 +34,7 @@ import functools
 import logging
 import os
 import re
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -56,6 +56,7 @@ _HEX_LEN = 32
 SENTINEL_PARENT_SPAN_ID = 0x1000000000000001
 
 _capture_content: bool = False
+_capture_user: bool = False
 _initialized: bool = False
 _metrics_initialized: bool = False
 _logs_initialized: bool = False
@@ -101,6 +102,37 @@ def should_capture_content() -> bool:
     :returns: ``True`` when content capture is enabled.
     """
     return _capture_content
+
+
+def should_capture_user() -> bool:
+    """
+    Return whether the acting user's id should be stamped on spans.
+
+    Controlled by ``OMNIGENT_OTEL_CAPTURE_USER``. Off by default because
+    the id (``enduser.id``) is usually an email address.
+
+    :returns: ``True`` when user attribution is enabled.
+    """
+    return _capture_user
+
+
+def set_resource_attribute(env: MutableMapping[str, str], key: str, value: str) -> None:
+    """
+    Set *key* in ``env["OTEL_RESOURCE_ATTRIBUTES"]``, replacing an existing entry.
+
+    Every provider built by :func:`init` merges that variable into its
+    ``Resource``, and processes spawned with *env* inherit the attribute.
+
+    :param env: Environment to update, e.g. ``os.environ``.
+    :param key: Resource attribute name, e.g. ``"omnigent.host.id"``.
+    :param value: Attribute value, e.g. a host id.
+    """
+    kept = [
+        attribute
+        for attribute in env.get("OTEL_RESOURCE_ATTRIBUTES", "").split(",")
+        if attribute.strip() and attribute.partition("=")[0].strip() != key
+    ]
+    env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join([*kept, f"{key}={value}"])
 
 
 def telemetry_enabled() -> bool:
@@ -256,12 +288,31 @@ def set_session_id(session_id: str | None) -> None:
     # writes) get tagged by _SessionIdSpanProcessor too; then stamp the
     # already-started active span directly (its on_start has already passed).
     _session_id_var.set(session_id)
+    _stamp_current_span("session.id", session_id)
+
+
+def set_request_user(user_id: str | None) -> None:
+    """
+    Stamp ``enduser.id`` on the active server span once auth resolves the user.
+
+    The FastAPI server span starts before the auth middleware runs, so the
+    user span processor's ``on_start`` misses it; child spans are covered by
+    the processor. A no-op unless ``OMNIGENT_OTEL_CAPTURE_USER`` is set.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``.
+    """
+    if user_id and should_capture_user():
+        _stamp_current_span("enduser.id", user_id)
+
+
+def _stamp_current_span(key: str, value: str) -> None:
+    """Set *key* on the already-started active span, whose ``on_start`` has passed."""
     try:
         from opentelemetry import trace as otel_trace
 
         span = otel_trace.get_current_span()
         if span is not None and span.is_recording():
-            span.set_attribute("session.id", session_id)
+            span.set_attribute(key, value)
     except Exception:  # pragma: no cover - telemetry must never break requests
         pass
 
@@ -346,6 +397,28 @@ def make_span_attribute_processor(attribute_key: str, get_value: Callable[[], st
 def _make_session_id_processor() -> Any:
     """Span processor stamping ``session.id`` from :data:`_session_id_var`."""
     return make_span_attribute_processor("session.id", _session_id_var.get)
+
+
+def _make_user_id_processor() -> Any:
+    """
+    Span processor stamping ``enduser.id`` from the debug-log user binding.
+
+    As for debug-log records, that is the request user on the server and the
+    process owner (``OMNIGENT_USER_ID``) on the host, runner and harness.
+    """
+    from omnigent.debug_logging import current_user_id
+
+    def span_user_id() -> str | None:
+        return current_user_id() if _capture_user else None
+
+    return make_span_attribute_processor("enduser.id", span_user_id)
+
+
+def _make_runner_id_processor() -> Any:
+    """Span processor stamping ``omnigent.runner.id`` from the debug-log runner binding."""
+    from omnigent.debug_logging import current_runner_id
+
+    return make_span_attribute_processor("omnigent.runner.id", current_runner_id)
 
 
 def _make_active_skill_processor() -> Any:
@@ -1075,6 +1148,10 @@ def _init_otel_traces(endpoint: str) -> None:
             provider.add_span_processor(_make_session_id_processor())
             # Tag every span with the skill active in the turn, if any.
             provider.add_span_processor(_make_active_skill_processor())
+            # Attribute every span to its runner, and to the acting user when
+            # OMNIGENT_OTEL_CAPTURE_USER opts in.
+            provider.add_span_processor(_make_runner_id_processor())
+            provider.add_span_processor(_make_user_id_processor())
             provider.add_span_processor(BatchSpanProcessor(_create_otlp_span_exporter()))
             trace.set_tracer_provider(provider)
 
@@ -1267,7 +1344,7 @@ def init(service_name: str | None = None) -> None:
       ``TracerProvider`` externally get spans automatically. The
       default OTel no-op provider discards spans silently.
     """
-    global _capture_content, _initialized
+    global _capture_content, _capture_user, _initialized
 
     if not telemetry_enabled():
         # Master opt-in off (the default): stay fully inert — no provider, no
@@ -1276,6 +1353,7 @@ def init(service_name: str | None = None) -> None:
         return
 
     _capture_content = _env_bool("OMNIGENT_OTEL_CAPTURE_CONTENT")
+    _capture_user = _env_bool("OMNIGENT_OTEL_CAPTURE_USER")
 
     if _initialized:
         return
@@ -1303,7 +1381,8 @@ def init(service_name: str | None = None) -> None:
 
     _initialized = True
     _logger.info(
-        "omnigent telemetry initialized (endpoint=%s, capture_content=%s)",
+        "omnigent telemetry initialized (endpoint=%s, capture_content=%s, capture_user=%s)",
         endpoint or "<none>",
         _capture_content,
+        _capture_user,
     )
