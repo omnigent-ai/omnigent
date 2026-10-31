@@ -23,6 +23,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass, field
@@ -263,16 +264,24 @@ def _databricks_sdk_token_command(host: str, profile: str | None) -> str:
     fail closed when a named profile resolves to a *different* workspace; a named
     ``--profile`` is added on top and pins identity to that section.
 
+    The mint runs under omnigent's own interpreter: a bare ``python3`` is whatever
+    the harness's ``PATH`` finds, often one without omnigent or the SDK (→ empty
+    bearer → 401). ``-P`` keeps the harness cwd — the agent's workspace — off
+    ``sys.path`` so a checkout there cannot shadow the installed package. An
+    empty ``PYTHONPATH`` component (``PYTHONPATH=:/opt/lib``) still resolves to
+    the cwd, so the mint also runs from ``/``.
+
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
     :param profile: ``~/.databrickscfg`` profile name, or ``None`` to select by
         host (env / OIDC service-principal credentials against that workspace).
     :returns: Shell command that prints a bearer token on stdout, or nothing.
     """
-    args = f"--host {shlex.quote(host.rstrip('/'))}"
+    argv = [sys.executable or "python3", "-P", "-m", "omnigent.inner.databricks_token"]
+    argv += ["--host", host.rstrip("/")]
     if profile:
-        args += f" --profile {shlex.quote(profile)}"
-    return f"python3 -m omnigent.inner.databricks_token {args}"
+        argv += ["--profile", profile]
+    return f"cd / && exec {shlex.join(argv)}"
 
 
 def databricks_bearer_token_command(
