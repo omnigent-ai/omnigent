@@ -21,6 +21,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
+    ClaudeSubmitUnconfirmed,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
     ClaudeUserPromptPending,
@@ -45,6 +46,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     ToolSpec,
     TurnComplete,
@@ -137,6 +139,8 @@ class ClaudeNativeExecutor(Executor):
             keystrokes (one terminal per conversation).
         :param content: User-supplied content, usually a string.
         :returns: ``True`` when tmux accepted the keystrokes.
+        :raises InjectionDeliveryAmbiguous: A submit may have delivered the input;
+            automatic replay could duplicate it.
         """
         del session_key
         if not _session_is_active(self._bridge_dir, self._request_session_id):
@@ -155,6 +159,8 @@ class ClaudeNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await self._inject_prompt(text, framework_notices(content))
+        except ClaudeSubmitUnconfirmed as exc:
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
         except RuntimeError:
             return False
         return True
