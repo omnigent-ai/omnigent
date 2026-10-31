@@ -6396,8 +6396,10 @@ function NewChatLandingContent({
     }
   }
 
-  const placeholderText = isMobileViewport
-    ? "Describe a task..."
+  const placeholderText = siblingSourceId
+    ? "What should this agent work on?"
+    : isMobileViewport
+      ? "Describe a task..."
     : selectedProject
       ? `Start a new session in ${selectedProject}`
       : "Describe a task to start a new session…";
@@ -6893,7 +6895,13 @@ function NewChatLandingContent({
         {/* On phones the heading yields its height first, so a long draft cannot
             push Send below the keyboard. */}
         <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
-          {selectedProject ? (
+          {siblingSourceId ? (
+            <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
+              <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">
+                <PlusIcon className="size-6 text-brand-accent" />
+              </span>
+            </div>
+          ) : selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
             // icon — the default pink folder, or a chosen emoji — and name the
             // project. Sized to Otto's h-16 box so the centered composer doesn't
@@ -6914,22 +6922,26 @@ function NewChatLandingContent({
           ) : (
             <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
           )}
-          {siblingSourceId && (
-            <div
-              className="mb-3 text-sm text-muted-foreground"
-              data-testid="sibling-composer-context"
-            >
-              {`Add new agent · ${siblingSource?.title ?? "New session"}`}
-              <p className="text-xs">
-                Starts a private, fresh conversation in this session family.
-              </p>
-            </div>
-          )}
-          {isMobileViewport || selectedProject || heading ? (
+          {siblingSourceId || isMobileViewport || selectedProject || heading ? (
             <h1 className="min-w-0 break-words text-center text-[28px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-              {isMobileViewport ? "Start a new session in" : selectedProject || heading}
+              {siblingSourceId
+                ? "Add an agent"
+                : isMobileViewport
+                  ? "Start a new session in"
+                  : selectedProject || heading}
             </h1>
           ) : null}
+          {siblingSourceId && (
+            <p
+              className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
+              data-testid="sibling-composer-context"
+            >
+              A new conversation alongside{" "}
+              <span className="font-medium text-foreground">
+                {siblingSource?.title?.trim() || "Untitled"}
+              </span>
+            </p>
+          )}
           {isMobileViewport && workspaceControls}
         </div>
         {/* Drop cue, spanning the landing surface. */}
