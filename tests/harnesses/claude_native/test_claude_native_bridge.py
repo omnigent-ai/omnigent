@@ -11180,12 +11180,12 @@ def _unreadable_process(pid: int = 4243) -> Mock:
         ),
         pytest.param(
             lambda now: [
-                _cpu_process(now / 10, pid=1),
+                _cpu_process(12.0, pid=1),
                 _cpu_process(12.0, pid=2)
                 if now < 170.0
-                else _cpu_process(1.0, pid=2, started=170.0),
+                else _cpu_process(now - 170.0, pid=2, started=170.0),
             ],
-            id="busy-root-outlives-a-recycled-child-pid",
+            id="busy-process-reuses-an-exited-child-pid",
         ),
         pytest.param(
             lambda now: [
@@ -11250,6 +11250,12 @@ def test_readiness_stops_at_the_cap_unless_the_boot_is_busy(
     ("pane_processes", "stopped_at", "extensions"),
     [
         pytest.param(lambda now: [_cpu_process(min(now, 200.0) / 2)], 240.0, 2, id="goes-idle"),
+        pytest.param(
+            lambda now: [_cpu_process(now / 2) if now < 210.0 else _unreadable_process(4242)],
+            210.0,
+            1,
+            id="becomes-unreadable",
+        ),
         pytest.param(
             lambda now: [_cpu_process(now)], 480.0, 10, id="stays-busy-until-the-ceiling"
         ),
