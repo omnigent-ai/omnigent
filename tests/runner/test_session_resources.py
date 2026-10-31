@@ -1753,6 +1753,7 @@ class _LaunchReturningRegistry(TerminalRegistry):
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        additional_read_roots: Any = (),
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 

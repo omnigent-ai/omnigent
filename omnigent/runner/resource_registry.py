@@ -19,7 +19,7 @@ import re
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1245,6 +1245,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """Launch a terminal required for the owning session to execute.
 
@@ -1265,6 +1266,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            additional_read_roots=additional_read_roots,
         )
 
     async def launch_auxiliary_terminal(
@@ -1278,6 +1280,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -1298,6 +1301,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            additional_read_roots=additional_read_roots,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -1312,6 +1316,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
@@ -1335,6 +1340,7 @@ class SessionResourceRegistry:
                 parent_os_env=parent_os_env,
                 cwd_override=cwd_override,
                 sandbox_override=sandbox_override,
+                additional_read_roots=additional_read_roots,
                 **program_status_args,
             )
         except TerminalExitedDuringLaunch as exc:
