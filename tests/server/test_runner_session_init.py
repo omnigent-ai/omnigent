@@ -16,6 +16,7 @@ from omnigent.entities import Conversation, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_ATTEMPT_HEADER,
     build_runner_session_init_payload,
     parse_runner_session_init_envelope,
 )
@@ -45,6 +46,7 @@ class _Registry:
 class _Client:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.headers: list[dict[str, str]] = []
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.status_code = 201
@@ -52,6 +54,7 @@ class _Client:
 
     async def post(self, _path: str, **kwargs: Any) -> httpx.Response:
         self.calls.append(kwargs["json"])
+        self.headers.append(kwargs.get("headers", {}))
         self.entered.set()
         await self.release.wait()
         return httpx.Response(self.status_code, json=self.response_json)
@@ -134,6 +137,9 @@ async def test_initializer_shares_result_for_one_tunnel_generation(
         if getattr(record, "event_name", None) == "runner_session_initialized"
     )
     assert completion.attributes["init_attempt_id"] == decisions[0].attributes["init_attempt_id"]
+    assert client.headers == [
+        {SESSION_INIT_ATTEMPT_HEADER: completion.attributes["init_attempt_id"]}
+    ]
     assert completion.attributes["duration_ms"] >= 0
     assert completion.attributes["init_trigger"] == "web_message"
     conversation.inference_snapshot = {"runtime_config": {"providers": {}}}
