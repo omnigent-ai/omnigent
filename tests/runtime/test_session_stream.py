@@ -964,6 +964,92 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         assert leaked.lower() not in flat
 
 
+@pytest.mark.parametrize("role", ["user", "assistant"])
+@pytest.mark.parametrize("text", ["", "private message"])
+def test_sse_message_progress_evidence_uses_real_serializer_without_content(
+    role: Literal["user", "assistant"], text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.entities.conversation import ConversationItem, MessageData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    item = ConversationItem(
+        id="opaque_message",
+        type="message",
+        status="completed",
+        response_id="opaque_response",
+        created_at=1753900000,
+        data=MessageData(
+            role=role,
+            content=[
+                {"type": "output_text" if role == "assistant" else "input_text", "text": text}
+            ],
+            agent="test-agent" if role == "assistant" else None,
+            is_meta=True,
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    with _capturing_sse_logger() as records:
+        session_stream.publish("conv_progress", event.model_dump())
+    assert len(records) == 1
+    assert records[0].attributes == {
+        "response_id": "opaque_response",
+        "item_id": "opaque_message",
+        "item_type": "message",
+        "item_role": role,
+        "item_has_text": bool(text),
+        "item_is_meta": True,
+    }
+    assert "private message" not in repr(records[0].__dict__)
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        ([], False),
+        ([{"type": "image", "url": "private image"}], False),
+        ([None, {"type": "output_text", "text": {"private": "payload"}}], False),
+        ([{"type": "text", "text": "private text"}], True),
+        ([{"type": "unknown", "text": "private text"}], False),
+        ("private malformed content", None),
+    ],
+)
+def test_sse_progress_evidence_omits_arbitrary_roles_and_malformed_content(
+    content: object, expected: bool | None
+) -> None:
+    attrs = session_stream._sse_safe_attributes(
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "private arbitrary role",
+                "content": content,
+                "is_meta": "private invalid flag",
+            },
+        }
+    )
+    assert attrs == {
+        "item_type": "message",
+        **({"item_has_text": expected} if expected is not None else {}),
+    }
+
+
+@pytest.mark.parametrize("delta,expected", [("private tokens", True), ("", False), ([], None)])
+def test_sse_final_text_reports_presence_without_logging_text(
+    delta: object, expected: bool | None
+) -> None:
+    attrs = session_stream._sse_safe_attributes(
+        {"type": "response.output_text.delta", "delta": delta, "final": True}
+    )
+    assert attrs == {
+        "final": True,
+        **({"text_delta_nonempty": expected} if expected is not None else {}),
+    }
+    assert (
+        session_stream._sse_safe_attributes({"type": "response.completed", "delta": delta}) == {}
+    )
+
+
 @pytest.mark.parametrize("count", [0, 2])
 def test_sse_status_preserves_background_task_count_without_details(count: int) -> None:
     attrs = session_stream._sse_safe_attributes(
