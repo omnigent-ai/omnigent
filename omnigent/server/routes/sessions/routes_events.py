@@ -2146,11 +2146,12 @@ def register_events_routes(
             ):
                 # The runner drops the old session's live SDK client and
                 # history (an older runner no-ops with 204); the work then
-                # moves to a fresh session on the same placement.
+                # moves to a fresh session on the same placement. The marker
+                # keeps a new runner from releasing for an older server.
                 release = await _forward_session_change_to_runner(
                     session_id,
                     runner_router,
-                    {"type": _CLEAR_TYPE},
+                    {"type": _CLEAR_TYPE, "continue_in_new_session": True},
                     timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
                 )
                 if release is not None and release.status_code == 409:

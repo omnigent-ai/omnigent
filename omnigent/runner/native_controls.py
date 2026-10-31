@@ -2315,8 +2315,9 @@ def build_native_controls(
     async def _handle_claude_sdk_clear(conv_id: str) -> Response:
         """Drop a claude-sdk session's live client and history before ``/clear``.
 
-        The server then continues the work in a fresh session, so this one
-        ends here; a later message rebuilds its client from the transcript.
+        Called only for a ``clear`` marked ``continue_in_new_session``: the
+        server then continues the work in a fresh session, so this one ends
+        here; a later message rebuilds its client from the transcript.
         Refused with 409 while a turn runs or messages wait for one, through
         the same ingest gate the message path uses.
         """

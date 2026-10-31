@@ -7602,7 +7602,13 @@ def create_runner_app(
                 return await _handle_codex_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "opencode-native":
                 return await _handle_opencode_native_clear(conversation_id)
-            if _session_harness_name(conversation_id) == "claude-sdk":
+            # Only a server that continues the work in a new session marks the
+            # request; an older server's plain clear keeps the unsupported 204.
+            if (
+                _session_harness_name(conversation_id) == "claude-sdk"
+                and isinstance(body, dict)
+                and body.get("continue_in_new_session") is True
+            ):
                 return await _handle_claude_sdk_clear(conversation_id)
             return Response(status_code=204)
 
