@@ -5494,6 +5494,31 @@ describe("SSH connect IPC", () => {
     });
   }
 
+  // On the remote machine, localhost is that machine; a LAN address may be reachable.
+  const reachCases = {
+    "a server on localhost": ["http://localhost:5190", false],
+    "a server on 127.0.0.1": ["http://127.0.0.1:6767", false],
+    "a server on [::1]": ["http://[::1]:6767", false],
+    "a server on another machine in the network": ["http://192.168.1.20:6767", true],
+  };
+  for (const [label, [serverUrl, connects]] of Object.entries(reachCases)) {
+    it(`${connects ? "connects" : "refuses before connecting"} for ${label}`, async (t) => {
+      const h = sshHarness(t, { serverUrl });
+      const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+      const result = await h.ipc.get("omnigent:ssh-connect")(event, "devbox");
+
+      assert.equal(result.ok, connects);
+      assert.equal(h.calls.sshConnects.length, connects ? 1 : 0);
+      if (!connects) {
+        assert.equal(
+          result.error,
+          `devbox can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server devbox can reach, or, if devbox runs this server itself, run "omnigent host" there.`,
+        );
+      }
+    });
+  }
+
   it("gives no page a way to list the user's SSH hosts", (t) => {
     // Aliases can name internal machines, and the server page is untrusted.
     const h = sshHarness(t);

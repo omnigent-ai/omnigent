@@ -56,6 +56,7 @@ const {
   normalizeSavedServerUrl,
   fetchServerManifest,
   isDatabricksManagedServerUrl,
+  isLoopbackServerUrl,
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
   parseManifestAuth,
@@ -4917,6 +4918,14 @@ function registerIpc() {
       target = sshConnect.validateDestination(destination);
     } catch (error) {
       return { ok: false, error: error.message };
+    }
+    // On the remote machine, localhost is that machine, so this server is out of
+    // its reach; refuse before the install and sign-in rather than after.
+    if (isLoopbackServerUrl(serverUrl)) {
+      return {
+        ok: false,
+        error: `${target} can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server ${target} can reach, or, if ${target} runs this server itself, run "omnigent host" there.`,
+      };
     }
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
