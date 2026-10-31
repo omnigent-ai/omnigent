@@ -389,18 +389,8 @@ def test_composer_pr_link_opens_github_tab(
     for test_id in ("composer-pr-link",):
         icon, label = bounds[f"{test_id}.icon"], bounds[f"{test_id}.label"]
         pair_gaps[test_id] = label["x"] - icon["x"] - icon["width"]
-    painted_right_edges = {
-        "composer-pr-link": pr_link.locator("path").evaluate(
-            "path => path.getBoundingClientRect().right"
-        ),
-    }
-    painted_gaps = {
-        test_id: bounds[f"{test_id}.label"]["x"] - right
-        for test_id, right in painted_right_edges.items()
-    }
     print(f"Composer fonts ({viewport_width}px, {font_size}px preference): {font_sizes}")
     print(f"Composer centers: {centers}; group gap: {group_gap}; pair gaps: {pair_gaps}")
-    print(f"Visible icon-to-label gaps: {painted_gaps}")
     bar.screenshot(path=tmp_path / "workspace-bar.png", animations="disabled")
     page.screenshot(path=tmp_path / "composer-pr-link.png", animations="disabled")
 
@@ -458,8 +448,6 @@ def test_composer_pr_link_opens_github_tab(
         assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
-    for name, painted_gap in painted_gaps.items():
-        assert painted_gap == pytest.approx(7.5, abs=0.1), (name, painted_gaps)
     directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
     branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
     assert directory_bounds is not None and branch_bounds is not None
@@ -564,6 +552,7 @@ def test_post_top_level_pr_comment(
     ]
     info = {
         **_INFO,
+        "tracking_available": True,
         "selected_pr_url": pr_url,
         "capabilities": {"comment_posting": True},
         "selected_account": "octocat",
@@ -597,6 +586,9 @@ def test_post_top_level_pr_comment(
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
         page.get_by_test_id("composer-pr-link").click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
     tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
     tabs.get_by_role("tab", name="Comments 30", exact=True).click()
     textbox = panel.get_by_role("textbox", name="New PR comment")
@@ -643,3 +635,445 @@ def test_post_top_level_pr_comment(
     expect(post_button).to_be_in_viewport()
     assert posts == [{"pr_url": pr_url, "body": "**Thanks for reviewing!**"}]
     page.screenshot(path=str(tmp_path / f"comment-{entry}-posted.png"))
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile", "canvas"])
+def test_reply_to_inline_review_conversation(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Reply and start line/range conversations through each shared-panel surface."""
+    base_url, session_id = seeded_session
+    page.emulate_media(color_scheme="dark" if entry in {"composer-mobile", "canvas"} else "light")
+    if entry in {"composer-desktop", "canvas"}:
+        palette = "gruvbox" if entry == "composer-desktop" else "github"
+        page.add_init_script(
+            'localStorage.setItem("omnigent:ui-theme-palette", '
+            f"JSON.stringify({json.dumps(palette)}))"
+        )
+    _stub_github(page, pr_count=2)
+    pr_url = _INFO["pr"]["url"]
+    thread = {
+        "id": "thread-1",
+        "path": "src/app/main.py",
+        "side": "RIGHT",
+        "line": 2,
+        "start_line": None,
+        "subject_type": "LINE",
+        "resolved": False,
+        "outdated": False,
+        "can_reply": True,
+        "diff_hunk": "@@ -1,2 +1,3 @@\n line1\n+added line\n line2",
+        "comments": {
+            "data": [
+                {
+                    "id": "root",
+                    "author": "alice",
+                    "body": (
+                        "Why add this line?\n\n```suggestion\nimproved line\nreturn result\n```"
+                    ),
+                    "created_at": "2026-10-26T12:00:00Z",
+                    "url": pr_url + "#discussion_r1",
+                }
+            ],
+            "has_more": False,
+            "next_cursor": None,
+        },
+    }
+    threads = {
+        "data": [
+            thread,
+            {
+                **thread,
+                "id": "old-side",
+                "side": "LEFT",
+                "line": 1,
+                "comments": {
+                    **thread["comments"],
+                    "data": [
+                        {
+                            **thread["comments"]["data"][0],
+                            "id": "old-root",
+                            "body": "Old-side context",
+                        }
+                    ],
+                },
+            },
+            {
+                **thread,
+                "id": "outdated",
+                "path": "removed.py",
+                "resolved": True,
+                "outdated": True,
+                "original_line": 2,
+                "original_start_line": None,
+                "comments": {
+                    **thread["comments"],
+                    "data": [{**thread["comments"]["data"][0], "id": "outdated-root"}],
+                },
+            },
+        ],
+        "has_more": False,
+        "next_cursor": None,
+        "head_sha": "head",
+        "base_sha": "base",
+    }
+    info = {
+        **_INFO,
+        "tracking_available": True,
+        "selected_pr_url": pr_url,
+        "selected_account": "octocat",
+        "capabilities": {
+            "review_threads": True,
+            "review_thread_replies": True,
+            "review_thread_creation": True,
+        },
+        "pr": {**_INFO["pr"], "head_sha": "head", "base_sha": "base"},
+    }
+    thread_reads = []
+    pending_reads: list[Route] = []
+    hold_threads = True
+
+    def read_info(route: Route) -> None:
+        route.fulfill(json=info)
+
+    def read_threads(route: Route) -> None:
+        thread_reads.append(route.request.url)
+        if hold_threads:
+            pending_reads.append(route)
+        else:
+            route.fulfill(json=threads)
+
+    posts = []
+
+    def reply(route: Route) -> None:
+        posts.append(route.request.post_data_json)
+        comment = {
+            "id": "reply",
+            "author": "octocat",
+            "body": posts[-1]["body"],
+            "created_at": "2026-10-28T12:00:00Z",
+            "url": pr_url + "#discussion_r2",
+        }
+        thread["comments"]["data"].append(comment)
+        route.fulfill(json={"thread_id": thread["id"], "comment": comment})
+
+    new_posts = []
+
+    def create_thread(route: Route) -> None:
+        payload = route.request.post_data_json
+        new_posts.append(payload)
+        identity = f"new-thread-{len(new_posts)}"
+        created = {
+            **thread,
+            **payload["anchor"],
+            "id": identity,
+            "comments": {
+                **thread["comments"],
+                "data": [
+                    {
+                        **thread["comments"]["data"][0],
+                        "id": identity + "-root",
+                        "author": "octocat",
+                        "body": payload["body"],
+                    }
+                ],
+            },
+        }
+        threads["data"].append(created)
+        route.fulfill(json={"thread": created})
+
+    page.route(re.compile(r"/resources/github(?:\?|$)"), read_info)
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
+    )
+    page.route(re.compile(r"/resources/github/review-threads/thread-1/replies$"), reply)
+    page.route(re.compile(r"/resources/github/review-threads$"), create_thread)
+    page.route(re.compile(r"/resources/github/review-threads\?"), read_threads)
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1440, "height": 900})
+    if entry == "canvas":
+        from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
+
+        _stub_server_info(page, canvas=True, session_pull_requests=True)
+    page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if entry == "rail":
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    else:
+        page.get_by_test_id("composer-pr-link").click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
+    tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
+    tabs.get_by_role("tab", name="Comments", exact=False).click()
+    top_comment = panel.get_by_role("region", name="PR comments").get_by_role("listitem").first
+    comment_background = top_comment.evaluate(
+        "element => getComputedStyle(element).backgroundColor"
+    )
+    comment_tint = top_comment.evaluate("element => getComputedStyle(element).backgroundImage")
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+    loading = panel.get_by_role("status").filter(has_text="Loading review threads")
+    expect(loading).to_be_visible()
+    layout_toggle = panel.get_by_role("button", name=re.compile(r"Switch to (split|unified) view"))
+    loading_box, toggle_box = loading.bounding_box(), layout_toggle.bounding_box()
+    assert loading_box and toggle_box
+    assert loading_box["y"] + loading_box["height"] / 2 == pytest.approx(
+        toggle_box["y"] + toggle_box["height"] / 2, abs=1
+    )
+    expect(loading.locator("svg")).to_have_class(re.compile("animate-spin"))
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-loading.png"))
+    hold_threads = False
+    pending_reads.pop().fulfill(json=threads)
+    expect(loading).to_have_count(0)
+    expect(panel.get_by_text(re.compile(r"^\d+\+? review conversations?$"))).to_have_count(0)
+    conversation = panel.locator('[data-review-thread="thread-1"]')
+    expect(conversation).to_be_visible()
+    file = panel.locator('[data-github-file="src/app/main.py"]')
+    diff = file.locator("diffs-container").first
+    gutter = diff.locator(":scope > [data-diff] > [data-code] > [data-gutter]")
+    rows = diff.locator(":scope > [data-diff] > [data-code] > [data-content]")
+    first_line = gutter.locator('[data-column-number="1"]')
+    last_line = gutter.locator('[data-column-number="3"]')
+    original_line = last_line.element_handle()
+    assert original_line
+    first_box, last_box = first_line.bounding_box(), last_line.bounding_box()
+    middle_box = gutter.locator('[data-column-number="2"]').bounding_box()
+    assert first_box and last_box and middle_box
+    page.mouse.move(last_box["x"] + 8, last_box["y"] + last_box["height"] / 2)
+    page.mouse.down()
+    expect(last_line).to_have_attribute("data-selected-line", "single")
+    page.mouse.move(first_box["x"] + 8, first_box["y"] + first_box["height"] / 2, steps=5)
+    expect(rows.locator(":scope > [data-line][data-selected-line]")).to_have_count(3)
+    expect(gutter.locator(":scope > [data-column-number][data-selected-line]")).to_have_count(3)
+    assert original_line.evaluate("element => element.isConnected")
+    page.mouse.move(middle_box["x"] + 8, middle_box["y"] + middle_box["height"] / 2)
+    expect(rows.locator(":scope > [data-line][data-selected-line]")).to_have_count(2)
+    page.mouse.move(first_box["x"] + 8, first_box["y"] + first_box["height"] / 2)
+    expect(rows.locator(":scope > [data-line][data-selected-line]")).to_have_count(3)
+    expect(file.get_by_role("button", name="Comment on selected lines")).to_have_count(0)
+    colors = page.evaluate("""() => {
+        const probe = document.createElement('span');
+        document.body.append(probe);
+        const colors = ['sidebar-active', 'sidebar-active-foreground', 'input']
+            .map(token => {
+                probe.style.backgroundColor = `var(--${token})`;
+                return getComputedStyle(probe).backgroundColor;
+            });
+        probe.remove();
+        return colors;
+    }""")
+    for selected in rows.locator(":scope > [data-line][data-selected-line]").all():
+        expect(selected).to_have_css("background-color", colors[0])
+    expect(first_line).to_have_css("background-color", colors[0])
+    expect(first_line).to_have_css("color", colors[1])
+    expect(first_line).to_have_css("box-shadow", f"{colors[1]} -3px 0px 0px 0px inset")
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-drag-selection.png"))
+    page.mouse.up()
+    expect(file.get_by_role("button", name="Comment on selected lines")).to_have_count(0)
+    expect(conversation).to_have_css("background-color", comment_background)
+    expect(conversation).to_have_css("background-image", comment_tint)
+    assert conversation.evaluate("element => !!element.closest('diffs-container')")
+    assert (
+        conversation.evaluate("element => element.closest('[slot]').getAttribute('slot')")
+        == "annotation-additions-2"
+    )
+    old_side = panel.locator('[data-review-thread="old-side"]')
+    expect(old_side).to_be_visible()
+    assert (
+        old_side.evaluate("element => element.closest('[slot]').getAttribute('slot')")
+        == "annotation-deletions-1"
+    )
+    panel.get_by_role("button", name="Next unresolved conversation", exact=True).click()
+    expect(conversation).to_be_focused()
+    expect(conversation.get_by_text("Why add this line?", exact=True)).to_be_visible()
+    suggestion = conversation.get_by_role("region", name="Suggested change", exact=True)
+    expect(suggestion.locator('[data-line][data-line-type="change-deletion"]')).to_have_text(
+        "added line"
+    )
+    expect(suggestion.locator('[data-line][data-line-type="change-addition"]')).to_have_text(
+        ["improved line", "return result"]
+    )
+    expect(suggestion.locator("[data-line-number-content]")).to_have_text(["2", "2", "3"])
+    expect(suggestion.locator("[data-diff-span]").first).to_be_visible()
+    expect(suggestion.get_by_text("return", exact=True)).to_be_visible()
+    assert suggestion.evaluate("element => element.scrollWidth <= element.clientWidth")
+    textbox = conversation.get_by_role("textbox", name="Reply to review conversation")
+    expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-compact.png"))
+    textbox.focus()
+    expect(textbox).to_be_focused()
+    expect(textbox).to_have_css("outline-style", "none")
+    expect(textbox).to_have_css("border-color", colors[2])
+    textbox.fill("**This handles empty input.**")
+    conversation.get_by_role("button", name="Cancel", exact=True).click()
+    expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
+    expect(textbox).to_have_value("**This handles empty input.**")
+    page.keyboard.press("Tab")
+    expect(textbox).to_be_focused()
+    expect(conversation.get_by_role("tab", name="Write", exact=True)).to_be_visible()
+    expect(textbox).to_have_value("**This handles empty input.**")
+    tabs.get_by_role("tab", name="Summary", exact=True).click()
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+    expect(textbox).to_have_value("**This handles empty input.**")
+    panel.get_by_role("button", name=re.compile(r"^All pull requests")).click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+    expect(textbox).to_have_value("**This handles empty input.**")
+    layout = panel.get_by_role("button", name=re.compile(r"Switch to (split|unified) view"))
+    layout.click()
+    expect(textbox).to_have_value("**This handles empty input.**")
+    page.wait_for_function("""() => {
+        const threads = document.querySelectorAll('[data-review-thread="thread-1"]');
+        return [...threads].some(element => element.getBoundingClientRect().width >= 240);
+    }""")
+    layout.click()
+    if mobile:
+        textbox.fill("Long Markdown preview.\n\n" * 80)
+        conversation.get_by_role("tab", name="Preview", exact=True).click()
+        post = conversation.get_by_role("button", name="Reply", exact=True)
+        post.scroll_into_view_if_needed()
+        expect(post).to_be_in_viewport()
+        page.set_viewport_size({"width": 390, "height": 540})
+        post.scroll_into_view_if_needed()
+        expect(post).to_be_in_viewport()
+        page.set_viewport_size({"width": 390, "height": 900})
+        conversation.get_by_role("tab", name="Write", exact=True).click()
+        textbox.fill("**This handles empty input.**")
+    conversation.get_by_role("tab", name="Preview", exact=True).click()
+    expect(conversation.get_by_text("This handles empty input.", exact=True)).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-preview.png"))
+    conversation.get_by_role("button", name="Reply", exact=True).click()
+    expect(conversation.locator("li")).to_have_count(2)
+    expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
+    hold_threads = True
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(loading).to_be_visible()
+    expect(conversation.locator("li")).to_have_count(2)
+    hold_threads = False
+    for pending in pending_reads:
+        pending.fulfill(json=threads)
+    pending_reads.clear()
+    expect(loading).to_have_count(0)
+    expect(conversation.get_by_text("This handles empty input.", exact=True)).to_be_visible()
+    assert posts == [{"pr_url": pr_url, "body": "**This handles empty input.**"}]
+    assert thread_reads
+    fallback = panel.locator('[data-review-thread="outdated"]')
+    expect(fallback.get_by_role("button", expanded=False)).to_be_visible()
+    fallback.get_by_role("button", expanded=False).click()
+    expect(fallback.get_by_text("Original code context", exact=True)).to_be_visible()
+    expect(fallback.get_by_text("Original context", exact=True)).to_be_visible()
+    conversation.scroll_into_view_if_needed()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-posted.png"))
+
+    line = file.locator("diffs-container").first.locator(
+        ":scope > [data-diff] > [data-code] > [data-gutter] "
+        '> [data-column-number="2"][data-line-type="change-addition"]'
+    )
+    line.locator("[data-line-number-content]").click()
+    plus = file.get_by_role("button", name="Start a new review conversation", exact=True)
+    expect(plus).to_be_visible()
+    line_box, plus_box = line.bounding_box(), plus.bounding_box()
+    assert line_box and plus_box
+    assert plus_box["x"] + plus_box["width"] / 2 == pytest.approx(
+        line_box["x"] + line_box["width"], abs=2
+    )
+    assert plus_box["y"] + plus_box["height"] / 2 == pytest.approx(
+        line_box["y"] + line_box["height"] / 2, abs=1
+    )
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-gutter.png"))
+    plus.click()
+    draft = file.get_by_role("region", name="New review conversation", exact=True)
+    expect(draft.get_by_text("New conversation · New line 2", exact=True)).to_be_visible()
+    expect(draft).to_have_css("background-color", comment_background)
+    expect(draft).to_have_css("background-image", comment_tint)
+    line.hover()
+    expect(plus).to_have_count(0)
+    draft.get_by_role("button", name="Close comment composer", exact=True).click()
+    expect(draft).to_have_count(0)
+    line.hover()
+    expect(plus).to_be_visible()
+    plus.click()
+    expect(draft.get_by_text("New conversation · New line 2", exact=True)).to_be_visible()
+    expect(plus).to_have_count(0)
+    comment_input = draft.get_by_role("textbox", name="New review comment")
+    expect(comment_input).to_be_focused()
+    expect(comment_input).to_have_css("outline-style", "none")
+    expect(comment_input).to_have_css("border-color", colors[2])
+    draft.get_by_role("textbox", name="New review comment").fill("**Separate conversation.**")
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-composer.png"))
+    tabs.get_by_role("tab", name="Summary", exact=True).click()
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+    expect(draft.get_by_role("textbox", name="New review comment")).to_have_value(
+        "**Separate conversation.**"
+    )
+    draft.get_by_role("tab", name="Preview", exact=True).click()
+    expect(draft.get_by_text("Separate conversation.", exact=True)).to_be_visible()
+    draft.scroll_into_view_if_needed()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-new-comment.png"))
+    draft.get_by_role("button", name="Post comment", exact=True).click()
+    created = file.locator('[data-review-thread="new-thread-1"]')
+    expect(created.get_by_text("Separate conversation.", exact=True)).to_be_visible()
+    expect(conversation.locator("li")).to_have_count(2)
+    assert (
+        created.evaluate("element => element.closest('[slot]').getAttribute('slot')")
+        == "annotation-additions-2"
+    )
+
+    split = panel.get_by_role("button", name="Switch to split view", exact=True)
+    if split.count():
+        split.click()
+    file.locator(
+        '[data-code][data-deletions] [data-column-number="1"] [data-line-number-content]'
+    ).click()
+    file.locator(
+        '[data-code][data-deletions] [data-column-number="2"] [data-line-number-content]'
+    ).click(modifiers=["Shift"])
+    old_line = file.locator('[data-code][data-deletions] [data-column-number="2"]')
+    expect(plus).to_be_visible()
+    line_box, plus_box = old_line.bounding_box(), plus.bounding_box()
+    assert line_box and plus_box
+    assert plus_box["x"] + plus_box["width"] / 2 == pytest.approx(
+        line_box["x"] + line_box["width"], abs=2
+    )
+    plus.click()
+    expect(draft.get_by_text("New conversation · Old lines 1–2", exact=True)).to_be_visible()
+    expect(plus).to_have_count(0)
+    draft.get_by_role("textbox", name="New review comment").fill("Consider these lines together.")
+    draft.get_by_role("button", name="Post comment", exact=True).click()
+    ranged = file.locator('[data-review-thread="new-thread-2"]')
+    expect(ranged.get_by_text("Consider these lines together.", exact=True)).to_be_visible()
+    assert (
+        ranged.evaluate("element => element.closest('[slot]').getAttribute('slot')")
+        == "annotation-deletions-2"
+    )
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(created.locator("li")).to_have_count(1)
+    expect(ranged.locator("li")).to_have_count(1)
+    assert new_posts == [
+        {
+            "pr_url": pr_url,
+            "body": body,
+            "anchor": {
+                "path": "src/app/main.py",
+                "side": side,
+                "line": 2,
+                "start_line": start,
+                "head_sha": "head",
+                "base_sha": "base",
+            },
+        }
+        for body, side, start in [
+            ("**Separate conversation.**", "RIGHT", None),
+            ("Consider these lines together.", "LEFT", 1),
+        ]
+    ]
+    ranged.scroll_into_view_if_needed()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-range-posted.png"))

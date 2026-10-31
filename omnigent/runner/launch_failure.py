@@ -24,6 +24,7 @@ from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
+    "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
@@ -40,6 +41,8 @@ __all__ = [
 CODEX_COMPACTION_MODEL_FAILED = "codex_compaction_model_failed"
 # A Codex turn failed because the model provider's token command gave Codex no token.
 CODEX_PROVIDER_AUTH_FAILED = "codex_provider_auth_failed"
+# A runner that connected and then exited, as opposed to one that never came up.
+RUNNER_PROCESS_CRASH = "runner_process_crash"
 
 
 @dataclass(frozen=True)
@@ -208,6 +211,24 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
 )
 
 
+# A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
+# ``killall tmux`` run anywhere on the host stops that server too.
+TERMINAL_CLOSED_OUTSIDE_OMNIGENT = FailureDiagnosis(
+    title="Claude Code's terminal was closed outside Omnigent",
+    cause=(
+        "Claude Code's tmux session, or the tmux server running it, was ended and Omnigent "
+        "did not end it. A tmux command such as `tmux kill-session`, `tmux kill-server` or "
+        "`killall tmux`, or another tool on the host, closes it this way."
+    ),
+    remediation=(
+        "Send your message again to relaunch Claude Code. Don't use `killall tmux` or kill "
+        "tmux sessions you didn't start; give your own tmux its own server with "
+        "`tmux -L <name>` and stop it with `tmux -L <name> kill-server`."
+    ),
+    category=ErrorCategory.USER,
+)
+
+
 def classify_terminal_failure(
     *,
     command: str | None,
@@ -279,6 +300,7 @@ _CODEX_PROVIDER_AUTH_FAILURE = re.compile(
     r"|produced an empty token|timed out|failed to start|wrote non-UTF-8)"
 )
 _EXIT_STATUS_PREFIX = re.compile(r"^\s*(?:exit status: -?\d+|signal: \d+[^:\n]*):?\s*")
+_STORAGE_EXHAUSTED_FRAGMENTS = ("no space left on device", "disk quota exceeded")
 # Shells that wrap a token helper; the helper to run is in their arguments.
 _SHELL_PROGRAMS = frozenset({"sh", "bash", "zsh", "dash"})
 # Persisted error labels hold 256 characters.
@@ -382,8 +404,8 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
     """Explain a model provider token command that failed, naming the command to run.
 
     A custom Codex model provider can set ``auth.command`` (for example
-    ``isaac``) to print a bearer token. When that command fails, every turn
-    fails until the user signs in with it again; ``codex login`` doesn't help.
+    ``isaac``) to print a bearer token. Its output can identify an expired
+    login or exhausted host storage, which need different recovery steps.
 
     :param message: Codex's turn error, e.g. ``"provider auth command `isaac`
         exited with status exit status: 1: ... Run `isaac` to log in and try again."``.
@@ -412,6 +434,18 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
         if helper_output
         else f"{cause}."
     )
+    if helper_output and any(
+        fragment in helper_output.lower() for fragment in _STORAGE_EXHAUSTED_FRAGMENTS
+    ):
+        return FailureDiagnosis(
+            title="Host storage is full",
+            cause=cause,
+            remediation=(
+                "Free space or inodes on the affected host filesystem, or raise its disk quota, "
+                "then send your message again."
+            ),
+            category=ErrorCategory.HOST,
+        )
     if outcome == "failed to start":
         remediation = (
             f"Check that `{command}` is installed and on PATH on the host, "
@@ -607,6 +641,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The agent CLI on the host is too old for the selected model. Update it on the "
         "host, then start a new session."
     ),
+    "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 

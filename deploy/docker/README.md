@@ -322,6 +322,23 @@ device sign-in fails with "IdP did not confirm re-authentication" because the
 IdP omits `auth_time` (for example, Cloudflare Access), opt out with
 `OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off.
 
+### Forced re-authentication window
+
+A CLI, host or device login asks the identity provider to re-authenticate the
+user rather than reuse its own session, sending `prompt=login` with a
+`max_age` of 300 seconds. Freshness is enforced by the server, which requires
+the id_token's `auth_time` to be at or after the moment it demanded
+re-authentication, so this value is a bound the provider must be able to honour
+rather than the security gate itself.
+
+`OMNIGENT_OIDC_REAUTH_MAX_AGE` changes the window for a provider that needs a
+different one. A value that is not a positive number of seconds is ignored and
+logged, because zero is a known incompatibility: Microsoft Entra ID caps the
+id_token's `exp` at `auth_time + max_age`, so a zero window returns a token
+that expires as it is issued and is accepted only within the server's
+clock-skew allowance, and some providers, such as Authelia, cannot complete
+consent when asked for `max_age=0`.
+
 To verify a deployment, restart with the settings above, sign in from a private
 browser window, then run `omnigent login <server-url>` and finish the browser
 flow. Confirm both identify the expected account. The identity provider must
