@@ -9,6 +9,8 @@ path produced the edge, and hold the publish sites to passing one.
 from __future__ import annotations
 
 import ast
+import asyncio
+import functools
 import logging
 from pathlib import Path
 from unittest.mock import Mock
@@ -39,6 +41,9 @@ def _clean_status_cache() -> None:
     yield
     helpers._session_status_cache.clear()
     helpers._session_active_response_cache.clear()
+    for handle, _publish in list(helpers._held_bare_failures.values()):
+        handle.cancel()
+    helpers._held_bare_failures.clear()
 
 
 def _publish_failed(
@@ -127,17 +132,28 @@ def test_unattributed_failure_is_labelled_not_blank(
     assert record.attributes["origin"] == "unattributed"
 
 
+def _call_name(node: ast.expr) -> str | None:
+    """Return the called name of ``f`` or ``module.f``."""
+    return node.attr if isinstance(node, ast.Attribute) else getattr(node, "id", None)
+
+
 def _failure_publish_calls(source: str) -> list[ast.Call]:
-    """Return ``_publish_status`` calls that can publish a failure."""
+    """Return ``_publish_status`` calls, direct or bound with ``partial``, that can fail."""
     calls: list[ast.Call] = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call):
             continue
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-        if name != "_publish_status":
+        args = node.args
+        # ``functools.partial(_publish_status, ...)`` publishes later; check it the same way.
+        if (
+            _call_name(node.func) == "partial"
+            and args
+            and _call_name(args[0]) == "_publish_status"
+        ):
+            args = args[1:]
+        elif _call_name(node.func) != "_publish_status":
             continue
-        status = node.args[1] if len(node.args) > 1 else None
+        status = args[1] if len(args) > 1 else None
         if isinstance(status, ast.Constant) and status.value in _NON_FAILURE_STATUSES:
             continue
         calls.append(node)
@@ -211,6 +227,92 @@ def test_short_failure_detail_is_preserved_verbatim(
         origin="native_terminal_boot_failed",
     )
     assert record.getMessage().endswith(": Native Codex terminal failed to start")
+
+
+def _hold_bare_relayed_failure(session_id: str) -> None:
+    """Hold a causeless ``failed`` edge the way the relay does for an older runner."""
+    helpers.hold_bare_failure(
+        session_id,
+        functools.partial(
+            helpers._publish_status,
+            session_id,
+            "failed",
+            None,
+            failure_origin="relayed_runner_status",
+        ),
+    )
+
+
+def _turn_failures(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeats", [1, 2], ids=["one-bare-edge", "re-sent-bare-edge"])
+async def test_held_bare_failure_is_replaced_by_its_cause(
+    caplog: pytest.LogCaptureFixture, repeats: int
+) -> None:
+    """The turn fails once, with the hook's cause and the status it was leaving."""
+    helpers._session_status_cache["conv_bare"] = "running"
+    with caplog.at_level(logging.ERROR, logger="omnigent.server.routes.sessions"):
+        for _ in range(repeats):
+            _hold_bare_relayed_failure("conv_bare")
+        assert helpers._session_status_cache.get("conv_bare") == "running"
+        helpers._publish_status(
+            "conv_bare",
+            "failed",
+            ErrorDetail(
+                code="transient_upstream_error", message="API Error: Server error mid-response."
+            ),
+            failure_origin="external_session_status",
+        )
+    [failure] = _turn_failures(caplog)
+    assert failure.attributes["code"] == "transient_upstream_error"
+    assert failure.attributes["origin"] == "external_session_status"
+    assert failure.attributes["previous_status"] == "running"
+    assert "conv_bare" not in helpers._held_bare_failures
+    # The cancelled grace timer must not publish the bare edge afterwards.
+    await asyncio.sleep(0)
+    assert len(_turn_failures(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_held_bare_failure_publishes_when_its_cause_never_arrives(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a cause, the bare edge publishes unchanged once the grace ends."""
+    monkeypatch.setattr(helpers, "ERROR_HOOK_GRACE_S", 0.01)
+    helpers._session_status_cache["conv_bare"] = "running"
+    with caplog.at_level(logging.ERROR, logger="omnigent.server.routes.sessions"):
+        _hold_bare_relayed_failure("conv_bare")
+        for _ in range(100):
+            if _turn_failures(caplog):
+                break
+            await asyncio.sleep(0.01)
+    [failure] = _turn_failures(caplog)
+    assert failure.attributes["code"] == "none"
+    assert failure.attributes["origin"] == "relayed_runner_status"
+    assert failure.attributes["previous_status"] == "running"
+    assert helpers._session_status_cache.get("conv_bare") == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_status", ["running", "idle"])
+async def test_other_edge_publishes_the_held_bare_failure_first(
+    caplog: pytest.LogCaptureFixture, next_status: str
+) -> None:
+    """A later non-failure edge keeps today's order: the bare failure, then the edge."""
+    helpers._session_status_cache["conv_bare"] = "running"
+    with caplog.at_level(logging.ERROR, logger="omnigent.server.routes.sessions"):
+        _hold_bare_relayed_failure("conv_bare")
+        helpers._publish_status("conv_bare", next_status)
+    [failure] = _turn_failures(caplog)
+    assert failure.attributes["code"] == "none"
+    assert failure.attributes["previous_status"] == "running"
+    # ``failed`` stays sticky against a trailing idle; a running edge clears it.
+    expected = "failed" if next_status == "idle" else "running"
+    assert helpers._session_status_cache.get("conv_bare") == expected
+    assert "conv_bare" not in helpers._held_bare_failures
 
 
 def test_every_failure_publish_site_names_itself() -> None:

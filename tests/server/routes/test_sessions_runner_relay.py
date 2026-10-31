@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Any, cast
@@ -1169,13 +1169,20 @@ class _ScriptedThenDropStreamResponse:
         before the tunnel drop.
     :param gate: Event the test sets once subscribed, gating the frames and
         the drop so the collector observes every scripted frame.
+    :param before_drop: Awaited after the relay handled every frame and before
+        the drop, e.g. to post what the runner's hook sends meanwhile.
     """
 
     def __init__(
-        self, frames: list[str], gate: asyncio.Event, connection: dict[str, object] | None = None
+        self,
+        frames: list[str],
+        gate: asyncio.Event,
+        connection: dict[str, object] | None = None,
+        before_drop: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._frames = frames
         self._gate = gate
+        self._before_drop = before_drop
         self.extensions = {"omnigent_runner_connection": connection}
 
     async def __aenter__(self) -> _ScriptedThenDropStreamResponse:
@@ -1201,6 +1208,9 @@ class _ScriptedThenDropStreamResponse:
         await self._gate.wait()
         for frame in self._frames:
             yield frame
+        # Resumed only once the relay has handled the last frame.
+        if self._before_drop is not None:
+            await self._before_drop()
         raise ConnectionError("tunnel closed before request completed")
 
 
@@ -1208,10 +1218,15 @@ class _ScriptedThenDropRunnerClient:
     """Fake runner client whose stream replays scripted frames then drops."""
 
     def __init__(
-        self, frames: list[str], gate: asyncio.Event, connection: dict[str, object] | None = None
+        self,
+        frames: list[str],
+        gate: asyncio.Event,
+        connection: dict[str, object] | None = None,
+        before_drop: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._frames = frames
         self._gate = gate
+        self._before_drop = before_drop
         self.extensions = {"omnigent_runner_connection": connection}
 
     def stream(
@@ -1223,7 +1238,10 @@ class _ScriptedThenDropRunnerClient:
     ) -> _ScriptedThenDropStreamResponse:
         del method, path, timeout
         return _ScriptedThenDropStreamResponse(
-            self._frames, self._gate, self.extensions["omnigent_runner_connection"]
+            self._frames,
+            self._gate,
+            self.extensions["omnigent_runner_connection"],
+            self._before_drop,
         )
 
 
@@ -1327,6 +1345,98 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._intentional_stop_sessions.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause_follows", [True, False], ids=["cause-follows", "no-cause"])
+async def test_relay_holds_a_bare_failed_edge_for_its_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    cause_follows: bool,
+) -> None:
+    """
+    A causeless ``failed`` edge waits for the cause the runner's hook posts next.
+
+    An older runner reports Claude's error state as a bare ``failed`` edge, and
+    its ``StopFailure`` hook posts the API error about a second later. The turn
+    must fail once, with that cause and the status it was leaving, not as a
+    causeless failure followed by a second one. Without a cause, the bare edge
+    still publishes when the grace runs out, while the stream is still up.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as session_helpers
+    from omnigent.server.schemas import ErrorDetail
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    # A grace far past the test's timeout makes the cause path timing-free.
+    monkeypatch.setattr(session_helpers, "ERROR_HOOK_GRACE_S", 60.0 if cause_follows else 0.0)
+    session_id = "c41e5b9a0f7d4e2b8a6c3d1f0e9b8a7c"
+    bare_edge = {"type": "session.status", "status": "failed"}
+    collector = None
+    statuses: list[dict[str, Any]] = []
+
+    async def _hook_reports_the_cause() -> None:
+        assert collector is not None
+        if cause_follows:
+            sessions_module._publish_status(
+                session_id,
+                "failed",
+                ErrorDetail(
+                    code="transient_upstream_error",
+                    message="API Error: Server error mid-response.",
+                ),
+                failure_origin="external_session_status",
+            )
+        # The failure is published before the stream drops.
+        statuses.append(await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S))
+
+    gate = asyncio.Event()
+    runner = _ScriptedThenDropRunnerClient(
+        [f"data: {json.dumps(bare_edge)}\n\n"],
+        gate,
+        before_drop=_hook_reports_the_cause,
+    )
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner-old-build",
+            runner,  # type: ignore[arg-type]
+            conversation_store=_RecordingLabelStore(live_status="running"),  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        with capture_debug_rows("server") as rows:
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
+        attrs = failure["attributes"]
+        assert isinstance(attrs, dict)
+        [status] = statuses
+        assert status["status"] == "failed"
+        assert attrs["previous_status"] == "running"
+        if cause_follows:
+            assert status["error"]["code"] == "transient_upstream_error"
+            assert attrs["code"] == "transient_upstream_error"
+            assert attrs["origin"] == "external_session_status"
+        else:
+            assert status.get("error") is None
+            assert attrs["code"] == "none"
+            assert attrs["origin"] == "relayed_runner_status"
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.pop(session_id, None)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 
