@@ -37,7 +37,8 @@ be able to write resources without a separate Omnigent account.
   credentials before it connects is reported with a sign-in-again instruction
   naming `omnigent login`, not as a runner crash.
 - `proxy-env`: login detects the right mode and host tunnels connect with HTTP
-  proxy variables set; loopback servers stay direct.
+  proxy variables set; loopback servers stay direct. Tunnels use CONNECT, so
+  the proxy must allow the server's port, or `NO_PROXY` must list the server.
 - `host-lifecycle`: register in the foreground or background, run as a per-user
   system service, and check status, stop, stop a session, or reset the host ID.
   A machine runs one host per host ID and Databricks workspace, even through

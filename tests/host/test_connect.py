@@ -2997,15 +2997,14 @@ async def test_rejected_websocket_upgrade_skips_owner_lookup(
         async def __aenter__(self) -> None:
             raise ConnectionError("test rejection")
 
+    connect = Mock(return_value=_RejectedConnection())
     monkeypatch.setattr(host, "_ensure_owner_user_id", _owner)
     monkeypatch.setattr(host, "_build_connect_headers", dict)
-    monkeypatch.setattr(
-        "omnigent.host.connect.websockets.asyncio.client.connect",
-        lambda *args, **kwargs: _RejectedConnection(),
-    )
+    monkeypatch.setattr("omnigent.host.connect.websockets.asyncio.client.connect", connect)
 
     with pytest.raises(ConnectionError, match="test rejection"):
         await host._connect_and_serve()
+    assert connect.call_args.kwargs["sock"] is None
 
 
 @pytest.mark.parametrize(
@@ -10468,21 +10467,26 @@ async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
 
 
 @pytest.mark.parametrize(
-    ("use_proxy", "failure"), [(False, "enter"), (True, "constructor"), (True, "enter")]
+    ("failure", "error"),
+    [
+        ("constructor", ConnectionError("test rejection")),
+        ("enter", ConnectionError("test rejection")),
+        ("enter", asyncio.CancelledError()),
+    ],
+    ids=["constructor", "enter", "enter-cancelled"],
 )
 async def test_connect_and_serve_proxy_socket(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    use_proxy: bool,
     failure: str,
+    error: BaseException,
 ) -> None:
     """The proxied socket is passed to connect() and closed when either connect step fails."""
     from omnigent.host import connect as connect_mod
 
     caplog.set_level(logging.INFO, logger="omnigent.host.connect")
     proxy_url = "http://proxyuser:proxysecret@127.0.0.1:3128"
-    if use_proxy:
-        monkeypatch.setenv("http_proxy", proxy_url)
+    monkeypatch.setenv("http_proxy", proxy_url)
     host = HostProcess(
         HostIdentity(host_id="host_test_connect", name="test-laptop"),
         "http://server.sandbox.test:8000",
@@ -10490,28 +10494,26 @@ async def test_connect_and_serve_proxy_socket(
     monkeypatch.setattr(host, "_build_connect_headers", dict)
     connect = Mock(return_value=AsyncMock())
     if failure == "constructor":
-        connect.side_effect = ConnectionError("test rejection")
+        connect.side_effect = error
     else:
-        connect.return_value.__aenter__.side_effect = ConnectionError("test rejection")
+        connect.return_value.__aenter__.side_effect = error
     monkeypatch.setattr(connect_mod.websockets.asyncio.client, "connect", connect)
 
     with socket.socket() as proxy_sock:
         dial = AsyncMock(return_value=proxy_sock)
         monkeypatch.setattr(connect_mod, "open_proxy_connect_socket", dial)
-        with pytest.raises(ConnectionError, match="test rejection"):
+        with pytest.raises(type(error)) as raised:
             await host._connect_and_serve()
 
+        assert raised.value is error
         tunnel_url = "ws://server.sandbox.test:8000/v1/hosts/host_test_connect/tunnel"
         assert connect.call_args.args == (tunnel_url,)
-        assert connect.call_args.kwargs["sock"] is (proxy_sock if use_proxy else None)
-        if use_proxy:
-            dial.assert_awaited_once_with(
-                proxy_url, tunnel_url, timeout=connect_mod._INITIAL_CONNECT_OPEN_TIMEOUT_S
-            )
-            assert proxy_sock.fileno() == -1
-            assert "via CONNECT proxy http://127.0.0.1:3128" in caplog.text
-        else:
-            dial.assert_not_awaited()
+        assert connect.call_args.kwargs["sock"] is proxy_sock
+        dial.assert_awaited_once_with(
+            proxy_url, tunnel_url, timeout=connect_mod._INITIAL_CONNECT_OPEN_TIMEOUT_S
+        )
+        assert proxy_sock.fileno() == -1
+        assert "via CONNECT proxy http://127.0.0.1:3128" in caplog.text
         assert "proxysecret" not in caplog.text
 
 

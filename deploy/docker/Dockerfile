@@ -394,7 +394,6 @@ RUN set -eu; \
 # /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
 # policy. Re-install without -e so the package bytes land in the venv's
 # site-packages and imports no longer require /build at runtime.
-
 # OpenShell's sandbox user installs wheels here; chowning at COPY avoids a second venv layer.
 COPY --from=builder --chown=sandbox:sandbox /opt/venv /opt/venv
 COPY --from=builder /build /build

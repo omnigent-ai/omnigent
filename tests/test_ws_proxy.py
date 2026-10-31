@@ -228,10 +228,22 @@ async def test_connect_tunnel(userinfo):
     ],
     ids=["refused", "non-http", "non-decimal-status", "oversized", "trailing-bytes", "eof"],
 )
-async def test_connect_error(reply, error):
+async def test_connect_error(monkeypatch, reply, error):
+    from omnigent.util import ws_proxy
+
+    dialed = []
+    create_connection = socket.create_connection
+
+    def recording_create_connection(*args, **kwargs):
+        dialed.append(create_connection(*args, **kwargs))
+        return dialed[-1]
+
+    monkeypatch.setattr(ws_proxy.socket, "create_connection", recording_create_connection)
     async with _connect_proxy(reply) as (port, _requests):
         with pytest.raises(OSError, match=error):
             await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=5)
+    assert len(dialed) == 1
+    assert dialed[0].fileno() == -1
 
 
 async def test_connect_tunnel_idna_host():
