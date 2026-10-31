@@ -1388,7 +1388,10 @@ async def test_subagent_permission_request_goes_through_policy() -> None:
 
 
 async def test_root_session_the_user_prompts_in_becomes_the_web_target(tmp_path: Path) -> None:
-    """Web actions follow the root last prompted in the TUI, not a new or sub-agent session."""
+    """Web actions follow the root last prompted in the TUI, not a new or sub-agent session.
+
+    A later update to an earlier prompt, as OpenCode sends after its reply, does not move it.
+    """
     write_bridge_state(
         tmp_path,
         OpenCodeNativeBridgeState(
@@ -1402,6 +1405,7 @@ async def test_root_session_the_user_prompts_in_becomes_the_web_target(tmp_path:
         state = read_bridge_state(tmp_path)
         return state.opencode_session_id if state is not None else None
 
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_0", "role": "user"}))
     await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
     await fwd.handle_event(_event("session.created", sessionID="ses_new", info={"id": "ses_new"}))
     assert web_target() == _SESSION
@@ -1433,6 +1437,10 @@ async def test_root_session_the_user_prompts_in_becomes_the_web_target(tmp_path:
     assert web_target() == "ses_new"
 
     await fwd.handle_event(_event("session.idle"))
+    await fwd.handle_event(
+        _event("message.updated", info={"id": "msg_0", "role": "user", "summary": {"diffs": []}})
+    )
+    assert web_target() == "ses_new"
     await fwd.handle_event(
         _event("message.updated", info={"id": "msg_back", "role": "user", "sessionID": _SESSION})
     )

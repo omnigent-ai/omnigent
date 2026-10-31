@@ -360,15 +360,20 @@ class OpenCodeNativeForwarder:
         The live stream does not replay missed events. On reconnect, re-read
         persisted history and feed unseen parts through the same posting paths
         as live events, then let the normal dedupe keys suppress any duplicate
-        live snapshots that arrive after reconnect. Covers the web target and
-        every root session with a turn in flight.
+        live snapshots that arrive after reconnect. Covers every mirrored root
+        session; the newest prompt sent during the gap moves the web target.
         """
         targeted = self._opencode_session_id
         settled: list[tuple[str, tuple[str, _JsonObject | None]]] = []
-        for opencode_session_id in [targeted, *sorted(self._active_sessions - {targeted})]:
-            outcome = await self._catch_up_session(opencode_session_id)
+        gap_prompts: list[tuple[str, str]] = []
+        for opencode_session_id in [targeted, *sorted(self._root_session_ids - {targeted})]:
+            outcome, newest_prompt_id = await self._catch_up_session(opencode_session_id)
             if outcome is not None:
                 settled.append((opencode_session_id, outcome))
+            if newest_prompt_id is not None:
+                gap_prompts.append((newest_prompt_id, opencode_session_id))
+        if gap_prompts:
+            self._follow_session(max(gap_prompts)[1])
         try:
             await self._post_session_usage()
         except Exception:  # usage re-post is best effort.
@@ -380,16 +385,18 @@ class OpenCodeNativeForwarder:
 
     async def _catch_up_session(
         self, opencode_session_id: str
-    ) -> tuple[str, _JsonObject | None] | None:
+    ) -> tuple[tuple[str, _JsonObject | None] | None, str | None]:
         """Replay one root session's unseen persisted parts.
 
-        :returns: How its in-flight turn ended, when history shows it finished.
+        :returns: How its in-flight turn ended, when history shows it finished,
+            and the id of its newest prompt not seen before.
         """
         try:
             messages = await self._opencode.list_messages(opencode_session_id)
         except Exception:  # catch-up is best effort.
             _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
-            return None
+            return None, None
+        newest_prompt_id: str | None = None
         for message in messages:
             if not isinstance(message, Mapping):
                 continue
@@ -398,6 +405,8 @@ class OpenCodeNativeForwarder:
             role = info.get("role") if isinstance(info, Mapping) else None
             info_map = info if isinstance(info, Mapping) else None
             if isinstance(message_id, str) and isinstance(role, str):
+                if role == "user" and message_id not in self._msg_role:
+                    newest_prompt_id = message_id
                 self._msg_role[message_id] = role
                 if role == "assistant" and info_map is not None:
                     self._record_assistant_usage(message_id, info_map)
@@ -430,8 +439,8 @@ class OpenCodeNativeForwarder:
                     await self._note_assistant_progress(opencode_session_id, message_id, info_map)
         # The stream does not replay a ``session.idle`` / ``session.error`` it missed.
         if opencode_session_id not in self._active_sessions:
-            return None
-        return _settled_turn_outcome(messages)
+            return None, newest_prompt_id
+        return _settled_turn_outcome(messages), newest_prompt_id
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -781,9 +790,11 @@ class OpenCodeNativeForwarder:
         role = info.get("role")
         if not isinstance(message_id, str) or not isinstance(role, str):
             return
+        is_new_message = message_id not in self._msg_role
         self._msg_role[message_id] = role
         session_id = self._event_root_session(event)
-        if role == "user":
+        # OpenCode updates a prompt again after its reply; only a new prompt moves the target.
+        if role == "user" and is_new_message:
             self._follow_session(session_id)
         if role == "assistant":
             await self._note_assistant_progress(session_id, message_id, info)

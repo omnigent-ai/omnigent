@@ -506,9 +506,9 @@ async def test_running_turn_ends_when_opencode_server_stays_unreachable() -> Non
 
     await _run_without_backoff(fwd, max_reconnects=20)
 
-    refused = fwd_mod._MAX_CONNECT_FAILURES_DURING_TURN
-    assert edges_at_connection[refused] == ["running"]
-    assert edges_at_connection[refused + 1] == ["running", "failed"]
+    # After the first connection, four refused reconnects leave the turn running; a fifth fails it.
+    assert edges_at_connection[5] == ["running"]
+    assert edges_at_connection[6] == ["running", "failed"]
     assert _status_edges(server) == ["running", "failed"]
     failed = [b for _u, b in server.posts if b["type"] == "external_session_status"][-1]
     assert failed["data"]["output"] == fwd_mod._SERVER_UNREACHABLE_OUTPUT
@@ -549,13 +549,67 @@ async def test_catch_up_ends_the_turn_only_when_history_shows_it_finished(
 
 
 async def test_catch_up_settles_a_root_session_left_running_after_tui_new() -> None:
-    """After TUI ``/new``, catch-up still reads the earlier root whose turn was in flight."""
+    """After TUI ``/new``, catch-up reads every in-flight root; the turn ends with the last."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
     await fwd.handle_event(_ev("message.updated", info={"id": "msg_1", "role": "assistant"}))
     await fwd.handle_event(_ev("session.created", sessionID="ses_new", info={"id": "ses_new"}))
-    finished = {"id": "msg_1", "role": "assistant", "finish": "stop", "time": {"completed": 2}}
-    histories = {_SESSION: [{"info": finished, "parts": []}], "ses_new": []}
+    for info in ({"id": "msg_2", "role": "user"}, {"id": "msg_3", "role": "assistant"}):
+        await fwd.handle_event(_ev("message.updated", sessionID="ses_new", info=info))
+    assert fwd._opencode_session_id == "ses_new"
+
+    def _finished(message_id: str) -> dict[str, Any]:
+        info = {"id": message_id, "role": "assistant", "finish": "stop", "time": {"completed": 4}}
+        return {"info": info, "parts": []}
+
+    histories = {
+        _SESSION: [_finished("msg_1")],
+        "ses_new": [
+            {"info": {"id": "msg_2", "role": "user"}, "parts": []},
+            {"info": {"id": "msg_3", "role": "assistant"}, "parts": []},
+        ],
+    }
+    requested: list[str] = []
+
+    async def _history(session_id: str) -> list[dict[str, Any]]:
+        requested.append(session_id)
+        return histories[session_id]
+
+    opencode.list_messages = _history  # type: ignore[method-assign]
+
+    await fwd.catch_up_from_history()
+
+    assert sorted(requested) == sorted([_SESSION, "ses_new"])
+    assert _status_edges(server) == ["running"]
+
+    histories["ses_new"][-1] = _finished("msg_3")
+    await fwd.catch_up_from_history()
+
+    assert _status_edges(server) == ["running", "idle"]
+
+
+async def test_catch_up_mirrors_a_prompt_sent_to_an_idle_root_during_the_gap() -> None:
+    """A TUI prompt in an earlier, idle root during the gap is mirrored and becomes the target."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_ev("session.created", sessionID="ses_new", info={"id": "ses_new"}))
+    await fwd.handle_event(
+        _ev("message.updated", sessionID="ses_new", info={"id": "msg_1", "role": "user"})
+    )
+    finished = {"id": "msg_3", "role": "assistant", "finish": "stop", "time": {"completed": 3}}
+    histories = {
+        _SESSION: [
+            {
+                "info": {"id": "msg_2", "role": "user"},
+                "parts": [{"id": "prt_2", "messageID": "msg_2", "type": "text", "text": "back"}],
+            },
+            {
+                "info": finished,
+                "parts": [{"id": "prt_3", "messageID": "msg_3", "type": "text", "text": "reply"}],
+            },
+        ],
+        "ses_new": [{"info": {"id": "msg_1", "role": "user"}, "parts": []}],
+    }
 
     async def _history(session_id: str) -> list[dict[str, Any]]:
         return histories[session_id]
@@ -564,7 +618,16 @@ async def test_catch_up_settles_a_root_session_left_running_after_tui_new() -> N
 
     await fwd.catch_up_from_history()
 
-    assert _status_edges(server) == ["running", "idle"]
+    items = [
+        b["data"]["item_data"]
+        for _u, b in server.posts
+        if b["type"] == "external_conversation_item"
+    ]
+    assert [(item["role"], item["content"][0]["text"]) for item in items] == [
+        ("user", "back"),
+        ("assistant", "reply"),
+    ]
+    assert fwd._opencode_session_id == _SESSION
 
 
 async def test_reconnect_that_reaches_the_server_resets_the_unreachable_count() -> None:
