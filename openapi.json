@@ -6202,6 +6202,11 @@
             "title": "Session Pull Requests",
             "type": "boolean"
           },
+          "session_rewind": {
+            "default": false,
+            "title": "Session Rewind",
+            "type": "boolean"
+          },
           "session_search_scope": {
             "default": true,
             "title": "Session Search Scope",
@@ -8998,6 +9003,45 @@
         "title": "SessionResponse",
         "type": "object"
       },
+      "SessionRewindRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/sessions/{session_id}/rewind`.",
+        "properties": {
+          "item_id": {
+            "description": "The session's user prompt to rewind to, e.g. `\"msg_abc123\"`. The new session keeps only the history before it.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id"
+        ],
+        "title": "SessionRewindRequest",
+        "type": "object"
+      },
+      "SessionRewindResponse": {
+        "description": "Result of `POST /v1/sessions/{session_id}/rewind`.",
+        "properties": {
+          "prompt": {
+            "description": "Text of the chosen prompt, for the client to put back in the composer, e.g. `\"Add a test for the parser\"`.",
+            "title": "Prompt",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The rewound session that continues the work, e.g. `\"conv_new\"`. The source session gets a notice linking to it.",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "prompt"
+        ],
+        "title": "SessionRewindResponse",
+        "type": "object"
+      },
       "SessionSandboxStatusEvent": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nA managed create returns before its sandbox exists; the Omnigent\nserver emits this event as the background launch pipeline advances\nso the Web UI can show live provisioning progress on the session\npage instead of a silent dead chat: sandbox provision \u2192 repository\nclone \u2192 host startup \u2192 runner connect \u2192 ready, or a terminal\nfailure with the reason.",
         "properties": {
@@ -9212,9 +9256,12 @@
             "type": "string"
           },
           "reason": {
-            "const": "clear",
             "default": "clear",
-            "description": "Why the session was superseded. Currently always `\"clear\"` (a Claude Code `/clear`); kept as a field so the client can branch on future supersession causes.",
+            "description": "Why the session was superseded: `\"clear\"` (a `/clear`) or `\"rewind\"` (a `/rewind` onto a truncated fork).",
+            "enum": [
+              "clear",
+              "rewind"
+            ],
             "title": "Reason",
             "type": "string"
           },
@@ -15783,6 +15830,24 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "Only items of this type, e.g. `\"message\"`; `None` lists every type.",
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Type"
+            }
           }
         ],
         "responses": {
@@ -19186,6 +19251,60 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/rewind": {
+      "post": {
+        "description": "Rewind a Claude session to just before one of its prompts.\n\nForks the session with the history before `body.item_id` onto the\nsame host, workspace and runner, links the source to the fork, and\nredirects live viewers there. The source keeps its full history. A\nclaude-native fork rebuilds Claude's transcript from the kept items.\nAdvertised by `GET /v1/info` `session_rewind`.\n\n**Parameters**\n\n- `body` \u2014 The prompt to rewind to.\n\n**Returns:** The new session id and the chosen prompt's text.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for a harness without `/rewind`, an item that is not one of the session's prompts, a sub-agent, or a running turn; 403/404 when the caller does not own the session; 503 when neither its runner nor its host can take the fork.",
+        "operationId": "rewind_session_v1_sessions__session_id__rewind_post",
+        "parameters": [
+          {
+            "description": "Session to rewind, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRewindRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRewindResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rewind Session",
+        "tags": [
+          "sessions"
         ]
       }
     },
