@@ -3,7 +3,7 @@ description: Install an allowlisted, pinned harness CLI with a verified download
 
 inputs:
   harness:
-    description: "Harness CLI to install: claude, codex, pi, or agy."
+    description: "Harness CLI to install: claude, codex, pi, opencode, or agy."
     required: true
   version:
     description: "Exact npm package version override; archive harnesses use their manifest pin."

@@ -15,7 +15,7 @@ test("npm harness defaults match the committed CI dependency pins", async () => 
     await readFile(path.join(actionDirectory, "..", "..", "ci-deps", "package.json"), "utf8"),
   ).dependencies;
 
-  for (const harness of ["claude", "codex", "pi"]) {
+  for (const harness of ["claude", "codex", "pi", "opencode"]) {
     const spec = manifest[harness];
     assert.equal(ciDependencies[spec.package], spec.version);
     const lock = JSON.parse(await readFile(spec.lockPath, "utf8"));
