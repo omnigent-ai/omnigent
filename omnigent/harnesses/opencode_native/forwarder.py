@@ -170,6 +170,9 @@ def _event_session_id(event: OpenCodeEvent) -> object:
     info = props.get("info")
     if session_id is None and isinstance(info, Mapping):
         session_id = info.get("id")
+    part = props.get("part")
+    if session_id is None and isinstance(part, Mapping):
+        session_id = part.get("sessionID")
     return session_id
 
 
@@ -268,10 +271,8 @@ class OpenCodeNativeForwarder:
         # ``message.updated``. Only assistant text parts become durable chat
         # items (a user part is already echoed by the client).
         self._msg_role: dict[str, str] = {}
-        # partID -> (sessionID, assistant messageID, latest full-text snapshot)
-        # for in-flight assistant text parts, finalized (posted once) on that
-        # session's ``step-finish`` / ``session.idle``. The messageID becomes the
-        # item's per-turn ``response_id``.
+        # partID -> (sessionID, messageID, latest text); posted once on that session's
+        # step-finish / session.idle, with messageID as the item's response_id.
         self._pending_text: dict[str, tuple[str, str | None, str]] = {}
         # messageID -> latest {cost, tokens, model, model_id} for assistant
         # messages (opencode reports cost/tokens per message). Summed into the
@@ -546,9 +547,6 @@ class OpenCodeNativeForwarder:
     def _event_root_session(self, event: OpenCodeEvent) -> str:
         """Return the root session *event* belongs to, defaulting to the web target."""
         session_id = _event_session_id(event)
-        part = event.properties.get("part")
-        if session_id is None and isinstance(part, Mapping):
-            session_id = part.get("sessionID")
         if isinstance(session_id, str) and session_id:
             return session_id
         return self._opencode_session_id
@@ -1157,6 +1155,11 @@ class OpenCodeNativeForwarder:
         error = event.properties.get("error")
         _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
         status, extra = _error_outcome(error)
+        if _event_session_id(event) is None:
+            # OpenCode can omit the session, so the error ends the whole turn.
+            await self._flush_pending_text()
+            await self._end_turn(status=status, extra=extra)
+            return
         await self._end_session_turn(self._event_root_session(event), status=status, extra=extra)
 
     async def _on_session_created(self, event: OpenCodeEvent) -> None:

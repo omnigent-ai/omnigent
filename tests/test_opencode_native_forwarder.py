@@ -302,6 +302,21 @@ async def test_session_error_generic_posts_failed_without_reauth() -> None:
     assert "reauth_required" not in status
 
 
+async def test_session_error_without_session_id_ends_turn_after_tui_new() -> None:
+    """OpenCode can omit ``sessionID`` on ``session.error``; the running turn still fails."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_event("session.created", sessionID="ses_new", info={"id": "ses_new"}))
+    error = {"name": "APIError", "data": {"message": "upstream boom"}}
+    await fwd.handle_event(
+        OpenCodeEvent(id=None, type="session.error", properties={"error": error}, raw={})
+    )
+    statuses = _status_edges(server.posts)
+    assert [status["status"] for status in statuses] == ["running", "failed"]
+    assert statuses[-1]["output"] == "upstream boom"
+
+
 async def test_session_error_message_aborted_takes_idle_path() -> None:
     """A MessageAbortedError is a user interrupt → the normal idle path."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
@@ -576,21 +591,23 @@ async def test_permission_asked_dedupes() -> None:
     assert len(opencode.replies) == 1
 
 
-async def test_event_for_other_session_ignored() -> None:
+@pytest.mark.parametrize("top_level_session_id", [True, False], ids=["top-level", "part-only"])
+async def test_event_for_other_session_ignored(top_level_session_id: bool) -> None:
+    """Another session's parts are not mirrored and do not keep the turn running."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        OpenCodeEvent(
-            id=None,
-            type="message.part.updated",
-            properties={
-                "sessionID": "ses_OTHER",
-                "part": {"id": "p", "messageID": "m", "type": "text", "text": "x"},
-            },
-            raw={},
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    for part_type in ("step-start", "text"):
+        part = {"id": part_type, "messageID": "m", "sessionID": "ses_OTHER", "type": part_type}
+        properties: dict[str, Any] = {"part": {**part, "text": "x"}}
+        if top_level_session_id:
+            properties["sessionID"] = "ses_OTHER"
+        await fwd.handle_event(
+            OpenCodeEvent(id=None, type="message.part.updated", properties=properties, raw={})
         )
-    )
-    assert server.posts == []
+    await fwd.handle_event(_event("session.idle"))
+    assert _message_texts(server.posts) == []
+    assert [edge["status"] for edge in _status_edges(server.posts)] == ["running", "idle"]
 
 
 async def test_unknown_event_is_ignored() -> None:
