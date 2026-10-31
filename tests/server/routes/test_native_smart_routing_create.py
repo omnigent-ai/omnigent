@@ -263,9 +263,9 @@ async def test_fixed_native_harness_create_routes_the_model(
     snapshot = await client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, snapshot.text
     assert snapshot.json()["model_override"] == picked_model
-    # The launch harness is reported as ``harness`` on both (there is no
-    # ``harness_override`` field on the snapshot — a native session stores none).
-    assert "harness_override" not in snapshot.json()
+    # The launch harness is reported as ``harness`` on both; a native session
+    # stores no ``harness_override``, so the field reads back null.
+    assert snapshot.json()["harness_override"] is None
     assert created.json()["harness"] == snapshot.json()["harness"]
 
 
@@ -412,11 +412,11 @@ async def test_create_binds_the_wrapper_the_router_picked(
     # The auto marker is what keeps subagents cross-harness-eligible.
     assert conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
     # What a client reads back to launch the TUI: the routed model plus the
-    # bound wrapper. The row keeps no ``harness_override`` on this path, so
-    # ``harness`` (resolved from the bound wrapper) is the harness field.
+    # bound wrapper. The row keeps no ``harness_override`` on this path (it reads
+    # back null), so ``harness`` is resolved from the bound wrapper.
     assert created.json()["model_override"] == picked_model
     assert created.json()["agent_id"] == wrappers[expected_harness]
-    assert "harness_override" not in created.json()
+    assert created.json()["harness_override"] is None
 
 
 async def test_router_is_offered_both_native_families(
