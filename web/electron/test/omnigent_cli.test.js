@@ -10,7 +10,6 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
 
 const {
   normalizeServerUrl,
@@ -145,9 +144,11 @@ describe("localServerHealthy", () => {
     assert.equal(await localServerHealthy(), null);
   });
 
-  it("is null for a stale pidfile (dead pid)", async () => {
-    // A just-exited child's pid is dead (reuse within the test is negligible).
-    const { pid } = spawnSync(process.execPath, ["-e", ""]);
+  it("is null for a stale pidfile (dead pid)", async (t) => {
+    const pid = 123456;
+    t.mock.method(process, "kill", () => {
+      throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+    });
     withPidfile(`${pid}\n6767\n`);
     assert.equal(await localServerHealthy(), null);
   });
@@ -530,7 +531,12 @@ describe("liveDaemonRecordFor", () => {
   afterEach(() => mock.restoreAll());
 
   it("skips a dead matching record before a live record", async () => {
-    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    const dead = process.pid + 1;
+    mock.method(process, "kill", (pid) => {
+      if (pid === dead) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      assert.equal(pid, process.pid);
+      return true;
+    });
     const records = [dead, process.pid].map((pid) => ({
       pid,
       target: "https://server.example",
