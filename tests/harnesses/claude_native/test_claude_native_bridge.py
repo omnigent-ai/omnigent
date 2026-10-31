@@ -12979,6 +12979,17 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
     ]
 
 
+_WRAPPED_BTW_PANE = "\n".join(
+    [
+        "▔" * 50,
+        "    /btw do the checks pass?",
+        "      Yes, the checks pass.",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to",
+        "    close",
+    ]
+)
+
+
 @pytest.mark.parametrize(
     ("occupied_pane", "after_preflight"),
     [
@@ -12991,6 +13002,8 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         (_TASK_DETAILS_PANE, False),
         (_SETTINGS_PANEL_PANE, True),
         (_TASK_DETAILS_PANE, True),
+        (_WRAPPED_BTW_PANE, False),
+        (_WRAPPED_BTW_PANE, True),
     ],
     ids=[
         "reverse-search",
@@ -13002,6 +13015,8 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "task-details-panel",
         "settings-after-preflight",
         "task-details-after-preflight",
+        "wrapped-quick-answer",
+        "wrapped-quick-answer-after-preflight",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -13596,9 +13611,15 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
     assert min(gaps) >= 1.0, f"Escapes {gaps} apart can open Claude Code's rewind dialog"
 
 
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE],
+    ids=["search", "wrapped-quick-answer"],
+)
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    occupied_pane: str,
 ) -> None:
     """
     The same reclaim guards slash commands (e.g. a routed model switch).
@@ -13613,8 +13634,8 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
         # re-confirmation, idle after the Escape, then the typed command
         # renders and the submit clears it.
         [
-            _REVERSE_SEARCH_PANE,
-            _REVERSE_SEARCH_PANE,
+            occupied_pane,
+            occupied_pane,
             _IDLE_PANE,
             _composer_pane("/effort high"),
             _IDLE_PANE,
@@ -15017,6 +15038,7 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
 # ── /btw side-chat overlay parsing ─────────────────────────────────
 
 _BTW_BORDER = "▔" * 120
+_BTW_COMPLETE_FOOTER = "    ↑/↓ to scroll · c to copy · f to fork · Esc to close"
 
 
 def _btw_pane(*body_lines: str) -> str:
@@ -15034,7 +15056,28 @@ def _btw_pane(*body_lines: str) -> str:
     return "\n".join([*prefix, *body_lines])
 
 
-def test_btw_overlay_parses_completed_single_turn() -> None:
+@pytest.mark.parametrize(
+    "footer",
+    [
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to\n    close",
+        "    ↑/↓ to scroll · c to copy · f to\n    fork · Esc to close",
+        *[
+            "\n".join(
+                _BTW_COMPLETE_FOOTER[start : start + width]
+                for start in range(0, len(_BTW_COMPLETE_FOOTER), width)
+            )
+            for width in range(20, len(_BTW_COMPLETE_FOOTER))
+        ],
+    ],
+    ids=[
+        "one-row",
+        "wrapped-close",
+        "wrapped-fork",
+        *[f"columns-{width}" for width in range(20, len(_BTW_COMPLETE_FOOTER))],
+    ],
+)
+def test_btw_overlay_parses_completed_single_turn(footer: str) -> None:
     """A settled single-turn overlay yields its question and answer."""
     pane = _btw_pane(
         "",
@@ -15042,7 +15085,7 @@ def test_btw_overlay_parses_completed_single_turn() -> None:
         "",
         "      Yes, the public API is unchanged.",
         "",
-        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        footer,
     )
     overlay = claude_native_bridge._btw_overlay_from_pane(pane)
     assert overlay is not None
@@ -15112,33 +15155,35 @@ def test_btw_overlay_preserves_relative_indentation() -> None:
     assert overlay.answer == "- top\n  - nested"
 
 
-def test_btw_overlay_present_matches_settled_multiturn_and_generating() -> None:
+@pytest.mark.parametrize("close_hint", ["Esc to close", "Esc to\n    close"])
+def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint: str) -> None:
     """The dismiss guard matches every /btw overlay state, settled or not."""
     settled = _btw_pane(
         "    /btw q",
         "",
         "      A",
         "",
-        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        f"    ↑/↓ to scroll · c to copy · f to fork · {close_hint}",
     )
     multiturn = _btw_pane(
         "    /btw q1",
         "    /btw q2",
         "",
         "      A",
-        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+        f"    ←/→ to switch · c to copy · f to fork · x to clear history · {close_hint}",
     )
     generating = _btw_pane(
         "    /btw q",
         "      ✻ Answering…",
-        "    ←/→ to switch · x to clear history · Esc to close",
+        f"    ←/→ to switch · x to clear history · {close_hint}",
     )
     assert claude_native_bridge._btw_overlay_present(settled) is True
     assert claude_native_bridge._btw_overlay_present(multiturn) is True
     assert claude_native_bridge._btw_overlay_present(generating) is True
 
 
-def test_btw_overlay_present_false_on_bare_composer() -> None:
+@pytest.mark.parametrize("quoted_overlay", ["none", "one-row", "wrapped"])
+def test_btw_overlay_present_false_on_bare_composer(quoted_overlay: str) -> None:
     """No /btw footer → no Escape (a blind Escape would cancel a turn)."""
     pane = "\n".join(
         [
@@ -15149,7 +15194,24 @@ def test_btw_overlay_present_false_on_bare_composer() -> None:
             "  Opus 4.8 (1M) │ high │ 0/1M $0.00 │ git:main",
         ]
     )
+    if quoted_overlay != "none":
+        overlay = _WRAPPED_BTW_PANE
+        if quoted_overlay == "one-row":
+            overlay = overlay.replace("Esc to\n    close", "Esc to close")
+        pane = overlay + "\n" + pane
     assert claude_native_bridge._btw_overlay_present(pane) is False
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
+def test_dismiss_btw_overlay_closes_a_wrapped_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing Quick Answer in Chat also closes the narrow terminal panel."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_WRAPPED_BTW_PANE])
+
+    assert claude_native_bridge.dismiss_btw_overlay(bridge_dir) is True
+    assert sends == [["send-keys", "-t", "claude:0.0", "Escape"]]
 
 
 # ---------------------------------------------------------------------------
