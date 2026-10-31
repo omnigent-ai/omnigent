@@ -2220,7 +2220,11 @@ describe("ForkSessionDialog", () => {
       ]);
       renderDialog({
         ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_providers: ["lakebox", "arclet"],
+          sibling_sessions: true,
+        },
       });
 
       await act(async () => {});

@@ -897,9 +897,16 @@ function SupportedForkSessionForm({
   const { data: agents } = useAvailableAgents({ enabled: true });
   const { data: sourceAgent } = useSessionAgent(sourceSessionId);
 
+  const info = useServerInfo();
+  const reusableSourceHostId =
+    info !== "loading" && info.sibling_sessions ? sourceHostId : undefined;
   // Hosts for the picker — only for a coding source (a non-coding fork
-  // never shows the host field).
-  const { data: hosts } = useHosts({ enabled: isCodingSource });
+  // never shows the host field). Reuse the source sandbox only when the server
+  // advertises the shared-sandbox lifecycle that makes it safe.
+  const { data: hosts } = useHosts({
+    enabled: isCodingSource,
+    sourceHostId: reusableSourceHostId,
+  });
   const allHosts = hosts ?? [];
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
@@ -918,7 +925,6 @@ function SupportedForkSessionForm({
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (rows hidden) until the boot probe resolves. Same gate
   // NewChatDialog uses for its own sandbox option.
-  const info = useServerInfo();
   const managedSandboxesEnabled =
     !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
   // One picker row per configured provider; a single-provider server

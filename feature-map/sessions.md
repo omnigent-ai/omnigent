@@ -9,6 +9,15 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
+- `siblings`: **+ Add new agent** creates a private, fresh conversation in the
+  same sidebar family. Its composer offers ordinary hosts/new sandboxes and
+  only the clicked member's ephemeral host, preselected. Siblings have one
+  indentation level with curved connectors and are absent from the Agents panel.
+  Archive/delete promotes the oldest active member; compute survives while any
+  session remains bound. The representative pins/moves the family; individual
+  pins are shortcuts. Existing sessions cannot join a family; ordinary forks
+  remain standalone and may reuse the source host.
+
 - `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
@@ -207,6 +216,10 @@ the header menu), and each place is a separate entry point.
   keep their own touch handling.
 
 ## How to get to it (user POV)
+
+- For siblings, open an owned active session's sidebar kebab, right-click menu,
+  or header menu and choose **+ Add new agent**. Mobile row/header menus offer
+  the same action. Select a host in the composer and send the first message.
 
 **Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
@@ -1155,7 +1168,22 @@ the hidden rail's tabs stay open and the app returns to the new-session page.
 Native accelerator delivery requires an Electron run; component tests cover
 selection, visibility, and stop failure.
 
+Own-environment sibling CUJs: `uv run --no-sync pytest
+ tests/e2e_ui/sessions/test_sibling_sessions.py --ui-skip-build --reruns 0`.
+This uses real replicas/hosts/runners with local sandbox allocation and a scripted
+model. It covers desktop kebab/right-click/header and mobile long-press/header
+composer navigation, shared/fresh compute, pin/project/fork actions, archive/undo,
+and survivor messaging after representative deletion. Set `OMNIGENT_DEMO_DIR`
+outside the checkout to retain recordings.
+
 ## Gotchas
+
+- Family membership is owner-only navigation context, not a sharing grant.
+  Siblings start private even if the source has readers. Edit-shared sources
+  cannot create siblings. Shared viewers see flat rows.
+- Families are bounded to 100 retained members, including archived members.
+- Sandbox expiry and explicit whole-host destruction remain separate from
+  deleting one session. Shared compute means a shared filesystem, not history.
 
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.

@@ -1,3 +1,4 @@
+import { orderSessionFamilies, isIndentedSibling } from "@/lib/sessionFamilies";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { GridSidebar } from "@/grid/GridWorkspace";
@@ -907,6 +908,10 @@ function SidebarImpl({
     () => pinnedData?.conversations ?? EMPTY_CONVERSATIONS,
     [pinnedData],
   );
+  const pinnedFamilyRows = useMemo(
+    () => [...pinnedConversations, ...(pinnedData?.familyMembers ?? [])],
+    [pinnedConversations, pinnedData],
+  );
   const pinnedFilterHonored = pinnedData?.filterHonored ?? false;
   // Membership is the union of the server's pinned rows and any pins still in
   // the legacy localStorage key — so a not-yet-migrated pin (server too old, or
@@ -1470,7 +1475,7 @@ function SidebarImpl({
                     onActiveTabChange={switchTab}
                     multiUser={multiUser}
                     pinnedConversationIds={pinnedConversationIds}
-                    pinnedConversations={pinnedConversations}
+                    pinnedConversations={pinnedFamilyRows}
                     pinReorderEnabled={pinnedFilterHonored}
                     onTogglePinned={togglePinnedConversation}
                     onEnterSelectionMode={enterSelectionMode}
@@ -2241,8 +2246,12 @@ function ConversationList({
     // the Shared tab, a shared pin stays visible on My sessions, and the pins
     // don't vanish on the Archived tab either. (An archived session is never
     // pinned into the live sections — hence notArchived, not allWithPinned.)
-    const pinned = orderByPinnedTimestamp(notArchived.filter((c) => pinnedSet.has(c.id)));
-    const pinnedIdSet = new Set(pinned.map((c) => c.id));
+    const pinned = orderSessionFamilies(
+      orderByPinnedTimestamp(notArchived.filter((c) => c.family?.pinned || pinnedSet.has(c.id))),
+    );
+    const pinnedIdSet = new Set(
+      pinned.filter((c) => c.family?.pinned || !c.family).map((c) => c.id),
+    );
 
     // Folders use live members on All / My and archives on Archived. Filing is
     // owner-only, so Shared and grouped views omit folders; pins precede them.
@@ -2327,6 +2336,23 @@ function ConversationList({
               )}`,
       ]),
     );
+    const familyGroups = new Map<string, string>();
+    for (const row of ordered) {
+      if (!row.family) continue;
+      const representative = ordered.find(
+        (candidate) => candidate.id === row.family!.representative_id,
+      );
+      const group = groupTitles.get(
+        (view.grouping === "created" || view.grouping === "harness") && representative
+          ? representative.id
+          : row.id,
+      );
+      if (group && !familyGroups.has(row.family.id)) familyGroups.set(row.family.id, group);
+    }
+    for (const row of ordered) {
+      const group = row.family ? familyGroups.get(row.family.id) : undefined;
+      if (group) groupTitles.set(row.id, group);
+    }
     const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
       (g) => g.conversations,
     );
@@ -4123,6 +4149,15 @@ function ConversationSection({
   /** The rows list, for a project folder's Show more slide. */
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
+  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
+  const familyRows = orderSessionFamilies(conversations);
+  const familyRepresentatives = new Set(
+    familyRows.filter((row) => row.family?.representative_id === row.id).map((row) => row.id),
+  );
+  const visibleFamilyRows = familyRows.filter(
+    (row) => !isIndentedSibling(row) || !row.family || !collapsedFamilies.has(row.family.id),
+  );
+
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
   const gridMembers = new Set(grids?.activeGrid ? gridSessionIds(grids.activeGrid.layout) : []);
@@ -4234,10 +4269,31 @@ function ConversationSection({
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul ref={listRef} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
-              {conversations.map((conv, index) => (
+              {visibleFamilyRows.map((conv, index) => (
                 <ConversationRow
                   key={conv.id}
                   conversation={conv}
+                  familyIndented={
+                    isIndentedSibling(conv) &&
+                    familyRepresentatives.has(conv.family!.representative_id!)
+                  }
+                  familyExpanded={
+                    conv.family?.representative_id === conv.id &&
+                    familyRows.some(
+                      (row) => row.id !== conv.id && row.family?.id === conv.family?.id,
+                    )
+                      ? !collapsedFamilies.has(conv.family.id)
+                      : undefined
+                  }
+                  onToggleFamily={() =>
+                    setCollapsedFamilies((previous) => {
+                      const next = new Set(previous);
+                      const id = conv.family!.id;
+                      if (next.has(id)) next.delete(id);
+                      else next.add(id);
+                      return next;
+                    })
+                  }
                   isActive={conv.id === activeConversationId}
                   inActiveGrid={gridMembers.has(conv.id)}
                   gridSelected={conv.id === grids?.selectedSessionId}
@@ -4251,8 +4307,8 @@ function ConversationSection({
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={onProjectAssigned}
                   reorderGroup={reorderGroup}
-                  previousId={reorderNeighbour(conversations[index - 1])}
-                  nextId={reorderNeighbour(conversations[index + 1])}
+                  previousId={reorderNeighbour(visibleFamilyRows[index - 1])}
+                  nextId={reorderNeighbour(visibleFamilyRows[index + 1])}
                   reorderIndex={reorderGroup ? index : undefined}
                 />
               ))}
@@ -4330,6 +4386,7 @@ function ConversationMenuItems({
   components: C,
   conversation,
   sessionShortcuts,
+  onNavigate,
   isPinned,
   isArchived,
   isOwner,
@@ -4357,6 +4414,7 @@ function ConversationMenuItems({
   conversation: Conversation;
   /** Session menu commands whose chords to list (the open session's row only). */
   sessionShortcuts: ReadonlySet<DesktopCommand>;
+  onNavigate?: (event: MouseEvent<HTMLAnchorElement>) => void;
   isPinned: boolean;
   isArchived: boolean;
   isOwner: boolean;
@@ -4389,6 +4447,7 @@ function ConversationMenuItems({
   /** The neighbours Move up/down swap with in the Custom order. */
   reorder?: { previousId?: string; nextId?: string };
 }) {
+  const info = useContext(ServerInfoContext);
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
   const moveSession = useContext(SessionReorderContext);
@@ -4527,6 +4586,13 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
+      {isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
+        <C.Item asChild data-testid="add-sibling-session">
+          <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
+            <PlusIcon className="size-3.5" />+ Add new agent
+          </Link>
+        </C.Item>
+      )}
       <SessionActionMenuItem
         className="mobile-touch-target"
         Item={C.Item}
@@ -4618,6 +4684,7 @@ function ConversationMenuItems({
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
       {isOwner &&
+        !isIndentedSibling(conversation) &&
         (isMobile ? (
           // Mobile: no room for a side flyout, so this item swaps the menu
           // body to the project picker in place (see the `view === "projects"`
@@ -5128,6 +5195,9 @@ function isRowFullyVisible(row: HTMLElement): boolean {
 
 function ConversationRowImpl({
   conversation,
+  familyIndented = false,
+  familyExpanded,
+  onToggleFamily,
   isActive,
   inActiveGrid,
   gridSelected,
@@ -5146,6 +5216,9 @@ function ConversationRowImpl({
   reorderIndex,
 }: {
   conversation: Conversation;
+  familyIndented?: boolean;
+  familyExpanded?: boolean;
+  onToggleFamily?: () => void;
   // Computed by the list owner against the resolved top-level root (so a
   // sub-agent view keeps its owning row highlighted). A prop, not a per-row
   // read, so only the two rows whose value flips re-render on a switch.
@@ -5408,7 +5481,12 @@ function ConversationRowImpl({
       reorderIndex,
     },
     disabled:
-      (!isOwner && !gridsEnabled) || selectionMode || isArchived || isEditing || isProvisionalRow,
+      isIndentedSibling(conversation) ||
+      (!isOwner && !gridsEnabled) ||
+      selectionMode ||
+      isArchived ||
+      isEditing ||
+      isProvisionalRow,
   });
   const {
     setNodeRef: setSessionOrderNodeRef,
@@ -5577,6 +5655,7 @@ function ConversationRowImpl({
   const menuItemProps = {
     conversation,
     sessionShortcuts,
+    onNavigate: onClick,
     isPinned,
     isArchived,
     isOwner,
@@ -5625,93 +5704,107 @@ function ConversationRowImpl({
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
-    <Link
-      to={selectionMode ? "#" : `/c/${conversation.id}`}
-      componentId="sidebar.conversation_switcher"
-      aria-keyshortcuts={
-        shortcutSlot !== undefined
-          ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])
-          : undefined
-      }
-      draggable={gridsEnabled ? false : undefined}
-      onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
-      className={cn(
-        SIDEBAR_ROW,
-        "relative flex text-left text-foreground transition-colors",
-        // With the harness icon the row takes a project row's shape: a leading
-        // icon centered against the title and meta column.
-        showHarness ? "items-center" : "flex-col justify-center",
-        SIDEBAR_HOVER_HIGHLIGHT,
-        // Full width (not 100%+1rem) so the highlight stays inset from the
-        // right edge, aligning with the project/folder rows above.
-        "w-full",
-        // Touch reaches the row menu by long press.
-        "mobile-touch-target",
-        // Mobile drops the pin + kebab (see the trailing controls below), so it
-        // reserves only what the badge needs — the same width desktop uses at
-        // rest, before hover reveals the controls.
-        !selectionMode &&
-          (showSharedIndicator ? trailingLayout.sharedReserve : trailingLayout.reserve),
-        // The narrowed reserve must track exactly when the trailing controls
-        // appear and the state marker fades — both keyed on `:focus-visible`.
-        // `focus-within` also fires for a plain click, which shrank the reserve
-        // on the selected row while the marker stayed put, sliding the title
-        // under it.
-        !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
-        !selectionMode && menuOpen && "md:pr-20",
-        // Same room as the hover controls, so a held hint never covers the title.
-        shortcutSlot !== undefined && "group-has-[[data-session-shortcut-hint]]:pr-20",
-        selectionMode && "pr-2 pl-8",
-        !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
-        !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
-        !selectionMode && gridSelected && SIDEBAR_GRID_SELECTED_RING,
-        selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
+    <div className="relative">
+      {familyExpanded !== undefined && (
+        <button
+          type="button"
+          aria-label={familyExpanded ? "Collapse session family" : "Expand session family"}
+          aria-expanded={familyExpanded}
+          onClick={onToggleFamily}
+          className="absolute top-1/2 left-2 z-10 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+        >
+          <ChevronRightIcon className={cn("size-3", familyExpanded && "rotate-90")} />
+        </button>
       )}
-      onClick={(e) => {
-        recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        if (selectionMode) {
-          e.preventDefault();
-          e.stopPropagation();
-          onToggleSelected(conversation.id, e.shiftKey);
-          return;
+      <Link
+        to={selectionMode ? "#" : `/c/${conversation.id}`}
+        componentId="sidebar.conversation_switcher"
+        aria-keyshortcuts={
+          shortcutSlot !== undefined
+            ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])
+            : undefined
         }
-        activateRow(conversation.id, e);
-        onClick(e);
-      }}
-      onDoubleClick={(e) => {
-        if (selectionMode) return;
-        if (!isOwner) return;
-        if (isProvisionalRow) return; // no rename before the real session exists
-        e.preventDefault();
-        // The dblclick's own second click was already recorded above, so
-        // exactly ONE recent click means the first click landed on a different
-        // row — the list reordered mid-double-click and renaming here would
-        // hit the wrong session. Zero recent clicks (synthetic dblclick with
-        // no click events, e.g. in tests) stays allowed.
-        const now = performance.now();
-        const recent = recentClickTimesRef.current.filter(
-          (t) => now - t <= DOUBLE_CLICK_PAIR_WINDOW_MS,
-        );
-        if (recent.length === 1) return;
-        setIsEditing(true);
-      }}
-      title={isMobile ? (conversation.title ?? conversation.id) : undefined}
-    >
-      {showHarness ? (
-        <>
-          <span className="flex size-4 shrink-0 items-center justify-center">
-            <SessionHarnessIcon
-              conversation={conversation}
-              testId="session-row-harness"
-              withFallback
-            />
-          </span>
-          <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
-        </>
-      ) : (
-        rowText
-      )}
-    </Link>
+        draggable={gridsEnabled ? false : undefined}
+        onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
+        className={cn(
+          SIDEBAR_ROW,
+          "relative flex text-left text-foreground transition-colors",
+          // With the harness icon the row takes a project row's shape: a leading
+          // icon centered against the title and meta column.
+          showHarness ? "items-center" : "flex-col justify-center",
+          SIDEBAR_HOVER_HIGHLIGHT,
+          // Full width (not 100%+1rem) so the highlight stays inset from the
+          // right edge, aligning with the project/folder rows above.
+          "w-full",
+          // Touch reaches the row menu by long press.
+          "mobile-touch-target",
+          familyExpanded !== undefined && "pl-7",
+          // Mobile drops the pin + kebab (see the trailing controls below), so it
+          // reserves only what the badge needs — the same width desktop uses at
+          // rest, before hover reveals the controls.
+          !selectionMode &&
+            (showSharedIndicator ? trailingLayout.sharedReserve : trailingLayout.reserve),
+          // The narrowed reserve must track exactly when the trailing controls
+          // appear and the state marker fades — both keyed on `:focus-visible`.
+          // `focus-within` also fires for a plain click, which shrank the reserve
+          // on the selected row while the marker stayed put, sliding the title
+          // under it.
+          !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
+          !selectionMode && menuOpen && "md:pr-20",
+          // Same room as the hover controls, so a held hint never covers the title.
+          shortcutSlot !== undefined && "group-has-[[data-session-shortcut-hint]]:pr-20",
+          selectionMode && "pr-2 pl-8",
+          !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+          !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
+          !selectionMode && gridSelected && SIDEBAR_GRID_SELECTED_RING,
+          selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
+        )}
+        onClick={(e) => {
+          recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
+          if (selectionMode) {
+            e.preventDefault();
+            e.stopPropagation();
+            onToggleSelected(conversation.id, e.shiftKey);
+            return;
+          }
+          activateRow(conversation.id, e);
+          onClick(e);
+        }}
+        onDoubleClick={(e) => {
+          if (selectionMode) return;
+          if (!isOwner) return;
+          if (isProvisionalRow) return; // no rename before the real session exists
+          e.preventDefault();
+          // The dblclick's own second click was already recorded above, so
+          // exactly ONE recent click means the first click landed on a different
+          // row — the list reordered mid-double-click and renaming here would
+          // hit the wrong session. Zero recent clicks (synthetic dblclick with
+          // no click events, e.g. in tests) stays allowed.
+          const now = performance.now();
+          const recent = recentClickTimesRef.current.filter(
+            (t) => now - t <= DOUBLE_CLICK_PAIR_WINDOW_MS,
+          );
+          if (recent.length === 1) return;
+          setIsEditing(true);
+        }}
+        title={isMobile ? (conversation.title ?? conversation.id) : undefined}
+      >
+        {showHarness ? (
+          <>
+            <span className="flex size-4 shrink-0 items-center justify-center">
+              <SessionHarnessIcon
+                conversation={conversation}
+                testId="session-row-harness"
+                withFallback
+              />
+            </span>
+            <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
+          </>
+        ) : (
+          rowText
+        )}
+      </Link>
+    </div>
   );
 
   // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
@@ -5746,8 +5839,15 @@ function ConversationRowImpl({
           dragListeners?.onTouchStart?.(event);
         }
       }}
-      className={cn("group relative", isDragging && "opacity-40")}
+      className={cn("group relative", familyIndented && "ml-5", isDragging && "opacity-40")}
+      data-sibling-session={familyIndented || undefined}
     >
+      {familyIndented && (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute -left-3 top-0 h-5 w-2 rounded-bl-md border-b border-l border-muted-foreground/40"
+        />
+      )}
       {insertion && (
         <span
           data-testid={pinInsertion ? "pin-order-insertion" : "session-order-insertion"}
@@ -6285,6 +6385,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "blocked_on",
   "provisional",
   "shared_with_others",
+  "family",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
@@ -6301,6 +6402,8 @@ function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
 // are stabilized at the list owner so they don't defeat it.
 const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
   return (
+    prev.familyIndented === next.familyIndented &&
+    prev.familyExpanded === next.familyExpanded &&
     prev.isActive === next.isActive &&
     prev.inActiveGrid === next.inActiveGrid &&
     prev.gridSelected === next.gridSelected &&
@@ -7126,8 +7229,17 @@ function BulkActionBar({
     );
   }
 
+  const canMoveSelection =
+    ownedSelected.length > 0 &&
+    ownedSelected.every(
+      (row) =>
+        !isIndentedSibling(row) ||
+        ownedSelected.some((other) => other.id === row.family?.representative_id),
+    );
+
   function handleMoveToProject(project: string) {
-    const ids = ownedSelected.map((c) => c.id);
+    if (!canMoveSelection) return;
+    const ids = ownedSelected.filter((row) => !isIndentedSibling(row)).map((c) => c.id);
     if (ids.length === 0) return;
     bulkMove.mutate(
       { ids, project },
@@ -7326,7 +7438,7 @@ function BulkActionBar({
                         type="button"
                         variant="ghost"
                         size="icon-xs"
-                        disabled={isBusy || ownedSelected.length === 0}
+                        disabled={isBusy || !canMoveSelection}
                         aria-label="Move to project"
                         data-testid="bulk-move-to-project"
                       >

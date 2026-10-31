@@ -1706,6 +1706,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
+    sibling_source_id: str | None = None
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
@@ -1958,6 +1959,7 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None
+    sibling_source_id: str | None = None
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
@@ -2176,6 +2178,13 @@ class BackgroundTaskInfo(BaseModel):
     status: str | None = None
     description: str | None = None
     command: str | None = None
+
+
+class SessionFamily(BaseModel):
+    id: str
+    representative_id: str | None
+    pinned: bool = False
+    pinned_at: str | None = None
 
 
 class SessionResponse(BaseModel):
@@ -2444,6 +2453,7 @@ class SessionResponse(BaseModel):
         snapshots independently of lifecycle status.
     """
 
+    family: SessionFamily | None = None
     id: str
     agent_id: str
     agent_name: str | None = None
@@ -2637,6 +2647,7 @@ class UpdateSessionRequest(BaseModel):
     """
 
     runner_id: str | None = None
+    family_pinned: bool | None = None
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
@@ -3210,6 +3221,7 @@ class SessionListItem(BaseModel):
         "not known yet". ``None`` on servers without PR storage.
     """
 
+    family: SessionFamily | None = None
     id: str
     agent_id: str
     agent_name: str | None = None

@@ -239,7 +239,7 @@ def test_private_manager_launch_send_read_and_sharing(
                     return
                 shared = client.put(
                     f"/v1/sessions/{worker}/permissions",
-                    json={"user_id": "__public__", "level": 1},
+                    json={"user_id": "editor@example.test", "level": 2},
                 )
                 assert shared.status_code == 200, shared.text
                 configure("WORKER_TASK", [{"text": "WORKER_RESULT"}])
@@ -350,8 +350,14 @@ def test_private_manager_launch_send_read_and_sharing(
                     output = results[-1].get("output", results[-1].get("content"))
                     if harness == "codex-native":
                         # Codex wraps MCP content in timing text; the SDK renders a Python dict.
-                        content = json.loads(output.split("\nOutput:\n", 1)[1])
-                        payload = json.loads(content[0]["text"])
+                        if isinstance(output, list):
+                            output = "\n".join(part.get("text", "") for part in output)
+                        content = json.loads(output.split("\nOutput:\n", 1)[-1])
+                        payload = (
+                            json.loads(content[0]["text"])
+                            if isinstance(content, list)
+                            else content
+                        )
                     else:
                         payload = ast.literal_eval(output)
                     discovered_worker = (
