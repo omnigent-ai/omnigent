@@ -3943,13 +3943,12 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
           },
         });
         h.api.setReconnectSlowDelayMs(60_000);
-        h.api.setBlockedHintDelayMs(100);
+        h.api.setBlockedHintDelayMs(300);
         await assert.rejects(h.api.loadServerUrl(h.win, workspace));
         await until(() => h.calls.auth.length === 2, "the fast retry");
+        await until(() => h.overlay.hint === hint, "the hint before the wake");
         // The next retry is a minute away.
-        await wait(150);
         assert.equal(h.calls.auth.length, 2);
-        assert.equal(h.overlay.hint, hint);
         const wakeShows = h.overlay.shows.length;
         h.powerMonitor.emit(event);
         assert.equal(h.overlay.hint, sinceWake[0]);
@@ -4000,35 +3999,62 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.equal(h.overlay.hint, null);
   });
 
-  it("stops on Cancel, Change Server, a new connection, or closing the window", async (t) => {
-    const cancelled = browserHarness(t, [40]);
-    const changed = browserHarness(t, [40]);
-    const connected = browserHarness(t, [40], {
-      expandWorkspace: async () => "http://127.0.0.1:1/",
+  // [failure, session renewal, start the reconnect, hint when stopped, Cancel's final message]
+  for (const [failure, ensureSession, start, hint, finalMessage] of [
+    [
+      "an unreachable page",
+      undefined,
+      (h, url) => failLoad(h, url),
+      unreachable,
+      "Couldn't reach Databricks. Check your network connection, then click Connect.",
+    ],
+    // Stopping during the blocked-network wait keeps its hint from showing later.
+    [
+      "an IP access list refusal",
+      async () => {
+        throw Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" });
+      },
+      (h) => h.api.loadServerUrl(h.win, workspace).catch(() => {}),
+      "",
+      "Databricks blocked this network. Connect from a network the workspace allows, then click Connect.",
+    ],
+  ]) {
+    it(`stops on Cancel, Change Server, a new connection, or closing the window after ${failure}`, async (t) => {
+      const cancelled = browserHarness(t, [40], { ensureSession });
+      const changed = browserHarness(t, [40], { ensureSession });
+      const connected = browserHarness(t, [40], {
+        expandWorkspace: async () => "http://127.0.0.1:1/",
+        ensureSession,
+      });
+      const closed = browserHarness(t, [40], { ensureSession });
+      const all = [cancelled, changed, connected, closed];
+      for (const h of all) h.api.setBlockedHintDelayMs(300);
+      closed.api.createWindow(workspace);
+      connected.api.registerIpc();
+      await wait(10);
+      const closedLoads = [...closed.calls.loadURL];
+      for (const h of [cancelled, changed, connected]) start(h, page);
+      start(closed, workspace);
+      await wait(10);
+      for (const h of all) assert.equal(h.overlay.hint, hint);
+      cancelled.overlay.cancel();
+      changed.api.loadSetupPage(changed.win);
+      void connected.ipc.get("omnigent:set-server-url")(
+        setupEvent(connected),
+        "http://127.0.0.1:1/",
+      );
+      closed.emitWindow("closed");
+      // Past both the next retry and the blocked-network wait.
+      await wait(350);
+      for (const h of all) assert.equal(h.overlay.hint, null);
+      for (const h of [cancelled, changed]) assert.deepEqual(h.calls.loadURL, []);
+      assert.deepEqual(connected.calls.loadURL, [["http://127.0.0.1:1/"]]);
+      // Only the window's own initial load ran, if its session allowed it.
+      assert.deepEqual(closed.calls.loadURL, closedLoads);
+      // Cancel shows the final message.
+      assert.deepEqual(setupParams(cancelled), { error: finalMessage, url: workspace });
     });
-    const closed = browserHarness(t, [40]);
-    closed.api.createWindow(workspace);
-    connected.api.registerIpc();
-    await wait(10);
-    for (const h of [cancelled, changed, connected]) failLoad(h);
-    failLoad(closed, workspace);
-    await wait(10);
-    cancelled.overlay.cancel();
-    changed.api.loadSetupPage(changed.win);
-    void connected.ipc.get("omnigent:set-server-url")(setupEvent(connected), "http://127.0.0.1:1/");
-    closed.emitWindow("closed");
-    await wait(70);
-    for (const h of [cancelled, changed, connected, closed]) assert.equal(h.overlay.hint, null);
-    for (const h of [cancelled, changed]) assert.deepEqual(h.calls.loadURL, []);
-    assert.deepEqual(connected.calls.loadURL, [["http://127.0.0.1:1/"]]);
-    // Only the window's own initial load ran.
-    assert.deepEqual(closed.calls.loadURL, [[workspace]]);
-    // Cancel shows the final message.
-    assert.deepEqual(setupParams(cancelled), {
-      error: "Couldn't reach Databricks. Check your network connection, then click Connect.",
-      url: workspace,
-    });
-  });
+  }
 
   it("does not retry credential failures", async (t) => {
     const h = browserHarness(t, [25], {
@@ -4116,8 +4142,8 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     ["the workspace redirects to login", loginRedirect],
   ]) {
     it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
-      const { h, network } = await connected(t, Array(6).fill(30));
-      h.api.setBlockedHintDelayMs(50);
+      const { h, network } = await connected(t, Array(6).fill(40));
+      h.api.setBlockedHintDelayMs(100);
       h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
       network.verdict = "blocked";
       drop(h, network);
@@ -4184,13 +4210,13 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
 
   it("drops the pending blocked-network hint once the reconnect succeeds", async (t) => {
     const { h, network } = await connected(t, [20]);
-    h.api.setBlockedHintDelayMs(100);
+    h.api.setBlockedHintDelayMs(400);
     network.verdict = "blocked";
     network.removeCookie();
     await until(() => h.overlay.hint !== null, "the reconnecting overlay");
     network.verdict = "allow";
     await until(() => h.calls.loadURL.length === 2, "the reconnect");
-    await wait(150);
+    await wait(450);
     assert.equal(h.overlay.hint, null);
     assert.deepEqual(h.overlay.shows, [""]);
   });
