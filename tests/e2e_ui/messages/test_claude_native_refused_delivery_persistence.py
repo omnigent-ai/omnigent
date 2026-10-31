@@ -27,7 +27,7 @@ from tests.e2e.test_native_terminal_start_error_log_correlation_e2e import (
 from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view
 
 
-@pytest.mark.parametrize("refusal", ["missing_target", "draft_not_accepted"])
+@pytest.mark.parametrize("refusal", ["target_publication_failed", "draft_not_accepted"])
 @pytest.mark.parametrize(
     "delivery_timeout_s",
     [
@@ -60,23 +60,39 @@ def test_claude_refused_message_survives_reload(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "mock-key")
     runner_env = {}
     observed_budget = tmp_path / "delivery-budget.json"
-    if delivery_timeout_s is not None:
+    publication_failure = tmp_path / "target-publication-failure"
+    if delivery_timeout_s is not None or refusal == "target_publication_failed":
         startup = tmp_path / "startup"
         startup.mkdir()
-        (startup / "sitecustomize.py").write_text(
+        startup_code = (
             "import json\n"
             "from pathlib import Path\n"
             "from omnigent.harnesses.claude_native import bridge\n"
-            f"bridge._SUBMIT_VERIFY_TIMEOUT_S = {delivery_timeout_s!r}\n"
-            "inject = bridge.inject_user_message\n"
-            "def short_inject(*args, **kwargs):\n"
-            f"    kwargs['timeout_s'] = {delivery_timeout_s!r}\n"
-            f"    Path({str(observed_budget)!r}).write_text(json.dumps(\n"
-            "        {'target_wait_s': kwargs['timeout_s'], "
-            "'submit_wait_s': bridge._SUBMIT_VERIFY_TIMEOUT_S}))\n"
-            "    return inject(*args, **kwargs)\n"
-            "bridge.inject_user_message = short_inject\n"
         )
+        if delivery_timeout_s is not None:
+            startup_code += (
+                f"bridge._SUBMIT_VERIFY_TIMEOUT_S = {delivery_timeout_s!r}\n"
+                "inject = bridge.inject_user_message\n"
+                "def short_inject(*args, **kwargs):\n"
+                f"    kwargs['timeout_s'] = {delivery_timeout_s!r}\n"
+                f"    Path({str(observed_budget)!r}).write_text(json.dumps(\n"
+                "        {'target_wait_s': kwargs['timeout_s'], "
+                "'submit_wait_s': bridge._SUBMIT_VERIFY_TIMEOUT_S}))\n"
+                "    return inject(*args, **kwargs)\n"
+                "bridge.inject_user_message = short_inject\n"
+            )
+        if refusal == "target_publication_failed":
+            startup_code += (
+                "publish = bridge.write_tmux_target\n"
+                "def failing_publish(*args, **kwargs):\n"
+                f"    failure = Path({str(publication_failure)!r})\n"
+                "    if failure.exists():\n"
+                "        failure.write_text('attempted')\n"
+                "        raise PermissionError('injected target publication failure')\n"
+                "    return publish(*args, **kwargs)\n"
+                "bridge.write_tmux_target = failing_publish\n"
+            )
+        (startup / "sitecustomize.py").write_text(startup_code)
         runner_env["PYTHONPATH"] = os.pathsep.join(
             [
                 str(startup),
@@ -105,7 +121,9 @@ def test_claude_refused_message_survives_reload(
             time.sleep(0.1)
         assert len(adverts) == 1
         advert = json.loads(adverts[0].read_text())
-        if refusal == "missing_target":
+        if refusal == "target_publication_failed":
+            # Block re-publication after launch so the missing target stays unavailable.
+            publication_failure.write_text("armed")
             adverts[0].unlink()
         page.goto(f"{stack.base_url}/c/{session_id}")
         _ensure_chat_view(page)
@@ -128,10 +146,12 @@ def test_claude_refused_message_survives_reload(
         detail = json.dumps([item for item in items if item["type"] == "error"])
         expected = (
             "tmux target is not advertised"
-            if refusal == "missing_target"
+            if refusal == "target_publication_failed"
             else "draft is still in the input box"
         )
         assert expected in detail, detail
+        if refusal == "target_publication_failed":
+            assert publication_failure.read_text() == "attempted"
         if delivery_timeout_s is not None:
             assert json.loads(observed_budget.read_text()) == {
                 "target_wait_s": delivery_timeout_s,
