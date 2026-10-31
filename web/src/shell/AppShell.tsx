@@ -325,7 +325,11 @@ function AppShellImpl() {
       : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const agentsPanelRequested = searchParams.get("panel") === "agents";
-  const [sidebarOpen, setSidebarOpen] = useCanvasSidebar(canvasMode, initialSidebarOpen);
+  const sidebarRequested = searchParams.get("sidebar");
+  const [sidebarOpen, setSidebarOpen] = useCanvasSidebar(
+    canvasMode,
+    () => sidebarRequested !== "closed" && initialSidebarOpen(),
+  );
   // Extension pages own their top chrome. The shell header only carries the
   // collapsed-sidebar toggle there, so skip it while the sidebar is open and
   // let the page use the full height (ExtensionViewHost drops its inset).
@@ -405,6 +409,11 @@ function AppShellImpl() {
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
   const { width: sidebarWidth } = useResizableSidebar();
+  // Retain closed for reloads. Reapply on navigation, while allowing manual
+  // expansion and unrelated workspace query changes within the current page.
+  useLayoutEffect(() => {
+    if (sidebarRequested === "closed" && !inSettings) setSidebarOpen(false);
+  }, [sidebarRequested, location.pathname, inSettings, setSidebarOpen]);
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare

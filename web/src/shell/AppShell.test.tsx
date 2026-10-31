@@ -2204,6 +2204,67 @@ describe("Sidebar across the md breakpoint", () => {
       });
   }
 
+  it.each([
+    [1280, "", true],
+    [390, "", false],
+    [1280, "?sidebar=closed", false],
+    [390, "?sidebar=closed", false],
+    [1280, "?sidebar=open", true],
+    [390, "?sidebar=open", true],
+    [1280, "?sidebar=unknown", true],
+    [390, "?sidebar=unknown", false],
+  ] as const)("honors sidebar presentation at width %i with %s", (width, query, open) => {
+    mockViewportWidth(width);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell(`/c/conv_abc${query}`);
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(open));
+    if (query === "?sidebar=closed") {
+      expect(screen.getByTestId("url-params")).toHaveTextContent("sidebar=closed");
+    } else if (query === "?sidebar=open") {
+      expect(screen.getByTestId("url-params")).not.toHaveTextContent("sidebar=");
+    }
+  });
+
+  it("retains closed across reload and resizing while allowing manual expansion", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    const first = renderShell("/c/conv_abc?sidebar=closed&debug=1");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    resize(390);
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("sidebar=closed&debug=1");
+    first.unmount();
+    renderShell("/c/conv_abc?sidebar=closed&debug=1");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+  });
+
+  it("applies closed to a new session without preventing manual expansion or workspace use", () => {
+    mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc?sidebar=closed", undefined, {
+      rerenderable: true,
+      sessionNavTo: "/c/conv_next?sidebar=closed&panel=agents",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("files-panel")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("sidebar=closed&panel=agents");
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
   it("closes an open sidebar when the window narrows and reopens it on widening", () => {
     const resize = mockViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
