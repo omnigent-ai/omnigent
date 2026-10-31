@@ -846,6 +846,59 @@ def test_preload_codex_thread_closes_client_on_failure(
     assert fake_client.closed
 
 
+_PROVIDER_MISMATCH = {
+    "code": -32600,
+    "message": "provider mismatch",
+    "data": {
+        "type": "modelProviderMismatch",
+        "modelProvider": "omnigent_databricks",
+        "currentModelProvider": "Databricks",
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("error", "has_rollout"),
+    [
+        (_PROVIDER_MISMATCH, False),
+        ({**_PROVIDER_MISMATCH, "data": {"type": "modelProviderMismatch"}}, True),
+        ({**_PROVIDER_MISMATCH, "code": -32603}, True),
+        ({"code": -32600, "message": "no rollout found for thread id thread_test"}, True),
+    ],
+    ids=["no_rollout_path", "no_current_provider", "internal_error", "missing_rollout"],
+)
+def test_preload_codex_thread_surfaces_refusals_it_cannot_restamp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: dict[str, Any],
+    has_rollout: bool,
+) -> None:
+    """Only a provider mismatch naming Codex's provider restamps a known rollout."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"omnigent_databricks"}}\n'
+    rollout.write_bytes(original)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(error)
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(codex_native_app_server.CodexAppServerResponseError):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="omnigent_databricks",
+                rollout_path=rollout if has_rollout else None,
+            )
+        )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert fake_client.closed
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [

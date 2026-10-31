@@ -1179,3 +1179,113 @@ async def test_session_app_server_launches_through_the_configured_wrapper(
     )
     # The terminal keeps attaching through Codex itself, not the wrapper.
     assert server.codex_path == sys.executable
+
+
+@dataclass
+class _ConfigReadStartupClient(_FakeStartupClient):
+    """Startup client answering ``config/read`` with an effective provider, or failing."""
+
+    effective_provider: str | None = None
+    requests: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+
+    async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        self.requests.append((method, params))
+        if method != "config/read" or self.effective_provider is None:
+            raise RuntimeError("config/read unavailable")
+        return {"result": {"config": {"model_provider": self.effective_provider}}}
+
+
+@pytest.mark.parametrize(
+    ("version", "overrides", "effective_provider", "expected_overrides", "reads"),
+    [
+        pytest.param(
+            (0, 166, 0),
+            ['model_provider="omnigent_databricks"', 'model="m"'],
+            "Databricks",
+            ['model_provider="Databricks"', 'model="m"'],
+            1,
+            id="managed_provider_wins",
+        ),
+        pytest.param(
+            None,
+            ['model_provider="omnigent_databricks"'],
+            "Databricks",
+            ['model_provider="Databricks"'],
+            1,
+            id="unknown_version",
+        ),
+        pytest.param(
+            (0, 166, 0),
+            ['model_provider="omnigent_databricks"'],
+            "omnigent_databricks",
+            ['model_provider="omnigent_databricks"'],
+            1,
+            id="pin_already_effective",
+        ),
+        pytest.param(
+            (0, 166, 0),
+            ['model_provider="omnigent_databricks"'],
+            None,
+            ['model_provider="omnigent_databricks"'],
+            1,
+            id="read_fails",
+        ),
+        pytest.param(
+            (0, 165, 0),
+            ['model_provider="omnigent_databricks"'],
+            "Databricks",
+            ['model_provider="omnigent_databricks"'],
+            0,
+            id="before_provider_check",
+        ),
+        pytest.param(
+            (0, 166, 0),
+            ['model="m"'],
+            "Databricks",
+            ['model="m"'],
+            0,
+            id="no_pin",
+        ),
+    ],
+)
+async def test_start_pins_the_terminal_to_codex_effective_model_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    version: tuple[int, int, int] | None,
+    overrides: list[str],
+    effective_provider: str | None,
+    expected_overrides: list[str],
+    reads: int,
+) -> None:
+    """A managed provider outranks the launch pin, so the TUI must start its thread under it."""
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _set_codex_version(monkeypatch, version)
+    startup_client = _ConfigReadStartupClient(effective_provider=effective_provider)
+
+    async def _ready(_self: CodexNativeAppServer) -> _ConfigReadStartupClient:
+        return startup_client
+
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _ready)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.config_overrides = list(overrides)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"):
+        await server.start()
+    try:
+        assert server.config_overrides == expected_overrides
+        assert (
+            startup_client.requests
+            == [("config/read", {"includeLayers": False, "cwd": str(workspace)})] * reads
+        )
+        assert startup_client.close_calls == 1
+        assert ("Could not read Codex's effective model provider" in caplog.text) == (
+            effective_provider is None and reads == 1
+        )
+    finally:
+        await server.close()
