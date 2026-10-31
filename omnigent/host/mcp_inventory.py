@@ -116,18 +116,10 @@ def _read_config(path: Path, harness: str) -> Mapping[str, object] | None:
 
 
 def _managed_mcp_paths() -> tuple[Path, ...]:
-    """Claude Code's enterprise MCP config, which sits beside its managed settings.
+    """Claude Code's enterprise MCP config locations on this platform."""
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_paths
 
-    Only locations that are absolute on this platform: the chain names every OS, and
-    a Windows path read on POSIX would resolve against the working directory.
-    """
-    from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
-
-    return tuple(
-        path.with_name("managed-mcp.json")
-        for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS
-        if path.is_absolute()
-    )
+    return claude_code_managed_mcp_paths()
 
 
 def _managed_claude_servers() -> list[ConfiguredMcpServer]:
