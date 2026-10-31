@@ -125,6 +125,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert "external_output_text_delta" not in data["session_event_types"]
     # Gates the web's claude-sdk /clear, which older servers list "clear" without.
     assert data["session_claude_sdk_clear"] is True
+    # Gates the web's /rewind and the items type filter its picker uses.
+    assert data["session_rewind"] is True
     # This app wires no project store, so automations cannot take a project.
     assert data["scheduled_task_projects"] is False
     # This app wires no scheduled-task store, so it has no automations to offer.
@@ -145,6 +147,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).session_event_types == []
     del data["session_claude_sdk_clear"]
     assert ServerInfoResponse.model_validate(data).session_claude_sdk_clear is False
+    del data["session_rewind"]
+    assert ServerInfoResponse.model_validate(data).session_rewind is False
     del data["automations_enabled"]
     assert ServerInfoResponse.model_validate(data).automations_enabled is False
 
