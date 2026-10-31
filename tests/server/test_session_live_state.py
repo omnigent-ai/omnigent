@@ -54,6 +54,7 @@ class _RecordingStore:
         self.status_writes: list[tuple[str, str]] = []
         self.pending_writes: list[tuple[str, int]] = []
         self.touches: list[list[str]] = []
+        self.touch_stamps: list[tuple[int, list[str], int]] = []
         self.clears: list[tuple[str, int | None]] = []
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
@@ -63,8 +64,10 @@ class _RecordingStore:
         self.pending_writes.append((conversation_id, count))
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
-        del now
+        from omnigent.db.db_models import current_workspace_id
+
         self.touches.append(runner_ids)
+        self.touch_stamps.append((current_workspace_id(), runner_ids, now))
 
     def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
         self.clears.append((runner_id, not_after))
@@ -173,6 +176,107 @@ def test_touch_records_stamp_and_clear_forwards_it_as_not_after(
     assert session_live_state.last_liveness_stamp("runner_c") == stamp
 
 
+def test_ping_refreshes_coalesce_into_one_write_per_workspace(
+    recording_store: _RecordingStore,
+) -> None:
+    """Refreshes in one window become one stamped write per workspace.
+
+    Each runner tunnel's ping loop refreshes on its own phase; writing each
+    separately is one ``UPDATE`` per runner per ping interval. Within a
+    window, every runner in a workspace shares the window's stamp and one
+    write, run under that workspace's scope. A repeat refresh in the same
+    window adds nothing, and the stamp recorded for each runner is exactly
+    the one written.
+    """
+    from omnigent.db.db_models import workspace_scope
+
+    with workspace_scope(7):
+        session_live_state.refresh_runner_liveness("runner_a")
+        session_live_state.refresh_runner_liveness("runner_b")
+        session_live_state.refresh_runner_liveness("runner_a")
+    with workspace_scope(8):
+        session_live_state.refresh_runner_liveness("runner_c")
+    assert recording_store.touch_stamps == []
+
+    stamp = session_live_state.last_liveness_stamp("runner_a")
+    assert stamp is not None
+    session_live_state.flush_runner_liveness()
+    _wait_until(lambda: len(recording_store.touch_stamps) >= 2)
+
+    assert sorted(recording_store.touch_stamps) == [
+        (7, ["runner_a", "runner_b"], stamp),
+        (8, ["runner_c"], stamp),
+    ]
+    assert session_live_state.last_liveness_stamp("runner_c") == stamp
+
+
+def test_refresh_window_flushes_on_its_timer(
+    recording_store: _RecordingStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open window is written without an explicit flush once it elapses."""
+    monkeypatch.setattr(session_live_state, "LIVENESS_REFRESH_WINDOW_S", 0.01)
+    session_live_state.refresh_runner_liveness("runner_a")
+    _wait_until(lambda: bool(recording_store.touches))
+    assert recording_store.touches == [["runner_a"]]
+
+
+def test_immediate_touch_bypasses_and_supersedes_the_refresh_window(
+    recording_store: _RecordingStore,
+) -> None:
+    """A connect-time touch writes at once and drops the runner's pending refresh.
+
+    Other replicas must see a just-connected runner before the next ping, so
+    the immediate path is never batched. Its newer stamp must also not be
+    rolled back by the window's older one when that window flushes.
+    """
+    session_live_state.refresh_runner_liveness("runner_a")
+    session_live_state.refresh_runner_liveness("runner_b")
+    session_live_state.touch_runner_liveness(["runner_a"])
+    immediate_stamp = session_live_state.last_liveness_stamp("runner_a")
+    _wait_until(lambda: bool(recording_store.touches))
+    assert recording_store.touches == [["runner_a"]]
+
+    # Stamped since the window opened, so a ping in the same window is a no-op.
+    session_live_state.refresh_runner_liveness("runner_a")
+    session_live_state.flush_runner_liveness()
+    _wait_until(lambda: len(recording_store.touches) >= 2)
+    assert recording_store.touches == [["runner_a"], ["runner_b"]]
+    assert session_live_state.last_liveness_stamp("runner_a") == immediate_stamp
+
+
+def test_clear_withdraws_a_pending_refresh(recording_store: _RecordingStore) -> None:
+    """A graceful disconnect is not undone by its runner's pending refresh.
+
+    The clear passes the runner's recorded stamp (the window's) as
+    ``not_after``, which still covers whatever older stamp the row holds.
+    """
+    session_live_state.refresh_runner_liveness("runner_a")
+    window_stamp = session_live_state.last_liveness_stamp("runner_a")
+    session_live_state.clear_runner_liveness("runner_a")
+    session_live_state.flush_runner_liveness()
+    _wait_until(lambda: bool(recording_store.clears))
+    # Drain the ordered worker behind the clear before asserting no touch.
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+
+    assert recording_store.clears == [("runner_a", window_stamp)]
+    assert recording_store.touches == []
+
+
+def test_clear_after_a_flushed_refresh_still_applies_in_order(
+    recording_store: _RecordingStore,
+) -> None:
+    """A refresh already flushed lands before a later clear, which then erases it."""
+    session_live_state.refresh_runner_liveness("runner_a")
+    session_live_state.flush_runner_liveness()
+    session_live_state.clear_runner_liveness("runner_a")
+    _wait_until(lambda: bool(recording_store.clears))
+
+    [(_, runner_ids, stamp)] = recording_store.touch_stamps
+    assert runner_ids == ["runner_a"]
+    assert recording_store.clears == [("runner_a", stamp)]
+
+
 def test_unconfigured_module_is_a_no_op() -> None:
     """Without a wired store (runner process, most tests) nothing runs.
 
@@ -182,6 +286,8 @@ def test_unconfigured_module_is_a_no_op() -> None:
     session_live_state.persist_live_status("conv_1", "running")
     session_live_state.persist_pending_count("conv_1", 1)
     session_live_state.touch_runner_liveness(["runner_a"])
+    session_live_state.refresh_runner_liveness("runner_a")
+    session_live_state.flush_runner_liveness()
     session_live_state.clear_runner_liveness("runner_a")
 
 
