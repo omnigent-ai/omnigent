@@ -1919,6 +1919,8 @@ class SqlSkillPrincipal(OmnigentBase):
     :param installed_count: Rows the principal holds in ``installed_skills``.
     :param enabled_bytes: Sum of ``bundle_bytes`` over its enabled rows.
     :param enabled_entries: Sum of ``bundle_entries`` over its enabled rows.
+    :param revision: Incremented by every write to the principal's installs,
+        so a running session can tell its delivered set is out of date.
     :param created_at: Unix epoch seconds at row creation.
     """
 
@@ -1933,6 +1935,7 @@ class SqlSkillPrincipal(OmnigentBase):
     installed_count: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     enabled_entries: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     @validates("principal")
