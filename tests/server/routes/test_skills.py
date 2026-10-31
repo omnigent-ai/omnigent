@@ -231,7 +231,10 @@ async def test_presession_catalog_matches_filtered_invocations(
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     for name in ("bundled", "allowed"):
         _install_personal_skill(db_uri, tmp_path, "owner", name, description=f"Installed {name}")
-    for name in ("bundled", "hidden", "allowed", "denied"):
+    # A hidden install still takes its name at runtime, so the host's "secret"
+    # it shadows must not be offered either.
+    _install_personal_skill(db_uri, tmp_path, "owner", "secret", user_invocable=False)
+    for name in ("bundled", "hidden", "allowed", "denied", "secret"):
         directory = tmp_path / ".claude" / "skills" / name
         directory.mkdir(parents=True)
         (directory / "SKILL.md").write_text(
@@ -315,12 +318,12 @@ async def test_presession_catalog_matches_filtered_invocations(
             "source": None,
         }
         for s in expected
-        if s.name != "allowed"
+        if s.name not in ("allowed", "secret")
     ]
     if any(s.name == "allowed" for s in expected):
         listed.append(installed)
     assert response.json()["skills"] == listed
-    assert "hidden" not in {s["name"] for s in response.json()["skills"]}
+    assert {"hidden", "secret"}.isdisjoint(s["name"] for s in response.json()["skills"])
     assert response.json()["warnings"] == []
 
 

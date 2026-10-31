@@ -213,7 +213,13 @@ def create_skills_router(
             # installed skill is delivered as bundle content and shadows the
             # host's, so the menu shows the installed one.
             added = installed_skill_summaries(installed, installed_spec, bundled)
-            shadowed = {skill.name for skill in added}
+            # Hidden installs take their name at runtime too, so they shadow
+            # host skills although the menu does not list them.
+            shadowed = {
+                skill.name
+                for skill in installed
+                if skill.name not in bundled and skill_allowed(installed_spec, skill.name)
+            }
             skills = [skill for skill in skills if skill.name not in shadowed] + added
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
