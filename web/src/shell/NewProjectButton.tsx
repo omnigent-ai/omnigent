@@ -24,7 +24,7 @@ import {
   sandboxHostChoiceProvider,
 } from "@/lib/hostPreferences";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import type { ProjectAppearance } from "@/lib/projectColors";
+import { type ProjectAppearance, withProjectAppearance } from "@/lib/projectColors";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import { deriveRepoName, sandboxRepoProblem } from "@/lib/sandboxRepositories";
@@ -320,9 +320,7 @@ export function NewProjectButton({
       }
     }
 
-    const config: ProjectConfig = {};
-    if (appearance.icon) config.icon = appearance.icon;
-    else if (appearance.color) config.color = appearance.color;
+    const config: ProjectConfig = withProjectAppearance({}, appearance);
     if (runsOnSandbox) {
       config.host_id = SANDBOX_HOST_CHOICE;
       if (sandboxProvider) config.sandbox_provider = sandboxProvider;
