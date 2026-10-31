@@ -181,9 +181,7 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
-      // Enforce navigation policy after IPC issues a URL (always opts.agent).
-      // Views start unenforced; direct registry callers may also omit the flag.
-      // Guards cover the full navigation chain, including redirects.
+      // Enables navigation guards; renderer IPC always sets it.
       navigationPolicyEnforced: false,
       agentContext: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
@@ -294,9 +292,7 @@ function createBrowserViewRegistry({
     });
   }
 
-  // will-navigate/will-redirect block navigation; did-navigate only reports it
-  // and fires too late. IPC enforces policy for every renderer navigation;
-  // new views and direct registry callers can leave enforcement off.
+  // Hook will-navigate/will-redirect: they can block; did-navigate fires too late.
   function attachAgentNavGuard(conversationId, entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
@@ -533,9 +529,7 @@ function createBrowserViewRegistry({
     if (needsAgentViewRevocation(get(conversationId), opts?.agentContext)) {
       return { ok: false, error: "Previous browser page must be cleared before navigating" };
     }
-    // IPC sets opts.agent for every renderer navigation, including the URL bar.
-    // Check before getOrCreate so a rejected URL creates no blank view;
-    // direct registry callers may omit the flag to skip enforcement.
+    // Validate before creating a view.
     if (opts && opts.agent && url) {
       const verdict = isAgentNavigationAllowed(url, {
         allowLocalhost: allowsLocalhost(opts.agentContext),
@@ -547,8 +541,7 @@ function createBrowserViewRegistry({
     const result = getOrCreate(conversationId);
     if (!result.ok) return result;
     const { entry, created } = result;
-    // Store enforcement and context for the whole navigation chain, only when
-    // issuing a URL. IPC always enables enforcement; direct callers may not.
+    // Latch policy for this URL's redirect chain; URL-less remounts keep the prior state.
     if (url) {
       entry.navigationPolicyEnforced = !!(opts && opts.agent);
       entry.agentContext = entry.navigationPolicyEnforced ? (opts.agentContext ?? null) : null;

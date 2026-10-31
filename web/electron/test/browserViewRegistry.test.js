@@ -548,7 +548,6 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
 
   it("does NOT block redirects for a direct registry navigation without opts.agent", () => {
     const { registry, fire } = makeEventCapturingRegistry();
-    // Direct registry calls without opts.agent leave enforcement off.
     registry.openOrNavigate("conv_1", "https://intranet.example.com/", undefined, {
       force: true,
     });
@@ -563,7 +562,6 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
   it("a direct registry navigation without opts.agent clears prior enforcement", () => {
     const { registry, fire } = makeEventCapturingRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
-    // A later direct call omits opts.agent on the same view.
     registry.openOrNavigate("conv_1", "https://intranet.example.com/", undefined, {
       force: true,
     });
