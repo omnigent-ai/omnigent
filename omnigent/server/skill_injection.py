@@ -279,25 +279,14 @@ def effective_installed_skills(
 
     :raises SkillDeliveryError: When more rows than that are visible.
     """
-    by_name: dict[str, InstalledSkill] = {}
-    # With URL installs off, only skills from a listed source are served, so
-    # turning the switch off also stops serving what was installed by URL.
-    listed = None if policy.allow_url_install else listed_sources(skill_store)
+    candidates: list[InstalledSkill] = []
     after: str | None = None
     seen = 0
     while True:
         page = skill_store.list_for_user(owner_id, limit=MAX_PAGE, after=after)
-        for skill in page.data:
-            if not skill.enabled or not policy.allows(skill.source_url):
-                continue
-            if listed is not None and not any(
-                (skill.source_url, skill.ref, path) in listed
-                for path in ancestor_paths(skill.path)
-            ):
-                continue
-            current = by_name.get(skill.name)
-            if current is None or (current.scope == "org" and skill.scope == "user"):
-                by_name[skill.name] = skill
+        candidates.extend(
+            skill for skill in page.data if skill.enabled and policy.allows(skill.source_url)
+        )
         seen += len(page.data)
         if seen > MAX_DELIVERED_SKILLS:
             raise SkillDeliveryError(
@@ -307,16 +296,39 @@ def effective_installed_skills(
         if not page.has_more or page.last_id is None:
             break
         after = page.last_id
+    # With URL installs off, only skills from a listed source are served, so
+    # turning the switch off also stops serving what was installed by URL.
+    if not policy.allow_url_install:
+        candidates = from_listed_sources(skill_store, candidates)
+    by_name: dict[str, InstalledSkill] = {}
+    for skill in candidates:
+        current = by_name.get(skill.name)
+        if current is None or (current.scope == "org" and skill.scope == "user"):
+            by_name[skill.name] = skill
     return list(by_name.values())
 
 
-def listed_sources(skill_store: SkillStore) -> set[tuple[str, str | None, str]]:
-    """Every browsable source as ``(url, ref, path)``, read page by page."""
-    listed: set[tuple[str, str | None, str]] = set()
-    after: str | None = None
-    while True:
-        page = skill_store.list_sources(limit=MAX_PAGE, after=after)
-        listed.update((source.url, source.ref, source.path) for source in page.data)
-        if not page.has_more or page.last_id is None:
-            return listed
-        after = page.last_id
+def from_listed_sources(
+    skill_store: SkillStore, skills: list[InstalledSkill]
+) -> list[InstalledSkill]:
+    """The *skills* whose repository and ref are a listed source at a directory holding them.
+
+    One identity lookup per distinct repository and ref among *skills*, for
+    the directories that could hold them, so the work follows the bounded
+    installed set and not the number of sources.
+    """
+    wanted: dict[tuple[str, str | None], set[str]] = {}
+    for skill in skills:
+        wanted.setdefault((skill.source_url, skill.ref), set()).update(ancestor_paths(skill.path))
+    listed = {
+        (url, ref, path)
+        for (url, ref), paths in wanted.items()
+        for path in skill_store.listed_source_paths(url, ref, paths)
+    }
+    return [
+        skill
+        for skill in skills
+        if any(
+            (skill.source_url, skill.ref, path) in listed for path in ancestor_paths(skill.path)
+        )
+    ]

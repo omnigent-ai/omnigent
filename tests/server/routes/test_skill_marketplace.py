@@ -1140,3 +1140,57 @@ def test_a_bundle_namespace_folder_is_a_reserved_install_name(tmp_path: Path) ->
         ],
     )
     assert spec_reserved_names(spec) == {"triage", "team", "lint"}
+
+
+def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None:
+    # With URL installs off, delivery read every source page to decide which
+    # installs came from a listed one, so its work grew with the source count.
+    import sqlalchemy as sa
+
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.skills.policy import SkillsMarketplacePolicy
+
+    store = SqlAlchemySkillStore(db_uri)
+    store.add_source(url=REPO_URL, ref=None, path="", name="acme", created_by=None)
+    store.install(
+        name="review",
+        display_name=None,
+        description="d",
+        source_url=REPO_URL,
+        ref=None,
+        commit=None,
+        path="skills/review",
+        scope="org",
+        owner_user_id=None,
+        bundle_location="skills/review.tar.gz",
+        bundle_bytes=1,
+        installed_by=None,
+    )
+    policy = SkillsMarketplacePolicy(allow_url_install=False)
+    engine = get_or_create_engine(db_uri)
+    statements: list[str] = []
+
+    def count(*args: object) -> None:
+        statements.append(str(args[2]))
+
+    def delivery_statements() -> int:
+        statements.clear()
+        sa.event.listen(engine, "before_cursor_execute", count)
+        try:
+            assert [s.name for s in effective_installed_skills(store, "alice", policy=policy)] == [
+                "review"
+            ]
+        finally:
+            sa.event.remove(engine, "before_cursor_execute", count)
+        return len(statements)
+
+    before = delivery_statements()
+    for index in range(450):  # more than two pages of sources
+        store.add_source(
+            url=f"https://github.com/other/r{index}.git",
+            ref=None,
+            path="",
+            name=f"r{index}",
+            created_by=None,
+        )
+    assert delivery_statements() == before
