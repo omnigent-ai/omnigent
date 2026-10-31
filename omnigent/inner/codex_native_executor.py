@@ -85,6 +85,7 @@ from omnigent.inner.native_attachments import (
     uses_filesystem_delivery,
 )
 from omnigent.native.input_diagnostics import (
+    current_input_attributes,
     log_input_event,
     with_input_attributes,
 )
@@ -102,6 +103,7 @@ _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
+_DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     message="Codex is still compacting, so this message was not delivered.",
     code="codex_compacting",
@@ -253,10 +255,12 @@ async def _native_delivery_request(
     state: CodexNativeBridgeState,
     *,
     bridge_dir: Path,
-) -> CodexMessage:
+) -> CodexMessage | None:
     """Reconnect once after an authoritative refusal; never retry socket loss."""
     try:
-        return await _native_delivery_request_once(client, method, params, state)
+        return await _native_delivery_request_once(
+            client, method, params, state, bridge_dir=bridge_dir
+        )
     except CodexAppServerResponseError as error:
         if not is_server_draining_error(error):
             raise
@@ -292,7 +296,74 @@ async def _native_delivery_request(
             ) from error
         # A second refusal still proves non-delivery. Transport failure after
         # this submission remains ambiguous and cannot authorize another retry.
-        return await _native_delivery_request_once(client, method, params, state)
+        return await _native_delivery_request_once(
+            client, method, params, state, bridge_dir=bridge_dir
+        )
+
+
+async def _read_native_delivery_receipt(
+    client: CodexAppServerClient,
+    state: CodexNativeBridgeState,
+    *,
+    bridge_dir: Path,
+    client_message_id: str,
+    requested_turn_id: str | None,
+) -> str | None:
+    """Confirm input identity from native history without submitting or changing a turn."""
+
+    def same_session() -> bool:
+        current = read_bridge_state(bridge_dir)
+        return (
+            current is not None
+            and current.session_id == state.session_id
+            and current.thread_id == state.thread_id
+            and current.socket_path == state.socket_path
+        )
+
+    try:
+        async with asyncio.timeout(_DELIVERY_RECEIPT_TIMEOUT_SECONDS):
+            if not same_session():
+                return None
+            await client.close()
+            await client.connect()
+            response = await client.request(
+                "thread/read", {"threadId": state.thread_id, "includeTurns": True}
+            )
+            if not same_session():
+                return None
+            result = _json_object(response.get("result"))
+            thread = _json_object(result.get("thread")) if result is not None else None
+            if thread is None or thread.get("id") != state.thread_id:
+                return None
+            turns = thread.get("turns")
+            if not isinstance(turns, list):
+                return None
+            for value in turns:
+                turn = _json_object(value)
+                if turn is None:
+                    continue
+                turn_id = turn.get("id")
+                if not isinstance(turn_id, str) or not turn_id:
+                    continue
+                if requested_turn_id is not None and turn_id != requested_turn_id:
+                    continue
+                items = turn.get("items")
+                if not isinstance(items, list):
+                    continue
+                for value in items:
+                    item = _json_object(value)
+                    if (
+                        item is not None
+                        and item.get("type") == "userMessage"
+                        and item.get("clientId") == client_message_id
+                        and isinstance(item.get("id"), str)
+                        and item["id"]
+                    ):
+                        return turn_id
+    except Exception:
+        # A missing/unreadable receipt leaves delivery uncertain; it never permits replay.
+        _logger.debug("Codex delivery receipt unavailable", exc_info=True)
+    return None
 
 
 async def _native_delivery_request_once(
@@ -300,7 +371,9 @@ async def _native_delivery_request_once(
     method: _NativeDeliveryMethod,
     params: CodexParams,
     state: CodexNativeBridgeState,
-) -> CodexMessage:
+    *,
+    bridge_dir: Path,
+) -> CodexMessage | None:
     """Pair each RPC attempt with its result, including a rejected stale steer."""
     attempt_id = uuid.uuid4().hex
     stage = _DELIVERY_STAGES[method]
@@ -308,6 +381,11 @@ async def _native_delivery_request_once(
     requested_turn_id = expected if isinstance(expected, str) else None
     requested_thread = params.get("threadId")
     thread_id = requested_thread if isinstance(requested_thread, str) else None
+    client_message_id = current_input_attributes().get("delivery_attempt_id")
+    if isinstance(client_message_id, str) and client_message_id and thread_id == state.thread_id:
+        params = {**params, "clientUserMessageId": client_message_id}
+    else:
+        client_message_id = None
     log_input_event(
         _logger,
         "codex_native_delivery_attempt",
@@ -342,6 +420,28 @@ async def _native_delivery_request_once(
             rpc_error_code=exc.code if isinstance(exc, CodexAppServerResponseError) else None,
         )
         if isinstance(exc, (OSError, WebSocketException)):
+            if isinstance(client_message_id, str):
+                confirmed_turn = await _read_native_delivery_receipt(
+                    client,
+                    state,
+                    bridge_dir=bridge_dir,
+                    client_message_id=client_message_id,
+                    requested_turn_id=requested_turn_id,
+                )
+                if confirmed_turn is not None:
+                    log_input_event(
+                        _logger,
+                        "codex_native_delivery_finished",
+                        session_id=state.session_id,
+                        native_rpc_attempt_id=attempt_id,
+                        stage=stage,
+                        thread_id=thread_id,
+                        requested_native_turn_id=requested_turn_id,
+                        native_turn_id=confirmed_turn,
+                        outcome="native_receipt_confirmed",
+                    )
+                    # The forwarder owns current turn state; this receipt can already be old.
+                    return None
             raise InjectionDeliveryAmbiguous(str(exc)) from exc
         raise
     result = _json_object(response.get("result"))
@@ -437,7 +537,7 @@ async def _start_codex_turn(
         state,
         bridge_dir=bridge_dir,
     )
-    result = _json_object(response.get("result"))
+    result = _json_object(response.get("result")) if response is not None else None
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
     if isinstance(turn_id, str) and turn_id:
@@ -465,7 +565,7 @@ async def _steer_codex_turn(
         state,
         bridge_dir=bridge_dir,
     )
-    result = _json_object(response.get("result"))
+    result = _json_object(response.get("result")) if response is not None else None
     turn_id = result.get("turnId") if result is not None else None
     if isinstance(turn_id, str) and turn_id:
         update_active_turn_id(bridge_dir, turn_id)
