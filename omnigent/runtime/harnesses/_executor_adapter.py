@@ -243,7 +243,9 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
+        ctx._watchdog_executor_stage = "preparing_turn"
         executor = self._ensure_executor()
+        ctx._watchdog_executor_type = type(executor).__name__[:128]
         messages = _translate_input_to_messages(
             request.input,
             include_tool_history=executor.replays_tool_history(),
@@ -372,6 +374,7 @@ class ExecutorAdapter(HarnessApp):
                     )
 
                 response_text: str | None = None
+                ctx._watchdog_executor_stage = "executor_stream"
                 async for event in executor.run_turn(
                     messages=messages,
                     tools=tools,
@@ -550,6 +553,10 @@ class ExecutorAdapter(HarnessApp):
             if self._executor is not None:
                 await self._executor.interrupt_session(self._session_key)
         except BaseException as exc:
+            ctx._watchdog_executor_unwind = {
+                "observed_tool_count_at_unwind": len(self._observed_tool_calls),
+                "pending_mcp_call_count_at_unwind": len(self._pending_mcp_call_ids),
+            }
             _turn_outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
             if input_identity and not input_outcome_logged:
                 log_input_event(
