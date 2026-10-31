@@ -3,13 +3,13 @@ import type * as NativeBridge from "@/lib/nativeBridge";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserPane } from "./BrowserPane";
 
-// supportsBrowser gates the whole pane. Force it true so the pane renders; the
-// unsupported-shell (returns null) path is covered by reading the early return.
 const getSessionSlim = vi.fn();
 vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
 
+// supportsBrowser gates the whole pane. Force it true so the pane renders; the
+// unsupported-shell (returns null) path is covered by reading the early return.
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridge>()),
   isElectronShell: () => true,
@@ -415,6 +415,58 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     );
     expect(getSessionSlim).toHaveBeenCalledTimes(2);
   });
+
+  it.each(["host lookup", "navigation result"])(
+    "keeps the latest URL submission when the earlier %s finishes last",
+    async (pendingStage) => {
+      const firstHost = Promise.withResolvers<unknown>();
+      const firstNavigation = Promise.withResolvers<{ ok: boolean; error?: string }>();
+      getSessionSlim
+        .mockReturnValueOnce(
+          pendingStage === "host lookup"
+            ? firstHost.promise
+            : Promise.resolve({ id: "conv_preview", hostId: "local-host" }),
+        )
+        .mockResolvedValue({ id: "conv_preview", hostId: "remote-host" });
+      const bridge = installBridge({
+        browserOpenOrNavigate: vi
+          .fn()
+          .mockImplementationOnce(() =>
+            pendingStage === "navigation result"
+              ? firstNavigation.promise
+              : Promise.resolve({ ok: true }),
+          )
+          .mockResolvedValue({ ok: true }),
+      });
+      render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      fireEvent.change(bar, { target: { value: "https://first.example" } });
+      fireEvent.keyDown(bar, { key: "Enter" });
+      if (pendingStage === "navigation result") {
+        await waitFor(() => expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+      }
+      fireEvent.change(bar, { target: { value: "https://latest.example" } });
+      fireEvent.keyDown(bar, { key: "Enter" });
+      await waitFor(() => expect(bar).toHaveValue("https://latest.example"));
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+          "browser-tab:conv_preview:two",
+          "https://latest.example",
+          undefined,
+          { force: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
+        ),
+      );
+      await act(async () => {
+        firstHost.resolve({ id: "conv_preview", hostId: "local-host" });
+        firstNavigation.resolve({ ok: false, error: "stale failure" });
+      });
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(
+        pendingStage === "host lookup" ? 1 : 2,
+      );
+      expect(bar).toHaveValue("https://latest.example");
+      expect(screen.queryByText("stale failure")).not.toBeInTheDocument();
+    },
+  );
 
   it("reload button calls the reload IPC once a view is active", async () => {
     const { bridge } = await renderActive("conv_reload");

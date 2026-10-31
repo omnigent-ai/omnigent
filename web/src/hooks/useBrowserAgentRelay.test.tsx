@@ -530,42 +530,44 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     );
   });
 
-  it("keeps source-host resolution alive across visible-session switches", async () => {
-    const bridge = installBridge();
-    let resolveHost!: (source: unknown) => void;
-    getSessionSlim.mockImplementation((id: string) =>
-      id === "parent"
-        ? new Promise((resolve) => {
-            resolveHost = resolve;
-          })
-        : Promise.resolve({ id, hostId: null, parentSessionId: "parent" }),
-    );
-    const hook = renderRelay();
-    emitBrowserActionRequest(
-      actionEvent("navigate", { url: "http://localhost:5173" }),
-      "conv_background_A",
-    );
-    await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith("parent"));
-    hook.rerender({ id: "conv_visible_B" });
-    setSessionHost("conv_visible_B", "local-host");
-    resolveHost({ id: "parent", hostId: "arca-host", parentSessionId: null });
-    await vi.waitFor(() =>
-      expect(postedResult().result).toEqual({
-        ok: true,
-        data: { final_url: "http://localhost:5173" },
-      }),
-    );
-    expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
-    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
-      "conv_background_A",
-      "http://localhost:5173",
-      undefined,
-      { force: true, agent: true, sourceHostId: "arca-host", sessionHostProtocol: 1 },
-    );
-    expect(authenticatedFetch.mock.calls[1][0]).toContain(
-      "/v1/sessions/conv_background_A/browser/action_result/",
-    );
-  });
+  it.each(["source", "ancestor"])(
+    "keeps a pending %s lookup tied to its source across visible-session switches",
+    async (pendingHop) => {
+      const bridge = installBridge();
+      const pending = Promise.withResolvers<unknown>();
+      const sourceId = "conv_background_A";
+      const pendingId = pendingHop === "source" ? sourceId : "parent";
+      getSessionSlim.mockImplementation((id: string) =>
+        id === pendingId
+          ? pending.promise
+          : Promise.resolve({ id, hostId: null, parentSessionId: "parent" }),
+      );
+      const hook = renderRelay();
+      emitBrowserActionRequest(actionEvent("navigate", { url: "http://localhost:5173" }), sourceId);
+      await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith(pendingId));
+      hook.rerender({ id: "conv_visible_B" });
+      setSessionHost("conv_visible_B", "local-host");
+      pending.resolve({ id: pendingId, hostId: "arca-host", parentSessionId: null });
+      await vi.waitFor(() =>
+        expect(postedResult().result).toEqual({
+          ok: true,
+          data: { final_url: "http://localhost:5173" },
+        }),
+      );
+      expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(
+        pendingHop === "source" ? [sourceId] : [sourceId, "parent"],
+      );
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        sourceId,
+        "http://localhost:5173",
+        undefined,
+        { force: true, agent: true, sourceHostId: "arca-host", sessionHostProtocol: 1 },
+      );
+      expect(authenticatedFetch.mock.calls[1][0]).toContain(
+        "/v1/sessions/conv_background_A/browser/action_result/",
+      );
+    },
+  );
 
   it("does not dispatch a stale metadata resolution after relay unmount", async () => {
     const bridge = installBridge();
@@ -588,33 +590,6 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       }),
     );
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-  });
-
-  it("keeps the authoritative source lookup alive across visible-session switches", async () => {
-    const bridge = installBridge();
-    let resolve!: (source: unknown) => void;
-    getSessionSlim.mockImplementation(
-      () =>
-        new Promise((r) => {
-          resolve = r;
-        }),
-    );
-    const hook = renderRelay();
-    emitBrowserActionRequest(
-      actionEvent("navigate", { url: "http://localhost:5173" }),
-      "conv_background_A",
-    );
-    await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith("conv_background_A"));
-    hook.rerender({ id: "conv_visible_B" });
-    setSessionHost("conv_visible_B", "local-host");
-    resolve({ id: "conv_background_A", hostId: "arca-host", parentSessionId: null });
-    await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
-    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
-      "conv_background_A",
-      "http://localhost:5173",
-      undefined,
-      { force: true, agent: true, sourceHostId: "arca-host", sessionHostProtocol: 1 },
-    );
   });
 
   it("navigate: reports the final_url and marks it agent+force", async () => {
@@ -849,6 +824,62 @@ describe("useBrowserAgentRelay — privileged reads", () => {
       sessionHostProtocol: 1,
       sourceHostId: "remote-host",
     });
+  });
+
+  it.each([{ exists: true, hostIsThisMachine: false }, { exists: false }])(
+    "skips host revalidation for view status %j",
+    async (status) => {
+      const bridge = installBridge({ browserHasView: vi.fn().mockResolvedValue(status) });
+      renderRelay();
+      emitBrowserActionRequest(actionEvent("screenshot", {}, "screen"), CONV);
+      await vi.waitFor(() =>
+        expect(bridge.browserScreenshot).toHaveBeenCalledExactlyOnceWith(CONV),
+      );
+      emitBrowserActionRequest(actionEvent("click", { ref: "e1" }, "click"), CONV);
+      await vi.waitFor(() =>
+        expect(bridge.browserPerformAction).toHaveBeenCalledExactlyOnceWith(CONV, "click", {
+          ref: "e1",
+        }),
+      );
+      expect(getSessionSlim).not.toHaveBeenCalled();
+    },
+  );
+
+  it("omits host options when a navigation lookup fails", async () => {
+    const bridge = installBridge();
+    setSessionHost(CONV, "stale-local-host");
+    getSessionSlim.mockRejectedValue(new Error("session unavailable"));
+    await runAction(actionEvent("navigate", { url: "https://example.com" }));
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledExactlyOnceWith(
+      CONV,
+      "https://example.com",
+      undefined,
+      { force: true, agent: true },
+    );
+  });
+
+  it.each([16, 17])("bounds host resolution with the binding at hop %i", async (hostHop) => {
+    const bridge = installBridge();
+    getSessionSlim.mockImplementation((id: string) => {
+      const hop = id === CONV ? 1 : Number(id.slice("ancestor-".length));
+      return Promise.resolve({
+        id,
+        hostId: hop === hostHop ? "local-host" : null,
+        parentSessionId: `ancestor-${hop + 1}`,
+      });
+    });
+    await runAction(actionEvent("navigate", { url: "https://example.com" }));
+    expect(getSessionSlim).toHaveBeenCalledTimes(16);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledExactlyOnceWith(
+      CONV,
+      "https://example.com",
+      undefined,
+      {
+        force: true,
+        agent: true,
+        ...(hostHop === 16 ? { sourceHostId: "local-host", sessionHostProtocol: 1 } : {}),
+      },
+    );
   });
 
   it("sends an explicit unknown host when fresh resolution fails", async () => {

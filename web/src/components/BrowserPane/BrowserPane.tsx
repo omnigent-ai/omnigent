@@ -181,6 +181,13 @@ export function BrowserPane({
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
   const urlEditingRef = useRef(false);
+  const submitSequenceRef = useRef(0);
+  useEffect(
+    () => () => {
+      submitSequenceRef.current++;
+    },
+    [conversationId],
+  );
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
   // Design-mode toggle: on, the main process injects the in-page picker; submit
@@ -276,18 +283,23 @@ export function BrowserPane({
     if (!raw) return;
     const navUrl = normalizeTypedUrl(raw);
     setNavigationError(null);
+    const sequence = ++submitSequenceRef.current;
     void fetchSessionHostId(browserViewOwnerId(conversationId))
-      .then((hostId) =>
-        bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
+      .then((hostId) => {
+        if (sequence !== submitSequenceRef.current) return null;
+        return bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
           force: true,
           ...navigationHostOptions(hostId),
-        }),
-      )
+        });
+      })
       .then((result) => {
+        if (!result || sequence !== submitSequenceRef.current) return;
         if (result.ok) setCurrentUrl(navUrl);
         else setNavigationError(result.error ?? "Unable to open this page.");
       })
-      .catch(() => setNavigationError("Unable to open this page."));
+      .catch(() => {
+        if (sequence === submitSequenceRef.current) setNavigationError("Unable to open this page.");
+      });
   }, [conversationId, currentUrl]);
 
   const handleBack = useCallback(() => {
