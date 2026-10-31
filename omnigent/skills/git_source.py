@@ -117,7 +117,7 @@ def repository_path(path: str | None, *, max_chars: int = MAX_PATH_CHARS) -> str
     if not cleaned:
         return ""
     parts = cleaned.split("/")
-    if "\x00" in cleaned or any(part in ("", ".", "..") for part in parts):
+    if _UNSAFE_PATH_CHARS.search(cleaned) or any(part in ("", ".", "..") for part in parts):
         raise GitSourceError(f"{cleaned!r} is not a directory inside the repository.")
     if len(cleaned) > max_chars:
         raise GitSourceError(f"A repository directory is limited to {max_chars} characters.")
@@ -254,6 +254,8 @@ class SparseCheckout:
     expand: Callable[[Path], Sequence[str]] | None = None
 
 
+# Characters a sparse-checkout pattern line (or a git argument) cannot carry.
+_UNSAFE_PATH_CHARS = re.compile(r"[\x00\n\r]")
 _PATTERN_SPECIALS = re.compile(r"([\\*?\[\]!#])")
 
 
@@ -263,7 +265,12 @@ def literal_pattern(path: str) -> str:
     Non-cone patterns use gitignore syntax, so a directory named ``[team]`` or
     ``a*b`` would otherwise be read as a wildcard; every special character is
     escaped, and so is a trailing space git would strip.
+
+    :raises GitSourceError: When *path* holds a line break or NUL, which the
+        one-pattern-per-line file cannot carry.
     """
+    if _UNSAFE_PATH_CHARS.search(path):
+        raise GitSourceError(f"{printable(path)!r} cannot be checked out sparsely.")
     escaped = _PATTERN_SPECIALS.sub(r"\\\1", path)
     if escaped.endswith(" "):
         escaped = escaped[:-1] + "\\ "
@@ -361,6 +368,15 @@ def _run_clone(
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
+def check_ref(ref: str | None) -> None:
+    """Refuse a ref git cannot be handed: NUL or a line break, or an option-like name.
+
+    :raises GitSourceError: With a user-facing reason.
+    """
+    if ref is not None and (_UNSAFE_PATH_CHARS.search(ref) or ref.startswith("-")):
+        raise GitSourceError(f"{printable(ref)!r} is not a branch or tag name.")
+
+
 def clone_github_source(
     clone_url: str,
     ref: str | None,
@@ -391,6 +407,7 @@ def clone_github_source(
     :raises GitSourceError: When git is missing, the clone times out, exceeds
         *max_bytes*, or git fails.
     """
+    check_ref(ref)
     base = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
             "-c", "protocol.https.allow=always", *_LOW_SPEED_CONFIG]  # fmt: skip
     if isolated:

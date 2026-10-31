@@ -196,6 +196,10 @@ def _entry(
 ) -> CatalogEntry | None:
     """The catalog entry for one skill directory, or ``None`` with the reason in *skipped*."""
     rel = skill_dir.relative_to(root).as_posix()
+    if any(char in rel for char in "\x00\n\r"):
+        # A sparse checkout lists one path per line, so this one cannot be packaged.
+        skipped.append(f"{rel!r}: path has a line break; not installable")
+        return None
     manifest = skill_dir / "SKILL.md"
     if manifest.is_symlink() or not _inside(root, manifest):
         skipped.append(f"{rel}: SKILL.md is a link; not followed")

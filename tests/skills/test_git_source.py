@@ -464,6 +464,11 @@ def test_a_sparse_clone_checks_out_only_what_it_selects(
     ).stdout.split()
     assert f"?{big}" in missing
 
+    # A path with a line break would split into two pattern lines and leave the
+    # skill's supporting files behind, so it is refused rather than packaged.
+    with pytest.raises(git_source.GitSourceError, match="cannot be checked out sparsely"):
+        git_source.directory_pattern("skills/team\nwide/review")
+
 
 def test_hidden_root_directories_are_valid_paths_but_traversal_is_not() -> None:
     # .agents and .claude are catalog layouts; a link into them parses, and an
@@ -478,3 +483,16 @@ def test_hidden_root_directories_are_valid_paths_but_traversal_is_not() -> None:
     with pytest.raises(git_source.GitSourceError):
         git_source.normalize_source_path("skills/[team]")
     assert git_source.parse_github_source("acme/skills/../x") is None
+
+
+@pytest.mark.parametrize("ref", ["main\x00evil", "main\nother", "--upload-pack=x"])
+def test_a_ref_git_cannot_take_is_refused_before_git_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ref: str
+) -> None:
+    # NUL made Popen raise ValueError, outside the GitSourceError translation.
+    def no_spawn(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("git must not start for a ref it cannot take")
+
+    monkeypatch.setattr(git_source.subprocess, "Popen", no_spawn)
+    with pytest.raises(git_source.GitSourceError, match="not a branch or tag name"):
+        git_source.clone_github_source("https://github.com/a/b.git", ref, tmp_path / "r")
