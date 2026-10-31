@@ -30,7 +30,17 @@ function renderConsole(t, { scrollHeight }) {
     cancel() {},
     resizeToContent: (size) => page.sizes.push(size),
   };
+  page.terminalSelection = "";
   dom.window.Terminal = class Terminal {
+    constructor() {
+      page.terminal = this;
+    }
+    attachCustomKeyEventHandler(handler) {
+      this.keyHandler = handler;
+    }
+    hasSelection() {
+      return page.terminalSelection !== "";
+    }
     loadAddon() {}
     open() {}
     write() {}
@@ -103,6 +113,23 @@ for (const copy of [
   });
 }
 
+it("lets copy shortcuts copy a terminal selection instead of sending ^C", (t) => {
+  const page = renderConsole(t, { scrollHeight: 360 });
+  page.events.Started({ login: false, command: "host command" });
+  const passesToTerminal = (event) =>
+    page.terminal.keyHandler({ altKey: false, shiftKey: false, ...event });
+
+  assert.equal(passesToTerminal({ ctrlKey: true, key: "c" }), true);
+  page.terminalSelection = "Error: OMNIGENT_AUTH_REQUIRED";
+  assert.equal(passesToTerminal({ ctrlKey: true, key: "c" }), false);
+  assert.equal(passesToTerminal({ metaKey: true, key: "c" }), false);
+  assert.equal(passesToTerminal({ ctrlKey: true, key: "C" }), false);
+  assert.equal(passesToTerminal({ ctrlKey: true, shiftKey: true, key: "C" }), true);
+  assert.equal(passesToTerminal({ ctrlKey: true, altKey: true, key: "c" }), true);
+  assert.equal(passesToTerminal({ ctrlKey: true, key: "v" }), true);
+  assert.equal(passesToTerminal({ key: "c" }), true);
+});
+
 /** A fake Electron world: BrowserWindow + ipcMain + a controllable connect. */
 function flowHarness() {
   const world = {
@@ -110,6 +137,7 @@ function flowHarness() {
     ipc: new EventEmitter(),
     connects: [],
     logins: [],
+    contextMenuWindows: [],
   };
 
   class FakeWindow extends EventEmitter {
@@ -162,6 +190,7 @@ function flowHarness() {
     preloadPath: "/bundle/src/arca_connect_preload.js",
     commandLine: (url) => `arca ssh isaac omni host --server ${url} …`,
     loginCommandLine: (url) => `arca ssh isaac omni login ${url}`,
+    attachContextMenu: (win) => world.contextMenuWindows.push(win),
     startLogin: (serverUrl) => {
       const login = {
         serverUrl,
@@ -299,6 +328,15 @@ describe("arca connect console flow", () => {
     const done = win.webContents.sent.find(([c]) => c === "arca-connect:done");
     assert.deepEqual(done[1], { ok: true, error: null });
     assert.equal(win.destroyed, false); // stays open so the output is readable
+  });
+
+  it("gives each console window the shell's context menu", () => {
+    const { world, flow } = flowHarness();
+    void flow.run(null, "https://srv.example.com");
+    world.windows[0].close();
+    void flow.run(null, "https://srv.example.com");
+    assert.deepEqual(world.contextMenuWindows, world.windows);
+    assert.equal(world.windows.length, 2);
   });
 
   it("labels preview recovery as a reconnect before asking consent", () => {
