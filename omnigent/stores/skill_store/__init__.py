@@ -136,6 +136,10 @@ class SkillStore(ABC):
         """The source for this exact ``(url, ref, path)``, if any."""
 
     @abstractmethod
+    def listed_source_paths(self, url: str, ref: str | None, paths: Collection[str]) -> set[str]:
+        """Which of *paths* are sources of this repository and ref; point lookups only."""
+
+    @abstractmethod
     def list_sources(
         self, *, limit: int = DEFAULT_PAGE, after: str | None = None
     ) -> SkillPage[SkillSource]:

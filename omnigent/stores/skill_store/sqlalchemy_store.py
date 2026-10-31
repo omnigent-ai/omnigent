@@ -225,6 +225,20 @@ class SqlAlchemySkillStore(SkillStore):
             row = session.scalar(_source_identity(url, ref, path))
             return None if row is None else _source_entity(row)
 
+    def listed_source_paths(self, url: str, ref: str | None, paths: Collection[str]) -> set[str]:
+        """Lookups on ``ux_skill_sources_identity``, one IN-list per 100 paths."""
+        found: set[str] = set()
+        with self._session("find_listed_skill_source_paths") as session:
+            for batch in _chunks(sorted(set(paths)), _NAMES_PER_QUERY):
+                stmt = select(SqlSkillSource.path).where(
+                    SqlSkillSource.workspace_id == current_workspace_id(),
+                    SqlSkillSource.url == url,
+                    SqlSkillSource.ref == (DEFAULT_REF if ref is None else ref),
+                    SqlSkillSource.path.in_(batch),
+                )
+                found.update(session.scalars(stmt))
+        return found
+
     def list_sources(
         self, *, limit: int = DEFAULT_PAGE, after: str | None = None
     ) -> SkillPage[SkillSource]:
