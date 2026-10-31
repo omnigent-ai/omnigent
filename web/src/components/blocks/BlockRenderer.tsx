@@ -639,17 +639,24 @@ function TurnWorkedFold({
 }) {
   const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
   const [open, setOpen] = useState(animateCollapse || defaultOpen);
+  // Closing over the trace it replaces, the fold keeps that trace laid out as it was on
+  // screen, so only its height changes; an opened fold indents it under the row.
+  const [inPlace, setInPlace] = useState(animateCollapse && !defaultOpen);
   const userChangedOpenRef = useRef(false);
   useLayoutEffect(() => {
     // History hydration can identify an interjection after this fold mounted.
     // Honor that late default unless the user has already made their own choice.
-    if (defaultOpen && !userChangedOpenRef.current) setOpen(true);
+    if (defaultOpen && !userChangedOpenRef.current) {
+      setInPlace(false);
+      setOpen(true);
+    }
   }, [defaultOpen]);
   useEffect(() => {
-    if (!animateCollapse || defaultOpen) return;
+    // Keyed to state, not the one-render prop: a re-render before the frame must not cancel it.
+    if (!inPlace || !open) return;
     const frame = requestAnimationFrame(() => setOpen(false));
     return () => cancelAnimationFrame(frame);
-  }, [animateCollapse, defaultOpen]);
+  }, [inPlace, open]);
 
   // A USER-initiated expand (never the animateCollapse mount-close)
   // opens INSTANTLY — no height animation — and snaps the fold row to
@@ -670,6 +677,7 @@ function TurnWorkedFold({
     userChangedOpenRef.current = true;
     scrollOnOpenRef.current = next;
     setUserOpened(next);
+    setInPlace(false);
     setOpen(next);
   };
   useLayoutEffect(() => {
@@ -711,11 +719,21 @@ function TurnWorkedFold({
       className="group/turn-fold not-prose w-full"
       data-testid="turn-worked-fold"
     >
-      <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-ui outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-          <span className="shrink-0">{label}</span>
-          <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
-        </CollapsibleTrigger>
+      <div
+        ref={rowRef}
+        className={cn("turn-fold-row", inPlace && "turn-fold-row-enter")}
+        // The grown row stops clipping, so the trigger's focus ring shows.
+        onAnimationEnd={(event) => {
+          if (event.animationName === "turn-fold-row-in") setInPlace(false);
+        }}
+      >
+        {/* The grow-in collapses this wrapper; the trigger's padding would floor it. */}
+        <div>
+          <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-ui outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+            <span className="shrink-0">{label}</span>
+            <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
+          </CollapsibleTrigger>
+        </div>
       </div>
       {/* Height animation lives in index.css (it needs Radix's measured
           --radix-collapsible-content-height) and is disabled under
@@ -726,12 +744,14 @@ function TurnWorkedFold({
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
-        <div className="relative flex flex-col gap-1 pt-2 pl-4">
-          <span
-            aria-hidden
-            className="absolute top-2 bottom-0 left-1 w-px bg-border"
-            data-testid="turn-worked-fold-pin-line"
-          />
+        <div className={cn("relative flex flex-col", inPlace ? "gap-1.5" : "gap-1 pt-2 pl-4")}>
+          {!inPlace && (
+            <span
+              aria-hidden
+              className="absolute top-2 bottom-0 left-1 w-px bg-border"
+              data-testid="turn-worked-fold-pin-line"
+            />
+          )}
           {children}
         </div>
       </CollapsibleContent>

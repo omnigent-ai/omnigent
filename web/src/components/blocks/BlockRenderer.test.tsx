@@ -1948,6 +1948,68 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("All done.")).toBeDefined();
     });
 
+    it("keeps the closing trace laid out as it was, and indents it once opened", async () => {
+      // Hold the mount-open frame: the fold closes in the next animation frame.
+      const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 0);
+      try {
+        const items: RenderItem[] = [
+          tool(1),
+          { kind: "text", itemId: "m1", text: "Done.", final: true },
+        ];
+        const view = (lifecycle: "streaming" | "completed") => (
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="running" turnLifecycle={lifecycle} />
+          </FileViewerContext.Provider>
+        );
+        const { rerender } = render(view("streaming"));
+        rerender(view("completed"));
+        const trigger = await screen.findByRole("button", { name: "Worked" });
+        expect(trigger).toHaveAttribute("aria-expanded", "true");
+        expect(screen.queryByTestId("turn-worked-fold-pin-line")).toBeNull();
+        expect(trigger.closest(".turn-fold-row")).toHaveClass("turn-fold-row-enter");
+
+        fireEvent.click(trigger);
+        fireEvent.click(trigger);
+        expect(trigger).toHaveAttribute("aria-expanded", "true");
+        expect(screen.getByTestId("turn-worked-fold-pin-line")).toBeDefined();
+        expect(trigger.closest(".turn-fold-row")).not.toHaveClass("turn-fold-row-enter");
+      } finally {
+        raf.mockRestore();
+      }
+    });
+
+    it("still closes a fold that re-renders before its closing frame", async () => {
+      const frames: (FrameRequestCallback | null)[] = [];
+      const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+        frames.push(callback);
+        return frames.length;
+      });
+      const caf = vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+        frames[id - 1] = null;
+      });
+      try {
+        const items: RenderItem[] = [
+          tool(1),
+          { kind: "text", itemId: "m1", text: "Done.", final: true },
+        ];
+        const view = (lifecycle: "streaming" | "completed") => (
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={[...items]} sessionStatus="running" turnLifecycle={lifecycle} />
+          </FileViewerContext.Provider>
+        );
+        const { rerender } = render(view("streaming"));
+        rerender(view("completed"));
+        const trigger = await screen.findByRole("button", { name: "Worked" });
+        rerender(view("completed"));
+        act(() => frames.splice(0).forEach((callback) => callback?.(0)));
+        expect(trigger).toHaveAttribute("aria-expanded", "false");
+        expect(trigger).toBeVisible();
+      } finally {
+        raf.mockRestore();
+        caf.mockRestore();
+      }
+    });
+
     it("mounts settled history already collapsed (nothing to animate)", () => {
       const items: RenderItem[] = [
         { kind: "text", itemId: "m0", text: "Looking around.", final: true },
