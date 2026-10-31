@@ -20,6 +20,9 @@ vi.mock("@/lib/nativeBridge", () => ({
   openServerSetup: () => openServerSetup(),
   signOutOfServer: () => signOutOfServer(),
   supportsNativeServerPicker: () => supportsNativeServerPicker(),
+  // Shortcut labels: a browser tab, without the desktop menu's Cmd/Ctrl+,.
+  isNativeShell: () => false,
+  supportsDesktopCommands: () => false,
 }));
 
 vi.mock("@/hooks/useViewerId", () => ({
@@ -70,6 +73,13 @@ describe("SidebarServerPicker", () => {
       "href",
       "/settings",
     );
+    // A browser keeps Cmd/Ctrl+Alt+, because Cmd/Ctrl+, opens its own settings.
+    expect(
+      Array.from(
+        screen.getByTestId("sidebar-profile-menu-settings").querySelectorAll("kbd"),
+        (key) => key.textContent,
+      ),
+    ).toEqual(["Ctrl", "Alt", ","]);
     expect(screen.getByText("Server")).toBeInTheDocument();
     expect(screen.queryByText("Connect to new server…")).toBeNull();
     expect(getServerPicker).not.toHaveBeenCalled();
