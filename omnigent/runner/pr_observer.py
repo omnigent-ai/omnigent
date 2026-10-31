@@ -250,19 +250,24 @@ def _shell_operations(
     ]
 
 
-def extract_prs(
-    tool_name: str, arguments: dict[str, object], result: object
-) -> tuple[list[PullRequestRef], bool]:
-    """Return positively identified PRs and whether the operation created them."""
+def _shell_result(tool_name: str, result: object) -> object:
+    """Return *result* with ``sys_os_shell``'s serialized envelope decoded."""
     if tool_name == "sys_os_shell" and isinstance(result, str):
         # This tool serializes its result envelope; native shell strings are stdout.
         try:
             envelope = json.loads(result)
         except ValueError:
-            pass
-        else:
-            if isinstance(envelope, dict) and "stdout" in envelope and "exit_code" in envelope:
-                result = envelope
+            return result
+        if isinstance(envelope, dict) and "stdout" in envelope and "exit_code" in envelope:
+            return envelope
+    return result
+
+
+def extract_prs(
+    tool_name: str, arguments: dict[str, object], result: object
+) -> tuple[list[PullRequestRef], bool]:
+    """Return positively identified PRs and whether the operation created them."""
+    result = _shell_result(tool_name, result)
     if _failed(result):
         return [], False
     facets = _facets()
@@ -334,12 +339,13 @@ def _record_resolved_prs(
     result: object,
     source: str,
     observation_id: str,
+    created: bool = False,
 ) -> None:
     try:
         references = [ref for ref in resolve(result) if ref.provider == provider_id]
         SessionPrRegistry(session_id).record(
             references,
-            relationship="worked_on",
+            relationship="created" if created else "worked_on",
             source=source,
             observation_id=observation_id,
         )
@@ -374,7 +380,8 @@ def observe_tool_completion(
         )
         if references:
             pr_reports.notify(session_id)
-        if not _failed(result):
+        shell_result = _shell_result(tool_name, result)
+        if not _failed(shell_result):
             for index, (provider_id, op) in enumerate(
                 _shell_operations(tool_name, arguments, _facets())
             ):
@@ -396,9 +403,10 @@ def observe_tool_completion(
                         session_id,
                         provider_id,
                         op.resolve_result,
-                        result,
+                        shell_result,
                         source,
                         observation_id,
+                        op.creates,
                     )
                 except Exception:
                     with _pending_lookups_lock:

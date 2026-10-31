@@ -15,6 +15,8 @@ and the recording protocol for comparing revisions.
 - `responsive`: desktop and mobile show the file and retain edits and drafts.
 - `load`: fixed mixed-content documents expose parsing and rendering costs.
 - `offline`: unsaved edits remain guarded when the workspace cannot save.
+- `live-refresh`: an open file shows saves from other sessions and processes
+  in place, keeping the caret; unsaved edits raise a conflict instead.
 - `large-files`: files above 1 MiB open as editable source; truncated files
   remain read-only, with full-file download available.
 
@@ -136,6 +138,16 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   `tests/e2e_ui/files/test_file_autosave.py::test_markdown_edit_autosaves`
   confirms the edit, undo, and redo through fresh filesystem API reads from
   the real server, then reloads the saved edit.
+- `direct-link`, `live-refresh`:
+  `tests/e2e_ui/files/test_file_autosave.py::test_open_markdown_follows_other_writers`
+  leaves an idle session's editor open while another process replaces the file
+  and another session saves it. Both edits appear without a reload, and typing
+  at the parked caret saves beside them. With saves failing, a later external
+  change raises the conflict instead of replacing unsaved text, and Keep mine
+  saves it. Edits typed during a save, the pre-save conflict check, undo, and
+  caret mapping are covered by component tests
+  (`MarkdownRichTextViewer.integration.test.tsx`,
+  `MonacoCodeEditor.autosave.test.tsx`, `TipTapEditorHelpers.test.ts`).
 - `files`, `review`:
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_markdown_rich_text_editor_add_comment`
   submits a comment and checks its stored anchor. The heading variant is
@@ -222,14 +234,42 @@ instead of treating one comparison clip as complete feature verification.
   TipTap 3.31.4. `web/src/shell/tiptapBoundedTokenizers.test.ts` checks upstream
   token compatibility and line-splitting volume using the CUJ fixture. Remove
   these bounds when upstream avoids the repeated whole-remainder scans.
+- Footnote references (`[^1]`) render as superscripts when the file defines
+  them, and definition lines as read-only source text; edit definitions in
+  Source. Typing, pasting or Enter over a selected footnote keeps it;
+  Backspace or Delete removes it. Saves keep footnotes and the final newline,
+  except a reference inside bold or italic moves just outside those marks;
+  reference syntax in link text stays literal, so the link is kept.
+- Reference-style links (`[text][label]`, `[text][]`, `[text]`) save in that
+  form while their URL, title and label still match a definition; otherwise
+  they save inline. Link definition lines show read-only, like footnotes.
+- Saves write top-level blocks the user did not change from the file's source,
+  byte-for-byte; only edited blocks are re-serialized, so an edit inside a list
+  or table rewrites that whole list or table. Changed definitions, or a kept
+  block that would read differently beside its new neighbour (indented code
+  after a list, an unclosed fence), re-serialize the whole file, so an unrelated
+  block's syntax can still change after a deletion. An edited block is separated from
+  its neighbours by exactly one blank line. `web/src/shell/markdownSourceBlocks.ts`.
 - Load measurements do not establish typing latency. Dirty detection compares
-  immutable editor documents; autosave still serializes the whole document.
+  immutable editor documents; autosave writes edited blocks only.
   Changes that serialize identically become clean when autosave checks them.
 - Setext-heading detection uses a line scanner with marked 17 interruption
   rules. Compatibility tests compare it with upstream; remove the workaround
   when upstream handles long lines without exhausting the regex stack.
 - Browser-contract saves update an in-memory mock filesystem. A successful
   reload there does not prove server/runner persistence or external-file edits.
+- Live refresh polls only an on-screen UTF-8 file up to 256 KiB, every two
+  seconds; hidden browser tabs pause. Larger and binary files, and the diff
+  view, refresh when shown again or when the session finishes a turn.
+- Every autosave re-reads the file first and raises the conflict if another
+  writer changed it. Saves are still last-writer-wins: a write landing between
+  that read and the save can be overwritten.
+- A failed refresh keeps the last loaded content, shows a notice, and re-checks
+  every 30 seconds; saving a file that was deleted meanwhile recreates it.
+- An external update replaces the document as `setContent` would, maps the
+  caret through the changed range, and clears undo history, as Monaco does. A
+  caret inside that range, or between separately changed regions, moves to its
+  end. Monaco keeps the caret's line and column instead of mapping it.
 - Desktop and mobile can have hidden viewer instances on older revisions.
   Interact with the visible viewer and report total editor count separately.
 - Resizing saved content is not evidence that unsaved edits or comments survive.

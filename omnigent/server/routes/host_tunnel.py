@@ -763,6 +763,7 @@ def _import_session_queue_payload(total: int, session: HostImportedLocalSession)
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 
@@ -878,6 +879,7 @@ async def _receive_loop(
                         "runner_id": frame.runner_id,
                         "error": frame.error,
                         "error_code": frame.error_code,
+                        "workspace_recreated": frame.workspace_recreated,
                     }
                 )
             continue

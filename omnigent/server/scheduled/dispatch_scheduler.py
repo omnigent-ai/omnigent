@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal
@@ -17,6 +18,7 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.schedule import (
+    host_ownership_key,
     manual_trigger_key,
     next_scheduled_time,
     occurrence_host_id,
@@ -109,6 +111,20 @@ def _claimed_event(
     )
 
 
+_CLAIM_FAILURE_MESSAGE = (
+    "Could not prepare a scheduled run for task %s; will check the task again on a later poll"
+)
+
+
+def _claim_failure_event(task: ScheduledTask) -> dict[str, object]:
+    return debug_event(
+        "scheduled_task_operation_failed",
+        operation="claim",
+        task_id=task.id,
+        task_workspace_id=task.workspace_id,
+    )
+
+
 def _seconds(value: float) -> float:
     # Clock skew between replicas must not produce a negative delay.
     return round(max(0.0, float(value)), 3)
@@ -177,11 +193,16 @@ class StartupLease:
         error: str | None = None,
         error_code: str | None = None,
     ) -> None:
-        """Record prompt delivery or a known startup failure, with a live lease."""
-        if status not in {"running", "failed", "skipped"}:
+        """Record prompt delivery or a known startup failure, with a live lease.
+
+        ``succeeded`` is for a prompt delivered into a continued session, whose
+        run does not wait for the turn it joins.
+        """
+        if status not in {"running", "succeeded", "failed", "skipped"}:
             raise ValueError(
                 f"Cannot finish startup with status {status!r}. "
-                "Use 'running' after sending the prompt, 'failed' for a known failure, "
+                "Use 'running' after sending the prompt, 'succeeded' after delivering it "
+                "into a continued session, 'failed' for a known failure, "
                 "or 'skipped' when execution is intentionally skipped."
             )
 
@@ -199,7 +220,7 @@ class StartupLease:
                     outcome=status,
                     error_code=error_code,
                     prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
-                    if status == "running"
+                    if status in ("running", "succeeded")
                     else None,
                 ),
             )
@@ -307,9 +328,14 @@ ClaimedFire = Callable[[ScheduledTask, StartupLease], Awaitable[None]]
 ReconcileStartup = Callable[
     [ScheduledTaskRun], Awaitable[Literal["running", "succeeded", "failed"] | None]
 ]
-OwnsHost = Callable[[int, str | None], Awaitable[bool]]
+# Receives host ownership keys and returns the subset this replica owns.
+OwnedHosts = Callable[[Sequence[str]], Awaitable[Collection[str]]]
 # Acts as the task's owner for the calls one startup or recovery makes.
 FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
+# Checked at the start of each poll and before Run now starts a run here.
+DispatchEnabled = Callable[[], bool]
+# Read before each wait between polls.
+PollInterval = Callable[[], float]
 
 
 class FireIdentityRevoked(Exception):
@@ -323,7 +349,11 @@ class FireIdentityRevoked(Exception):
 _RECOVERY_RESULTS = ("running", "succeeded", "failed")
 
 
-async def _owns_every_host(_workspace_id: int, _host_id: str | None) -> bool:
+async def _owns_every_host(keys: Sequence[str]) -> Collection[str]:
+    return keys
+
+
+def _always_enabled() -> bool:
     return True
 
 
@@ -337,8 +367,10 @@ class ScheduledTaskDispatchHooks:
 
     on_fire: ClaimedFire | None = None
     on_expired: ReconcileStartup | None = None
-    owns_host: OwnsHost = _owns_every_host
+    owned_hosts: OwnedHosts = _owns_every_host
     fire_identity: FireIdentity | None = None
+    dispatch_enabled: DispatchEnabled = _always_enabled
+    poll_interval: PollInterval | None = None
 
     def __post_init__(self) -> None:
         if (self.on_fire is None) != (self.on_expired is None):
@@ -362,7 +394,9 @@ class PersistentTaskScheduler:
         on_fire: ClaimedFire,
         on_expired: ReconcileStartup,
         *,
-        owns_host: OwnsHost = _owns_every_host,
+        owned_hosts: OwnedHosts = _owns_every_host,
+        dispatch_enabled: DispatchEnabled = _always_enabled,
+        poll_interval: PollInterval | None = None,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -384,7 +418,9 @@ class PersistentTaskScheduler:
         self._store = store
         self._on_fire = on_fire
         self._on_expired = on_expired
-        self._owns_host = owns_host
+        self._owned_hosts = owned_hosts
+        self._dispatch_enabled = dispatch_enabled
+        self._poll_interval = poll_interval
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -443,12 +479,40 @@ class PersistentTaskScheduler:
                     "Could not check scheduled tasks for work; will check again on the next poll",
                     extra=debug_event("scheduled_task_operation_failed", operation="poll"),
                 )
-            await asyncio.sleep(self._poll_seconds)
+            await asyncio.sleep(self._next_poll_delay())
+
+    def _next_poll_delay(self) -> float:
+        """Return the live poll interval, or the configured one if it is unusable."""
+        if self._poll_interval is None:
+            return self._poll_seconds
+        try:
+            delay = float(self._poll_interval())
+        except Exception:
+            _logger.exception(
+                "Could not read the poll interval; waiting %s seconds", self._poll_seconds
+            )
+            return self._poll_seconds
+        if not math.isfinite(delay) or delay <= 0:
+            _logger.warning(
+                "Ignoring poll interval %r, which is not a positive number; waiting %s seconds",
+                delay,
+                self._poll_seconds,
+            )
+            return self._poll_seconds
+        return delay
+
+    def _dispatching(self) -> bool:
+        """Whether polls may read and start work; a failing check keeps dispatch on."""
+        try:
+            return bool(self._dispatch_enabled())
+        except Exception:
+            _logger.exception("Could not check whether dispatch is enabled; dispatching anyway")
+            return True
 
     async def poll_once(self) -> None:
         """Serialize due-task polling and start recovery in the background if idle."""
         async with self._poll_lock:
-            if self._stopped:
+            if self._stopped or not self._dispatching():
                 return
             if self._recovery is None or self._recovery.done():
                 self._recovery = asyncio.create_task(
@@ -465,40 +529,22 @@ class PersistentTaskScheduler:
             await self._claim_pending()
 
     async def run_now(self, task: ScheduledTask) -> ScheduledTaskRun | None:
-        """Record a Run now request, starting it here if this replica owns its host.
+        """Record a Run now request for the host's owner to start on its next poll.
 
-        Otherwise the host's owner starts it on its next poll. Returns the
-        recorded run, or None if the task was deleted.
+        Starting it inside the request would tie the startup to the request's
+        context, which request cancellation tears down when the response ends.
+        Returns the recorded run, or None if the task was deleted.
         """
         trigger_key = manual_trigger_key()
         host_id = occurrence_host_id(task, trigger_key)
         with workspace_scope(task.workspace_id):
-            run = await asyncio.to_thread(
+            return await asyncio.to_thread(
                 self._store.request_manual_run,
                 task,
                 now=int(self._now()),
                 trigger_key=trigger_key,
                 host_id=host_id,
             )
-        if run is None:
-            return None
-        # A poll may claim it concurrently; the claim is conditional, so one wins.
-        try:
-            if (
-                not self._stopped
-                and self.is_started
-                and len(self._startups) < self._max_startups
-                and await self._owns_host(run.workspace_id, run.host_id)
-            ):
-                await self._start_pending(run)
-        except Exception:
-            # The request is recorded; failing it here would invite a duplicate retry.
-            _logger.exception(
-                "Could not start requested run %s here; a later poll will start it",
-                run.id,
-                extra=_run_event("scheduled_task_operation_failed", run, operation="claim"),
-            )
-        return run
 
     async def _claim_pending(self) -> None:
         """Start Run now requests whose host this replica owns, one page per poll.
@@ -511,13 +557,17 @@ class PersistentTaskScheduler:
         runs = await asyncio.to_thread(
             self._store.list_pending_runs, after=self._pending_cursor, limit=self._batch_size
         )
+        owned = await self._owned_host_keys(
+            [host_ownership_key(run.workspace_id, run.host_id) for run in runs],
+            operation="claim",
+        )
         for run in runs:
             if self._stopped or len(self._startups) >= self._max_startups:
                 # Resume here next poll, so no request is skipped.
                 return
             self._pending_cursor = (run.workspace_id, run.id)
             try:
-                if await self._owns_host(run.workspace_id, run.host_id):
+                if host_ownership_key(run.workspace_id, run.host_id) in owned:
                     await self._start_pending(run)
             except Exception:
                 _logger.exception(
@@ -621,13 +671,18 @@ class PersistentTaskScheduler:
             after=self._recovery_cursor,
             limit=self._batch_size,
         )
+        owned = await self._owned_host_keys(
+            [host_ownership_key(run.workspace_id, run.host_id) for run in runs],
+            operation="recovery",
+            timeout=self._recovery_seconds,
+        )
         for run in runs:
             assert run.lease_expires_at is not None
             self._recovery_cursor = (run.lease_expires_at, run.workspace_id, run.id)
             transition: asyncio.Future[ScheduledTaskRun | None] | None = None
             try:
                 async with asyncio.timeout(self._recovery_seconds):
-                    if await self._owns_host(run.workspace_id, run.host_id):
+                    if host_ownership_key(run.workspace_id, run.host_id) in owned:
                         local = self._startups.get((run.workspace_id, run.id))
                         if local is not None:
                             local.cancel()
@@ -718,17 +773,32 @@ class PersistentTaskScheduler:
             )
             if not tasks:
                 return
+            assert tasks[-1].next_run_at is not None
+            cursor = (tasks[-1].next_run_at, tasks[-1].workspace_id, tasks[-1].id)
+            candidates: list[tuple[ScheduledTask, str | None]] = []
             for task in tasks:
-                if self._stopped or len(self._startups) >= self._max_startups:
+                if self._stopped:
                     return
                 assert task.next_run_at is not None
-                cursor = (task.next_run_at, task.workspace_id, task.id)
                 try:
-                    if not await self._validate_schedule(task):
-                        continue
-                    host_id = occurrence_host_id(task, scheduled_trigger_key(task.next_run_at))
-                    if not await self._owns_host(task.workspace_id, host_id):
-                        continue
+                    if await self._validate_schedule(task):
+                        host_id = occurrence_host_id(task, scheduled_trigger_key(task.next_run_at))
+                        candidates.append((task, host_id))
+                except Exception:
+                    _logger.exception(
+                        _CLAIM_FAILURE_MESSAGE, task.id, extra=_claim_failure_event(task)
+                    )
+            owned = await self._owned_host_keys(
+                [host_ownership_key(task.workspace_id, host_id) for task, host_id in candidates],
+                operation="claim",
+            )
+            for task, host_id in candidates:
+                if self._stopped or len(self._startups) >= self._max_startups:
+                    return
+                if host_ownership_key(task.workspace_id, host_id) not in owned:
+                    continue
+                assert task.next_run_at is not None
+                try:
                     now = int(self._now())
                     next_run = await asyncio.to_thread(next_scheduled_time, task, now)
                     if self._stopped:
@@ -768,15 +838,7 @@ class PersistentTaskScheduler:
                         )
                 except Exception:
                     _logger.exception(
-                        "Could not prepare a scheduled run for task %s; "
-                        "will check the task again on a later poll",
-                        task.id,
-                        extra=debug_event(
-                            "scheduled_task_operation_failed",
-                            operation="claim",
-                            task_id=task.id,
-                            task_workspace_id=task.workspace_id,
-                        ),
+                        _CLAIM_FAILURE_MESSAGE, task.id, extra=_claim_failure_event(task)
                     )
 
     def _start(self, task: ScheduledTask, run: ScheduledTaskRun) -> None:
@@ -790,6 +852,25 @@ class PersistentTaskScheduler:
             startup = asyncio.create_task(self._execute(task, run))
             self._startups[key] = startup
             startup.add_done_callback(lambda _, key=key: self._startups.pop(key, None))
+
+    async def _owned_host_keys(
+        self, keys: list[str], *, operation: str, timeout: float | None = None
+    ) -> set[str]:
+        """Ask once per page which keys this replica owns; on failure, own none of them."""
+        requested = set(keys)
+        if not requested:
+            return set()
+        try:
+            async with asyncio.timeout(timeout):
+                return set(await self._owned_hosts(sorted(requested))) & requested
+        except Exception:
+            _logger.exception(
+                "Could not check which of %d hosts this server owns; "
+                "will check them again on a later poll",
+                len(requested),
+                extra=debug_event("scheduled_task_operation_failed", operation=operation),
+            )
+            return set()
 
     async def _execute(self, task: ScheduledTask, run: ScheduledTaskRun) -> None:
         lease = StartupLease(

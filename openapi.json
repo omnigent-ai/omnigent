@@ -320,6 +320,58 @@
         "title": "AgentDetailObject",
         "type": "object"
       },
+      "AgentList": {
+        "description": "The built-in agent list, plus the packaged names this deployment hides.",
+        "properties": {
+          "data": {
+            "items": {},
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          },
+          "suppressed_agent_names": {
+            "description": "Packaged built-ins `OMNIGENT_SEEDED_AGENTS` trimmed from `data`. The web picker also discovers agents from a user's recent sessions, so it needs these names to keep a hidden built-in with prior sessions from resurfacing as a custom agent.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Suppressed Agent Names",
+            "type": "array"
+          }
+        },
+        "title": "AgentList",
+        "type": "object"
+      },
       "AgentMCPConfig": {
         "description": "Editable MCP projection without credential values.",
         "properties": {
@@ -3310,6 +3362,11 @@
       "ImportSessionRequest": {
         "description": "Request body for importing one local harness session.\n\n`project_id` files the imported session into a first-class project the\ncaller owns, with the same ownership, default-fill, and mismatch-warning\nsemantics as `POST /v1/sessions`.",
         "properties": {
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
           "external_session_id": {
             "maxLength": 128,
             "minLength": 1,
@@ -4736,6 +4793,34 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PickerInfo": {
+        "description": "How a deployment curates what the New Chat picker shows.\n\nDisplay only: it narrows the picker, never what exists. Every agent stays\nseeded, forkable and reachable through the API.",
+        "properties": {
+          "default_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Name a fresh New Chat starts on, or `None`. A user's remembered pick wins over it.",
+            "title": "Default Agent Name"
+          },
+          "restrict_to_agent_names": {
+            "default": [],
+            "description": "Names the picker may offer; empty means the full roster.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Restrict To Agent Names",
+            "type": "array"
+          }
+        },
+        "title": "PickerInfo",
+        "type": "object"
+      },
       "PluginAsset": {
         "properties": {
           "id": {
@@ -5762,6 +5847,85 @@
         "title": "RoutingDecisionData",
         "type": "object"
       },
+      "SandboxProfileSummary": {
+        "additionalProperties": false,
+        "description": "Public session/host reference; execution identity stays on the server.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Provider",
+            "type": "string"
+          },
+          "revision": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "revision",
+          "provider"
+        ],
+        "title": "SandboxProfileSummary",
+        "type": "object"
+      },
+      "SandboxProfilesResponse": {
+        "properties": {
+          "managed_providers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Managed Providers",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxProfileSummary"
+            },
+            "title": "Profiles",
+            "type": "array"
+          }
+        },
+        "required": [
+          "profiles",
+          "managed_providers",
+          "next_cursor"
+        ],
+        "title": "SandboxProfilesResponse",
+        "type": "object"
+      },
       "SandboxStatus": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nCarried on the session snapshot only while the session's\nbackground sandbox launch is in flight or has failed; `None`\nfor sessions without a managed launch and once the launch\nsucceeds (the session then looks like any host-bound session).",
         "properties": {
@@ -5878,6 +6042,11 @@
             "title": "Archive Worktree Cleanup",
             "type": "boolean"
           },
+          "automations_enabled": {
+            "default": false,
+            "title": "Automations Enabled",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
@@ -5948,6 +6117,12 @@
             "title": "Needs Setup",
             "type": "boolean"
           },
+          "picker": {
+            "$ref": "#/components/schemas/PickerInfo",
+            "default": {
+              "restrict_to_agent_names": []
+            }
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
@@ -5995,6 +6170,16 @@
             "title": "Sandbox Providers",
             "type": "array"
           },
+          "scheduled_task_projects": {
+            "default": false,
+            "title": "Scheduled Task Projects",
+            "type": "boolean"
+          },
+          "scheduled_task_session_modes": {
+            "default": true,
+            "title": "Scheduled Task Session Modes",
+            "type": "boolean"
+          },
           "server_version": {
             "title": "Server Version",
             "type": "string"
@@ -6006,6 +6191,16 @@
             },
             "title": "Session Event Types",
             "type": "array"
+          },
+          "session_fork_workspaces": {
+            "default": true,
+            "title": "Session Fork Workspaces",
+            "type": "boolean"
+          },
+          "session_pull_requests": {
+            "default": false,
+            "title": "Session Pull Requests",
+            "type": "boolean"
           },
           "session_search_scope": {
             "default": true,
@@ -6697,6 +6892,32 @@
             "description": "Per-session reasoning-effort override to apply to the fork, e.g. `\"high\"`. **Omitting** the field inherits the source's effort; an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets it. Validated against the shared effort vocabulary; provider support is enforced at launch. Set by the web fork dialog's effort picker.",
             "title": "Reasoning Effort"
           },
+          "sandbox_profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Profile Id"
+          },
+          "sandbox_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Profile Revision"
+          },
           "sandbox_provider": {
             "anyOf": [
               {
@@ -6763,8 +6984,23 @@
                 "type": "null"
               }
             ],
-            "description": "Git repository URL (optionally `#<branch>`) the server clones into the fork's sandbox as its working directory, e.g. `\"https://github.com/org/repo#release-1.2\"`. **Omitting** the field inherits the repository the source session recorded, so cloning a sandbox session lands the fork in the same checkout; an explicit value overrides it and an explicit `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"` \u2014 an external fork's directory is chosen when it binds a host.",
+            "description": "Git repository URL (optionally `#<branch>`) the server clones into the fork's sandbox as its working directory, e.g. `\"https://github.com/org/repo#release-1.2\"`. **Omitting** both workspace fields inherits all repositories the source session recorded, so cloning a sandbox session preserves its checkouts; an explicit value overrides it and an explicit `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"` \u2014 an external fork's directory is chosen when it binds a host.",
             "title": "Workspace"
+          },
+          "workspaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Repository URLs (each optionally `#<branch>`) to clone into the fork's sandbox, replacing the source's repositories. Send only when `GET /v1/info` reports `session_fork_workspaces`. Several repositories require a provider with `multi_repo` support. Mutually exclusive with `workspace`; explicitly sending `[]` or `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"`.",
+            "title": "Workspaces"
           }
         },
         "title": "SessionForkRequest",
@@ -7251,6 +7487,29 @@
             ],
             "title": "Project Id"
           },
+          "pull_request": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPullRequestSummary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's first linked pull request, or `None` when it has none."
+          },
+          "pull_requests_synced": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the server has imported the session's PRs from its host, so a missing `pull_request` means \"none\" rather than \"not known yet\". `None` on servers without PR storage.",
+            "title": "Pull Requests Synced"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -7614,6 +7873,266 @@
         "title": "SessionProjectSummary",
         "type": "object"
       },
+      "SessionPullRequest": {
+        "description": "A pull request linked to a session, as `GET /v1/sessions/{id}/pull-requests` lists it.",
+        "properties": {
+          "first_seen_at": {
+            "description": "Epoch seconds the session first saw the PR.",
+            "format": "double",
+            "title": "First Seen At",
+            "type": "number"
+          },
+          "host": {
+            "description": "Forge host, e.g. `\"github.com\"`.",
+            "title": "Host",
+            "type": "string"
+          },
+          "is_draft": {
+            "default": false,
+            "title": "Is Draft",
+            "type": "boolean"
+          },
+          "last_seen_at": {
+            "description": "Epoch seconds of the PR's latest activity in the session.",
+            "format": "double",
+            "title": "Last Seen At",
+            "type": "number"
+          },
+          "number": {
+            "format": "int64",
+            "title": "Number",
+            "type": "integer"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "provider_display": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Display"
+          },
+          "relationship": {
+            "description": "How the PR joined the session: `\"created\"`, `\"worked_on\"`, `\"attached\"`, or `\"inferred\"` from the branch.",
+            "enum": [
+              "created",
+              "worked_on",
+              "attached",
+              "inferred"
+            ],
+            "title": "Relationship",
+            "type": "string"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "state_checked_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Checked At"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "provider",
+          "repository",
+          "number",
+          "host",
+          "relationship",
+          "first_seen_at",
+          "last_seen_at"
+        ],
+        "title": "SessionPullRequest",
+        "type": "object"
+      },
+      "SessionPullRequestList": {
+        "description": "A page of a session's linked pull requests in display order, keyed by URL.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionPullRequest"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          },
+          "synced": {
+            "default": false,
+            "description": "Whether the server has imported the session's PRs from its host. Until then an empty list means \"not known yet\", not \"none\".",
+            "title": "Synced",
+            "type": "boolean"
+          }
+        },
+        "title": "SessionPullRequestList",
+        "type": "object"
+      },
+      "SessionPullRequestSummary": {
+        "description": "The first pull request linked to a session, for list surfaces.\n\nStored on the server from what the session's host last reported, so it\nis available while the host is offline.",
+        "properties": {
+          "is_draft": {
+            "default": false,
+            "description": "Whether the PR was a draft when last fetched.",
+            "title": "Is Draft",
+            "type": "boolean"
+          },
+          "number": {
+            "description": "The PR number.",
+            "format": "int64",
+            "title": "Number",
+            "type": "integer"
+          },
+          "provider": {
+            "description": "Git provider id, e.g. `\"github\"`.",
+            "title": "Provider",
+            "type": "string"
+          },
+          "provider_display": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The provider's labels (`display_name`, `request_name`, `number_prefix`), or `None` for an unknown provider.",
+            "title": "Provider Display"
+          },
+          "repository": {
+            "description": "Base repository, e.g. `\"owner/repo\"`.",
+            "title": "Repository",
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"OPEN\"`, `\"MERGED\"` or `\"CLOSED\"` as last fetched, or `None` before the host fetched the PR.",
+            "title": "State"
+          },
+          "state_checked_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds of the request that last fetched the PR's state, or `None` before one did. Open PRs older than five minutes are refreshed when their host is online; clients show older ones as stale.",
+            "title": "State Checked At"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last title the host looked up, or `None`.",
+            "title": "Title"
+          },
+          "url": {
+            "description": "The PR's URL.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "provider",
+          "repository",
+          "number"
+        ],
+        "title": "SessionPullRequestSummary",
+        "type": "object"
+      },
       "SessionReasoningEffortEvent": {
         "description": "Active reasoning-effort update from a terminal-backed integration.\n\nEmitted after an `external_reasoning_effort_change` POST from a native\nterminal forwarder when the user changes the thinking level inside the\nterminal UI. Lets the web effort picker reflect a TUI-side switch without\na reload.",
         "properties": {
@@ -7660,6 +8179,59 @@
           "conversation_id"
         ],
         "title": "SessionReasoningEffortEvent",
+        "type": "object"
+      },
+      "SessionRepositoryBranch": {
+        "description": "Current branch and remote availability for one managed repository.\n\n`pushed` is true when the branch exists at the original clone URL,\nfalse when confirmed absent, and null when availability is unknown.\nIt does not indicate whether local commits or working-tree changes are pushed.",
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch"
+          },
+          "pushed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pushed"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "SessionRepositoryBranch",
+        "type": "object"
+      },
+      "SessionRepositoryBranchList": {
+        "description": "Managed repositories in their original launch order.",
+        "properties": {
+          "repositories": {
+            "items": {
+              "$ref": "#/components/schemas/SessionRepositoryBranch"
+            },
+            "title": "Repositories",
+            "type": "array"
+          }
+        },
+        "required": [
+          "repositories"
+        ],
+        "title": "SessionRepositoryBranchList",
         "type": "object"
       },
       "SessionResourceCreatedEvent": {
@@ -8248,6 +8820,16 @@
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. This is the sole reachability signal: `True` means the client can chat normally. It does **not** fold in host-relaunch optimism (a dead runner on a live host reads `False` here, not `True`) \u2014 the open-session view pairs it with `host_online` to decide what to show. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
           },
+          "sandbox_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SandboxProfileSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "sandbox_status": {
             "anyOf": [
               {
@@ -8263,6 +8845,11 @@
             "default": false,
             "description": "Whether the owner opted into letting view-level collaborators browse the workspace (Files/Changes/GitHub surfaces). `False` by default \u2014 read grants share the conversation only. The web share dialog reads this to render the toggle, and the rail reads it to decide whether to mount the file surfaces for a view-only viewer.",
             "title": "Share Workspace Files",
+            "type": "boolean"
+          },
+          "side_chat_settings_supported": {
+            "default": false,
+            "title": "Side Chat Settings Supported",
             "type": "boolean"
           },
           "status": {
@@ -9202,6 +9789,13 @@
               "$ref": "#/components/schemas/SkillSummary"
             },
             "title": "Skills",
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
             "type": "array"
           }
         },
@@ -10477,7 +11071,7 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\n**Returns:** A `PaginatedList` of agents.",
+        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\nPackaged built-ins the deployment suppressed via\n`OMNIGENT_SEEDED_AGENTS` are filtered out after the store page is\nread, so `first_id`, `last_id` and `has_more` describe the rows\nread, not the rows returned. A page can hold fewer than `limit` rows,\nor none; keep following `last_id` while `has_more` is true.\nSuppressing hides a row without deleting it, so a session already\nbound to one keeps working.\n\n**Returns:** An `AgentList` of agents; for server agents it also names the packaged built-ins the deployment suppressed.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
@@ -10563,7 +11157,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PaginatedList"
+                  "$ref": "#/components/schemas/AgentList"
                 }
               }
             },
@@ -11192,6 +11786,22 @@
             "schema": {
               "title": "Host Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
             }
           }
         ],
@@ -13332,6 +13942,114 @@
         ]
       }
     },
+    "/v1/sandbox-profiles": {
+      "get": {
+        "operationId": "list_profiles_v1_sandbox_profiles_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 32,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Provider"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 200,
+              "title": "Search",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxProfilesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Profiles",
+        "tags": [
+          "sandbox profiles"
+        ]
+      }
+    },
     "/v1/sandbox-providers/{provider}/harnesses/{harness}/model-options": {
       "get": {
         "operationId": "model_options_v1_sandbox_providers__provider__harnesses__harness__model_options_get",
@@ -13591,7 +14309,7 @@
             }
           },
           {
-            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
+            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions; with `project`, only owned sessions are returned so first-class project names resolve within the caller's projects. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
             "in": "query",
             "name": "visibility",
             "required": false,
@@ -15732,6 +16450,134 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/pull-requests": {
+      "delete": {
+        "description": "Unlink a pull request from the session, whether or not its host is online.\n\nThe server's unlink stands on its own; it is also passed to the runner\nor host when one is reachable, so its local list stops reporting the PR.\n\n**Returns:** The first page of the session's remaining linked PRs.",
+        "operationId": "unlink_session_pull_request_v1_sessions__session_id__pull_requests_delete",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The linked PR's URL.",
+            "in": "query",
+            "name": "url",
+            "required": true,
+            "schema": {
+              "maxLength": 2048,
+              "title": "Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPullRequestList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Session Pull Request",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "get": {
+        "description": "List the session's linked pull requests from the server.\n\nNever contacts the runner or host, so it answers while both are\noffline. Each entry carries the state the host last fetched, and\n`synced` says whether the server has imported the session's PRs yet.\n\n**Returns:** A page of linked PRs in display order.",
+        "operationId": "list_session_pull_requests_v1_sessions__session_id__pull_requests_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most PRs to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The `last_id` (PR URL) of the previous page.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPullRequestList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Pull Requests",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/read-state": {
       "put": {
         "description": "Set the calling user's read-state for one session.\n\nRequires `LEVEL_READ` on the session in multi-user mode \u2014 you can\nonly track read-state for sessions you can see. Stores the values\nverbatim (the client enforces the baseline's monotonicity and the\nunread semantics); the server does not interpret them against\nsession status. Returns `204` \u2014 the client already has the\noptimistic state and re-reads the authoritative value on the next\n`GET /v1/sessions` poll.\n\n**Parameters**\n\n- `body` \u2014 The validated `ReadStatePutRequest`.\n\n**Returns:** An empty `204 No Content` response.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks read access.",
@@ -17695,7 +18541,128 @@
     },
     "/v1/sessions/{session_id}/resources/github/prs": {
       "post": {
+        "description": "Link a pull request the session's host can read, or unlink one.\n\nBoth need the runner or host online: linking verifies the PR with its\nprovider account, and the server records an unlink once the host accepts\nit. `DELETE /pull-requests` unlinks while they are offline.\n\n**Returns:** The refreshed `session.github.info` object.",
         "operationId": "update_session_github_pr_v1_sessions__session_id__resources_github_prs_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Pr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/review-threads": {
+      "get": {
+        "description": "Read review conversations, with code excerpts subject to file sharing.",
+        "operationId": "get_session_review_threads_v1_sessions__session_id__resources_github_review_threads_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "After",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "head_sha",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Head Sha",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "base_sha",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Base Sha",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Review Threads",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "post": {
+        "description": "Publish a new line conversation with the host's selected GitHub account.",
+        "operationId": "create_session_review_thread_v1_sessions__session_id__resources_github_review_threads_post",
         "parameters": [
           {
             "in": "path",
@@ -17727,7 +18694,125 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Update Session Github Pr",
+        "summary": "Create Session Review Thread",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments": {
+      "get": {
+        "description": "Load additional replies in a published PR review conversation.",
+        "operationId": "get_session_review_thread_comments_v1_sessions__session_id__resources_github_review_threads__thread_id__comments_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": true,
+            "schema": {
+              "title": "After",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Review Thread Comments",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/replies": {
+      "post": {
+        "description": "Publish one reply with the host's selected GitHub account.",
+        "operationId": "reply_to_session_review_thread_v1_sessions__session_id__resources_github_review_threads__thread_id__replies_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reply To Session Review Thread",
         "tags": [
           "session_resources"
         ]
@@ -17820,6 +18905,49 @@
           }
         },
         "summary": "Update Session Github Reviewers",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/repository-branches": {
+      "get": {
+        "description": "Suggest fork branches without waking or modifying the source sandbox.",
+        "operationId": "get_session_repository_branches_v1_sessions__session_id__resources_repository_branches_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRepositoryBranchList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Repository Branches",
         "tags": [
           "session_resources"
         ]
@@ -18336,7 +19464,7 @@
     },
     "/v1/skills": {
       "get": {
-        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.",
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined. `warnings` names sources the host\ncould not read, so an incomplete catalog is distinguishable from an\nempty one.",
         "operationId": "get_skills_v1_skills_get",
         "parameters": [
           {
