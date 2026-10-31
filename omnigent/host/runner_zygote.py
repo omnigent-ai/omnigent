@@ -36,9 +36,11 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, RUNNER_ID_ENV_VAR, debug_event
 from omnigent.inner import _proc
 from omnigent.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
@@ -63,6 +65,18 @@ class ZygoteUnavailable(RuntimeError):
     The daemon catches this and falls back to a direct ``Popen`` launch.
     """
 
+    def __init__(self, message: str, *, reason: str = "unavailable") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class _RunnerStatus:
+    returncode: int | None
+    unavailable_reason: str | None = None
+    control_error_type: str | None = None
+    child_alive: bool | None = None
+
 
 class ZygoteRunnerProc:
     """A ``subprocess.Popen``-shaped handle for a zygote-forked runner.
@@ -77,13 +91,24 @@ class ZygoteRunnerProc:
     """
 
     def __init__(
-        self, pid: int, manager: ZygoteManager, *, zygote_generation: int | None = None
+        self,
+        pid: int,
+        manager: ZygoteManager,
+        *,
+        zygote_generation: int | None = None,
+        zygote_process: subprocess.Popen[bytes] | None = None,
+        session_id: str | None = None,
+        runner_id: str | None = None,
     ) -> None:
         self.pid = pid
         self._manager = manager
         self._zygote_generation = (
             manager._generation if zygote_generation is None else zygote_generation
         )
+        self._zygote_process = zygote_process if zygote_process is not None else manager._proc
+        self._last_unavailable_status: tuple[str | None, bool | None] = (None, None)
+        self._session_id = session_id
+        self._runner_id = runner_id
         self.returncode: int | None = None
 
     def poll(self) -> int | None:
@@ -94,7 +119,35 @@ class ZygoteRunnerProc:
         """
         if self.returncode is not None:
             return self.returncode
-        code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
+        status = self._manager._poll_status(self.pid, zygote_generation=self._zygote_generation)
+        if status.unavailable_reason is not None and (
+            (status.unavailable_reason, status.child_alive) != self._last_unavailable_status
+        ):
+            self._last_unavailable_status = (status.unavailable_reason, status.child_alive)
+            parent = self._zygote_process
+            parent_code = parent.poll() if parent is not None else None
+            logger.warning(
+                "Runner exit status unavailable from its forkserver",
+                extra=debug_event(
+                    "runner_zygote_status_unavailable",
+                    session_id=self._session_id,
+                    runner_id=self._runner_id,
+                    runner_pid=self.pid,
+                    zygote_pid=parent.pid if parent is not None else None,
+                    zygote_generation=self._zygote_generation,
+                    current_zygote_generation=self._manager._generation,
+                    zygote_returncode=parent_code,
+                    zygote_signal=-parent_code
+                    if parent_code is not None and parent_code < 0
+                    else None,
+                    loss_reason=status.unavailable_reason,
+                    control_error_type=status.control_error_type,
+                    child_alive=status.child_alive,
+                    reported_runner_exit_code=status.returncode,
+                    runner_exit_code_known=False,
+                ),
+            )
+        code = status.returncode
         if code is not None:
             self.returncode = code
         return self.returncode
@@ -274,22 +327,31 @@ class ZygoteManager:
         :returns: A :class:`ZygoteRunnerProc` for the forked runner.
         :raises ZygoteUnavailable: If the zygote is down or reports a fork error.
         """
-        generation = self._generation
-        reply = self._exchange(
-            {
-                "cmd": "fork",
-                "env": env,
-                "log_path": log_path,
-                "cwd": workspace,
-            },
-            zygote_generation=generation,
-        )
+        with self._lock:
+            generation = self._generation
+            parent = self._proc
+            reply = self._exchange(
+                {
+                    "cmd": "fork",
+                    "env": env,
+                    "log_path": log_path,
+                    "cwd": workspace,
+                },
+                zygote_generation=generation,
+            )
         if "error" in reply:
             raise ZygoteUnavailable(f"zygote fork failed: {reply['error']}")
         pid = reply.get("pid")
         if not isinstance(pid, int):
             raise ZygoteUnavailable(f"zygote returned no pid: {reply!r}")
-        return ZygoteRunnerProc(pid, self, zygote_generation=generation)
+        return ZygoteRunnerProc(
+            pid,
+            self,
+            zygote_generation=generation,
+            zygote_process=parent,
+            session_id=env.get(PRIMARY_SESSION_ID_ENV_VAR),
+            runner_id=env.get(RUNNER_ID_ENV_VAR),
+        )
 
     def poll(self, pid: int, *, zygote_generation: int | None = None) -> int | None:
         """Return the exit code for a forked runner, or ``None`` if still live.
@@ -298,20 +360,31 @@ class ZygoteManager:
         :param zygote_generation: The child's forkserver generation, if pinned.
         :returns: Exit code once the zygote has reaped it, else ``None``.
         """
+        return self._poll_status(pid, zygote_generation=zygote_generation).returncode
+
+    def _poll_status(self, pid: int, *, zygote_generation: int | None) -> _RunnerStatus:
         try:
             reply = self._exchange(
                 {"cmd": "poll", "pid": pid}, zygote_generation=zygote_generation
             )
-        except ZygoteUnavailable:
+        except ZygoteUnavailable as exc:
             # The zygote (the runner's OS parent) died, so exit status can no
             # longer be recovered over the control socket. Probe the runner pid
             # directly: if it is gone, surface a dead-and-failed sentinel so the
             # daemon's watcher stops looping and reports the exit; if it is
             # somehow still alive, report "still live" and keep polling. Never
             # report an eternal None for a process that has actually exited.
-            return None if _proc.process_alive(pid) else _ZYGOTE_LOST_EXIT_CODE
+            alive = _proc.process_alive(pid)
+            return _RunnerStatus(
+                None if alive else _ZYGOTE_LOST_EXIT_CODE,
+                unavailable_reason=exc.reason,
+                control_error_type=type(exc.__cause__).__name__
+                if exc.__cause__ is not None
+                else None,
+                child_alive=alive,
+            )
         code = reply.get("returncode")
-        return code if isinstance(code, int) else None
+        return _RunnerStatus(code if isinstance(code, int) else None)
 
     def stop(self) -> None:
         """Terminate the zygote and close the control socket.
@@ -350,15 +423,19 @@ class ZygoteManager:
         """
         with self._lock:
             if zygote_generation is not None and zygote_generation != self._generation:
-                raise ZygoteUnavailable("runner belongs to a previous zygote generation")
+                raise ZygoteUnavailable(
+                    "runner belongs to a previous zygote generation", reason="generation_changed"
+                )
             sock = self._sock
             if sock is None:
-                raise ZygoteUnavailable("runner zygote is not running")
+                raise ZygoteUnavailable("runner zygote is not running", reason="not_running")
             try:
                 sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
                 return self._read_reply(sock)
             except (OSError, ValueError) as exc:
-                raise ZygoteUnavailable(f"runner zygote control error: {exc}") from exc
+                raise ZygoteUnavailable(
+                    f"runner zygote control error: {exc}", reason="control_error"
+                ) from exc
 
     @staticmethod
     def _read_reply(sock: socket.socket) -> dict[str, object]:
@@ -373,10 +450,14 @@ class ZygoteManager:
         while b"\n" not in buf:
             chunk = sock.recv(4096)
             if not chunk:
-                raise ZygoteUnavailable("runner zygote closed the control socket")
+                raise ZygoteUnavailable(
+                    "runner zygote closed the control socket", reason="control_eof"
+                )
             buf.extend(chunk)
         line, _, _ = bytes(buf).partition(b"\n")
         decoded = json.loads(line)
         if not isinstance(decoded, dict):
-            raise ZygoteUnavailable(f"runner zygote sent a non-object reply: {decoded!r}")
+            raise ZygoteUnavailable(
+                f"runner zygote sent a non-object reply: {decoded!r}", reason="invalid_reply"
+            )
         return decoded
