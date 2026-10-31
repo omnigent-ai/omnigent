@@ -44,6 +44,37 @@ const POLL_INTERVAL_MS = 10_000;
 // Exponential-backoff ceiling on consecutive /health failures.
 const POLL_MAX_INTERVAL_MS = 60_000;
 
+const refreshListeners = new Set<() => void>();
+type PollListener = (liveness: Map<string, SessionLiveness>, scheduled: boolean) => void;
+const pollListeners = new Set<PollListener>();
+
+/** Poll `/health` now instead of at the next tick, e.g. right after a host wakes. */
+export function refreshRunnerHealth(): void {
+  for (const listener of refreshListeners) listener();
+}
+
+/**
+ * Hear each successful `/health` poll's liveness, and whether the poll interval ran it
+ * rather than a refresh or a change in the polled sessions; returns the unsubscribe.
+ */
+export function onRunnerHealthPolled(listener: PollListener): () => void {
+  pollListeners.add(listener);
+  return () => {
+    pollListeners.delete(listener);
+  };
+}
+
+/** A throwing listener mustn't hide the poll from the others or read as a failed poll. */
+function notifyPollListeners(liveness: Map<string, SessionLiveness>, scheduled: boolean): void {
+  for (const listener of pollListeners) {
+    try {
+      listener(liveness, scheduled);
+    } catch (err) {
+      console.warn("[runner-health] poll listener failed", err);
+    }
+  }
+}
+
 interface BatchHealthResponse {
   sessions?: Record<
     string,
@@ -74,8 +105,16 @@ export function useRunnerHealth(
   const [statusMap, setStatusMap] = useState<Map<string, SessionLiveness>>(new Map());
   const [hostStatusRevision, setHostStatusRevision] = useState(0);
 
-  // Desktop reconnects should update the badge without waiting for the next poll.
-  useEffect(() => onHostStatusChanged(() => setHostStatusRevision((revision) => revision + 1)), []);
+  // Desktop reconnects and sandbox wakes update the badge without waiting for the next poll.
+  useEffect(() => {
+    const bump = () => setHostStatusRevision((revision) => revision + 1);
+    const unsubscribeNative = onHostStatusChanged(bump);
+    refreshListeners.add(bump);
+    return () => {
+      unsubscribeNative();
+      refreshListeners.delete(bump);
+    };
+  }, []);
 
   useEffect(() => {
     if (!sessions || sessions.length === 0) {
@@ -93,7 +132,7 @@ export function useRunnerHealth(
     let nextDelayMs = POLL_INTERVAL_MS;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    async function poll() {
+    async function poll(scheduled: boolean) {
       let success = false;
       try {
         const param = ids.join(",");
@@ -116,6 +155,7 @@ export function useRunnerHealth(
             }
             setStatusMap(next);
             success = true;
+            notifyPollListeners(next, scheduled);
           }
         }
       } catch {
@@ -127,10 +167,10 @@ export function useRunnerHealth(
       } else {
         nextDelayMs = Math.min(nextDelayMs * 2, POLL_MAX_INTERVAL_MS);
       }
-      timer = setTimeout(() => void poll(), nextDelayMs);
+      timer = setTimeout(() => void poll(true), nextDelayMs);
     }
 
-    void poll();
+    void poll(false);
     return () => {
       cancelled = true;
       if (timer !== null) clearTimeout(timer);

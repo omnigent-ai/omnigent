@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
+import { onRunnerHealthPolled, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -11,22 +12,41 @@ import {
   supportsArcaConnect,
 } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
+import type { SandboxStatus } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
+
+/** How many scheduled health polls may report a woken sandbox's host offline before it gives up. */
+export const SANDBOX_WAKE_ONLINE_GRACE_POLLS = 3;
+
+/** Identifies a reported launch stage by value; snapshots rebuild the object. */
+function launchKey(launch: SandboxStatus | null): string {
+  return launch ? JSON.stringify([launch.stage, launch.error, launch.details]) : "";
+}
+
+/** A launch that failed or waits on the user is no longer making progress. */
+function launchStopped(launch: SandboxStatus | null): boolean {
+  return launch?.stage === "failed" || launch?.stage === "action_required";
+}
 
 /**
  * Reconnect this desktop's host directly; use the dialog for fallback and retry.
- * A resumable sandbox host is woken by the server instead.
+ * A resumable sandbox host is woken by the server instead, with its progress
+ * shown by the composer's host status dot rather than a toast.
  */
 export function useSessionReconnect({
   sessionId,
   hostId,
   hostName,
   hostResumable = false,
+  hostOnline,
   isOwner,
 }: {
   sessionId: string | null;
   hostId: string | null;
   hostName?: string | null;
   hostResumable?: boolean;
+  /** The session's host liveness; a woken sandbox counts as starting until it is `true`. */
+  hostOnline?: boolean | null;
   isOwner: boolean;
 }) {
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -34,7 +54,14 @@ export function useSessionReconnect({
   const [error, setError] = useState<string | null>(null);
   const [canReconnectThisMachine, setCanReconnectThisMachine] = useState(false);
   const [canReconnectArca, setCanReconnectArca] = useState(false);
+  const [sandboxWake, setSandboxWake] = useState<"waking" | "awaiting_online" | null>(null);
   const inFlight = useRef<{ progressToast?: string | number } | null>(null);
+  // The open session's launch stage, compared against its value at the wake's click.
+  const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const launchInProgress = launch !== null && !launchStopped(launch);
+  const wakeStart = useRef<{ operation: object; launch: string; stageChanged: boolean } | null>(
+    null,
+  );
   const isSessionArcaHost = useCallback(
     () =>
       hostId !== null && isArcaHost({ host_id: hostId, name: hostName ?? "" }, readArcaHostId()),
@@ -51,6 +78,7 @@ export function useSessionReconnect({
     setCanReconnectThisMachine(false);
     setCanReconnectArca(false);
     setReconnecting(false);
+    setSandboxWake(null);
     return () => {
       if (inFlight.current?.progressToast !== undefined) {
         toast.dismiss(inFlight.current.progressToast);
@@ -112,29 +140,64 @@ export function useSessionReconnect({
     }
   }, [hostId, runsArcaConnect]);
 
+  // Liveness polls lag the wake, so stay "starting" until the host reads online.
+  useEffect(() => {
+    if (sandboxWake === "awaiting_online" && hostOnline === true) setSandboxWake(null);
+  }, [sandboxWake, hostOnline]);
+
+  // Count the interval's polls, not time, since `/health` backs off on failures; a
+  // refresh or dialog's extra polls could use up the count in seconds. The count
+  // waits for the launch to stop reporting progress, and starts from zero then.
+  useEffect(() => {
+    if (sandboxWake !== "awaiting_online" || launchInProgress || !sessionId) return;
+    let offlinePolls = 0;
+    return onRunnerHealthPolled((liveness, scheduled) => {
+      const session = liveness.get(sessionId);
+      if (!scheduled || !session || session.host_online === true) return;
+      offlinePolls += 1;
+      if (offlinePolls !== SANDBOX_WAKE_ONLINE_GRACE_POLLS) return;
+      setSandboxWake(null);
+      toast.error("The sandbox didn't come online. Try Reconnect host again.");
+    });
+  }, [sandboxWake, launchInProgress, sessionId]);
+
+  // A failed or waiting stage left over from before the click mustn't end the
+  // wake; one reported since then does, even if it repeats the old one.
+  useEffect(() => {
+    const start = wakeStart.current;
+    if (sandboxWake === null || !start) return;
+    if (launchKey(launch) !== start.launch) start.stageChanged = true;
+    if (!start.stageChanged || !launchStopped(launch)) return;
+    if (inFlight.current === start.operation) inFlight.current = null;
+    wakeStart.current = null;
+    setSandboxWake(null);
+  }, [sandboxWake, launch]);
+
   // The server resumes the sandbox and starts the agent, as it does for a
   // message, so this works in the browser and for anyone who can send one.
   const wakeSandbox = useCallback(async () => {
     if (inFlight.current || !sessionId) return;
-    const operation: { progressToast?: string | number } = {};
+    const operation = {};
     inFlight.current = operation;
+    const store = useChatStore.getState();
+    const clickLaunch = store.conversationId === sessionId ? store.sandboxStatus : null;
+    wakeStart.current = { operation, launch: launchKey(clickLaunch), stageChanged: false };
+    setSandboxWake("waking");
     try {
-      operation.progressToast = toast.loading("Reconnecting sandbox…");
-      const result = await retrySession(sessionId);
+      await retrySession(sessionId);
       if (inFlight.current !== operation) return;
-      toast.success(result.recovered ? "Sandbox is back online." : "Sandbox is already online.");
+      setSandboxWake("awaiting_online");
+      refreshRunnerHealth();
     } catch (err) {
       if (inFlight.current !== operation) return;
+      setSandboxWake(null);
       toast.error(
         err instanceof Error && err.message
           ? `Couldn't reconnect the sandbox: ${err.message}`
           : "Couldn't reconnect the sandbox. Try again.",
       );
     } finally {
-      if (inFlight.current === operation) {
-        if (operation.progressToast !== undefined) toast.dismiss(operation.progressToast);
-        inFlight.current = null;
-      }
+      if (inFlight.current === operation) inFlight.current = null;
     }
   }, [sessionId]);
 
@@ -199,6 +262,8 @@ export function useSessionReconnect({
     reconnect,
     /** Whether `reconnect` runs the desktop's Arca connect for this session's host. */
     reconnectsArca: runsArcaConnect(),
+    /** A sandbox wake is running or its host has not yet been seen online. */
+    sandboxStarting: sandboxWake !== null,
     dialogOpen,
     setDialogOpen,
     localReconnect: canReconnectThisMachine
