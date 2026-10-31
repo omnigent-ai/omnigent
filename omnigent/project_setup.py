@@ -27,6 +27,10 @@ PARALLEL_SETUP_KEY = "parallel_setup"
 #: Set on a runner whose environment carries a project's ``env_commands``
 #: changes, so harnesses keep tool shells from rebuilding ``PATH``.
 PROJECT_ENV_APPLIED_ENV_VAR = "OMNIGENT_PROJECT_ENV_APPLIED"
+#: JSON ``{"set": {...}, "unset": [...]}`` of project env changes the runner
+#: applies to itself only after starting: Python-runtime variables such as
+#: ``PYTHONPATH`` would otherwise change how the runner's own interpreter starts.
+PROJECT_DEFERRED_ENV_ENV_VAR = "OMNIGENT_PROJECT_DEFERRED_ENV"
 
 #: Upper bounds that keep a project config and its launch frame small.
 MAX_COMMANDS_PER_LIST = 20

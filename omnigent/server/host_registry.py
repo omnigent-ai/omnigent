@@ -517,6 +517,11 @@ class HostConnection:
     pending_stats: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    #: Per-``request_id`` futures for in-flight project setup log reads,
+    #: resolved with the log text or ``None``.
+    pending_project_setup_logs: dict[str, asyncio.Future[str | None]] = field(
+        default_factory=dict,
+    )
     pending_list_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )

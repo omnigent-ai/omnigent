@@ -198,3 +198,15 @@ export async function rerunProjectSetup(sessionId: string): Promise<void> {
   );
   if (!res.ok) throw new Error(await readError(res));
 }
+
+/**
+ * The end of a session worktree's latest project setup log (owner only), or
+ * `null` when the worktree has none.
+ */
+export async function getProjectSetupLog(sessionId: string): Promise<string | null> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/project-setup/log`,
+  );
+  if (!res.ok) throw new Error(await readError(res));
+  return ((await res.json()) as { content: string | null }).content;
+}

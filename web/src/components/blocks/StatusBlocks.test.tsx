@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
-import { rerunProjectSetup } from "@/lib/projectsApi";
+import { getProjectSetupLog, rerunProjectSetup } from "@/lib/projectsApi";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
@@ -10,7 +10,10 @@ import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
-vi.mock("@/lib/projectsApi", () => ({ rerunProjectSetup: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/projectsApi", () => ({
+  rerunProjectSetup: vi.fn(() => Promise.resolve()),
+  getProjectSetupLog: vi.fn(() => Promise.resolve("npm ERR! missing script: ci")),
+}));
 
 afterEach(cleanup);
 
@@ -1423,5 +1426,25 @@ describe("project setup notices", () => {
       expect(screen.getByTestId("error-rerun-project-setup")).toHaveTextContent("Setup re-running"),
     );
     expect(vi.mocked(rerunProjectSetup)).toHaveBeenCalledWith("sess-setup");
+  });
+
+  it("shows the worktree's setup log from its host", async () => {
+    render(
+      <ConversationScopeContext.Provider value="sess-setup">
+        <ErrorBanner
+          message="Project setup commands finished."
+          source="execution"
+          code="project_setup_finished"
+          level="info"
+        />
+      </ConversationScopeContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByTestId("error-project-setup-log"));
+
+    expect(await screen.findByTestId("project-setup-log-content")).toHaveTextContent(
+      "npm ERR! missing script: ci",
+    );
+    expect(vi.mocked(getProjectSetupLog)).toHaveBeenCalledWith("sess-setup");
   });
 });

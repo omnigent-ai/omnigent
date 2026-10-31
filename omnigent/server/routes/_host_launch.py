@@ -240,7 +240,13 @@ async def resolve_launch_project_setup(
     :param host_conn: Live connection to the target host.
     :returns: What to send, or an empty result.
     """
-    if conv.project_id is None or _project_store is None:
+    # A managed sandbox is not the user's machine: their local env (conda envs,
+    # ~/.env files) does not exist there, so its commands would only fail.
+    if (
+        conv.project_id is None
+        or _project_store is None
+        or host_conn.registered_with_managed_token
+    ):
         return LaunchProjectSetup()
     try:
         project = await asyncio.to_thread(_owned_project, conv.project_id, host_conn.owner)

@@ -32,6 +32,7 @@ from datetime import UTC
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
+import cachetools
 import httpx
 from fastapi import (
     HTTPException,
@@ -6252,6 +6253,11 @@ PROJECT_SETUP_NOTICE_CODE = "project_setup_failed"
 PROJECT_SETUP_RUNNING_NOTICE_CODE = "project_setup_running"
 PROJECT_SETUP_FINISHED_NOTICE_CODE = "project_setup_finished"
 
+#: Last env-command failure told to each session, so relaunches don't repeat it.
+_last_env_failure: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096), reset_on_error=True
+)
+
 
 async def _append_launch_notice(
     conv: Conversation,
@@ -6341,7 +6347,13 @@ async def note_project_setup_on_launch(
         (the project did not opt into ``parallel_setup``).
     """
     messages = [PROJECT_SETUP_UNSUPPORTED_NOTICE] if unsupported else []
-    messages.extend(f"Project env commands did not apply: {warning}" for warning in warnings)
+    env_failure = "\n".join(warnings)
+    # A broken env command fails every relaunch; say so again only when it changes.
+    if env_failure and _last_env_failure.get(conv.id) != env_failure:
+        _last_env_failure[conv.id] = env_failure
+        messages.extend(f"Project env commands did not apply: {warning}" for warning in warnings)
+    elif not env_failure:
+        _last_env_failure.pop(conv.id, None)
     for message in messages:
         await _append_launch_notice(
             conv,

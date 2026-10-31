@@ -9,11 +9,12 @@ never runs against a half-installed worktree. Projects that opt into
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 
-from omnigent.project_setup import SETUP_BUDGET_S
+from omnigent.project_setup import PROJECT_DEFERRED_ENV_ENV_VAR, SETUP_BUDGET_S
 
 _logger = logging.getLogger(__name__)
 
@@ -23,6 +24,29 @@ WAIT_TIMEOUT_S = SETUP_BUDGET_S + 60.0
 _POLL_INTERVAL_S = 0.5
 
 _released = False
+
+
+def apply_deferred_project_env() -> None:
+    """
+    Apply project env changes the host kept off the runner's own startup.
+
+    Called once the interpreter is up, so ``PYTHONPATH`` and friends reach the
+    agent's tool processes without changing how the runner itself started.
+    A malformed payload is logged and ignored.
+    """
+    raw = os.environ.pop(PROJECT_DEFERRED_ENV_ENV_VAR, None)
+    if not raw:
+        return
+    try:
+        payload = json.loads(raw)
+        set_vars = {str(k): str(v) for k, v in payload.get("set", {}).items()}
+        unset_vars = [str(k) for k in payload.get("unset", [])]
+    except (ValueError, AttributeError, TypeError):
+        _logger.warning("Ignoring a malformed deferred project env")
+        return
+    for key in unset_vars:
+        os.environ.pop(key, None)
+    os.environ.update(set_vars)
 
 
 async def wait_for_project_setup(

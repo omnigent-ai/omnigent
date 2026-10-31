@@ -61,6 +61,7 @@ from omnigent.host.frames import (
     HostPluginsResultFrame,
     HostProbeAccountsResultFrame,
     HostProjectSetupFinishedFrame,
+    HostReadProjectSetupLogResultFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -895,6 +896,12 @@ async def _receive_loop(
                         "project_setup_running": frame.project_setup_running,
                     }
                 )
+            continue
+
+        if isinstance(frame, HostReadProjectSetupLogResultFrame):
+            log_future = conn.pending_project_setup_logs.pop(frame.request_id, None)
+            if log_future is not None and not log_future.done():
+                log_future.set_result(frame.content)
             continue
 
         if isinstance(frame, HostProjectSetupFinishedFrame):

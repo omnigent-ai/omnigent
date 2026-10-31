@@ -42,7 +42,12 @@ ENV_PROBE_TIMEOUT_S = 7.0
 #: A probe slower than this is logged so users can trim their rc files.
 ENV_PROBE_SLOW_S = 2.0
 #: How long a successful probe is reused for the same workspace and commands.
-ENV_PROBE_CACHE_TTL_S = 600.0
+#: Long, like Orca and Paradev, which probe once per boot: every probe runs
+#: the user's rc files, which may start agents or print prompts.
+ENV_PROBE_CACHE_TTL_S = 3600.0
+#: How long a failed probe is remembered, so a slow or broken rc file does not
+#: cost every relaunch the full timeout.
+ENV_PROBE_FAILURE_TTL_S = 60.0
 #: Output lines copied to the host log for a failure.
 _LOG_TAIL_LINES = 40
 
@@ -53,7 +58,22 @@ _POSIX_SHELLS = frozenset({"bash", "zsh", "sh", "dash", "ksh"})
 
 #: Variables that differ between any two shells and say nothing about the project.
 _VOLATILE_ENV_KEYS = frozenset(
-    {"PWD", "OLDPWD", "SHLVL", "_", "PS1", "PS2", "PS4", "COLUMNS", "LINES"}
+    {
+        "PWD",
+        "OLDPWD",
+        "SHLVL",
+        "_",
+        "PS1",
+        "PS2",
+        "PS4",
+        "COLUMNS",
+        "LINES",
+        # An rc that starts ssh-agent or gpg-agent makes a new one per probe;
+        # forwarding its socket would point the agent at a process that may go away.
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "GPG_AGENT_INFO",
+    }
 )
 _VOLATILE_ENV_PREFIXES = ("TERM", "TMUX", "SHELL_SESSION_", "ITERM_", "__CF")
 #: Runner wiring that project commands must never override.
@@ -135,6 +155,28 @@ def apply_env_delta(env: dict[str, str], delta: EnvDelta) -> None:
         if key.startswith(_PROTECTED_ENV_PREFIXES):
             continue
         env[key] = _merge_paths(value, env.get("PATH", "")) if key == "PATH" else value
+
+
+def split_deferred_env(delta: EnvDelta) -> tuple[EnvDelta, dict[str, object] | None]:
+    """
+    Separate Python-runtime variables the runner must not start with.
+
+    ``PYTHONPATH`` or ``PYTHONHOME`` from a project's env would change how the
+    runner's own interpreter starts; the runner applies them after startup
+    instead, so only the agent's tool processes see them.
+
+    :param delta: The project env delta.
+    :returns: ``(delta to apply now, deferred {"set", "unset"} payload or None)``.
+    """
+    deferred_set = {k: v for k, v in delta.set_vars.items() if k.startswith("PYTHON")}
+    deferred_unset = sorted(k for k in delta.unset_vars if k.startswith("PYTHON"))
+    if not deferred_set and not deferred_unset:
+        return delta, None
+    now = EnvDelta(
+        set_vars={k: v for k, v in delta.set_vars.items() if k not in deferred_set},
+        unset_vars=frozenset(k for k in delta.unset_vars if k not in deferred_unset),
+    )
+    return now, {"set": deferred_set, "unset": deferred_unset}
 
 
 def _merge_paths(project_path: str, base_path: str) -> str:
@@ -244,12 +286,26 @@ def _run_bounded(
         return exit_code
 
 
-def _probe_script(commands: tuple[str, ...], before_path: str, after_path: str) -> str:
-    # Each command runs in a brace group so its own ';' or '||' stays inside it.
-    chained = " && ".join(f"{{ {command}\n}}" for command in commands)
+def _env_script(commands: tuple[str, ...]) -> str:
+    """
+    Script of ``env_commands`` the probe sources, stopping at the first failure.
+
+    Each command keeps its own lines, so heredocs and multi-line commands work
+    without being joined into one shell expression.
+    """
+    lines: list[str] = []
+    for command in commands:
+        lines.append(command)
+        lines.append(
+            '__omnigent_status=$?; [ "$__omnigent_status" -eq 0 ] || return "$__omnigent_status"'
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _probe_script(script_path: str, before_path: str, after_path: str) -> str:
     return (
         f"{_ENV_DUMP} > {shlex.quote(before_path)} || exit 97\n"
-        f"{chained} && {_ENV_DUMP} > {shlex.quote(after_path)}\n"
+        f". {shlex.quote(script_path)} && {_ENV_DUMP} > {shlex.quote(after_path)}\n"
     )
 
 
@@ -293,10 +349,12 @@ def probe_env_delta(
     with tempfile.TemporaryDirectory(prefix="omnigent-env-probe-") as scratch:
         before_path = os.path.join(scratch, "before.env")
         after_path = os.path.join(scratch, "after.env")
+        script_path = os.path.join(scratch, "env_commands.sh")
+        Path(script_path).write_text(_env_script(commands))
         output_path = Path(scratch) / "output.log"
         started = time.monotonic()
         exit_code = _run_bounded(
-            [shell, "-i", "-l", "-c", _probe_script(commands, before_path, after_path)],
+            [shell, "-i", "-l", "-c", _probe_script(script_path, before_path, after_path)],
             cwd=workspace,
             env=os.environ.copy(),
             timeout=timeout,
@@ -319,26 +377,49 @@ def probe_env_delta(
 
 
 class EnvProbeCache:
-    """Reuses a successful env probe for the same workspace and commands."""
+    """Reuses a probe for the same workspace and commands: successes long, failures briefly."""
 
-    def __init__(self, ttl_s: float = ENV_PROBE_CACHE_TTL_S) -> None:
+    def __init__(
+        self,
+        ttl_s: float = ENV_PROBE_CACHE_TTL_S,
+        failure_ttl_s: float = ENV_PROBE_FAILURE_TTL_S,
+    ) -> None:
         self._ttl_s = ttl_s
-        self._entries: dict[tuple[str, str, str], tuple[float, EnvDelta]] = {}
+        self._failure_ttl_s = failure_ttl_s
+        self._entries: dict[tuple[str, str, str], tuple[float, EnvDelta | None, str | None]] = {}
         self._lock = threading.Lock()
 
-    def get(self, workspace: str, commands: tuple[str, ...]) -> EnvDelta | None:
-        key = (workspace, os.environ.get("SHELL", ""), commands_digest(commands))
+    @staticmethod
+    def _key(workspace: str, commands: tuple[str, ...]) -> tuple[str, str, str]:
+        return (workspace, os.environ.get("SHELL", ""), commands_digest(commands))
+
+    def get(
+        self, workspace: str, commands: tuple[str, ...]
+    ) -> tuple[EnvDelta | None, str | None] | None:
+        """Return a remembered ``(delta, warning)`` probe result, or ``None``."""
+        key = self._key(workspace, commands)
         with self._lock:
             entry = self._entries.get(key)
             if entry is None or entry[0] < time.monotonic():
                 self._entries.pop(key, None)
                 return None
-            return entry[1]
+            return entry[1], entry[2]
 
-    def put(self, workspace: str, commands: tuple[str, ...], delta: EnvDelta) -> None:
-        key = (workspace, os.environ.get("SHELL", ""), commands_digest(commands))
+    def put(
+        self,
+        workspace: str,
+        commands: tuple[str, ...],
+        delta: EnvDelta | None,
+        warning: str | None,
+    ) -> None:
+        """Remember a probe result."""
+        ttl = self._ttl_s if delta is not None else self._failure_ttl_s
         with self._lock:
-            self._entries[key] = (time.monotonic() + self._ttl_s, delta)
+            self._entries[self._key(workspace, commands)] = (
+                time.monotonic() + ttl,
+                delta,
+                warning,
+            )
 
 
 def linked_worktree_git_dir(workspace: str) -> Path | None:
@@ -397,6 +478,44 @@ def pending_setup_marker(workspace: str) -> Path | None:
 #: the same worktree don't run the installs twice.
 _running_setups: set[Path] = set()
 _running_setups_lock = threading.Lock()
+#: Log of each running setup, so it can be read while it is still going.
+_running_setup_logs: dict[Path, Path] = {}
+
+#: Most of a setup log returned to a reader, from its end.
+SETUP_LOG_READ_LIMIT_BYTES = 256 * 1024
+
+
+def read_setup_log(workspace: str) -> str | None:
+    """
+    Return the end of a worktree's latest setup log, running or finished.
+
+    The path comes from the host's own records, never from the caller.
+
+    :param workspace: Session workspace inside the worktree.
+    :returns: Up to :data:`SETUP_LOG_READ_LIMIT_BYTES` of log text, or ``None``
+        when this worktree has no setup log.
+    """
+    git_dir = linked_worktree_git_dir(workspace)
+    if git_dir is None:
+        return None
+    with _running_setups_lock:
+        log_path = _running_setup_logs.get(git_dir)
+    if log_path is None:
+        try:
+            recorded = json.loads((git_dir / SETUP_MARKER_NAME).read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(recorded, dict) or not isinstance(recorded.get("log_path"), str):
+            return None
+        log_path = Path(recorded["log_path"])
+    try:
+        with open(log_path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            log.seek(max(0, size - SETUP_LOG_READ_LIMIT_BYTES))
+            return log.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def claim_worktree_setup(*, workspace: str) -> Path | None:
@@ -461,7 +580,7 @@ def run_worktree_setup(
     :returns: The outcome and log path.
     """
     try:
-        result = _run_claimed_setup(commands, workspace, session_id, env, budget_s)
+        result = _run_claimed_setup(commands, git_dir, workspace, session_id, env, budget_s)
     except InterruptedByShutdownError:
         return WorktreeSetupResult(warning="interrupted by host shutdown", log_path=None)
     except Exception as exc:
@@ -472,6 +591,7 @@ def run_worktree_setup(
     finally:
         with _running_setups_lock:
             _running_setups.discard(git_dir)
+            _running_setup_logs.pop(git_dir, None)
     _write_marker(git_dir, commands, result)
     return result
 
@@ -491,6 +611,7 @@ def _write_marker(git_dir: Path, commands: tuple[str, ...], result: WorktreeSetu
 
 def _run_claimed_setup(
     commands: tuple[str, ...],
+    git_dir: Path,
     workspace: str,
     session_id: str | None,
     env: dict[str, str],
@@ -510,6 +631,8 @@ def _run_claimed_setup(
         command_env["OMNIGENT_SESSION_ID"] = session_id
     log_path, log_file = open_process_log_file("project-setup", prefix="project-setup-")
     log_file.close()
+    with _running_setups_lock:
+        _running_setup_logs[git_dir] = log_path
     deadline = time.monotonic() + budget_s
     warning: str | None = None
     # A login shell restores the user's PATH (e.g. Homebrew from .zprofile),
@@ -552,13 +675,13 @@ def prepare_project_env(
     outcome = ProjectSetupOutcome()
     if not setup.env_commands:
         return outcome
-    delta = cache.get(workspace, setup.env_commands)
-    if delta is None:
-        delta, warning = probe_env_delta(setup.env_commands, workspace=workspace)
-        if warning:
-            outcome.warnings.append(warning)
-        if delta is not None:
-            cache.put(workspace, setup.env_commands, delta)
+    cached = cache.get(workspace, setup.env_commands)
+    if cached is None:
+        cached = probe_env_delta(setup.env_commands, workspace=workspace)
+        cache.put(workspace, setup.env_commands, *cached)
+    delta, warning = cached
+    if warning:
+        outcome.warnings.append(warning)
     if delta is not None:
         outcome.env_delta = delta
     return outcome

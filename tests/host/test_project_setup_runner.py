@@ -23,7 +23,9 @@ from omnigent.host.project_setup_runner import (
     pending_setup_marker,
     prepare_project_env,
     probe_env_delta,
+    read_setup_log,
     run_worktree_setup,
+    split_deferred_env,
 )
 from omnigent.project_setup import ProjectSetup
 
@@ -258,3 +260,64 @@ def test_a_finished_host_shutdown_does_not_mark_later_setups_interrupted(
     kill_running_project_commands()
 
     assert _run_claimed_setup(linked_worktree, ("true",)) is None
+
+
+def test_env_commands_may_span_lines_and_stop_at_the_first_failure(
+    bash_login_shell: None, tmp_path: Path
+) -> None:
+    delta, warning = probe_env_delta(
+        ('export FROM_HEREDOC="$(cat <<EOF\nmulti\nEOF\n)"', "false", "export NEVER=1"),
+        workspace=str(tmp_path),
+    )
+
+    assert delta is None and warning is not None and "exit 1" in warning
+    delta, warning = probe_env_delta(
+        ('export FROM_HEREDOC="$(cat <<EOF\nmulti\nEOF\n)"',), workspace=str(tmp_path)
+    )
+    assert warning is None and delta is not None and delta.set_vars["FROM_HEREDOC"] == "multi"
+
+
+def test_agent_sockets_and_python_runtime_vars_never_reach_the_runner_process() -> None:
+    delta = compute_env_delta(
+        {"PATH": "/usr/bin"},
+        {"PATH": "/usr/bin", "SSH_AUTH_SOCK": "/tmp/a", "PYTHONPATH": "/proj", "FOO": "1"},
+    )
+
+    now, deferred = split_deferred_env(delta)
+
+    assert now.set_vars == {"FOO": "1"}
+    assert deferred == {"set": {"PYTHONPATH": "/proj"}, "unset": []}
+
+
+def test_a_failed_probe_is_remembered_briefly(
+    bash_login_shell: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    real_probe = project_setup_runner.probe_env_delta
+
+    def counting_probe(commands: tuple[str, ...], **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return real_probe(commands, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(project_setup_runner, "probe_env_delta", counting_probe)
+    cache = EnvProbeCache(failure_ttl_s=60)
+    broken = ProjectSetup(env_commands=("false",))
+
+    first = prepare_project_env(broken, workspace=str(tmp_path), cache=cache)
+    second = prepare_project_env(broken, workspace=str(tmp_path), cache=cache)
+
+    assert calls == 1
+    assert first.warnings == second.warnings and first.warnings
+
+
+def test_the_setup_log_is_readable_for_its_worktree_only(
+    bash_login_shell: None, linked_worktree: Path, tmp_path: Path
+) -> None:
+    assert read_setup_log(str(linked_worktree)) is None
+
+    _run_claimed_setup(linked_worktree, ("echo installing-deps",))
+
+    log = read_setup_log(str(linked_worktree))
+    assert log is not None and "installing-deps" in log
+    assert read_setup_log(str(tmp_path / "repo")) is None

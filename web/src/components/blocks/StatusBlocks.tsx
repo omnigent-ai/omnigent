@@ -18,6 +18,7 @@ import {
   Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
+  FileTextIcon,
   ShieldXIcon,
   ShrinkIcon,
   SplitIcon,
@@ -25,7 +26,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { rerunProjectSetup } from "@/lib/projectsApi";
+import { getProjectSetupLog, rerunProjectSetup } from "@/lib/projectsApi";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { ReactNode } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
@@ -285,6 +287,60 @@ function ErrorForkAction({
           {label}
         </Button>
       </DisabledActionTooltip>
+    </div>
+  );
+}
+
+/** Notices about a worktree's setup, which offer its log. */
+const PROJECT_SETUP_LOG_CODES = new Set([
+  "project_setup_failed",
+  "project_setup_running",
+  "project_setup_finished",
+]);
+
+/** Opens the end of the session worktree's project setup log, read from its host. */
+function ProjectSetupLogAction({ className }: { className?: string }) {
+  const conversationId = useScopedConversationId();
+  const [open, setOpen] = useState(false);
+  const [log, setLog] = useState<{ content: string | null } | { error: string } | null>(null);
+  if (!conversationId) return null;
+  return (
+    <div className={className} onClick={(event) => event.stopPropagation()}>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        data-testid="error-project-setup-log"
+        onClick={() => {
+          setOpen(true);
+          setLog(null);
+          getProjectSetupLog(conversationId).then(
+            (content) => setLog({ content }),
+            (reason: unknown) =>
+              setLog({ error: reason instanceof Error ? reason.message : String(reason) }),
+          );
+        }}
+      >
+        <FileTextIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        View setup log
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Project setup log</DialogTitle>
+          </DialogHeader>
+          <pre
+            data-testid="project-setup-log-content"
+            className="max-h-[60vh] overflow-auto rounded-md bg-muted p-3 font-mono text-sm whitespace-pre-wrap"
+          >
+            {log === null
+              ? "Loading…"
+              : "error" in log
+                ? log.error
+                : (log.content ?? "This worktree has no setup log yet.")}
+          </pre>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -621,6 +677,11 @@ export function ErrorBanner({
         </div>
         {code === "project_setup_failed" && message.startsWith("Project setup failed") ? (
           <RerunProjectSetupAction className="mx-[4px] mt-[8px]" />
+        ) : null}
+        {code &&
+        PROJECT_SETUP_LOG_CODES.has(code) &&
+        !message.startsWith("Project env commands") ? (
+          <ProjectSetupLogAction className="mx-[4px] mt-[8px]" />
         ) : null}
         {workspaceMissing ? (
           <ErrorForkAction

@@ -120,6 +120,8 @@ from omnigent.host.frames import (
     HostProbeAccountsFrame,
     HostProbeAccountsResultFrame,
     HostProjectSetupFinishedFrame,
+    HostReadProjectSetupLogFrame,
+    HostReadProjectSetupLogResultFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -161,7 +163,9 @@ from omnigent.host.project_setup_runner import (
     kill_running_project_commands,
     pending_setup_marker,
     prepare_project_env,
+    read_setup_log,
     run_worktree_setup,
+    split_deferred_env,
 )
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
@@ -205,7 +209,11 @@ from omnigent.process_logging import (
     redact_log_text,
     should_log_to_stderr,
 )
-from omnigent.project_setup import PROJECT_ENV_APPLIED_ENV_VAR, ProjectSetup
+from omnigent.project_setup import (
+    PROJECT_DEFERRED_ENV_ENV_VAR,
+    PROJECT_ENV_APPLIED_ENV_VAR,
+    ProjectSetup,
+)
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
@@ -2305,6 +2313,8 @@ class HostProcess:
         :param env: Runner environment, updated in place.
         :returns: Warnings to show on the session, and the applied delta.
         """
+        if frame.project_setup_invalid:
+            return ["the project's setup was malformed and was skipped"], EnvDelta()
         setup = ProjectSetup.from_mapping(frame.project_setup) if frame.project_setup else None
         if setup is None or not setup.env_commands:
             return [], EnvDelta()
@@ -2318,7 +2328,10 @@ class HostProcess:
             _logger.exception("Project env commands crashed for %s", workspace)
             crash = f"project env commands crashed on the host ({type(exc).__name__})"
             return [crash], EnvDelta()
-        apply_env_delta(env, outcome.env_delta)
+        runner_delta, deferred = split_deferred_env(outcome.env_delta)
+        apply_env_delta(env, runner_delta)
+        if deferred is not None:
+            env[PROJECT_DEFERRED_ENV_ENV_VAR] = json.dumps(deferred)
         if outcome.env_delta.set_vars or outcome.env_delta.unset_vars:
             env[PROJECT_ENV_APPLIED_ENV_VAR] = "1"
         for warning in outcome.warnings:
@@ -6008,6 +6021,18 @@ class HostProcess:
                 raise launch_fault
         elif isinstance(frame, HostRerunProjectSetupFrame):
             await self._handle_rerun_project_setup(frame)
+        elif isinstance(frame, HostReadProjectSetupLogFrame):
+            content = await asyncio.to_thread(
+                read_setup_log, str(Path(frame.workspace).expanduser())
+            )
+            await self._send_text(
+                ws,
+                encode_host_frame(
+                    HostReadProjectSetupLogResultFrame(
+                        request_id=frame.request_id, content=content
+                    )
+                ),
+            )
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
                 stop_result = await self._handle_stop(frame)

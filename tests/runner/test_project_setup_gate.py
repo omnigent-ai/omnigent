@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from pathlib import Path
 
 import pytest
 
+from omnigent.project_setup import PROJECT_DEFERRED_ENV_ENV_VAR
 from omnigent.runner import project_setup_gate
 from omnigent.runner.project_setup_gate import (
     PROJECT_SETUP_MARKER_ENV_VAR,
+    apply_deferred_project_env,
     wait_for_project_setup,
 )
 
@@ -47,3 +51,20 @@ async def test_runners_without_due_setup_do_not_wait(monkeypatch: pytest.MonkeyP
     monkeypatch.delenv(PROJECT_SETUP_MARKER_ENV_VAR, raising=False)
 
     await asyncio.wait_for(wait_for_project_setup(), timeout=0.5)
+
+
+def test_deferred_project_env_is_applied_once_the_runner_is_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONSTALE", "old")
+    monkeypatch.setenv(
+        PROJECT_DEFERRED_ENV_ENV_VAR,
+        json.dumps({"set": {"PYTHONPATH": "/proj"}, "unset": ["PYTHONSTALE"]}),
+    )
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    apply_deferred_project_env()
+
+    assert os.environ["PYTHONPATH"] == "/proj"
+    assert "PYTHONSTALE" not in os.environ
+    assert PROJECT_DEFERRED_ENV_ENV_VAR not in os.environ

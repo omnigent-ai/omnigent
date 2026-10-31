@@ -44,6 +44,8 @@ from omnigent.host.frames import (
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostProjectSetupFinishedFrame,
+    HostReadProjectSetupLogFrame,
+    HostReadProjectSetupLogResultFrame,
     HostRerunProjectSetupFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
@@ -5176,3 +5178,35 @@ async def test_rerun_project_setup_is_refused_without_setup_commands(
 
     assert response.status_code == 400, response.text
     assert "no setup commands" in response.text
+
+
+async def test_project_setup_log_is_read_from_the_sessions_host(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    comm = await _connect_host(app, capabilities=(CAP_PROJECT_SETUP,))
+    session_id, _ = await _create_project_session(client, comm, {"setup_commands": ["npm ci"]})
+
+    async def answer_log_read() -> HostReadProjectSetupLogFrame:
+        deadline = Deadline(10.0)
+        while True:
+            output = await comm.receive_output(timeout=deadline.next_wait(10.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostReadProjectSetupLogFrame):
+                reply = HostReadProjectSetupLogResultFrame(
+                    request_id=frame.request_id, content="npm ERR! boom"
+                )
+                await comm.send_input(
+                    {"type": "websocket.receive", "text": encode_host_frame(reply)}
+                )
+                return frame
+
+    host = asyncio.create_task(answer_log_read())
+    response = await client.get(f"/v1/sessions/{session_id}/project-setup/log")
+    frame = await host
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"content": "npm ERR! boom"}
+    # The host picks the log from its own records; the server only names the workspace.
+    assert frame.workspace == _WORKSPACE

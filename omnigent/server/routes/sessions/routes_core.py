@@ -339,6 +339,8 @@ async def _wake_runner_for_model_change(
 # Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
 # mirroring/cleanup (6s) to finish before the server restores a selection.
 _CODEX_SETTINGS_FORWARD_TIMEOUT_S = 40.0
+#: How long the project setup log endpoint waits for the host.
+_PROJECT_SETUP_LOG_TIMEOUT_S = 15.0
 
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
@@ -4559,6 +4561,53 @@ def register_core_routes(
             agent_waits=False,
         )
         return {"status": "started"}
+
+    # ── GET /sessions/{session_id}/project-setup/log ─────────────
+    @router.get("/sessions/{session_id}/project-setup/log")
+    async def read_project_setup_log(request: Request, session_id: str) -> dict[str, str | None]:
+        """Return the end of the session worktree's latest project setup log.
+
+        Owner-only: setup output can hold whatever the commands printed.
+
+        :returns: ``{"content": <log text or None>}``.
+        :raises OmnigentError: 404 for an unknown session, 400 when it does not
+            run on a host, 503 when its host is offline or does not answer.
+        """
+        from omnigent.host.frames import HostReadProjectSetupLogFrame, encode_host_frame
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.host_id is None or conv.workspace is None:
+            raise OmnigentError(
+                "This session does not run on a host", code=ErrorCode.INVALID_INPUT
+            )
+        registry = getattr(request.app.state, "host_registry", None)
+        conn = registry.get(conv.host_id) if registry is not None else None
+        if registry is None or conn is None:
+            raise OmnigentError("The session's host is offline", code=ErrorCode.HOST_OFFLINE)
+        request_id = secrets.token_hex(8)
+        future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+        conn.pending_project_setup_logs[request_id] = future
+        try:
+            registry.send_text(
+                conn,
+                encode_host_frame(
+                    HostReadProjectSetupLogFrame(request_id=request_id, workspace=conv.workspace)
+                ),
+            )
+            content = await asyncio.wait_for(future, timeout=_PROJECT_SETUP_LOG_TIMEOUT_S)
+        except (ConnectionError, TimeoutError) as exc:
+            raise OmnigentError(
+                "The session's host did not return the setup log", code=ErrorCode.HOST_OFFLINE
+            ) from exc
+        finally:
+            conn.pending_project_setup_logs.pop(request_id, None)
+        return {"content": content}
 
     # ── POST /sessions/{session_id}/switch-agent (reserved) ──────
     # Placeholder: in-place agent switching was retired and will return with a

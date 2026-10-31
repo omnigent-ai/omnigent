@@ -56,10 +56,13 @@ from omnigent.host.frames import (
     HostProbeAccountsFrame,
     HostProbeAccountsResultFrame,
     HostProjectSetupFinishedFrame,
+    HostReadProjectSetupLogFrame,
+    HostReadProjectSetupLogResultFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
+    HostRerunProjectSetupFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -979,14 +982,18 @@ def test_launch_runner_project_setup_round_trips_and_is_absent_for_older_peers()
     assert decode_host_frame(encoded) == legacy
 
 
-def test_launch_runner_rejects_malformed_project_setup() -> None:
-    """A malformed command list is rejected at decode, not run on the host."""
+def test_launch_runner_drops_malformed_project_setup_without_failing_the_launch() -> None:
+    """A malformed command list is never run, and never fails the whole launch."""
     raw = json.loads(
         encode_host_frame(HostLaunchRunnerFrame(request_id="r", binding_token="t", workspace="/w"))
     )
     raw["project_setup"] = {"env_commands": "conda activate proj"}
-    with pytest.raises(ValueError, match="env_commands"):
-        decode_host_frame(json.dumps(raw))
+
+    decoded = decode_host_frame(json.dumps(raw))
+
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.project_setup is None
+    assert decoded.project_setup_invalid is True
 
 
 def test_launch_result_and_setup_finished_report_round_trip() -> None:
@@ -1003,6 +1010,17 @@ def test_launch_result_and_setup_finished_report_round_trip() -> None:
         session_id="conv_1", warning="npm ci failed", log_path="/logs/setup.log"
     )
     assert decode_host_frame(encode_host_frame(report)) == report
+    for frame in (
+        HostRerunProjectSetupFrame(
+            session_id="conv_1",
+            workspace="/w",
+            project_setup={"env_commands": [], "setup_commands": ["x"], "parallel_setup": False},
+        ),
+        HostReadProjectSetupLogFrame(request_id="req_log", workspace="/w"),
+        HostReadProjectSetupLogResultFrame(request_id="req_log", content="log text"),
+        HostReadProjectSetupLogResultFrame(request_id="req_log", content=None),
+    ):
+        assert decode_host_frame(encode_host_frame(frame)) == frame
 
 
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
