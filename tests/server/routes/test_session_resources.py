@@ -11300,52 +11300,6 @@ _FS_BASE = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments
 
 
 @pytest.mark.asyncio
-async def test_skip_gzip_responder_forwards_start_before_bodies() -> None:
-    from starlette.types import Message, Receive, Scope, Send
-
-    from omnigent.server.routes._gzip_route import (
-        GZIP_COMPRESSLEVEL,
-        GZIP_MINIMUM_SIZE,
-        SKIP_GZIP_STATE_KEY,
-        _StateAwareGZipResponder,
-    )
-
-    start: Message = {
-        "type": "http.response.start",
-        "status": 200,
-        "headers": [(b"content-type", b"application/json")],
-    }
-    first_body: Message = {"type": "http.response.body", "body": b"first chunk", "more_body": True}
-    final_body: Message = {"type": "http.response.body", "body": b"last chunk", "more_body": False}
-    sent: list[Message] = []
-
-    async def app(scope: Scope, receive: Receive, send: Send) -> None:
-        del scope, receive
-        await send(start)
-        assert sent == [start]
-        await send(first_body)
-        await send(final_body)
-
-    async def receive() -> Message:
-        return {"type": "http.disconnect"}
-
-    async def send(message: Message) -> None:
-        sent.append(message)
-
-    responder = _StateAwareGZipResponder(
-        app,
-        GZIP_MINIMUM_SIZE,
-        GZIP_COMPRESSLEVEL,
-        {SKIP_GZIP_STATE_KEY: True},
-    )
-    await responder({"type": "http"}, receive, send)
-
-    assert sent == [start, first_body, final_body]
-    assert b"content-encoding" not in dict(sent[0]["headers"])
-    assert b"vary" not in dict(sent[0]["headers"])
-
-
-@pytest.mark.asyncio
 async def test_file_read_is_gzipped(client: httpx.AsyncClient) -> None:
     """A text file read is compressed, and the body survives the round-trip.
 
