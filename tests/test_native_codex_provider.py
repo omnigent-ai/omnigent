@@ -279,6 +279,89 @@ def test_resolve_native_codex_launch_subscription_logged_in_uses_cli_login(
     assert launch.profile is None
 
 
+_GATEWAY_KEY_PROVIDER = {
+    "gateway": {
+        "kind": "key",
+        "openai": {
+            "base_url": "https://gateway.example.com/serving-endpoints",
+            "api_key": "gw-key",
+        },
+    }
+}
+
+
+@pytest.mark.parametrize("logged_in", [True, False])
+def test_resolve_native_codex_launch_subscription_gateway_pick_routes_through_gateway(
+    _isolated: Path, logged_in: bool
+) -> None:
+    """A pinned gateway model never reaches the built-in openai provider on a login.
+
+    The ChatGPT login cannot serve a Databricks gateway id, so a launch pinned to
+    one must route through a configured provider that can, whether or not Codex is
+    logged in. Failure with ``model_provider="openai"`` means the gateway pick was
+    sent to the login and fails with model_not_found.
+    """
+    _seed(
+        _isolated,
+        {
+            "codex-subscription": {"kind": "subscription", "cli": "codex", "default": True},
+            **_GATEWAY_KEY_PROVIDER,
+        },
+    )
+    _write_codex_login(_isolated, logged_in=logged_in)
+
+    launch = resolve_native_codex_launch(model="system.ai.gpt-6-astra")
+
+    joined = "\n".join(launch.config_overrides)
+    assert 'model_provider="openai"' not in joined
+    assert 'base_url="https://gateway.example.com/serving-endpoints"' in joined
+    assert launch.model == "system.ai.gpt-6-astra"
+    assert not launch.login_required
+
+
+@pytest.mark.parametrize("logged_in", [True, False])
+def test_resolve_native_codex_launch_subscription_gateway_pick_without_gateway_runs_default(
+    _isolated: Path, logged_in: bool
+) -> None:
+    """With no provider to route a gateway pick, the login runs without that model.
+
+    The launch keeps the built-in openai pin but drops the unservable gateway model,
+    so Codex does not fail every turn with model_not_found. A logged-out login is
+    still marked login-required so the sign-in screen is reported.
+    """
+    _seed(
+        _isolated,
+        {"codex-subscription": {"kind": "subscription", "cli": "codex", "default": True}},
+    )
+    _write_codex_login(_isolated, logged_in=logged_in)
+
+    launch = resolve_native_codex_launch(model="system.ai.gpt-6-astra")
+
+    assert launch.config_overrides == ['model_provider="openai"']
+    assert launch.model is None
+    assert launch.login_required is (not logged_in)
+    assert "system.ai.gpt-6-astra" in launch.summary
+
+
+def test_resolve_native_codex_launch_subscription_account_pick_stays_on_login(
+    _isolated: Path,
+) -> None:
+    """A non-gateway pick on a logged-in subscription still defers to the login."""
+    _seed(
+        _isolated,
+        {
+            "codex-subscription": {"kind": "subscription", "cli": "codex", "default": True},
+            **_GATEWAY_KEY_PROVIDER,
+        },
+    )
+    _write_codex_login(_isolated, logged_in=True)
+
+    launch = resolve_native_codex_launch(model="gpt-5.5")
+
+    assert launch.config_overrides == ['model_provider="openai"']
+    assert launch.model == "gpt-5.5"
+
+
 def test_resolve_native_codex_launch_subscription_ignores_private_inherited_home(
     _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

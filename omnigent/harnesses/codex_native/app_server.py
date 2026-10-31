@@ -29,6 +29,7 @@ from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -374,6 +375,37 @@ def _codex_mcp_server_config_section(
 # Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
 # it can be clamped to one the pinned model accepts. Tolerates a trailing comment.
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
+
+
+# Codex's built-in ``openai`` provider, which a ChatGPT login authenticates. It
+# serves OpenAI ids only, never a Databricks gateway id.
+_BUILTIN_OPENAI_PROVIDER_OVERRIDE = 'model_provider="openai"'
+
+
+def _drop_gateway_model_from_codex_config(codex_home: Path) -> None:
+    """
+    Remove a copied top-level ``model`` that only a Databricks gateway serves.
+
+    The session ``config.toml`` copies the user's shared file, whose ``model``
+    may name a gateway route (``system.ai.*``). A launch that pins the built-in
+    ``openai`` provider (a ChatGPT login) cannot serve that id, so the line is
+    dropped and Codex uses its own default. Other models are kept.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    """
+    config_path = codex_home / "config.toml"
+    copied_model = read_codex_home_config_model(codex_home)
+    if copied_model is None or not is_databricks_model_id(copied_model):
+        return
+    _materialize_config_symlink(config_path)
+    kept: list[str] = []
+    in_table = False
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        in_table = in_table or line.startswith("[")
+        if not in_table and re.match(r"^model\s*=", line):
+            continue
+        kept.append(line)
+    config_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
 
 
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
@@ -2466,6 +2498,8 @@ class CodexNativeAppServer:
                     self.pinned_model,
                     model_migration_target,
                 )
+        elif _BUILTIN_OPENAI_PROVIDER_OVERRIDE in self.config_overrides:
+            _drop_gateway_model_from_codex_config(self.codex_home)
         effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
         requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
         effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
@@ -4255,7 +4289,7 @@ def _first_routable_codex_provider(
         launch = _codex_provider_launch(candidate, model)
         if launch is not None:
             _logger.warning(
-                "native-codex: subscription default %r has no usable Codex login; "
+                "native-codex: subscription default %r cannot serve this launch; "
                 "routing through provider %r instead.",
                 exclude,
                 name,
@@ -4333,7 +4367,23 @@ def _resolve_subscription_launch(
     # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
     # Gateway), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
-    subscription_overrides = ['model_provider="openai"']
+    subscription_overrides = [_BUILTIN_OPENAI_PROVIDER_OVERRIDE]
+    if model is not None and is_databricks_model_id(model):
+        # A ChatGPT login cannot serve a gateway id, even when Codex is logged in.
+        gateway_launch = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
+        if gateway_launch is not None:
+            return gateway_launch
+        return NativeCodexLaunch(
+            config_overrides=subscription_overrides,
+            model=None,
+            profile=None,
+            summary=(
+                f"Codex CLI login (subscription provider {entry.name!r}; gateway model "
+                f"{model!r} is not served by the login and no provider routes it, so Codex "
+                "runs its own default)"
+            ),
+            login_required=not _codex_login_usable(),
+        )
     if _codex_login_usable():
         log_info_once(
             _logger,
