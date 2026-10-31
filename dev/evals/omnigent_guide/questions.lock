@@ -1,0 +1,7 @@
+{
+  "cases_file": "questions.yaml",
+  "split": "test",
+  "cases": 56,
+  "sha256": "c2d4bad2af752b8e23a728eec64d7125c19bf5d4617bed4ff7d29a105b0ec936",
+  "frozen_at": "2026-10-15"
+}

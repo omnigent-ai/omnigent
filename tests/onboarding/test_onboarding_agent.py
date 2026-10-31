@@ -40,7 +40,7 @@ def test_onboarding_agent_has_expected_skills(
     assert skill_names == [
         "build-omnigent",
         "detect-framework",
-        "omnigent-knowledge",
+        "omnigent-guide",
     ], f"Expected exactly the three designed skills, got {skill_names}."
 
 
