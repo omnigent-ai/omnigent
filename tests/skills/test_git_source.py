@@ -385,6 +385,9 @@ def test_a_sparse_clone_checks_out_only_what_it_selects(
         "team-a/skills/lint/scripts/run.py": "print('lint')\n",
         "team-a/docs/guide.md": "guide\n",
         "team-b/skills/deploy/SKILL.md": "---\nname: deploy\ndescription: Deploy\n---\n",
+        # A namespace whose name is a gitignore character class unless escaped.
+        "skills/[team]/review/SKILL.md": "---\nname: review\ndescription: Review\n---\n",
+        "skills/[team]/review/scripts/run.py": "print('review')\n",
         "assets/big.bin": "x" * 100_000,
     }.items():
         (source / path).parent.mkdir(parents=True, exist_ok=True)
@@ -413,7 +416,10 @@ def test_a_sparse_clone_checks_out_only_what_it_selects(
                 if ".git" not in p.parts and p.is_file()
             }
         )
-        return ["/team-a/skills/lint/"]
+        return [
+            git_source.directory_pattern("team-a/skills/lint"),
+            git_source.directory_pattern("skills/[team]/review"),
+        ]
 
     dest = tmp_path / "checkout"
     git_source.clone_github_source(
@@ -421,15 +427,27 @@ def test_a_sparse_clone_checks_out_only_what_it_selects(
         None,
         dest,
         isolated=True,
-        sparse=git_source.SparseCheckout(("/team-a/**/SKILL.md",), expand),
+        sparse=git_source.SparseCheckout(
+            (
+                f"{git_source.literal_pattern('team-a')}/**/SKILL.md",
+                f"{git_source.literal_pattern('skills/[team]')}/**/SKILL.md",
+            ),
+            expand,
+        ),
     )
-    assert seen == [{"team-a/skills/lint/SKILL.md"}]
+    assert seen == [{"team-a/skills/lint/SKILL.md", "skills/[team]/review/SKILL.md"}]
     files = {
         p.relative_to(dest).as_posix()
         for p in dest.rglob("*")
         if ".git" not in p.parts and p.is_file()
     }
-    assert files == {"team-a/skills/lint/SKILL.md", "team-a/skills/lint/scripts/run.py"}
+    assert files == {
+        "team-a/skills/lint/SKILL.md",
+        "team-a/skills/lint/scripts/run.py",
+        # The supporting file survives the bracketed namespace.
+        "skills/[team]/review/SKILL.md",
+        "skills/[team]/review/scripts/run.py",
+    }
     assert git_source.checkout_commit(dest) is not None
     # Nothing outside the selection was downloaded, not even into .git.
     big = subprocess.run(

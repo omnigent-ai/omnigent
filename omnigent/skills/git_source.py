@@ -254,6 +254,27 @@ class SparseCheckout:
     expand: Callable[[Path], Sequence[str]] | None = None
 
 
+_PATTERN_SPECIALS = re.compile(r"([\\*?\[\]!#])")
+
+
+def literal_pattern(path: str) -> str:
+    """*path* (repository-relative, POSIX) as a sparse-checkout pattern that matches only itself.
+
+    Non-cone patterns use gitignore syntax, so a directory named ``[team]`` or
+    ``a*b`` would otherwise be read as a wildcard; every special character is
+    escaped, and so is a trailing space git would strip.
+    """
+    escaped = _PATTERN_SPECIALS.sub(r"\\\1", path)
+    if escaped.endswith(" "):
+        escaped = escaped[:-1] + "\\ "
+    return "/" + escaped if escaped else ""
+
+
+def directory_pattern(path: str) -> str:
+    """A sparse-checkout pattern for everything under the repository directory *path*."""
+    return f"{literal_pattern(path)}/"
+
+
 def _kill_process_group(proc: subprocess.Popen[str]) -> None:
     """Kill git and every helper it started (``git-remote-https``, ``index-pack``).
 
