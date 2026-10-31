@@ -2783,6 +2783,58 @@ async def test_runner_os_env_edit_of_a_crlf_file_reverted_outside_leaves_changes
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("original", "first_seed_byte_caps", "baseline"),
+    [
+        pytest.param(b"\x89PNG\x00\xff", [1], None, id="binary"),
+        pytest.param(b"0123456789\n", [1, 8], None, id="larger-than-the-read-cap"),
+        pytest.param(b"a\r\nb\r\n", [1, 8], "a\r\nb\r\n", id="complete-text"),
+    ],
+)
+async def test_runner_os_env_snapshot_reads_only_a_complete_text_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original: bytes,
+    first_seed_byte_caps: list[int],
+    baseline: str | None,
+) -> None:
+    """Binary files are probed, not read, and a later complete read never becomes the original."""
+    from omnigent.inner.os_env import OpResult, OSEnvironment, _read_impl
+    from omnigent.runner import environment_filesystem
+    from omnigent.runner.tool_dispatch import _seed_os_env_snapshot
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+
+    byte_caps: list[int | None] = []
+
+    class _InProcessReads:
+        async def read(
+            self,
+            path: str,
+            offset: int = 1,
+            limit: int | None = None,
+            max_bytes: int | None = None,
+        ) -> OpResult:
+            byte_caps.append(max_bytes)
+            return _read_impl(tmp_path / path, offset, limit, max_bytes)
+
+    monkeypatch.setattr(environment_filesystem, "_MAX_READ_BYTES", 8)
+    (tmp_path / "notes").write_bytes(original)
+    os_env = cast(OSEnvironment, _InProcessReads())
+    registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+
+    await _seed_os_env_snapshot(os_env, "notes", registry, "conv_seed")
+    assert byte_caps == first_seed_byte_caps
+    assert registry.get_baseline("notes") == baseline
+
+    (tmp_path / "notes").write_text("short\n")
+    registry.record_change("notes", "modified", "conv_seed")
+    await _seed_os_env_snapshot(os_env, "notes", registry, "conv_seed")
+
+    listed = registry.list_changed_files("conv_seed", limit=10)
+    assert [(r["path"], r["status"]) for r in listed] == [("notes", "modified")]
+
+
+@pytest.mark.asyncio
 async def test_runner_os_env_cleanup_is_off_loop_and_cancellation_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
