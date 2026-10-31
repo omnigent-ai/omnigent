@@ -102,6 +102,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
         "codex_plan_at_launch": True,
+        "message_reactions": False,
+        "message_reactions_always_visible": False,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False

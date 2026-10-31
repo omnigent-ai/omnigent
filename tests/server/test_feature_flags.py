@@ -39,6 +39,8 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
         "codex_plan_at_launch": True,
+        "message_reactions": False,
+        "message_reactions_always_visible": False,
     }
 
 

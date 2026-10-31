@@ -38,6 +38,8 @@ class Feature(StrEnum):
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    MESSAGE_REACTIONS = "message_reactions"
+    MESSAGE_REACTIONS_ALWAYS_VISIBLE = "message_reactions_always_visible"
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,21 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MESSAGE_REACTIONS,
+        description="Thumbs up/down feedback on assistant responses, persisted per user",
+        owner="web",
+        review_by_release="0.22.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MESSAGE_REACTIONS_ALWAYS_VISIBLE,
+        description=(
+            "Show the reaction thumbs at full opacity on every settled reply instead of "
+            "on hover only; no effect unless message_reactions is also on"
+        ),
+        owner="web",
+        review_by_release="0.22.0",
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
