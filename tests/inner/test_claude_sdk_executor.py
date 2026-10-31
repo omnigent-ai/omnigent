@@ -1439,11 +1439,18 @@ class TestConstructor(unittest.TestCase):
         client = SimpleNamespace(_query=None, _transport=_Transport())
 
         async def _t():
-            with patch(
-                "omnigent.inner.claude_sdk_executor._terminate_process_tree"
-            ) as terminate_tree:
+            with (
+                patch(
+                    "omnigent.inner.claude_sdk_executor._terminate_process_tree"
+                ) as terminate_tree,
+                self.assertLogs("omnigent.inner.claude_sdk_executor", level="INFO") as logs,
+            ):
                 await ClaudeSDKExecutor._force_close_client(client)
             terminate_tree.assert_called_once()
+            [record] = [r for r in logs.records if getattr(r, "event_name", None)]
+            self.assertEqual(record.attributes["sdk_action"], "terminate_requested")
+            self.assertEqual(record.attributes["sdk_process_pid"], 12345)
+            self.assertEqual(record.attributes["sdk_process_state"], "running")
 
         _run(_t())
 
@@ -2962,7 +2969,10 @@ class TestStreamEventStreaming(unittest.TestCase):
         async def _t():
             executor = ClaudeSDKExecutor()
             messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
-            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            with (
+                patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
+                self.assertLogs("omnigent.inner.claude_sdk_executor", level="INFO") as logs,
+            ):
                 first_events = [e async for e in executor.run_turn(messages, [], "")]
                 second_events = [e async for e in executor.run_turn(messages, [], "")]
 
@@ -2972,6 +2982,14 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn("cannot continue in this Session", second_events[0].message)
             self.assertIn("claude subprocess crashed", second_events[0].message)
             self.assertIn("session-a", executor._crashed_sessions)
+            lifecycle = [r.attributes for r in logs.records if getattr(r, "event_name", None)]
+            self.assertEqual(
+                [r["sdk_action"] for r in lifecycle],
+                ["connected", "turn_error_observed", "close_requested"],
+            )
+            self.assertEqual(lifecycle[1]["exception_type"], "RuntimeError")
+            self.assertEqual(lifecycle[2]["sdk_close_reason"], "turn_error")
+            self.assertEqual(len({r["sdk_client_id"] for r in lifecycle}), 1)
 
         _run(_t())
 
@@ -3011,7 +3029,10 @@ class TestStreamEventStreaming(unittest.TestCase):
         async def _t():
             executor = ClaudeSDKExecutor()
             messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
-            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            with (
+                patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
+                self.assertLogs("omnigent.inner.claude_sdk_executor", level="INFO") as logs,
+            ):
 
                 async def _consume():
                     return [e async for e in executor.run_turn(messages, [], "")]
@@ -3032,6 +3053,13 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertEqual(len(created), 2)
             self.assertIsInstance(events[-1], TurnComplete)
             self.assertEqual(events[-1].response, "recovered")
+            lifecycle = [r.attributes for r in logs.records if getattr(r, "event_name", None)]
+            self.assertEqual(
+                [r["sdk_action"] for r in lifecycle],
+                ["connected", "turn_cancelled", "connected"],
+            )
+            self.assertEqual(lifecycle[0]["sdk_client_id"], lifecycle[1]["sdk_client_id"])
+            self.assertNotEqual(lifecycle[0]["sdk_client_id"], lifecycle[2]["sdk_client_id"])
 
         _run(_t())
 
@@ -3044,8 +3072,31 @@ class TestStreamEventStreaming(unittest.TestCase):
         async def _t():
             executor = ClaudeSDKExecutor()
             executor._clients["session-a"] = _ClaudeClientState(client=client, model=None)
-            await executor.close_session("session-a")
+            client_id = executor._clients["session-a"].diagnostic_id
+            with self.assertLogs("omnigent.inner.claude_sdk_executor", level="INFO") as logs:
+                await executor.close_session("session-a")
             disconnect.assert_awaited_once_with()
+            self.assertEqual(executor._clients, {})
+            [record] = logs.records
+            self.assertEqual(record.attributes["sdk_action"], "close_requested")
+            self.assertEqual(record.attributes["sdk_client_id"], client_id)
+            self.assertEqual(record.attributes["sdk_close_reason"], "session_close")
+
+        _run(_t())
+
+    def test_close_session_survives_broken_diagnostic_sink(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            client = SimpleNamespace(disconnect=AsyncMock())
+            executor._clients["session-a"] = _ClaudeClientState(client=client, model=None)
+            with patch(
+                "omnigent.inner.claude_sdk_executor.logger.info",
+                side_effect=RuntimeError("diagnostic sink unavailable"),
+            ):
+                await executor.close_session("session-a")
+            client.disconnect.assert_awaited_once_with()
             self.assertEqual(executor._clients, {})
 
         _run(_t())
@@ -3072,7 +3123,8 @@ class TestStreamEventStreaming(unittest.TestCase):
             executor = ClaudeSDKExecutor()
             executor._clients["session-a"] = _ClaudeClientState(client=client, model=None)
 
-            interrupted = await executor.interrupt_session("session-a")
+            with self.assertLogs("omnigent.inner.claude_sdk_executor", level="INFO") as logs:
+                interrupted = await executor.interrupt_session("session-a")
 
             self.assertTrue(interrupted)
             # Safe interrupt is attempted first to halt the in-flight turn.
@@ -3082,6 +3134,11 @@ class TestStreamEventStreaming(unittest.TestCase):
             # is the invariant that prevents the canceled-instruction leak.
             disconnect.assert_awaited_once_with()
             self.assertEqual(executor._clients, {})
+            lifecycle = [r.attributes for r in logs.records if getattr(r, "event_name", None)]
+            self.assertEqual(
+                [r["sdk_action"] for r in lifecycle], ["interrupt_requested", "close_requested"]
+            )
+            self.assertEqual(lifecycle[0]["sdk_client_id"], lifecycle[1]["sdk_client_id"])
 
         _run(_t())
 
@@ -6031,7 +6088,10 @@ def _make_recovery_fake_sdk():
 
 
 @pytest.mark.asyncio
-async def test_terminated_cli_client_is_evicted_and_turn_recovers() -> None:
+@pytest.mark.parametrize("exit_code", [143, -9, -1])
+async def test_terminated_cli_client_is_evicted_and_turn_recovers(
+    exit_code: int, caplog: pytest.LogCaptureFixture
+) -> None:
     """Rebuild a cached client after its CLI child exits."""
     from omnigent.inner.claude_sdk_executor import (
         ClaudeSDKExecutor,
@@ -6043,20 +6103,40 @@ async def test_terminated_cli_client_is_evicted_and_turn_recovers() -> None:
 
     dead_client = SimpleNamespace(
         _query=None,
-        _transport=_make_transport_with_process(143),
+        _transport=_make_transport_with_process(exit_code),
         disconnect=AsyncMock(),
         query=AsyncMock(side_effect=AssertionError("dead client must not be queried")),
         set_model=AsyncMock(),
     )
     executor._clients["sess-1"] = _ClaudeClientState(client=dead_client, model=None)
+    dead_client_id = executor._clients["sess-1"].diagnostic_id
 
     messages = [
         {"role": "user", "content": "first question", "session_id": "sess-1"},
         {"role": "assistant", "content": "first answer", "session_id": "sess-1"},
         {"role": "user", "content": "second question", "session_id": "sess-1"},
     ]
-    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        caplog.at_level(logging.INFO, logger="omnigent.inner.claude_sdk_executor"),
+    ):
         events = [e async for e in executor.run_turn(messages, [], "")]
+
+    lifecycle = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_sdk_client_lifecycle"
+    ]
+    assert [r["sdk_action"] for r in lifecycle] == [
+        "exit_observed",
+        "close_requested",
+        "connected",
+    ]
+    assert lifecycle[0]["sdk_client_id"] == lifecycle[1]["sdk_client_id"] == dead_client_id
+    assert lifecycle[0]["sdk_process_returncode"] == exit_code
+    assert lifecycle[0]["sdk_process_state"] == "exited"
+    assert lifecycle[1]["sdk_close_reason"] == "process_exited"
+    assert lifecycle[2]["sdk_client_id"] != dead_client_id
 
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert not errors, f"Turn after a terminated CLI must recover, got: {errors}"
