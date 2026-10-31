@@ -30,7 +30,7 @@ const ALERT_LABELS: Record<AlertType, string> = {
 
 /** Matches a marker at the start of the quote's first paragraph text,
  *  e.g. "[!NOTE]\nrest of the paragraph…" or a bare "[!NOTE]". */
-const ALERT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](\n|$)/;
+export const ALERT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](\n|$)/;
 
 /** Result of stripping an alert marker from parsed blockquote children. */
 interface ExtractedAlert {
@@ -45,7 +45,7 @@ interface ExtractedAlert {
  * blockquote child is block-level. `image` counts because the workspace image
  * extension configures it `inline: true`.
  */
-const INLINE_TYPES = new Set(["text", "image", "hardBreak"]);
+export const INLINE_TYPES: ReadonlySet<string> = new Set(["text", "image", "hardBreak"]);
 
 /**
  * Coerce parsed blockquote children into valid `block+` content.
