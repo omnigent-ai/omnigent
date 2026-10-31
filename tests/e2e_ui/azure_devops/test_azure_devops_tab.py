@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import open_right_rail, stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO, _stub_github
 
 _PR_URL = "https://dev.azure.com/contoso/web/_git/app/pullrequest/7"
@@ -86,10 +86,10 @@ _UNSUPPORTED_REMOTE = {
 
 def _stub_azure(page: Page, info: dict | None = None) -> None:
     _stub_github(page)
-    page.route(
-        re.compile(r"/resources/github(?:\?|$)"),
-        lambda route: route.fulfill(json=info if info is not None else _ADO_INFO),
-    )
+    payload = info if info is not None else _ADO_INFO
+    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=payload))
+    # The server's stored list matches the live payload it would have answered.
+    stub_session_pull_requests(page, lambda: payload["prs"], lambda _url: None)
     page.route(
         re.compile(r"/resources/github/changes"),
         lambda route: route.fulfill(
@@ -159,7 +159,10 @@ def test_azure_devops_tab_shows_provider_repo_and_pull_request(
         else page.get_by_role("complementary", name="Workspace")
     )
 
-    expect(rail.get_by_role("heading", name="Azure DevOps")).to_be_visible(timeout=30_000)
+    rail.get_by_role(
+        "button", name="dev.azure.com/contoso/web/app !7 — Add the widget", exact=True
+    ).click()
+    expect(rail.get_by_title("Azure DevOps")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text("contoso/web/app", exact=False).first).to_be_visible()
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(rail.get_by_text("!7", exact=True)).to_be_visible()
@@ -169,6 +172,8 @@ def test_azure_devops_tab_shows_provider_repo_and_pull_request(
     expect(rail.get_by_text("Adds the widget.", exact=True)).to_be_visible()
     page.screenshot(path=tmp_path / "azure-summary.png", animations="disabled")
     rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    if mobile:
+        rail.get_by_role("button", name="Show file list", exact=True).click()
     expect(rail.get_by_role("button", name="src/app", exact=True)).to_be_visible()
     expect(rail.get_by_text("new_line", exact=True)).to_be_visible()
     rail.locator("[data-expand-button]").first.click()
@@ -224,6 +229,9 @@ def test_azure_partial_results_keep_loaded_data_and_explain_unavailable_diff(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Pull Requests").click()
 
+    rail.get_by_role(
+        "button", name="dev.azure.com/contoso/web/app !7 — Add the widget", exact=True
+    ).click()
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
     page.screenshot(path=tmp_path / "azure-partial-summary.png", animations="disabled")
@@ -308,6 +316,11 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
 
     page.route(re.compile(r"/resources/github(?:/prs)?(?:\?|$)"), respond)
 
+    def unlink(url: str) -> None:
+        references[:] = [ref for ref in references if ref["url"] != url]
+
+    stub_session_pull_requests(page, lambda: references, unlink)
+
     def diff(route: Route) -> None:
         if parse_qs(urlsplit(route.request.url).query).get("pr_url") == [_SECOND_URL]:
             route.fulfill(
@@ -327,8 +340,9 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(_SECOND_URL)
     panel.get_by_role("button", name="Link", exact=True).click()
-    picker = panel.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("!12")
+    panel.get_by_role(
+        "button", name="dev.azure.com/contoso/web/other !12 — Another repository", exact=True
+    ).click()
     expect(panel.get_by_text("Another repository", exact=True)).to_be_visible()
     panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
     expect(
@@ -337,13 +351,17 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
         )
     ).to_be_visible()
     page.screenshot(path=tmp_path / "azure-outside-workspace.png", animations="disabled")
-    picker.click()
-    page.get_by_role("option").filter(has_text="contoso/web/app !7").click()
+    panel.get_by_role("button", name="All pull requests (2)").click()
+    panel.get_by_role(
+        "button", name="dev.azure.com/contoso/web/app !7 — Add the widget", exact=True
+    ).click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="contoso/web/other !12").click()
+    panel.get_by_role("button", name="All pull requests (2)").click()
+    panel.get_by_role(
+        "button", name="dev.azure.com/contoso/web/other !12 — Another repository", exact=True
+    ).click()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
-    expect(picker).to_contain_text("!7")
+    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(page.get_by_test_id("composer-pr-link")).to_have_text("!7")
     page.screenshot(path=tmp_path / "azure-selection.png", animations="disabled")
 
@@ -351,16 +369,31 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
 def test_azure_canvas_link_uses_provider_identity(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    from tests.e2e_ui.sessions.test_canvas_page import _serve_list, _session, _stub_server_info
+    from tests.e2e_ui.sessions.test_canvas_page import (
+        _refuse_live_pull_requests,
+        _serve_list,
+        _session,
+        _stub_server_info,
+    )
 
     base_url, session_id = seeded_session
-    _stub_azure(page)
-    _stub_server_info(page, canvas=True)
+    live_lookups = _refuse_live_pull_requests(page)
+    _stub_server_info(page, canvas=True, session_pull_requests=True)
     # Keep live session updates from replacing the mocked Canvas branch.
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
     page.route(
         "**/v1/sessions?*",
-        _serve_list([_session(session_id, "Azure session", 1, git_branch="feature/widget")]),
+        _serve_list(
+            [
+                _session(
+                    session_id,
+                    "Azure session",
+                    1,
+                    git_branch="feature/widget",
+                    pull_request={**_REFERENCE, "state": "OPEN", "is_draft": False},
+                )
+            ]
+        ),
     )
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))
     page.goto(f"{base_url}/canvas")
@@ -369,4 +402,5 @@ def test_azure_canvas_link_uses_provider_identity(
     link = card.get_by_role("link", name="Open pull request !7", exact=True)
     expect(link).to_be_visible(timeout=30_000)
     expect(link).to_have_attribute("href", _PR_URL)
+    assert live_lookups == []
     page.screenshot(path=tmp_path / "azure-canvas.png", animations="disabled")

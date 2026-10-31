@@ -50,7 +50,7 @@ concurrency:
 jobs:
   resolve:
     name: Resolve release tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.r.outputs.tag }}
       is_final: ${{ steps.r.outputs.is_final }}
@@ -93,7 +93,7 @@ jobs:
   publish:
     name: Open release-post PR (omnigent-site)
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Canonical repo only, and only where the App is configured — EXCEPT a
     # dry-run, which just renders + prints (no cross-repo write), so it runs
     # anywhere (e.g. a fork) to preview the page.

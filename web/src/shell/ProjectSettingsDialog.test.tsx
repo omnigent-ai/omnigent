@@ -4,6 +4,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import {
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/lib/projectsApi", () => ({
@@ -86,7 +90,10 @@ beforeEach(() => {
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 describe("ProjectSettingsDialog", () => {
   it("seeds fields from the project's stored config", async () => {
@@ -652,4 +659,122 @@ describe("ProjectSettingsDialog", () => {
       );
     },
   );
+
+  // The project's last start (remembered in this browser) fills the fields, so
+  // the dialog shows what the project's next session opens with.
+  it("fills the fields from the project's last start and saves them as the settings", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults(
+      "p_1",
+      {
+        agentId: "ag_claude",
+        pickedHarness: null,
+        harness: "claude-native",
+        harnessOptions: { model: "opus", effort: "high", mode: "default" },
+        hostId: "h1",
+        workspace: "/repo-b",
+      },
+      { agent_id: "ag_1" },
+    );
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent(/opus/i),
+    );
+    expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_claude",
+        host_id: "h1",
+        workspace: "/repo-b",
+        model: "opus",
+        effort: "high",
+      }),
+    );
+  });
+
+  it("keeps the stored agent when the last start's agent no longer exists", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults("p_1", { agentId: "ag_gone", hostId: "h1" }, { agent_id: "ag_1" });
+    renderDialog();
+
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1", host_id: "h1" }),
+    );
+  });
+
+  it("replaces the last start even when the saved settings match the stored ones", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults(
+      "p_1",
+      { agentId: "ag_claude", pickedHarness: null },
+      { agent_id: "ag_1" },
+    );
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+
+    // Restore the stored agent, so the saved settings match the stored ones.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_1"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1" }));
+    await waitFor(() => expect(readProjectLaunchDefaults("p_1", { agent_id: "ag_1" })).toBeNull());
+  });
+
+  it("saves a last-start agent still resolving with its own model and effort", async () => {
+    // Discovery so far holds only catalog rows, without the remembered agent.
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()], isPlaceholderData: true });
+    const stored = { agent_id: "ag_claude", model: "opus", effort: "low" };
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: stored });
+    writeProjectLaunchDefaults(
+      "p_1",
+      {
+        agentId: "ag_custom",
+        harness: "claude-native",
+        harnessOptions: { model: "sonnet", effort: "high" },
+      },
+      stored,
+    );
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_custom",
+        model: "sonnet",
+        effort: "high",
+      }),
+    );
+  });
+
+  it("leaves the last start in place when the filled-in dialog is cancelled", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    const launch = { agentId: "ag_1", hostId: "h1", workspace: "/repo-b" };
+    writeProjectLaunchDefaults("p_1", launch, {});
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(readProjectLaunchDefaults("p_1", {})).toEqual(launch);
+  });
 });
