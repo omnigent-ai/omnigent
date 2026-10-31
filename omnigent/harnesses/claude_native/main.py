@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import importlib.resources
 import json
 import logging
 import os
@@ -257,6 +258,14 @@ _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 # only in the pane, so a web-driven session shows an unanswerable prompt —
 # often with nobody attached to the terminal at all.
 _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
+# Gateway catalogs can reject Claude's canonical refusal fallback.
+# Keep the original model and refusal instead of switching to an unservable id.
+_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
+# Claude Code sources this script before every Bash command. The pane's
+# TMUX/TMUX_PANE point at Omnigent's private tmux server, so without the scrub a
+# tool's `tmux kill-session` or `kill-server` ends Claude itself.
+_CLAUDE_CODE_ENV_FILE_ENV = "CLAUDE_ENV_FILE"
+_CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -469,16 +478,23 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
-def _ambient_env_is_non_anthropic_gateway() -> bool:
+def _ambient_env_is_non_anthropic_gateway(configured_base_url: str | None = None) -> bool:
     """Whether managed settings or the process env route through a gateway.
 
     Used as the ``claude_config is None`` counterpart to
     :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
     set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
     fingerprint must treat the env as a non-canonical endpoint.
+
+    :param configured_base_url: Optional launch override for the ambient URL;
+        managed settings still take precedence.
     """
     managed_base_url, _ = managed_claude_gateway_signal()
-    base_url = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    base_url = managed_base_url or (
+        configured_base_url
+        if configured_base_url is not None
+        else os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    )
     if not base_url:
         return False
     host = (urlparse(base_url).hostname or "").lower()
@@ -823,6 +839,73 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     return claude_managed_gateway(_managed_settings_paths())
 
 
+# Env flags that switch Claude Code to a cloud transport.
+_CLAUDE_CLOUD_TRANSPORT_FLAGS = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+@dataclass(frozen=True)
+class ClaudeAmbientTransport:
+    """Settings that can move an unconfigured Claude Code launch off its own login.
+
+    :param env: The effective ``ANTHROPIC_BASE_URL`` and cloud transport flags,
+        each from managed settings, else user settings, else the process env,
+        e.g. ``(("ANTHROPIC_BASE_URL", "https://gateway.example"),)``.
+    :param user_api_key_helper: Whether user settings name an ``apiKeyHelper``.
+    """
+
+    env: tuple[tuple[str, str], ...]
+    user_api_key_helper: bool
+
+    def leaves_login(self) -> bool:
+        """Whether Claude Code would use a gateway, helper, or cloud transport.
+
+        :returns: ``True`` when the effective base URL is not Anthropic's, a cloud
+            transport is enabled, or user settings name an ``apiKeyHelper``.
+        """
+        env = dict(self.env)
+        if self.user_api_key_helper or any(
+            env.get(name, "").lower() in ("1", "true", "yes", "on")
+            for name in _CLAUDE_CLOUD_TRANSPORT_FLAGS
+        ):
+            return True
+        base_url = env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+        if not base_url:
+            return False
+        host = (urlparse(base_url).hostname or "").lower()
+        return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
+def claude_ambient_transport() -> ClaudeAmbientTransport:
+    """Read the transport settings an unconfigured Claude Code launch applies.
+
+    Project settings depend on the session workspace and are not read here.
+
+    :returns: The effective transport settings across managed settings, user
+        settings, and the process env.
+    """
+    from omnigent.onboarding.ambient import read_claude_managed_settings, read_claude_user_settings
+
+    user_settings = read_claude_user_settings() or {}
+    layers: list[Mapping[str, object]] = []
+    for settings in (read_claude_managed_settings(_managed_settings_paths()), user_settings):
+        env = settings.get("env") if settings is not None else None
+        layers.append(env if isinstance(env, dict) else {})
+    layers.append(os.environ)
+    effective: list[tuple[str, str]] = []
+    for name in (_UCODE_CLAUDE_BASE_URL_ENV, *_CLAUDE_CLOUD_TRANSPORT_FLAGS):
+        values = (str(layer.get(name) or "").strip() for layer in layers)
+        value = next((value for value in values if value), None)
+        if value is not None:
+            effective.append((name, value))
+    return ClaudeAmbientTransport(
+        env=tuple(effective), user_api_key_helper=bool(user_settings.get("apiKeyHelper"))
+    )
+
+
 def claude_native_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]]:
@@ -939,26 +1022,20 @@ def _claude_model_probe_launch(
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.config import load_effective_config
     from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     args = ["-p"]
     if stream_input:
         args.extend(("--input-format", "stream-json"))
     else:
         args.append("/model")
-    args.extend(
-        [
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            # The probe asks one client-side question; the MCP fleet, session
-            # persistence, and background chatter are irrelevant startup weight.
-            "--strict-mcp-config",
-            "--mcp-config",
-            '{"mcpServers":{}}',
-            "--no-session-persistence",
-            *extra_args,
-        ]
-    )
+    args.extend(["--output-format", "stream-json", "--verbose"])
+    # The probe asks one client-side question; the MCP fleet, session
+    # persistence, and background chatter are irrelevant startup weight.
+    # Claude Code refuses both MCP flags while an enterprise MCP config exists.
+    if not claude_code_managed_mcp_present():
+        args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+    args.extend(["--no-session-persistence", *extra_args])
     if claude_config is not None and claude_config.api_key_helper:
         args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
     cfg = load_effective_config()
@@ -1337,10 +1414,9 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, launch_args = _claude_model_probe_launch(claude_config, stream_input=True)
-    ambient_gateway = None
-    if claude_config is None:
-        managed_base_url, _ = managed_claude_gateway_signal()
-        ambient_gateway = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV)
+    # Keying on every transport setting means a catalog probed under a gateway or
+    # cloud transport is never read again once that setting is removed.
+    ambient_transport = claude_ambient_transport() if claude_config is None else None
     return fingerprint_of(
         "claude-native",
         "control-picker-v3",
@@ -1352,7 +1428,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         launch_args,
         binary_identity(command),
         binary_identity("claude"),
-        ambient_gateway,
+        ambient_transport,
         claude_managed_model_picker() if claude_config is None else None,
     )
 
@@ -1553,6 +1629,18 @@ def native_claude_auth_env_unset(
     return ()
 
 
+def claude_tool_env_file() -> str:
+    """
+    Return the packaged script Claude Code sources before each Bash command.
+
+    :returns: Absolute script path, e.g.
+        ``"/opt/omnigent/omnigent/resources/scripts/claude_tool_env.sh"``.
+    """
+    return str(
+        importlib.resources.files("omnigent.resources.scripts").joinpath(_CLAUDE_TOOL_ENV_SCRIPT)
+    )
+
+
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> dict[str, str]:
@@ -1560,11 +1648,14 @@ def build_native_claude_terminal_env(
     Build env overrides for a native Claude Code terminal process.
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
-    loads them on demand, disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing, and
-    disables the in-TUI feedback surveys, which a web-driven session
-    cannot see or answer (see
-    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
+    loads them on demand, keeps Bash tool commands off Omnigent's private
+    tmux server (see :data:`_CLAUDE_CODE_ENV_FILE_ENV`), disables Claude
+    Code's agent view so the terminal stays pinned to the session the
+    Omnigent UI is showing, and disables the in-TUI feedback surveys,
+    which a web-driven session cannot see or answer (see
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`). Custom Anthropic
+    endpoints keep the selected model when it refuses, since their catalogs
+    may not serve Claude Code's canonical refusal-fallback target.
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1582,6 +1673,16 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
+    configured_base_url = (
+        claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is not None else None
+    )
+    if _ambient_env_is_non_anthropic_gateway(configured_base_url):
+        terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
+    # A user-provided env file keeps priority; it replaces the tmux scrub.
+    if _CLAUDE_CODE_ENV_FILE_ENV not in terminal_env and not os.environ.get(
+        _CLAUDE_CODE_ENV_FILE_ENV
+    ):
+        terminal_env[_CLAUDE_CODE_ENV_FILE_ENV] = claude_tool_env_file()
     # A raw credential can override the helper or open Claude's API-key menu.
     for name in native_claude_auth_env_unset(claude_config):
         if name in terminal_env:
@@ -7059,13 +7160,18 @@ def _websocket_connect(
     import websockets
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.session_host import session_routing_headers
     from omnigent.util.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
     # guard (CSWSH protection) allows the handshake — this attach client
     # is not a browser. Set on a copy so the caller's dict (which also
     # carries auth headers and may be reused) is not mutated here.
-    handshake_headers = {**headers, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+    handshake_headers = {
+        **headers,
+        **session_routing_headers(attach_url),
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+    }
     # A remote (https) workspace yields a wss:// attach URL; build a verifying
     # SSL context from a real CA bundle so verification works on interpreters
     # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
