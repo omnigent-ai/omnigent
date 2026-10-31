@@ -10,6 +10,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type RunnerHealthInput,
+  type SessionLiveness,
   onRunnerHealthPolled,
   refreshRunnerHealth,
   useRunnerHealth,
@@ -18,6 +19,14 @@ import {
 import * as nativeBridge from "@/lib/nativeBridge";
 
 const fetchMock = vi.fn();
+const pollUnsubscribes: (() => void)[] = [];
+
+/** Subscribes to polls until the test ends, even if it fails first. */
+function listenToPolls(listener: (liveness: Map<string, SessionLiveness>) => void): () => void {
+  const unsubscribe = onRunnerHealthPolled(listener);
+  pollUnsubscribes.push(unsubscribe);
+  return unsubscribe;
+}
 
 function input(id: string, runner_id: string | null = null): RunnerHealthInput {
   return { id, runner_id };
@@ -42,6 +51,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const unsubscribe of pollUnsubscribes.splice(0)) unsubscribe();
   cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -139,8 +149,9 @@ describe("useRunnerHealth", () => {
       trigger: "an app refresh request",
       listen: () => ({
         fire: refreshRunnerHealth,
-        expectStopped: () => {
+        expectStopped: async () => {
           refreshRunnerHealth();
+          await act(async () => {});
           expect(fetchMock).toHaveBeenCalledTimes(2);
         },
       }),
@@ -170,13 +181,13 @@ describe("useRunnerHealth", () => {
       });
       expect(result.current.get("conv_a")?.host_online).toBe(true);
       unmount();
-      expectStopped();
+      await expectStopped();
     },
   );
 
   it("reports each successful poll to its listeners until they unsubscribe", async () => {
     const heard = vi.fn();
-    const unsubscribe = onRunnerHealthPolled(heard);
+    const unsubscribe = listenToPolls(heard);
     fetchMock.mockResolvedValueOnce({ ok: false, status: 503 } as Response);
     const sessions = [input("conv_a")];
     const { result } = renderHook(() => useRunnerHealth(sessions));
@@ -207,11 +218,11 @@ describe("useRunnerHealth", () => {
   it("still reports a poll to later listeners when an earlier one throws", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const failure = new Error("listener broke");
-    const unsubscribeThrowing = onRunnerHealthPolled(() => {
+    listenToPolls(() => {
       throw failure;
     });
     const heard = vi.fn();
-    const unsubscribeHeard = onRunnerHealthPolled(heard);
+    listenToPolls(heard);
     fetchMock.mockResolvedValue(
       mockHealth({ conv_a: { runner_online: false, host_online: false } }),
     );
@@ -222,8 +233,6 @@ describe("useRunnerHealth", () => {
 
     act(() => refreshRunnerHealth());
     await waitFor(() => expect(heard).toHaveBeenCalledTimes(2));
-    unsubscribeThrowing();
-    unsubscribeHeard();
   });
 
   it("ignores a stale poll that finishes after a desktop-triggered refresh", async () => {
@@ -239,7 +248,7 @@ describe("useRunnerHealth", () => {
       }),
     );
     const heard = vi.fn();
-    const unsubscribe = onRunnerHealthPolled(heard);
+    listenToPolls(heard);
     const sessions = [input("conv_a")];
     const { result } = renderHook(() => useRunnerHealth(sessions));
     fetchMock.mockResolvedValueOnce(
@@ -253,7 +262,6 @@ describe("useRunnerHealth", () => {
     expect(result.current.get("conv_a")?.host_online).toBe(true);
     expect(heard).toHaveBeenCalledOnce();
     expect(heard.mock.calls[0][0].get("conv_a")?.host_online).toBe(true);
-    unsubscribe();
   });
 
   it("polls nothing and stays empty when the session set is empty", async () => {

@@ -547,17 +547,18 @@ describe("useSessionReconnect", () => {
         reconnect = result.current.reconnect();
       });
       // The count starts when the server answers, not at the click.
-      finishHealthPolls(SANDBOX_WAKE_ONLINE_GRACE_POLLS);
+      finishHealthPolls(3);
       expect(result.current.sandboxStarting).toBe(true);
       await act(async () => {
         pending.resolve({ queued: false, recovered: true });
         await reconnect;
       });
       // Polls backed off to the 60s ceiling don't run out a deadline between them.
-      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_ONLINE_GRACE_POLLS * 60_000));
-      finishHealthPolls(SANDBOX_WAKE_ONLINE_GRACE_POLLS, false, "other-session");
+      act(() => vi.advanceTimersByTime(3 * 60_000));
+      finishHealthPolls(3, false, "other-session");
       expect(result.current.sandboxStarting).toBe(true);
-      finishHealthPolls(SANDBOX_WAKE_ONLINE_GRACE_POLLS - 1);
+      // Two offline polls keep it starting; the third ends it.
+      finishHealthPolls(2);
       // Liveness settling to another not-online value must not restart the count.
       rerender({ hostOnline: null });
       expect(result.current.sandboxStarting).toBe(true);
@@ -573,7 +574,7 @@ describe("useSessionReconnect", () => {
         await result.current.reconnect();
       });
       expect(retrySession).toHaveBeenCalledTimes(2);
-      finishHealthPolls(SANDBOX_WAKE_ONLINE_GRACE_POLLS - 1);
+      finishHealthPolls(2);
       expect(result.current.sandboxStarting).toBe(true);
       expect(toast.error).toHaveBeenCalledOnce();
       finishHealthPolls(1);
