@@ -349,6 +349,80 @@ async def test_session_snapshot_uses_child_spec_metadata(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spec_config", "harness_override", "expected_harness"),
+    [
+        pytest.param({"harness": "claude-sdk"}, "grok", "grok", id="grok-override"),
+        pytest.param(
+            {"harness": "acp", "acp_agent": {"name": "Grok Build", "command": "grok"}},
+            None,
+            "acp",
+            id="spec-embedded-acp",
+        ),
+    ],
+)
+async def test_session_snapshot_does_not_claim_agent_model_for_own_auth_acp(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_config: dict[str, Any],
+    harness_override: str | None,
+    expected_harness: str,
+) -> None:
+    """A self-authenticated ACP session must not inherit the spec's unrelated model pin.
+
+    Both routes into own-auth ACP are covered: a Grok override on a provider-routed
+    spec, and a spec whose own harness is the generic ACP wrap.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="polly",
+        executor=ExecutorSpec(config=spec_config, model="claude-opus-5", context_window=1_000_000),
+    )
+    conv = Conversation(
+        id="conv_acp",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_acp",
+        agent_id="ag_polly",
+        harness_override=harness_override,
+    )
+    store = _ConversationStore([], conversations={conv.id: conv})
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "polly",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                    "operator_authored": False,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return type("LoadedAgent", (), {"spec": spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    snapshot = await _get_session_snapshot(
+        store,  # type: ignore[arg-type]
+        conv.id,
+        agent_store=_AgentStore(),  # type: ignore[arg-type]
+        agent_cache=_AgentCache(),  # type: ignore[arg-type]
+    )
+
+    assert snapshot.harness == expected_harness
+    assert snapshot.llm_model is None
+    assert snapshot.context_window is None
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -944,7 +1018,7 @@ async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_conn
 
     assert snapshot.status == "failed"
     assert snapshot.last_task_error == {
-        "code": "runner_failed_to_start",
+        "code": "runner_process_crash",
         "message": _RUNNER_EXIT_ERROR,
     }
 
@@ -3011,6 +3085,14 @@ _TRACEBACK_LINES = (
     *(f'  File "/venv/site-packages/pkg/module_{n}.py", line {n}, in call' for n in range(10)),
     "asyncio.exceptions.CancelledError",
 )
+_RUNNER_SHUTDOWN_LOG_LINES = (
+    "INFO  10-28 23:03:02.662 debug_logging                    _post              | "
+    "debug-log sink: first batch delivered to example.default.debug_logs (1 row(s))",
+    "DEBUG 10-28 23:03:02.663 runner._zygote                   _flush_child       | "
+    "flushing runner output",
+    "WARN  10-28 23:03:02.664 debug_logging                    _diag              | "
+    "debug-log sink: flush timed out",
+)
 
 
 def _runner_exit_report(summary: str, *tail_lines: str) -> str:
@@ -3018,23 +3100,50 @@ def _runner_exit_report(summary: str, *tail_lines: str) -> str:
     return "\n".join([summary, RUNNER_LOG_TAIL_HEADING, *tail_lines])
 
 
-def test_truncate_error_message_label_keeps_runner_exit_cause() -> None:
-    """A long runner-exit report keeps its summary and the tail's last line."""
+@pytest.mark.parametrize(
+    ("cause", "trailing_lines"),
+    [
+        pytest.param(_REJECTED_TUNNEL_ERROR, (), id="last-line"),
+        pytest.param(_REJECTED_TUNNEL_ERROR, _RUNNER_SHUTDOWN_LOG_LINES[:1], id="debug-upload"),
+        pytest.param(
+            _REJECTED_TUNNEL_ERROR, ("", *_RUNNER_SHUTDOWN_LOG_LINES), id="shutdown-logs"
+        ),
+        pytest.param(
+            "OSError: [Errno 28] No space left on device: '/tmp/runner-specs-example'",
+            _RUNNER_SHUTDOWN_LOG_LINES,
+            id="disk-full-traceback",
+        ),
+        pytest.param(
+            "ERROR 10-28 23:03:02.660 runner._zygote _child_main | runner child failed",
+            _RUNNER_SHUTDOWN_LOG_LINES,
+            id="error-record",
+        ),
+    ],
+)
+def test_truncate_error_message_label_keeps_runner_exit_cause(
+    cause: str, trailing_lines: tuple[str, ...]
+) -> None:
+    """Shutdown diagnostics must not displace the failure in a saved report."""
     summary = "runner process exited with code 1 (log on host: ~/logs/runner-a1.log)"
-    report = _runner_exit_report(summary, *_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR)
+    report = _runner_exit_report(summary, *_TRACEBACK_LINES, cause, *trailing_lines)
     assert len(report) > _LABEL_VALUE_MAX_LEN
 
     result = _truncate_error_message_label(report)
 
     # The traceback is dropped; the line naming the cause survives whole.
-    assert result == f"{summary}\n…\n{_REJECTED_TUNNEL_ERROR}"
+    assert result == f"{summary}\n…\n{cause}"
     assert len(result) <= _LABEL_VALUE_MAX_LEN
 
 
-def test_truncate_error_message_label_trims_an_oversized_last_line() -> None:
-    """An oversized last line is trimmed so the summary's start still fits."""
+@pytest.mark.parametrize("trailing_lines", [(), _RUNNER_SHUTDOWN_LOG_LINES])
+def test_truncate_error_message_label_trims_an_oversized_last_line(
+    trailing_lines: tuple[str, ...],
+) -> None:
+    """An oversized cause is trimmed so the summary's start still fits."""
     report = _runner_exit_report(
-        "runner process exited with code 1 (log on host: ~/x.log)", "error: " + "y" * 400
+        "runner process exited with code 1 (log on host: ~/x.log)",
+        "error: " + "y" * 400,
+        *trailing_lines,
     )
 
     result = _truncate_error_message_label(report)
@@ -3043,6 +3152,16 @@ def test_truncate_error_message_label_trims_an_oversized_last_line() -> None:
     assert result.startswith("runner process exited with code 1")
     assert "…\n…\nerror: yyy" in result
     assert result.endswith("y…")
+
+
+def test_truncate_error_message_label_keeps_last_log_when_no_cause_is_available() -> None:
+    summary = "runner process exited with code 1"
+    report = _runner_exit_report(summary, *_RUNNER_SHUTDOWN_LOG_LINES)
+
+    result = _truncate_error_message_label(report)
+
+    assert result == f"{summary}\n…\n{_RUNNER_SHUTDOWN_LOG_LINES[-1]}"
+    assert len(result) <= _LABEL_VALUE_MAX_LEN
 
 
 @pytest.mark.parametrize(
@@ -3118,7 +3237,10 @@ async def test_persist_error_labels_truncates_long_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path) -> None:
+@pytest.mark.parametrize("trailing_lines", [(), _RUNNER_SHUTDOWN_LOG_LINES])
+async def test_persist_error_labels_keeps_host_runner_exit_cause(
+    tmp_path: Path, trailing_lines: tuple[str, ...]
+) -> None:
     """A host's runner-exit report still names its cause once stored.
 
     The live failure event carries the whole report, but a reloaded session
@@ -3128,7 +3250,9 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path)
     from omnigent.server.schemas import ErrorDetail
 
     log_path = tmp_path / "runner.log"
-    log_path.write_text("\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR]) + "\n")
+    log_path.write_text(
+        "\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR, *trailing_lines]) + "\n"
+    )
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:

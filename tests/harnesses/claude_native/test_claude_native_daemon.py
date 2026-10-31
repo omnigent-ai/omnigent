@@ -18,6 +18,7 @@ import click
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
 from omnigent.harnesses.codex_native import main as codex_native
@@ -57,8 +58,11 @@ async def test_launch_or_reuse_daemon_runner_reuses_online_runner() -> None:
     """
     posted: list[str] = []
 
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         """Route the reuse-path requests."""
+        requests.append(request)
         path = request.url.path
         if request.method == "GET" and path == "/v1/sessions/conv_a":
             return httpx.Response(200, json={"runner_id": "runner_live"})
@@ -79,6 +83,13 @@ async def test_launch_or_reuse_daemon_runner_reuses_online_runner() -> None:
     assert runner_id == "runner_live"
     # No launch POST fired — proves the online runner was reused, not respawned.
     assert posted == []
+
+    launch_ids = {r.headers["X-Omnigent-Launch-Id"] for r in requests}
+    assert len(launch_ids) == 1
+    assert len(next(iter(launch_ids))) == 32
+    assert all(r.headers["X-Omnigent-Caller-Host-Id"] == "host_1" for r in requests)
+    assert all(r.headers["X-Omnigent-Launch-Mode"] == "ensure_existing" for r in requests)
+    assert "X-Omnigent-Launch-Id" not in client.headers
 
 
 async def test_launch_or_reuse_daemon_runner_launches_when_unbound() -> None:
@@ -111,7 +122,10 @@ async def test_launch_or_reuse_daemon_runner_launches_when_unbound() -> None:
     assert launched["body"] == {"session_id": "conv_a", "workspace": "/work"}
 
 
-async def test_launch_or_reuse_daemon_runner_clears_stale_binding() -> None:
+@pytest.mark.parametrize("retry_launch", [False, True])
+async def test_launch_or_reuse_daemon_runner_clears_stale_binding(
+    retry_launch: bool,
+) -> None:
     """
     A bound-but-offline runner is cleared before launching a fresh one.
 
@@ -119,10 +133,15 @@ async def test_launch_or_reuse_daemon_runner_clears_stale_binding() -> None:
     NULL``; without clearing the dead binding first it would 400. The
     clear must therefore precede the launch.
     """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+
     events: list[tuple[str, object]] = []
+
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Route the stale-binding-path requests, recording order."""
+        requests.append(request)
         path = request.url.path
         if request.method == "GET" and path == "/v1/sessions/conv_a":
             return httpx.Response(200, json={"runner_id": "runner_dead"})
@@ -133,21 +152,35 @@ async def test_launch_or_reuse_daemon_runner_clears_stale_binding() -> None:
             return httpx.Response(200, json={})
         if request.method == "POST" and path == "/v1/hosts/host_1/runners":
             events.append(("launch", None))
+            if retry_launch and events.count(("launch", None)) == 1:
+                return httpx.Response(409, json={"detail": "host is offline"})
             return httpx.Response(200, json={"runner_id": "runner_fresh"})
         return httpx.Response(404, json={})
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="https://e.com"
+        transport=httpx.MockTransport(handler),
+        base_url="https://e.com",
+        headers={OMNIGENT_SLICE_KEY_HEADER: "host:host_1", "X-Databricks-Org-Id": "123"},
     ) as client:
         runner_id = await daemon_launch.launch_or_reuse_daemon_runner(
             client, host_id="host_1", session_id="conv_a", workspace="/w"
         )
 
     assert runner_id == "runner_fresh"
+    assert events.count(("launch", None)) == (2 if retry_launch else 1)
+    assert all(r.headers[OMNIGENT_SLICE_KEY_HEADER] == "host:host_1" for r in requests)
+    assert all(r.headers["X-Databricks-Org-Id"] == "123" for r in requests)
     # The stale binding was cleared (runner_id="") strictly before the
     # launch — the ordering the atomic NULL-bind requires.
     assert ("patch", {"runner_id": ""}) in events
     assert events.index(("patch", {"runner_id": ""})) < events.index(("launch", None))
+
+    launch_ids = {r.headers["X-Omnigent-Launch-Id"] for r in requests}
+    assert len(launch_ids) == 1
+    assert len(next(iter(launch_ids))) == 32
+    assert all(r.headers["X-Omnigent-Caller-Host-Id"] == "host_1" for r in requests)
+    assert all(r.headers["X-Omnigent-Launch-Mode"] == "ensure_existing" for r in requests)
+    assert "X-Omnigent-Launch-Id" not in client.headers
 
 
 async def test_launch_or_reuse_daemon_runner_fresh_skips_session_get() -> None:
@@ -160,8 +193,11 @@ async def test_launch_or_reuse_daemon_runner_fresh_skips_session_get() -> None:
     """
     gets: list[str] = []
 
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         """Record any GET to sessions and serve the launch endpoint."""
+        requests.append(request)
         if request.method == "GET" and "/sessions/" in request.url.path:
             gets.append(request.url.path)
             return httpx.Response(200, json={})
@@ -179,6 +215,13 @@ async def test_launch_or_reuse_daemon_runner_fresh_skips_session_get() -> None:
     assert runner_id == "runner_new"
     # No GET to /v1/sessions — the binding check was skipped.
     assert gets == []
+
+    launch_ids = {r.headers["X-Omnigent-Launch-Id"] for r in requests}
+    assert len(launch_ids) == 1
+    assert len(next(iter(launch_ids))) == 32
+    assert all(r.headers["X-Omnigent-Caller-Host-Id"] == "host_1" for r in requests)
+    assert all(r.headers["X-Omnigent-Launch-Mode"] == "fresh" for r in requests)
+    assert "X-Omnigent-Launch-Id" not in client.headers
 
 
 async def test_create_claude_session_persists_terminal_launch_args() -> None:
@@ -221,6 +264,33 @@ async def test_create_claude_session_persists_terminal_launch_args() -> None:
     assert b"--dangerously-skip-permissions" in body
     # bridge_id=None → the bridge-id label must NOT be written.
     assert BRIDGE_ID_LABEL_KEY.encode() not in body
+
+
+async def test_create_claude_session_stamps_passed_effort_over_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass-through ``--effort`` is the effort Claude runs at, so it is stamped."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    captured: dict[str, bytes] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Capture the multipart create body."""
+        captured["body"] = request.content
+        return httpx.Response(201, json={"session_id": "conv_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        await claude_native._create_claude_session(
+            client,
+            b"bundle",
+            bridge_id=None,
+            claude_args=("--model", "opus", "--effort", "xhigh"),
+        )
+
+    assert b'"reasoning_effort": "xhigh"' in captured["body"]
 
 
 def _install_daemon_seam_mocks(
@@ -282,25 +352,108 @@ def _install_daemon_seam_mocks(
     monkeypatch.setattr(claude_native, "_attach_with_transcript_forwarder", _fake_attach)
 
 
+@pytest.mark.parametrize("session_id", [None, "conv_existing"])
+@pytest.mark.parametrize("prompt", [None, "Reply with READY.\nThen wait."])
 def test_run_with_remote_server_routes_through_daemon(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    session_id: str | None,
+    prompt: str | None,
 ) -> None:
     """
-    A fresh remote launch routes through _prepare_claude_terminal_via_daemon.
+    Remote launches prepare through the daemon and queue a prompt once.
 
     Proves the CLI no longer spawns the runner itself: it routes the launch
     through ``_prepare_claude_terminal_via_daemon`` with this host's id,
     the cwd as workspace, and the user's ``claude_args`` (so the runner
     can apply them). Daemon start is handled by ``_ensure_backend`` in
     ``cli_native.py`` before ``_run_with_remote_server`` is called — not
-    inside ``_run_with_remote_server`` itself.
+    inside ``_run_with_remote_server`` itself. Attach recovery must not
+    resubmit the explicit prompt on either fresh launch or resume.
     """
     spec_path = tmp_path / "claude.yaml"
     spec_path.write_text("name: claude-native-ui\nprompt: hi\n")
     monkeypatch.chdir(tmp_path)
     captured: dict[str, Any] = {}
     ensured: list[str] = []
+    prepared = claude_native.PreparedClaudeTerminal(
+        session_id=session_id or "conv_new",
+        terminal_id=claude_native.claude_terminal_resource_id(),
+        bridge_dir=tmp_path / "bridge",
+        reattached=session_id is not None,
+    )
+    _install_daemon_seam_mocks(
+        monkeypatch,
+        prepared=prepared,
+        attach_outcome=claude_native._AttachOutcome.EXITED,
+        captured=captured,
+        ensured=ensured,
+    )
+
+    messages: list[dict[str, Any]] = []
+
+    def handle_message(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == f"/v1/sessions/{prepared.session_id}/events"
+        messages.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda base_url, **kwargs: httpx.AsyncClient(
+            base_url=base_url, transport=httpx.MockTransport(handle_message), **kwargs
+        ),
+    )
+
+    async def attach_with_recovery(**kwargs: Any) -> claude_native._AttachOutcome:
+        assert len(messages) == (0 if prompt is None else 1)
+        await kwargs["recover"]()
+        await kwargs["recover"]()
+        assert len(messages) == (0 if prompt is None else 1)
+        return claude_native._AttachOutcome.EXITED
+
+    monkeypatch.setattr(claude_native, "_attach_with_transcript_forwarder", attach_with_recovery)
+
+    claude_native._run_with_remote_server(
+        "https://example.com",
+        spec_path,
+        session_id=session_id,
+        resume_picker=False,
+        claude_args=("--dangerously-skip-permissions",),
+        prompt=prompt,
+    )
+
+    # Daemon start is now _ensure_backend's responsibility (called from
+    # cli_native before _run_with_remote_server); not asserted here.
+    # The launch was routed through the daemon prepare with this host,
+    # the cwd workspace, and the user's args.
+    assert captured["host_id"] == "host_1"
+    assert captured["workspace"] == str(tmp_path.resolve())
+    assert captured["claude_args"] == ("--dangerously-skip-permissions",)
+    assert captured["session_id"] == session_id
+    assert "prompt" not in captured
+    assert messages == (
+        [
+            {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+            }
+        ]
+        if prompt is not None
+        else []
+    )
+
+
+def test_run_with_remote_server_unsent_prompt_stops_before_attach(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unsent remote prompt fails with the session id and skips the attach."""
+    spec_path = tmp_path / "claude.yaml"
+    spec_path.write_text("name: claude-native-ui\nprompt: hi\n")
     prepared = claude_native.PreparedClaudeTerminal(
         session_id="conv_new",
         terminal_id=claude_native.claude_terminal_resource_id(),
@@ -311,26 +464,38 @@ def test_run_with_remote_server_routes_through_daemon(
         monkeypatch,
         prepared=prepared,
         attach_outcome=claude_native._AttachOutcome.EXITED,
-        captured=captured,
-        ensured=ensured,
+        captured={},
+        ensured=[],
     )
 
-    claude_native._run_with_remote_server(
-        "https://example.com",
-        spec_path,
-        session_id=None,
-        resume_picker=False,
-        claude_args=("--dangerously-skip-permissions",),
-    )
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
 
-    # Daemon start is now _ensure_backend's responsibility (called from
-    # cli_native before _run_with_remote_server); not asserted here.
-    # The launch was routed through the daemon prepare with this host,
-    # the cwd workspace, and the user's args.
-    assert captured["host_id"] == "host_1"
-    assert captured["workspace"] == str(tmp_path.resolve())
-    assert captured["claude_args"] == ("--dangerously-skip-permissions",)
-    assert captured["session_id"] is None
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda base_url, **kwargs: httpx.AsyncClient(
+            base_url=base_url, transport=httpx.MockTransport(refuse), **kwargs
+        ),
+    )
+    attached: list[dict[str, Any]] = []
+
+    async def record_attach(**kwargs: Any) -> claude_native._AttachOutcome:
+        attached.append(kwargs)
+        return claude_native._AttachOutcome.EXITED
+
+    monkeypatch.setattr(claude_native, "_attach_with_transcript_forwarder", record_attach)
+
+    with pytest.raises(click.ClickException, match="Session conv_new did not receive it"):
+        claude_native._run_with_remote_server(
+            "https://example.com",
+            spec_path,
+            session_id=None,
+            resume_picker=False,
+            claude_args=(),
+            prompt="hello",
+        )
+
+    assert attached == []
 
 
 def test_run_with_remote_server_detach_prints_resume_hint(

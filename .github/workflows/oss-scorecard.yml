@@ -21,7 +21,7 @@ jobs:
   analysis:
     name: Scorecard analysis
     if: ${{ github.repository == 'omnigent-ai/omnigent' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       security-events: write  # upload the SARIF result to code scanning
