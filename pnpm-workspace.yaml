@@ -133,7 +133,6 @@ overrides:
 allowBuilds:
   '@anthropic-ai/claude-code': true
   '@google/genai': true
-  '@opencode/cli': true
   '@vscode/vsce-sign': true
   canvas: true
   # electron + playwright: the desktop recording lane (web/electron/e2e/) needs

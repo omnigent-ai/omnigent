@@ -13,8 +13,8 @@ mock mode only (no ``--llm-api-key``)::
     npm install -g @opencode/cli@2.0.32
     uv run pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v
 
-Set ``OMNIGENT_E2E_OPENCODE_REQUIRED=1`` (CI does) to fail instead of skip when
-the CLI is missing or unsupported.
+Set ``OMNIGENT_E2E_OPENCODE_REQUIRED=1`` to fail instead of skip when the CLI
+is missing or unsupported.
 """
 
 from __future__ import annotations

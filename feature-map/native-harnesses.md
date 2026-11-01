@@ -947,9 +947,9 @@ Cross-harness journeys:
   switch (`model-and-effort`), fork, and `/compact`. For `cleanup`,
   `tests/e2e/test_opencode_native_startup_cancel_leak_e2e.py::test_opencode_native_startup_cancel_reaps_serve`
   (Linux only) cancels a session during startup and checks its `opencode serve`
-  is reaped. CI sets
-  `OMNIGENT_E2E_OPENCODE_REQUIRED=1` so a missing or unsupported CLI fails
-  rather than skips. Live-model checks remain opt-in
+  is reaped. CI does not install OpenCode yet, so these tests skip there; run
+  them locally, and set `OMNIGENT_E2E_OPENCODE_REQUIRED=1` so a missing or
+  unsupported CLI fails rather than skips. Live-model checks remain opt-in
   (`OMNIGENT_E2E_OPENCODE_NATIVE=1`): `tests/e2e/test_host_opencode_native_e2e.py`
   on OpenCode's free model for multi-delta streaming and import from the user's
   store, and
