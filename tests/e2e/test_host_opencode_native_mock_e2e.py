@@ -20,9 +20,7 @@ is missing or unsupported.
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import subprocess
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -33,11 +31,6 @@ import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.opencode_native import bridge as opencode_bridge
-from omnigent.harnesses.opencode_native.app_server import (
-    OpenCodeVersionError,
-    check_opencode_version,
-    parse_opencode_version,
-)
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.polling import poll_until
 from tests.e2e import _opencode_native_helpers as oc
@@ -61,29 +54,6 @@ _TURN_TIMEOUT_S = 120.0
 # Scripted queues answer only requests that offer OpenCode's shell tool, so
 # OpenCode's tool-less background requests (titles, summaries) never consume them.
 _TURN_TOOLS = ["shell"]
-
-
-def _require_opencode() -> None:
-    """Skip, or fail under ``OMNIGENT_E2E_OPENCODE_REQUIRED=1``, without a supported CLI."""
-    required = os.environ.get("OMNIGENT_E2E_OPENCODE_REQUIRED") == "1"
-    binary = shutil.which("opencode")
-    reason = None
-    if binary is None:
-        reason = "no `opencode` on PATH"
-    else:
-        output = subprocess.run(
-            [binary, "--version"], capture_output=True, text=True, timeout=30, check=False
-        ).stdout
-        version = parse_opencode_version(output)
-        try:
-            check_opencode_version(version or output.strip())
-        except OpenCodeVersionError as exc:
-            reason = str(exc)
-    if reason is not None:
-        message = f"opencode-native mock e2e needs @opencode/cli@2.0.x: {reason}"
-        if required:
-            pytest.fail(message)
-        pytest.skip(message)
 
 
 def _host_config(mock_url: str) -> dict[str, Any]:
@@ -123,7 +93,7 @@ def mock_host(
     """One isolated host whose runner binds OpenCode to the mock; stopped at module end."""
     if not using_mock_llm or mock_llm_server_url is None:
         pytest.skip("scripted OpenCode journeys run in mock mode only")
-    _require_opencode()
+    oc.require_opencode()
     root = tmp_path_factory.mktemp("opencode-mock-host")
     with isolated_host(root, live_server, config=_host_config(mock_llm_server_url)) as host:
         host.wait_online(http_client, timeout=60, poll_interval=0.2)

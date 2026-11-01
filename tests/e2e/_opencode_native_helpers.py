@@ -9,7 +9,9 @@ transcript, record the web SSE stream and read the runner's bridge state.
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -18,8 +20,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.opencode_native.app_server import (
+    OpenCodeVersionError,
+    check_opencode_version,
+    parse_opencode_version,
+)
 from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
@@ -31,6 +39,29 @@ from tests.e2e.helpers import POLL_INTERVAL_S
 TURN_TIMEOUT_S = 240.0
 TERMINAL_TIMEOUT_S = 90.0
 ASK_ON_OS_TOOLS = "omnigent.policies.builtins.safety.ask_on_os_tools"
+
+
+def require_opencode() -> None:
+    """Skip, or fail under ``OMNIGENT_E2E_OPENCODE_REQUIRED=1``, without a supported CLI."""
+    required = os.environ.get("OMNIGENT_E2E_OPENCODE_REQUIRED") == "1"
+    binary = shutil.which("opencode")
+    reason = None
+    if binary is None:
+        reason = "no `opencode` on PATH"
+    else:
+        output = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=30, check=False
+        ).stdout
+        version = parse_opencode_version(output)
+        try:
+            check_opencode_version(version or output.strip())
+        except OpenCodeVersionError as exc:
+            reason = str(exc)
+    if reason is not None:
+        message = f"opencode-native e2e needs @opencode/cli@2.0.x: {reason}"
+        if required:
+            pytest.fail(message)
+        pytest.skip(message)
 
 
 def poll_for_terminal(
