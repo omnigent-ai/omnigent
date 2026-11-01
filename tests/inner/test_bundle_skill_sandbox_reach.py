@@ -45,28 +45,69 @@ def test_resource_roots_name_the_skill_and_plugin_directories(tmp_path: Path) ->
 def test_the_primary_environment_grants_the_specs_skill_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from dataclasses import replace
+
     from omnigent.inner import os_env
+    from omnigent.inner.sandbox import SandboxPolicy
 
     _bundle, skill = _bundle_with_skill(tmp_path)
-    granted: list[list[Path]] = []
-
-    def capture(spec: object, *, additional_read_roots: list[Path] = (), **_kwargs: object):  # type: ignore[no-untyped-def]
-        granted.append(list(additional_read_roots))
-        return object()
-
-    monkeypatch.setattr(os_env, "create_os_environment", capture)
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    agent = AgentSpec(
-        spec_version=1,
-        name="skills",
-        os_env=OSEnvSpec(type="caller_process", cwd=str(workspace)),
-        skills=[skill],
+    created: list[_RecordingEnvironment] = []
+
+    def create(spec: object, *, additional_read_roots: list[Path] = (), **_kwargs: object):  # type: ignore[no-untyped-def]
+        policy = SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=list(additional_read_roots),
+            write_roots=[workspace],
+            write_files=[],
+            allow_network=False,
+            copy_on_write_roots=[workspace],
+        )
+        created.append(_RecordingEnvironment(policy))
+        return created[-1]
+
+    monkeypatch.setattr(os_env, "create_os_environment", create)
+    copy_on_write = OSEnvSpec(
+        type="caller_process",
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap", write_paths=[{"path": ".", "copy_on_write": True}]
+        ),
     )
-    SessionResourceRegistry(runner_workspace=workspace).resolve_environment(
-        "s1", DEFAULT_ENVIRONMENT_ID, agent
-    )
-    assert skill.skill_dir in granted[0]
+    agent = AgentSpec(spec_version=1, name="skills", os_env=copy_on_write, skills=[skill])
+    registry = SessionResourceRegistry(runner_workspace=workspace)
+    env = registry.resolve_environment("s1", DEFAULT_ENVIRONMENT_ID, agent)
+    base_roots = list(created[0].base.read_roots or [])
+    assert skill.skill_dir in env.sandbox.read_roots
+
+    # An updated skill extracts elsewhere: the same copy-on-write environment
+    # now reads the new directory, and no longer the old one.
+    moved = tmp_path / "bundle-v2" / "skills" / "pdf"
+    moved.mkdir(parents=True)
+    updated = replace(agent, skills=[replace(skill, skill_dir=moved)])
+    again = registry.resolve_environment("s1", DEFAULT_ENVIRONMENT_ID, updated)
+    assert again is env and len(created) == 1
+    assert moved in env.sandbox.read_roots and skill.skill_dir not in env.sandbox.read_roots
+    assert set(base_roots) <= set(env.sandbox.read_roots)
+    assert env.sandbox.copy_on_write_roots == [workspace]
+    replaced = len(env.policies)
+    registry.resolve_environment("s1", DEFAULT_ENVIRONMENT_ID, updated)
+    assert len(env.policies) == replaced  # unchanged skills: the helper is left running
+
+
+class _RecordingEnvironment:
+    """An environment stand-in that records each sandbox policy it is given."""
+
+    def __init__(self, policy: object) -> None:
+        self.base = policy
+        self.sandbox = policy
+        self.policies: list[object] = []
+
+    def replace_sandbox_policy(self, policy: object) -> None:
+        self.sandbox = policy
+        self.policies.append(policy)
 
 
 @pytest.mark.skipif(
@@ -220,3 +261,28 @@ async def test_a_dispatched_os_tool_grants_the_specs_skill_directories(
     )
     assert "unable to create" in result
     assert granted == [[skill.skill_dir]]
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_policy_restarts_the_helper_and_keeps_its_copy_on_write_paths(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.inner.sandbox import with_additional_read_roots
+
+    env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert env is not None
+    try:
+        assert (await env.shell("echo before", timeout=30)).get("exit_code") == 0
+        granted = with_additional_read_roots(env.sandbox, [tmp_path / "skills"])
+        env.replace_sandbox_policy(granted)
+        assert env.sandbox is granted
+        assert (await env.shell("echo after", timeout=30)).get("exit_code") == 0
+        with pytest.raises(ValueError, match="copy-on-write"):
+            env.replace_sandbox_policy(replace(granted, copy_on_write_roots=[tmp_path]))
+    finally:
+        env.close()

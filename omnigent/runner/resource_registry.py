@@ -42,7 +42,12 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.bundle_skills import skill_resource_roots
-from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.inner.sandbox import (
+    SandboxPolicy,
+    contained_realpath,
+    containment_prefix,
+    with_additional_read_roots,
+)
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
@@ -511,6 +516,9 @@ class SessionResourceRegistry:
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
+        # The primary environment's sandbox before skill grants, and the skill
+        # directories granted on top, so a new spec can swap exactly those.
+        self._primary_skill_grants: dict[str, tuple[SandboxPolicy, tuple[Path, ...]]] = {}
         self._client_surfaces: dict[str, str] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
@@ -1053,14 +1061,17 @@ class SessionResourceRegistry:
                         # the agent's sandbox configuration becomes available.
                         cached.close()
                         self._primary_envs.pop(session_id)
+                        self._primary_skill_grants.pop(session_id, None)
                     elif previous_spec != requested_spec:
                         raise ValueError(
                             "Cannot change an active copy-on-write environment; "
                             "start a new session"
                         )
                     else:
+                        self._sync_skill_grants_locked(session_id, cached, agent_spec)
                         return cached
                 else:
+                    self._sync_skill_grants_locked(session_id, cached, agent_spec)
                     return cached
 
             os_env = (
@@ -1071,6 +1082,29 @@ class SessionResourceRegistry:
             self._primary_envs[session_id] = os_env
             self._primary_env_specs[session_id] = deepcopy(requested_spec)
             return os_env
+
+    def _sync_skill_grants_locked(
+        self, session_id: str, env: OSEnvironment, agent_spec: AgentSpec | None
+    ) -> None:
+        """Grant *agent_spec*'s skill directories read-only, dropping earlier ones.
+
+        Bundle skills live under the temp directory bwrap hides, and an updated
+        skill extracts to a new directory, so a reused environment (a
+        copy-on-write one keeps its changes) follows the current spec.
+        """
+        grants = self._primary_skill_grants.get(session_id)
+        if agent_spec is None or grants is None:
+            return
+        base, granted = grants
+        roots = tuple(
+            root.resolve(strict=False)
+            for root in skill_resource_roots(getattr(agent_spec, "skills", None) or ())
+        )
+        if roots == granted:
+            return
+        policy = with_additional_read_roots(base, list(roots)) if roots else base
+        env.replace_sandbox_policy(policy)
+        self._primary_skill_grants[session_id] = (base, roots)
 
     def _effective_primary_spec(self, session_id: str, spec: OSEnvSpec) -> OSEnvSpec:
         """Use the same workspace identity for tools and inherited terminals."""
@@ -1146,13 +1180,13 @@ class SessionResourceRegistry:
             effective_spec = self._effective_primary_spec(session_id, spec_os_env)
             env = create_os_environment(
                 effective_spec,
-                additional_read_roots=[
-                    self._codex_skills_dir_locked(session_id),
-                    # Bundle skills live under the temp directory bwrap hides.
-                    *skill_resource_roots(getattr(agent_spec, "skills", ())),
-                ],
+                additional_read_roots=[self._codex_skills_dir_locked(session_id)],
             )
             if env is not None:
+                base = getattr(env, "sandbox", None)
+                if isinstance(base, SandboxPolicy):
+                    self._primary_skill_grants[session_id] = (base, ())
+                    self._sync_skill_grants_locked(session_id, env, agent_spec)
                 return env
 
         default_spec = OSEnvSpec(
@@ -2214,6 +2248,7 @@ class SessionResourceRegistry:
             self._client_surfaces.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
+            self._primary_skill_grants.pop(session_id, None)
             skills_directory = self._codex_skills_dirs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
