@@ -223,6 +223,7 @@ from omnigent.server.schemas import (
 from omnigent.server.session_orchestration import (
     inherited_project_fields,
     project_list_scope,
+    record_team_asker,
     require_orchestration_source,
     require_project_read_access,
 )
@@ -1128,6 +1129,10 @@ def register_core_routes(
             project_store=project_store,
             created_by_session_id=source.id if source is not None else None,
         )
+        if source is not None and body.initial_input is not None:
+            await asyncio.to_thread(
+                record_team_asker, request, conversation_store, source.id, conv.id
+            )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists

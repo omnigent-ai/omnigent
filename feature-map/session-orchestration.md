@@ -43,6 +43,10 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   same rule and file into the caller's project, except that a legacy-label project
   can only continue its own sessions. Agent tools only: a shell can still reach the
   host's files and server.
+- `team-updates`: with `canvas` enabled, a session that receives peer work, or is
+  created with a first task, wakes the sender once with a system notice when it
+  finishes or fails, and also when it starts waiting on an approval. Notices stop
+  when either session leaves the project. Other sessions are not told.
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid

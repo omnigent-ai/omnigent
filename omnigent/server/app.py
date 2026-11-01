@@ -1962,12 +1962,18 @@ def create_app(
         # for multi-app test setups).
         from omnigent.server.routes.sessions import (
             configure_subagent_block_notifier,
+            configure_team_updates,
         )
 
         _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
             conversation_store,
             runner_router,
             agent_store=agent_store,
+        )
+        _uninstall_team_updates = (
+            configure_team_updates(conversation_store, runner_router, agent_store=agent_store)
+            if resolved_feature_flags.enabled(Feature.CANVAS)
+            else lambda: None
         )
 
         from omnigent.runner.resource_registry import (
@@ -2217,6 +2223,7 @@ def create_app(
                 await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
+            _uninstall_team_updates()
             set_resource_registry(None)
             set_runner_ws_factory(None)
             set_runner_direct_attach_resolver(None)

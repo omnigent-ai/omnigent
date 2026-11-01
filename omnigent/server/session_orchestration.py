@@ -19,6 +19,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    TEAM_REPLY_TO_LABEL_KEY,
     ConversationStore,
 )
 from omnigent.stores.permission_store import PermissionStore
@@ -109,6 +110,26 @@ def project_list_scope(
         return None
     root = _project_root(source, conversations)
     return _project_name(request, root, user_id) or ""
+
+
+def same_project_filing(
+    conversations: ConversationStore, first: Conversation, second: Conversation
+) -> bool:
+    """Say whether two sessions' top-level sessions are filed identically."""
+    first_root = _project_root(first, conversations)
+    second_root = _project_root(second, conversations)
+    return (first_root.project_id, first_root.labels.get(PROJECT_LABEL_KEY)) == (
+        second_root.project_id,
+        second_root.labels.get(PROJECT_LABEL_KEY),
+    )
+
+
+def record_team_asker(
+    request: Request, conversations: ConversationStore, asker_id: str, teammate_id: str
+) -> None:
+    """Remember who to tell when a teammate settles, where Canvas teams are enabled."""
+    if request.app.state.feature_flags.enabled(Feature.CANVAS):
+        conversations.set_labels(teammate_id, {TEAM_REPLY_TO_LABEL_KEY: asker_id})
 
 
 def scheduled_task_in_project(

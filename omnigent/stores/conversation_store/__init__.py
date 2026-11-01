@@ -182,6 +182,8 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 
 # Creation provenance only; this does not confer parentage or permissions.
+# The session waiting to hear when this one settles; server-written on peer work.
+TEAM_REPLY_TO_LABEL_KEY = "omnigent.team_reply_to"
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
 
 
@@ -237,6 +239,7 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
+    TEAM_REPLY_TO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,

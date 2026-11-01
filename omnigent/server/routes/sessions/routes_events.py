@@ -1195,9 +1195,15 @@ def register_events_routes(
                 permission_store,
                 target_id=session_id,
             )
-            from omnigent.server.session_orchestration import orchestration_message
+            from omnigent.server.session_orchestration import (
+                orchestration_message,
+                record_team_asker,
+            )
 
             body = orchestration_message(source.id, body.data.get("message"))
+            await asyncio.to_thread(
+                record_team_asker, request, conversation_store, source.id, session_id
+            )
         native_shell_authorized = False
         if (
             body.type == "message"
