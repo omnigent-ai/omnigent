@@ -4137,6 +4137,45 @@ def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
     assert len(cfgs) == 2
 
 
+def test_databricks_clients_share_the_preflight_token_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-flight headers and every later client for a server resolve credentials once."""
+    import omnigent.inner.databricks_executor as dbx
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer tok"}
+
+    resolved: list[str | None] = []
+
+    def _fake_resolve(
+        profile: str | None = None, *, host: str | None = None
+    ) -> tuple[object, str]:
+        resolved.append(host)
+        return dbx._DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.databricks.com"
+
+    server = "https://ex.databricks.com/api/2.0/omnigent"
+    monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda _url: "https://ex.databricks.com",
+    )
+
+    assert chat_module._stored_databricks_record_token(server) == "tok"
+    for _ in range(3):
+        auth = chat_module._DatabricksTokenAuth(server_url=server)
+        assert _first_auth_header(auth, f"{server}/v1/sessions") == "Bearer tok"
+    assert resolved == ["https://ex.databricks.com"]
+
+    chat_module._forget_refused_credential(server)
+    auth = chat_module._DatabricksTokenAuth(server_url=server)
+    assert _first_auth_header(auth, f"{server}/v1/sessions") == "Bearer tok"
+    assert len(resolved) == 2
+
+
 def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every SDK-client request carries the workspace-routing header.
 

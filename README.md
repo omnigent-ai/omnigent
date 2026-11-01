@@ -331,6 +331,9 @@ See the [native agy gateway guide](docs/native-agy-gateways.md) for compatibilit
 requirements, model and authentication behavior, troubleshooting, and smoke
 steps. These settings configure native agy; the Antigravity Python SDK retains
 its separate key/Vertex setup.
+`omnigent opencode` requires OpenCode 2.0.x (`npm i -g @opencode/cli@2.0.32`).
+Its free models need no sign-in; run `opencode auth login` to add your own
+providers. See the [OpenCode harness guide](docs/opencode-native.md).
 
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
@@ -425,6 +428,12 @@ To suppress the automatic browser tab, use `omni host --no-open` or set
 `OMNIGENT_HOST_NO_OPEN=1` in your shell. Both also apply to `omni host
 --background` and `omni start`. Sign-in may still open a browser; use
 `--non-interactive` in scripts to fail if sign-in is required.
+
+To open it in the Omnigent desktop app instead, use `--open-in-desktop` or set
+`OMNIGENT_HOST_OPEN_IN_DESKTOP=1`; it falls back to the browser if the app is
+not installed, too old to accept the request, or does not respond within five
+seconds. URLs with base paths or query/fragment selectors stay in the browser
+to preserve their destination.
 
 A session can also start itself: the **Automations** page runs an agent on a
 recurring schedule. See the [automations guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/AUTOMATIONS.md)

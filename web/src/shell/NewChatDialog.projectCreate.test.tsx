@@ -49,6 +49,11 @@ import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import {
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { showToast } from "@/components/ui/toast";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
@@ -59,7 +64,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // creates the session WITH `project_id`: the server files it atomically and
 // default-fills config-seeded fields the composer omits. These tests pin the
 // new request shape, the field-omission semantics, the skipped follow-up
-// move, and the untouched legacy paths (label-only folders, plain visits).
+// move, the legacy paths (label-only, plain visits), and the saved start.
 const navigateMock = vi.fn();
 
 const RECENT_KEY = "omnigent:recent-workspaces";
@@ -353,6 +358,27 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("workspace" in body).toBe(false);
   });
 
+  it("sends a seed from the project's last start explicitly, not for config default-fill", async () => {
+    // The server fills an omitted slot from the stored config, which doesn't
+    // know about the last start this browser remembers.
+    const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
+    setProjectConfig(config);
+    writeProjectLaunchDefaults(
+      "proj_alpha",
+      { agentId: "ag_hello", hostId: "host_1", workspace: RECENT_WORKSPACE },
+      config,
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.agent_id).toBe("ag_hello");
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+  });
+
   it("keeps a non-project visit explicit and adds only the create token label", async () => {
     searchParams = new URLSearchParams("");
     localStorage.setItem("omnigent:last-agent-id", "ag_hello");
@@ -393,6 +419,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // label and the follow-up move creates the row on demand.
     setProjects([{ id: null, name: "Alpha" }]);
     setProjectConfig(undefined);
+    vi.mocked(moveConversationToProject).mockResolvedValue({ project_id: "proj_new" } as never);
     renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
@@ -402,6 +429,13 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("project_id" in body).toBe(false);
     expect((body.labels as Record<string, string>).omni_project).toBe("Alpha");
     expect(vi.mocked(moveConversationToProject)).toHaveBeenCalledWith("conv_new", "Alpha");
+    // The start is remembered under the project row the move created.
+    expect(readProjectLaunchDefaults("proj_new", {})).toEqual({
+      agentId: "ag_hello",
+      pickedHarness: null,
+      hostId: "host_1",
+      workspace: RECENT_WORKSPACE,
+    });
   });
 
   it("sends agent_id when the user explicitly re-picks the config agent", async () => {
@@ -500,7 +534,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // Absent fields are default-filled from the project config, and a managed
     // create rejects a path workspace / git block — the explicit nulls keep
     // the server from filling them in.
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
+    setProjectConfig(config);
     renderLanding({ managed_sandboxes_enabled: true });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
@@ -518,11 +553,18 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("host_id" in body).toBe(false);
     // The untouched config agent is still omitted for default-fill.
     expect("agent_id" in body).toBe(false);
+    // The sandbox, not the config host, is remembered for the next session.
+    expect(readProjectLaunchDefaults("proj_alpha", config)).toEqual({
+      agentId: "ag_other",
+      pickedHarness: null,
+      hostId: SANDBOX_HOST_CHOICE,
+    });
   });
 
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
-    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
+    const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
+    setProjectConfig(config);
+    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
     renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
@@ -549,5 +591,12 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // The runner still launches with the explicit client-side workspace.
     expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
+    // The session-scoped agent the create registered is the start's agent.
+    expect(readProjectLaunchDefaults("proj_alpha", config)).toEqual({
+      agentId: "ag_pending",
+      pickedHarness: null,
+      hostId: "host_1",
+      workspace: REPO,
+    });
   });
 });
