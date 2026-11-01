@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy import event
 from sqlalchemy.orm import Session
@@ -481,8 +483,11 @@ def test_list_pages_continue_without_omissions_or_duplicates(
     from omnigent.stores.skill_store import sqlalchemy_store
 
     monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_700_000_000)
-    for i in range(6):
-        _install(store, f"m{i}", scope="org" if i % 2 else "user", owner=None if i % 2 else "bob")
+    # Ids rise in install order, so pages of two end on an org row, then a user row.
+    ids = (uuid.UUID(int=n) for n in range(1, 100))
+    monkeypatch.setattr(sqlalchemy_store.uuid, "uuid4", lambda: next(ids))
+    for i, scope in enumerate(("user", "org", "org", "user", "user", "org")):
+        _install(store, f"m{i}", scope=scope, owner="bob" if scope == "user" else None)
         _install(store, f"other{i}", owner="carol")
     merged: list[tuple[int, str]] = []
     cursor_scopes: set[str] = set()

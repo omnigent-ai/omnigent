@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import io
 import shutil
-import tarfile
 from pathlib import Path
 
 from omnigent.skills.git_source import SparseCheckout
 from omnigent.skills.limits import DEFAULT_CLONE_LIMITS, CloneLimits
+from tests._helpers.session import bundle_files
 
 
 def write_skill(
@@ -28,13 +27,7 @@ def write_skill(
 
 def skill_tarball(files: dict[str, bytes]) -> bytes:
     """A gzipped tar of *files* (``{"SKILL.md": b"..."}``), as the artifact store holds a skill."""
-    out = io.BytesIO()
-    with tarfile.open(fileobj=out, mode="w:gz") as tf:
-        for name, data in files.items():
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            tf.addfile(info, io.BytesIO(data))
-    return out.getvalue()
+    return bundle_files(files)
 
 
 def copying_cloner(repo: Path):  # type: ignore[no-untyped-def]  # a Cloner

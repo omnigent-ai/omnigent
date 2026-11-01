@@ -6453,3 +6453,40 @@ def test_prepare_claude_cli_path_grants_the_extra_read_roots(tmp_path: Path) -> 
             "/usr/bin/claude", spec, extra_read_roots=[tmp_path / "bundle" / "skills"]
         )
     assert (tmp_path / "bundle" / "skills").resolve() in captured["sandbox"].read_roots
+
+
+def test_prepare_tight_cli_process_path_grants_the_extra_read_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default wrapper for a CLI without its own sandbox spec grants the
+    # bundle's skills too; the wrapped-CLI test above stops at this boundary.
+    from omnigent.inner import claude_sdk_executor
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict[str, SandboxPolicy] = {}
+
+    def capture(_path: str, sandbox: SandboxPolicy) -> str:
+        captured["sandbox"] = sandbox
+        return "/tmp/launcher"
+
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[tmp_path],
+        write_roots=[],
+        write_files=[],
+        allow_network=True,
+    )
+    monkeypatch.setattr(claude_sdk_executor.sys, "platform", "linux")
+    monkeypatch.setattr(claude_sdk_executor, "_sandbox_disabled_by_env", lambda: False)
+    monkeypatch.setattr(claude_sdk_executor, "resolve_sandbox", lambda *_a, **_k: policy)
+    monkeypatch.setattr(claude_sdk_executor, "_claude_internal_write_roots", list)
+    monkeypatch.setattr(claude_sdk_executor, "_claude_internal_write_files", list)
+    monkeypatch.setattr(claude_sdk_executor, "create_exec_launcher", capture)
+    skills = tmp_path / "bundle" / "skills"
+    wrapped = claude_sdk_executor.prepare_tight_cli_process_path(
+        "/usr/bin/claude", cwd=str(tmp_path), extra_read_roots=[skills]
+    )
+    assert wrapped == "/tmp/launcher"
+    assert skills.resolve() in captured["sandbox"].read_roots
+    assert tmp_path in captured["sandbox"].read_roots
