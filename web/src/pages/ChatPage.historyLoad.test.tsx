@@ -289,15 +289,21 @@ describe("KeepBottomOnResize", () => {
     stickContext.state.escapedFromLock = false;
     render(<KeepBottomOnResize />);
 
-    // A wheel up releases the lock before any scroll event moves the reader.
+    metrics.scrollHeight = 2021;
+    act(() => resize?.());
+    expect(metrics.scrollTop).toBe(1320);
+
+    // A wheel up releases the lock before any scroll event moves the reader:
+    // neither the pending follow-up frame nor the next line moves the view.
     stickContext.state.isAtBottom = false;
     stickContext.state.escapedFromLock = true;
-    metrics.scrollHeight = 2200;
+    metrics.scrollHeight = 2042;
+    flushFrames();
     act(() => resize?.());
 
-    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
     expect(frames.size).toBe(0);
-    expect(metrics.scrollTop).toBe(1300);
+    expect(metrics.scrollTop).toBe(1320);
   });
 
   it("holds still while the reader drags a selection in the transcript", () => {
