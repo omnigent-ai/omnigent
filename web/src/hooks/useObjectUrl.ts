@@ -4,15 +4,16 @@ import { useEffect, useState } from "react";
  *  committed <img> points at is never revoked early (StrictMode double mount)
  *  and never leaks. Guarded: jsdom (tests) lacks createObjectURL. */
 export function useObjectUrl(blob: Blob | null): string | undefined {
-  const [url, setUrl] = useState<string>();
+  const [entry, setEntry] = useState<{ blob: Blob; url: string }>();
   useEffect(() => {
     if (!blob || typeof URL.createObjectURL !== "function") {
-      setUrl(undefined);
+      setEntry(undefined);
       return;
     }
-    const objectUrl = URL.createObjectURL(blob);
-    setUrl(objectUrl);
-    return () => URL.revokeObjectURL(objectUrl);
+    const url = URL.createObjectURL(blob);
+    setEntry({ blob, url });
+    return () => URL.revokeObjectURL(url);
   }, [blob]);
-  return url;
+  // The render after `blob` changes must not hand out the URL being revoked.
+  return entry?.blob === blob ? entry.url : undefined;
 }

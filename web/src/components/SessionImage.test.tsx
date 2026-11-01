@@ -234,9 +234,8 @@ describe("InlineImage (data: URI carried by the transcript)", () => {
     ["data URI", BAD_PNG],
     ["blob URL", "blob:http://localhost/broken"],
   ])("swaps a corrupt %s for the unavailable-image chip", (_label, src) => {
-    // WHY: a truncated/corrupt data URI from an imported transcript used to
-    // leave the browser's broken-image glyph in the transcript. Local bytes,
-    // such as a decoded workspace file, collapse to the compact chip too.
+    // Corrupt local bytes (an imported data URI or a decoded workspace file)
+    // show the compact chip, not the browser's broken-image glyph.
     render(<InlineImage src={src} alt="broken.png" />);
     fireEvent.error(screen.getByRole("img", { name: "broken.png" }));
 

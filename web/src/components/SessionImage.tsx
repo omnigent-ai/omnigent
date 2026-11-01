@@ -103,9 +103,8 @@ export function InlineImage({
         // off the main thread keeps the swap from blocking paint.
         loading="lazy"
         decoding="async"
-        // An absent src never resolved, so nothing has failed yet — latching
-        // here would strand the slot on a chip once the path arrives. Local
-        // data/blob bytes fail for good; a fetched path stays retryable.
+        // No src yet means nothing failed. Local data/blob bytes fail for
+        // good; a fetched path stays retryable.
         onError={() => {
           if (src !== undefined && /^(?:data|blob):/.test(src)) setFailedSrc(src);
         }}

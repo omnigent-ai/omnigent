@@ -53,7 +53,7 @@ export function createBooleanPreference(
         window.localStorage.setItem(storageKey, String(enabled));
       }
     } catch {
-      // A storage failure must not break Settings.
+      // Ignore storage failures; readers fall back to the default.
     }
     notify();
   };
