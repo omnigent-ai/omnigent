@@ -5,7 +5,7 @@
       The cutout mode lets the WebView extend into the display cutout so
       injected safe-area insets cover notched devices.
     -->
-    <style name="Theme.Omnigent" parent="Theme.AppCompat.DayNight.NoActionBar">
+    <style name="Base.Theme.Omnigent" parent="Theme.AppCompat.DayNight.NoActionBar">
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
@@ -14,5 +14,10 @@
              The night variant flips these back to light icons. -->
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowBackground">@color/brand_background</item>
+    </style>
+    <style name="Theme.Omnigent" parent="Base.Theme.Omnigent" />
+    <style name="Theme.Omnigent.Launch" parent="Theme.Omnigent">
+        <item name="android:windowBackground">@drawable/launch_background</item>
     </style>
 </resources>
