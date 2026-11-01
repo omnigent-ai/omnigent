@@ -12235,15 +12235,18 @@ def prefetch_session_routing_catalogs(
     task.add_done_callback(_catalog_prefetch_tasks.discard)
 
 
-async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]] | None:
+async def _host_model_options_via_registry(
+    host_id: str, harness: str = "claude-native"
+) -> list[dict[str, Any]] | None:
     """
-    Resolve a host's pre-launch claude catalog over its live tunnel.
+    Resolve a host's pre-launch catalog for *harness* over its live tunnel.
 
     Session-side reuse of the new-session picker's source
     (``get_host_model_options`` in ``routes/hosts.py``): the host resolves
     the catalog locally, so no runner is needed.
 
     :param host_id: Host identifier, e.g. ``"host_a1b2c3"``.
+    :param harness: Harness whose catalog to resolve, e.g. ``"pi-native"``.
     :returns: Raw model rows, or ``None`` when the host is not connected,
         rejects the request, or times out.
     """
@@ -12260,7 +12263,7 @@ async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]]
         result = await _proxy_model_options(
             host_registry=registry,
             host_conn=conn,
-            harness="claude-native",
+            harness=harness,
         )
     except HTTPException:
         return None
@@ -12270,7 +12273,9 @@ async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]]
     return models if isinstance(models, list) else None
 
 
-async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
+async def _load_model_options_from_host(
+    session_id: str, host_id: str, harness: str = "claude-native"
+) -> None:
     """
     Background catalog fill for an asleep claude-native session.
 
@@ -12283,12 +12288,15 @@ async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param host_id: The session's bound host, e.g. ``"host_a1b2c3"``.
+    :param harness: Harness whose catalog to resolve. ``"pi-native"`` fills the
+        extension-pushed cache (the only store its picker reads) and is never
+        stale-marked: the extension's own push replaces it.
     """
     # Read through the facade so tests patching
     # ``sessions._host_model_options_via_registry`` reach this impl.
     import omnigent.server.routes.sessions as _facade
 
-    raw = await _facade._host_model_options_via_registry(host_id)
+    raw = await _facade._host_model_options_via_registry(host_id, harness)
     if not raw:
         return
     try:
@@ -12296,6 +12304,11 @@ async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
     except ValueError:
         return
     if not options:
+        return
+    if harness == "pi-native":
+        # Do not clobber a catalog the extension pushed while we awaited.
+        _pushed_model_options_cache.setdefault(session_id, options)
+        _publish_model_options(session_id)
         return
     _model_options_cache[session_id] = options
     _model_options_stale.add(session_id)

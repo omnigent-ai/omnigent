@@ -13122,7 +13122,24 @@ async def _fetch_model_options(
         # own ``/login``), so the picker populates even when no ``models.json``
         # is written into the bridge dir. Empty until the extension posts
         # ``external_model_options`` on session start.
-        return _pushed_model_options_cache.get(session_id, [])
+        pushed = _pushed_model_options_cache.get(session_id)
+        if pushed:
+            return pushed
+        # That cache is in-memory: a server restart empties it for every
+        # sleeping session, and the extension only pushes on start. Fill it
+        # from the session's host (the new-session picker's source) so a
+        # resumed session can pick a model before it wakes.
+        if conv.host_id is not None and session_id not in _model_options_inflight:
+            task = asyncio.create_task(
+                _load_model_options_from_host(session_id, conv.host_id, "pi-native")
+            )
+            _model_options_inflight[session_id] = task
+
+            def _clear_pi_host_options_inflight(_task: asyncio.Task[None]) -> None:
+                _model_options_inflight.pop(session_id, None)
+
+            task.add_done_callback(_clear_pi_host_options_inflight)
+        return []
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
         # Generic ACP sessions carry no native wrapper label; their picker
