@@ -3532,6 +3532,16 @@ async def _execute_session_create(
         return json.dumps({"error": "Sandbox selection fields must be nonempty strings"})
     if selection.get("sandbox_profile_revision") and not selection.get("sandbox_profile_id"):
         return json.dumps({"error": "sandbox_profile_revision requires sandbox_profile_id"})
+    branch_name, base_branch = args.get("branch_name"), args.get("base_branch")
+    if branch_name is not None and placement != "same_host":
+        return json.dumps({"error": "branch_name requires placement='same_host'"})
+    if base_branch is not None and branch_name is None:
+        return json.dumps({"error": "base_branch requires branch_name"})
+    if any(
+        value is not None and (not isinstance(value, str) or not value.strip())
+        for value in (branch_name, base_branch)
+    ):
+        return json.dumps({"error": "branch_name and base_branch must be nonempty strings"})
     if placement != "child" and message is not None:
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
@@ -3580,6 +3590,10 @@ async def _execute_session_create(
                 body["initial_input"] = initial_items[0]
         else:
             body.pop("initial_items", None)
+            if branch_name is not None:
+                body["git"] = {"branch_name": branch_name}
+                if base_branch is not None:
+                    body["git"]["base_branch"] = base_branch
     unconfirmed_creation = {
         "error": "Session creation could not be confirmed; "
         "inspect your sessions before creating another. Use sys_session_list's sessions "

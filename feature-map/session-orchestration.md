@@ -25,6 +25,8 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
+  `same_host` accepts `branch_name` and `base_branch` to start the worker in its
+  own git worktree instead of the sender's checkout.
 - `sharing`: sharing the sender blocks subsequent sends and independent creates.
   Side chats and their children also inherit restrictions from the source chain.
   Accepted work, including tasks saved while a worker starts, continues. Making

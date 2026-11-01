@@ -977,6 +977,12 @@ def register_core_routes(
                 if form is not None
                 else await request.json()
             )
+            # An orchestrated worktree uses the sender's host, resolved after validation.
+            orchestrated_git = (
+                payload.pop("git", None)
+                if isinstance(payload, dict) and ORCHESTRATION_SOURCE_HEADER in request.headers
+                else None
+            )
             # Dispatch on the VALUE, not key presence: a null project_id is
             # "no project", so it must keep the legacy request shape (and its
             # 422 contract) byte-identical to an absent key.
@@ -1019,6 +1025,10 @@ def register_core_routes(
             if body.parent_session_id is not None:
                 raise OmnigentError(
                     "Orchestration creates independent sessions", code=ErrorCode.INVALID_INPUT
+                )
+            if orchestrated_git is not None and body.host_type != "external":
+                raise OmnigentError(
+                    "A worktree requires placement='same_host'", code=ErrorCode.INVALID_INPUT
                 )
             if body.host_type == "managed":
                 deployment = getattr(request.app.state, "sandbox_config", None)
@@ -1078,6 +1088,7 @@ def register_core_routes(
                             **body.model_dump(exclude_unset=True),
                             "host_id": placement.host_id,
                             "workspace": placement.workspace,
+                            **({"git": orchestrated_git} if orchestrated_git else {}),
                         }
                     )
                 except ValidationError as exc:

@@ -1293,3 +1293,71 @@ async def test_independent_session_joins_creator_project(
     assert created.labels.get(PROJECT_LABEL_KEY) == (
         "Legacy team" if filing == "legacy_label" else None
     )
+
+
+async def test_same_host_worker_can_start_in_its_own_worktree(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+):
+    from omnigent.host.frames import (
+        HostCreateWorktreeFrame,
+        HostLaunchRunnerFrame,
+        HostStatFrame,
+        decode_host_frame,
+    )
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    auth_app.state.host_store.upsert_on_connect(host_id, host_id, "alice")
+    store.set_host_id(source["id"], host_id, workspace="/repo")
+    worktree_requests = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostCreateWorktreeFrame):
+            worktree_requests.append(frame)
+            connection.pending_create_worktrees[frame.request_id].set_result(
+                {
+                    "status": "ok",
+                    "worktree_path": "/worktrees/team-backend",
+                    "branch": frame.branch_name,
+                }
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+
+    async def create(**arguments):
+        return json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": source["agent_id"], **arguments}),
+                server_client=auth_client,
+                conversation_id=source["id"],
+            )
+        )
+
+    created = await create(placement="same_host", branch_name="team/backend", base_branch="main")
+    worker = store.get_conversation(created["conversation_id"])
+    assert worker.workspace == "/worktrees/team-backend"
+    assert worker.git_branch == "team/backend"
+    assert worker.parent_conversation_id is None
+    assert [(f.branch_name, f.base_branch) for f in worktree_requests] == [
+        ("team/backend", "main")
+    ]
+    assert store.get_conversation(source["id"]).workspace == "/repo"
+
+    for arguments, refusal in (
+        ({"placement": "child", "branch_name": "x"}, "requires placement='same_host'"),
+        ({"placement": "same_host", "base_branch": "main"}, "base_branch requires branch_name"),
+        ({"placement": "same_host", "branch_name": " "}, "must be nonempty"),
+    ):
+        assert refusal in (await create(**arguments))["error"]
+    assert len(worktree_requests) == 1
