@@ -471,6 +471,24 @@ def _session_workspace(session_id: str) -> str:
     return os.path.join(_contained_session_dir(root, session_id), "workspace")
 
 
+def _retire_closed_terminal_poller(
+    poller: SessionStatusPoller | ClaudeProgramStatusPoller | None,
+) -> None:
+    """
+    Retire the Claude status poller of a pane that was closed.
+
+    Closing a terminal or cleaning up its session skips the pane's exit
+    callback, which would retire it. Retiring clears the session's
+    background-shell flag, since the shells ended with the pane and nothing
+    else would report that. It runs after the close, so the pane reads as
+    stopped rather than moved to another session.
+
+    :param poller: The pane's poller, or ``None`` when it had none.
+    """
+    if poller is not None:
+        poller.retire()
+
+
 class SessionResourceRegistry:
     """Runner-side registry that owns session-scoped resources.
 
@@ -532,6 +550,11 @@ class SessionResourceRegistry:
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
         self._session_status_publisher: Callable[[str, str, str | None], None] | None = None
+        # Optional callback ``(session_id, running) -> None`` invoked on the
+        # event loop when a claude-native session's background shells start
+        # or stop outliving its turn. Set via
+        # :meth:`set_session_background_publisher`.
+        self._session_background_publisher: Callable[[str, bool], None] | None = None
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -608,6 +631,20 @@ class SessionResourceRegistry:
             (e.g. ``"permission prompt"``), or ``None``.
         """
         self._session_status_publisher = publisher
+
+    def set_session_background_publisher(
+        self,
+        publisher: Callable[[str, bool], None],
+    ) -> None:
+        """Install the background-shell publisher for claude-native sessions.
+
+        Invoked on the event loop, like the session-status publisher, when
+        Claude's status file starts or stops reporting a background shell that
+        outlives the turn.
+
+        :param publisher: Callable ``(session_id, running) -> None``.
+        """
+        self._session_background_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -1500,6 +1537,7 @@ class SessionResourceRegistry:
         """
         activity_publisher = self._terminal_activity_publisher
         status_publisher = self._session_status_publisher
+        background_publisher = self._session_background_publisher
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
@@ -1589,6 +1627,30 @@ class SessionResourceRegistry:
             # activity badges and process-death detection.
             return status_poller is not None and status_poller.active
 
+        def _may_report_background(running: bool) -> bool:
+            # Only the session's current, running terminal reports shells. A
+            # replacement, or the session a pane moved to, reports its own; a
+            # terminal that stopped may still clear them, never set them.
+            current = (
+                self._terminal_registry.get(session_id, terminal_name, session_key)
+                if self._terminal_registry is not None
+                else None
+            )
+            if current is instance:
+                return instance.running or not running
+            return not running and current is None and not instance.running
+
+        def _publish_background_if_current(running: bool) -> None:
+            if background_publisher is not None and _may_report_background(running):
+                background_publisher(session_id, running)
+
+        def _publish_background(running: bool) -> None:
+            # Runs on the watcher thread; hop to the loop for the loop-only publisher.
+            if background_publisher is None or not _may_report_background(running):
+                return
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(_publish_background_if_current, running)
+
         # Claude reports explicit state through OSC when opted in, with its
         # sessions/<pid>.json file as fallback. Other roles retain pane inference.
         status_poller = (
@@ -1598,6 +1660,7 @@ class SessionResourceRegistry:
                 on_status=lambda status, blocked_on=None: _publish_status(
                     status, blocked_on, record_activity=True
                 ),
+                on_background=_publish_background,
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
@@ -1787,8 +1850,12 @@ class SessionResourceRegistry:
         session_id: str,
         instance: TerminalInstance,
         on_status: Callable[[str, str | None], None],
+        on_background: Callable[[bool], None] | None = None,
     ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
-        """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity."""
+        """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity.
+
+        The file also supplies the background-shell signal, even while OSC owns status.
+        """
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
             read_claude_session_id,
@@ -1815,6 +1882,7 @@ class SessionResourceRegistry:
             ),
             session_id_getter=_session_id_getter,
             omnigent_session_id=session_id,
+            on_background=on_background,
         )
         if reader is not None:
             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
@@ -2078,6 +2146,12 @@ class SessionResourceRegistry:
                         ),
                     ),
                 )
+                reports_status = (
+                    self.terminal_resource_role(session_id, terminal_id)
+                    == CLAUDE_NATIVE_TERMINAL_ROLE
+                )
+                with self._lock:
+                    poller = self._status_pollers.get(session_id) if reports_status else None
                 closed = await self._terminal_registry.close(
                     session_id,
                     entry.terminal_name,
@@ -2087,6 +2161,10 @@ class SessionResourceRegistry:
                     with self._lock:
                         self._terminal_roles.pop((session_id, terminal_id), None)
                         self._terminal_lifecycles.pop((session_id, terminal_id), None)
+                        # A replacement launched during the close keeps its own poller.
+                        if poller is not None and self._status_pollers.get(session_id) is poller:
+                            del self._status_pollers[session_id]
+                    _retire_closed_terminal_poller(poller)
                 return closed
         return False
 
@@ -2154,10 +2232,17 @@ class SessionResourceRegistry:
                             self._session_activity_epoch.get(target_session_id, 0) + 1
                         )
                 self._active_session_turns.discard(source_session_id)
-                # The watcher restart below rebuilds the poller under the
-                # target, so drop the source's entry rather than leaving a
-                # retired poller to be re-armed on every later reconnect.
-                self._status_pollers.pop(source_session_id, None)
+                if role == CLAUDE_NATIVE_TERMINAL_ROLE:
+                    # The watcher restart below rebuilds the poller under the
+                    # target, so drop the source's entry rather than leaving a
+                    # retired poller to be re-armed on every later reconnect.
+                    self._status_pollers.pop(source_session_id, None)
+            if (
+                role == CLAUDE_NATIVE_TERMINAL_ROLE
+                and self._session_background_publisher is not None
+            ):
+                # The pane's background shells now belong to the target, which reports its own.
+                self._session_background_publisher(source_session_id, False)
             try:
                 await entry.instance.set_conversation_link(
                     self._terminal_registry.conversation_link_for_id(target_session_id)
@@ -2197,6 +2282,8 @@ class SessionResourceRegistry:
 
         :param session_id: Session/conversation identifier.
         """
+        with self._lock:
+            status_poller = self._status_pollers.get(session_id)
         self._take_session_status_memo(session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
@@ -2222,6 +2309,7 @@ class SessionResourceRegistry:
                     "Error cleaning up terminals for session=%s",
                     session_id,
                 )
+        _retire_closed_terminal_poller(status_poller)
 
         if primary is not None:
             try:

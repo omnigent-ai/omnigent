@@ -1293,6 +1293,197 @@ async def test_external_session_status_event_lands_in_status_cache(
         sessions_module._session_status_cache.pop(session["id"], None)
 
 
+async def test_external_background_work_sets_sidebar_flag_without_status_edge(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_background_work`` sets the session-list flag and publishes no edge.
+
+    A background shell that outlives its turn keeps the session working. The
+    turn status stays as reported, so the session still takes a new message.
+    """
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def listed_item() -> dict[str, Any]:
+        """Return this session's row from the session list."""
+        list_resp = await client.get("/v1/sessions")
+        return next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+
+    status_before = (await listed_item())["status"]
+    published.clear()
+    for running in (True, False):
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": running}},
+        )
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"queued": False}
+        assert (await listed_item())["background_work_running"] is running
+    assert published == []
+    assert (await listed_item())["status"] == status_before
+
+
+async def test_external_background_work_from_a_replaced_runner_is_rejected(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A report delayed past a rebind cannot overwrite the replacement runner's value."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server import session_live_state
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], token_bound_runner_id("token-a"))
+
+    async def report(token: str, running: bool) -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+            json={"type": "external_background_work", "data": {"running": running}},
+        )
+
+    assert (await report("token-a", False)).status_code == 202
+    store.replace_runner_id(session["id"], token_bound_runner_id("token-b"))
+    assert (await report("token-b", False)).status_code == 202
+
+    late = await report("token-a", True)
+
+    assert late.status_code == 403, late.text
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is False
+
+
+async def test_external_background_work_handed_off_mid_request_is_retried(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A report this replica hands off before writing gets a retryable 503 and writes nothing.
+
+    The runner's retry, once the session is settled, is written.
+    """
+    from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions.orchestration import _relinquish_session_live_state
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    real_count = session_live_state.handoff_count
+    calls = 0
+
+    def handoff_while_authorizing(session_id: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            # Another replica takes the session after this request began.
+            _relinquish_session_live_state(session_id)
+        return real_count(session_id)
+
+    async def report() -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": True}},
+        )
+
+    monkeypatch.setattr(routes_events, "handoff_count", handoff_while_authorizing)
+    handed_off = await report()
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+
+    assert handed_off.status_code == 503, handed_off.text
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is None
+
+    retried = await report()
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+
+    assert retried.status_code == 202, retried.text
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is True
+
+
+async def test_external_background_work_keeps_the_newest_report(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A report that lands after a newer one, such as an abandoned retry, does not overwrite it."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+
+    async def report(running: bool, reported_at: int) -> None:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_background_work",
+                "data": {"running": running, "reported_at": reported_at},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+    await report(False, 2_000)
+    await report(True, 1_000)
+
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is False
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+
+
+async def test_a_session_unbound_from_its_runner_lists_no_background_work(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """No runner is left to report the shell ending, so clearing the binding clears the flag."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], "runner_old")
+    store.set_background_work_running(session["id"], True, runner_id="runner_old")
+
+    store.clear_runner_id(session["id"])
+
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"running": "yes"},
+        {"running": True, "reported_at": -1},
+        {"running": True, "reported_at": "1"},
+    ],
+)
+async def test_post_external_background_work_rejects_invalid_data(
+    client: httpx.AsyncClient, data: dict[str, Any]
+) -> None:
+    """A malformed flag or report time fails loud rather than setting the flag."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_background_work", "data": data},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "external_background_work" in resp.text
+
+
 # ── POST /v1/sessions/{id}/events external_session_superseded ─────
 
 

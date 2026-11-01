@@ -89,6 +89,18 @@ class _StubResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def set_session_background_publisher(
+        self,
+        publisher: Callable[[str, bool], None],
+    ) -> None:
+        """
+        Accept the background-shell publisher installed by the runner app.
+
+        The stub never launches a real terminal, so the callback stays unused.
+        :returns: None.
+        """
+        del publisher
+
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],

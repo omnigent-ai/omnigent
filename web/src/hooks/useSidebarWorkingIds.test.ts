@@ -44,6 +44,19 @@ it("enters Working immediately and requires ten uninterrupted idle seconds per s
   expect([...result.current]).toEqual([]);
 });
 
+it("holds Working while a background shell outlives the turn", () => {
+  const shells: Conversation = { ...idle, background_work_running: true };
+  const { result, rerender } = renderHook(({ rows }) => useSidebarWorkingIds(rows, null, true), {
+    initialProps: { rows: [shells] },
+  });
+  expect([...result.current]).toEqual([idle.id]);
+  act(() => vi.advanceTimersByTime(60_000));
+  expect([...result.current]).toEqual([idle.id]);
+  rerender({ rows: [idle] });
+  act(() => vi.advanceTimersByTime(10_000));
+  expect([...result.current]).toEqual([]);
+});
+
 it("holds startup and clears timers when disabled, removed, or unmounted", () => {
   const { result, rerender, unmount } = renderHook(
     ({ rows, startingId, enabled }) => useSidebarWorkingIds(rows, startingId, enabled),

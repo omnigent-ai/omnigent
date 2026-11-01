@@ -7716,9 +7716,10 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
 
     ``updated_at`` drives sidebar ordering, so the tunnel replica's
     per-tunnel liveness stamps and per-transition status/pending writes
-    must not reorder the list. Round-trips all three columns:
+    must not reorder the list. Round-trips every live-state column:
     ``runner_last_seen`` (bulk by runner, cleared on disconnect),
-    ``live_status`` (enum round-trip), ``pending_elicitation_count``.
+    ``live_status`` (enum round-trip), ``pending_elicitation_count``,
+    ``background_work_running``.
     """
     from omnigent.stores.conversation_store import runner_seen_is_fresh
 
@@ -7749,19 +7750,167 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     connectivity = conversation_store.get_session_connectivity([conv_a.id])
     assert connectivity[conv_a.id].runner_last_seen is None
 
-    # Status + pending count round-trip through the entity.
+    # Status, pending count and background flag round-trip through the entity.
+    assert before.background_work_running is None
     conversation_store.set_session_live_status(conv_a.id, "running")
     conversation_store.set_pending_elicitation_count(conv_a.id, 2)
+    conversation_store.set_background_work_running(conv_a.id, True)
     updated = conversation_store.get_conversation(conv_a.id)
     assert updated is not None
     assert updated.live_status == "running"
     assert updated.pending_elicitation_count == 2
+    assert updated.background_work_running is True
+    # A guarded clear for another runner leaves the flag; one for the bound runner clears it.
+    conversation_store.set_background_work_running(conv_a.id, False, runner_id="runner_other")
+    kept = conversation_store.get_conversation(conv_a.id)
+    assert kept is not None and kept.background_work_running is True
+    # The runner reconnected at 2,000: a clear for "unseen since 2,000" keeps its report.
+    conversation_store.touch_runner_liveness(["runner_live"], now=2_000)
+    conversation_store.set_background_work_running(
+        conv_a.id, False, runner_id="runner_live", unseen_since=2_000
+    )
+    kept = conversation_store.get_conversation(conv_a.id)
+    assert kept is not None and kept.background_work_running is True
+    conversation_store.set_background_work_running(
+        conv_a.id, False, runner_id="runner_live", unseen_since=2_001
+    )
+    cleared = conversation_store.get_conversation(conv_a.id)
+    assert cleared is not None and cleared.background_work_running is False
 
     # None of the live-state writes moved updated_at.
     assert updated.updated_at == before.updated_at
 
     # Empty runner list is a no-op (no query, no error).
     conversation_store.touch_runner_liveness([], now=1)
+
+
+def test_background_flag_keeps_the_newest_report_and_resets_with_the_runner(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    An older report never overwrites a newer one, and a runner change resets the flag.
+
+    Only the bound runner reports the flag, so a session moved to another runner
+    or unbound from one would otherwise keep the old runner's value forever.
+    """
+    conv = conversation_store.create_conversation(title="background")
+    assert conversation_store.set_runner_id(conv.id, "runner_a")
+
+    def flag() -> bool | None:
+        current = conversation_store.get_conversation(conv.id)
+        assert current is not None
+        return current.background_work_running
+
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_a", reported_at=2_000
+    )
+    conversation_store.set_background_work_running(
+        conv.id, False, runner_id="runner_a", reported_at=1_000
+    )
+    assert flag() is True
+    conversation_store.set_background_work_running(
+        conv.id, False, runner_id="runner_a", reported_at=3_000
+    )
+    assert flag() is False
+
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_a", reported_at=4_000
+    )
+    conversation_store.replace_runner_id(conv.id, "runner_b")
+    assert flag() is None
+    # The new runner's clock is not compared with the old one's.
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_b", reported_at=10
+    )
+    assert flag() is True
+
+    conversation_store.clear_runner_id(conv.id)
+    assert flag() is None
+
+    conversation_store.set_background_work_running(conv.id, True, reported_at=5_000)
+    assert conversation_store.set_runner_id(conv.id, "runner_c")
+    assert flag() is None
+
+
+def test_runner_change_resets_a_flag_stored_after_the_row_was_read(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A runner change resets a flag the old runner stored after the row was read.
+
+    Without a row lock, as on MySQL and PostgreSQL, the old runner's report can
+    commit between the store reading the session and writing the new runner.
+    """
+    from sqlalchemy.orm import object_session
+
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    conv = conversation_store.create_conversation(title="background")
+    assert conversation_store.set_runner_id(conv.id, "runner_a")
+    bind_runner = store_mod._bind_runner
+    table = SqlConversationMetadata.__table__
+
+    def report_lands_then_bind(meta: SqlConversationMetadata, runner_id: str | None) -> None:
+        # The old runner's report reaches the row, but not the copy already loaded.
+        session = object_session(meta)
+        assert session is not None
+        session.execute(
+            table.update()
+            .where(table.c.workspace_id == meta.workspace_id, table.c.id == meta.id)
+            .values(background_work_running=True, background_work_reported_at=4_000)
+        )
+        bind_runner(meta, runner_id)
+
+    monkeypatch.setattr(store_mod, "_bind_runner", report_lands_then_bind)
+    conversation_store.replace_runner_id(conv.id, "runner_b")
+    monkeypatch.setattr(store_mod, "_bind_runner", bind_runner)
+
+    moved = conversation_store.get_conversation(conv.id)
+    assert moved is not None and moved.background_work_running is None
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_b", reported_at=10
+    )
+    reported = conversation_store.get_conversation(conv.id)
+    assert reported is not None and reported.background_work_running is True
+
+
+def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    Moving a session to another host's runner, and moving it back, reset the flag.
+
+    Each runner's reports are compared only with its own, so the new runner's
+    first report is accepted whatever its time.
+    """
+    store = conversation_store
+    host_id = "c" * 32
+    _register_host(db_uri, host_id)
+    store.create_conversation(
+        runner_id="runner_b", host_id=host_id, workspace="/repo", git_branch="main"
+    )
+    target = store.create_conversation(runner_id="runner_a")
+    store.set_background_work_running(target.id, True, runner_id="runner_a", reported_at=4_000)
+    previous = store.get_conversation(target.id)
+    assert previous is not None
+
+    def flag() -> bool | None:
+        current = store.get_conversation(target.id)
+        assert current is not None
+        return current.background_work_running
+
+    store.reassign_runner_with_host(target.id, host_id, "runner_b", expected_runner_id="runner_a")
+    assert flag() is None
+    store.set_background_work_running(target.id, True, runner_id="runner_b", reported_at=10)
+    assert flag() is True
+
+    assert store.rollback_runner_reassignment(
+        previous, expected_runner_id="runner_b", expected_host_id=host_id
+    )
+    assert flag() is None
+    store.set_background_work_running(target.id, False, runner_id="runner_a", reported_at=1)
+    assert flag() is False
 
 
 def test_clear_runner_liveness_not_after_spares_a_newer_stamp(
