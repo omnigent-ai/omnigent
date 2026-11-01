@@ -112,6 +112,25 @@ class SysScheduledTaskCreateTool(Tool):
                                 "blocked once the limit is reached. Omit for no cap."
                             ),
                         },
+                        "session_mode": {
+                            "type": "string",
+                            "enum": ["new", "continue"],
+                            "description": (
+                                "Optional. 'new' (default) starts a new session for every "
+                                "run. 'continue' sends every run's prompt into one session, "
+                                "keeping its context: session_id when given, otherwise the "
+                                "session the first run creates."
+                            ),
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional, with session_mode 'continue'. An existing "
+                                "top-level session the owner owns, e.g. the current session, "
+                                "to send every run's prompt into. agent_id must be that "
+                                "session's agent."
+                            ),
+                        },
                         "workspace": {
                             "type": "string",
                             "description": (
@@ -138,6 +157,21 @@ class SysScheduledTaskCreateTool(Tool):
                                 "a fresh server-managed sandbox per firing, using the server's "
                                 "sandbox lifecycle settings. Do not set host_id or workspace "
                                 "with it. Requires managed sandboxes configured on the server."
+                            ),
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional project to file every fired session into, by "
+                                "name: your existing project with this name, or a new one "
+                                "if you have none. Do not set project_id with it."
+                            ),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional existing project id to file every fired session "
+                                "into. Do not set project_name with it."
                             ),
                         },
                     },
@@ -244,6 +278,22 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "New per-firing cost budget in USD. Null clears the cap."
                             ),
                         },
+                        "session_mode": {
+                            "type": "string",
+                            "enum": ["new", "continue"],
+                            "description": (
+                                "'new' starts a new session for every run; 'continue' sends "
+                                "every run's prompt into one session."
+                            ),
+                        },
+                        "session_id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "With session_mode 'continue': the existing session to "
+                                "continue, or null so the next run starts a new session "
+                                "that later runs continue."
+                            ),
+                        },
                         "workspace": {
                             "type": "string",
                             "description": "New existing absolute runner start path.",
@@ -264,6 +314,20 @@ class SysScheduledTaskUpdateTool(Tool):
                         "state": {
                             "type": "string",
                             "description": "'active' or 'paused'.",
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "File future fired sessions into this project, by name: "
+                                "your existing project with this name, or a new one."
+                            ),
+                        },
+                        "project_id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "File future fired sessions into this existing project id. "
+                                "Null stops filing them into a project."
+                            ),
                         },
                     },
                     "required": ["scheduled_task_id"],

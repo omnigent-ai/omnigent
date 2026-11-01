@@ -244,7 +244,7 @@ jobs:
           effort: medium
           review_concurrency: '2'
           review_task_timeout: '15'
-          max_tokens_budget: '600000'
+          max_tokens_budget: '1200000'
           sticky_summary: 'false'
           incremental: 'true'
           route_severity_below: low
@@ -346,6 +346,14 @@ jobs:
           log_text = log.read_text() if log.exists() else ''
           filter_failed = any(message in log_text for message in
                               ('Review filter: failed', 'Review filter failed'))
+          failed = data.get('manifest', {}).get('coverage', {}).get('failed') or []
+          # A review that only ran out of token budget is a warning, never a completion receipt.
+          # Collapse whitespace and backticks so a path cannot break the Markdown list.
+          budget_skipped = sorted(' '.join(str(item.get('path', '?')).replace('`', "'").split())
+                                  for item in failed)
+          budget_only = (data.get('status') == 'partial' and summary.get('budget_exceeded') is True
+                         and bool(failed)
+                         and all('token budget' in (item.get('reason') or '') for item in failed))
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
               output.write('## Open Code Review\n\n')
               output.write(f"Status: {data.get('status', 'unknown')}\n\n")
@@ -356,9 +364,16 @@ jobs:
               if filter_failed:
                   output.write('**Finding-filter failure:** OCR retained findings without completing '
                                'its fact-checking pass. Validate them manually.\n')
+              if budget_only:
+                  output.write('**Token budget reached:** these files were not reviewed; '
+                               'review them manually:\n\n')
+                  output.write(''.join(f'- `{path}`\n' for path in budget_skipped))
           if filter_failed:
               print('::warning::OCR finding filter failed; reported findings need manual validation.')
-          if data.get('status') not in ('complete', 'skipped'):
+          if budget_only:
+              print(f'::warning::OCR token budget reached; {len(budget_skipped)} file(s) were not '
+                    'reviewed. See the job summary for the list.')
+          elif data.get('status') not in ('complete', 'skipped'):
               raise SystemExit('::error::OCR review is incomplete; inspect the coverage in the JSON artifact.')
           if data.get('status') == 'complete':
               head = data.get('manifest', {}).get('input', {}).get('resolved_head')

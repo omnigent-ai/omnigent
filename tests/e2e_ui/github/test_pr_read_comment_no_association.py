@@ -25,6 +25,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import re
 import shutil
 import subprocess
 import tarfile
@@ -268,7 +269,7 @@ def test_read_or_comment_does_not_associate_pr(
     rail = _open_github_panel(page)
     # A read/comment must leave the session unassociated: no session-PR
     # picker in the Pull Requests tab and no composer status-line PR link.
-    expect(rail.get_by_role("combobox", name="Session pull request")).to_have_count(0)
+    expect(rail.get_by_role("list", name="Pull requests")).to_have_count(0)
     expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
     # The registry itself must stay empty — a hidden association would still
     # resurface in pickers and defaults later.
@@ -301,6 +302,7 @@ def test_created_pr_remains_tracked(
     )
 
     rail = _open_github_panel(page)
-    picker = rail.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_have_text("example/one #42", timeout=30_000)
+    expect(
+        rail.get_by_role("button", name=re.compile(r"^example\/one #42(?: —|$)"))
+    ).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("#42")
