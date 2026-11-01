@@ -1029,6 +1029,37 @@ async def test_post_turn_status_edge_auth_error_includes_reauth_hint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_token_command_failure_posts_without_codex_login_hint(
+    tmp_path: Path,
+) -> None:
+    """A failed model provider token command is not a Codex login problem."""
+    _seed_active_turn(tmp_path, "turn_123")
+    message = (
+        "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+        "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
+        "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools "
+        "access token. Run `isaac` to log in and try again."
+    )
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": message, "codexErrorInfo": "other"},
+        }
+    }
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+    assert edge is not None
+    client = _RecordingClient()
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    data = client.posts[0][1]["data"]
+    assert data["status"] == "failed"
+    assert data["output"] == message
+    assert "reauth_required" not in data
+
+
+@pytest.mark.asyncio
 async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     """A normal idle edge (no error) posts status only — the success path."""
     client = _RecordingClient()

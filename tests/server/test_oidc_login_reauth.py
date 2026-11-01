@@ -8,10 +8,10 @@ page to force re-authentication.
 In accounts mode ``?reauth=1`` is honoured by the SPA login form (it shows the
 password field even when the user is already signed in).  In OIDC mode
 ``/auth/login`` must forward a forced-re-authentication demand to the IdP —
-``prompt=login`` plus ``max_age=0`` — so the IdP cannot silently reuse an
+``prompt=login`` plus a short ``max_age`` — so the IdP cannot silently reuse an
 existing IdP session.
 
-``/auth/login`` must both (a) forward ``prompt=login`` + ``max_age=0`` to the
+``/auth/login`` must both (a) forward ``prompt=login`` + ``max_age`` to the
 IdP and (b) stamp ``reauth_at`` into the signed state cookie so the callback can
 verify the id_token's ``auth_time`` proves a real re-authentication.  Without
 (a) the bypass was:
@@ -30,6 +30,8 @@ closes the residual "IdP ignored prompt=login" hole) is covered in
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -37,7 +39,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.oidc import OIDCConfig
+from omnigent.server.oidc import OIDCConfig, parse_reauth_max_age
 from omnigent.server.routes.auth import create_auth_router
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
@@ -76,12 +78,17 @@ def login_client(
     db_uri: str,
 ) -> TestClient:
     """Mount the OIDC auth router; return a TestClient for /auth/login probes."""
+    return _login_client(tmp_path, db_uri, _oidc_config())
+
+
+def _login_client(tmp_path, db_uri: str, config: OIDCConfig) -> TestClient:
+    """Mount the OIDC auth router for *config*; return a TestClient."""
     from omnigent.server.admin_list import AdminList
 
     admins = tmp_path / "admins"
     admins.write_text("")
     perm_store = SqlAlchemyPermissionStore(db_uri)
-    provider = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config())
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
 
     app = FastAPI()
     app.include_router(
@@ -117,7 +124,7 @@ def test_login_without_reauth_sends_no_prompt(login_client: TestClient) -> None:
 
 
 def test_login_with_reauth_forces_prompt_login_at_idp(login_client: TestClient) -> None:
-    """OIDC /auth/login?reauth=1 must forward prompt=login + max_age=0 to the IdP.
+    """OIDC /auth/login?reauth=1 must forward prompt=login + a usable max_age.
 
     This is the anti-phishing gate: when the device-grant consent page detects a
     stale session it bounces here with reauth=1.  Without prompt=login the IdP
@@ -136,8 +143,11 @@ def test_login_with_reauth_forces_prompt_login_at_idp(login_client: TestClient) 
         "so the IdP cannot silently reuse an existing session; "
         f"got authorization URL: {location!r}"
     )
-    assert params.get("max_age") == ["0"], (
-        "/auth/login?reauth=1 must add max_age=0 to the IdP authorization URL "
+    # Not zero: an IdP that caps the id_token's exp at auth_time + max_age
+    # (Entra ID) would hand back a token that has already expired. Freshness
+    # is enforced by the callback's auth_time >= reauth_at check instead.
+    assert params.get("max_age") == ["300"], (
+        "/auth/login?reauth=1 must add a positive max_age to the IdP authorization URL "
         f"got authorization URL: {location!r}"
     )
 
@@ -217,3 +227,33 @@ def test_github_provider_reauth_sends_no_prompt(
     assert "max_age" not in params, (
         f"GitHub OAuth /auth/login must NOT include max_age; got authorization URL: {location!r}"
     )
+
+
+def test_reauth_login_sends_the_configured_max_age(tmp_path, db_uri: str) -> None:
+    """``/auth/login?reauth=1`` sends the deployment's ``max_age``, not a constant."""
+    client = _login_client(tmp_path, db_uri, replace(_oidc_config(), reauth_max_age_seconds=90))
+
+    params = _parse_auth_url(client.get("/auth/login", params={"reauth": "1"}).headers["location"])
+
+    assert params.get("max_age") == ["90"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected", "warned"),
+    [
+        ("90", 90, False),
+        (None, 300, False),
+        ("", 300, False),
+        # A typo must not reintroduce the expired-on-arrival failure.
+        ("0", 300, True),
+        ("-5", 300, True),
+        ("abc", 300, True),
+    ],
+)
+def test_reauth_max_age_parses_positive_seconds_and_falls_back(
+    raw: str | None, expected: int, warned: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.oidc"):
+        assert parse_reauth_max_age(raw) == expected
+
+    assert ("OMNIGENT_OIDC_REAUTH_MAX_AGE must be a positive" in caplog.text) is warned

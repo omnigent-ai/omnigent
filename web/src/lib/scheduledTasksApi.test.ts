@@ -127,6 +127,41 @@ describe("listScheduledTaskRuns", () => {
       firedAt: 1_700_000_005,
       finishedAt: 1_700_000_050,
       errorCode: null,
+      // An older server sends no session read state.
+      conversationUpdatedAt: null,
+      conversationStatus: null,
+      viewerLastSeen: null,
+      viewerUnread: null,
+    });
+  });
+
+  it("maps a run's session read state when the server sends it", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        runs: [
+          {
+            id: "run_1",
+            scheduled_task_id: "st_1",
+            status: "succeeded",
+            scheduled_at: 1_700_000_000,
+            conversation_id: "conv_1",
+            fired_at: 1_700_000_005,
+            finished_at: 1_700_000_050,
+            error_code: null,
+            conversation_updated_at: 1_700_000_060,
+            conversation_status: "idle",
+            viewer_last_seen: 1_700_000_055,
+            viewer_unread: false,
+          },
+        ],
+      }),
+    );
+    const [run] = await listScheduledTaskRuns("st_1");
+    expect(run).toMatchObject({
+      conversationUpdatedAt: 1_700_000_060,
+      conversationStatus: "idle",
+      viewerLastSeen: 1_700_000_055,
+      viewerUnread: false,
     });
   });
 });

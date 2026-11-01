@@ -24,7 +24,8 @@ the header menu), and each place is a separate entry point.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
   Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
-  own Show more.
+  own Show more. Archived sessions match too, marked **Archived**; the recent
+  sessions shown before typing leave them out.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -37,9 +38,11 @@ the header menu), and each place is a separate entry point.
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
-- `side-chat-settings`: before or after the first message, choose a supported model or effort
-  in the side-chat composer; selections apply to that chat's next turn independently
-  of its parent, in the desktop panel and mobile drawer.
+- `side-chat-settings`: choose a supported model or effort in the side-chat composer;
+  selections apply to that chat's next turn independently of its parent, in the
+  desktop panel and mobile drawer. Generic side chats allow selection before or
+  after the first message. Native Codex controls appear after child creation and
+  require a runner that supports side-chat settings.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
   writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
   interleaved comments and existing attachments; removing a quote keeps its comments.
@@ -52,19 +55,41 @@ the header menu), and each place is a separate entry point.
   including for the session being viewed. Its dot appears once the turn is
   idle; approval and error indicators can take precedence. A row showing the
   unread dot offers Mark as read instead. Bulk selection also offers these actions.
+  Behind `automations_v2`, an automation's detail page shows the same unread state
+  on each run that started a session: a run that succeeds while the page is open
+  is marked unread, and opening its session from the run row clears it there and
+  in the sidebar.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+- `project-show-more`: an expanded project folder lists its five newest
+  sessions; each Show more slides five more in until none remain. Re-expanding
+  starts at five again, the open session stays listed once the sidebar has
+  loaded it, and Show more carries the badge of a hidden session that needs
+  attention or is unread. Filing a session into the folder leaves its listed
+  rows as they are, so an older one lands behind Show more.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
   unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
   For a native target, the fork dialog also offers model, reasoning effort,
-  and permission mode pickers.
+  and permission mode pickers. A long model list from several creators (Pi)
+  shows creator headings; it has no search or collapsible groups.
+  Closing the dialog mid-clone keeps the clone running: a toast reports it
+  (with **Open** on success), and reopening the dialog shows it again.
+  Dismissing that toast stops tracking the clone, so a new one can start.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
+- `fork-sandbox-repositories`: edit the inherited repository list before cloning
+  onto a fresh sandbox. Add repositories from connected GitHub search or by URL,
+  remove repositories, and choose each branch independently. Providers that
+  support multiple repositories allow several; switching to a single-repository
+  provider keeps the selection visible and asks you to remove the extras.
+  Each repository starts on its current branch if pushed, otherwise its original
+  launch branch. A quiet note explains an unpushed branch's fallback; unavailable
+  source workspaces retain their original selections.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
 - `unsupported-sandbox-actions`: Databricks Sandbox fork controls and
@@ -73,6 +98,8 @@ the header menu), and each place is a separate entry point.
 - `fork-arclet`: an Arclet session forks only onto a new Arclet, the dialog's
   single host choice. Without one on the server, Fork stays disabled.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
+  Participating sandbox providers require a [profile selection](sandbox-profiles.md)
+  before submission, including branch clones.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app reconnects a local host
   itself, and starts an Arca host recognized by its saved ID or CLI-seeded name
@@ -103,6 +130,8 @@ the header menu), and each place is a separate entry point.
   progress after leaving Settings. Results stay compact, with expandable failure
   details and retry of the original selection.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
+  Pi imports retain readable history and compaction checkpoints; continuation
+  uses the latest summary, retained context and subsequent turns.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
@@ -163,8 +192,11 @@ menu → **Open in grid** and choose the pane and direction. Each pane has its o
 transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
-screen; drafts and terminal connections survive view changes. Shared-session
-terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
+screen; drafts and terminal connections survive view changes.
+Render failures in one chat or terminal show **Try again** in that view while
+cell controls, the other view and neighboring sessions stay usable. Clear the
+fault and retry to recover.
+Shared-session terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
 for additional controls; close a pane to expand its neighbor. Closing down to
 one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects and Pinned, or use
 their `/grid/<id>` URL on the same desktop browser. All sessions in the open grid
@@ -200,9 +232,15 @@ Quoted replies recover as serialized text.
 **Import:** open Settings → Import sessions, or choose **Import your recent
 sessions** on the empty landing. Choose a machine, harness, and recent count
 or session ID. After starting, go Back to the session list; its heading shows
-progress and links back to Settings. Imported sessions appear in the normal list.
+progress and links back to Settings. Imported sessions appear in the normal list,
+except Codex threads archived in Codex, which land in Archived, so the list can
+show fewer sessions than the import count.
 On phones, the progress link opens the Import panel directly; its header arrow
 returns to the Settings menu.
+For a local Pi session, the CLI also accepts
+`omnigent import --harness pi --session <id> --server <url>`.
+Open the imported session and choose a host and working directory to resume it,
+then continue from Chat or Terminal.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
@@ -210,6 +248,11 @@ session), archive or unarchive, and delete.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
+
+**Project folder sessions:** expand a project with more than five sessions,
+then click Show more under its rows. Opening one of its older sessions from
+the ⌘K / Ctrl+K palette or a link also lists down to that session, once the
+sidebar has loaded it.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -239,6 +282,14 @@ agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
 
+**Sandbox fork repositories:** from the header menu, sidebar row menu,
+right-click menu, or a message's Fork action, choose a sandbox destination. The
+repository list appears directly in the dialog with the source's repositories
+preselected. Search connected GitHub repositories or paste a repository URL,
+choose a branch for each, and remove any repositories the clone does not need.
+Removing every repository starts an empty sandbox. The phone header's Fork
+action offers the same choices.
+
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
 "No, archive only" and "Yes, delete worktree", plus Remember my choice.
@@ -260,13 +311,18 @@ when the live lookup has none, with its age once that state is over five
 minutes old. With the flag off, the funnel sits on the Sessions header and
 offers Display only.
 
-**Offline pull requests:** link a PR to a session, then stop its host. The
-session's Pull Requests tab still lists the PR with its title, link, and status,
-plus "Last sync time" and a note to reconnect the host (or, for a sleeping
-sandbox, to send a message). Link a PR is disabled; Unlink PR still works, and
-the server keeps the unlink. A session whose PRs the server hasn't imported yet
-says so instead. Against servers that predate stored PRs, the tab behaves as it
-did before and unlinking needs the host.
+**Offline pull requests:** link PRs to a session, then stop its host. Open the
+Pull Requests tab from the Workspace rail or composer (desktop and mobile).
+On phones, Refresh and Link sit beside Close in the single drawer header;
+in details, the header title becomes the back-to-list button.
+The list retains stored titles and status pills; each row shows **Host offline**
+(or **Sandbox asleep**) instead of checks and Merge. Hover or focus that notice
+for the last sync time and reconnect guidance. Click a row for its stored summary,
+then **All pull requests** to return. The row menu can open, copy, or unlink the
+PR while offline; linking needs the host. Reconnect and verify live checks and
+merge controls return. Unlink the last PR and verify it stays absent after refresh.
+A session not yet imported to the server says so. Older servers retain their
+host-dependent unlink behavior.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
@@ -298,7 +354,9 @@ Open a Canvas session outside the loaded sidebar pages to see its current host
 status and live session updates, including when the app is embedded.
 
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
-in the chat; the dialog shows the command for this situation (for example
+in the chat. Its **Clone** tab uses the shared fork form, including the searchable
+sandbox-profile picker and source-profile default for participating providers.
+The dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
 when a local session is stranded). In the desktop app, **Reconnect host** acts
 directly for this machine or a recognized Arca host; Arca's connect console
@@ -382,6 +440,13 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
+With Settings → General → **Open sub-agents in the Workspace panel** on, a
+plain click on a sub-agent (transcript link, composer indicator, Agents row or
+graph node) opens it as a tab in the same strip, marked with a bot icon, and
+reveals the panel; ancestors still open full screen. The tab's **Open full
+screen** link opens the sub-agent's own page. Claude Code and closed sub-agents
+are read-only there too. Closing a sub-agent tab only hides it; the sub-agent
+keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
@@ -393,7 +458,8 @@ session's skills: `/help` is answered locally and a recognised skill runs
 in-process through `slash_command`; a native terminal side chat shows no menu
 and forwards slash text to the vendor TUI.
 
-**Side-chat settings:** open an unsent side chat from the Workspace menu,
+**Side-chat settings:** for harnesses other than native Codex, open an unsent
+side chat from the Workspace menu,
 composer add tray, or Ask in side chat. Before sending, open the model pill
 beside the microphone, open its configuration row, and select a model or effort.
 Switch tabs and return to confirm the draft keeps the choice. Send the first
@@ -407,8 +473,12 @@ If the native session's model list is empty, the picker uses the same host
 catalog as the main composer until the session's list arrives.
 Available choices follow the harness's capabilities; viewers and closed chats
 cannot change them. A failed start keeps the draft and selections for retry
-without changing the parent's settings. Native Codex retains its existing
-side-thread flow and does not expose these controls; it is a separate follow-up.
+without changing the parent's settings. Native Codex shows these controls only
+once the side-chat child exists, when both server and runner support them.
+The first message uses the existing native fork flow and inherited settings;
+later model and effort changes apply to the child's next turn. Native Codex
+requires a concrete model selection; model-reset aliases are rejected without
+saving changes. Effort can still be reset to the selected model's default.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -461,6 +531,11 @@ plain `uv run pytest`, which starts a private server for the test.
   Layout combinations and malformed local storage have unit coverage in
   `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
   `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
+  Per-view render recovery, preserved neighboring drafts, usable cell controls
+  and independent chat/terminal retry have component coverage in
+  `web/src/grid/GridSessionPane.test.tsx`. To check manually, inject a render
+  exception into one chat or terminal, confirm the other views stay usable,
+  clear the fault, and choose **Try again** in the failed view.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
@@ -542,6 +617,17 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`.
   Its SDK-to-SDK target is a built-in agent that only the test's own server
   loads; run it with plain `uv run pytest` so that target is available.
+- **`fork-sandbox-repositories`, header, message, sidebar row, right-click, and phone header:**
+  `tests/browser_ui/chat/test_fork_sandbox_repositories.py::test_sandbox_fork_edits_multiple_repositories_and_branches`
+  runs without a repro instance using `uv run pytest <test>
+--browser-ui-skip-build --video=on --output=<evidence-directory>`.
+  Each entry checks current-branch prefilling and the unpushed-branch fallback.
+  Desktop and phone header variants remove a repo, search for another, choose
+  independent branches, and check the fork request and navigation. The message
+  variant submits the inherited selection and checks the history cutoff; sidebar
+  variants stop after opening and checking the prefill. The built SPA uses mocked
+  sandbox and GitHub responses and advertises support for editable fork workspaces;
+  this proves browser behavior and the submitted payload, not sandbox provisioning.
 - **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
   `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
   runs without a repro instance using `uv run pytest <test>
@@ -596,6 +682,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`clone`:**
   `tests/e2e_ui/sessions/test_clone_session.py::test_clone_session_copies_transcript_and_navigates`,
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`
+  Closing mid-clone has component coverage in `web/src/shell/ForkSessionDialog.test.tsx`
+  (`clone outliving its form`). To drive it by hand, delay `POST …/fork` in the
+  browser, close the dialog after Clone, and expect a toast whose **Open** opens the clone.
 - **`unsupported-sandbox-actions`:**
   `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_fork_and_switch_host_disabled`
   covers the header, sidebar context menu, message action, and composer host menu
@@ -716,7 +805,11 @@ plain `uv run pytest`, which starts a private server for the test.
   session APIs, including fork-time draft settings and later child-only updates.
   `web/src/components/chat/SideChatSettings.test.tsx`
   covers explicit child targeting, compatible effort choices, rejected updates,
-  harness capabilities, and viewer/closed states.
+  harness capabilities, parent-runner reconnect recovery, and viewer/closed states.
+  `tests/server/integration/test_sessions_child_sessions.py::test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn`
+  covers a parent whose live reported model differs from its saved web selection:
+  an untouched child follow-up retains the live model. It also checks that model
+  reset aliases fail without changing the saved model or effort.
 - **`side-chat-quotes`, desktop Ask in side chat and Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
   checks pending/live tab reuse, interleaved comments, pasted images, and replies
@@ -737,11 +830,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory
   picker. Session metadata and message dispatch are mocked.
-- **`side-chat-lifecycle`, native Codex:**
+- **`side-chat-lifecycle`, `side-chat-settings`, native Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   drives a real Codex CLI and app-server with scripted model replies. It checks
   inherited context in the model request, isolated follow-ups, and a parent
-  that stays usable after closing its side chat.
+  that stays usable after closing its side chat. Desktop/mobile variants create
+  a side chat through the Workspace menu or `/side`, then change its model and
+  effort before a follow-up. Scripted provider requests verify the actual model
+  switch, inherited context, effort reset and unchanged parent settings.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,
@@ -807,6 +903,20 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
+  covers the shared host picker with Claude. For Pi checkpoint conversion, run
+  `tests/test_session_import.py::test_pi_import_retains_compaction_for_resume`
+  with retries disabled; it covers legacy/current formats, retained tool pairs,
+  images and missing boundaries. Imported images remain in readable history;
+  resume snapshots use the same text-only representation as live Pi checkpoints.
+  This is component coverage, not a running Pi session.
+  For real Pi acceptance, create a session with enough history to compact,
+  compact it, then add another turn. Import it using the CLI and Settings
+  (exact ID and recent sessions), and check duplicate imports remain a single
+  session. Resume onto an isolated host and send from both Chat and Terminal.
+  Check that the full imported history remains readable and the original file
+  is unchanged. With a recording provider, verify that the outgoing context
+  contains the summary, retained context and later turns, omitting summarized
+  raw turns. Record the Pi version and mock/live provider scope separately.
 - **`recent-switcher` (manual Electron):** open at least six sessions, hold
   Control and press Tab to show the five most recent, cycle with Tab and
   Shift+Tab, release Control to switch, then reopen and press Escape to cancel.
@@ -894,6 +1004,16 @@ plain `uv run pytest`, which starts a private server for the test.
   (enable the flag by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
+- **`project-show-more`:** no browser test drives it. Component tests in
+  `web/src/shell/Sidebar.test.tsx` ("Sidebar project Show more") cover paging,
+  the next server page, the slide and its reduced-motion skip, the open-session
+  reveal, row-menu filing leaving the listed rows as they are, the
+  hidden-session badge, and the ⌘[ / ⌘] hotkey;
+  `web/src/shell/Sidebar.shiftSelect.test.tsx` covers shift ranges, bulk
+  actions, and bulk filing. By hand: create a project
+  (`POST /v1/projects`), file six or more sessions into it with
+  `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
+  orders them, then expand the folder and click Show more.
 
 ## Gotchas
 

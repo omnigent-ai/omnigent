@@ -71,7 +71,7 @@ def pytest_configure(config: pytest.Config) -> None:
             "browser windows are only allowed for local debugging."
         )
     _isolate_config_home(config)
-    _isolate_playwright_output(config)
+    isolate_playwright_output(config)
 
 
 # Run after the root conftest reaps leaked processes that may still use this home.
@@ -121,7 +121,7 @@ def _isolate_config_home(config: pytest.Config) -> None:
     config.stash[_CONFIG_HOME_KEY] = (home, originals)
 
 
-def _isolate_playwright_output(config: pytest.Config) -> None:
+def isolate_playwright_output(config: pytest.Config) -> None:
     """Keep each xdist worker's Playwright artifacts in its own directory.
 
     pytest-playwright clears ``--output`` when every worker's session starts, so

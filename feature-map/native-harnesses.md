@@ -10,6 +10,21 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
+- `picker-curation`: server config `restrict_to_agent_names` limits and orders
+  what New Chat offers, and `default_agent_name` pre-selects one for a user
+  with no remembered pick. Curated, the menu is one flat list with no Harnesses
+  heading, no "Other..." submenus, no "Create custom agent" entry and no Smart
+  Routing entry; a name matching nothing shows an empty state and logs at
+  startup, while a failed agent fetch says so rather than blaming the
+  deployment. A returning user's cached picker stays closed while `/v1/info` is
+  pending, including behind the embedded app's offline stand-in, so the full
+  roster never shows ahead of the curation (a failed probe falls back to the
+  uncurated picker); "Hide unconfigured harnesses" and the per-entry hides in
+  Settings > Appearance apply to the curated list too. A remembered pick the curation drops falls back to the
+  configured default carrying that agent's own brain harness, never the
+  rejected agent's, and a project's configured agent outside the curation is
+  reported unavailable until the user picks an offered one. Display only,
+  and New Chat only: the scheduled-task and project-settings pickers are untouched.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
@@ -46,16 +61,23 @@ implements them separately, so a fix for one harness does not reach the others.
 - `isaac-credential-detection`: harness setup offers Isaac when host-side
   Databricks detection finds a matching credential, and fails open for older
   hosts or servers that cannot report detection results.
+- `picker-entry-visibility`: the user hides individual harnesses and agents from
+  every agent picker (new chat, automation, project default) in Settings →
+  Appearance, per device. Independent of the readiness filter above, which only
+  drops rows that cannot launch.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
   composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
   the answer reaches the harness.
+- `devin-questions`: Devin's native question picker appears in Chat and Inbox;
+  selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
-  when rebuilding tool results, as required by Gemini. Unmatched outputs become
+  when rebuilding tool results, as required by Gemini. Results stay after their
+  calls, ahead of messages sent while a tool ran. Unmatched outputs become
   labeled recovery text so missing calls do not block continuation.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
@@ -74,6 +96,8 @@ implements them separately, so a fix for one harness does not reach the others.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
+- `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
+  composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `idle-reap`: a finished native pane left alone past the idle window closes
@@ -134,8 +158,27 @@ Chat session as well as the local terminal.
 from Chat or type it into the native Pi terminal. Follow a completed tool call
 with a question about its result; verify the routed model and retained history.
 
+**Pi model and effort changes:** in an existing session, select Medium, switch
+to a non-reasoning model, then to a reasoning model from another family. Send
+immediately from Chat and repeat from Terminal. Verify the target request uses
+Medium and retains earlier conversation text. Repeat with a later effort change
+while the model switch is pending; the latest choice must win. With no explicit
+session effort, Pi keeps its native defaults. Component coverage:
+`tests/runner/test_app_sessions_native_events_lifecycle.py::test_events_model_change_on_pi_native_enqueues_bridge_model_change`
+and
+`tests/harnesses/pi_native/test_pi_native_extension.py::test_input_waits_for_inbox_model_change_to_settle`.
+Real-provider history compatibility requires a separate live check.
+
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Picker visibility:** open Settings → Appearance → **Show in agent pickers**.
+The row summarizes what is shown ("Showing 15 of 17. Hidden: …"). Press
+**Edit**, filter the checklist and uncheck an entry, or press **Show all** to
+restore them. The entry drops from the New Chat, New automation and
+project-default pickers. This is the user's own per-device choice, unlike "Hide
+unconfigured harnesses" next to it, which only drops rows that cannot launch on
+the selected host.
 
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
@@ -152,6 +195,11 @@ before entering the harness menu. Then start a new CLI or web session.
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices.
+
+**Devin questions:** start Devin from the CLI or the new-session picker and ask
+it to use `ask_user_question` with selectable options. Answer in Chat or open Inbox
+to answer there. Reload while a choice is pending, submit it, and confirm Devin
+continues with the answer and the session no longer needs a response.
 
 **Approval links:** open a pending permission's standalone approval link.
 Claude directory requests show the exact directories in Chat, Inbox, and the
@@ -221,7 +269,7 @@ columns name one journey test per harness; "—" means none exists yet.
 | `hermes-native` | `omnigent hermes` | no | tests/e2e_ui/messages/test_native_hermes_render_parity.py::test_native_hermes_message_render_parity | tests/e2e/test_hermes_native_policy_hook_path_e2e.py::test_hermes_native_policy_hook_path_lets_the_tool_run | — |
 | `kimi-native` | `omnigent kimi` | no | — | tests/e2e/test_kimi_native_steering_e2e.py::test_midturn_steer_is_applied_not_queued | — |
 | `kiro-native` | `omnigent kiro` | no | tests/e2e_ui/messages/test_native_kiro_render_parity.py::test_native_kiro_message_render_parity | tests/e2e/test_kiro_native_cli_e2e.py::test_kiro_native_cli_smoke | — |
-| `opencode-native` | `omnigent opencode` | no | — | tests/e2e/test_opencode_native_startup_cancel_leak_e2e.py::test_opencode_native_startup_cancel_reaps_serve | — |
+| `opencode-native` | `omnigent opencode` | no | — | tests/e2e/test_host_opencode_native_mock_e2e.py::test_reply_reaches_the_bound_mock_and_renders_once | — |
 | `pi-native` | `omnigent pi` | no | — | tests/e2e/test_pi_native_send_now_steer_e2e.py::test_pi_native_send_now_steers_into_active_turn | [pi-native-e2e-dev](../.claude/skills/pi-native-e2e-dev/SKILL.md) |
 | `qwen-native` | `omnigent qwen` | no | — | tests/e2e/test_qwen_native_subagent_wake_e2e.py::test_qwen_native_subagent_completion_wakes_parent | — |
 
@@ -390,7 +438,8 @@ Cross-harness journeys:
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
   model context, distinct native threads on one runner, transcript isolation,
-  follow-ups, and a working parent after side-chat closure.
+  follow-ups that switch model and effort on the same thread, and a working
+  parent after side-chat closure.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus
@@ -406,6 +455,14 @@ Cross-harness journeys:
   response contract is covered by
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
+- **`picker-curation`:** `tests/server/test_server_config.py` (parsing),
+  `tests/server/test_app.py` (the `/v1/info` block and the startup warning),
+  `web/src/lib/capabilities.test.ts` (probe parsing),
+  the "curated New Chat picker" cases in `web/src/shell/AgentHarnessPicker.test.tsx`
+  (menu shape) and the
+  "picker curation" cases in `web/src/shell/NewChatDialog.test.tsx` (default
+  pre-selection, remembered picks and the empty state in the real landing
+  flow). Set the two keys in the server config, restart, and open New Chat.
 - **`needs-auth`:**
   `web/src/pages/settings/SettingsHarnessesSection.test.tsx` covers the
   flag-gated credential warning card, its Reconfigure affordance, and full-card click.
@@ -435,6 +492,16 @@ Cross-harness journeys:
   a newer same-value model write and its effort while the applied model stays
   unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
   These cases do not cover live providers or a post-refusal retry.
+- **`picker-entry-visibility`:**
+  `web/src/shell/AgentHarnessPicker.test.tsx` covers the picker rows a hidden
+  entry drops and when the picker points at Settings,
+  `web/src/pages/settings/PickerVisibilitySetting.test.tsx` the Settings
+  summary, checklist, **Show all** and a failed catalog load,
+  `web/src/lib/pickerEntryVisibility.test.ts`
+  the stored set, `web/src/lib/settingsPortability.test.ts` export and import,
+  `web/src/hooks/useAvailableAgents.test.tsx` (`useAgentCatalog`) the Settings
+  list's agents, and `web/src/lib/agentGrouping.test.ts` that Settings and the
+  picker group an entry the same way.
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal
@@ -622,12 +689,48 @@ Cross-harness journeys:
   terminal. Check retained history and cumulative input usage 1,000 → 1,100 →
   1,200. The provider replies and usage are scripted; this does not prove live
   billing or recovery after the runner deletes the bridge directory.
+- **`resume`, Pi compaction → restart → continuation → fork (own environment):**
+  `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_compacted_restart_then_fork`
+  runs parallel file reads and two actual Pi compactions through the API, then
+  replaces the native Pi process. Separate cases keep the runner, abruptly
+  replace the runner while its idle native pane is still alive, or remove native
+  history before relaunch. Preserved files retain their checkpoint. Missing-file
+  reconstruction and forks restore the shared compaction snapshot: Pi's summary,
+  retained tool-call/result pairs and subsequent turns, stored text-only, like
+  live forwarding, in the item shapes other harnesses replay. The parent
+  transcript stays unchanged; resume keeps its native identity and forks mint
+  one.
+  Incomplete or unsupported snapshots use a meaningful summary and preserve turns
+  after its recorded boundary, including turns before the checkpoint itself.
+  If that boundary is unavailable, or only a compaction notice is available
+  (such as an opaque Codex or Claude hook checkpoint), keep the full history.
+  A scripted provider enforces the same 16,384 serialized-message-byte limit from
+  the first request. Continuation, reconstruction and fork must fit it without
+  resurrecting summarized reads or duplicating retained tools/replies.
+  Artifacts include full provider payloads, server transcripts, native JSONL and
+  genuine tmux text captures. This tests a bounded synthetic capacity limit,
+  not vendor token limits or model recall. The retention setting is deliberately
+  small; large production histories remain unvalidated. Older sessions compacted
+  before checkpoint persistence have no server snapshot until another compaction;
+  losing their native files still requires full-transcript reconstruction.
+  There is no startup backfill. Live gateways, browser controls, sandboxing,
+  automatic-compaction triggering and active-turn loss are not covered here.
 - **`resume`, Pi user setup (own environment):**
   `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` drives native startup
   and process resume through the server/host/runner. User skills/extensions and
   relative settings must survive relocation of the agent root, including a
   relative custom root. Existing context/prompt opt-outs remain independent.
   This is not Claude marketplace or Managed deployment coverage.
+- **`auth-recovery`, Pi token commands (component/process boundaries):**
+  With a positive configured auth refresh interval, warm and renew tokens in the
+  session workspace, even when the runner starts elsewhere. Relative token files
+  must keep working after renewal. Discard caches created in another directory
+  or before directory tracking was added.
+  `tests/runner/test_app_pi_native_model.py::test_auto_create_pi_terminal_threads_spec_model_into_models_json`
+  drives startup and renewal with real helpers and a stubbed terminal launcher;
+  `tests/harnesses/pi_native/test_pi_native_auth_refresh.py` covers cache rejection,
+  failed refreshes and cleanup. These checks do not establish browser, sandbox
+  or live-gateway acceptance.
 - **`resume`, Pi cost reporting (component boundaries):**
   `tests/harnesses/pi_native/test_pi_native_extension.py` exercises Pi-reported
   dollars, duplicate callbacks, local/server restart baselines and missing pricing.
@@ -665,6 +768,17 @@ Cross-harness journeys:
   uv run --no-sync pytest tests/e2e_ui/approvals/test_pi_extension_ui.py --ui-skip-build --video=on --screenshot=on --reruns 0 -q
   pnpm --filter web test src/components/blocks/ApprovalCard.test.tsx
   ```
+
+- **`devin-questions`:**
+  `tests/e2e_ui/approvals/test_ask_user_question.py::test_devin_question_hook_round_trip_survives_reload`
+  runs the real native hook subprocess with a recorded question shape through
+  the server and browser. Chat and Inbox each restore a pending question after
+  reload, submit the answer in Devin's native input shape, and clear the pending
+  count and sidebar badge. This uses no Devin CLI or live model; a live native
+  session must additionally confirm that the tool consumes the answer and
+  continues. Custom and multiple selections belong in the hook's component
+  coverage. Standalone approval links do not expose the question form; mobile
+  and Managed question journeys remain unverified.
 
 - **`resume`, Claude and Pi provider selection after a runner restart:**
   `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
@@ -727,6 +841,33 @@ Cross-harness journeys:
   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
   prompt must remain a separate user turn outside the assistant's folded work,
   including after reload. This browser contract does not launch the Claude CLI.
+- **`chat-render`, `steer`, Codex shell commands from the web composer:**
+  A standalone `!command` runs in the session's shell. Its pending bubble settles
+  and its output appears below it; attachments, multiple content blocks and `!!`
+  text remain model input. On shared servers, direct Codex shell messages require
+  owner access (`LEVEL_OWNER`), including API and automated messages. Codex runs
+  these commands as the host process user, outside its thread sandbox and
+  model-tool approval path. Collaborators with edit access can still send model
+  prompts. Each shell delivery carries trusted owner authorization from the
+  server, bound to the exact command at runner ingress. An older server cannot
+  authorize direct shell execution: the runner reports an undelivered upgrade
+  error and preserves the native session.
+  `tests/e2e_ui/messages/test_native_codex_shell_input.py::test_web_shell_input_runs_in_codex_shell_not_as_prompt`
+  covers both a first message and an existing session, including rendered output.
+  Run it through the repro environment with `--ui-skip-build --video=on` after
+  building the SPA. It requires real Codex and tmux with the mock model provider.
+  `tests/e2e/test_codex_native_shell_followup_e2e.py::test_web_prompt_during_standalone_shell_gets_model_reply`
+  (own environment; real server, runner, Codex and tmux, local mock model) checks
+  that a prompt sent during the command receives an answer after it finishes,
+  and that an unresolved submission with no running command allows the next
+  question through without resubmitting the shell command.
+  `tests/e2e/test_codex_native_shell_followup_e2e.py::test_editor_bang_input_cannot_execute_through_an_older_server`
+  covers editor rejection and ordinary-prompt recovery with current peers or an
+  older server selected by `OMNIGENT_COMPAT_SERVER_PYTHON`.
+  Manually, send `!echo hi`, expand its output and check for `hi`. Then send
+  `!sleep 5` followed immediately by a question; the question must receive an
+  answer. Upload a text file containing `!echo file-content` with an empty
+  composer and verify that it reaches the model without running a shell command.
 - **`codex-plugin-skills`:** use the
   [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
   real CLI catalog regression and recorded browser journey across both
@@ -789,17 +930,37 @@ Cross-harness journeys:
   interrupts through the runner's real event route, and the next idle settles
   a sub-agent dispatch as cancelled with its output.
   `tests/runner/test_native_interrupt_runner.py::test_opencode_interrupt_fallbacks`
-  covers missing native session state and a failed abort. Neither runs
-  OpenCode. With the CLI on `PATH`,
-  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`
-  (opt-in `OMNIGENT_E2E_OPENCODE_NATIVE=1`) checks the abort call against a
-  real server, and the matrix test covers cancelling during startup. No test
-  interrupts a running OpenCode turn: configure an OpenAI-compatible loopback
-  provider that holds the reply open, interrupt once the request arrives, then
-  confirm the session goes idle without turning busy again, a reply released
-  afterwards never appears, and a follow-up in the same session completes. The
-  harness bench does not register opencode-native, so its interrupt probe does
-  not apply.
+  covers missing native session state and a failed interrupt. Neither runs
+  OpenCode. With OpenCode 2.0.x on `PATH`,
+  `tests/e2e/test_host_opencode_native_mock_e2e.py::test_interrupt_settles_a_held_reply_and_the_next_turn_works`
+  interrupts a running turn while the scripted model holds its reply, checks
+  the session stays idle and the released reply never appears, then completes
+  a follow-up. The harness bench does not register opencode-native, so its
+  interrupt probe does not apply.
+- **opencode-native journeys (own environment, scripted model):** needs
+  `@opencode/cli` 2.0.18–2.0.x and tmux on `PATH`, in e2e mock mode:
+  `uv run --no-sync pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v`.
+  An isolated host binds `opencode-native` to a chat-wire provider on the mock
+  model server, so each test scripts its replies and checks the request the
+  mock received: reply and routing (`launch-web`), shell approval allow with the
+  tool output in the next request and deny (`approvals`), interrupt, model
+  switch (`model-and-effort`), fork, and `/compact`. For `cleanup`,
+  `tests/e2e/test_opencode_native_startup_cancel_leak_e2e.py::test_opencode_native_startup_cancel_reaps_serve`
+  (Linux only) cancels a session during startup and checks its `opencode serve`
+  is reaped. CI runs these, the wire-contract test and the OpenCode import e2e in
+  the `E2E Harness (opencode)` job, which installs the pinned CLI and sets
+  `OMNIGENT_E2E_OPENCODE_REQUIRED=1` so a missing or unsupported CLI fails rather
+  than skips; the sharded E2E lane skips them. The wire-contract test,
+  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`,
+  checks the API contract without credentials. Live-model checks remain opt-in
+  (`OMNIGENT_E2E_OPENCODE_NATIVE=1`): `tests/e2e/test_host_opencode_native_e2e.py`
+  on OpenCode's free model for multi-delta streaming and import from the user's
+  store. The browser question form
+  (`interactive-input`) is
+  `tests/e2e_ui/approvals/test_opencode_question.py::test_opencode_question_round_trips_through_web`,
+  which feeds the forwarder a form event without running OpenCode. Not covered
+  by any of these: catch-up after the server's event stream drops (component
+  tests replay captured events), images, and steering into a running turn.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.
@@ -915,9 +1076,9 @@ persistence deduplication. These checks do not establish desktop rendering parit
 
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
-and duplicate results, plus missing calls and outputs arriving across user turns.
-Unmatched outputs retain their content as labeled, untrusted tool data without inventing a call;
-same-turn results retain their names and pairing. The existing
+and duplicate results, results stored after a message sent during their call,
+missing calls, and calls, including interrupted or malformed ones, that reuse an earlier call's id. Unmatched outputs retain their content as labeled, untrusted
+tool data without inventing a call; matched results retain their names and pairing. The existing
 `tests/e2e/test_pi_native_resume_duplicate_tool_result_e2e.py::test_cold_resume_does_not_replay_duplicate_tool_result`
 checks real server/runner serialization with a stub Pi process.
 `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent`
@@ -925,6 +1086,9 @@ uses real Pi with scripted providers: an Anthropic tool turn forks onto Anthropi
 or OpenAI Responses with an unmatched stored output. The Responses case also
 stops Pi, removes its isolated local history file and cold-resumes. Both retain
 parallel results and recovery text, and the follow-up succeeds.
+`tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_cold_resume_keeps_result_before_message_sent_during_tool`
+steers a message into a running real Pi `bash` call, then cold-resumes; the provider
+receives the real result before that message instead of a synthetic missing result.
 
 For a manual check, fork an affected session onto a Responses model and send a
 follow-up; expect retained output without an orphan-call HTTP 400. Reload Chat
@@ -971,6 +1135,13 @@ checks do not prove live providers, browser rendering or thought-signature parit
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
-- OpenCode accepts an abort even when nothing is running, so an accepted
-  interrupt does not prove a turn was stopped. Check the session state and the
-  model request instead.
+- OpenCode answers an interrupt even when nothing is running, and Stop returns
+  success either way, so an accepted interrupt does not prove a turn was
+  stopped. Check the session state and the model request instead.
+- OpenCode's scripted journeys bind the harness to the mock in their own
+  host's config. Do not add that binding to the shared verification instance:
+  any inference binding changes how the runner builds every harness's spec,
+  so Claude and Codex runs there would no longer match production defaults.
+- Script OpenCode replies to require the turn's tools, as the mock suite does.
+  A tool-less request to the same model (for example a session title) could
+  otherwise consume the turn's reply.
