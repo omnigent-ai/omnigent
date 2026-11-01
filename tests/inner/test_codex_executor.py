@@ -4395,6 +4395,41 @@ async def test_app_server_starts_when_windows_chmod_leaves_codex_home_writable(
     assert not codex_home.exists()
 
 
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="requires POSIX uids")
+async def test_app_server_rejects_codex_home_chmod_cannot_make_private_on_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With POSIX uids, an unsigned session still requires a 0o700 home."""
+    real_chmod = os.chmod
+
+    def _chmod_leaving_dirs_writable(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+        real_chmod(path, 0o777 if os.path.isdir(path) else mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", _chmod_leaving_dirs_writable)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spawn = AsyncMock(return_value=_FakeProcess())
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(workspace),
+        env={},
+        tool_executor=None,
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+
+    with (
+        patch("omnigent.inner.codex_executor._create_subprocess_exec", new=spawn),
+        pytest.raises(OSError, match="unsafe signer CODEX_HOME"),
+    ):
+        await session.start()
+
+    spawn.assert_not_called()
+    assert not list(tmp_path.rglob("omnigent-codex-home-*"))
+
+
 def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
