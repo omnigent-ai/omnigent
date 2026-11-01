@@ -356,6 +356,13 @@ labels do not establish what the screen displayed. Describe icon-only controls
 by their visible appearance. If frame inspection is unavailable, disclose that
 and limit claims to states the recording driver actually verified.
 
+A driver check covers only the element it targets. The screen can show one
+state in several places: a session's activity appears as the chat pane's
+working indicator, a spinner on its sidebar row, and a sub-agent count badge.
+An absence check on the chat pane's indicator supports "the chat pane shows no
+working indicator", not "the session shows no activity". Check every such place
+before claiming that none shows the state.
+
 ### Timed captions inside the video
 
 For every newly captured clip, **burn in step-by-step captions before declaring

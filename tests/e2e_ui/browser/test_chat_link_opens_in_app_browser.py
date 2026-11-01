@@ -24,13 +24,20 @@ _NOOP_SUBSCRIPTIONS = ", ".join(
         "onBrowserViewCreated",
         "onBrowserHostActiveChanged",
         "onBrowserViewClosed",
-        "onBrowserUrlChanged",
         "onBrowserNavState",
     )
 )
 _SHELL_STUB = f"""
 window.__calls = [];
 window.__views = {{}};
+window.__titles = {{}};
+window.__urlListeners = new Set();
+window.__emitBrowserMetadata = (conversationId, title) => {{
+  window.__titles[conversationId] = title;
+  for (const callback of window.__urlListeners) {{
+    callback({{ conversationId, url: window.__views[conversationId], title }});
+  }}
+}};
 window.omnigentDesktop = {{
   kind: "electron",
   setBadgeCount() {{}},
@@ -41,11 +48,20 @@ window.omnigentDesktop = {{
   browserHasView: (conversationId) => Promise.resolve({{
     exists: conversationId in window.__views,
     url: window.__views[conversationId],
+    title: window.__titles[conversationId],
   }}),
   browserOpenOrNavigate(conversationId, url) {{
     window.__calls.push({{ conversationId, url }});
     window.__views[conversationId] = url;
+    window.__titles[conversationId] = {{
+      "{LINK_URL}": "Product docs",
+      "{SECOND_LINK_URL}": "Release notes",
+    }}[url] ?? "";
     return Promise.resolve({{ ok: true, created: true }});
+  }},
+  onBrowserUrlChanged(callback) {{
+    window.__urlListeners.add(callback);
+    return () => window.__urlListeners.delete(callback);
   }},
   {_NOOP_SUBSCRIPTIONS},
 }};
@@ -53,7 +69,7 @@ window.omnigentDesktop = {{
 
 
 def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[str, str]) -> None:
-    """Opted-in links reuse matching tabs; distinct URLs open independently."""
+    """Opted-in links reuse titled tabs and update labels for background pages."""
     base_url, session_id = seeded_session
     seed_committed_turn(
         session_id,
@@ -85,9 +101,9 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
     page.wait_for_function("window.__calls.length === 1")
     first_view = page.evaluate("window.__calls[0].conversationId")
     rail = page.get_by_role("complementary", name="Workspace")
-    first_tab = rail.get_by_role("tab", name="Browser 1", exact=True)
+    first_tab = rail.get_by_role("tab", name="Product docs", exact=True)
     expect(first_tab).to_have_attribute("aria-selected", "true")
-    expect(rail.get_by_role("button", name="Close Browser 1", exact=True)).to_be_visible()
+    expect(rail.get_by_role("button", name="Close Product docs", exact=True)).to_be_visible()
     expect(rail.get_by_placeholder("Enter a URL")).to_have_value(LINK_URL)
     expect(page).not_to_have_url(re.compile("file="))
 
@@ -95,23 +111,36 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
     page.get_by_role("link", name="Release notes", exact=True).click()
     page.wait_for_function("window.__calls.length === 2")
     second_view = page.evaluate("window.__calls[1].conversationId")
-    second_tab = rail.get_by_role("tab", name="Browser 2", exact=True)
+    second_tab = rail.get_by_role("tab", name="Release notes", exact=True)
     expect(second_tab).to_have_attribute("aria-selected", "true")
     expect(first_tab).to_have_attribute("aria-selected", "false")
     expect(rail.get_by_placeholder("Enter a URL")).to_have_value(SECOND_LINK_URL)
+
+    # A background page can rename its tab without selecting it.
+    page.evaluate("id => window.__emitBrowserMetadata(id, 'Product docs updated')", first_view)
+    first_tab = rail.get_by_role("tab", name="Product docs updated", exact=True)
+    expect(first_tab).to_have_attribute("aria-selected", "false")
+    expect(second_tab).to_have_attribute("aria-selected", "true")
+    expect(
+        rail.get_by_role("button", name="Close Product docs updated", exact=True)
+    ).to_be_visible()
 
     # Reopening the first URL selects its existing tab without reloading the page.
     link.click(modifiers=["ControlOrMeta"])
     expect(first_tab).to_have_attribute("aria-selected", "true")
     expect(second_tab).to_have_attribute("aria-selected", "false")
-    expect(rail.get_by_role("tab", name=re.compile(r"^Browser"))).to_have_count(2)
+    expect(
+        rail.get_by_role("tab", name=re.compile(r"^(Product docs|Release notes)"))
+    ).to_have_count(2)
     expect(rail.get_by_placeholder("Enter a URL")).to_have_value(LINK_URL)
     assert page.evaluate("window.__calls.length") == 2
 
     second_tab.click()
     link.click()
     expect(first_tab).to_have_attribute("aria-selected", "true")
-    expect(rail.get_by_role("tab", name=re.compile(r"^Browser"))).to_have_count(2)
+    expect(
+        rail.get_by_role("tab", name=re.compile(r"^(Product docs|Release notes)"))
+    ).to_have_count(2)
     expect(rail.get_by_placeholder("Enter a URL")).to_have_value(LINK_URL)
     assert page.evaluate("window.__calls.length") == 2
 
@@ -119,7 +148,12 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
     page.get_by_role("link", name="API guide", exact=True).click(modifiers=["ControlOrMeta"])
     page.wait_for_function("window.__calls.length === 3")
     third_view = page.evaluate("window.__calls[2].conversationId")
-    expect(rail.get_by_role("tab", name="Browser 3", exact=True)).to_have_attribute(
+    # Until the page supplies a title, its hostname identifies the tab.
+    expect(rail.get_by_role("tab", name="127.0.0.1", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    page.evaluate("id => window.__emitBrowserMetadata(id, 'API guide')", third_view)
+    expect(rail.get_by_role("tab", name="API guide", exact=True)).to_have_attribute(
         "aria-selected", "true"
     )
     assert len({first_view, second_view, third_view}) == 3

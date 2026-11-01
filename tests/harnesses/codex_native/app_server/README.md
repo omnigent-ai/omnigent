@@ -6,6 +6,7 @@ parameterization produces additional collected cases.
 
 | Module | Behavior | Test definitions |
 | --- | --- | ---: |
+| [test_backfill_lease.py](test_backfill_lease.py) | Backfill lease recovery | 5 |
 | [test_catalog_cache.py](test_catalog_cache.py) | Catalog cache | 16 |
 | [test_catalog_resolution.py](test_catalog_resolution.py) | Catalog resolution | 5 |
 | [test_client.py](test_client.py) | Client | 7 |
