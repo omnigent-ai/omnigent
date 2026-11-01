@@ -456,6 +456,17 @@ describe("index.css native transcript top padding", () => {
   });
 });
 
+describe("index.css native fold-row snap", () => {
+  it("snaps Worked for rows below the inset-aware top fade on both native shells", () => {
+    const snaps = cssBlocks.filter(([block]) =>
+      block.includes("scroll-margin-top: calc(88px + var(--omnigent-inset-top))"),
+    );
+    expect(snaps.map(([block]) => selectorOf(block).replace(/\s+/g, " "))).toEqual([
+      ":is([data-ios-native], [data-android-native]) .turn-fold-row",
+    ]);
+  });
+});
+
 describe("index.css native Settings status bar", () => {
   const ruleFor = (selector: string) =>
     cssBlocks.find(([block]) => selectorOf(block).replace(/\s+/g, " ") === selector);

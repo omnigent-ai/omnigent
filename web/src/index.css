@@ -1539,7 +1539,7 @@ html[data-electron-mac] .breadcrumb-folder {
   padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
 }
 
-[data-ios-native] .turn-fold-row {
+:is([data-ios-native], [data-android-native]) .turn-fold-row {
   scroll-margin-top: calc(88px + var(--omnigent-inset-top));
 }
 
