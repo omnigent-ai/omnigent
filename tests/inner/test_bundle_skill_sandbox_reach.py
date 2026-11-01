@@ -149,7 +149,7 @@ async def test_sys_terminal_and_native_terminals_pass_the_agents_skill_directori
     import json
 
     from omnigent.inner.datamodel import TerminalEnvSpec
-    from omnigent.runner.native.orchestration import _agent_skill_roots
+    from omnigent.runner.native import _agent_skill_root_kwargs
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools.base import ToolContext
     from omnigent.tools.builtins.sys_terminal import SysTerminalLaunchTool
@@ -177,8 +177,8 @@ async def test_sys_terminal_and_native_terminals_pass_the_agents_skill_directori
     assert "launch failed" in json.loads(raw)["error"]
     assert seen == [[skill.skill_dir]]
 
-    # The runner's native terminals forward the agent's skill directories too.
-    assert _agent_skill_roots(agent) == [skill.skill_dir]
+    # The runner's native and HTTP terminal launches forward the agent's skill directories too.
+    assert _agent_skill_root_kwargs(agent) == {"additional_read_roots": [skill.skill_dir]}
     resources = SessionResourceRegistry(terminal_registry=registry)
     with pytest.raises(RuntimeError, match="stop after"):
         await resources.launch_auxiliary_terminal(
@@ -186,7 +186,7 @@ async def test_sys_terminal_and_native_terminals_pass_the_agents_skill_directori
             terminal_name="bash",
             session_key="main",
             spec=TerminalEnvSpec(command="bash"),
-            additional_read_roots=_agent_skill_roots(agent),
+            **_agent_skill_root_kwargs(agent),
         )
     assert seen[-1] == [skill.skill_dir]
 

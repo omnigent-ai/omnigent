@@ -47,8 +47,9 @@ def skill_resource_roots(skills: Iterable[SkillSpec]) -> list[Path]:
     """
     roots: list[Path] = []
     for skill in skills:
-        if skill.skill_dir is not None and skill.skill_dir not in roots:
-            roots.append(skill.skill_dir)
+        skill_dir = getattr(skill, "skill_dir", None)
+        if skill_dir is not None and skill_dir not in roots:
+            roots.append(skill_dir)
     return roots
 
 
