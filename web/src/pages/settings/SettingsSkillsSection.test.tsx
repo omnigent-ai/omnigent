@@ -96,6 +96,9 @@ const state = {
   previewGate: null as Promise<void> | null,
   // Scopes triage is installed in, as the source's catalog reports it.
   triageScopes: [] as string[],
+  failUpdate: false,
+  failInstall: false,
+  failContent: false,
 };
 const page = <T,>(data: T[], has_more = false, last_id: string | null = null) => ({
   data,
@@ -126,7 +129,12 @@ function script() {
         page(state.sources, state.moreSources !== null, state.moreSources ? "src-cursor" : null),
       );
     }
-    if (url === "/v1/skill-sources" && method === "POST") return json(source, 201);
+    if (url === "/v1/skill-sources" && method === "POST") {
+      const body = JSON.parse(String(init?.body)) as { source: string; ref?: string };
+      const added = { ...source, id: `src${state.sources.length + 9}`, name: body.source };
+      state.sources = [...state.sources, added];
+      return json(added, 201);
+    }
     if (url === "/v1/skill-sources/src1" && method === "DELETE" && state.failDeleteSource)
       return json({ error: { message: "This source is set in the server config" } }, 403);
     const deleted = url.match(/^\/v1\/skill-sources\/(\w+)$/);
@@ -149,6 +157,8 @@ function script() {
     if (url === "/v1/skill-catalog")
       // A repository directory link: the catalog names the directory it indexed.
       return json({ ...catalog, url: "https://github.com/other/repo.git", path: "team-a" });
+    if (url === "/v1/installed-skills" && method === "POST" && state.failInstall)
+      return json({ error: { message: "Installed skills would exceed 200 MB" } }, 409);
     if (url === "/v1/installed-skills" && method === "POST") {
       const body = JSON.parse(String(init?.body)) as {
         source: string;
@@ -164,8 +174,12 @@ function script() {
       state.installed = state.installed.map((s) => (s.id === "sk1" ? { ...s, enabled } : s));
       return json({ ...review, enabled });
     }
+    if (url === "/v1/installed-skills/sk1/content" && state.failContent)
+      return json({ error: { message: "The stored copy is gone; update or remove it" } }, 404);
     if (url === "/v1/installed-skills/sk1/content")
       return json({ markdown: "---\nname: review\n---\nReview it." });
+    if (url === "/v1/installed-skills/sk1/update" && state.failUpdate)
+      return json({ error: { message: "Repository is gone" } }, 409);
     if (url === "/v1/installed-skills/sk1/update") {
       state.installed = state.installed.map((s) =>
         s.id === "sk1" ? { ...s, commit: "b".repeat(40) } : s,
@@ -215,6 +229,9 @@ beforeEach(() => {
   state.failSecondPage = false;
   state.previewGate = null;
   state.triageScopes = [];
+  state.failUpdate = false;
+  state.failInstall = false;
+  state.failContent = false;
   calls.length = 0;
   fetchMock.mockReset();
   script();
@@ -257,6 +274,14 @@ describe("SettingsSkillsSection", () => {
     renderSection();
     fireEvent.click(await screen.findByRole("button", { name: "Code Review" }));
     expect(await screen.findByTestId("skill-content")).toHaveTextContent("Review it.");
+
+    // A stored copy the server cannot return is named in the dialog.
+    cleanup();
+    state.failContent = true;
+    renderSection();
+    fireEvent.click(await screen.findByRole("button", { name: "Code Review" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The stored copy is gone");
+    expect(screen.queryByTestId("skill-content")).toBeNull();
   });
 
   it("browses a source's catalog and installs a skill from it", async () => {
@@ -370,6 +395,12 @@ describe("SettingsSkillsSection", () => {
     // Back on a source, its own same-named skill is what the server says: not installed.
     fireEvent.click(screen.getByRole("button", { name: "Back to sources" }));
     expect(await screen.findByTestId("install-skill-triage")).toBeInTheDocument();
+
+    // A refused install says why and leaves Install in place.
+    state.failInstall = true;
+    fireEvent.click(screen.getByTestId("install-skill-triage"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("would exceed 200 MB");
+    expect(screen.getByTestId("install-skill-triage")).toBeInTheDocument();
   });
 
   it("shows a refused removal inside the confirmation dialog", async () => {
@@ -429,6 +460,14 @@ describe("SettingsSkillsSection", () => {
     const row = await screen.findByTestId("installed-skill-review");
     fireEvent.click(within(row).getByTestId("installed-skill-toggle-review"));
     expect(await screen.findByRole("alert")).toHaveTextContent("Administrator access required");
+    // A later Update that fails shows its own message, not the toggle's.
+    state.failUpdate = true;
+    fireEvent.click(within(row).getByRole("button", { name: "Update review" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Repository is gone"));
+    // And one that succeeds clears the earlier failure.
+    state.failUpdate = false;
+    fireEvent.click(within(row).getByRole("button", { name: "Update review" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
 
   it("loads further pages of installed skills on request", async () => {
@@ -534,6 +573,8 @@ describe("SettingsSkillsSection", () => {
         body: { source: "acme/more", ref: "main" },
       }),
     );
+    // The added source joins the list.
+    expect(await screen.findByTestId("skill-source-src10")).toHaveTextContent("acme/more");
     fireEvent.click(screen.getByRole("button", { name: "Remove source acme/skills" }));
     await waitFor(() =>
       expect(calls).toContainEqual({

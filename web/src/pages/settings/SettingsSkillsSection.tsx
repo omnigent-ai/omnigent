@@ -144,7 +144,11 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
                   data-testid={`installed-skill-toggle-${skill.name}`}
                   checked={skill.enabled}
                   disabled={toggle.isPending}
-                  onCheckedChange={(next) => toggle.mutate({ id: skill.id, enabled: next })}
+                  onCheckedChange={(next) => {
+                    // Only the latest action's outcome is shown.
+                    update.reset();
+                    toggle.mutate({ id: skill.id, enabled: next });
+                  }}
                   componentId="settings.skills.toggle"
                 />
                 <Button
@@ -152,7 +156,10 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
                   size="icon"
                   aria-label={`Update ${skill.name}`}
                   disabled={update.isPending}
-                  onClick={() => update.mutate(skill.id)}
+                  onClick={() => {
+                    toggle.reset();
+                    update.mutate(skill.id);
+                  }}
                   componentId="settings.skills.update"
                 >
                   <RefreshCwIcon />
