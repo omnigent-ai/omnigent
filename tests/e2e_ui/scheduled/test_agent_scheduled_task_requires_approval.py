@@ -25,6 +25,7 @@ from tests.e2e_ui.conftest import (
     configure_mock_llm,
     set_fallback_mock_llm,
 )
+from tests.e2e_ui.scheduled.test_scheduled_tasks_page import _open_automations_page
 
 _APPROVAL_CARD = '[data-testid="approval-card"][data-state="pending"]'
 _TASK_ROW = '[data-testid="scheduled-task-row"]'
@@ -158,7 +159,7 @@ def _drive_gated_turn(
 
 
 def _open_task_row(page: Page, base_url: str, name: str):
-    page.goto(f"{base_url}/tasks")
+    _open_automations_page(page, base_url)
     row = page.locator(_TASK_ROW).filter(has_text=name)
     expect(row).to_be_visible(timeout=30_000)
     _hold(page)

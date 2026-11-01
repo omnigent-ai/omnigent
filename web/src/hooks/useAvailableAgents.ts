@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -473,6 +473,57 @@ const AGENT_CATALOG_QUERY_KEY = ["available-agents-catalog"] as const;
 // The caller's own agents (GET /v1/agents?scope=user); refetch after an install.
 export const USER_AGENTS_QUERY_KEY = ["available-agents-user"] as const;
 const AVAILABLE_AGENTS_STALE_MS = 30_000;
+
+/**
+ * The picker's agents without session discovery: the catalog plus the caller's
+ * own agents, flagged and labelled the way the picker shows them.
+ *
+ * Shares the picker's query keys, and works outside a ``SidebarDataProvider``.
+ * Agents known only from a session (a one-off upload) are therefore absent.
+ *
+ * @param enabled - Whether to fetch; defaults true.
+ * @returns The merged agents (``undefined`` until the catalog loads), whether
+ *   the catalog is still loading or failed to load, and a retry.
+ */
+export function useAgentCatalog(enabled = true): {
+  data: AvailableAgent[] | undefined;
+  isLoading: boolean;
+  isError: boolean;
+  retry: () => void;
+} {
+  const serverInfo = useServerInfo();
+  const includeUserAgents = serverInfo !== "loading" && serverInfo.agent_install === true;
+  const catalogQuery = useQuery({
+    queryKey: AGENT_CATALOG_QUERY_KEY,
+    queryFn: fetchAgentCatalog,
+    enabled,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+  const userAgentsQuery = useQuery({
+    queryKey: USER_AGENTS_QUERY_KEY,
+    queryFn: fetchUserAgents,
+    enabled: enabled && includeUserAgents,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+  const acpHarnessIds = useAcpHarnessIds(enabled);
+  const harnessLabels = useHarnessLabels(enabled);
+  const catalog = catalogQuery.data;
+  const userAgents = userAgentsQuery.data;
+  const data = useMemo(
+    () =>
+      catalog === undefined
+        ? undefined
+        : applyAcpHarnessCatalog(
+            mergeAvailableAgents(catalog.agents, [], userAgents ?? [], catalog.suppressedNames),
+            acpHarnessIds,
+            harnessLabels,
+          ),
+    [catalog, userAgents, acpHarnessIds, harnessLabels],
+  );
+  const { refetch } = catalogQuery;
+  const retry = useCallback(() => void refetch(), [refetch]);
+  return { data, isLoading: catalogQuery.isLoading, isError: catalogQuery.isError, retry };
+}
 
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
