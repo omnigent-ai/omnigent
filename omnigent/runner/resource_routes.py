@@ -154,6 +154,7 @@ def register_resource_routes(
 
     The keyword arguments are the runner app's shared session state and helpers.
     """
+    from omnigent.inner.os_env_upload import is_upload_staging
     from omnigent.runtime.filesystem_registry import detect_git_root
 
     async def _resolve_conversation_id(response_id: str) -> str | None:
@@ -1260,6 +1261,7 @@ def register_resource_routes(
                 ),
             }
             for rec in raw_changes
+            if not is_upload_staging(rec["path"])
         ]
         return JSONResponse(
             status_code=200,
