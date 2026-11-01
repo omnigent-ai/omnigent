@@ -788,6 +788,101 @@ def test_composer_fits_available_space_while_resizing(
         assert document_width(page) <= width
 
 
+# iOS WKWebView bridge stub; ``__setKeyboardHeight`` plays UIKit keyboard-frame updates.
+_IOS_KEYBOARD_SHELL = """
+(() => {
+  const listeners = new Set();
+  let keyboardHeight = 0;
+  window.omnigentNative = {
+    kind: "ios",
+    setBadgeCount: function () {},
+    notify: function () { return Promise.resolve(false); },
+    onNotificationActivated: function () { return function () {}; },
+    onOpenPath: function () { return function () {}; },
+    onSidebarDrag: function () { return function () {}; },
+    setServerSwitcherHidden: function () {},
+    setViewMode: function () {},
+    onViewModeChanged: function () { return function () {}; },
+    setDocumentScrollEnabled: function () {},
+    getKeyboardViewport: function () {
+      return { width: window.innerWidth, height: window.innerHeight - keyboardHeight };
+    },
+    onKeyboardViewportChanged: function (callback) {
+      listeners.add(callback);
+      return function () { listeners.delete(callback); };
+    },
+  };
+  window.__setKeyboardHeight = (height) => {
+    keyboardHeight = height;
+    for (const callback of [...listeners]) callback();
+  };
+})();
+"""
+
+
+@pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
+def test_landing_hero_yields_to_a_long_draft_above_the_ios_keyboard(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """The landing hero centers when it fits and clips its logo before Send leaves the screen."""
+    viewport = {"width": 375, "height": 667}
+    # iPhone SE portrait keyboard with its QuickType bar, in CSS px.
+    keyboard_top = viewport["height"] - 260
+    page.add_init_script(_IOS_KEYBOARD_SHELL)
+    open_landing(page, chat_session_contract, viewport)
+    expect(page.locator(".app-shell")).to_have_attribute("data-ios-native", "true")
+    hero = page.get_by_test_id("new-chat-landing").locator(":scope > div > div").first
+    heading = hero.get_by_role("heading", level=1)
+
+    def hero_extent() -> dict[str, float]:
+        return hero.evaluate(
+            """(el) => {
+              const rects = [...el.querySelectorAll('*')]
+                .map((child) => child.getBoundingClientRect())
+                .filter((rect) => rect.height > 0);
+              const own = el.getBoundingClientRect();
+              return { top: own.top, bottom: own.bottom,
+                contentTop: Math.min(...rects.map((rect) => rect.top)),
+                contentBottom: Math.max(...rects.map((rect) => rect.bottom)) };
+            }"""
+        )
+
+    roomy = hero_extent()
+    top_gap = roomy["contentTop"] - roomy["top"]
+    assert top_gap > 0 and top_gap == pytest.approx(
+        roomy["bottom"] - roomy["contentBottom"], abs=TOLERANCE
+    ), roomy
+
+    landing_input = page.get_by_test_id("new-chat-landing-input")
+    landing_input.tap()
+    page.evaluate(
+        """(height) => new Promise((resolve) => {
+          window.__setKeyboardHeight(height);
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
+        })""",
+        viewport["height"] - keyboard_top,
+    )
+    landing_input.fill("\n".join(f"Line {line}: a longer mobile draft" for line in range(18)))
+    assert landing_input.evaluate("el => el.scrollHeight > el.clientHeight")
+
+    submit = box(_submit(page, "landing"))
+    assert submit["y"] + submit["height"] <= keyboard_top, submit
+    # A disabled Send is hit-tested through its tooltip wrapper.
+    assert page.evaluate(
+        """([x, y]) => {
+          const hit = document.elementFromPoint(x, y);
+          const send = document.querySelector('[data-testid="new-chat-landing-submit"]');
+          return !!hit && (send.contains(hit) || hit.contains(send));
+        }""",
+        [submit["x"] + submit["width"] / 2, submit["y"] + submit["height"] / 2],
+    )
+    constrained = hero_extent()
+    assert constrained["contentTop"] < constrained["top"], constrained
+    assert constrained["contentBottom"] == pytest.approx(constrained["bottom"], abs=TOLERANCE)
+    assert box(heading)["y"] >= constrained["top"] - TOLERANCE, constrained
+
+
 def test_composer_hides_native_scrollbar_without_disabling_scroll(
     page: Page,
     chat_session_contract: ChatSessionContract,
