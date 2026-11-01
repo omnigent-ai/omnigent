@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
+import shutil
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -296,6 +299,62 @@ async def test_run_turn_points_auth_commands_at_a_remedy_reachable_from_the_host
         assert phrase in events[0].message
     assert unreachable_remedy not in events[0].message
     assert events[0].undelivered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_bytes", "delivered"), [(4096, False), (512 * 1024 * 1024, True)])
+async def test_run_turn_does_not_type_into_a_full_transcript_disk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    free_bytes: int,
+    delivered: bool,
+) -> None:
+    """
+    A full disk under Claude's transcript fails the turn before typing.
+
+    Claude Code would run the message but could not record it, so the web would
+    show nothing and later report the message as never recorded.
+    """
+    transcript = tmp_path / "projects" / "session.jsonl"
+    (tmp_path / claude_bridge._STATE_FILE).write_text(
+        json.dumps({"transcript_path": str(transcript)}), encoding="utf-8"
+    )
+    checked: list[Path] = []
+    typed: list[str] = []
+
+    def fake_disk_usage(path: Path) -> SimpleNamespace:
+        checked.append(Path(path))
+        return SimpleNamespace(total=1 << 40, used=(1 << 40) - free_bytes, free=free_bytes)
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        typed.append(content)
+
+    monkeypatch.setattr(shutil, "disk_usage", fake_disk_usage)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello from web"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    if delivered:
+        assert typed == ["hello from web"]
+        assert events == [TurnComplete(response=None)]
+    else:
+        assert typed == []
+        [error] = events
+        assert isinstance(error, ExecutorError)
+        assert error.code == "host_disk_full"
+        assert error.undelivered is True
+    assert checked == [transcript.parent]
 
 
 @pytest.mark.asyncio
