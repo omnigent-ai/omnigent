@@ -275,18 +275,23 @@ def register_agent_routes(
             # Unresolved ownership on a multi-user server delivers nobody's installs.
             owner_known = owner_id is not None or permission_store is None
             if owner_known and (managed_token or user_id == owner_id):
-                try:
-                    bundle_bytes = await asyncio.to_thread(
-                        with_installed_skills,
-                        bundle_bytes,
+                policy = getattr(request.app.state, "skills_policy", DEFAULT_POLICY)
+                base_bundle = bundle_bytes
+
+                def overlay() -> bytes:
+                    # A cold spec load extracts the bundle: off the event loop too.
+                    target = session_target(bundle_spec(agent_cache, agent), conv.sub_agent_name)
+                    return with_installed_skills(
+                        base_bundle,
                         owner_id=owner_id,
                         skill_store=skill_store,
                         artifact_store=artifact_store,
-                        target=session_target(
-                            bundle_spec(agent_cache, agent), conv.sub_agent_name
-                        ),
-                        policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
+                        target=target,
+                        policy=policy,
                     )
+
+                try:
+                    bundle_bytes = await asyncio.to_thread(overlay)
                 except SkillDeliveryError as exc:
                     raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from None
         selection_headers = {}

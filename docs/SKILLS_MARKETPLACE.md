@@ -80,6 +80,11 @@ bundles include them.
   it (a managed host, or the owner's own host); someone the session is
   shared with downloads the agent's own files without them, and sees the
   owner's installs, not their own, in that session's slash menu.
+- The owner's own download of a session's bundle is its effective snapshot:
+  the same archive their runner receives, installed skills included, since
+  the server cannot tell the owner's runner from the owner. Re-importing that
+  archive as an agent makes those copies part of the agent's own files, which
+  then win over later marketplace updates or removals of the same names.
 - Each user can hold at most 200 installed skills, and their enabled skills
   at most 200 MB and 4,000 files unpacked; so can **Everyone**. Those budgets
   are two fifths of what a runner unpacks from a session's bundle (500 MB and

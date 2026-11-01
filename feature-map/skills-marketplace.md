@@ -22,6 +22,8 @@ Settings → Skills lets a user browse repositories of skills, install the ones 
 - Settings → Skills → Browse: pick a source on the left, search, Install on a card; or paste a repository under Add from URL and Preview skills.
 - Settings → Skills → Installed: toggle, Update, Remove, or click a name to read its SKILL.md.
 - New session: type `/` in the composer; installed skills are listed with their repository as the source.
+- Existing session: type `/` in an open session's composer; it lists the session owner's installs and picks up an install, update or removal made in Settings (the menu refetches after each change), and the next turn runs the current copy.
+- Live side chat: its composer's `/` menu is the parent session's, so it lists the same installed skills; check an install made while the side chat is open appears there too.
 - Feature off: the Skills entry is absent from Settings and the routes answer 404.
 
 ## Driving it with the repro environment
