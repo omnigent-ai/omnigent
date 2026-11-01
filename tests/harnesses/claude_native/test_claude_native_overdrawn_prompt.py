@@ -38,6 +38,9 @@ class _Clock:
     def monotonic(self) -> float:
         return self.now
 
+    def time(self) -> float:
+        return self.now
+
     def sleep(self, seconds: float) -> None:
         self.now += seconds
 

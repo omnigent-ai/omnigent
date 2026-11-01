@@ -96,6 +96,22 @@ _READY_DELAY_S = 45
 # The turn must reach a terminal outcome within: gate wait + slow boot + a
 # mock LLM turn + terminal attach.
 _TURN_OUTCOME_TIMEOUT_S = 200.0
+# Startup still working past the readiness cap: about half a core busy, with progress output.
+_CPU_BUSY_BOOT_PAST_CAP_S = 260.0
+_CPU_BUSY_BOOT = (
+    "import sys, time\n"
+    "start = time.monotonic()\n"
+    "end = start + float(sys.argv[1])\n"
+    "next_report = start\n"
+    "while (now := time.monotonic()) < end:\n"
+    "    if now >= next_report:\n"
+    "        print(f'Loading certificates and plugins... {int(now - start)}s', flush=True)\n"
+    "        next_report += 15\n"
+    "    burst_end = now + 0.05\n"
+    "    while time.monotonic() < burst_end:\n"
+    "        pass\n"
+    "    time.sleep(0.05)\n"
+)
 # How long the persisted transcript may lag the rendered assistant bubble.
 _TRANSCRIPT_SETTLE_S = 60.0
 # claude-native auto-launch of the (slow) terminal + WS attach.
@@ -179,7 +195,12 @@ def _no_proxy_env() -> dict[str, str]:
 
 
 def _write_slow_ready_claude_wrapper(
-    bin_dir: Path, real_claude: str, gate_started: Path, *, delay_s: float = _READY_DELAY_S
+    bin_dir: Path,
+    real_claude: str,
+    gate_started: Path,
+    *,
+    delay_s: float = _READY_DELAY_S,
+    cpu_busy: bool = False,
 ) -> Path:
     """Write a ``claude`` wrapper that becomes ready only after a slow boot.
 
@@ -192,9 +213,14 @@ def _write_slow_ready_claude_wrapper(
     :param real_claude: Absolute path of the real ``claude`` binary to exec.
     :param gate_started: Marker written when delivery enters the readiness gate.
     :param delay_s: Boot delay after delivery enters the readiness gate.
+    :param cpu_busy: Spend the delay using CPU and printing progress, like a
+        launcher still loading certificates and plugins, instead of sleeping.
     :returns: The absolute path of the wrapper executable.
     """
     wrapper = bin_dir / "claude"
+    boot = f"sleep {delay_s}\n"
+    if cpu_busy:
+        boot = f"{shlex.join([sys.executable, '-I', '-S', '-c', _CPU_BUSY_BOOT])} {delay_s}\n"
     wrapper.write_text(
         "#!/usr/bin/env bash\n"
         "# Rig: a Claude Code launch that becomes ready only after a slow\n"
@@ -202,7 +228,7 @@ def _write_slow_ready_claude_wrapper(
         'echo "Claude Code — connecting to host..."\n'
         'echo "This is taking longer than usual."\n'
         f"while [ ! -f {shlex.quote(str(gate_started))} ]; do sleep 0.05; done\n"
-        f"sleep {delay_s}\n"
+        f"{boot}"
         f'exec {shlex.quote(real_claude)} "$@"\n'
     )
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -320,9 +346,16 @@ def test_slow_ready_wrapper_waits_for_delivery(tmp_path: Path) -> None:
 
 @pytest.fixture(
     params=[
-        pytest.param((2.0, 4.0), id="short-readiness-budget"),
+        pytest.param((2.0, 4.0, False), id="short-readiness-budget"),
         pytest.param(
-            (None, _READY_DELAY_S), id="production-readiness-budget", marks=pytest.mark.nightly
+            (None, _READY_DELAY_S, False),
+            id="production-readiness-budget",
+            marks=pytest.mark.nightly,
+        ),
+        pytest.param(
+            (None, _CPU_BUSY_BOOT_PAST_CAP_S, True),
+            id="cpu-busy-boot-past-slow-boot-cap",
+            marks=pytest.mark.nightly,
         ),
     ]
 )
@@ -357,9 +390,9 @@ def slow_ready_claude_session(
     for path in (config_home, home_dir, wrapper_bin, artifacts):
         path.mkdir(parents=True, exist_ok=True)
     gate_started = work / "readiness-gate-started"
-    ready_timeout_s, delay_s = request.param
+    ready_timeout_s, delay_s, cpu_busy = request.param
     wrapper = _write_slow_ready_claude_wrapper(
-        wrapper_bin, real_claude, gate_started, delay_s=delay_s
+        wrapper_bin, real_claude, gate_started, delay_s=delay_s, cpu_busy=cpu_busy
     )
     rig_python = _rig_python(work, gate_started, ready_timeout_s=ready_timeout_s)
 
@@ -482,7 +515,7 @@ def slow_ready_claude_session(
         runner_handle.close()
 
 
-@pytest.mark.timeout(400)
+@pytest.mark.timeout(600)
 def test_claude_native_first_prompt_survives_slow_terminal_boot(
     page: Page,
     slow_ready_claude_session: tuple[str, str, Path, float, float | None],
@@ -534,7 +567,8 @@ def test_claude_native_first_prompt_survives_slow_terminal_boot(
     # assistant reply (the prompt was delivered and answered) or an error
     # pill (the turn failed — the silent-drop bug).
     outcome = page.locator(_ERROR_PILL).or_(page.locator(_ASSISTANT))
-    expect(outcome.first).to_be_visible(timeout=int(_TURN_OUTCOME_TIMEOUT_S * 1000))
+    turn_outcome_timeout_s = max(_TURN_OUTCOME_TIMEOUT_S, delay_s + 120.0)
+    expect(outcome.first).to_be_visible(timeout=int(turn_outcome_timeout_s * 1000))
     elapsed = time.monotonic() - sent_at
     _log.info("turn reached a user-visible outcome after %.0fs", elapsed)
     assert gate_started.exists(), "delivery never entered the readiness gate"

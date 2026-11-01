@@ -99,6 +99,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     import httpx
+    import psutil
 
     from omnigent.inner.datamodel import OSEnvSandboxSpec
     from omnigent.inner.os_env import OSEnvironment
@@ -287,6 +288,13 @@ _TMUX_READY_TIMEOUT_S = 30.0
 # Hard cap on waiting for a slow-booting terminal whose process is still
 # alive.
 _TMUX_READY_SLOW_BOOT_TIMEOUT_S = 180.0
+# A pane still using CPU at that cap is waited on one window at a time, up to
+# the ceiling. Busy means at least the share of one core over the window,
+# floored above the 10 ms tick at which CPU time is counted.
+_TMUX_READY_BUSY_BOOT_CEILING_S = 480.0
+_TMUX_READY_BUSY_BOOT_WINDOW_S = 30.0
+_TMUX_READY_BUSY_BOOT_CPU_SHARE = 2.0 / 30.0
+_TMUX_READY_BUSY_BOOT_MIN_CPU_S = 0.03
 # Per-command tmux budget. 10s matches every other native bridge: a tmux
 # server starved by parallel worker boots on a large worktree can stall
 # past 5s while still healthy, and a shorter budget kills the delivery.
@@ -5949,6 +5957,38 @@ def _request_claude_repaint(
         process could not be found.
     """
     import signal
+
+    import psutil
+
+    if IS_WINDOWS:
+        return 0
+    _check_injection_cancelled()
+    signalled = 0
+    for process in _claude_pane_processes(socket_path, tmux_target, bridge_dir) or ():
+        with contextlib.suppress(psutil.Error):
+            process.send_signal(signal.SIGCONT)
+            signalled += 1
+    return signalled
+
+
+def _claude_pane_processes(
+    socket_path: str, tmux_target: str, bridge_dir: Path | None = None
+) -> list[psutil.Process] | None:
+    """
+    List the processes running a Claude Code pane.
+
+    These are the pane's process and its descendants, plus any process the
+    Claude session registry names outside that tree (see
+    :func:`_request_claude_repaint`).
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge directory whose Claude session the registry
+        is searched for, or ``None`` for only the pane's tree.
+    :returns: The processes, or ``None`` when the pane's process could not
+        be found.
+    """
     import subprocess
 
     import psutil
@@ -5956,8 +5996,7 @@ def _request_claude_repaint(
     from omnigent.harnesses.claude_native.status_file import session_pids
 
     if IS_WINDOWS:
-        return 0
-    _check_injection_cancelled()
+        return None
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
@@ -5967,15 +6006,15 @@ def _request_claude_repaint(
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.SubprocessError, OSError):
-        return 0
+        return None
     fields = proc.stdout.split() if proc.returncode == 0 else []
     if not fields or not fields[0].isdigit():
-        return 0
+        return None
     try:
         root = psutil.Process(int(fields[0]))
         tree = [root, *root.children(recursive=True)]
     except psutil.Error:
-        return 0
+        return None
     claude_session_id = read_claude_session_id(bridge_dir) if bridge_dir is not None else None
     if claude_session_id is not None:
         in_tree = {process.pid for process in tree}
@@ -5983,12 +6022,69 @@ def _request_claude_repaint(
             if pid not in in_tree:
                 with contextlib.suppress(psutil.Error):
                     tree.append(psutil.Process(pid))
-    signalled = 0
-    for process in tree:
+    return tree
+
+
+class _PaneCpuSample(NamedTuple):
+    """The CPU time of a Claude Code pane's readable processes at one moment."""
+
+    taken_at: float
+    # pid -> (start time, user plus system seconds); the start time tells a
+    # recycled pid apart.
+    processes: dict[int, tuple[float, float]]
+
+
+def _claude_pane_cpu_sample(
+    socket_path: str, tmux_target: str, bridge_dir: Path | None = None
+) -> _PaneCpuSample | None:
+    """
+    Read the CPU time of each process running a Claude Code pane.
+
+    A process that cannot be read is left out.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge directory whose Claude session's process is
+        included (see :func:`_claude_pane_processes`), or ``None``.
+    :returns: The sample, or ``None`` when the pane's process could not be
+        found or no process could be read.
+    """
+    import psutil
+
+    taken_at = time.time()
+    processes = _claude_pane_processes(socket_path, tmux_target, bridge_dir)
+    if processes is None:
+        return None
+    readings: dict[int, tuple[float, float]] = {}
+    for process in processes:
         with contextlib.suppress(psutil.Error):
-            process.send_signal(signal.SIGCONT)
-            signalled += 1
-    return signalled
+            times = process.cpu_times()
+            readings[process.pid] = (process.create_time(), times.user + times.system)
+    return _PaneCpuSample(taken_at, readings) if readings else None
+
+
+def _pane_cpu_seconds_between(earlier: _PaneCpuSample, later: _PaneCpuSample) -> float:
+    """
+    Total the CPU time a pane's processes used between two samples.
+
+    Each process is compared only with itself, so one that exits cannot cancel
+    the others' work, and one already running but unread in *earlier* adds
+    nothing. A process started after *earlier* counts in full. Time used by a
+    process that exits in between, or by children it reaps, is not counted.
+
+    :param earlier: The sample at the start of the window.
+    :param later: The sample at its end.
+    :returns: CPU seconds, e.g. ``3.0``.
+    """
+    used = 0.0
+    for pid, (started, cpu_s) in later.processes.items():
+        before = earlier.processes.get(pid)
+        if before is not None and before[0] == started:
+            used += cpu_s - before[1]
+        elif started >= earlier.taken_at:
+            used += cpu_s
+    return used
 
 
 def claude_pane_ready(bridge_dir: Path) -> bool:
@@ -6996,8 +7092,12 @@ def _wait_for_claude_prompt_ready(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param timeout_s: Base readiness budget, e.g. ``30.0``. A live pane or
         unanswered liveness probe extends the wait to
-        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`. Liveness checks start within
-        one second; a dead pane or rejected query ends the wait.
+        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`. A pane whose processes are
+        still using CPU at that cap is then waited on one window at a time
+        (:data:`_TMUX_READY_BUSY_BOOT_WINDOW_S`, or half the cap if shorter)
+        up to :data:`_TMUX_READY_BUSY_BOOT_CEILING_S`; an idle pane, or one
+        whose CPU time cannot be read, stops at the cap. Liveness checks start
+        within one second; a dead pane or rejected query ends the wait.
     :param bridge_dir: Protect live permission-hook waits when delivering a message.
     :param extend_for_slow_boot: ``False`` makes *timeout_s* a hard cap with no
         slow-boot extension, for a caller that must answer within its own
@@ -7024,10 +7124,10 @@ def _wait_for_claude_prompt_ready(
         Also raised when the launcher waits on two consecutive polls for a
         sign-in that another process started.
     :raises ClaudePromptTimeout: If the prompt never renders in time
-        (Claude failed to boot, or a slow boot outlasted even the hard
-        cap). The message carries the seconds actually waited, a poll
-        count, how many of those polls saw an empty capture, how many
-        repaints were requested, and the tail
+        (Claude failed to boot, a slow boot went idle at the cap, or a busy
+        boot outlasted the ceiling). The message carries the seconds actually
+        waited, a poll count, how many of those polls saw an empty capture,
+        how many repaints were requested, any busy-boot extensions, and the tail
         of the last non-empty capture the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a startup crash, a torn/empty capture under a mid-turn repaint, or
@@ -7038,6 +7138,15 @@ def _wait_for_claude_prompt_ready(
     hard_deadline = started + (
         max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S) if extend_for_slow_boot else timeout_s
     )
+    busy_window_s = (
+        min(_TMUX_READY_BUSY_BOOT_WINDOW_S, (hard_deadline - started) / 2)
+        if extend_for_slow_boot
+        else 0.0
+    )
+    busy_ceiling = max(hard_deadline, started + _TMUX_READY_BUSY_BOOT_CEILING_S)
+    # (when, CPU sample) at the start of the window that decides the next extension.
+    cpu_mark: tuple[float, _PaneCpuSample | None] | None = None
+    busy_extensions = 0
     next_repaint = started + _CLAUDE_REPAINT_AFTER_S
     polls = 0
     empty_polls = 0
@@ -7177,8 +7286,36 @@ def _wait_for_claude_prompt_ready(
                 exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
+        now = time.monotonic()
+        if busy_window_s > 0 and cpu_mark is None and now >= hard_deadline - busy_window_s:
+            cpu_mark = (now, _claude_pane_cpu_sample(socket_path, tmux_target, bridge_dir))
         if time.monotonic() >= hard_deadline:
-            break
+            if cpu_mark is None or hard_deadline >= busy_ceiling:
+                break
+            marked_at, marked_sample = cpu_mark
+            now = time.monotonic()
+            sample = _claude_pane_cpu_sample(socket_path, tmux_target, bridge_dir)
+            if marked_sample is None or sample is None:
+                break
+            used_cpu_s = _pane_cpu_seconds_between(marked_sample, sample)
+            busy_cpu_s = max(
+                _TMUX_READY_BUSY_BOOT_CPU_SHARE * (now - marked_at),
+                _TMUX_READY_BUSY_BOOT_MIN_CPU_S,
+            )
+            if used_cpu_s < busy_cpu_s:
+                break
+            hard_deadline = min(now + busy_window_s, busy_ceiling)
+            cpu_mark = (now, sample)
+            busy_extensions += 1
+            delivery_diagnostics.record_readiness(prompt_busy_boot_extensions=busy_extensions)
+            _logger.info(
+                "claude-native: terminal still booting after %.1fs (%.2f CPU-s in %.1fs); "
+                "waiting up to %.1fs more",
+                now - started,
+                used_cpu_s,
+                now - marked_at,
+                hard_deadline - now,
+            )
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
@@ -7202,10 +7339,11 @@ def _wait_for_claude_prompt_ready(
             + _format_terminal_failure_tail(last_nonempty),
             exit_status=exited_status,
         )
+    busy_note = f", {busy_extensions} busy-boot extensions" if busy_extensions else ""
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
-        f"{empty_polls} empty captures, {repaint_requests} repaint requests). "
+        f"{empty_polls} empty captures, {repaint_requests} repaint requests{busy_note}). "
         "The message was not delivered." + _format_terminal_failure_tail(last_nonempty)
     )
 
