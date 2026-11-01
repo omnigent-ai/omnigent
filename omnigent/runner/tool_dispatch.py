@@ -164,6 +164,12 @@ def _route_identifier(value: object, kind: str) -> str:
     return value
 
 
+def _team_role_field(labels: object) -> dict[str, str]:
+    """Report a session's team role, leaving sessions outside a team unchanged."""
+    role = (_string_mapping(labels) or {}).get(TEAM_ROLE_LABEL_KEY)
+    return {"team_role": role} if role else {}
+
+
 def _orchestration_source_headers(conversation_id: str | None) -> dict[str, str]:
     """Identify the calling session so the server can apply its project boundary."""
     from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
@@ -5382,7 +5388,7 @@ async def _session_get_info_via_rest(
             "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
                 CREATED_BY_SESSION_LABEL_KEY
             ),
-            "team_role": (_string_mapping(snap.get("labels")) or {}).get(TEAM_ROLE_LABEL_KEY),
+            **_team_role_field(snap.get("labels")),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
             # Effective model: a per-session override wins over the
@@ -6572,7 +6578,7 @@ async def _collect_global_sessions(
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),
-                "team_role": (_string_mapping(r.get("labels")) or {}).get(TEAM_ROLE_LABEL_KEY),
+                **_team_role_field(r.get("labels")),
                 # Only an archive-inclusive listing can return archived rows.
                 **({"archived": r.get("archived") is True} if include_archived else {}),
             }
