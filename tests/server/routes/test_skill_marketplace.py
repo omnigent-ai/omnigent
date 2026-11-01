@@ -173,8 +173,7 @@ async def _location(app: FastAPI, skill_id: str) -> str:
 async def test_a_source_directory_is_browsed_installed_and_updated(
     db_uri: str, tmp_path: Path, runtime_init: None
 ) -> None:
-    # A repository directory in the link was dropped, so skills under it could
-    # not be reached and a link to one skill showed the root catalog instead.
+    # A link's directory is the catalog root; a link to one skill lists just that skill.
     mono = tmp_path / "mono"
     write_skill(mono / "skills", "root-only", "Root")
     write_skill(mono / "team-a" / "skills", "lint", "Lint")
@@ -293,12 +292,6 @@ async def test_lists_paginate_with_a_continuation_cursor(market) -> None:
     second = (await client.get(f"/v1/installed-skills?limit=1&after={first['last_id']}")).json()
     assert len(second["data"]) == 1 and second["has_more"] is False
     assert {first["data"][0]["name"], second["data"][0]["name"]} == {"review", "triage"}
-    # The cursor row removed between the two reads: the next page still follows.
-    assert (
-        await client.delete(f"/v1/installed-skills/{first['data'][0]['id']}")
-    ).status_code == 204
-    again = (await client.get(f"/v1/installed-skills?limit=1&after={first['last_id']}")).json()
-    assert [s["name"] for s in again["data"]] == [second["data"][0]["name"]]
     assert (await client.get("/v1/installed-skills?after=" + "0" * 32)).status_code == 400
     overflow = "9" * 19 + "." + "0" * 32
     assert (await client.get(f"/v1/installed-skills?after={overflow}")).status_code == 400
@@ -1106,8 +1099,7 @@ def test_a_users_install_wins_over_the_orgs_whatever_the_order(
 async def test_turning_url_installs_off_stops_serving_what_was_installed_by_url(
     db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
 ) -> None:
-    # allowed_sources was re-checked at delivery but allow_url_install was not,
-    # so switching URL installs off kept serving every skill installed by URL.
+    # Switching URL installs off stops serving skills installed by URL.
     app, artifact_store = _build(db_uri, tmp_path)
     app.state.skill_fetcher = _fetcher(repo)
     transport = httpx.ASGITransport(app=app)
@@ -1208,23 +1200,6 @@ async def test_server_policy_binds_sources_url_installs_and_delivery(
         assert (await client.delete(f"/v1/skill-sources/{source_id}")).status_code == 204
 
 
-def test_a_bundle_namespace_folder_is_a_reserved_install_name(tmp_path: Path) -> None:
-    # Discovery reserves what the overlay will not add: every name directly
-    # under the bundle's skills/, and every SKILL.md directory below it.
-    from omnigent.skills.overlay import bundle_skill_directories, reserved_install_names
-
-    files = {
-        "skills/team/triage/SKILL.md": b"---\nname: triage\n---\n",
-        "skills/lint/SKILL.md": b"---\nname: lint\n---\n",
-        "skills/lib/helper.py": b"x = 1\n",
-    }
-    for relative, data in files.items():
-        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / relative).write_bytes(data)
-    assert reserved_install_names(tmp_path) == {"team", "triage", "lint", "lib"}
-    assert bundle_skill_directories(skill_tarball(files)) == {"team", "lint", "lib"}
-
-
 def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None:
     # With URL installs off, delivery's work follows the installed set, not the
     # source count, and a path longer than a source row can hold still resolves.
@@ -1298,8 +1273,7 @@ def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None
 async def test_a_marketplace_change_reaches_a_warm_sessions_next_turn(
     market, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Installs change the turn's agent revision, and a slash command sends it
-    # with the resolve request, which runs before the turn reaches the runner.
+    # Installs change the turn's agent revision; a slash command's resolve carries it.
     import json
 
     client, _app, artifact_store = market

@@ -26,6 +26,10 @@ from omnigent.skills import git_source
             "https://github.com/acme/skills/tree/v2/pack",
             ("https://github.com/acme/skills.git", "v2", "pack", None),
         ),
+        (
+            "https://github.com/acme/agents/tree/v1@orion",
+            ("https://github.com/acme/agents.git", "v1", "", "orion"),
+        ),
         ("github:acme/skills.git", ("https://github.com/acme/skills.git", None, "", None)),
         (
             "github:acme/skills/pack/sub@review",
@@ -396,9 +400,8 @@ def test_a_checkout_with_too_many_entries_is_refused(
 def test_a_sparse_clone_checks_out_only_what_it_selects(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # A monorepo's whole tip tree was checked out under a fixed budget, so a
-    # large repository was refused outright. A partial clone fetches the blobs of
-    # the selected paths only: the manifests first, then what *expand* adds.
+    # A partial clone fetches the blobs of the selected paths only: the
+    # manifests first, then what *expand* adds.
     real_git = shutil.which("git")
     source = tmp_path / "mono"
     for path, text in {
@@ -510,7 +513,7 @@ def test_hidden_root_directories_are_valid_paths_but_traversal_is_not() -> None:
 def test_a_ref_git_cannot_take_is_refused_before_git_runs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ref: str
 ) -> None:
-    # NUL made Popen raise ValueError, outside the GitSourceError translation.
+    # A NUL or newline must not reach Popen.
     def no_spawn(*_args: object, **_kwargs: object) -> None:
         pytest.fail("git must not start for a ref it cannot take")
 

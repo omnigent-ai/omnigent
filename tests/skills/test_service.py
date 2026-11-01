@@ -17,6 +17,7 @@ from omnigent.skills.limits import (
 )
 from omnigent.skills.policy import SkillPolicyError, SkillsMarketplacePolicy, SourceCredential
 from omnigent.skills.service import SkillFetcher, resolve_source
+from tests._helpers.skill_repos import copying_cloner
 
 
 def test_resolve_source_prefers_an_explicit_ref_and_names_the_restriction() -> None:
@@ -28,8 +29,7 @@ def test_resolve_source_prefers_an_explicit_ref_and_names_the_restriction() -> N
 
 
 def test_resolve_source_keeps_the_linked_directory() -> None:
-    # A /tree/<ref>/<dir> link was reduced to the repository, so its directory
-    # was silently replaced by the root catalog.
+    # A /tree/<ref>/<dir> link keeps its directory as the catalog root.
     linked = resolve_source("https://github.com/acme/mono/tree/main/team-a/skills")
     assert (linked.url, linked.ref, linked.path) == (
         "https://github.com/acme/mono.git",
@@ -44,8 +44,8 @@ def test_resolve_source_keeps_the_linked_directory() -> None:
         resolve_source("acme/mono", path="a" * 201)
 
 
-def test_catalog_is_cached_per_source_until_refreshed(plain_repo: Path, fake_clone) -> None:
-    clone = fake_clone(plain_repo)
+def test_catalog_is_cached_per_source_until_refreshed(plain_repo: Path) -> None:
+    clone = copying_cloner(plain_repo)
     fetcher = SkillFetcher(clone=clone)
 
     first = fetcher.catalog("acme/skills")
@@ -60,13 +60,13 @@ def test_catalog_is_cached_per_source_until_refreshed(plain_repo: Path, fake_clo
 
 
 def test_catalog_cache_is_bounded_and_drops_expired_entries_first(
-    plain_repo: Path, fake_clone, monkeypatch: pytest.MonkeyPatch
+    plain_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.skills import service
 
     clock = {"now": 1_000.0}
     monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
-    clone = fake_clone(plain_repo)
+    clone = copying_cloner(plain_repo)
     fetcher = SkillFetcher(clone=clone, ttl_s=100, max_cached=2)
 
     for index in range(3):
@@ -83,8 +83,8 @@ def test_catalog_cache_is_bounded_and_drops_expired_entries_first(
     assert fetcher.cached_catalogs == 1  # the expired ones went before the cap was applied
 
 
-def test_package_clones_once_and_tars_each_named_skill(plain_repo: Path, fake_clone) -> None:
-    clone = fake_clone(plain_repo)
+def test_package_clones_once_and_tars_each_named_skill(plain_repo: Path) -> None:
+    clone = copying_cloner(plain_repo)
     fetcher = SkillFetcher(clone=clone)
 
     commit, packaged = fetcher.package("acme/skills", None, ["triage", "review"])
@@ -97,18 +97,18 @@ def test_package_clones_once_and_tars_each_named_skill(plain_repo: Path, fake_cl
     assert len(clone.calls) == 1
 
 
-def test_package_names_the_missing_skill(plain_repo: Path, fake_clone) -> None:
-    fetcher = SkillFetcher(clone=fake_clone(plain_repo))
+def test_package_names_the_missing_skill(plain_repo: Path) -> None:
+    fetcher = SkillFetcher(clone=copying_cloner(plain_repo))
     with pytest.raises(GitSourceError, match=r"No such skill .*: nope"):
         fetcher.package("acme/skills", None, ["review", "nope"])
 
 
 def test_package_bounds_the_whole_request(
-    plain_repo: Path, fake_clone, monkeypatch: pytest.MonkeyPatch
+    plain_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.skills import service
 
-    fetcher = SkillFetcher(clone=fake_clone(plain_repo))
+    fetcher = SkillFetcher(clone=copying_cloner(plain_repo))
     sizes = [
         len(fetcher.package("acme/skills", None, [name])[1][0].tarball)
         for name in ("review", "triage")
@@ -170,10 +170,8 @@ def test_fetcher_clones_isolated_from_server_credentials(monkeypatch: pytest.Mon
     )
 
 
-def test_fetcher_refuses_a_source_outside_the_policy_before_cloning(
-    plain_repo: Path, fake_clone
-) -> None:
-    clone = fake_clone(plain_repo)
+def test_fetcher_refuses_a_source_outside_the_policy_before_cloning(plain_repo: Path) -> None:
+    clone = copying_cloner(plain_repo)
     policy = SkillsMarketplacePolicy(allowed_sources=("github.com/acme/*",))
     fetcher = SkillFetcher(clone=clone, policy=policy)
 
@@ -188,10 +186,10 @@ def test_fetcher_refuses_a_source_outside_the_policy_before_cloning(
 
 
 def test_fetcher_hands_the_policys_token_to_the_clone(
-    plain_repo: Path, fake_clone, monkeypatch: pytest.MonkeyPatch
+    plain_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("SKILLS_TOKEN", "ghs_secret")
-    clone = fake_clone(plain_repo)
+    clone = copying_cloner(plain_repo)
     policy = SkillsMarketplacePolicy(
         credentials=(SourceCredential(match="github.com/acme/*", token_env="SKILLS_TOKEN"),)
     )
@@ -202,16 +200,14 @@ def test_fetcher_hands_the_policys_token_to_the_clone(
     assert clone.tokens == ["ghs_secret", None]
 
 
-def test_a_source_directory_is_the_catalog_root_and_clones_stay_sparse(
-    tmp_path: Path, fake_clone
-) -> None:
-    from tests._helpers.skill_repos import write_skill
+def test_a_source_directory_is_the_catalog_root_and_clones_stay_sparse(tmp_path: Path) -> None:
+    from tests._helpers.skill_repos import copying_cloner, write_skill
 
     repo = tmp_path / "mono"
     write_skill(repo / "skills", "root-only", "Root")
     write_skill(repo / "team-a" / "skills", "lint", "Lint")
     write_skill(repo / "team-a" / "skills", "format", "Format")
-    clone = fake_clone(repo)
+    clone = copying_cloner(repo)
     fetcher = SkillFetcher(clone=clone)
 
     catalog = fetcher.catalog("https://github.com/acme/mono/tree/main/team-a")
@@ -232,9 +228,7 @@ def test_a_source_directory_is_the_catalog_root_and_clones_stay_sparse(
         fetcher.package("acme/mono", "main", ["root-only"], path="team-a")
 
 
-def test_a_linked_directory_that_escapes_the_checkout_is_not_indexed(
-    tmp_path: Path, fake_clone
-) -> None:
+def test_a_linked_directory_that_escapes_the_checkout_is_not_indexed(tmp_path: Path) -> None:
     from tests._helpers.skill_repos import write_skill
 
     outside = tmp_path / "outside"
@@ -243,6 +237,6 @@ def test_a_linked_directory_that_escapes_the_checkout_is_not_indexed(
     repo.mkdir()
     (repo / "team-a").symlink_to(outside, target_is_directory=True)
     # Only the first segment is a link; the directory itself would index cleanly.
-    fetcher = SkillFetcher(clone=fake_clone(repo))
+    fetcher = SkillFetcher(clone=copying_cloner(repo))
     catalog = fetcher.catalog("acme/repo", path="team-a/skills/secret")
     assert catalog.entries == () and "not a directory" in catalog.skipped[0]

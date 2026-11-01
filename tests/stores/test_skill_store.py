@@ -96,7 +96,9 @@ def test_concurrent_source_seeding_ends_on_one_row(
 
 
 def test_users_see_org_skills_and_their_own_only(store: SqlAlchemySkillStore) -> None:
-    _install(store, "shared", scope="org", owner=None)
+    # An org install ignores the owner argument: it is everyone's.
+    shared = _install(store, "shared", scope="org", owner="alice")
+    assert shared.owner_user_id is None and shared.scope == "org"
     _install(store, "mine", owner="alice")
     _install(store, "theirs", owner="bob")
     # A user-scoped install with no user id: the single local user's own.
@@ -116,11 +118,6 @@ def test_users_see_org_skills_and_their_own_only(store: SqlAlchemySkillStore) ->
     assert store.find_for_user("alice", []) == []
     assert (store.count_installed("user", "alice"), store.count_installed("org", None)) == (1, 1)
     assert store.count_installed("user", None) == 1
-
-
-def test_org_scope_ignores_the_owner_argument(store: SqlAlchemySkillStore) -> None:
-    row = _install(store, "shared", scope="org", owner="alice")
-    assert row.owner_user_id is None and row.scope == "org"
 
 
 def test_the_principal_row_keeps_its_totals_through_every_write(
@@ -439,7 +436,9 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
     assert store.set_enabled(row.id, True) is None
 
 
-def test_list_pages_continue_without_omissions_or_duplicates(store: SqlAlchemySkillStore) -> None:
+def test_list_pages_continue_without_omissions_or_duplicates(
+    store: SqlAlchemySkillStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
     for i in range(7):
         _install(store, f"s{i:02d}", scope="org", owner=None)
     seen: list[str] = []
@@ -470,12 +469,34 @@ def test_list_pages_continue_without_omissions_or_duplicates(store: SqlAlchemySk
     assert first.has_more and not rest.has_more
     assert len(first.data) + len(rest.data) == 4
     assert len({s.id for s in first.data + rest.data}) == 4
-    # The last is a 19-digit epoch past signed 64-bit, which overflowed the bind.
+    # The last is a 19-digit epoch past signed 64-bit.
     for bad in ("0" * 32, "1.zz", "x", "-1." + "0" * 32, "9" * 19 + "." + "0" * 32):
         with pytest.raises(SkillValueError, match="invalid cursor"):
             store.list_sources(after=bad)
         with pytest.raises(SkillValueError, match="invalid cursor"):
             store.list_for_user("alice", after=bad)
+
+    # One page merges the org's and the user's partitions; with equal timestamps
+    # the id decides, and a cursor from either partition continues both.
+    from omnigent.stores.skill_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_700_000_000)
+    for i in range(6):
+        _install(store, f"m{i}", scope="org" if i % 2 else "user", owner=None if i % 2 else "bob")
+        _install(store, f"other{i}", owner="carol")
+    merged: list[tuple[int, str]] = []
+    cursor_scopes: set[str] = set()
+    after = None
+    while True:
+        page = store.list_for_user("bob", limit=2, after=after)
+        merged.extend((s.installed_at, s.id) for s in page.data if s.name.startswith("m"))
+        if not page.has_more:
+            break
+        cursor_scopes.add(page.data[-1].scope)
+        after = page.last_id
+    assert len(merged) == 6 and len(set(merged)) == 6
+    assert merged == sorted(merged)
+    assert cursor_scopes == {"org", "user"}
 
 
 def test_the_user_invocable_flag_is_stored_and_refetched(store: SqlAlchemySkillStore) -> None:

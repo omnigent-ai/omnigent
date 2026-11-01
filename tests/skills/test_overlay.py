@@ -10,8 +10,10 @@ import pytest
 
 from omnigent.skills.overlay import (
     SkillTarballError,
+    bundle_skill_directories,
     bundle_skill_names,
     overlay_skills,
+    reserved_install_names,
     validate_skill_tarball,
 )
 from tests._helpers.skill_repos import skill_tarball
@@ -155,3 +157,18 @@ def test_only_the_root_skill_md_is_the_manifest() -> None:
     assert not is_root_manifest(".SKILL.md") and not is_root_manifest("docs/SKILL.md")
     with pytest.raises(SkillTarballError, match=r"no SKILL\.md at its root"):
         validate_skill_tarball(skill_tarball({".SKILL.md": b"decoy"}))
+
+
+def test_a_bundle_namespace_folder_is_a_reserved_install_name(tmp_path: Path) -> None:
+    # Discovery reserves what the overlay will not add: every name directly
+    # under the bundle's skills/, and every SKILL.md directory below it.
+    files = {
+        "skills/team/triage/SKILL.md": b"---\nname: triage\n---\n",
+        "skills/lint/SKILL.md": b"---\nname: lint\n---\n",
+        "skills/lib/helper.py": b"x = 1\n",
+    }
+    for relative, data in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_bytes(data)
+    assert reserved_install_names(tmp_path) == {"team", "triage", "lint", "lib"}
+    assert bundle_skill_directories(skill_tarball(files)) == {"team", "lint", "lib"}

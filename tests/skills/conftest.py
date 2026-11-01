@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from tests._helpers.skill_repos import copying_cloner, write_skill
+from tests._helpers.skill_repos import write_skill
 
 
 @pytest.fixture
@@ -41,9 +40,3 @@ def marketplace_repo(tmp_path: Path) -> Path:
     # A root-level skill with the same name as a plugin skill: root wins.
     write_skill(repo / "skills", "changelog", "Root changelog")
     return repo
-
-
-@pytest.fixture
-def fake_clone() -> Callable[[Path], Callable[..., None]]:
-    """Build a cloner that copies a fixture repo instead of running git."""
-    return copying_cloner

@@ -342,8 +342,8 @@ async def test_presession_catalog_matches_filtered_invocations(
     menu = {s["name"] for s in response.json()["skills"]}
     assert {"hidden", "secret", "lib"}.isdisjoint(menu)
     assert response.json()["warnings"] == []
-    # The archive a session would be served agrees with the menu.
-    from omnigent.server.skill_injection import with_installed_skills
+    # The archive a session on this spec is served agrees with the menu.
+    from omnigent.server.skill_injection import SessionTarget, with_installed_skills
     from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
 
     served = with_installed_skills(
@@ -351,13 +351,21 @@ async def test_presession_catalog_matches_filtered_invocations(
         owner_id="owner",
         skill_store=SqlAlchemySkillStore(db_uri),
         artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+        target=SessionTarget(spec, ""),
     )
     with tarfile.open(fileobj=io.BytesIO(served), mode="r:gz") as tf:
         names = tf.getnames()
-    delivered = {name.split("/")[1] for name in names if name.startswith("skills/")}
+    installed_names = {
+        name.split("/")[1]
+        for name in names
+        if name.startswith("skills/") and name.split("/")[1] not in ("bundled", "hidden", "lib")
+    }
     assert "skills/lib/helper.py" in names and "skills/lib/SKILL.md" not in names
-    for name in ("allowed", "secret"):
-        assert name in delivered
+    expected_delivered = {"all": {"allowed", "secret"}, "none": set()}.get(
+        skill_filter if isinstance(skill_filter, str) else "", {"allowed"}
+    )
+    assert installed_names == expected_delivered
+    assert ("allowed" in menu) == ("allowed" in expected_delivered)
 
 
 async def test_presession_discovery_rejects_private_agent(
