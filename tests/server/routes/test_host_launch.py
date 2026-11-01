@@ -66,9 +66,10 @@ class _FakeConversationStore:
 @dataclass
 class _FakePermissionStore:
     grants: set[tuple[str, str]] = field(default_factory=set)
+    admins: set[str] = field(default_factory=set)
 
     def is_admin(self, user_id: str) -> bool:
-        return False
+        return user_id in self.admins
 
     def check_access(
         self,
@@ -108,6 +109,25 @@ class TestResolveHostOwner:
         store = _FakeHostStore(hosts={"host_1": host})
         result = resolve_host_owner(user_id=None, host_id="host_1", host_store=store)
         assert result.host_id == "host_1"
+
+    def test_admin_passes_when_permission_store_given(self) -> None:
+        host = _FakeHost(host_id="host_1", user_id="bob")
+        store = _FakeHostStore(hosts={"host_1": host})
+        permissions = _FakePermissionStore(admins={"alice"})
+        result = resolve_host_owner(
+            user_id="alice", host_id="host_1", host_store=store, permission_store=permissions
+        )
+        assert result.host_id == "host_1"
+
+    def test_non_admin_403_with_permission_store(self) -> None:
+        host = _FakeHost(host_id="host_1", user_id="bob")
+        store = _FakeHostStore(hosts={"host_1": host})
+        permissions = _FakePermissionStore(admins={"carol"})
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_host_owner(
+                user_id="alice", host_id="host_1", host_store=store, permission_store=permissions
+            )
+        assert exc_info.value.status_code == 403
 
 
 # ── resolve_host_launch ──────────────────────────────────────────────

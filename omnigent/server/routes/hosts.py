@@ -87,6 +87,7 @@ from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
     host_absent_error,
     resolve_host_launch,
+    resolve_host_owner,
     resolve_launch_timeout_s,
 )
 from omnigent.server.routes._workspace_validation import (
@@ -222,14 +223,17 @@ async def _connected_owned_host(
     auth_provider: AuthProvider | None,
     host_registry: HostRegistry,
     host_store: HostStore,
+    permission_store: PermissionStore | None,
 ) -> tuple[Host, HostConnection]:
-    """Resolve an owner-authorized host and require its live local tunnel."""
+    """Resolve a host the caller owns (or administers) and require its live local tunnel."""
     user_id = require_user(request, auth_provider)
-    host = await asyncio.to_thread(host_store.get_host, host_id)
-    if host is None:
-        raise HTTPException(status_code=404, detail="host not found")
-    if user_id is not None and host.user_id != user_id:
-        raise HTTPException(status_code=403, detail="not your host")
+    host = await asyncio.to_thread(
+        resolve_host_owner,
+        user_id=user_id,
+        host_id=host_id,
+        host_store=host_store,
+        permission_store=permission_store,
+    )
     conn = host_registry.get(host.host_id)
     if conn is None:
         raise _host_absent_error(host)
@@ -962,11 +966,13 @@ def create_hosts_router(
         # exposing another user's host. user_id is None only when auth
         # is disabled entirely (single-user server).
         user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            permission_store=permission_store,
+        )
 
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
@@ -1032,16 +1038,18 @@ def create_hosts_router(
         snapshot: launch re-resolves with the session's agent spec, and the
         in-session picker reflects that launch snapshot once the runner is up.
 
-        :raises HTTPException: 404 when the host is unknown, 403 when not the
-            owner, 409 when offline or the host daemon is too old to list model
+        :raises HTTPException: 404 when the host is unknown, 403 when neither the
+            owner nor an admin, 409 when offline or the host daemon is too old to list model
             options, 502 on host-side failure, 504 on timeout.
         """
         user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            permission_store=permission_store,
+        )
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
@@ -1625,14 +1633,13 @@ def create_hosts_router(
         # past the owner check below as None (see get_host above).
         user_id = require_user(request, auth_provider)
 
-        # Owner check: load the host record, fail with 404 if it
-        # doesn't exist (don't leak existence to non-owners), fail
-        # with 403 only when an authenticated caller doesn't own it.
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            permission_store=permission_store,
+        )
 
         if "\x00" in path:
             raise HTTPException(
@@ -1700,8 +1707,8 @@ def create_hosts_router(
         :param body: Request body carrying the absolute (or
             tilde-prefixed) ``path`` to create.
         :returns: ``{"object": "directory", "path": "<created abs path>"}``.
-        :raises HTTPException: 404 if host not found, 403 if not owned
-            by caller, 409 if host is offline or the directory could not
+        :raises HTTPException: 404 if host not found, 403 if the caller is neither
+            owner nor admin, 409 if host is offline or the directory could not
             be created (already exists / permission denied), 400 on path
             validation, 504 on host timeout, 502 on host I/O failure.
         """
@@ -1709,11 +1716,13 @@ def create_hosts_router(
         # past the owner check below as None.
         user_id = require_user(request, auth_provider)
 
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            permission_store=permission_store,
+        )
 
         path = body.path
         if not path.strip():
@@ -1775,6 +1784,7 @@ def create_hosts_router(
             auth_provider=auth_provider,
             host_registry=host_registry,
             host_store=host_store,
+            permission_store=permission_store,
         )
         _require_harness_setup_support(conn, "refreshing harness readiness")
         if CAP_REFRESH_HARNESSES not in conn.hello.capabilities:
@@ -1821,6 +1831,7 @@ def create_hosts_router(
             auth_provider=auth_provider,
             host_registry=host_registry,
             host_store=host_store,
+            permission_store=permission_store,
         )
         if CAP_HARNESS_ACCOUNTS not in conn.hello.capabilities:
             raise OmnigentError(
@@ -1867,6 +1878,7 @@ def create_hosts_router(
             auth_provider=auth_provider,
             host_registry=host_registry,
             host_store=host_store,
+            permission_store=permission_store,
         )
         if CAP_HARNESS_LOGIN not in conn.hello.capabilities:
             raise OmnigentError(
@@ -1982,6 +1994,7 @@ def create_hosts_router(
             auth_provider=auth_provider,
             host_registry=host_registry,
             host_store=host_store,
+            permission_store=permission_store,
         )
         if CAP_HARNESS_LOGIN not in conn.hello.capabilities:
             raise OmnigentError(
@@ -2032,6 +2045,7 @@ def create_hosts_router(
             auth_provider=auth_provider,
             host_registry=host_registry,
             host_store=host_store,
+            permission_store=permission_store,
         )
         if CAP_HARNESS_LOGIN not in conn.hello.capabilities:
             raise OmnigentError(
@@ -2081,6 +2095,7 @@ def create_hosts_router(
             auth_provider=auth_provider,
             host_registry=host_registry,
             host_store=host_store,
+            permission_store=permission_store,
         )
         if CAP_HARNESS_LOGIN not in conn.hello.capabilities:
             raise OmnigentError(
@@ -2147,11 +2162,13 @@ def create_hosts_router(
         # the owner check below as None.
         user_id = require_user(request, auth_provider)
 
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            permission_store=permission_store,
+        )
 
         conn = host_registry.get(host.host_id)
         if conn is None:
@@ -2247,8 +2264,8 @@ def create_hosts_router(
             reconnect, plus the refreshed gateway-inference map (``None`` when
             the host didn't report one).
         :raises HTTPException: 404 when disabled or host unknown, 400 when the
-            harness isn't UI-configurable or the body is invalid, 403 when not
-            the owner, 409 when offline or the host daemon is too old to store
+            harness isn't UI-configurable or the body is invalid, 403 when neither
+            owner nor admin, 409 when offline or the host daemon is too old to store
             credentials, 502 on host-side failure, 504 on timeout.
         """
         require_harness_install()
@@ -2268,11 +2285,13 @@ def create_hosts_router(
 
         user_id = require_user(request, auth_provider)
 
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            permission_store=permission_store,
+        )
 
         conn = host_registry.get(host.host_id)
         if conn is None:
@@ -2345,19 +2364,21 @@ def create_hosts_router(
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier.
         :returns: ``{"object": "detected_credentials", "credentials": [...]}``.
-        :raises HTTPException: 404 when disabled or host unknown, 403 when not
-            the owner, 409 when offline or the host daemon is too old to detect
+        :raises HTTPException: 404 when disabled or host unknown, 403 when neither
+            owner nor admin, 409 when offline or the host daemon is too old to detect
             credentials, 502/504 on host failure/timeout.
         """
         require_harness_install()
 
         user_id = require_user(request, auth_provider)
 
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            permission_store=permission_store,
+        )
 
         conn = host_registry.get(host.host_id)
         if conn is None:
@@ -2391,8 +2412,8 @@ def create_hosts_router(
             worktrees for, e.g. ``"/Users/alice/myrepo"``.
         :returns: ``{"object": "list", "data": [{path, branch,
             is_main, detached, updated_at?}, ...]}`` (main first).
-        :raises HTTPException: 404 if host not found, 403 if not owned
-            by caller, 409 if host is offline/unresponsive, 400 on path
+        :raises HTTPException: 404 if host not found, 403 if the caller is neither
+            owner nor admin, 409 if host is offline/unresponsive, 400 on path
             validation or a non-git path.
         """
         from omnigent.server.routes._host_worktree import (
@@ -2405,11 +2426,13 @@ def create_hosts_router(
         # past the owner check below as None.
         user_id = require_user(request, auth_provider)
 
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            permission_store=permission_store,
+        )
 
         if not path.strip():
             raise HTTPException(status_code=400, detail="path must not be empty")
