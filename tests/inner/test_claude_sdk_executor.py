@@ -89,6 +89,14 @@ def _run(coro):
         loop.close()
 
 
+def _long_prior_messages():
+    """Four prior messages of roughly 1,000 estimated replay tokens each."""
+    return [
+        {"role": role, "content": f"turn-{index} " + "x" * 3000}
+        for index, role in enumerate(("user", "assistant", "user", "assistant"))
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tests: Prompt extraction
 # ---------------------------------------------------------------------------
@@ -415,6 +423,79 @@ class TestPromptExtraction(unittest.TestCase):
             f"[image: image/png, {len(image_payload)} base64 chars]",
             rendered,
         )
+
+    def test_budgeted_fresh_replay_keeps_the_newest_history(self):
+        executor = self._make_executor()
+        messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=2_100)
+
+        marker = "[Earlier messages omitted to fit the model's context window: 2.]"
+        self.assertNotIn("turn-0", prompt)
+        self.assertNotIn("turn-1", prompt)
+        self.assertLess(prompt.index("Conversation so far:"), prompt.index(marker))
+        self.assertLess(prompt.index(marker), prompt.index("user: turn-2"))
+        self.assertLess(prompt.index("user: turn-2"), prompt.index("assistant: turn-3"))
+        self.assertTrue(prompt.endswith("user: What next?"))
+
+    def test_budgeted_fresh_replay_always_sends_the_latest_user_message(self):
+        executor = self._make_executor()
+        messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=0)
+
+        self.assertIn("[Earlier messages omitted to fit the model's context window: 4.]", prompt)
+        self.assertNotIn("turn-", prompt)
+        self.assertTrue(prompt.endswith("user: What next?"))
+
+    def test_budgeted_replay_counts_an_image_by_estimate_not_encoded_size(self):
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"\0" * 300_000).decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{image_payload}"},
+                    {"type": "input_text", "text": "Keep this image."},
+                ],
+            },
+            {"role": "assistant", "content": "Kept."},
+            {"role": "user", "content": "What next?"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=2_100)
+
+        self.assertEqual(len([block for block in prompt if block.get("type") == "image"]), 1)
+        text = self._text_of(prompt)
+        self.assertIn("Keep this image.", text)
+        self.assertNotIn("omitted", text)
+
+    def test_budgeted_replay_counts_a_pdf_by_its_encoded_size(self):
+        executor = self._make_executor()
+        pdf_payload = base64.b64encode(b"%PDF-1.7" + b"\0" * 300_000).decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": f"data:application/pdf;base64,{pdf_payload}",
+                    },
+                    {"type": "input_text", "text": "Read this report."},
+                ],
+            },
+            {"role": "assistant", "content": "Read."},
+            {"role": "user", "content": "What next?"},
+        ]
+
+        prompt = executor._build_prompt(
+            messages, resume_session=False, history_token_budget=100_000
+        )
+
+        self.assertIsInstance(prompt, str)
+        self.assertIn("[Earlier messages omitted to fit the model's context window: 1.]", prompt)
+        self.assertNotIn("Read this report.", prompt)
+        self.assertIn("assistant: Read.", prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -6108,6 +6189,128 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
     assert fake_sdk.created_clients == []
     assert executor._clients["sess-1"].client is live_client
     assert live_client.prompts == ["second question"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("declared_window", "model_override"),
+    [(4_200, None), (1_000_000, "small-window-model")],
+)
+async def test_fresh_client_replays_history_within_the_turn_models_window(
+    declared_window, model_override
+) -> None:
+    """A restarted client's replay fits the declared window, or an override model's."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=declared_window)
+    messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch(
+            "omnigent.llms.context_window.get_model_context_window", return_value=4_200
+        ) as catalog_lookup,
+    ):
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages, [], "", ExecutorConfig(model=model_override)
+            )
+        ]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    [prompt] = fake_sdk.created_clients[0].prompts
+    assert "[Earlier messages omitted to fit the model's context window: 2.]" in prompt
+    assert "turn-1" not in prompt
+    assert "turn-2" in prompt
+    if model_override is None:
+        catalog_lookup.assert_not_called()
+    else:
+        catalog_lookup.assert_called_once_with(model_override)
+
+
+@pytest.mark.asyncio
+async def test_unpinned_databricks_session_replays_within_its_default_models_window() -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.databricks_executor import DatabricksCredentials
+
+    with patch(
+        "omnigent.inner.databricks_executor._read_databrickscfg",
+        return_value=DatabricksCredentials(
+            host="https://example.cloud.databricks.com", token="dapi_test_token"
+        ),
+    ):
+        executor = ClaudeSDKExecutor(gateway=True)
+    fake_sdk = _make_recovery_fake_sdk()
+    messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch(
+            "omnigent.inner.claude_sdk_executor._resolve_databricks_claude_model",
+            return_value="system.ai.claude-opus-5",
+        ) as resolve_default,
+        patch(
+            "omnigent.llms.context_window.get_model_context_window", return_value=4_200
+        ) as catalog_lookup,
+    ):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    [prompt] = fake_sdk.created_clients[0].prompts
+    assert "[Earlier messages omitted to fit the model's context window: 2.]" in prompt
+    assert "turn-1" not in prompt
+    assert "turn-2" in prompt
+    catalog_lookup.assert_called_once_with("system.ai.claude-opus-5")
+    resolve_default.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", ["200k", "-10"])
+async def test_invalid_window_override_replays_within_the_default_window(
+    monkeypatch: pytest.MonkeyPatch, override: str
+) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.llms.context_window import DEFAULT_CONTEXT_WINDOW
+
+    monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", override)
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
+    # Too large for half of the default window, but not for half of a 200k window.
+    oldest = {"role": "user", "content": "oldest " + "x" * (2 * DEFAULT_CONTEXT_WINDOW)}
+    messages = [
+        oldest,
+        {"role": "assistant", "content": "ok"},
+        *_long_prior_messages(),
+        {"role": "user", "content": "What next?"},
+    ]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    [prompt] = fake_sdk.created_clients[0].prompts
+    assert "[Earlier messages omitted to fit the model's context window: 1.]" in prompt
+    assert "oldest" not in prompt
+    assert "turn-0" in prompt
+    assert "What next?" in prompt
+
+
+@pytest.mark.asyncio
+async def test_first_turn_skips_the_context_window_lookup() -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch("omnigent.inner.claude_sdk_executor._resolve_replay_context_window") as resolve,
+    ):
+        events = [
+            event async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
+        ]
+
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert fake_sdk.created_clients[0].prompts == ["hi"]
+    resolve.assert_not_called()
 
 
 @pytest.mark.asyncio

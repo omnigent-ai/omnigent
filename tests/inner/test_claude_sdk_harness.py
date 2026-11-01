@@ -353,6 +353,31 @@ def test_databricks_env_var_truthy_parsing(
 
 @pytest.mark.parametrize(
     "raw_value, expected",
+    [("1000000", 1_000_000), (" 200000 ", 200_000), ("", None), ("1M", None), ("0", None)],
+)
+def test_context_window_env_var_parsing(
+    raw_value: str,
+    expected: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a positive integer reaches the executor; anything else resolves from the model."""
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CONTEXT_WINDOW", raw_value)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["context_window"] == expected
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected",
     [
         ('"all"', "all"),
         ('"none"', "none"),
