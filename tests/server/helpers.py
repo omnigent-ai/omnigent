@@ -9,7 +9,7 @@ import re
 import tarfile
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 import click
@@ -22,6 +22,7 @@ from omnigent.onboarding.sandboxes import (
     RemoteProcess,
     SandboxLauncher,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import session_stream
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
@@ -173,6 +174,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         fail_on_command: str | None = None,
         home: str = "/root",
         can_resume: bool = False,
+        resume_preserves_host: bool = False,
+        started_sandbox_id: str | None = None,
         fail_on_resume: bool = False,
         provision_gate: threading.Event | None = None,
     ) -> None:
@@ -183,6 +186,11 @@ class FakeSandboxLauncher(SandboxLauncher):
         self._fail_on_command = fail_on_command
         self._home = home
         self.can_resume = can_resume
+        self._resume_preserves_host = resume_preserves_host
+        # When set, the host start surfaces this as the provider-assigned id (the
+        # Lambda MicroVMs shape: a real id only known at start, which the
+        # framework must persist over the reserved provision name).
+        self._started_sandbox_id = started_sandbox_id
         self.fail_on_resume = fail_on_resume
         self._provision_gate = provision_gate
         # Image reference / secret names / env names the production code
@@ -228,12 +236,24 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.pod_ready_timeout_s: int | None = None
         self.runtime_class: str | None = None
         self.home_size_limit: str | None = None
+        # Lambda MicroVM ctor wiring (captured by
+        # install_fake_lambda_microvm_launcher).
+        self.region: str | None = None
+        self.image_identifier: str | None = None
+        self.image_version: str | None = None
+        self.execution_role_arn: str | None = None
+        self.egress_network_connectors: list[str] | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
         self.host_starts: list[HostStartInvocation] = []
         self.terminated: list[str] = []
         self.resumed: list[str] = []
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        """The base flags, plus the host-preserving resume this fake can claim."""
+        return replace(super().capabilities, resume_preserves_host=self._resume_preserves_host)
 
     def prepare(self) -> None:
         """Record the preflight call (no real SDK/credential check)."""
@@ -273,6 +293,10 @@ class FakeSandboxLauncher(SandboxLauncher):
                 raise click.ClickException("simulated in-sandbox host start failure")
             invocation = _parse_host_start(command)
             self.host_starts.append(invocation)
+            # Surface a provider-assigned id (known only at start) for the
+            # framework's write-back, mirroring Lambda MicroVMs' run-microvm.
+            if self._started_sandbox_id is not None:
+                self.started_sandbox_id = self._started_sandbox_id
             if self._on_host_start is not None:
                 self._on_host_start(invocation)
         return RemoteCommandResult(returncode=0, stdout="", stderr="")
@@ -657,6 +681,48 @@ def install_fake_kubernetes_launcher(
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
+
+
+def install_fake_lambda_microvm_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``LambdaMicroVMSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``LambdaMicroVMSandboxLauncher(region=…,
+    image_identifier=…, image_version=…, execution_role_arn=…, env=…,
+    egress_network_connectors=…)``; the shim records those constructor args on
+    the fake and hands it back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.lambda_microvm as lambda_microvm_mod
+
+    def _ctor(
+        *,
+        region: str | None = None,
+        image_identifier: str | None = None,
+        image_version: str | None = None,
+        execution_role_arn: str | None = None,
+        env: list[str] | None = None,
+        egress_network_connectors: list[str] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.region = region
+        fake.image_identifier = image_identifier
+        fake.image_version = image_version
+        fake.execution_role_arn = execution_role_arn
+        fake.env = env
+        fake.egress_network_connectors = egress_network_connectors
+        # Report the lambda_microvm provider so managed-host teardown's provider
+        # match (launcher.provider vs host.sandbox_provider) exercises the real
+        # path instead of the FakeSandboxLauncher default ("modal").
+        fake.provider = "lambda_microvm"  # type: ignore[misc]  # shadow ClassVar per-instance
+        return fake
+
+    monkeypatch.setattr(lambda_microvm_mod, "LambdaMicroVMSandboxLauncher", _ctor)
 
 
 async def wait_for_completion(
