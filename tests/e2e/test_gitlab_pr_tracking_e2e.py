@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shlex
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -74,13 +73,15 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
         loop=asyncio.get_running_loop(),
         session_id="gitlab-owned",
     )
-    command = shlex.split(
+    command = [
+        "/bin/sh",
+        "-c",
         str(
             hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")[
                 "command"
             ]
-        )
-    )
+        ),
+    ]
     if operation.startswith("push-stderr"):
         push = tmp_path / "git-push-fixture"
         banner = f"remote: \nremote: View merge request for feature:\nremote:   {URL}\nremote: \n"
