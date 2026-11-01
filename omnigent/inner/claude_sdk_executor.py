@@ -85,9 +85,11 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    is_interruption_marker,
     without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
@@ -419,6 +421,8 @@ class _ClaudeSDK(Protocol):
 
 _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_INTERRUPT_TIMEOUT_SECONDS = 1.5
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -901,6 +905,8 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    # Set once the current query has been interrupted; cleared when the next query starts.
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -2167,23 +2173,23 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             return False
-        # Interrupt is best-effort and fast; a failure just falls through to
-        # the close below.
+        if state.interrupted:
+            return True
+        state.interrupted = True
         try:
-            await asyncio.wait_for(state.client.interrupt(), timeout=0.5)
+            await asyncio.wait_for(state.client.interrupt(), timeout=_INTERRUPT_TIMEOUT_SECONDS)
+            return True
+        except asyncio.CancelledError:
+            state.interrupted = False
+            raise
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
                 "Claude SDK interrupt failed for session %s: %s",
                 session_key,
                 exc,
             )
-        # Always drop the live session after an interrupt. Its transcript
-        # still holds the abandoned prompt, and resumed turns send only the
-        # latest user message (see _build_prompt), so the runner's
-        # "[System: interrupted]" marker would never reach the model. Closing
-        # forces the next turn to rebuild full history (marker included) in a
-        # fresh session — the abandoned request is then visible-but-superseded
-        # rather than silently continued.
+        # The turn may still be running, so drop the session; the next turn
+        # replays history, including the interruption marker, in a fresh one.
         try:
             await self.close_session(session_key)
             return True
@@ -2297,6 +2303,9 @@ class ClaudeSDKExecutor(Executor):
         return False
 
     def supports_tool_boundary_interrupt(self) -> bool:
+        return True
+
+    def resumes_after_interrupt(self) -> bool:
         return True
 
     def max_context_tokens(self) -> int | None:
@@ -3218,12 +3227,17 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
+                if is_interruption_marker(message):
+                    break
         self._pending_framework_context[session_key] = "\n\n".join(
             notice
             for message in notice_messages
             if message.get("role") == "user"
             for notice in framework_notices(message.get("content"))
         )
+        client_state = self._clients.get(session_key)
+        if client_state is not None:
+            client_state.interrupted = False
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3653,6 +3667,11 @@ class ClaudeSDKExecutor(Executor):
         if turn_usage is None:
             turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
+        if client_state is not None and client_state.interrupted:
+            # The CLI's result for an interrupted query is not a turn outcome.
+            yield TurnCancelled()
+            return
+
         if terminal_error:
             if compaction_occurred and claude_session_id:
                 compaction_event = _build_compaction_complete_event()
@@ -3850,6 +3869,9 @@ class ClaudeSDKExecutor(Executor):
                         return "/compact"
                     break
                 trailing.append(msg)
+                # The live session already received the user input before an interruption.
+                if is_interruption_marker(msg):
+                    break
             else:
                 break
         trailing.reverse()

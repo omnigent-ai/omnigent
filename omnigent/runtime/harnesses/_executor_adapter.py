@@ -18,7 +18,7 @@ import secrets
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from fastapi import Response
@@ -88,6 +88,10 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 # slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
 INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
+
+# How long a harness that keeps its native session may take to end an interrupted turn.
+# Stays under the runner's 3s interrupt POST so the clean stop lands before it cancels the turn.
+_INTERRUPT_SETTLE_TIMEOUT_S = 2.0
 
 # Interrupting an executor abandoned by an abnormal exit usually fails because the
 # harness is already gone -- that absence is what abandoned it. Its socket refuses or
@@ -220,6 +224,9 @@ class ExecutorAdapter(HarnessApp):
         # until completion; drained before recovery and on shutdown.
         self._bg_tasks: set[asyncio.Task[bool]] = set()
         self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
+        # Set when the latest run_turn has unwound, so an interrupt can confirm the stop.
+        self._turn_finished = asyncio.Event()
+        self._turn_finished.set()
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -340,6 +347,8 @@ class ExecutorAdapter(HarnessApp):
 
         user_message = _extract_last_user_message(request.input)
 
+        turn_finished = asyncio.Event()
+        self._turn_finished = turn_finished
         # Watcher forwards mid-turn steering injections into the in-flight executor session.
         injection_watcher = asyncio.create_task(
             self._watch_injections(ctx, executor),
@@ -372,12 +381,13 @@ class ExecutorAdapter(HarnessApp):
                     )
 
                 response_text: str | None = None
-                async for event in executor.run_turn(
+                turn_events = executor.run_turn(
                     messages=messages,
                     tools=tools,
                     system_prompt=system_prompt,
                     config=config,
-                ):
+                )
+                async for event in turn_events:
                     if ctx.cancelled.is_set():
                         log_input_event(
                             _logger,
@@ -396,7 +406,11 @@ class ExecutorAdapter(HarnessApp):
                         # the finally's _safe_interrupt fallback still fires.
                         await executor.interrupt_session(self._session_key)
                         _turn_outcome = "cancelled"
-                        clean_exit = True
+                        clean_exit = (
+                            await self._settle_interrupted_turn(event, turn_events)
+                            if executor.resumes_after_interrupt()
+                            else True
+                        )
                         return
                     # --- Tracing: emit spans per event ---
                     if tctx is not None:
@@ -516,13 +530,20 @@ class ExecutorAdapter(HarnessApp):
                                 undelivered=event.undelivered,
                             )
                         raise RuntimeError(f"inner executor error: {detail}")
+                # A kept native session can end its interrupted turn without another event.
+                interrupted_turn_ended = (
+                    ctx.cancelled.is_set() and executor.resumes_after_interrupt()
+                )
                 log_input_event(
                     _logger,
                     "native_input_execution_finished",
                     session_id=turn_session_id,
-                    outcome="executor_stream_ended",
+                    outcome="cancelled" if interrupted_turn_ended else "executor_stream_ended",
                 )
                 input_outcome_logged = True
+                if interrupted_turn_ended:
+                    _turn_outcome = "cancelled"
+                    clean_exit = True
         except ElicitationDeclinedError:
             if input_identity and not input_outcome_logged:
                 log_input_event(
@@ -607,16 +628,65 @@ class ExecutorAdapter(HarnessApp):
                 self._abandoned_executor_cleanup = interrupt_task
                 self._bg_tasks.add(interrupt_task)
                 interrupt_task.add_done_callback(self._bg_tasks.discard)
+            turn_finished.set()
+
+    async def _settle_interrupted_turn(
+        self, event: ExecutorEvent, turn_events: AsyncIterator[ExecutorEvent]
+    ) -> bool:
+        """Discard an interrupted turn's events, from *event* on, until its harness ends it.
+
+        Returns ``False`` when the turn does not end in time or reports a session-ending
+        error, so the caller drops the executor instead of resuming its native session.
+        """
+        try:
+            async with asyncio.timeout(_INTERRUPT_SETTLE_TIMEOUT_S):
+                while True:
+                    if isinstance(event, ExecutorError) and not event.preserve_session:
+                        _logger.warning(
+                            "interrupted turn of inner session %s ended with an error: %s",
+                            self._session_key,
+                            event.message,
+                        )
+                        return False
+                    event = await anext(turn_events)
+        except StopAsyncIteration:
+            return True
+        except Exception:
+            _logger.warning(
+                "interrupted turn of inner session %s did not end cleanly",
+                self._session_key,
+                exc_info=True,
+            )
+            return False
 
     async def _handle_interrupt_event(self) -> Response:
-        """Cancel the turn and drop the inner executor session synchronously.
+        """Cancel the turn and stop the inner executor's in-flight generation.
 
         Extends the base handler to also call ``interrupt_session`` — ensuring the in-flight
-        generation stops even when the run loop is blocked awaiting the first token.
+        generation stops even when the run loop is blocked awaiting the first token. When the
+        executor keeps its native session, waits for the turn to end so the next turn cannot
+        reach a session that is still running; an unconfirmed stop closes that session.
         """
         response = await super()._handle_interrupt_event()
-        if self._executor is not None:
-            await self._executor.interrupt_session(self._session_key)
+        executor = self._executor
+        if executor is None:
+            return response
+        if not executor.resumes_after_interrupt():
+            await executor.interrupt_session(self._session_key)
+            return response
+        turn_finished = self._turn_finished
+        try:
+            async with asyncio.timeout(_INTERRUPT_SETTLE_TIMEOUT_S):
+                await executor.interrupt_session(self._session_key)
+                await turn_finished.wait()
+        except Exception:
+            _logger.warning(
+                "inner session %s did not confirm the interrupt; closing it",
+                self._session_key,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await executor.close_session(self._session_key)
         return response
 
     async def _prepare_turn_retry(self) -> bool:

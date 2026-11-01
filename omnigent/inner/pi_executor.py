@@ -113,6 +113,7 @@ from .executor import (
     ToolCallStatus,
     ToolSpec,
     TurnComplete,
+    pending_interruption_marker,
 )
 
 logger = logging.getLogger(__name__)
@@ -1449,6 +1450,8 @@ class _PiSessionState:
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
     _has_sent_prompt: bool = False
+    # Set once the current prompt has been aborted; cleared when the next prompt is sent.
+    abort_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -1682,7 +1685,9 @@ def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | l
     On the first turn with prior history (e.g. sub-agent with
     ``pass_history=True``), serializes the full conversation so
     the Pi process has context. Otherwise returns just the
-    latest user message content (may be multimodal).
+    latest user message content (may be multimodal), preceded by
+    the runner's interruption marker when the process's previous
+    turn was interrupted.
 
     :param messages: Omnigent conversation history for the
         turn.
@@ -1705,7 +1710,13 @@ def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | l
         )
         return "\n".join(lines)
 
-    return _extract_latest_user_content(messages)
+    latest_user_content = _extract_latest_user_content(messages)
+    marker = pending_interruption_marker(messages)
+    if marker is None:
+        return latest_user_content
+    if isinstance(latest_user_content, list):
+        return [{"type": "input_text", "text": marker}, *latest_user_content]
+    return f"{marker}\n\n{latest_user_content}"
 
 
 @dataclass(frozen=True)
@@ -2370,6 +2381,9 @@ class PiExecutor(Executor):
     def supports_live_message_queue(self) -> bool:
         return True
 
+    def resumes_after_interrupt(self) -> bool:
+        return True
+
     async def enqueue_session_message(  # type: ignore[explicit-any]
         self,
         session_key: str,
@@ -2416,16 +2430,16 @@ class PiExecutor(Executor):
         state = self._session_states.get(session_key)
         if state is None or state.rpc is None:
             return False
-        # Best-effort abort to halt the in-flight turn.
+        if state.abort_requested:
+            return True
+        state.abort_requested = True
         try:
             await state.rpc.send_command({"type": "abort", "id": "abort"})
+            return True
         except Exception as exc:  # noqa: BLE001 — abort is best-effort
             logger.debug("PiExecutor: interrupt abort failed: %s", exc)
-        # Always drop the session so the next turn starts fresh and replays
-        # full history. A resumed subprocess sends only the latest user
-        # message, which would bypass the runner's "[System: interrupted]"
-        # marker and silently continue the abandoned request. See
-        # claude_sdk_executor.interrupt_session for the rationale.
+        # The turn may still be running, so drop the process; the next turn
+        # replays history, including the interruption marker, in a fresh one.
         try:
             await self.close_session(session_key)
             return True
@@ -3062,6 +3076,7 @@ class PiExecutor(Executor):
 
         if state is not None:
             state._has_sent_prompt = True
+            state.abort_requested = False
 
         # Send prompt command. Pi's JSONL protocol carries text in ``message``
         # and images in a native ``images`` field. Split multimodal blocks into
@@ -3379,6 +3394,9 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                    if stop == "aborted" and state is not None and state.abort_requested:
+                        # Read on to the run's boundary so the kept process is idle.
+                        continue
                     if stop == "aborted" or (
                         stop == "error" and settled_boundary and message_streamed_text
                     ):
