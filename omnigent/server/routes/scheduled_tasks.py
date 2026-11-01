@@ -16,18 +16,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
-from omnigent.entities import Agent, ScheduledTask, ScheduledTaskRun
+from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
+from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -37,6 +39,11 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.routes._sessions.helpers import (
+    _read_state_entry,
+    _session_status_from_cache,
+)
+from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -53,6 +60,9 @@ _VALID_EXECUTION_TARGETS = frozenset({"connected_host", "managed_sandbox"})
 _MANAGED_SANDBOX_WITH_HOST_MSG = (
     "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id or workspace"
 )
+_SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
+# A continued session cannot follow a change to these, so the next run starts a new one.
+_SESSION_BOUND_FIELDS = frozenset({"agent_id", "host_id", "workspace", "execution_target"})
 
 
 class CreateScheduledTaskRequest(BaseModel):
@@ -71,6 +81,10 @@ class CreateScheduledTaskRequest(BaseModel):
     # path derives the runner's --permission-mode launch arg from it.
     permission_mode: str | None = None
     max_cost_usd: float | None = Field(default=None, gt=0)
+    # "continue" sends every run's prompt into one session: ``session_id`` when
+    # given, else the session the first run creates.
+    session_mode: Literal["new", "continue"] = "new"
+    session_id: str | None = Field(default=None, min_length=1)
     # Optional: no PINNED host/workspace. When both are unset the fire path
     # resolves the owner's online host at fire time and defaults the workspace to
     # that host's home directory (a failed run is recorded if none is online) —
@@ -94,6 +108,8 @@ class CreateScheduledTaskRequest(BaseModel):
             self.host_id is not None or self.workspace is not None
         ):
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
+        if self.session_id is not None and self.session_mode != "continue":
+            raise ValueError(_SESSION_ID_WITHOUT_CONTINUE_MSG)
         return self
 
 
@@ -114,6 +130,9 @@ class UpdateScheduledTaskRequest(BaseModel):
     reasoning_effort: str | None = None
     permission_mode: str | None = None
     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
+    session_mode: Literal["new", "continue"] | None = None
+    # Null makes a continue-mode task's next run start a new session.
+    session_id: str | None = Field(default=None, min_length=1)
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     execution_target: str | None = Field(default=None, min_length=1)
@@ -186,6 +205,8 @@ def _to_response(
         "reasoning_effort": task.reasoning_effort,
         "permission_mode": task.permission_mode,
         "max_cost_usd": task.max_cost_usd,
+        "session_mode": task.session_mode,
+        "session_id": task.session_id,
         "workspace": task.workspace,
         "host_id": task.host_id,
         "execution_target": task.execution_target,
@@ -199,11 +220,33 @@ def _to_response(
     }
 
 
-def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
+def _run_to_response(
+    run: ScheduledTaskRun,
+    *,
+    conversation_updated_at: int | None = None,
+    conversation_status: str | None = None,
+    viewer_last_seen: int | None = None,
+    viewer_unread: bool | None = None,
+) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
 
     Excludes the free-text ``error`` blob (never SQL-queried, potentially
     large); ``error_code`` carries the queryable failure classification.
+
+    :param conversation_updated_at: The conversation's ``updated_at`` epoch
+        seconds, or ``None`` for runs without a conversation. Embedded so the
+        frontend can call ``isConversationUnseen`` with no per-row fetch.
+    :param conversation_status: The session's status as ``GET /v1/sessions``
+        reports it (``"idle"``, ``"running"`` or ``"failed"``; waiting and
+        booting read as running), without that list's sub-agent roll-up. ``None``
+        for runs without a conversation.
+    :param viewer_last_seen: When the caller last saw the conversation (epoch
+        seconds), or ``None`` if never or for runs without a conversation. Same
+        value as ``viewer_last_seen`` in ``GET /v1/sessions``.
+    :param viewer_unread: The caller's ``viewer_unread`` flag for the
+        conversation (in-memory read-state explicit-unread), or ``None`` for
+        runs without a conversation. Hydrates ``useUnseenConversations`` on load
+        so the frontend never needs a separate session fetch.
     """
     return {
         "id": run.id,
@@ -214,6 +257,10 @@ def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
+        "conversation_updated_at": conversation_updated_at,
+        "conversation_status": conversation_status,
+        "viewer_last_seen": viewer_last_seen,
+        "viewer_unread": viewer_unread,
     }
 
 
@@ -246,6 +293,7 @@ def create_scheduled_tasks_router(
     auth_provider: AuthProvider | None = None,
     artifact_store: ArtifactStore | None = None,
     project_store: ProjectStore | None = None,
+    automations: DeploymentGate = True,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -255,11 +303,17 @@ def create_scheduled_tasks_router(
     :param artifact_store: Holds the copy a task gets of another user's agent.
     :param project_store: Checks the project fired sessions are filed into.
         ``None`` rejects tasks that set a project.
+    :param automations: Per-request gate; every route returns 404 while it is off.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` disables auth (owner resolves to ``"local"``).
     :returns: A configured :class:`APIRouter`.
     """
-    router = APIRouter()
+
+    def require_automations() -> None:
+        if not deployment_gate_enabled(automations, "automations"):
+            raise HTTPException(status_code=404, detail="not found")
+
+    router = APIRouter(dependencies=[Depends(require_automations)])
 
     def _owner(request: Request) -> str:
         """Resolve the calling user, mapping the auth-disabled case to
@@ -323,6 +377,12 @@ def create_scheduled_tasks_router(
             if sandbox_config is None or not sandbox_config.managed_launch_supported:
                 raise OmnigentError(
                     "managed sandboxes are not configured on this server",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if sandbox_config.default.manages_profiles:
+                raise OmnigentError(
+                    "Scheduled fresh sandboxes cannot select a profile yet; "
+                    "use a connected host or a default provider without profiles",
                     code=ErrorCode.INVALID_INPUT,
                 )
             return agent, None, validated_model, validated_effort
@@ -402,6 +462,29 @@ def create_scheduled_tasks_router(
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
+    async def _require_continuable(request: Request, task: ScheduledTask) -> Conversation:
+        """Return a picked session *task* can continue; reject it otherwise, hiding one
+        the owner cannot see."""
+        from omnigent.server.scheduled.fire import continued_session_problem
+
+        assert task.session_id is not None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, task.session_id)
+        problem = await continued_session_problem(
+            task,
+            conv,
+            host_store=getattr(request.app.state, "host_store", None),
+            permission_store=permission_store,
+        )
+        if problem is None:
+            assert conv is not None
+            return conv
+        reason, error_code = problem
+        if error_code in ("continued_session_missing", "continued_session_forbidden"):
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        raise OmnigentError(
+            f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
+        )
+
     @router.post("/scheduled-tasks")
     async def create_scheduled_task(
         request: Request,
@@ -425,13 +508,42 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         project_owner = _project_owner(owner)
-        bound = await _bind_agent(agent, owner_id)
+        # Known before the task exists, since a sandbox session must run on the
+        # sandbox host derived from it.
+        task_id = uuid.uuid4().hex
+        host_id = body.host_id
+        if body.session_id is not None:
+            # A picked session keeps the agent it runs, so the task takes no copy.
+            bound = agent
+            picked = await _require_continuable(
+                request,
+                ScheduledTask(
+                    id=task_id,
+                    name=body.name,
+                    prompt=body.prompt,
+                    rrule=body.rrule,
+                    user_id=owner_id,
+                    agent_id=agent.id,
+                    timezone=body.timezone,
+                    created_at=0,
+                    workspace=workspace,
+                    host_id=body.host_id,
+                    execution_target=body.execution_target,
+                    session_mode=body.session_mode,
+                    session_id=body.session_id,
+                ),
+            )
+            # The session cannot move, so the task routes every run to its host.
+            if host_id is None and body.execution_target != "managed_sandbox":
+                host_id = picked.host_id
+        else:
+            bound = await _bind_agent(agent, owner_id)
         project_id: str | None = None
         try:
             if body.project_id is not None:
                 project_id = await _owned_project_id(project_owner, body.project_id)
             task = store.create(
-                scheduled_task_id=uuid.uuid4().hex,
+                scheduled_task_id=task_id,
                 name=body.name,
                 prompt=body.prompt,
                 rrule=body.rrule,
@@ -442,8 +554,10 @@ def create_scheduled_tasks_router(
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
                 max_cost_usd=body.max_cost_usd,
+                session_mode=body.session_mode,
+                session_id=body.session_id,
                 workspace=workspace,
-                host_id=body.host_id,
+                host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
             )
@@ -551,10 +665,37 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _require_owned(scheduled_task_id, owner_id)
+        # Read state is keyed by the caller's raw identity, as the session
+        # read-state routes key it; ``owner_id`` folds "local" into None.
+        viewer_id = require_user(request, auth_provider)
         runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
         runs = force_fail_stale_runs(store, runs)
+        # Batch-fetch conversation metadata for runs that produced a session so
+        # the frontend can compute unread dots without per-row session GETs.
+        # Runs without a conversation_id (skipped/failed) contribute null fields.
+        conv_ids = [r.conversation_id for r in runs if r.conversation_id is not None]
+        sessions = conversation_store.get_session_activity(conv_ids) if conv_ids else {}
+        run_rows = []
+        for r in runs:
+            session = sessions.get(r.conversation_id) if r.conversation_id is not None else None
+            if r.conversation_id is not None and session is not None:
+                last_seen, explicit_unread = _read_state_entry(viewer_id, r.conversation_id)
+                run_rows.append(
+                    _run_to_response(
+                        r,
+                        conversation_updated_at=session.updated_at,
+                        conversation_status=_list_status_with_starting(
+                            _session_status_from_cache(r.conversation_id, session.live_status),
+                            r.conversation_id,
+                        ),
+                        viewer_last_seen=last_seen,
+                        viewer_unread=explicit_unread,
+                    )
+                )
+            else:
+                run_rows.append(_run_to_response(r))
         return {
-            "runs": [_run_to_response(r) for r in runs],
+            "runs": run_rows,
             "next_cursor": next_cursor,
         }
 
@@ -628,6 +769,13 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
+        if fields.get("session_mode") is None:
+            fields.pop("session_mode", None)
+        target_session_mode = fields.get("session_mode", existing.session_mode)
+        if target_session_mode == "new":
+            if fields.get("session_id") is not None:
+                raise OmnigentError(_SESSION_ID_WITHOUT_CONTINUE_MSG, code=ErrorCode.INVALID_INPUT)
+            fields["session_id"] = None
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
         new_copy: Agent | None = None
@@ -708,10 +856,41 @@ def create_scheduled_tasks_router(
                 fields["workspace"] = None
             elif "workspace" in fields:
                 fields["workspace"] = workspace
-            if agent_changed:
+            # A picked session keeps the agent it runs, so the task takes no copy.
+            if agent_changed and fields.get("session_id") is None:
                 bound = await _bind_agent(agent, owner_id)
                 fields["agent_id"] = bound.id
                 new_copy = bound if bound.id != agent.id else None
+        if "session_id" not in fields and any(
+            name in fields and fields[name] != getattr(existing, name)
+            for name in _SESSION_BOUND_FIELDS
+        ):
+            fields["session_id"] = None
+        if fields.get("session_id") is not None:
+            picked = await _require_continuable(
+                request,
+                replace(
+                    existing,
+                    **{
+                        name: fields[name]
+                        for name in (
+                            "agent_id",
+                            "host_id",
+                            "workspace",
+                            "execution_target",
+                            "session_mode",
+                            "session_id",
+                        )
+                        if name in fields
+                    },
+                ),
+            )
+            # The session cannot move, so the task routes every run to its host.
+            if (
+                fields.get("host_id", existing.host_id) is None
+                and fields.get("execution_target", existing.execution_target) != "managed_sandbox"
+            ):
+                fields["host_id"] = picked.host_id
         project_owner = _project_owner(owner)
         try:
             if fields.get("project_id") is not None:
