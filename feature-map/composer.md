@@ -123,8 +123,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   chat shows no menu and sends slash text to the vendor TUI. Claude Code and
   Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
   `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
+  A Claude native session started through a configured command, arguments or
+  launcher also lists the plugins that launch loads, such as `--plugin-dir`.
   States: loading, error/retry, unavailable while disconnected, and an
-  incomplete catalog.
+  incomplete catalog, including a launch that cannot report its plugins.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -597,7 +599,9 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
-  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`
+  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`;
+  launcher-loaded Claude plugins:
+  `tests/e2e_ui/chat/test_claude_skills_menu_terminal_parity.py::test_claude_menu_lists_plugin_skills_a_launcher_loads`
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

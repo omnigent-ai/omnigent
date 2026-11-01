@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -308,6 +309,103 @@ def test_claude_menu_lists_plugin_commands_the_terminal_lists(
             review_row = page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:review")
             try:
                 expect(review_row).to_be_visible(timeout=30_000)
+            except AssertionError:
+                listed = client.get("/v1/skills", params={"session_id": session_id}).json()
+                names = [skill["name"] for skill in listed.get("skills", [])]
+                raise AssertionError(
+                    f"chat menu lacks /{_PLUGIN}:review although the terminal lists it; "
+                    f"/v1/skills names={names}"
+                ) from None
+        finally:
+            client.delete(f"/v1/sessions/{session_id}")
+
+
+def _plugin_dir_launcher(root: Path, plugin: Path) -> Path:
+    """Write a Claude launcher that loads *plugin* via ``--plugin-dir``, as wrapper CLIs do."""
+    claude = shutil.which("claude")
+    assert claude is not None
+    launcher = root / "claude-launcher"
+    launcher.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = "--" ] && shift\n'
+        f'exec {shlex.quote(claude)} --plugin-dir {shlex.quote(str(plugin))} "$@"\n'
+    )
+    launcher.chmod(0o755)
+    return launcher
+
+
+@pytest.mark.timeout(600)
+def test_claude_menu_lists_plugin_skills_a_launcher_loads(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    """Plugin skills a configured Claude launcher loads are offered in the chat menu.
+
+    The host's ``harness.claude-native.command`` points at a launcher passing
+    ``--plugin-dir``, so the plugin is never recorded in ``installed_plugins.json``.
+    """
+    if shutil.which("claude") is None or shutil.which("tmux") is None:
+        pytest.skip("needs the claude CLI and tmux")
+    plugin = tmp_path / "launcher-plugins" / _PLUGIN
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": _PLUGIN, "version": "1.0.0", "description": "e2e plugin"})
+    )
+    for name in ("review", "review-add-rule", "review-add-guideline"):
+        _seed_skill(plugin / "skills", name, f"{name} skill")
+    launcher = _plugin_dir_launcher(tmp_path, plugin)
+    claude_config_dir = tmp_path / "claude-config"
+    claude_config_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with (
+        httpx.Client(base_url=live_server, timeout=20) as client,
+        isolated_host(
+            tmp_path / "host",
+            live_server,
+            env={
+                "CLAUDE_CONFIG_DIR": str(claude_config_dir),
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            },
+            config={"harness": {"claude-native": {"command": str(launcher), "args": ["--"]}}},
+            command=_host_command(live_server, mock_llm_server_url),
+        ) as host,
+    ):
+        host.wait_online(client, timeout=120, poll_interval=0.5)
+        created = create_native_session(
+            client,
+            live_server,
+            harness="claude",
+            metadata={"host_id": host.host_id, "workspace": str(workspace)},
+        )
+        session_id = str(created["session_id"])
+        try:
+            reviewed_key = json.dumps(f"omnigent:imports-reviewed:{host.host_id}")
+            page = request.getfixturevalue("page")
+            page.add_init_script(f"localStorage.setItem({reviewed_key}, 'true')")
+            page.goto(f"{live_server}/c/{session_id}")
+            composer = page.get_by_label("Message the agent")
+            expect(composer).to_be_visible(timeout=60_000)
+
+            _open_terminal_view(page)
+            _wait_terminal_connected(page)
+            _focus_tui(page)
+            page.keyboard.type(f"/{_PLUGIN}", delay=30)
+            _wait_pane_contains(live_server, session_id, f"{_PLUGIN}:review")
+            page.wait_for_timeout(1_500)
+            for _ in range(len(_PLUGIN) + 1):
+                page.keyboard.press("Backspace")
+
+            _select_view_mode(page, "Chat")
+            expect(composer).to_be_visible(timeout=30_000)
+            composer.fill(f"/{_PLUGIN}:review")
+            try:
+                expect(page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:review")).to_be_visible(
+                    timeout=30_000
+                )
+                page.wait_for_timeout(1_500)
             except AssertionError:
                 listed = client.get("/v1/skills", params={"session_id": session_id}).json()
                 names = [skill["name"] for skill in listed.get("skills", [])]

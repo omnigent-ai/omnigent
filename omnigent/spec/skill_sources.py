@@ -386,22 +386,22 @@ def _managed_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     return {key for key in managed if isinstance(key, str) and key}
 
 
-def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
+def _plugin_enablement(ctx: SkillSourceContext) -> dict[str, bool]:
     """
-    Resolve which plugins are enabled, honoring scope + local precedence
-    and the managed (policy) tier.
+    Resolve each configured plugin's enablement, honoring scope + local
+    precedence and the managed (policy) tier.
 
     Merges ``enabledPlugins`` across the settings files from
     :func:`_enabled_plugin_settings_files` in increasing-precedence order
     (last-wins per key), so a plugin enabled globally but explicitly
     disabled in a project's ``settings.local.json`` is correctly excluded
     (and vice-versa). The managed tier (:func:`_managed_plugin_keys`) is then
-    unioned on top: it force-enables at the highest precedence and so cannot
+    applied on top: it force-enables at the highest precedence and so cannot
     be overridden by a settings disable.
 
     :param ctx: Session discovery context.
-    :returns: The set of ``<plugin>@<marketplace>`` keys whose effective
-        enablement is truthy, unioned with the managed (policy) keys.
+    :returns: Each ``<plugin>@<marketplace>`` key with an effective setting;
+        managed (policy) keys are ``True``.
     """
     state: dict[str, bool] = {}
     for path in _enabled_plugin_settings_files(ctx):
@@ -417,11 +417,15 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
                 # real bool from a weaker-precedence tier).
                 if isinstance(value, bool):
                     state[key] = value
-    enabled = {key for key, on in state.items() if on}
     # Managed (policy) plugins are force-enabled at the highest precedence and
-    # cannot be overridden by a user/project enabledPlugins toggle, so union
-    # them on top of the settings-derived set (force-enable, never disable).
-    return enabled | _managed_plugin_keys(ctx)
+    # cannot be overridden by a user/project enabledPlugins toggle.
+    state.update(dict.fromkeys(_managed_plugin_keys(ctx), True))
+    return state
+
+
+def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
+    """The ``<plugin>@<marketplace>`` keys whose effective enablement is truthy."""
+    return {key for key, on in _plugin_enablement(ctx).items() if on}
 
 
 def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
@@ -772,9 +776,50 @@ def _claude_code_commands(ctx: SkillSourceContext) -> list[SkillSpec]:
     return out
 
 
+def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
+    """Plugins a customized native launch loads, such as a launcher's ``--plugin-dir``."""
+    from omnigent.harnesses.claude_native.plugin_discovery import (
+        claude_launch_is_customized,
+        claude_launch_plugin_dirs,
+    )
+
+    if not ctx.is_native:
+        return {}
+    try:
+        customized = claude_launch_is_customized()
+    except (OSError, yaml.YAMLError) as exc:
+        _log.warning("Could not read the Omnigent config to find the Claude launch: %s", exc)
+        if ctx.warnings is not None:
+            ctx.warnings.append(
+                "Claude plugins added by a configured launch may be missing: the Omnigent "
+                "config could not be read; see the host log for details."
+            )
+        return {}
+    if not customized:
+        return {}
+    try:
+        return claude_launch_plugin_dirs()
+    except (OSError, subprocess.SubprocessError, ValueError, yaml.YAMLError) as exc:
+        summary = (
+            f"timed out after {exc.timeout:g}s"
+            if isinstance(exc, subprocess.TimeoutExpired)
+            else "did not report its plugins"
+        )
+        _log.warning("The configured Claude launch %s: %s", summary, exc)
+        if ctx.warnings is not None:
+            ctx.warnings.append(
+                f"Claude plugins added by the configured launch are missing: the launch "
+                f"{summary}; see the host log for details."
+            )
+        return {}
+
+
 def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     Enabled Claude Code plugin skills and commands, namespaced ``<plugin>:<name>``.
+
+    A customized native launch also contributes the plugins it loads without
+    recording them in Claude's settings, such as a launcher's ``--plugin-dir``.
 
     Both are host skills, so they obey the spec's ``skills_filter`` exactly as
     :func:`discover_host_skills` does: ``"none"`` suppresses them entirely,
@@ -787,11 +832,15 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     filter_names: set[str] | None = (
         set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
     )
-    enabled = _enabled_plugin_keys(ctx)
-    if not enabled:
-        return []
+    enablement = _plugin_enablement(ctx)
+    enabled = {key for key, on in enablement.items() if on}
+    install_paths = _plugin_install_paths(ctx, enabled) if enabled else {}
+    for key, launch_path in _claude_launch_plugin_paths(ctx).items():
+        # The launch reads settings from home, so this workspace's disables apply here.
+        if enablement.get(key, True):
+            install_paths.setdefault(key, launch_path)
     out: list[SkillSpec] = []
-    for key, install_path in _plugin_install_paths(ctx, enabled).items():
+    for key, install_path in install_paths.items():
         plugin = key.split("@", 1)[0]
         skipped: list[str] = []
         specs = _discover_skills(install_path / "skills", skipped=skipped)

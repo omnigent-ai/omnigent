@@ -7,6 +7,8 @@ import json
 import os
 import subprocess
 import tarfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.harnesses.claude_native import plugin_discovery
 from omnigent.host.frames import HostSkillsFrame
 from omnigent.host.skills import (
     INCOMPLETE_CATALOG_TTL_SECONDS,
@@ -24,6 +27,8 @@ from omnigent.host.skills import (
 )
 from omnigent.spec import load
 from omnigent.spec.skill_sources import resolve_session_skills
+from tests._helpers.claude_launch import configure_claude_launch
+from tests._helpers.providers import isolate_provider_resolution
 
 
 def _skill(name: str, *, hidden: bool = False) -> str:
@@ -355,3 +360,57 @@ def test_incomplete_codex_catalog_reports_warnings_and_is_cached_only_briefly(
     assert names(warnings := []) == ["later", "local", "toolkit:review"]
     assert warnings == []
     assert cli.call_count == 2
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("shared_discovery", [True, False], ids=["shared", "separate"])
+def test_cold_claude_catalogs_share_one_stalled_launch_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shared_discovery: bool,
+    _no_configured_claude_launch: Callable[[], bool],
+) -> None:
+    """Concurrent catalogs fall back after one probe timeout, not one timeout each.
+
+    Separate discoveries, like concurrent runner sessions, share no discovery lock.
+    """
+    for name in ("OMNIGENT_CLAUDE_LAUNCHER", "OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
+    )
+    monkeypatch.setattr(plugin_discovery, "LAUNCH_PLUGINS_TIMEOUT_S", 3.0)
+    home = tmp_path / "home"
+    skill = home / ".claude" / "skills" / "local" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(_skill("local"))
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    launches = tmp_path / "launches.jsonl"
+    configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        launches,
+        "time.sleep(30)\n",
+    )
+    shared = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
+
+    def catalog(workspace: Path) -> tuple[list[str], list[str]]:
+        workspace.mkdir()
+        discovery = (
+            shared
+            if shared_discovery
+            else HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
+        )
+        warnings: list[str] = []
+        frame = HostSkillsFrame("request", "claude-native", str(workspace))
+        skills = discovery.discover(frame, workspace, warnings=warnings)
+        return [skill["name"] for skill in skills], warnings
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        catalogs = list(pool.map(catalog, (tmp_path / "first", tmp_path / "second")))
+
+    assert len(launches.read_text().splitlines()) == 1
+    warning = (
+        "Claude plugins added by the configured launch are missing: the launch "
+        "timed out after 3s; see the host log for details."
+    )
+    assert catalogs == [(["local"], [warning]), (["local"], [warning])]
