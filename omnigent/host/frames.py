@@ -20,6 +20,7 @@ see.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -67,6 +68,9 @@ RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+# The runner starts a codex-native session whose collaboration-mode label is
+# ``plan`` (armed on the New Session screen) in Codex Plan mode:
+CAP_CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
 # The host answers ``host.mcp_servers`` with its user-level MCP inventory:
 CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
@@ -77,10 +81,13 @@ CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
 CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
+# The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
+CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
+    CAP_CODEX_PLAN_AT_LAUNCH,
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
@@ -90,6 +97,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
     CAP_REFRESH_HARNESSES,
+    CAP_WORKTREE_CREATE_BUDGET,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
 ]
@@ -632,6 +640,9 @@ class HostCreateWorktreeFrame:
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree (the deleted-worktree
         recreate path) instead of creating a new branch.
+    :param timeout_s: Seconds the host may spend on this create; the
+        server waits a margin longer. ``None`` on frames from an older
+        server, whose shorter deadline the host must then stay within.
     """
 
     request_id: str
@@ -639,6 +650,7 @@ class HostCreateWorktreeFrame:
     branch_name: str
     base_branch: str | None = None
     existing_branch: bool = False
+    timeout_s: float | None = None
 
 
 @dataclass
@@ -1081,7 +1093,8 @@ class HostFsRequestFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
-        ``"diff"``, ``"search"``.
+        ``"diff"``, ``"search"``, or PR resources including ``"github_info"``,
+        ``"github_review_threads"`` and ``"github_review_thread_comments"``.
     :param workspace: Absolute path to the session's workspace on the
         host, e.g. ``"/Users/alice/project"``.
     :param session_id: Session id, forwarded to the change registry.
@@ -1108,7 +1121,7 @@ class HostFsWriteFrame:
     (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
     reviewer edits (``op="github_reviewers_update"``), title and description edits
     (``op="github_details_update"``), comments (``op="github_comment_create"``),
-    description attachment uploads
+    review replies (``op="github_review_thread_reply"``), description attachment uploads
     (``op="github_attachment_upload"``, the file base64-encoded in
     ``content_base64``), merges (``op="github_merge"``),
     and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
@@ -1121,8 +1134,8 @@ class HostFsWriteFrame:
     :param op: Write op name — ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
-        ``"github_attachment_upload"``, ``"github_merge"``, or
-        ``"github_disable_auto_merge"``.
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1213,6 +1226,8 @@ class HostSkillsResultFrame:
     error_code: str | None = None
     session_id: str | None = None
     agent_id: str | None = None
+    # Sources the host could not read; non-empty means ``skills`` is incomplete.
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1320,6 +1335,8 @@ class HostImportedLocalSession:
         server synthesize one from the first user message.
     :param source: Harness this session came from, e.g. ``"claude"``. Carried
         per session so an "all harnesses" request can mix sources in one batch.
+    :param archived: Whether the harness had archived this session; the server
+        archives the imported conversation too. Absent from older hosts.
     """
 
     external_session_id: str
@@ -1327,6 +1344,7 @@ class HostImportedLocalSession:
     items: list[_JsonObject]
     title: str | None = None
     source: str = ""
+    archived: bool = False
 
 
 @dataclass
@@ -1696,6 +1714,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
                 "existing_branch": frame.existing_branch,
+                "timeout_s": frame.timeout_s,
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -2013,6 +2032,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error_code": frame.error_code,
                 "session_id": frame.session_id,
                 "agent_id": frame.agent_id,
+                "warnings": frame.warnings,
             }
         )
     if isinstance(frame, HostPluginsFrame):
@@ -2164,6 +2184,7 @@ def _imported_local_session_payload(session: HostImportedLocalSession) -> _JsonO
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 
@@ -2859,6 +2880,7 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
         existing_branch=existing_branch is True,
+        timeout_s=_optional_positive_float(msg, "timeout_s"),
     )
 
 
@@ -3196,6 +3218,8 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
         error_code=_optional_nullable_str(msg, "error_code"),
         session_id=_optional_nullable_str(msg, "session_id"),
         agent_id=_optional_nullable_str(msg, "agent_id"),
+        # Absent from older hosts, which never reported partial catalogs.
+        warnings=_optional_str_list(msg, "warnings"),
     )
 
 
@@ -3403,6 +3427,7 @@ def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
         items=items,
         title=title,
         source=source,
+        archived=_required_bool(raw, "archived") if "archived" in raw else False,
     )
 
 
@@ -3588,3 +3613,26 @@ def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
     if not isinstance(val, str):
         raise ValueError(f"frame field must be a string or null: {key!r}")
     return val
+
+
+def _optional_positive_float(msg: _JsonObject, key: str) -> float | None:
+    """Return an optional positive number field as a float.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"timeout_s"``.
+    :returns: The value as a float, or ``None`` when absent or null.
+    :raises ValueError: If the field is present but not a positive,
+        finite number.
+    """
+    val = msg.get(key)
+    if val is None:
+        return None
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"frame field must be a number: {key!r}")
+    try:
+        number = float(val)
+    except OverflowError:
+        number = math.inf
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"frame field must be positive and finite: {key!r}")
+    return number
