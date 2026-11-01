@@ -1169,21 +1169,12 @@ def register_core_routes(
                     resp.id,
                     exc_info=True,
                 )
-        # Grant the creator ownership BEFORE any host launch so the
-        # launch's session-ownership check (shared with
-        # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
-        # sees the grant.
+        # The creator was granted ownership when the session was created,
+        # before the runner init above and before any host launch, whose
+        # ownership check (shared with POST /v1/hosts/{host_id}/runners via
+        # resolve_host_launch) sees the grant.
         if permission_store is not None and user_id is not None:
-            with creation_stage("create_identity_ms"):
-                await asyncio.to_thread(permission_store.ensure_user, user_id)
-            with creation_stage("create_acl_ms"):
-                grant = await asyncio.to_thread(
-                    permission_store.grant,
-                    user_id,
-                    resp.id,
-                    LEVEL_OWNER,
-                )
-            resp.permission_level = grant.level
+            resp.permission_level = LEVEL_OWNER
         await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes

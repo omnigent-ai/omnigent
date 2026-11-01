@@ -8,6 +8,7 @@ deployed server.
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
 import json
@@ -779,13 +780,32 @@ async def multi_user_client(
     runtime_init: None, db_uri: str, tmp_path: Path
 ) -> AsyncIterator[httpx.AsyncClient]:
     """Full server app on a multi-user server (identity from ``X-Forwarded-Email``)."""
+    async with _multi_user_client(db_uri, tmp_path) as c:
+        yield c
+
+
+@pytest_asyncio.fixture()
+async def multi_user_skills_client(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> AsyncIterator[httpx.AsyncClient]:
+    """The same app with the skills marketplace on, so bundles carry installed skills."""
+    async with _multi_user_client(db_uri, tmp_path, skills=True) as c:
+        yield c
+
+
+@contextlib.asynccontextmanager
+async def _multi_user_client(
+    db_uri: str, tmp_path: Path, *, skills: bool = False
+) -> AsyncIterator[httpx.AsyncClient]:
     from omnigent.server.app import create_app
+    from omnigent.server.feature_flags import Feature, FeatureFlags
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
+    from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
 
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     app = create_app(
@@ -798,6 +818,14 @@ async def multi_user_client(
         permission_store=SqlAlchemyPermissionStore(db_uri),
         scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        **(
+            {
+                "skill_store": SqlAlchemySkillStore(db_uri),
+                "feature_flags": FeatureFlags(frozenset({Feature.SKILLS_MARKETPLACE})),
+            }
+            if skills
+            else {}
+        ),
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -1115,17 +1143,58 @@ async def test_mcp_edits_change_the_agent_for_every_session_using_it(
 
 @pytest.mark.parametrize("edit", ["reinstall", "patch"])
 async def test_reinstall_reaches_every_session_on_its_next_turn(
-    multi_user_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, edit: str
+    multi_user_skills_client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit: str,
 ) -> None:
     """A reinstall keeps the id, so each turn names the bundle revision (a
     create's initial items too); every session's runner sees the new one on its
-    next turn and rebuilds the spec."""
-    c = multi_user_client
-    forwarded: dict[str, list[str]] = {}
+    next turn and rebuilds the spec. A child's first turn already belongs to its
+    creator: the bundle fetched while it starts carries the creator's skills."""
+    from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+    from tests._helpers.skill_repos import skill_tarball
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    c = multi_user_skills_client
+    LocalArtifactStore(str(tmp_path / "artifacts")).put(
+        "skills/review.tar.gz",
+        skill_tarball({"SKILL.md": b"---\nname: review\ndescription: d\n---\n"}),
+    )
+    SqlAlchemySkillStore(db_uri).install(
+        name="review",
+        display_name=None,
+        description="d",
+        source_url="https://github.com/acme/skills.git",
+        ref=None,
+        commit=None,
+        path="skills/review",
+        scope="user",
+        owner_user_id="alice@example.com",
+        bundle_location="skills/review.tar.gz",
+        bundle_bytes=1,
+        installed_by="alice@example.com",
+    )
+    forwarded: dict[str, list[str]] = {}
+    # What the runner would receive if it fetched the bundle while starting a session.
+    fetched_at_start: dict[str, tuple[str | None, bool]] = {}
+
+    async def fetch_while_starting(session_id: str) -> None:
+        if session_id in fetched_at_start:
+            return
+        contents = await c.get(f"/v1/sessions/{session_id}/agent/contents", headers=ALICE)
+        assert contents.status_code == 200, contents.text
+        with tarfile.open(fileobj=io.BytesIO(contents.content), mode="r:gz") as tf:
+            has_skill = "skills/review/SKILL.md" in tf.getnames()
+        owner = SqlAlchemyConversationStore(db_uri).get_session_owner(session_id, owner_only=True)
+        fetched_at_start[session_id] = (owner, has_skill)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            await fetch_while_starting(json.loads(request.content)["session_id"])
         if request.method == "POST" and request.url.path.endswith("/events"):
             session_id = request.url.path.split("/")[3]
+            await fetch_while_starting(session_id)
             forwarded.setdefault(session_id, []).append(
                 json.loads(request.content)["agent_revision"]
             )
@@ -1136,6 +1205,9 @@ async def test_reinstall_reaches_every_session_on_its_next_turn(
 
     async def relay_ready(*_args: object, **_kwargs: object) -> None:
         return None
+
+    def bundle_of(revision: str) -> str:
+        return revision.split("+skills.")[0]
 
     text = {"type": "input_text", "text": "hi"}
     message = {"type": "message", "data": {"role": "user", "content": [text]}}
@@ -1157,6 +1229,20 @@ async def test_reinstall_reaches_every_session_on_its_next_turn(
             f"/v1/sessions/{sessions[1]['id']}/events", json=message, headers=ALICE
         )
         assert sent.status_code == 202, sent.text
+        child = await c.post(
+            "/v1/sessions",
+            json={**kickoff, "parent_session_id": sessions[0]["id"]},
+            headers=ALICE,
+        )
+        assert child.status_code == 201, child.text
+        child_id = child.json()["id"]
+        sent = await c.post(f"/v1/sessions/{child_id}/events", json=message, headers=ALICE)
+        assert sent.status_code == 202, sent.text
+        # The creator owned the child before its first turn, so that turn's
+        # bundle carried the creator's skill, and an unchanged turn keeps its revision.
+        assert fetched_at_start[child_id] == ("alice@example.com", True)
+        first, again = forwarded[child_id]
+        assert first == again
         if edit == "patch":
             config = await c.get(f"/v1/agents/{orion['id']}/config", headers=ALICE)
             updated = await c.patch(
@@ -1177,10 +1263,10 @@ async def test_reinstall_reaches_every_session_on_its_next_turn(
         assert new_session.status_code == 201, new_session.text
 
     v2 = SqlAlchemyAgentStore(db_uri).get(orion["id"]).bundle_location
-    assert forwarded[new_session.json()["id"]] == [v2]
+    assert [bundle_of(r) for r in forwarded[new_session.json()["id"]]] == [v2]
     for session in sessions:
         before, after = forwarded[session["id"]]
-        assert before != after == v2
+        assert bundle_of(before) != bundle_of(after) == v2
 
 
 async def test_a_user_agent_stays_private_after_its_last_session_is_deleted(

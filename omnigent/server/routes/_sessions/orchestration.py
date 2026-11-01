@@ -137,6 +137,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_OWNER,
     LEVEL_READ,
 )
 from omnigent.server.background_session_titles import (
@@ -12334,6 +12335,15 @@ async def _create_session_from_existing_agent(
             )
     except Exception:  # noqa: BLE001
         pass
+
+    # The creator owns the session before anything runs in it: an initial turn
+    # or the runner's session init can fetch the bundle, whose installed skills
+    # are the owner's.
+    if permission_store is not None and user_id is not None:
+        with creation_stage("create_identity_ms"):
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+        with creation_stage("create_acl_ms"):
+            await asyncio.to_thread(permission_store.grant, user_id, conv.id, LEVEL_OWNER)
 
     if body.initial_items:
         runner_client = await _get_runner_client(
