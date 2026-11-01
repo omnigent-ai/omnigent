@@ -661,6 +661,9 @@ async function fetchWorkspaceDirectory(
 
 // ── Path existence check (parent-directory listing) ──────────────────────────
 
+// A flag word (`-v`, `--force`) or shell operator marks a command line.
+const COMMAND_LINE_MARKER = /(?:^|\s)--?[A-Za-z]|[|;<>$`]|&&/;
+
 /**
  * Heuristic gate: does this inline-code string look like a workspace-relative
  * file path worth verifying against the filesystem?
@@ -669,13 +672,14 @@ async function fetchWorkspaceDirectory(
  * status`, `useState`, `npm test`, …). A candidate must have a parent segment
  * before its first slash, not be absolute (absolute forms are collapsed or
  * kept host-absolute by {@link resolveChatFilePath}, which marks its results
- * trusted so they bypass this gate), not be a URL or carry a query/fragment,
- * and not have whitespace
- * before its first slash (which marks a command like `git diff src/app`
- * rather than a path). Every slash-delimited segment must be non-empty and
- * not a `.`/`..` traversal segment (rejects `a/`, `a//b`, `../x`). Spaces
- * *inside* a segment are allowed — `docs/Design Notes.md` is a real filename
- * and segments are URL-encoded when listed.
+ * trusted so they bypass this gate), and not be a URL or carry a
+ * query/fragment. Every slash-delimited segment must be non-empty and not a
+ * `.`/`..` traversal segment (rejects `a/`, `a//b`, `../x`). Spaces are
+ * allowed in any segment — `Design Docs/Q3 Plan.md` is a real path and
+ * segments are URL-encoded when listed. A first segment with whitespace and a
+ * flag or shell operator is a command (`ls -la src/app`, `cd web && pnpm test
+ * src/x`); a plain one like `git diff src/app` is left to the existence check,
+ * since it reads the same as a folder name with spaces.
  */
 export function looksLikeWorkspaceFilePath(text: string): boolean {
   if (!text) return false;
@@ -684,8 +688,8 @@ export function looksLikeWorkspaceFilePath(text: string): boolean {
   if (text.includes("?") || text.includes("#")) return false; // query/fragment → not a plain path
   const slash = text.indexOf("/");
   if (slash <= 0) return false; // need a parent segment before the first slash
-  // Whitespace before the first slash means a command, not a path.
-  if (/\s/.test(text.slice(0, slash))) return false;
+  const firstSegment = text.slice(0, slash);
+  if (/\s/.test(firstSegment) && COMMAND_LINE_MARKER.test(firstSegment)) return false;
   const segments = text.split("/");
   // Need at least parent + basename, every segment non-empty (rejects "a/",
   // "a//b"), and no "."/".." traversal segments.

@@ -279,6 +279,22 @@ describe("markdown links to workspace files", () => {
     fireEvent.click(screen.getByRole("button", { name: "docs/notes.md" }));
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
+
+  it("linkifies an inline-code path whose first folder has spaces and an ampersand", async () => {
+    const path = "Architecture & Migration/2026-10-27-options.md";
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "2026-10-27-options.md", path, type: "file", bytes: 5 }],
+        has_more: false,
+      }),
+    );
+    renderMarkdown(`The doc is ready at \`${path}\`.`, [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: path }));
+    expect(openFile).toHaveBeenCalledWith(path);
+    expect(fetchMock.mock.calls[0][0]).toContain("/filesystem/Architecture%20%26%20Migration?");
+  });
 });
 
 // A markdown link destination is a URL, so a filename with spaces arrives
