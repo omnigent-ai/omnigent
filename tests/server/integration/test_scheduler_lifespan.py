@@ -419,7 +419,7 @@ async def test_automations_v2_records_claims_with_the_built_in_executor(
     assert run.trigger_key is not None
 
 
-async def test_automations_v2_run_now_starts_a_claimed_manual_run(
+async def test_automations_v2_run_now_records_a_manual_run_that_the_poll_starts(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
@@ -433,10 +433,20 @@ async def test_automations_v2_run_now_starts_a_claimed_manual_run(
         _uid("run-now"), "run now", "prompt", "FREQ=DAILY", None, _uid("agent"), "UTC"
     )
     store.update(task.id, state="paused")
-    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+    # Run now only records the run; a short poll starts it promptly.
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=store,
+        scheduler_config=ScheduledTaskSchedulerConfig(poll_seconds=0.1),
+    )
 
     def finished_runs() -> list:
-        return [run for run in store.list_runs(task.id)[0] if run.status != "starting"]
+        return [
+            run
+            for run in store.list_runs(task.id)[0]
+            if run.status not in ("scheduled", "starting")
+        ]
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)

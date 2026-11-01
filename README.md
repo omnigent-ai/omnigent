@@ -322,6 +322,9 @@ See the [native agy gateway guide](docs/native-agy-gateways.md) for compatibilit
 requirements, model and authentication behavior, troubleshooting, and smoke
 steps. These settings configure native agy; the Antigravity Python SDK retains
 its separate key/Vertex setup.
+`omnigent opencode` requires OpenCode 2.0.x (`npm i -g @opencode/cli@2.0.32`).
+Its free models need no sign-in; run `opencode auth login` to add your own
+providers. See the [OpenCode harness guide](docs/opencode-native.md).
 
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
