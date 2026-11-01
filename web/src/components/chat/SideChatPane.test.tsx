@@ -1118,6 +1118,29 @@ describe("side-chat interrupt", () => {
   });
 });
 
+describe("generic side chat waiting on a worker it started", () => {
+  it("keeps showing the worker's progress without a dead interrupt, then locks for a live turn", () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-sdk",
+      sessionStatus: "waiting",
+      activeResponse: { responseId: "resp_side_turn", state: "completed", error: null },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
+    expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
+    expect(screen.getByTestId("side-chat-send")).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "running" }));
+
+    expect(screen.getByTestId("side-chat-interrupt")).toBeInTheDocument();
+    expect(screen.queryByTestId("side-chat-send")).toBeNull();
+  });
+});
+
 describe("seeded /side question survives an unmount before the child binds", () => {
   // Switching rail tabs (or crossing the mobile breakpoint) unmounts this pane.
   // The question must not die with it: it stays in the store until the send

@@ -297,8 +297,9 @@ describe("sessionStatus", () => {
     expect(sessionStatus("launching").activity).toBe("launching");
   });
 
-  it("maps running to working and idle to idle", () => {
+  it("maps running and waiting to working and idle to idle", () => {
     expect(sessionStatus("running").activity).toBe("working");
+    expect(sessionStatus("waiting").activity).toBe("working");
     expect(sessionStatus("idle").activity).toBe("idle");
   });
 

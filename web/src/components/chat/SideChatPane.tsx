@@ -67,7 +67,7 @@ import {
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
-import { shouldQueueSend } from "@/lib/messageQueue";
+import { isTurnBlockingSend, shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -283,6 +283,11 @@ export function SideChatPane({
   const showsWorking =
     (!readOnly || fullSession) &&
     (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+  // A generic side chat's own turn is over while it only waits on workers it started.
+  const composerBusy =
+    fullSession || usesNativeSideChatFork(sessionHarness)
+      ? showsWorking
+      : !readOnly && (starting || isTurnBlockingSend(state.status, sessionStatus));
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
@@ -419,7 +424,7 @@ export function SideChatPane({
                 agentId={boundAgentId}
                 responseId={activeResponse?.responseId}
                 interruptReady={interruptReady}
-                busy={showsWorking}
+                busy={composerBusy}
                 pending={pending}
                 starting={starting}
                 onStart={onStart ? startSideChat : undefined}

@@ -723,6 +723,60 @@ async def test_session_snapshot_existing_failure_survives_runner_exit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("persisted_status", "cached_status", "opted_in_status"),
+    [
+        ("running", None, "running"),
+        ("waiting", None, "waiting"),
+        (None, "running", "running"),
+        (None, "waiting", "waiting"),
+        ("waiting", "running", "running"),
+    ],
+    ids=[
+        "running-persisted",
+        "waiting-persisted",
+        "running-cached",
+        "waiting-cached",
+        "stale-persisted",
+    ],
+)
+async def test_session_snapshot_reports_waiting_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    persisted_status: str | None,
+    cached_status: str | None,
+    opted_in_status: str,
+) -> None:
+    """Only an opted-in read tells a turn that ended on running sub-agents from a live turn."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "5b2f0c7d9e1a4b3c8d6e2f1a0b9c8d7e"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="synthetic-agent",
+        live_status=persisted_status,
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    if cached_status is None:
+        monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    else:
+        monkeypatch.setitem(sessions_module._session_status_cache, session_id, cached_status)
+
+    default = await _get_session_snapshot(store, session_id)  # type: ignore[arg-type]
+    opted_in = await _get_session_snapshot(
+        store,  # type: ignore[arg-type]
+        session_id,
+        include_waiting_status=True,
+    )
+
+    assert default.status == "running"
+    assert opted_in.status == opted_in_status
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("owner_matches", [True, False], ids=["same_runner", "replacement_runner"])
 async def test_session_snapshot_scopes_existing_failure_to_owning_runner(
     monkeypatch: pytest.MonkeyPatch, owner_matches: bool
