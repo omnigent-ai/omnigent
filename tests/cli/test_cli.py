@@ -3256,9 +3256,19 @@ def _upload_and_parse(agent_dir: Path) -> dict[str, Any]:
     :param agent_dir: The agent image directory.
     :returns: ``{server_name: MCPServerConfig}`` from the server-side spec.
     """
+    return _parse_bundle(_bundle(agent_dir))
+
+
+def _parse_bundle(bundle_bytes: bytes) -> dict[str, Any]:
+    """
+    Parse an already-built bundle the way the server parses an upload.
+
+    :param bundle_bytes: The bundle tarball bytes.
+    :returns: ``{server_name: MCPServerConfig}`` from the server-side spec.
+    """
     from omnigent.server.bundles import validate_agent_bundle
 
-    spec = validate_agent_bundle(_bundle(agent_dir), enforce_handler_allowlist=False)
+    spec = validate_agent_bundle(bundle_bytes, enforce_handler_allowlist=False)
     return {server.name: server for server in spec.mcp_servers}
 
 
@@ -3462,10 +3472,13 @@ def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
     assert "tools/mcp/templated.yaml" in resolved
     templated = _extract_yaml_from_bundle(bundle_bytes, "tools/mcp/templated.yaml")
     assert templated["headers"] == {"Authorization": "Bearer tok-sidecar"}
-    # The server accepts every declaration, so the fixtures are valid.
-    servers = _upload_and_parse(tmp_path)
-    assert {"inline", "literal-http", "literal-stdio", "templated"} <= set(servers)
+    # The server accepts the same bundle, so every fixture is a valid declaration.
+    servers = _parse_bundle(bundle_bytes)
+    assert set(servers) == {"inline", "literal-http", "literal-stdio", "templated"}
+    assert servers["literal-http"].url == "http://localhost:9000/mcp"
+    assert servers["literal-http"].headers == {"Authorization": "Bearer literal-token"}
     assert servers["literal-stdio"].env == {"LOG_LEVEL": "debug"}
+    assert servers["templated"].headers == {"Authorization": "Bearer tok-sidecar"}
 
 
 def test_bundle_materializes_standalone_omnigent_yaml(tmp_path: Path) -> None:
