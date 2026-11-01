@@ -18,8 +18,12 @@ export function isNewSessionHotkey(
     : !e.altKey && e.shiftKey && e.key.toLowerCase() === "o";
 }
 
-/** Navigate to the same new-session route used by the command palette. */
-export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): void {
+/** Start a new session via `onNewSession`, or open the plain composer. */
+export function useNewSessionHotkey(
+  enabled = true,
+  isMac = isMacPlatform(),
+  onNewSession?: () => void,
+): void {
   const navigate = useNavigate();
   const isEmbedded = useIsEmbedded();
 
@@ -31,9 +35,10 @@ export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): vo
       if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
       e.preventDefault();
       e.stopPropagation();
-      navigate("/");
+      if (onNewSession) onNewSession();
+      else navigate("/");
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [enabled, isMac, isEmbedded, navigate]);
+  }, [enabled, isMac, isEmbedded, navigate, onNewSession]);
 }
