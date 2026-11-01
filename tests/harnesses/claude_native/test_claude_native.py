@@ -62,7 +62,10 @@ from tests.budgets import budget
 
 
 @pytest.fixture(autouse=True)
-def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_provider_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep provider defaults independent of ambient CI context and catalog access."""
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
@@ -9194,11 +9197,16 @@ def test_provider_config_for_native_claude_keeps_betas_under_use_gateway(
     assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
 
 
+@pytest.mark.parametrize("ci", [False, True])
 def test_provider_config_for_native_claude_attributes_a_unity_gateway(
     monkeypatch: pytest.MonkeyPatch,
+    ci: bool,
 ) -> None:
     """A provider on the Unity Gateway adds attribution after the user's own headers."""
     from omnigent.onboarding.provider_config import load_providers
+
+    if ci:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
 
     monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Team: search")
@@ -9217,12 +9225,17 @@ def test_provider_config_for_native_claude_attributes_a_unity_gateway(
     cfg = claude_native._provider_config_for_native_claude(entry)
 
     assert cfg is not None
+    tags_line = (
+        '\nDatabricks-Ai-Gateway-Request-Tags: {"pipeline":"polly-review","run_id":"123"}'
+        if ci
+        else ""
+    )
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_CUSTOM_HEADERS": (
             "X-Team: search\n"
             "Databricks-Custom-Coding-Agent: claude-code\n"
-            "Databricks-Custom-Client-Surfaces: omnigent"
+            "Databricks-Custom-Client-Surfaces: omnigent" + tags_line
         ),
     }
 

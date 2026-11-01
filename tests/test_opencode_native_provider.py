@@ -141,8 +141,12 @@ def test_write_provider_config_is_0600_and_valid_json(tmp_path: Path) -> None:
     assert parsed["providers"]["databricks-gateway"]["settings"]["apiKey"] == "tok"
 
 
-def test_write_provider_config_attributes_unity_gateway_models(tmp_path: Path) -> None:
+def test_write_provider_config_attributes_unity_gateway_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Each model of a Unity Gateway provider names OpenCode and Omnigent (+ ug)."""
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     config = {
         "providers": {
             "databricks": {

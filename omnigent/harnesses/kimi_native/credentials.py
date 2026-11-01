@@ -14,18 +14,24 @@ runner points the launched ``kimi`` process at a session-scoped home that:
   ``[[hooks]]`` appended — a ``PreToolUse`` deny-gate and a ``PermissionRequest``
   read-only surface, both dispatched to :mod:`omnigent.harnesses.kimi_native.hook`.
 
-Appending as text (rather than parsing + re-emitting TOML) keeps the user's
-config byte-for-byte and needs no TOML writer: a trailing ``[[hooks]]`` table
-array is always valid regardless of what section preceded it.
+Outside opted-in CI, appending hooks keeps the user's config byte-for-byte.
+CI adds provider-scoped request headers to the private config copy first.
 """
 
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import shlex
 import sys
 from pathlib import Path
+
+from omnigent.databricks_ai_gateway import (
+    ci_request_tags,
+    gateway_request_tag_headers,
+    with_ci_request_tags,
+)
 
 #: Env var Kimi Code reads to locate its data dir (config.toml + oauth + …).
 KIMI_CODE_HOME_ENV_VAR = "KIMI_CODE_HOME"
@@ -34,6 +40,50 @@ _CONFIG_FILE = "config.toml"
 #: is rebuilt with the Omnigent hooks, and the sessions store + its index stay
 #: per-session so parallel kimi sessions cannot adopt each other's wire logs.
 _PRIVATE_ENTRIES = frozenset({_CONFIG_FILE, "sessions", "session_index.jsonl"})
+
+
+def with_kimi_ci_request_tags(config_text: str) -> str:
+    """Add CI headers to gateway providers in a private Kimi config copy."""
+    if not ci_request_tags():
+        return config_text
+    import tomlkit
+    from tomlkit.exceptions import TOMLKitError
+
+    try:
+        config = tomlkit.parse(config_text)
+    except TOMLKitError:
+        logging.getLogger(__name__).warning("Skipping CI tags: invalid Kimi provider config")
+        return config_text
+    providers = config.get("providers", {})
+    if not isinstance(providers, dict):
+        return config_text
+    changed = False
+    models = config.get("models", {})
+    for provider_name, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        base_url = provider.get("base_url", provider.get("baseUrl"))
+        if not isinstance(base_url, str) or not gateway_request_tag_headers(base_url):
+            continue
+        # A model URL overrides the provider URL but inherits its headers.
+        if isinstance(models, dict) and any(
+            isinstance(model, dict)
+            and model.get("provider", model.get("providerId")) == provider_name
+            and (override := model.get("base_url", model.get("baseUrl")))
+            and (not isinstance(override, str) or not gateway_request_tag_headers(override))
+            for model in models.values()
+        ):
+            logging.getLogger(__name__).warning(
+                "Skipping CI tags: Kimi provider has a non-gateway model URL override"
+            )
+            continue
+        header_key = "customHeaders" if "customHeaders" in provider else "custom_headers"
+        existing = provider.get(header_key, {})
+        if not isinstance(existing, dict) or not all(isinstance(name, str) for name in existing):
+            continue
+        provider[header_key] = with_ci_request_tags(existing)
+        changed = True
+    return tomlkit.dumps(config) if changed else config_text
 
 
 def resolve_user_kimi_home() -> Path:
@@ -154,6 +204,8 @@ def build_kimi_session_home(
     # Ensure a clean separation if the user's config has no trailing newline.
     if base_config and not base_config.endswith("\n"):
         base_config += "\n"
-    (session_home / _CONFIG_FILE).write_text(base_config + hooks, encoding="utf-8")
+    (session_home / _CONFIG_FILE).write_text(
+        with_kimi_ci_request_tags(base_config) + hooks, encoding="utf-8"
+    )
 
     return {KIMI_CODE_HOME_ENV_VAR: str(session_home)}

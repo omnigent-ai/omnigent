@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,6 +26,80 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.goose_executor import GooseExecutor
+
+
+@pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
+@pytest.mark.parametrize(
+    "base_path", ["ai-gateway/codex/v1/responses", "serving-endpoints/responses"]
+)
+@pytest.mark.parametrize(
+    "base_url", ["https://test.cloud.databricks.com/ai-gateway/codex/v1", "https://[invalid"]
+)
+def test_ci_custom_provider_reaches_goose_spawn(
+    tmp_path, monkeypatch, caplog, context, base_path, base_url
+) -> None:
+    """Custom-provider JSON preserves comma-bearing tag values and the Responses path."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+    from omnigent.harnesses.goose_native.credentials import with_goose_ci_request_tags
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if context is not None:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.harnesses.goose_native.credentials.urlsplit",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+    original = {
+        "name": "custom_ci",
+        "engine": "openai",
+        "display_name": "CI",
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": base_url,
+        "base_path": base_path,
+        "models": [{"name": "test-model", "context_limit": 200000}],
+        "requires_auth": True,
+        "headers": {"X-Existing": "kept", REQUEST_TAGS_HEADER: '{"team":"ci"}'},
+    }
+    provider_dir = tmp_path / "config" / "custom_providers"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "custom_ci.json").write_text(json.dumps(with_goose_ci_request_tags(original)))
+    monkeypatch.setenv("GOOSE_PATH_ROOT", str(tmp_path))
+    monkeypatch.setenv("GOOSE_PROVIDER", "custom_ci")
+    monkeypatch.setenv("GOOSE_MODEL", "test-model")
+    env = GooseExecutor()._build_spawn_env()
+    configured = json.loads(
+        (
+            Path(env["GOOSE_PATH_ROOT"])
+            / "config"
+            / "custom_providers"
+            / f"{env['GOOSE_PROVIDER']}.json"
+        ).read_text()
+    )
+    assert env["GOOSE_MODEL"] == "test-model"
+    assert {key: value for key, value in configured.items() if key != "headers"} == {
+        key: value for key, value in original.items() if key != "headers"
+    }
+    assert configured["headers"]["X-Existing"] == "kept"
+    expected = {"team": "ci"}
+    if (
+        context
+        and context != "invalid"
+        and base_path.startswith("ai-gateway/")
+        and base_url != "https://[invalid"
+    ):
+        expected.update(json.loads(context))
+    assert json.loads(configured["headers"][REQUEST_TAGS_HEADER]) == expected
+    assert ("malformed Goose provider URL" in caplog.text) == (
+        context not in (None, "invalid") and base_url == "https://[invalid"
+    )
+    assert original["headers"][REQUEST_TAGS_HEADER] == '{"team":"ci"}'
+
 
 # ---------------------------------------------------------------------------
 # Construction / attribute defaults

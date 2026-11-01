@@ -62,6 +62,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  OMNIGENT_CI_PIPELINE: issue-triage
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
@@ -269,6 +270,9 @@ jobs:
           mkdir -p "$HOME/.omnigent"
           python3 -c "
           import pathlib, os, json
+          from omnigent.databricks_ai_gateway import ci_gateway_base_url, ci_request_tags
+          if not ci_request_tags(strict=True).get('pipeline'):
+              raise ValueError('CI pipeline is required')
           gw = os.environ['GATEWAY_BASE_URL']
           host = gw.removesuffix('/serving-endpoints')
           cfg = {
@@ -277,7 +281,7 @@ jobs:
                       'kind': 'gateway',
                       'default': ['anthropic'],
                       'anthropic': {
-                          'base_url': gw + '/anthropic',
+                          'base_url': ci_gateway_base_url(gw, 'anthropic'),
                           'api_key_ref': 'env:LLM_API_KEY',
                           'models': {'default': os.environ['OMNIGENT_AGENT_MODEL']},
                       },
@@ -795,6 +799,7 @@ jobs:
       )
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
+      pipeline: issue-triage
       issue_number: ${{ fromJSON(format('{0}', github.event.issue.number || inputs.issue_number)) }}
       intake: ${{ github.event_name == 'workflow_dispatch' || github.event.action == 'opened' }}
       apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}
