@@ -447,9 +447,13 @@ reveals the panel; ancestors still open full screen. The tab's **Open full
 screen** link opens the sub-agent's own page. Claude Code and closed sub-agents
 are read-only there too. Closing a sub-agent tab only hides it; the sub-agent
 keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
-While a side chat works, typing a follow-up turns Interrupt into Send, which
-queues or steers it as the main composer does; Escape still interrupts. Its queue
-strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
+While a side chat's own turn runs, typing a follow-up turns Interrupt into Send,
+which queues or steers it as the main composer does; Escape still interrupts.
+After that turn ends with only sub-agents it started still running, a generic
+side chat keeps its working indicator but shows Send, and Escape does not
+interrupt, including after a reload; a native Codex side chat still shows
+Interrupt. Its queue strip offers edit, steer, reorder and delete, and Mod+Enter
+steers them all.
 Closing the side chat discards its queued follow-ups. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace. The side-chat composer opens the same `/` menu
