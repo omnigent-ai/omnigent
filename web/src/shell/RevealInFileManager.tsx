@@ -20,13 +20,14 @@ import {
   supportsFileReveal,
 } from "@/lib/nativeBridge";
 import { FileViewerContext } from "./FileViewerContext";
+import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 
 /** Folder the Files tree is browsing; its row paths are relative to it. */
 export const RevealBaseContext = createContext("");
 
 export interface RevealTarget {
   hostId: string;
-  /** Absolute path on this machine. */
+  /** Absolute path on the session's host. */
   path: string;
 }
 
@@ -57,17 +58,11 @@ function watchHostId(shouldWatch: boolean, listener: () => void) {
   };
 }
 
-const subscribeToHostId = (listener: () => void) => watchHostId(supportsFileReveal(), listener);
 const subscribeToDesktopHostId = (listener: () => void) => watchHostId(isElectronShell(), listener);
 
 /** This machine's host id from the desktop shell; null in a browser or before its first connect. */
 export function useDesktopHostId(): string | null {
   return useSyncExternalStore(subscribeToDesktopHostId, () => localHostId);
-}
-
-function useLocalHostId(): string | null {
-  const hostId = useSyncExternalStore(subscribeToHostId, () => localHostId);
-  return supportsFileReveal() ? hostId : null;
 }
 
 function joinPath(base: string, path: string): string {
@@ -76,13 +71,16 @@ function joinPath(base: string, path: string): string {
   return `${base.replace(/[\\/]+$/, "")}/${path}`;
 }
 
-/** Where ``path`` lives on this machine, or null when it can't be revealed here. */
-export function useRevealTarget(path: string | null): RevealTarget | null {
+/** Resolve a file against the session's host and currently browsed folder. */
+export function useHostFileTarget(path: string | null): RevealTarget | null {
   const ctx = useContext(FileViewerContext);
   const base = useContext(RevealBaseContext);
-  const hostId = useLocalHostId();
+  const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
+    ctx?.conversationId ? getSessionHost(ctx.conversationId) : null,
+  );
+  const hostId = ctx?.sessionHostId || inheritedHostId;
   const root = ctx?.workspaceRoot;
-  if (path === null || !root || !hostId || ctx?.sessionHostId !== hostId) return null;
+  if (path === null || !root || !hostId) return null;
   return { hostId, path: joinPath(joinPath(root, base), path) };
 }
 
@@ -92,6 +90,19 @@ export function fileManagerName(): string {
   if (userAgent.includes("Macintosh")) return "Finder";
   if (userAgent.includes("Windows")) return "File Explorer";
   return "file manager";
+}
+
+/** Where ``path`` lives, only when this desktop owns the session's host. */
+export function useLocalFileTarget(path: string | null): RevealTarget | null {
+  const target = useHostFileTarget(path);
+  const hostId = useDesktopHostId();
+  return target?.hostId === hostId ? target : null;
+}
+
+/** Where ``path`` lives on this machine, or null when it can't be revealed here. */
+export function useRevealTarget(path: string | null): RevealTarget | null {
+  const target = useLocalFileTarget(path);
+  return supportsFileReveal() ? target : null;
 }
 
 /** "Show in Finder" for a file (selected in its folder), "Open in Finder" for a folder. */

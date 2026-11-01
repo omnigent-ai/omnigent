@@ -293,7 +293,8 @@ session authenticated for that specific ticket; ordinary browser sessions,
 runner tokens, and refresh-issued tokens cannot approve it. Existing sessions
 remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication
 and a signed ID token with `auth_time` at or after the reauthentication request.
-Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
+Verify that your IdP honors `prompt=login` with a positive `max_age` (300 seconds
+by default; `OMNIGENT_OIDC_REAUTH_MAX_AGE` changes it) and supplies `auth_time`;
 missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
 but still requires ticket-specific browser sign-in and approval.
 For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare

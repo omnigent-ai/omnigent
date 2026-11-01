@@ -25,46 +25,15 @@ that only the live server path can exercise.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-
-import pytest
 from playwright.sync_api import Page, expect
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
-from tests._helpers.compat import compat_server_cwd, server_executable, server_pythonpath
-from tests._helpers.live_server import isolated_local_server
-from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT
 from tests.e2e_ui.scheduled.test_scheduled_tasks_page import (
     _create_task,
     _open_automations_page,
     _row_by_name,
 )
-
-
-@pytest.fixture(scope="module")
-def automations_v2_server(
-    built_spa: None,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[str]:
-    """Run a server with ``OMNIGENT_FEATURES=automations_v2`` and yield its URL.
-
-    It starts no runner and connects no host: every Run now here fails at the
-    host stage, which is what the journey checks.
-    """
-    with isolated_local_server(
-        tmp_path_factory.mktemp("automations_v2_server"),
-        env={
-            "OMNIGENT_FEATURES": "automations_v2",
-            "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
-            "PYTHONPATH": server_pythonpath(_REPO_ROOT),
-        },
-        executable=server_executable(),
-        cwd=compat_server_cwd(),
-        # Cold-boots alongside the suite's shared server.
-        health_timeout=180.0,
-    ) as base_url:
-        yield base_url
 
 
 def test_scheduled_task_detail_page_run_now_records_run_row(

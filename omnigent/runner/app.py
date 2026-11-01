@@ -226,6 +226,52 @@ _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 # Pending questions outlive prompt delivery; poll outside the turn watchdog.
 _CLAUDE_PENDING_PROMPT_POLL_S = 0.5
 
+# How long a message refused by a launcher sign-in may wait, including the time the server
+# already had it queued. Must stay inside the server's pending-input lifetime, so a refusal
+# that outlasts the wait is still recorded and shown.
+_SIGN_IN_HOLD_MAX_S = 8 * 60.0
+# Refusals one sign-in wait absorbs; a pane that keeps asking after it looked ready fails.
+_SIGN_IN_HOLD_MAX_REPEATS = 3
+
+
+@dataclasses.dataclass
+class _SignInHold:
+    """
+    One session's wait for a launcher sign-in that refused its queued message.
+
+    :param deadline: ``time.monotonic()`` at which the wait gives up.
+    :param holds: Refusals absorbed so far.
+    :param waiting: Whether the queue is paused until the sign-in completes.
+    :param releasing: Whether the sign-in watcher saw the agent ready and is
+        announcing the resend; until it resumes the queue, the deadline can't.
+    :param resent: Whether the wait ran out and its message is being resent, so
+        a watcher that sees the agent ready meanwhile asks for no resend.
+    """
+
+    deadline: float
+    holds: int = 0
+    waiting: bool = False
+    releasing: bool = False
+    resent: bool = False
+
+
+def _sign_in_hold_deadline(body: Mapping[str, Any]) -> float:
+    """
+    Return when a sign-in wait for the refused message *body* gives up.
+
+    The wait gets :data:`_SIGN_IN_HOLD_MAX_S`, less the time the server says the
+    message was already queued, e.g. behind a slow start.
+
+    :param body: The refused message, carrying the server's ``input_enqueued_at_ms``
+        when the server sent one.
+    :returns: A ``time.monotonic()`` deadline, in the past when no time is left.
+    """
+    enqueued_at_ms = input_attributes(body).get("input_enqueued_at_ms")
+    queued_s = 0.0
+    if isinstance(enqueued_at_ms, int):
+        queued_s = max(0.0, time.time() - enqueued_at_ms / 1000)
+    return time.monotonic() + _SIGN_IN_HOLD_MAX_S - queued_s
+
 
 _SPEC_FETCH_HTTP_STATUS = re.compile(r"failed with HTTP (\d{3})$")
 
@@ -1459,6 +1505,11 @@ def create_runner_app(
     app.state.session_message_buffers = _session_message_buffers
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
     app.state.claude_prompt_waiters = _claude_prompt_waiters
+    # Sessions whose queued Claude message waits for a launcher sign-in.
+    _sign_in_holds: dict[str, _SignInHold] = {}
+    app.state.sign_in_holds = _sign_in_holds
+    # The web message each background turn carries, so a sign-in refusal can queue it again.
+    _turn_message_bodies: dict[str, _JsonObject] = {}
     _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
@@ -1475,6 +1526,7 @@ def create_runner_app(
     # ``proxy_stream`` is reading, which surfaces there as a transport error;
     # the stream's failure handler consumes the record to report the exit.
     _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
+    app.state.required_terminal_exit_errors = _required_terminal_exit_errors
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -3964,12 +4016,16 @@ def create_runner_app(
     _sign_in_watch = build_sign_in_watch(
         _background_tasks=_background_tasks,
         _session_harness_name=_session_harness_name,
+        # Late-bound: the queue helpers that own the hold are defined further down.
+        _claim_sign_in_release=lambda conv_id: _claim_sign_in_release(conv_id),
+        _release_sign_in_hold=lambda conv_id: _release_sign_in_hold(conv_id),
         _sign_in_watchers=_sign_in_watchers,
         resource_registry=resource_registry,
         server_client=server_client,
     )
     _native_pane_names = _sign_in_watch.native_pane_names
     _start_sign_in_watch = _sign_in_watch.start_sign_in_watch
+    _post_sign_in_hold_notice = _sign_in_watch.post_sign_in_hold_notice
 
     def _begin_turn_slot(conv_id: str, body: Mapping[str, Any] | None = None) -> None:
         """Bind the ``None`` sentinel and stamp a fresh epoch for the new turn.
@@ -4032,6 +4088,7 @@ def create_runner_app(
         *,
         error: dict[str, Any] | None = None,
         owner_response_id: str | None = None,
+        sign_in_hold: bool = False,
     ) -> None:
         # Harness children record PRs without a server client; report them as the turn ends.
         pr_reports.notify(conv_id)
@@ -4075,7 +4132,17 @@ def create_runner_app(
             _append_cancellation_items(conv_id)
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
+        elif sign_in_hold:
+            # Nothing failed: the queued message is sent once the sign-in completes.
+            pass
         elif error is not None:
+            if not has_buffered or error.get("code") != "databricks_sign_in_pending":
+                # Only a refusal that ended the wait fails the queue behind it too; after
+                # any other end, a later refusal waits afresh.
+                _sign_in_holds.pop(conv_id, None)
+            elif (hold := _sign_in_holds.get(conv_id)) is not None:
+                # The resend failed, so no resend is in flight any more.
+                hold.resent = False
             normalized_error = _normalize_turn_error(error)
             if not _suppress_status:
                 _publish_turn_status(
@@ -4088,6 +4155,11 @@ def create_runner_app(
             if normalized_error.get("code") == "databricks_sign_in_pending":
                 _start_sign_in_watch(conv_id)
         else:
+            # A delivered turn proves the pane takes input, so any sign-in wait is over,
+            # and a watcher still polling could only ask for a resend that already happened.
+            _sign_in_holds.pop(conv_id, None)
+            if (watcher := _sign_in_watchers.pop(conv_id, None)) is not None:
+                watcher.cancel()
             if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
                 has_running_children = any(
@@ -4444,6 +4516,9 @@ def create_runner_app(
 
     def _cancel_claude_prompt_waiter(session_id: str) -> None:
         """Discard waiting input before explicit terminal interruption or teardown."""
+        _sign_in_holds.pop(session_id, None)
+        # A refusal still streaming can no longer hold the cancelled turn's message.
+        _turn_message_bodies.pop(session_id, None)
         waiter = _claude_prompt_waiters.pop(session_id, None)
         if waiter is not None or _session_harness_name(session_id) == "claude-native":
             # Cancel queued work even if the terminal control fails; restoring it
@@ -4461,11 +4536,30 @@ def create_runner_app(
         async def _wait_for_prompt() -> None:
             from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
 
+            resolved_dir = bridge_dir
+            warned = False
             try:
-                resolved_dir = bridge_dir or await _claude_prompt_bridge_dir(session_id)
                 while _session_message_buffers.get(session_id):
                     if session_id in _active_turns:
                         return
+                    if _sign_in_hold_waiting(session_id):
+                        await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
+                        continue
+                    if resolved_dir is None:
+                        try:
+                            resolved_dir = await _claude_prompt_bridge_dir(session_id)
+                        except (httpx.HTTPError, RuntimeError, OSError):
+                            # A failed lookup must not strand the queue; try again next poll.
+                            if not warned:
+                                warned = True
+                                _logger.warning(
+                                    "Failed to resolve the Claude bridge for %s; retrying",
+                                    session_id,
+                                    exc_info=True,
+                                    extra={"session_id": session_id},
+                                )
+                            await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
+                            continue
                     try:
                         pending = await asyncio.to_thread(has_pending_user_prompt, resolved_dir)
                     except (OSError, RuntimeError):
@@ -4494,6 +4588,128 @@ def create_runner_app(
         _background_tasks.add(waiter)
         waiter.add_done_callback(_background_tasks.discard)
 
+    def _holds_for_sign_in(conv_id: str, error: Mapping[str, Any] | None) -> bool:
+        """
+        Return whether a turn's refusal should wait for a launcher sign-in instead of failing.
+
+        Only a main-session Claude message that never reached the pane
+        qualifies: the launcher in front of ``claude`` is showing a sign-in
+        address, so the message can be sent unchanged once the person signs in.
+        A sub-agent dispatch fails as before, since its launch bookkeeping
+        times out on its own.
+
+        :param conv_id: Session whose background turn was refused.
+        :param error: The harness ``response.failed`` error.
+        :returns: ``True`` when the message should be queued again and held.
+        """
+        if (
+            error is None
+            or error.get("code") != "databricks_sign_in_pending"
+            or not error.get("undelivered")
+            or _session_harness_name(conv_id) != "claude-native"
+            or conv_id not in _turn_message_bodies
+            or conv_id in _interrupted_sessions
+            or _is_sub_agent_session(conv_id)
+        ):
+            return False
+        hold = _sign_in_holds.get(conv_id)
+        if hold is None:
+            # A message the server queued too long ago fails while it can still be recorded.
+            return time.monotonic() < _sign_in_hold_deadline(_turn_message_bodies[conv_id])
+        if hold.holds >= _SIGN_IN_HOLD_MAX_REPEATS or time.monotonic() >= hold.deadline:
+            # The wait ran out, or the pane kept asking after it looked signed in: this
+            # refusal stands, and so do those of the messages queued during the wait.
+            return False
+        return True
+
+    def _is_sub_agent_session(conv_id: str) -> bool:
+        """Return whether *conv_id* runs a sub-agent dispatch rather than a main session."""
+        snapshot = _session_snapshot_cache.get(conv_id)
+        return (
+            get_subagent_work(conv_id) is not None
+            or conv_id in _child_session_parents
+            or (snapshot is not None and snapshot.parent_session_id is not None)
+        )
+
+    def _hold_message_for_sign_in(conv_id: str, error: Mapping[str, Any]) -> None:
+        """
+        Queue a sign-in-refused message first again and pause the queue for the sign-in.
+
+        The sign-in watcher releases the pause once the agent can take input,
+        and the pending-prompt waiter then sends the queue in order.
+
+        :param conv_id: Session whose message the launcher's sign-in refused.
+        :param error: The harness refusal, carrying the sign-in title and link.
+        """
+        body = _turn_message_bodies[conv_id]
+        history = _session_histories.get(conv_id)
+        if history and history[-1].get("content") == body.get("content"):
+            # The queue records the message again when it sends it.
+            history.pop()
+        _session_message_buffers.setdefault(conv_id, []).insert(0, body)
+        hold = _sign_in_holds.get(conv_id)
+        if hold is None:
+            hold = _sign_in_holds[conv_id] = _SignInHold(deadline=_sign_in_hold_deadline(body))
+        hold.holds += 1
+        hold.waiting = True
+        _logger.info(
+            "Holding a message for %s until its Databricks sign-in completes (refusal %d)",
+            conv_id,
+            hold.holds,
+            extra={"session_id": conv_id, "event_name": "native_input_held_for_sign_in"},
+        )
+        if hold.holds == 1:
+            notice = asyncio.get_running_loop().create_task(
+                _post_sign_in_hold_notice(conv_id, error), name=f"sign-in-hold-notice-{conv_id}"
+            )
+            _background_tasks.add(notice)
+            notice.add_done_callback(_background_tasks.discard)
+        _start_sign_in_watch(conv_id)
+
+    def _message_held_for_sign_in(conv_id: str) -> bool:
+        """Return whether a queued message waits on the session's sign-in, without resuming it."""
+        hold = _sign_in_holds.get(conv_id)
+        return hold is not None and hold.waiting
+
+    def _claim_sign_in_release(conv_id: str) -> bool:
+        """
+        Return whether a held message is being sent without the person resending it.
+
+        A message still waiting on the sign-in is claimed: only the watcher resumes it.
+        One the expired wait already resent needs no claim.
+        """
+        hold = _sign_in_holds.get(conv_id)
+        if hold is None:
+            return False
+        if hold.waiting:
+            hold.releasing = True
+            return True
+        return hold.resent
+
+    def _release_sign_in_hold(conv_id: str) -> None:
+        """Resume a queue paused for a sign-in."""
+        hold = _sign_in_holds.get(conv_id)
+        if hold is not None:
+            hold.waiting = False
+            hold.releasing = False
+
+    def _sign_in_hold_waiting(session_id: str) -> bool:
+        """Return whether queued input still waits on a sign-in; an expired wait resumes."""
+        hold = _sign_in_holds.get(session_id)
+        if hold is None or not hold.waiting:
+            return False
+        if hold.releasing or time.monotonic() < hold.deadline:
+            return True
+        hold.waiting = False
+        hold.resent = True
+        _logger.warning(
+            "Databricks sign-in for %s did not complete before its wait ran out; "
+            "resending its message",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return False
+
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
@@ -4515,7 +4731,23 @@ def create_runner_app(
                 _rewake_parent_if_inbox_stranded(session_id)
                 return
 
-            pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            if _sign_in_hold_waiting(session_id):
+                _start_claude_prompt_waiter(session_id)
+                return
+            try:
+                pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            except (httpx.HTTPError, RuntimeError, OSError):
+                # Nothing else resumes this queue, so a failed pane check hands it to the
+                # waiter, which retries until the check succeeds.
+                _logger.warning(
+                    "Failed to check the Claude prompt before sending queued input for %s; "
+                    "retrying",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                _start_claude_prompt_waiter(session_id)
+                return
             # Stop/delete can clear the queue while the pane inspection is in flight.
             buf = _session_message_buffers.get(session_id)
             if not buf:
@@ -5056,6 +5288,7 @@ def create_runner_app(
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
+        _turn_message_bodies[conv] = msg_body
         _own_epoch = _turn_bind_epoch.get(conv)
         # A fresh turn is binding: whatever desync the previous turn ended on is
         # resolved now. Also clear a stale publish-once token (e.g. left set by a
@@ -5131,6 +5364,8 @@ def create_runner_app(
                 # different task, this turn is already accounted for — skip.
                 if _active_turns.get(conv) is _own_task and _own_task is not None:
                     _on_proxy_stream_end(conv)
+                if _turn_message_bodies.get(conv) is msg_body:
+                    _turn_message_bodies.pop(conv, None)
 
     def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
         """Reasoning block to forward on a turn, or ``None`` when unset.
@@ -5985,6 +6220,20 @@ def create_runner_app(
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
+            # A sign-in refusal kept from the chat while its message waits to be resent.
+            _held_refusal: _JsonObject | None = None
+            _held_body: _JsonObject | None = None
+
+            def _report_held_refusal() -> None:
+                """Publish a kept sign-in refusal as the harness sent it: nothing is held."""
+                nonlocal _held_refusal
+                if _held_refusal is None:
+                    return
+                if turn_input_identity:
+                    _held_refusal.update(turn_input_identity)
+                _publish_event(conv_id, _held_refusal)
+                _held_refusal = None
+
             try:
                 async with client.stream(
                     "POST",
@@ -6048,6 +6297,11 @@ def create_runner_app(
                     # call, so a later compaction snapshot already covers them.
                     _text_acc_before_tool = 0
                     _stream_failed_error: _JsonObject | None = None
+
+                    def _owns_live_turn() -> bool:
+                        live = _live_response_id.get(conv_id)
+                        return _response_id is None or live == _response_id
+
                     async for chunk in harness_resp.aiter_text():
                         _buffer += chunk
                         while "\n\n" in _buffer:
@@ -6155,6 +6409,16 @@ def create_runner_app(
                                         if isinstance(_err, dict)
                                         else {"message": "harness turn failed"}
                                     )
+                                    if (
+                                        dispatch is not None
+                                        and _owns_live_turn()
+                                        and _holds_for_sign_in(conv_id, _stream_failed_error)
+                                    ):
+                                        # Neither fail the turn nor mark the message
+                                        # undelivered: it is sent after the sign-in.
+                                        _held_refusal = event
+                                        _held_body = _turn_message_bodies.get(conv_id)
+                                        continue
                                 elif _evt_type == "response.output_item.done":
                                     _item = event.get("item")
                                     if isinstance(_item, dict):
@@ -6435,14 +6699,30 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
+                    if (
+                        not _owns_live_turn()
+                        or _turn_message_bodies.get(conv_id) is not _held_body
+                    ):
+                        # A newer turn took the session, or an interrupt or Stop cancelled
+                        # this one meanwhile: report the refusal as usual.
+                        _report_held_refusal()
+                    _holding = _held_refusal is not None and _stream_failed_error is not None
+                    if _holding:
+                        _hold_message_for_sign_in(conv_id, _stream_failed_error)
+                        # Queued again: there is nothing left to report however the turn ends.
+                        _held_refusal = None
                     # _on_proxy_stream_end clears any claude-sdk `/compact`
                     # spinner (publishing `failed` when no compaction landed);
                     # it is the single convergence point for every turn-end path.
                     _on_proxy_stream_end(
-                        conv_id, error=_stream_failed_error, owner_response_id=_response_id
+                        conv_id,
+                        error=None if _holding else _stream_failed_error,
+                        owner_response_id=_response_id,
+                        sign_in_hold=_holding,
                     )
 
             except _ContextWindowOverflow as overflow:
+                _report_held_refusal()
                 _error = {
                     "code": "context_length_exceeded",
                     "message": overflow.detail_message
@@ -6466,6 +6746,8 @@ def create_runner_app(
                 )
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                # A refusal kept before the stream broke still reports its message undelivered.
+                _report_held_refusal()
                 _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
                 if _exit_error is not None:
                     # The runner ended this stream itself: the session's required
@@ -6525,6 +6807,14 @@ def create_runner_app(
                     source="harness",
                     input_identity=turn_input_identity,
                 )
+
+            except asyncio.CancelledError:
+                if conv_id in _desynced_sessions:
+                    # A respawn or model-switch resync tore the turn down: a kept refusal
+                    # still reports its message undelivered. Stop and interrupt don't cancel
+                    # this stream; they drop the message and finalization reports it.
+                    _report_held_refusal()
+                raise
 
         return StreamingResponse(
             proxy_stream(),
@@ -6857,7 +7147,11 @@ def create_runner_app(
                             status_code=202,
                             content={
                                 "status": "buffered",
-                                "detail": "Message buffered until the pending prompt is resolved.",
+                                "detail": (
+                                    "Message buffered until the Databricks sign-in completes."
+                                    if _message_held_for_sign_in(conversation_id)
+                                    else "Message buffered until the pending prompt is resolved."
+                                ),
                             },
                         )
 

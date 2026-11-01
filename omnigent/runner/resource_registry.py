@@ -1511,12 +1511,26 @@ class SessionResourceRegistry:
         resource_id = terminal_resource_id(terminal_name, session_key)
         loop = asyncio.get_running_loop()
 
+        def _owns_terminal() -> bool:
+            return (
+                self._terminal_registry is not None
+                and self._terminal_registry.get(session_id, terminal_name, session_key) is instance
+            )
+
+        def _publish_activity() -> None:
+            if activity_publisher is not None and _owns_terminal():
+                activity_publisher(session_id, resource_id)
+
         # Monotonic time of the last activity pulse published for this
         # terminal, mutated only on the watcher daemon thread (so no lock),
         # used to throttle emissions to at most one per
         # :data:`_TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS`. ``None``
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
+
+        def _publish_status_if_current(status: str, blocked_on: str | None) -> None:
+            if status_publisher is not None and _owns_terminal():
+                status_publisher(session_id, status, blocked_on)
 
         def _publish_status(
             status: str,
@@ -1525,13 +1539,6 @@ class SessionResourceRegistry:
             record_activity: bool = False,
             failure_activity_epoch: int | None = None,
         ) -> None:
-            # Publish one running/idle edge: dedup against the last value,
-            # memo for exit classification, and hop to the loop (publishers
-            # are loop-only). Shared by the PTY edges and the claude-native
-            # structured-state poller so both go through the same dedup/memo. The
-            # dedup baseline lives on the registry, not this closure, so a
-            # forwarder's hook-derived edge resyncs it (see
-            # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
             if status == "failed":
@@ -1552,11 +1559,16 @@ class SessionResourceRegistry:
                     or self.session_activity_epoch(session_id) != failure_activity_epoch
                 ):
                     return
+            if not _owns_terminal():
+                return
             explicit_activity = record_activity and status in {"running", "waiting"}
             if explicit_activity:
                 self._set_session_status_memo(session_id, status)
             if not self._claim_status_edge(session_id, status, blocked_on):
                 return
+            # Pane repaints can be startup output, not a new agent turn.
+            if not explicit_activity:
+                self._set_session_status_memo(session_id, status, record_activity=False)
             with contextlib.suppress(Exception):
                 reader = getattr(instance, "program_status", None)
                 instance.lifecycle_trace.note_status(
@@ -1567,13 +1579,10 @@ class SessionResourceRegistry:
                     if record_activity
                     else "pane_activity",
                 )
-            # Pane repaints can be startup output, not a new agent turn.
-            if not explicit_activity:
-                self._set_session_status_memo(session_id, status, record_activity=False)
             if status == "failed":
-                status_publisher(session_id, status, blocked_on)
+                _publish_status_if_current(status, blocked_on)
             else:
-                loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
+                loop.call_soon_threadsafe(_publish_status_if_current, status, blocked_on)
 
         def _structured_status_active() -> bool:
             # Explicit Claude state owns the indicator; pane changes still drive
@@ -1602,8 +1611,12 @@ class SessionResourceRegistry:
 
         def _on_tick() -> None:
             nonlocal native_input_ready
+            if not _owns_terminal():
+                return
             if status_poller is not None:
                 status_poller.tick()
+                if not _owns_terminal():
+                    return
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
                 try:
                     from omnigent.harnesses.claude_native.bridge import (
@@ -1646,6 +1659,8 @@ class SessionResourceRegistry:
                         )
 
         def _on_activity() -> None:
+            if not _owns_terminal():
+                return
             with contextlib.suppress(Exception):
                 instance.lifecycle_trace.note_activity()
             # Runs on the watcher daemon thread; hop to the loop so the
@@ -1664,7 +1679,7 @@ class SessionResourceRegistry:
                     or now - previous >= _TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS
                 ):
                     last_activity_emit["value"] = now
-                    loop.call_soon_threadsafe(activity_publisher, session_id, resource_id)
+                    loop.call_soon_threadsafe(_publish_activity)
             # Pane changed → the agent is working. Coalesce to the
             # idle→running edge so a continuously-redrawing pane doesn't
             # re-emit ``running`` every poll. Skipped once the status file owns
@@ -1691,6 +1706,7 @@ class SessionResourceRegistry:
                         session_key=session_key,
                         lifecycle=lifecycle,
                         instance=instance,
+                        resource_role=resource_role,
                         reached_input_ready=(
                             native_input_ready if input_ready_probe is not None else None
                         ),
@@ -1823,6 +1839,7 @@ class SessionResourceRegistry:
         session_key: str,
         lifecycle: TerminalLifecycle,
         instance: TerminalInstance | None = None,
+        resource_role: str | None = None,
         reached_input_ready: bool | None = None,
     ) -> None:
         """Clean up and publish lifecycle events for an unexpected terminal exit.
@@ -1832,8 +1849,16 @@ class SessionResourceRegistry:
         """
         terminal_id = terminal_resource_id(terminal_name, session_key)
         with self._lock:
-            observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
-            observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
+            current = (
+                self._terminal_registry.get(session_id, terminal_name, session_key)
+                if self._terminal_registry is not None
+                else None
+            )
+            if instance is not None and current is not None and current is not instance:
+                observed, observed_role = lifecycle, resource_role
+            else:
+                observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
+                observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
         if observed is None:
             return
         if observed != lifecycle:

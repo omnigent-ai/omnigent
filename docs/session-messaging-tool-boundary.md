@@ -24,12 +24,14 @@ on which owned destinations the peer-message tool can address.
 Some Smart Routing configurations pre-approve `sys_session_send` so a routed
 child can receive work without an unattended permission prompt. Claude receives
 the tool name in `--allowedTools`; Codex receives a per-tool
-`approval_mode = "approve"`. Neither framework exemption names
-`sys_session_message`. These entries do not inspect the destination's parentage.
+`approval_mode = "approve"`. Cursor independently includes `sys_session_send`
+in its generated MCP `autoApprove` list and adds it to an existing CLI permission
+config, without a Smart Routing gate. These framework exemptions omit
+`sys_session_message` and do not inspect the destination's parentage.
 
 ```mermaid
 flowchart TD
-    A["Agent chooses a messaging tool"] --> S["sys_session_send<br/>Routed-child exemption may apply"]
+    A["Agent chooses a messaging tool"] --> S["sys_session_send<br/>Child-tool exemption may apply"]
     A --> M["sys_session_message<br/>Ordinary native approval"]
     S --> C["Runner verifies direct parentage"]
     C --> I["Tracked child work → inbox result"]
@@ -62,7 +64,7 @@ not a sandbox against agents with unrestricted shell or user-granted access.
 
 | Choice | Child follow-ups | Peer approval | Cost |
 | --- | --- | --- | --- |
-| **Keep separate tools** | Preserve the existing routed-child exemption | Preserve ordinary native rules | Agents must choose the appropriate tool; retain clear descriptions/examples. |
+| **Keep separate tools** | Preserve existing child-tool exemptions | Preserve ordinary native rules | Agents must choose the appropriate tool; retain clear descriptions/examples. |
 | One tool, remove its blanket exemption | Follow ordinary native rules too; may prompt or refuse unattended work | Preserved | Small implementation, but changes child workflow behavior. |
 | One tool, approve according to destination | Can preserve automatic child follow-ups | Requires a verified destination-aware gate | More approval plumbing and integration checks across harnesses. |
 
@@ -89,6 +91,7 @@ were checked against `695db899f` on `main`.
 | Child-only by-ID dispatch | [`_send_to_existing_session`](../omnigent/runner/tool_dispatch.py) |
 | Claude routed-tool exemption | [`_ROUTED_SPAWN_ALLOWED_TOOLS`](../omnigent/runner/native/orchestration.py) |
 | Codex routed-tool exemption | [`framework_approved_tools`](../omnigent/harnesses/codex_native/app_server.py) |
+| Cursor MCP and CLI exemptions, independent of Smart Routing | [`_CURSOR_AUTO_APPROVE_TOOLS`, `build_mcp_config`, `allow_mcp_tools_in_cli_config`](../omnigent/harnesses/cursor_native/bridge.py) |
 | Server ALLOW leaves native consent independent | [`evaluation_response_to_hook_output`](../omnigent/native/native_policy_hook.py) |
 | Peer delivery and server authorization | [Peer helper](../omnigent/runner/session_message.py), [server gate](../omnigent/server/session_orchestration.py) |
 
@@ -102,8 +105,9 @@ Reconsider unification when we accept ordinary approvals for child follow-ups,
 or have verified destination-aware approval. Before expanding an automatically
 approved tool's scope, checks must cover native Chat and terminal paths: denied
 peer consent produces no destination event; child completion/wake still works;
-lookup failures never grant approval; and the actual generated Claude/Codex
+lookup failures never grant approval; and the actual generated Claude/Codex/Cursor
 configuration matches the intended scope. Existing [Claude launch](../tests/runner/test_app_claude_native_launch_args.py),
 [Codex profile](../tests/harnesses/codex_native/app_server/test_session_profiles.py),
+[Cursor MCP/CLI configuration](../tests/inner/test_cursor_native_executor.py),
 and [dispatch](../tests/runner/test_runner_dispatch.py) scenarios are the starting
 points, not proof of an unimplemented approval mechanism.

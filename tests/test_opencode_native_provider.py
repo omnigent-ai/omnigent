@@ -23,6 +23,7 @@ from omnigent.harnesses.opencode_native.provider import (
     resolve_databricks_gateway,
     write_opencode_provider_config,
 )
+from omnigent.process_logging import data_dir
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +50,7 @@ def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]
     assert "omnigent.harnesses.claude_native.bridge" in cmd
     assert entry.get("environment", {}).get("PYTHONUNBUFFERED") == "1"
+    assert entry["environment"]["OMNIGENT_DATA_DIR"] == str(data_dir())
 
 
 def test_build_omnigent_mcp_server_honors_python_executable() -> None:

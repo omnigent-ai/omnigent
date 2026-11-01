@@ -8110,9 +8110,11 @@ async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
         old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
         os.utime(model_catalog_store.catalog_path("claude-native", fingerprint), (old, old))
     probed_configs: list[object] = []
+    release_probe = asyncio.Event()
 
     async def _probe(claude_config: object) -> list[dict[str, object]]:
         probed_configs.append(claude_config)
+        await release_probe.wait()
         return rows
 
     def _fake_listing(spec: object, harness: str) -> ModelListing:
@@ -8136,19 +8138,25 @@ async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
 
     monkeypatch.setattr(host, "_probed_claude_model_options", _unexpected_probe)
 
-    result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_sdk_store", harness="claude-sdk"),
-    )
-
-    assert result == HostModelOptionsResultFrame(
-        request_id="req_sdk_store",
-        status="ok",
-        models=rows,
-        routable_models=["claude-sonnet-5"],
-    )
-    refresh = model_catalog_store._inflight.get(("claude-native", fingerprint))
-    if refresh is not None:
-        await refresh
+    try:
+        # The probe stays blocked, so a reply proves the picker never waits on the refresh.
+        result = await asyncio.wait_for(
+            host._handle_model_options(
+                HostModelOptionsFrame(request_id="req_sdk_store", harness="claude-sdk"),
+            ),
+            timeout=10,
+        )
+        assert result == HostModelOptionsResultFrame(
+            request_id="req_sdk_store",
+            status="ok",
+            models=rows,
+            routable_models=["claude-sonnet-5"],
+        )
+    finally:
+        release_probe.set()
+        refresh = model_catalog_store._inflight.get(("claude-native", fingerprint))
+        if refresh is not None:
+            await refresh
     assert probed_configs == ([None] if stale else [])
     assert not model_catalog_store.catalog_is_stale("claude-native", fingerprint)
     _cleanup_host(host)

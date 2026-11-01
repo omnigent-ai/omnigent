@@ -1022,26 +1022,20 @@ def _claude_model_probe_launch(
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.config import load_effective_config
     from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     args = ["-p"]
     if stream_input:
         args.extend(("--input-format", "stream-json"))
     else:
         args.append("/model")
-    args.extend(
-        [
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            # The probe asks one client-side question; the MCP fleet, session
-            # persistence, and background chatter are irrelevant startup weight.
-            "--strict-mcp-config",
-            "--mcp-config",
-            '{"mcpServers":{}}',
-            "--no-session-persistence",
-            *extra_args,
-        ]
-    )
+    args.extend(["--output-format", "stream-json", "--verbose"])
+    # The probe asks one client-side question; the MCP fleet, session
+    # persistence, and background chatter are irrelevant startup weight.
+    # Claude Code refuses both MCP flags while an enterprise MCP config exists.
+    if not claude_code_managed_mcp_present():
+        args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+    args.extend(["--no-session-persistence", *extra_args])
     if claude_config is not None and claude_config.api_key_helper:
         args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
     cfg = load_effective_config()
