@@ -3742,7 +3742,6 @@ class _CodexAppServerSession:
                     message["content"] = goal_objective
                     break
         after_interrupt = self._interruption_marker_pending
-        self._interruption_marker_pending = False
         prompt = _prompt_for_turn(
             prompt_messages, is_new_thread=is_new_thread, after_interrupt=after_interrupt
         )
@@ -3794,6 +3793,8 @@ class _CodexAppServerSession:
             "turn/start",
             turn_params,
         )
+        if after_interrupt:
+            self._interruption_marker_pending = False
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
@@ -4277,9 +4278,12 @@ class _CodexAppServerSession:
 
     async def interrupt_turn(self) -> bool:
         turn_id = self.active_turn_id
-        if self.thread_id is None or turn_id is None:
+        if self.thread_id is None:
             return False
+        # Arming without an active turn is harmless: the marker is sent only if history holds it.
         self._interruption_marker_pending = True
+        if turn_id is None:
+            return False
         if turn_id in (self._interrupted_turn_id, self._reader_completed_turn):
             return True
         self._interrupted_turn_id = turn_id

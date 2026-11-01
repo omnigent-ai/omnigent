@@ -510,6 +510,73 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def _follow_up_inputs_after_failed_start(self, active_turn_id: str | None):
+        """Interrupt the thread, fail the follow-up's ``turn/start``, retry, and return inputs."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session.active_turn_id = active_turn_id
+            interrupt_responses = [{"result": {}}] if active_turn_id else []
+            session._request = AsyncMock(
+                side_effect=[
+                    *interrupt_responses,
+                    RuntimeError("turn/start failed"),
+                    {"result": {"turn": {"id": "turn-2"}}},
+                ]
+            )
+            session._drain_turn_completed_tail = AsyncMock(return_value=None)
+            await session.interrupt_turn()
+            session.active_turn_id = None
+
+            history = [
+                {"role": "user", "content": "Write a long essay."},
+                {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+                {"role": "user", "content": "Summarize instead."},
+            ]
+            turn_kwargs = {
+                "tools": [],
+                "system_prompt": "",
+                "model": "gpt-5",
+                "cwd": ".",
+                "sandbox": "workspace-write",
+            }
+            with self.assertRaises(RuntimeError):
+                async for _event in session.run_turn(messages=list(history), **turn_kwargs):
+                    pass
+            session._events.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-2", "status": "completed"}},
+                }
+            )
+            async with asyncio.timeout(10):
+                async for _event in session.run_turn(messages=list(history), **turn_kwargs):
+                    pass
+            return [
+                call.args[1]["input"]
+                for call in session._request.await_args_list
+                if call.args[0] == "turn/start"
+            ]
+
+        return _run(_t())
+
+    def test_follow_up_retried_after_failed_start_keeps_interruption_marker(self):
+        """The marker stays pending until Codex accepts a turn, even if no turn was active."""
+        with_marker = [
+            {"type": "text", "text": f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."}
+        ]
+        for active_turn_id in ("turn-1", None):
+            with self.subTest(active_turn_id=active_turn_id):
+                self.assertEqual(
+                    self._follow_up_inputs_after_failed_start(active_turn_id),
+                    [with_marker, with_marker],
+                )
+
     def test_build_initial_prompt_keeps_user_attachments_as_native_blocks(self):
         # A fresh thread replaying multimodal history must keep image bytes as
         # native input_image blocks, not flatten the data URI into prompt text.

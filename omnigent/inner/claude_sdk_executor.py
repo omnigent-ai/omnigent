@@ -907,6 +907,8 @@ class _ClaudeClientState:
     effort: str | None = None
     # Set once the current query has been interrupted; cleared when the next query starts.
     interrupted: bool = False
+    # Whether the next query must carry the runner's interruption marker.
+    interruption_marker_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -2173,6 +2175,7 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             return False
+        state.interruption_marker_pending = True
         if state.interrupted:
             return True
         state.interrupted = True
@@ -2786,6 +2789,8 @@ class ClaudeSDKExecutor(Executor):
         prompt = self._build_prompt(
             messages,
             resume_session=resume_session,
+            after_interrupt=resume_session
+            and self._clients[session_key].interruption_marker_pending,
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -3255,6 +3260,8 @@ class ClaudeSDKExecutor(Executor):
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
+            if client_state is not None:
+                client_state.interruption_marker_pending = False
             message_stream = client.receive_response()
             try:
                 while True:
@@ -3728,6 +3735,7 @@ class ClaudeSDKExecutor(Executor):
         messages: list[Message],
         *,
         resume_session: bool,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -3748,13 +3756,17 @@ class ClaudeSDKExecutor(Executor):
         :param resume_session: ``True`` when the SDK session
             already has prior turns cached (no need to replay
             history).
+        :param after_interrupt: ``True`` when the resumed session's
+            interruption marker has not been delivered yet.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
         """
         if resume_session:
             # The live session already holds its tool items; only a fresh one replays them.
-            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
+            return ClaudeSDKExecutor._extract_trailing_user_content(
+                without_tool_history(messages), after_interrupt=after_interrupt
+            )
 
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         if len(messages) <= 1 or len(user_messages) <= 1:
@@ -3831,6 +3843,8 @@ class ClaudeSDKExecutor(Executor):
     @staticmethod
     def _extract_trailing_user_content(
         messages: list[Message],
+        *,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Extract the trailing run of consecutive user messages for the SDK.
@@ -3852,6 +3866,8 @@ class ClaudeSDKExecutor(Executor):
         survive.
 
         :param messages: Conversation history.
+        :param after_interrupt: ``True`` when an interruption marker in
+            the run has not been delivered yet, so it is sent too.
         :returns: A string prompt, or a list of Anthropic content
             block dicts when the trailing run is multimodal.
         """
@@ -3871,10 +3887,12 @@ class ClaudeSDKExecutor(Executor):
                     if not trailing:
                         return "/compact"
                     break
-                trailing.append(msg)
                 # The live session already received the user input before an interruption.
                 if is_interruption_marker(msg):
+                    if after_interrupt:
+                        trailing.append(msg)
                     break
+                trailing.append(msg)
             else:
                 break
         trailing.reverse()

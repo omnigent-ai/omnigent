@@ -6862,6 +6862,81 @@ def test_settled_requested_abort_keeps_session_and_next_prompt_sends_marker(
     _run(_test())
 
 
+def test_settled_requested_abort_that_compacted_evicts_session() -> None:
+    """A kept process must not hold a compaction the interrupted turn never reports."""
+
+    async def _test() -> None:
+        aborted = _assistant_message("partial", stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial"),
+            ]
+        )
+        turn = executor.run_turn(
+            [{"role": "user", "content": "Write a long essay.", "session_id": _SESSION_KEY}],
+            [],
+            "system",
+        )
+        assert await anext(turn) == TextChunk(text="partial")
+
+        assert await executor.interrupt_session(_SESSION_KEY)
+        for frame in [
+            _rpc_frame(type="response", command="abort", success=True),
+            _rpc_frame(type="message_end", message=aborted),
+            _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+            _rpc_frame(type="compaction_start", reason="threshold"),
+            _rpc_frame(
+                type="compaction_end",
+                reason="threshold",
+                result={"summary": "SUMMARY"},
+                aborted=False,
+                willRetry=False,
+            ),
+            _rpc_frame(type="agent_settled"),
+            _rpc_frame(type="response", command="get_messages", success=False, error="busy"),
+        ]:
+            rpc._line_queue.put_nowait(frame)
+        rest = [event async for event in turn]
+
+        assert [type(e) for e in rest] == [CompactionComplete, TurnComplete]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_prompt_that_never_reaches_pi_keeps_interruption_marker_pending() -> None:
+    """A follow-up whose prompt fails before Pi receives it leaves the marker for the next."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(_plain_answer_frames("OK"))
+        state = executor._session_states[_SESSION_KEY]
+        state._has_sent_prompt = True
+        state.abort_requested = True
+        external_image = {"type": "input_image", "image_url": "https://example.com/cat.png"}
+        history = [
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": [external_image], "session_id": _SESSION_KEY},
+        ]
+        rejected = [event async for event in executor.run_turn(list(history), [], "system")]
+        history.append(
+            {"role": "user", "content": "Summarize instead.", "session_id": _SESSION_KEY}
+        )
+        answered = [event async for event in executor.run_turn(list(history), [], "system")]
+
+        assert [type(e) for e in rejected] == [ExecutorError]
+        assert [e.response for e in answered if isinstance(e, TurnComplete)] == ["OK"]
+        commands = [json.loads(line) for line in rpc.process.stdin.data]
+        assert [command["message"] for command in commands] == [
+            f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."
+        ]
+        assert not state.abort_requested
+
+    _run(_test())
+
+
 def test_settled_rejected_prompt_evicts_session() -> None:
     """A prompt pi refuses leaves the session in an unknown state; drop it."""
 

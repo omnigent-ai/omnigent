@@ -203,15 +203,17 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertNotIn("old two", prompt)
 
     def test_resumed_session_trailing_run_starts_at_interruption_marker(self):
-        """A kept session already saw the interrupted request; send the marker onward."""
+        """A kept session already saw the interrupted request; send a pending marker onward."""
         executor = self._make_executor()
         messages = [
             {"role": "user", "content": "Write a long essay."},
             {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
             {"role": "user", "content": "Summarize instead."},
         ]
-        prompt = executor._build_prompt(messages, resume_session=True)
+        prompt = executor._build_prompt(messages, resume_session=True, after_interrupt=True)
         self.assertEqual(prompt, f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertEqual(prompt, "Summarize instead.")
 
     def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
         """A multimodal message in the trailing run keeps structured blocks for all."""
@@ -3102,7 +3104,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                     if compacts and len(queries) == 1:
                         yield _SystemMessage()
                     await self.result_ready.wait()
-                    yield _ResultMessage("claude-session-a", "partial essay")
+                    # The first follow-up ends without assistant text.
+                    yield _ResultMessage(
+                        "claude-session-a", [None, None, "THANKS"][len(queries) - 1]
+                    )
 
                 async def interrupt(self):
                     interrupt_calls.append(self)
@@ -3127,22 +3132,20 @@ class TestStreamEventStreaming(unittest.TestCase):
                 self.assertTrue(await executor.interrupt_session("session-a"))
                 first_events = await first_turn
 
-                second_events = await _collect(
-                    [
-                        *history,
-                        {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
-                        {"role": "user", "content": "Summarize instead."},
-                    ]
-                )
+                history.append({"role": "user", "content": INTERRUPTION_MARKER_TEXT})
+                follow_up_events = []
+                for text in ("Summarize instead.", "Thanks."):
+                    history.append({"role": "user", "content": text, "session_id": "session-a"})
+                    follow_up_events.append(await _collect(list(history)))
             await asyncio.gather(*executor._cancel_close_tasks)
-            return first_events, second_events
+            return first_events, follow_up_events
 
-        first_events, second_events = _run(_t())
-        return first_events, second_events, queries, connect_calls, interrupt_calls, disconnect
+        first_events, follow_up_events = _run(_t())
+        return first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect
 
     def test_interrupted_query_keeps_session_for_next_turn(self):
         """An interrupted query ends as cancelled and the next query resumes the same client."""
-        first_events, second_events, queries, connect_calls, interrupt_calls, disconnect = (
+        first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect = (
             self._interrupt_query_then_follow_up(compacts=False)
         )
 
@@ -3151,12 +3154,14 @@ class TestStreamEventStreaming(unittest.TestCase):
         self.assertEqual(len(connect_calls), 1)
         disconnect.assert_not_awaited()
         self.assertEqual(queries[1], f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
-        self.assertIsInstance(second_events[-1], TurnComplete)
-        self.assertEqual(second_events[-1].response, "partial essay")
+        self.assertNotIn(INTERRUPTION_MARKER_TEXT, queries[2])
+        self.assertTrue(queries[2].endswith("Thanks."))
+        self.assertFalse(follow_up_events[0][-1].response)
+        self.assertEqual(follow_up_events[1][-1].response, "THANKS")
 
     def test_interrupted_query_that_compacted_replays_history_in_new_client(self):
         """A compaction the server never received is not resumed; the next turn replays history."""
-        first_events, second_events, queries, connect_calls, _, _ = (
+        first_events, follow_up_events, queries, connect_calls, _, _ = (
             self._interrupt_query_then_follow_up(compacts=True)
         )
 
@@ -3164,7 +3169,8 @@ class TestStreamEventStreaming(unittest.TestCase):
         self.assertEqual(len(connect_calls), 2)
         self.assertIn("Conversation so far:", queries[1])
         self.assertIn("Write a long essay.", queries[1])
-        self.assertIsInstance(second_events[-1], TurnComplete)
+        self.assertNotIn(INTERRUPTION_MARKER_TEXT, queries[2])
+        self.assertIsInstance(follow_up_events[-1][-1], TurnComplete)
 
     def test_interrupt_session_closes_when_interrupt_fails(self):
         """A failed interrupt drops the session so a still-running query cannot be resumed."""

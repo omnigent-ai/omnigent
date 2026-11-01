@@ -1450,7 +1450,7 @@ class _PiSessionState:
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
     _has_sent_prompt: bool = False
-    # Set once the current prompt has been aborted; cleared when the next prompt is sent.
+    # Set once the current prompt has been aborted; cleared once Pi accepts the next prompt.
     abort_requested: bool = False
 
 
@@ -3084,7 +3084,6 @@ class PiExecutor(Executor):
 
         if state is not None:
             state._has_sent_prompt = True
-            state.abort_requested = False
 
         # Send prompt command. Pi's JSONL protocol carries text in ``message``
         # and images in a native ``images`` field. Split multimodal blocks into
@@ -3117,6 +3116,8 @@ class PiExecutor(Executor):
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
+        if state is not None:
+            state.abort_requested = False
 
         # Read events until the turn boundary: ``agent_settled`` on pi >= 0.80.4,
         # where one prompt may span several ``agent_end`` runs (retry, compaction,
@@ -3379,7 +3380,11 @@ class PiExecutor(Executor):
             if event_type == "agent_settled" and settled_boundary:
                 # A failed turn still reports it: the kept pi process stays compacted.
                 if compaction_result is not None:
-                    yield await self._compaction_complete(rpc, compaction_result, model)
+                    compaction = await self._compaction_complete(rpc, compaction_result, model)
+                    if state is not None and state.abort_requested:
+                        # An interrupted turn's events are discarded, so replay history instead.
+                        await self._evict_rpc(session_key, rpc)
+                    yield compaction
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return

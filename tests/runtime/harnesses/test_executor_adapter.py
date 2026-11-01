@@ -2734,7 +2734,7 @@ async def test_watch_injections_no_marker_without_injection_id() -> None:
     assert ctx.emitted == []
 
 
-class _InterruptTrackingExecutor:
+class _InterruptTrackingExecutor(Executor):
     """Inner executor stub that records ``interrupt_session`` calls."""
 
     def __init__(self) -> None:
@@ -2749,10 +2749,6 @@ class _InterruptTrackingExecutor:
         """
         self.interrupted.append(session_key)
         return True
-
-    def resumes_after_interrupt(self) -> bool:
-        """Report that an interrupt drops the native session."""
-        return False
 
 
 @pytest.mark.asyncio
@@ -2849,6 +2845,9 @@ class _KeptSessionExecutor(Executor):
             elif self.stop_outcome == "errors_on_release":
                 await self.turn_released.wait()
                 yield ExecutorError(message="native session crashed")
+            elif self.stop_outcome == "raises":
+                yield TextChunk(text=" more")
+                raise RuntimeError("native stream broke")
         finally:
             self.turn_unwound = True
 
@@ -2909,7 +2908,7 @@ async def test_interrupt_waits_for_kept_session_turn_to_end(stop_outcome: str) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stop_outcome", ["errors", "keeps_streaming"])
+@pytest.mark.parametrize("stop_outcome", ["errors", "raises", "keeps_streaming"])
 async def test_interrupted_turn_that_does_not_end_cleanly_detaches_executor(
     stop_outcome: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3065,6 +3064,35 @@ async def test_turn_failing_after_later_unconfirmed_interrupt_reaps_only_its_exe
     second_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await second_task
+
+
+@pytest.mark.asyncio
+async def test_turn_interrupted_before_it_starts_never_reaches_kept_session() -> None:
+    """An interrupt between turn registration and start leaves the kept session idle."""
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = _KeptSessionExecutor("completes")
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    assert adapter._ensure_executor() is executor
+    ctx = TurnContext(response_id="resp_1", event_queue=asyncio.Queue(), cancelled=asyncio.Event())
+    adapter._in_flight["resp_1"] = ctx
+
+    response = await asyncio.wait_for(adapter._handle_interrupt_event(), timeout=5)
+    await asyncio.wait_for(
+        adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx),
+        timeout=5,
+    )
+
+    assert response.status_code == 204
+    assert ctx.cancelled.is_set()
+    assert not executor.turn_started.is_set()
+    assert adapter._executor is executor
+    assert adapter._abandoned_executor_cleanup is None
+    assert adapter._turn_finished.is_set()
 
 
 def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None:

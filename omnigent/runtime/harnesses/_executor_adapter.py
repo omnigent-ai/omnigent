@@ -373,6 +373,18 @@ class ExecutorAdapter(HarnessApp):
                 log_input_event(
                     _logger, "native_input_execution_started", session_id=turn_session_id
                 )
+                if ctx.cancelled.is_set() and executor.resumes_after_interrupt():
+                    # Its interrupt arrived before this turn began, so nothing waited for it.
+                    log_input_event(
+                        _logger,
+                        "native_input_execution_finished",
+                        session_id=turn_session_id,
+                        outcome="cancelled",
+                    )
+                    input_outcome_logged = True
+                    _turn_outcome = "cancelled"
+                    clean_exit = True
+                    return
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
