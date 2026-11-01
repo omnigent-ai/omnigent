@@ -78,9 +78,15 @@ async def _start_wedged_pi_session(
     rpc._read_task = asyncio.create_task(rpc._reader())
     rpc._stderr_task = asyncio.create_task(rpc._stderr_reader())
     executor._session_states["sess"] = _PiSessionState(rpc=rpc)
-    # Wait until the SIGTERM-ignoring handler is armed so the reap genuinely races it.
-    ready = await rpc.read_line(timeout=10.0)
-    assert ready == "READY", f"wedged child never became ready: {ready!r}"
+    try:
+        # Wait until the SIGTERM-ignoring handler is armed so the reap genuinely races it.
+        ready = await rpc.read_line(timeout=10.0)
+        assert ready == "READY", f"wedged child never became ready: {ready!r}"
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        raise
     return proc
 
 

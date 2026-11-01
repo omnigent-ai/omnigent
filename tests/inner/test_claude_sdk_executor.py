@@ -3063,8 +3063,8 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
-    def test_interrupted_query_keeps_session_for_next_turn(self):
-        """An interrupted query ends as cancelled and the next query resumes the same client."""
+    def _interrupt_query_then_follow_up(self, *, compacts: bool):
+        """Interrupt a running query, optionally after a CLI compaction, then send a follow-up."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
         queries: list[object] = []
@@ -3078,8 +3078,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                 self.session_id = session_id
                 self.result = result
 
+        class _SystemMessage:
+            subtype = "hook_started"
+            data = {"hook_event": "PreCompact"}
+            hook_event_name = "PreCompact"
+
         class _FakeSDK(_sdk_types()):
             ResultMessage = _ResultMessage
+            SystemMessage = _SystemMessage
 
             class ClaudeSDKClient(_SDKClient):
                 async def connect(self):
@@ -3093,6 +3099,8 @@ class TestStreamEventStreaming(unittest.TestCase):
                         self.result_ready.set()
 
                 async def receive_response(self):
+                    if compacts and len(queries) == 1:
+                        yield _SystemMessage()
                     await self.result_ready.wait()
                     yield _ResultMessage("claude-session-a", "partial essay")
 
@@ -3126,16 +3134,37 @@ class TestStreamEventStreaming(unittest.TestCase):
                         {"role": "user", "content": "Summarize instead."},
                     ]
                 )
+            await asyncio.gather(*executor._cancel_close_tasks)
+            return first_events, second_events
 
-            self.assertIsInstance(first_events[-1], TurnCancelled)
-            self.assertEqual(len(interrupt_calls), 1)
-            self.assertEqual(len(connect_calls), 1)
-            disconnect.assert_not_awaited()
-            self.assertEqual(queries[1], f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
-            self.assertIsInstance(second_events[-1], TurnComplete)
-            self.assertEqual(second_events[-1].response, "partial essay")
+        first_events, second_events = _run(_t())
+        return first_events, second_events, queries, connect_calls, interrupt_calls, disconnect
 
-        _run(_t())
+    def test_interrupted_query_keeps_session_for_next_turn(self):
+        """An interrupted query ends as cancelled and the next query resumes the same client."""
+        first_events, second_events, queries, connect_calls, interrupt_calls, disconnect = (
+            self._interrupt_query_then_follow_up(compacts=False)
+        )
+
+        self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(len(interrupt_calls), 1)
+        self.assertEqual(len(connect_calls), 1)
+        disconnect.assert_not_awaited()
+        self.assertEqual(queries[1], f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        self.assertIsInstance(second_events[-1], TurnComplete)
+        self.assertEqual(second_events[-1].response, "partial essay")
+
+    def test_interrupted_query_that_compacted_replays_history_in_new_client(self):
+        """A compaction the server never received is not resumed; the next turn replays history."""
+        first_events, second_events, queries, connect_calls, _, _ = (
+            self._interrupt_query_then_follow_up(compacts=True)
+        )
+
+        self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(len(connect_calls), 2)
+        self.assertIn("Conversation so far:", queries[1])
+        self.assertIn("Write a long essay.", queries[1])
+        self.assertIsInstance(second_events[-1], TurnComplete)
 
     def test_interrupt_session_closes_when_interrupt_fails(self):
         """A failed interrupt drops the session so a still-running query cannot be resumed."""

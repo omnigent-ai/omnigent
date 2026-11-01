@@ -3668,7 +3668,10 @@ class ClaudeSDKExecutor(Executor):
             turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
         if client_state is not None and client_state.interrupted:
-            # The CLI's result for an interrupted query is not a turn outcome.
+            # The CLI's result for an interrupted query is not a turn outcome. Its compaction
+            # never reaches the server, so drop the compacted client and replay history next turn.
+            if compaction_occurred:
+                self._evict_client_on_cancel(session_key)
             yield TurnCancelled()
             return
 

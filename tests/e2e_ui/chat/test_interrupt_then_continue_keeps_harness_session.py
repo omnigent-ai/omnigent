@@ -9,6 +9,7 @@ a continued session sends only the new message, led by the interruption marker.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import uuid
@@ -63,6 +64,11 @@ def _create_session(base_url: str, runner_id: str, executor: dict) -> str:
     return session_id
 
 
+def _delete_session(base_url: str, session_id: str) -> None:
+    with contextlib.suppress(httpx.HTTPError):  # best-effort cleanup
+        httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=30.0)
+
+
 def _send(page: Page, text: str) -> None:
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_editable(timeout=60_000)
@@ -106,6 +112,7 @@ def test_follow_up_after_interrupt_continues_harness_session(
     session_id = _create_session(
         live_server, runner_id, _executor(harness, model, mock_llm_server_url)
     )
+    request.addfinalizer(lambda: _delete_session(live_server, session_id))
     page: Page = request.getfixturevalue("page")
     page.goto(f"{live_server}/c/{session_id}")
     assistant = page.locator(_ASSISTANT)

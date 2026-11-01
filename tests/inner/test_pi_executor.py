@@ -39,6 +39,7 @@ from omnigent.inner.pi_executor import (
     PiExecutor,
     PiSubprocessConfig,
     _build_models_json,
+    _build_pi_prompt,
     _databricks_model_wire_catalog,
     _generate_extension_js,
     _only_configured_family,
@@ -438,6 +439,27 @@ def test_split_pi_prompt_separates_text_and_images():
         ]
     )
     assert message == "what is in this image?"
+    assert images == [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
+
+
+def test_image_follow_up_after_interrupt_keeps_marker_and_image():
+    history = [
+        {"role": "user", "content": "Write a long essay."},
+        {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is in this image?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        },
+    ]
+
+    prompt = _build_pi_prompt(history, is_first_turn=False, after_interrupt=True)
+
+    assert isinstance(prompt, list)
+    message, images = _split_pi_prompt(prompt)
+    assert message == f"{INTERRUPTION_MARKER_TEXT}\nwhat is in this image?"
     assert images == [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
 
 
