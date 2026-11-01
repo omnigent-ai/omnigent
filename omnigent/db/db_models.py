@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import (
@@ -32,6 +34,7 @@ from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
 from omnigent.db.compression import CompressedText
+from omnigent.db.envelope import EnvelopeError, Sealed, open_envelope, seal
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -1807,6 +1810,66 @@ def _within_declared_length(row: OmnigentBase, key: str, value: str | None) -> s
     return value
 
 
+@dataclass(frozen=True)
+class SkillMetadata:
+    """An installed skill's descriptive frontmatter, as one stored envelope.
+
+    :param display_name: Human-facing label, or ``None``.
+    :param description: One-line summary.
+    """
+
+    display_name: str | None
+    description: str
+
+
+# Character bounds on the descriptive fields; the stored envelope is bounded in bytes too.
+SKILL_DISPLAY_NAME_CHARS = 256
+SKILL_DESCRIPTION_CHARS = 1024
+
+
+class SkillMetadataEnvelope(TypeDecorator[SkillMetadata]):
+    """:class:`SkillMetadata` stored as a bounded envelope (see ``omnigent.db.envelope``).
+
+    The frontmatter of a skill from a private repository may need encrypting,
+    so it is kept opaque to the database: never indexed or filtered, stored as
+    bytes whose variant (plaintext today) is explicit. The checks run at the
+    bind boundary, so a bulk write cannot skip them.
+    """
+
+    impl = LargeBinary
+    cache_ok = True
+
+    def process_bind_param(self, value: SkillMetadata | None, dialect: object) -> bytes | None:
+        del dialect
+        if value is None:
+            return None
+        for field, field_value, limit in (
+            ("display_name", value.display_name, SKILL_DISPLAY_NAME_CHARS),
+            ("description", value.description, SKILL_DESCRIPTION_CHARS),
+        ):
+            if field_value is not None and len(field_value) > limit:
+                raise ValueError(f"{field} is longer than {limit} characters")
+        payload = json.dumps(
+            {"display_name": value.display_name, "description": value.description},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return seal(payload)
+
+    def process_result_value(self, value: bytes | None, dialect: object) -> SkillMetadata | None:
+        del dialect
+        if value is None:
+            return None
+        payload = open_envelope(value)
+        if isinstance(payload, Sealed):
+            raise EnvelopeError(
+                f"installed skill metadata is encrypted with {payload.key_ref!r}, "
+                "and no key is configured to open it"
+            )
+        fields = json.loads(payload.decode("utf-8"))
+        return SkillMetadata(fields["display_name"], fields["description"])
+
+
 class SqlInstalledSkill(OmnigentBase):
     """
     SQLAlchemy model for the ``installed_skills`` table.
@@ -1817,8 +1880,9 @@ class SqlInstalledSkill(OmnigentBase):
 
     :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`).
     :param name: Invocation identifier, the skill's directory name.
-    :param display_name: Human-facing label from the frontmatter, or ``None``.
-    :param description: One-line summary from the frontmatter.
+    :param metadata_envelope: The frontmatter's label and summary
+        (:class:`SkillMetadata`), stored as a bounded envelope that may later
+        hold ciphertext; never queried.
     :param source_url: Clone URL the skill came from.
     :param ref: Branch or tag it was fetched at, or ``None``.
     :param commit: Commit it was packaged from, or ``None`` when unknown.
@@ -1869,8 +1933,9 @@ class SqlInstalledSkill(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
     name: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
-    display_name: Mapped[str | None] = mapped_column(BoundedString(256), nullable=True)
-    description: Mapped[str] = mapped_column(BoundedString(1024), nullable=False)
+    metadata_envelope: Mapped[SkillMetadata] = mapped_column(
+        SkillMetadataEnvelope(), nullable=False
+    )
     source_url: Mapped[str] = mapped_column(BoundedString(255), nullable=False)
     ref: Mapped[str | None] = mapped_column(BoundedString(255), nullable=True)
     commit: Mapped[str | None] = mapped_column(BoundedString(64), nullable=True)
@@ -1889,8 +1954,6 @@ class SqlInstalledSkill(OmnigentBase):
 
     @validates(
         "name",
-        "display_name",
-        "description",
         "source_url",
         "ref",
         "commit",

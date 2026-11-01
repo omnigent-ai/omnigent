@@ -64,8 +64,9 @@ def _installed_skills_columns() -> list[sa.Column]:
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         sa.Column("id", Uuid16(), nullable=False),
         sa.Column("name", _exact_string(255), nullable=False),
-        sa.Column("display_name", sa.String(256), nullable=True),
-        sa.Column("description", sa.String(1024), nullable=False),
+        # The frontmatter's label and summary, as one opaque envelope that may
+        # later hold ciphertext (omnigent.db.envelope); at most 16,383 bytes.
+        sa.Column("metadata_envelope", sa.LargeBinary(), nullable=False),
         sa.Column("source_url", sa.String(255), nullable=False),
         sa.Column("ref", sa.String(255), nullable=True),
         sa.Column("commit", sa.String(64), nullable=True),
