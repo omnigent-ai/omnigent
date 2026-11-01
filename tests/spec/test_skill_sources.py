@@ -1047,11 +1047,41 @@ def test_claude_launch_is_probed_only_for_a_customized_native_launch(
     assert not launches.exists()
 
 
+@pytest.mark.parametrize(
+    ("config", "env", "customized"),
+    [
+        ({}, {}, False),
+        ({"command": "/opt/wrapper/claude"}, {}, True),
+        ({"args": ["--plugin-dir", "/opt/plugins/dev"]}, {}, True),
+        ({}, {"OMNIGENT_CLAUDE_PATH": "/opt/claude"}, True),
+        ({}, {"OMNIGENT_CLAUDE_LAUNCHER": "wrapper"}, True),
+    ],
+    ids=["default", "command", "args", "path-env", "launcher-env"],
+)
+def test_claude_launch_customization_triggers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config: dict[str, object],
+    env: dict[str, str],
+    customized: bool,
+) -> None:
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    (config_home / "config.yaml").write_text(json.dumps({"harness": {"claude-native": config}}))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    assert plugin_discovery.claude_launch_is_customized() is customized
+
+
 @pytest.mark.posix_only
 @pytest.mark.parametrize(
     ("script", "timeout_s", "summary"),
     [
-        ("sys.exit(3)\n", 10.0, "did not report its plugins"),
+        (
+            "sys.stderr.write('/home/private/launcher failed\\n')\nsys.exit(3)\n",
+            10.0,
+            "did not report its plugins",
+        ),
         ("time.sleep(30)\n", 0.5, "timed out after 0.5s"),
     ],
     ids=["no-init", "timeout"],
