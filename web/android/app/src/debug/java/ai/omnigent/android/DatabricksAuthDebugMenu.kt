@@ -11,12 +11,18 @@ internal object DatabricksAuthDebugMenu {
     const val REJECT_ACCESS_TOKEN = 20_003
     const val CLEAR_REFRESH_GRANT = 20_004
 
+    /** The faults, in menu order; the sidebar server picker lists them too. */
+    val ACTIONS =
+        listOf(
+            AuthDebugAction(CLEAR_SESSION_COOKIE, "Clear Session Cookie"),
+            AuthDebugAction(EXPIRE_ACCESS_TOKEN, "Expire Access Token"),
+            AuthDebugAction(REJECT_ACCESS_TOKEN, "Reject Access Token"),
+            AuthDebugAction(CLEAR_REFRESH_GRANT, "Clear Refresh Grant"),
+        )
+
     fun addItems(menu: Menu) {
         val debug = menu.addSubMenu(3, MENU_ROOT, 0, "Debug Authentication")
-        debug.add(3, CLEAR_SESSION_COOKIE, 0, "Clear Session Cookie")
-        debug.add(3, EXPIRE_ACCESS_TOKEN, 1, "Expire Access Token")
-        debug.add(3, REJECT_ACCESS_TOKEN, 2, "Reject Access Token")
-        debug.add(3, CLEAR_REFRESH_GRANT, 3, "Clear Refresh Grant")
+        ACTIONS.forEachIndexed { order, action -> debug.add(3, action.id, order, action.label) }
     }
 
     fun handles(itemId: Int): Boolean = itemId in CLEAR_SESSION_COOKIE..CLEAR_REFRESH_GRANT

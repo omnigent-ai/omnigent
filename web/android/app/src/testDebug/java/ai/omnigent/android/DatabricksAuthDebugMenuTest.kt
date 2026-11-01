@@ -42,6 +42,9 @@ class DatabricksAuthDebugMenuTest {
         assertNotNull(popup.menu.findItem(DatabricksAuthDebugMenu.EXPIRE_ACCESS_TOKEN))
         assertNotNull(popup.menu.findItem(DatabricksAuthDebugMenu.REJECT_ACCESS_TOKEN))
         assertNotNull(popup.menu.findItem(DatabricksAuthDebugMenu.CLEAR_REFRESH_GRANT))
+        // The sidebar server picker offers the same faults as the native menu.
+        assertTrue(DatabricksAuthDebugMenu.ACTIONS.all { DatabricksAuthDebugMenu.handles(it.id) })
+        assertEquals(4, DatabricksAuthDebugMenu.ACTIONS.size)
     }
 
     @Test

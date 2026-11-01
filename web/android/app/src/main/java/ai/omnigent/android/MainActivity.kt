@@ -131,6 +131,8 @@ class MainActivity : AppCompatActivity() {
 
     // Hidden while the current page provides the sidebar picker. A watchdog
     // restores the native recovery path for old or broken web builds.
+    // Deprecated: removal targeted for Android 0.3.0, once broken pages have a
+    // native recovery screen.
     private lateinit var switchButton: TextView
     private val revealSwitcherFallback = Runnable { switchButton.visibility = View.VISIBLE }
 
@@ -801,13 +803,8 @@ class MainActivity : AppCompatActivity() {
      */
     private fun onServerPickerRequested() {
         switchButton.removeCallbacks(revealSwitcherFallback)
-        // Workspace recovery and local sign-out stay natively reachable even
-        // when the current SPA also renders its sidebar server picker, as do the
-        // OIDC debug faults in debug builds.
-        val nativeMenu =
-            workspaceSession != null ||
-                (OidcAuthDebugMenu.IS_AVAILABLE && oidcSession?.canSignOut == true)
-        switchButton.visibility = if (nativeMenu) View.VISIBLE else View.GONE
+        // Sign-out and the debug faults are in the sidebar picker's payload.
+        switchButton.visibility = View.GONE
         emitServerPicker()
     }
 
@@ -828,6 +825,9 @@ class MainActivity : AppCompatActivity() {
                     "recentServers",
                     JSONArray(store.recentServers().filterNot(store.managed::includes)),
                 ).put("canSignOut", canSignOut())
+                // No browser chrome to reload from, so the picker offers it.
+                .put("offersReload", true)
+                .put("debugActions", JSONArray(authDebugActions().map(AuthDebugAction::toJson)))
         webView.evaluateJavascript(
             "window.__omnigentNativeEmitServerPicker && " +
                 "window.__omnigentNativeEmitServerPicker($payload);",
@@ -867,6 +867,36 @@ class MainActivity : AppCompatActivity() {
 
     /** Whether this connection's sign-in belongs to the shell, so the shell can sign it out. */
     private fun canSignOut(): Boolean = workspaceSession != null || oidcSession?.canSignOut == true
+
+    /** Authentication faults this connection offers; empty in release builds. */
+    private fun authDebugActions(): List<AuthDebugAction> =
+        when {
+            workspaceSession != null -> DatabricksAuthDebugMenu.ACTIONS
+            oidcSession?.canSignOut == true -> OidcAuthDebugMenu.ACTIONS
+            else -> emptyList()
+        }
+
+    /** A debug fault picked in the sidebar picker; ids it didn't offer are ignored. */
+    private fun onAuthDebugActionRequested(id: Int) {
+        if (authDebugActions().none { it.id == id }) return
+        runAuthDebugAction(id)
+    }
+
+    /** Run a debug fault from either menu; false when [itemId] is not one. */
+    private fun runAuthDebugAction(itemId: Int): Boolean {
+        val session = oidcSession
+        return if (DatabricksAuthDebugMenu.handles(itemId)) {
+            runAuthenticationDebugFault(itemId)
+            true
+        } else if (OidcAuthDebugMenu.handles(itemId) && session != null) {
+            OidcAuthDebugMenu.run(itemId, session) { message ->
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            }
+            true
+        } else {
+            false
+        }
+    }
 
     /**
      * The sidebar picker's "Sign out of <server>": the same sign-out as the native menu. The
@@ -1140,6 +1170,7 @@ class MainActivity : AppCompatActivity() {
                     onOpenServerSetup = ::onOpenServerSetupRequested,
                     onSignOut = if (workspaceSession != null) ::requestWorkspaceSignOut else null,
                     onSignOutOfServer = ::onSignOutOfServerRequested,
+                    onAuthDebugAction = ::onAuthDebugActionRequested,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -1499,18 +1530,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 else -> {
-                    val session = oidcSession
-                    if (DatabricksAuthDebugMenu.handles(item.itemId)) {
-                        runAuthenticationDebugFault(item.itemId)
-                        true
-                    } else if (OidcAuthDebugMenu.handles(item.itemId) && session != null) {
-                        OidcAuthDebugMenu.run(item.itemId, session) { message ->
-                            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-                        }
-                        true
-                    } else {
-                        false
-                    }
+                    runAuthDebugAction(item.itemId)
                 }
             }
         }
