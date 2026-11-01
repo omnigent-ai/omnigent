@@ -1,0 +1,40 @@
+# Only git-ignored paths, so local builds match the scanner's fresh clone and leave out secrets and host installs.
+# .git stays for history: don't share an image built from a checkout whose .git/config holds credentials.
+
+# Secrets
+**/.env
+.envrc
+
+# Host installs, which would also clash with the image's own uv sync and pnpm install
+.venv
+**/node_modules
+.pnpm-store
+
+# Build outputs and caches
+build
+dist
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+.pytest_cache
+omnigent/_build_info.py
+omnigent/server/static/web-ui
+web/storybook-static
+dev/omnidev/target
+
+# Local databases, sessions and run output
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.omnigent
+.sessions
+.codex
+.codex-tmp
+.worktrees
+.claude/worktrees
+.tmp*
+artifacts
+test-results
+output/playwright
+recordings
+reviews

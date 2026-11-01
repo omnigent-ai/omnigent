@@ -8,6 +8,9 @@ import {
   harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
+  harnessWarningBadgeText,
+  isNativeOpenCodeHarness,
+  missingHarnessCredentialCopy,
   resolveSetupSteps,
   skillInvocationPrefix,
 } from "./harnessSetup";
@@ -31,6 +34,19 @@ const info = (overrides: Partial<ServerInfo> = {}): ServerInfo =>
     installable_harnesses: ["codex", "codex-native", "pi", "pi-native"],
     ...overrides,
   }) as ServerInfo;
+
+describe("missingHarnessCredentialCopy", () => {
+  it.each([
+    ["codex-native", "Codex", "No ChatGPT account or API key on laptop"],
+    ["native-claude", "Claude Code", "No Claude subscription or API key on laptop"],
+    ["pi-native", "Pi", "No API key or gateway credential on laptop"],
+    ["cursor-native", "Cursor", "No credentials on laptop"],
+  ])("uses the credential wording for %s", (harness, harnessName, expectedStart) => {
+    expect(missingHarnessCredentialCopy(harness, harnessName, "laptop")).toBe(
+      `${expectedStart}, so new sessions can’t use ${harnessName}.`,
+    );
+  });
+});
 
 // A codex-shaped server descriptor: one-click install, then a UI-authable auth
 // step (the form lists subscription / API key / gateway; `command` is the
@@ -336,7 +352,7 @@ describe("harnessAuthableOnHost", () => {
   });
 
   it("false for env-auth / own-login harnesses, flag off, offline, or loading", () => {
-    // OpenCode/Qwen (env-auth) and Cursor (own-login) are NOT UI-authable.
+    // OpenCode/Cursor (own CLI login) and Qwen (env-auth) are NOT UI-authable.
     expect(harnessAuthableOnHost(info(), "opencode-native", online)).toBe(false);
     expect(harnessAuthableOnHost(info(), "qwen", online)).toBe(false);
     expect(harnessAuthableOnHost(info(), "cursor-native", online)).toBe(false);
@@ -421,6 +437,53 @@ describe("resolveSetupSteps", () => {
   it("returns [] with no descriptor or no harness", () => {
     expect(resolveSetupSteps(undefined, "codex", hostWith({ codex: false }))).toEqual([]);
     expect(resolveSetupSteps(CODEX_STEPS, null, hostWith({ codex: false }))).toEqual([]);
+  });
+});
+
+// The server's opencode descriptor: install, then an optional run-on-host CLI
+// login. Free models need no login, so that step is informational (no status key).
+const OPENCODE_STEPS: SetupStepWire[] = [
+  {
+    kind: "install",
+    title: "Install OpenCode",
+    detail: "We'll install OpenCode on the host for you.",
+    action: "install",
+    command: null,
+    status_key: "installed",
+  },
+  {
+    kind: "auth",
+    title: "Sign in to a provider (optional)",
+    detail:
+      "OpenCode's free models work without signing in. Sign in on the host to use your own providers.",
+    action: "command",
+    command: "opencode auth login",
+    status_key: null,
+  },
+];
+
+describe("OpenCode setup", () => {
+  it("recognizes every OpenCode harness spelling", () => {
+    expect(isNativeOpenCodeHarness("opencode-native")).toBe(true);
+    expect(isNativeOpenCodeHarness("native-opencode")).toBe(true);
+    expect(isNativeOpenCodeHarness("opencode")).toBe(true);
+    expect(isNativeOpenCodeHarness("codex-native")).toBe(false);
+    expect(isNativeOpenCodeHarness("cursor-native")).toBe(false);
+  });
+
+  it("flags a 1.x OpenCode host as outdated with only the install to do", () => {
+    const host = hostWith({ "opencode-native": "version-too-low" });
+    expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBe("version-too-low");
+    expect(harnessWarningBadgeText("version-too-low")).toBe("outdated");
+    const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "todo"]]);
+  });
+
+  it("treats an installed OpenCode with no provider login as ready", () => {
+    const host = hostWith({ "opencode-native": true });
+    expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBeNull();
+    const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "done"]]);
   });
 });
 

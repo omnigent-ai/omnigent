@@ -4,8 +4,8 @@ name: Nightly Failure Monitor
 # are excluded from the PR gate, so a break in them blocks no PR and can rot
 # silently. This watches the scheduled (cron) runs of the e2e suites and, once a
 # suite fails TWICE IN A ROW, files/updates a single tracking issue assigned to
-# the maintainer; it comments-and-closes that issue when a later nightly is
-# green. A single flake (one red run) is ignored -- the real-LLM legs are
+# the repo-automation owners in .github/areas.json; it comments-and-closes that
+# issue when a later nightly is green. A single flake (one red run) is ignored -- the real-LLM legs are
 # 429-sensitive -- so only a sustained break pages.
 #
 # Nightly Release is watched for the same reason: it is fully unattended, so a
@@ -26,7 +26,7 @@ permissions:
 jobs:
   monitor:
     name: monitor nightly result
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Triage scheduled run outcome
@@ -57,7 +57,6 @@ jobs:
 
             const { owner, repo } = context.repo;
             const LABEL = 'nightly-failure';
-            const ASSIGNEE = 'PattaraS';
             const title = `Nightly failure: ${run.name}`;
 
             // The single open tracking issue for this workflow, if any.
@@ -135,10 +134,18 @@ jobs:
               owner, repo, title, body, labels: [LABEL],
             });
             try {
+              const { data: file } = await github.rest.repos.getContent({
+                owner, repo, path: '.github/areas.json',
+                ref: context.payload.repository.default_branch,
+              });
+              const config = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+              const paused = new Set((config.assignment_paused || []).map(l => l.toLowerCase()));
+              const assignees = (config.areas.find(a => a.key === 'repo-automation')?.owners || [])
+                .filter(l => !paused.has(l.toLowerCase()));
               await github.rest.issues.addAssignees({
-                owner, repo, issue_number: created.data.number, assignees: [ASSIGNEE],
+                owner, repo, issue_number: created.data.number, assignees,
               });
             } catch (e) {
-              core.warning(`could not assign ${ASSIGNEE}: ${e.message}`);
+              core.warning(`could not assign the repo-automation owners: ${e.message}`);
             }
             core.info(`opened #${created.data.number}`);

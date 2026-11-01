@@ -1,13 +1,11 @@
 """Runner-side MCP proxy manager.
 
-Routes all MCP calls through the Omnigent server's
-``POST /v1/sessions/{session_id}/mcp`` endpoint (MCP Streamable HTTP,
-JSON-RPC 2.0) instead of connecting to external MCP servers directly.
+Registry services use ``POST /v1/mcp/{service}`` with session context for
+server policy enforcement. Existing runner-local tools and custom MCPs use
+``POST /v1/sessions/{session_id}/mcp``. Both speak JSON-RPC 2.0.
 
-The Omnigent server holds the live connections in its
-:class:`omnigent.server.mcp_pool.ServerMcpPool` and enforces
-TOOL_CALL + TOOL_RESULT policies on every call before forwarding to the
-real MCP server.  :class:`ProxyMcpManager` implements the same public
+The server applies TOOL_CALL and TOOL_RESULT policies around execution.
+:class:`ProxyMcpManager` implements the same public
 interface as :class:`omnigent.runner.mcp_manager.RunnerMcpManager` so
 it can be substituted transparently at every dispatch site in
 ``runner/app.py``.
@@ -24,15 +22,17 @@ When to use each implementation:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
+from time import monotonic
 from typing import cast
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
@@ -178,6 +178,7 @@ class ProxyMcpManager:
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
+        self._registry_services: set[str] = set()
 
     @property
     def _mcp_url(self) -> str:
@@ -188,36 +189,44 @@ class ProxyMcpManager:
         return f"/v1/sessions/{self._session_id}/mcp"
 
     async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
-        """Fetch tool schemas from the Omnigent server MCP proxy (``tools/list``).
+        """Expose selected services using per-service discovery and runner namespaces."""
+        self._registry_services = {c.name for c in spec.mcp_servers if c.transport == "registry"}
+        schemas: list[_JsonObject] = []
+        names: set[str] = set()
+        failures: dict[str, str] = {}
+        routes: list[str | None] = []
+        routes.extend(sorted(self._registry_services))
+        if any(c.transport != "registry" for c in spec.mcp_servers):
+            routes.insert(0, None)
+        for service in routes:
+            result = await self._schemas_at(service)
+            for schema in result.schemas:
+                name = schema.get("name")
+                if not isinstance(name, str):
+                    continue
+                if service is None and name.split("__", 1)[0] in self._registry_services:
+                    continue
+                schemas.append(schema)
+                names.add(name)
+            failures.update(result.failures)
+        return McpSchemasResult(schemas=schemas, tool_names=names, failures=failures)
 
-        Sends a ``tools/list`` JSON-RPC 2.0 request to the Omnigent server's MCP
-        proxy endpoint.  Returns tool schemas in the same flat OpenAI
-        function-tool format as
-        :meth:`omnigent.runner.mcp_manager.RunnerMcpManager.schemas_for`.
+    async def _schemas_at(self, service: str | None) -> McpSchemasResult:
+        """Discover one service, adding its namespace for the harness.
 
-        Tool names are returned with the server namespace prefix applied by
-        the Omnigent server (e.g. ``github__search``).  This ensures the harness
-        sees collision-safe names even when multiple MCP servers define tools
-        with the same bare name.
-
-        :param spec: The agent spec.  When ``spec.mcp_servers`` is empty,
-            returns an empty result immediately without hitting the network.
-        :returns: :class:`McpSchemasResult` containing schemas, tool name
-            set, and per-server failure messages.
+        ``None`` selects the existing session proxy for runner-local tools.
         """
-        if not spec.mcp_servers:
-            return McpSchemasResult(schemas=[], tool_names=set(), failures={})
-
         payload: _JsonObject = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
-            "params": {},
+            "params": {} if service else {"_omnigent_skip_registry": True},
         }
         try:
             resp = await self._omnigent_client.post(
-                self._mcp_url,
+                f"/v1/mcp/{service}" if service else self._mcp_url,
                 json=payload,
+                headers={"X-Omnigent-Session-Id": self._session_id} if service else {},
                 timeout=30.0,
             )
             resp.raise_for_status()
@@ -231,7 +240,7 @@ class ProxyMcpManager:
             return McpSchemasResult(
                 schemas=[],
                 tool_names=set(),
-                failures={"proxy": f"{type(exc).__name__}: {exc}"},
+                failures={service or "proxy": f"{type(exc).__name__}: {exc}"},
             )
 
         if "error" in data:
@@ -249,7 +258,7 @@ class ProxyMcpManager:
             return McpSchemasResult(
                 schemas=[],
                 tool_names=set(),
-                failures={"proxy": msg},
+                failures={service or "proxy": msg},
             )
 
         result = _json_object(data.get("result"))
@@ -262,7 +271,7 @@ class ProxyMcpManager:
             return McpSchemasResult(
                 schemas=[],
                 tool_names=set(),
-                failures={"proxy": msg},
+                failures={service or "proxy": msg},
             )
         tools_list = _json_object_list(result.get("tools"))
         schemas: list[_JsonObject] = []
@@ -271,6 +280,8 @@ class ProxyMcpManager:
             name = tool.get("name")
             if not isinstance(name, str) or not name:
                 continue
+            if service:
+                name = f"{service}__{name}"
             # The Omnigent server returns ``inputSchema`` (JSON Schema from MCP).
             # Convert to the ``parameters`` key expected by LLM providers,
             # normalizing the same way RunnerMcpManager does via
@@ -312,9 +323,8 @@ class ProxyMcpManager:
         runner-side approval Future until the user accepts or declines, then
         retries once with the user's decision in ``inputResponses``.
 
-        :param spec: Ignored — accepted for interface parity with
-            :class:`RunnerMcpManager`.  ``None`` is acceptable for callers
-            that have no spec context (e.g. the claude-native relay executor).
+        :param spec: Session selection used to route registry tools. When
+            ``None``, reuse the selection from the last schema discovery.
         :param tool_name: Tool name as seen by the LLM, e.g.
             ``"github__search"`` or ``"sys_os_read"``.
         :param arguments: Decoded tool arguments dict.
@@ -323,7 +333,10 @@ class ProxyMcpManager:
             so the harness can feed it to the LLM as a tool result.
         :raises RuntimeError: On network failure or unexpected protocol errors.
         """
-        del spec  # Omnigent server resolves spec from session context
+        if spec is not None:
+            self._registry_services = {
+                c.name for c in spec.mcp_servers if c.transport == "registry"
+            }
 
         operation_id = f"mcpop_{uuid.uuid4().hex}"
         registry = self._execution_registry
@@ -343,6 +356,53 @@ class ProxyMcpManager:
     ) -> str:
         """Run one proxy call under an already-retained operation id."""
         request_id = 1
+        service, separator, upstream_name = tool_name.partition("__")
+        managed = bool(separator and service in self._registry_services)
+        wire_name = upstream_name if managed else tool_name
+        url = f"/v1/mcp/{service}" if managed else self._mcp_url
+
+        def _record_failure(
+            exc: BaseException | None,
+            *,
+            phase: str,
+            request_generation: int,
+            started: float,
+            response: httpx.Response | None = None,
+            reattach_trigger: str | None = None,
+        ) -> None:
+            # Diagnostics must preserve the original failure and replay policy.
+            with suppress(Exception):
+                upstream_request_id = None
+                if response is not None:
+                    raw_id = response.headers.get("x-request-id", "")
+                    try:
+                        if len(raw_id) in {32, 36}:
+                            upstream_request_id = str(uuid.UUID(raw_id))
+                    except ValueError:
+                        pass
+                registry = self._execution_registry
+                _logger.warning(
+                    "MCP proxy call failed",
+                    extra=debug_event(
+                        "mcp_proxy_call_failed",
+                        session_id=self._session_id,
+                        operation_id=operation_id,
+                        jsonrpc_request_id=request_id,
+                        proxy_route="registry" if managed else "session",
+                        failure_phase=phase,
+                        exception_type=type(exc).__name__[:80] if exc is not None else "none",
+                        http_status=response.status_code if response is not None else None,
+                        upstream_request_id=upstream_request_id,
+                        server_generation=request_generation,
+                        observed_server_generation=pending_approvals.current_server_generation(),
+                        operation_retained=registry is not None
+                        and registry.has_operation(self._session_id, operation_id),
+                        reattach_trigger=reattach_trigger[:80]
+                        if reattach_trigger is not None
+                        else None,
+                        phase_elapsed_ms=round((monotonic() - started) * 1000),
+                    ),
+                )
 
         def _initial_payload() -> _JsonObject:
             return {
@@ -350,7 +410,7 @@ class ProxyMcpManager:
                 "id": request_id,
                 "method": "tools/call",
                 "params": {
-                    "name": tool_name,
+                    "name": wire_name,
                     "arguments": arguments,
                     MCP_OPERATION_ID_PARAM: operation_id,
                 },
@@ -359,9 +419,21 @@ class ProxyMcpManager:
         async def _wait_to_reattach(
             request_generation: int,
             cause: BaseException | None = None,
+            *,
+            response: httpx.Response | None = None,
         ) -> None:
+            started = monotonic()
+            trigger = type(cause).__name__ if cause is not None else "detached_response"
             registry = self._execution_registry
             if registry is None or not registry.has_operation(self._session_id, operation_id):
+                _record_failure(
+                    cause,
+                    phase="server_reattach",
+                    request_generation=request_generation,
+                    started=started,
+                    response=response,
+                    reattach_trigger=trigger,
+                )
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
                     f"{self._session_id!r} lost its server without a reserved "
@@ -372,7 +444,15 @@ class ProxyMcpManager:
                     request_generation,
                     timeout_seconds=_SERVER_RECONNECT_WAIT_S,
                 )
-            except asyncio.TimeoutError as reconnect_exc:
+            except TimeoutError as reconnect_exc:
+                _record_failure(
+                    reconnect_exc,
+                    phase="server_reattach",
+                    request_generation=request_generation,
+                    started=started,
+                    response=response,
+                    reattach_trigger=trigger,
+                )
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
                     f"{self._session_id!r} lost its server and no replacement "
@@ -384,10 +464,14 @@ class ProxyMcpManager:
 
         while True:
             request_generation = pending_approvals.current_server_generation()
+            started = monotonic()
+            failure_phase = "transport"
+            resp: httpx.Response | None = None
             try:
                 resp = await self._omnigent_client.post(
-                    self._mcp_url,
+                    url,
                     json=payload,
+                    headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
                     # Short connect timeout still fails fast on an unreachable
                     # server; the read timeout covers ordinary proxy request
                     # hangs. Sub-agent dispatch returns an async handle
@@ -399,9 +483,22 @@ class ProxyMcpManager:
                         pool=10.0,
                     ),
                 )
+                failure_phase = "http_status"
                 resp.raise_for_status()
+                failure_phase = "response_decode"
                 data = _response_json_object(resp)
             except httpx.TransportError as exc:
+                if managed:
+                    _record_failure(
+                        exc,
+                        phase=failure_phase,
+                        request_generation=request_generation,
+                        started=started,
+                    )
+                    raise RuntimeError(
+                        "MCP gateway transport failed; completion is unknown. "
+                        "Call was not retried."
+                    ) from exc
                 await _wait_to_reattach(request_generation, exc)
                 # Reattach the new server generation to the same runner-owned
                 # operation. A fresh JSON-RPC id distinguishes this transport
@@ -410,6 +507,13 @@ class ProxyMcpManager:
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
             except Exception as exc:
+                _record_failure(
+                    exc,
+                    phase=failure_phase,
+                    request_generation=request_generation,
+                    started=started,
+                    response=resp,
+                )
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
                     f"{self._session_id!r}: {exc}"
@@ -424,7 +528,7 @@ class ProxyMcpManager:
                 code = err.get("code")
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
-                    await _wait_to_reattach(request_generation)
+                    await _wait_to_reattach(request_generation, response=resp)
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
@@ -491,7 +595,7 @@ class ProxyMcpManager:
                     "id": request_id,  # MRTR retry MUST use a different id
                     "method": "tools/call",
                     "params": {
-                        "name": tool_name,
+                        "name": wire_name,
                         "arguments": arguments,
                         MCP_OPERATION_ID_PARAM: operation_id,
                         "requestState": request_state,

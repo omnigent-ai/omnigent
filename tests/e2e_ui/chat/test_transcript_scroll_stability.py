@@ -526,17 +526,31 @@ _STREAM_PROMPT = "Tell me a long story, streamed."
 # few seconds and the view has to keep up rather than jump once.
 _STREAM_CHUNK_DELAY_S = 0.03
 
-# Per painted frame while the reply streams: how far the view sits above the
-# bottom, and the document height.
-_TRACK_BOTTOM = """
+# Measure the newest text, not the scroll extent (which includes footer spacing).
+_TRACK_NEWEST_TEXT = """
 () => {
   const el = document.querySelector('[data-pw-scroller]');
-  window.__bottomSamples = [];
+  window.__newestTextSamples = [];
   const sample = () => {
-    window.__bottomSamples.push([
+    const section = [...el.querySelectorAll('[data-testid="assistant-text-section"]')].at(-1);
+    if (!section?.textContent.startsWith('streamedword000')) return;
+    const walker = document.createTreeWalker(section, NodeFilter.SHOW_TEXT);
+    let tail = null;
+    while (walker.nextNode()) {
+      if (walker.currentNode.textContent.trim()) tail = walker.currentNode;
+    }
+    if (!tail) return;
+    const range = document.createRange();
+    const end = tail.textContent.trimEnd().length;
+    range.setStart(tail, end - 1);
+    range.setEnd(tail, end);
+    const line = range.getBoundingClientRect();
+    const viewport = el.getBoundingClientRect();
+    window.__newestTextSamples.push([
       Math.round(performance.now()),
-      Math.round(el.scrollHeight - el.clientHeight - el.scrollTop),
+      Math.max(0, line.bottom - viewport.bottom, viewport.top - line.top),
       el.scrollHeight,
+      section.textContent.length,
     ]);
   };
   const tick = () => { setTimeout(sample, 0); requestAnimationFrame(tick); };
@@ -545,7 +559,7 @@ _TRACK_BOTTOM = """
 """
 
 
-def test_streaming_reply_keeps_a_bottom_pinned_view_at_the_bottom(
+def test_streaming_reply_keeps_newest_text_visible(
     page: Page,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
@@ -568,7 +582,7 @@ def test_streaming_reply_keeps_a_bottom_pinned_view_at_the_bottom(
     expect(page.get_by_text(_NEWEST_REPLY).first).to_be_visible(timeout=30_000)
     assert page.evaluate(_TAG_SCROLLER), "transcript did not overflow; seed more turns"
     page.wait_for_timeout(500)
-    page.evaluate(_TRACK_BOTTOM)
+    page.evaluate(_TRACK_NEWEST_TEXT)
     height_before = page.evaluate(
         "() => document.querySelector('[data-pw-scroller]').scrollHeight"
     )
@@ -580,22 +594,95 @@ def test_streaming_reply_keeps_a_bottom_pinned_view_at_the_bottom(
     expect(page.get_by_text(_STREAMED_REPLY_DONE).first).to_be_visible(timeout=60_000)
     page.wait_for_timeout(1000)
 
-    samples = page.evaluate("() => window.__bottomSamples")
+    samples = page.evaluate("() => window.__newestTextSamples")
+    assert samples, "no streamed answer text was observed"
+    lengths = {sample[3] for sample in samples}
+    assert len(lengths) > 2, "the answer must render incrementally, not only at completion"
+    assert samples[-1][3] == len(reply), "the complete answer must be rendered"
     height_after = samples[-1][2]
     # The reply must actually have lengthened the transcript, or this proves nothing.
     assert height_after > height_before + 200, (height_before, height_after)
 
-    # Ends at the bottom, on the newest text.
+    # The final line is visible even if footer spacing extends below the viewport.
     assert samples[-1][1] <= 2, samples[-1]
     # And followed the reply as it grew.
     growing = [s for s in samples if s[2] > height_before]
     assert growing, samples[:3]
     # A resize may precede its scroll correction by one frame. Count only
-    # intervals bounded by two off-bottom samples; a delayed first sample
+    # intervals bounded by two clipped-text samples; a delayed first sample
     # does not establish how long the view has been behind.
     behind_ms = 0
     longest_behind_ms = 0
-    for (t0, d0, _h0), (t1, d1, _h1) in pairwise(growing):
+    for (t0, d0, _h0, _n0), (t1, d1, _h1, _n1) in pairwise(growing):
         behind_ms = behind_ms + (t1 - t0) if d0 > 8 and d1 > 8 else 0
         longest_behind_ms = max(longest_behind_ms, behind_ms)
     assert longest_behind_ms <= 100, (longest_behind_ms, [s for s in growing if s[1] > 8][:20])
+
+
+# --- Pinned at the bottom: a reply's completion keeps the reader at the end ---
+
+_CODE_PROMPT = "Explain the code, streamed."
+_CODE_REPLY_DONE = "code reply complete marker"
+_END_SLACK_PX = 24
+# Resolves once the distance has held for 20 frames; fails if it never does within 600.
+_SETTLED_DISTANCE_FROM_END_JS = """
+() => new Promise((resolve, reject) => {
+  const el = document.querySelector('[data-pw-scroller]');
+  let last = null;
+  let still = 0;
+  let frames = 0;
+  const tick = () => {
+    const distance = el.scrollHeight - el.clientHeight - el.scrollTop;
+    still = distance === last ? still + 1 : 0;
+    last = distance;
+    frames += 1;
+    if (still >= 20) resolve(distance);
+    else if (frames >= 600) reject(new Error(`distance never settled; last ${distance}px`));
+    else requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})
+"""
+
+
+def _code_reply() -> str:
+    """A Python block and a TypeScript block, sized like a long code answer."""
+    python = "\n".join(f"    value_{n} = compute({n}, factor={n * 3})" for n in range(33))
+    typescript = "\n".join(f"  const v{n} = await fetchThing({n});" for n in range(14))
+    return (
+        "Here is the implementation and its client.\n\n"
+        f"```python\ndef run():\n{python}\n    return value_0\n```\n\n"
+        f"```ts\nexport async function load() {{\n{typescript}\n}}\n```\n\n{_CODE_REPLY_DONE}"
+    )
+
+
+def test_code_reply_completion_keeps_reader_at_bottom(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """The reader at the end of a streamed reply is still at the end after it completes."""
+    base_url, session_id = seeded_session
+    _seed_turns(session_id)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _code_reply(), "stream": True, "chunk_delay": 0.02}],
+        key="turn-end-follow",
+        match=_CODE_PROMPT,
+    )
+
+    page.set_viewport_size(_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_text(_NEWEST_REPLY).first).to_be_visible(timeout=30_000)
+    assert page.evaluate(_TAG_SCROLLER), "transcript did not overflow; seed more turns"
+    page.wait_for_timeout(500)
+
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(_CODE_PROMPT)
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.get_by_text(_CODE_REPLY_DONE).first).to_be_visible(timeout=60_000)
+    expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
+
+    distance = page.evaluate(_SETTLED_DISTANCE_FROM_END_JS)
+    assert distance <= _END_SLACK_PX, f"reader left {distance}px above the end"

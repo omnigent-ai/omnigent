@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_timeout,
     read_bridge_state,
     read_certificate_failure,
+    read_child_usage_baselines,
     read_codex_config_effort,
     read_codex_config_model,
     read_codex_home_config_effort,
@@ -38,6 +40,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_policy_hook_config,
     record_app_server_stopped,
     record_certificate_failure,
+    record_child_usage_baseline,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -48,6 +51,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+from omnigent.process_logging import data_dir
 
 
 def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
@@ -74,12 +78,14 @@ def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
     assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
-def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
-    """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
+def test_codex_mcp_config_overrides_isolate_the_bridge_relay(tmp_path: Path) -> None:
+    """codex launches serve-mcp with ``-I`` and the runner's data dir.
 
     The MCP server starts in the session workspace, and without ``-I`` python puts
     that cwd on ``sys.path``, so a workspace that is an omnigent checkout supplies
-    the bridge's own package. Every other native bridge passes ``-I`` here.
+    the bridge's own package. Every other native bridge passes ``-I`` here. codex
+    also drops ``OMNIGENT_DATA_DIR`` from an MCP server's env, so the relay gets it
+    pinned to find the bridge root that holds its bridge dir.
 
     :param tmp_path: Stands in for the per-session bridge dir.
     """
@@ -93,6 +99,29 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Pat
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",
     ]
+    env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
+    raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
+    assert json.loads(raw_data_dir) == str(data_dir())
+
+
+def test_codex_mcp_config_overrides_pin_a_relative_data_dir_as_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relay starts in the session workspace, so it must get an absolute data dir.
+
+    :param tmp_path: Stands in for the host's launch directory.
+    :param monkeypatch: Sets a relative ``OMNIGENT_DATA_DIR`` and the cwd.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", "state")
+
+    overrides = codex_mcp_config_overrides(tmp_path / "bridge")
+
+    env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
+    raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
+    pinned = Path(json.loads(raw_data_dir))
+    assert pinned.is_absolute()
+    assert pinned == Path.cwd() / "state"
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
@@ -124,12 +153,119 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.cwd == str(tmp_path)
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state == state
+    assert observation.status == "ready"
+    assert observation.os_errno is None
 
     clear_active_turn_id_if_matches(tmp_path, "turn_1")
 
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+
+
+@pytest.mark.parametrize("native_turn", [None, "turn_agent", "turn_shell"])
+def test_shell_reconciliation_requires_idle_or_the_original_parent(
+    tmp_path: Path, native_turn: str | None
+) -> None:
+    """Only authoritative idle or the original model turn makes steering safe."""
+    _seed_active_turn(tmp_path, "turn_agent")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "shell_request")
+    pending = read_bridge_state(tmp_path)
+    assert pending is not None
+    for _ in range(2):
+        codex_native_bridge.reconcile_shell_command_state(tmp_path, pending, native_turn)
+        updated = read_bridge_state(tmp_path)
+        assert updated is not None
+        assert updated.active_turn_id == "turn_agent"
+        assert (updated.pending_shell_command_id is None) == (native_turn != "turn_shell")
+        assert updated.active_shell_turn_id is None
+
+
+@pytest.mark.parametrize(
+    "changed_field", ["pending_shell_command_id", "session_id", "thread_id", "socket_path"]
+)
+def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
+    tmp_path: Path, changed_field: str
+) -> None:
+    """A delayed fence response cannot change state that replaced its captured submission."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, None)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "older_request")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    newer = replace(observed, **{changed_field: "newer_value"})
+    write_bridge_state(tmp_path, newer)
+
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, None)
+
+    assert read_bridge_state(tmp_path) == newer
+
+
+def test_shell_reconciliation_never_restores_a_completed_turn(tmp_path: Path) -> None:
+    """Completion during the probe must not create a stale standalone-shell latch."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_shell")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    observed = replace(state, pending_shell_command_id="submission")
+    write_bridge_state(tmp_path, observed)
+    clear_active_turn_id_if_matches(tmp_path, "turn_shell")
+
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, "turn_shell")
+
+    current = read_bridge_state(tmp_path)
+    assert current is not None
+    assert current.active_turn_id is None
+    assert current.active_shell_turn_id is None
+    assert current.pending_shell_command_id == "submission"
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, current, None)
+    settled = read_bridge_state(tmp_path)
+    assert settled is not None and settled.pending_shell_command_id is None
+
+
+@pytest.mark.parametrize(
+    ("contents", "status"),
+    [
+        pytest.param(None, "missing", id="missing"),
+        pytest.param(b"\xff", "invalid_encoding", id="invalid-utf8"),
+        pytest.param(b"{", "invalid_json", id="invalid-json"),
+        pytest.param(b"[]", "invalid_state", id="invalid-shape"),
+        pytest.param(
+            b'{"session_id":"private-state-content"}', "invalid_state", id="missing-fields"
+        ),
+    ],
+)
+def test_invalid_bridge_state_is_unavailable_with_content_free_status(
+    tmp_path: Path, contents: bytes | None, status: str
+) -> None:
+    if contents is not None:
+        (tmp_path / "state.json").write_bytes(contents)
+
+    assert read_bridge_state(tmp_path) is None
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state is None
+    assert observation.status == status
+    assert observation.os_errno == (errno.ENOENT if contents is None else None)
+    assert "private-state-content" not in str(observation)
+
+
+def test_bridge_state_rejects_non_file_without_reading_it(tmp_path: Path) -> None:
+    (tmp_path / "state.json").mkdir()
+
+    assert read_bridge_state(tmp_path) is None
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state is None
+    assert observation.status == "not_file"
+    assert observation.os_errno is None
+    assert str(tmp_path) not in str(observation)
 
 
 @pytest.fixture
@@ -504,6 +640,32 @@ def test_clear_active_turn_id_if_matches(
     # The cleared/preserved active turn id also governs steering: a turn
     # wrongly cleared here means later web messages stop steering it.
     assert state.active_turn_id == expected_active_after
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "next_turn_id"),
+    [(None, None), ("turn_a", "turn_a"), (None, "turn_a"), ("turn_a", "turn_b"), ("turn_a", None)],
+)
+def test_active_turn_update_requires_storage_only_when_state_changes(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_turn_id: str | None,
+    next_turn_id: str | None,
+) -> None:
+    _seed_active_turn(bridge_dir, active_turn_id)
+    before = read_bridge_state(bridge_dir)
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(codex_native_bridge.tempfile, "mkstemp", disk_full)
+    if active_turn_id == next_turn_id:
+        update_active_turn_id(bridge_dir, next_turn_id)
+    else:
+        with pytest.raises(OSError) as raised:
+            update_active_turn_id(bridge_dir, next_turn_id)
+        assert raised.value.errno == errno.ENOSPC
+    assert read_bridge_state(bridge_dir) == before
 
 
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:
@@ -943,6 +1105,45 @@ def test_clear_bridge_state_removes_mcp_startup(bridge_dir: Path) -> None:
     assert read_mcp_startup(bridge_dir) == {}
 
 
+@pytest.mark.parametrize(
+    ("patched_owner", "patched_name"),
+    [(Path, "open"), (codex_native_bridge.tempfile, "mkstemp")],
+    ids=["read-fails", "write-fails"],
+)
+def test_child_usage_baseline_storage_failure_keeps_recorded_baselines(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    patched_owner: object,
+    patched_name: str,
+) -> None:
+    """
+    A failed read or write while recording one child keeps the others' baselines
+    and is logged, so a restarted forwarder still subtracts their inherited usage.
+    """
+    record_child_usage_baseline(bridge_dir, "thread_forked", (5000, 4000, 100))
+    record_child_usage_baseline(bridge_dir, "thread_fresh", (0, 0, 0))
+
+    def storage_error(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EIO, "Input/output error")
+
+    with (
+        monkeypatch.context() as patch,
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.bridge"),
+    ):
+        patch.setattr(patched_owner, patched_name, storage_error)
+        record_child_usage_baseline(bridge_dir, "thread_new", (300, 0, 30))
+
+    assert read_child_usage_baselines(bridge_dir) == {
+        "thread_forked": (5000, 4000, 100),
+        "thread_fresh": (0, 0, 0),
+    }
+    assert any(
+        "Could not record inherited Codex child usage" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
 
 
@@ -1155,6 +1356,138 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def _make_unmarked_bridge(root: Path, *, inactive_since: float) -> tuple[Path, Path]:
+    """Create a pre-marker bridge dir whose every entry was last written at *inactive_since*."""
+    bridge_dir = root / ("a" * 32)
+    rollout = (
+        bridge_dir
+        / "codex-home"
+        / "sessions"
+        / "2026"
+        / "08"
+        / "30"
+        / "rollout-2026-08-30T00-00-00-thread.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    (bridge_dir / "bridge.json").write_text("secret", encoding="utf-8")
+    for path in (rollout, bridge_dir / "bridge.json", bridge_dir / "codex-home", bridge_dir):
+        os.utime(path, (inactive_since, inactive_since))
+    return bridge_dir, rollout
+
+
+def test_prune_orphaned_bridge_dirs_removes_expired_unmarked_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-marker bridge inactive for 7 days is removed instead of kept forever."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    bridge_dir, _rollout = _make_unmarked_bridge(root, inactive_since=expired_at)
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 1
+    assert not bridge_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_keeps_unmarked_bridge_with_recent_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recent top-level file or rollout keeps an otherwise old unmarked bridge."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    bridge_dir, rollout = _make_unmarked_bridge(root, inactive_since=expired_at)
+
+    relay = bridge_dir / "tool_relay.json"
+    relay.write_text("{}", encoding="utf-8")
+    os.utime(relay, (now - 60, now - 60))
+    os.utime(bridge_dir, (expired_at, expired_at))
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert bridge_dir.exists()
+
+    os.utime(relay, (expired_at, expired_at))
+    os.utime(rollout, (now - 60, now - 60))
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert bridge_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_keeps_unmarked_non_bridge_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old unmarked dirs not named like a bridge digest, e.g. process-owners, stay."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    process_owners = root / "process-owners"
+    process_owners.mkdir()
+    os.utime(process_owners, (expired_at, expired_at))
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert process_owners.exists()
+
+
+def test_prune_keeps_expired_standalone_launch_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old launch state under a session digest survives while its bridge lives elsewhere."""
+    from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
+
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(root))
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+
+    session_id = "0123456789abcdef0123456789abcdef"
+    write_launch_state(session_id, str(tmp_path))
+    (state_dir,) = root.iterdir()
+    for path in (state_dir / "launch.json", state_dir):
+        os.utime(path, (expired_at, expired_at))
+    live_bridge = codex_native_bridge.prepare_bridge_dir("random-bridge-id")
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert live_bridge.exists()
+    launch_state = read_launch_state(session_id)
+    assert launch_state is not None
+    assert launch_state.working_directory == str(tmp_path)
+
+
+def test_prune_removes_expired_unmarked_bridge_that_also_holds_launch_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Launch state alongside old bridge files does not pin the whole bridge."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    bridge_dir, _rollout = _make_unmarked_bridge(root, inactive_since=expired_at)
+    launch = bridge_dir / "launch.json"
+    launch.write_text('{"working_directory": "/tmp"}', encoding="utf-8")
+    for path in (launch, bridge_dir):
+        os.utime(path, (expired_at, expired_at))
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 1
+    assert not bridge_dir.exists()
 
 
 def test_mirror_applied_codex_settings_records_failed_writes_until_the_config_changes(

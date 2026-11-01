@@ -274,6 +274,67 @@ async def test_tool_call_allow_when_no_matching_policy(
     # No policies → ALLOW (the default engine result).
     assert body["result"] == "POLICY_ACTION_ALLOW"
     assert "reason" not in body
+    # The allow cache is opt-in: no window unless the operator configures one.
+    assert "allow_cache_seconds" not in body
+
+
+def _patch_allow_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    resolver: Any,
+    default_policies: list[FunctionPolicySpec] | None = None,
+) -> None:
+    """Install *resolver* as the caps' native hook allow-cache window."""
+    patched_caps = RuntimeCaps(
+        execution_timeout=get_caps().execution_timeout,
+        default_policies=default_policies or [],
+        native_hook_allow_cache_seconds=resolver,
+    )
+    monkeypatch.setattr("omnigent.server.routes.sessions.get_caps", lambda: patched_caps)
+
+
+async def test_no_policy_allow_carries_configured_cache_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no policies, ALLOW tells the runner how long it may reuse the answer."""
+    _patch_allow_cache(monkeypatch, lambda: 30.0)
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 30.0}
+
+
+async def test_engine_allow_never_carries_cache_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ALLOW decided by real policies must not let the runner skip later calls.
+
+    Read is allowed by the deny-Bash policy, but a cached ALLOW would let the
+    next Bash call through without evaluation.
+    """
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    _patch_allow_cache(monkeypatch, lambda: 30.0, default_policies=[deny_bash_policy])
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert "allow_cache_seconds" not in body
 
 
 async def test_tool_call_deny_with_default_policy(
@@ -740,6 +801,59 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
     )
 
 
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
+    client: httpx.AsyncClient,
+    tool_name: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        )
+    )
+    try:
+        # The built-in scheduled-task gate must fire even with no custom policies.
+        elicitation_id = await asyncio.wait_for(drain, timeout=5)
+        assert not evaluate.done()
+        response = await client.post(
+            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            json={"action": "accept"},
+        )
+        assert response.status_code == 202, response.text
+        response = await asyncio.wait_for(evaluate, timeout=5)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+    finally:
+        for task in (drain, evaluate):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(drain, evaluate, return_exceptions=True)
+
+
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_scheduled_task_delete"])
+async def test_schedule_read_and_removal_do_not_require_new_approval(
+    client: httpx.AsyncClient,
+    tool_name: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    # A regression that gates these tools would park the request; fail fast instead.
+    response = await asyncio.wait_for(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        ),
+        timeout=5,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
 async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1004,7 +1118,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         elif entries == 2:
             second_in_gate.set()
         if result.state_updates:
-            engine.apply_state_updates(result.state_updates)
+            engine.apply_state_updates(result.state_updates, approved=True)
         return True
 
     monkeypatch.setattr(sessions_routes, "_hold_native_ask_gate", _controllable_gate)
@@ -1033,7 +1147,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
     try:
         await asyncio.wait_for(second_in_gate.wait(), timeout=1.0)
         second_entered = True
-    except asyncio.TimeoutError:
+    except TimeoutError:
         second_entered = False
     assert not second_entered, (
         "A second concurrent cost ask entered the gate while the first was "
@@ -1458,7 +1572,7 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
                             "allow_all": {
                                 "type": "function",
                                 "on": ["tool_call"],
-                                "function": "tests.runtime.policies.conftest._always_allow",
+                                "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
                             }
                         }
                     },
@@ -1523,7 +1637,7 @@ async def test_authenticated_evaluate_route_sql_budget(
     payload = {
         "event": {
             "type": "PHASE_TOOL_CALL",
-            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+            "data": {"name": "echo", "arguments": {}},
         }
     }
     # Warm the spec / policy / ACL caches so the count is the steady-state one.

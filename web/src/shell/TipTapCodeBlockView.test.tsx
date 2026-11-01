@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NodeViewProps } from "@tiptap/react";
 import { TipTapCodeBlockView } from "./TipTapCodeBlockView";
 import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
+import { CODE_BLOCK_LANGUAGES } from "./codeBlockLanguages";
 
 vi.mock("@tiptap/react", () => ({
   NodeViewWrapper: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
@@ -75,6 +76,7 @@ describe("TipTapCodeBlockView", () => {
     // The flag is what lets the change persist even though the picker blurs the
     // editor before the update fires.
     const { tr, dispatch } = renderView({ language: "python" });
+    fireEvent.focus(screen.getByRole("combobox"));
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "mermaid" } });
     expect(tr.setNodeAttribute).toHaveBeenCalledWith(0, "language", "mermaid");
     expect(tr.setMeta).toHaveBeenCalledWith(CODE_BLOCK_LANGUAGE_EDIT_META, true);
@@ -83,6 +85,7 @@ describe("TipTapCodeBlockView", () => {
 
   it("maps the empty selection back to a null language", () => {
     const { tr } = renderView({ language: "python" });
+    fireEvent.focus(screen.getByRole("combobox"));
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "" } });
     expect(tr.setNodeAttribute).toHaveBeenCalledWith(0, "language", null);
   });
@@ -103,4 +106,18 @@ describe("TipTapCodeBlockView", () => {
     renderView({ language: "mermaid", textContent: "graph TD", editable: false });
     expect(screen.getByRole("combobox")).toBeDisabled();
   });
+
+  it.each(["pointerEnter", "pointerDown", "focus"] as const)(
+    "populates the native menu on %s without changing the document",
+    (event) => {
+      const { dispatch } = renderView({ language: "python" });
+      const picker = screen.getByRole("combobox");
+      expect(screen.getAllByRole("option")).toHaveLength(1);
+      expect(picker).toHaveValue("python");
+      fireEvent[event](picker);
+      expect(screen.getAllByRole("option")).toHaveLength(CODE_BLOCK_LANGUAGES.length);
+      expect(picker).toHaveValue("python");
+      expect(dispatch).not.toHaveBeenCalled();
+    },
+  );
 });

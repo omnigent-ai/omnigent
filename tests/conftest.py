@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,20 @@ except ImportError:
 # deliberately replaces ambient state; subprocesses inherit the safe override.
 _TEST_OMNIGENT_DATA_DIR = Path(tempfile.mkdtemp(prefix="omnigent-pytest-")).resolve()
 os.environ["OMNIGENT_DATA_DIR"] = str(_TEST_OMNIGENT_DATA_DIR)
+# Servers and runners booted by tests otherwise sweep the developer's live
+# harness root. Prefer /tmp for the AF_UNIX path-length limit; some sandboxes
+# only allow the default temp dir.
+try:
+    _TEST_HARNESS_TMP_PARENT = Path(tempfile.mkdtemp(prefix="omni-h-", dir="/tmp"))
+except OSError:
+    _TEST_HARNESS_TMP_PARENT = Path(tempfile.mkdtemp(prefix="omni-h-"))
+os.environ["OMNIGENT_HARNESS_TMP_PARENT"] = str(_TEST_HARNESS_TMP_PARENT)
+
+# Tests and their subprocesses must not ship logs through the caller's sink.
+# Sink tests configure their own credentials or sender explicitly.
+for _test_env_name in tuple(os.environ):
+    if _test_env_name.startswith("OMNIGENT_DEBUG_LOG_"):
+        os.environ.pop(_test_env_name)
 
 # Skip the synchronous api.litellm.ai/model_catalog HTTP fallback during
 # tests. Hardened CI runners can't reach the public internet, so every
@@ -144,6 +159,7 @@ def pytest_unconfigure(config: pytest.Config) -> None:
     for cmdline in survivors:
         print(f"\nUNREAPED omnigent process survived SIGKILL: {cmdline}", file=sys.stderr)
     shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
+    shutil.rmtree(_TEST_HARNESS_TMP_PARENT, ignore_errors=True)
 
 
 # Per-worker progress logger: fsync'd START/END lines so a
@@ -295,6 +311,32 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(autouse=True)
+def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests off the network: the host's workspace probe answers "unknown".
+
+    Any CLI path that starts or checks a host daemon on a server URL probes
+    that server. Tests that need an answer patch the probe themselves.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.host.daemon_lifecycle.probe_workspace_id", lambda url, **_kwargs: None
+    )
+
+
+@pytest.fixture
+def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a runner stall from tripping the RRULE search's elapsed-time limit.
+
+    Searches then end only on the deterministic work budget. Tests of the time
+    limit patch this clock themselves, which overrides the frozen one.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", lambda: 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     """
     Clear smart routing's per-session runner-catalog cache after every test.
@@ -313,6 +355,28 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     module = sys.modules.get("omnigent.server.smart_routing")
     if module is not None:
         module._runner_catalog_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_databricks_auth_memory() -> None:
+    """
+    Start every test without shared Databricks token sources or remembered profiles.
+
+    Both are meant to outlive a single client: the token sources are
+    process-global and keyed by server URL, which tests reuse, and the
+    remembered profiles live in the shared test data dir. Either would let one
+    test's resolution answer another's. The reset runs before the test, not
+    at teardown, where a test's ``Path.unlink`` patch can still be active.
+
+    :returns: None.
+    """
+    chat = sys.modules.get("omnigent.chat")
+    if chat is not None:
+        chat._databricks_auth_cache.clear()
+    executor = sys.modules.get("omnigent.inner.databricks_executor")
+    if executor is not None:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(_TEST_OMNIGENT_DATA_DIR / executor._REMEMBERED_PROFILES_FILE)
 
 
 @pytest.fixture(autouse=True)
@@ -377,6 +441,26 @@ def _isolate_codex_native_state(
     """
     state_dir = tmp_path_factory.mktemp("codex-native-state")
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
+
+
+@pytest.fixture(autouse=True)
+def _no_configured_codex_app_server_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[], tuple[str, ...]]:
+    """
+    Run Codex directly unless a test configures an app-server wrapper.
+
+    The wrapper is read from the user's ``~/.omnigent/config.yaml``, so without
+    this every native Codex session launch would depend on the machine.
+
+    :param monkeypatch: Fixture used to stub the config read.
+    :returns: The real config reader, for a test that exercises it.
+    """
+    from omnigent.harnesses.codex_native import app_server
+
+    real = app_server._configured_app_server_command
+    monkeypatch.setattr(app_server, "_configured_app_server_command", lambda: ())
+    return real
 
 
 @pytest.fixture()
@@ -456,6 +540,47 @@ def _stub_untracked_cache_start(
     if "untracked_cache_start" in request.fixturenames:
         return
     monkeypatch.setattr(GitFilesystemRegistry, "start", lambda self: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_origin_identity(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep debug-log workspace attribution off the network and out of later tests.
+
+    Host startup and CLI server resolution probe a workspace-hosted server once
+    when nothing records its workspace id. Unstubbed, that probe would consume a
+    response a test scripted into a patched ``httpx.get`` (or hit the real host),
+    and the published env would carry into later tests. The probe's own tests
+    request ``origin_identity_probe``.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the env and probe
+        at teardown.
+    :returns: None.
+    """
+    from omnigent import debug_logging
+
+    monkeypatch.delenv(debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR, raising=False)
+    monkeypatch.setattr(debug_logging, "_probed_workspace_ids", {})
+    if "origin_identity_probe" in request.fixturenames:
+        return
+    monkeypatch.setattr(debug_logging, "_probe_workspace_id", lambda api_base: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_databricks_org_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register the org pin with monkeypatch so direct os.environ writes are undone."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR
+
+    monkeypatch.setenv(PINNED_DATABRICKS_ORG_ENV_VAR, "")
+    monkeypatch.delenv(PINNED_DATABRICKS_ORG_ENV_VAR)
+
+
+@pytest.fixture
+def origin_identity_probe() -> None:
+    """Opt in to the real workspace-id probe (see ``_isolate_origin_identity``)."""
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -16,6 +16,15 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+
+/* CSS-pixel floor, independent of viewport width and pointer capability. */
+@utility mobile-touch-target {
+  &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
 
 @theme inline {
   --font-heading: var(--font-sans);
@@ -82,6 +91,8 @@
   --color-secondary: var(--secondary);
   --color-primary-foreground: var(--primary-foreground);
   --color-primary: var(--primary);
+  --color-primary-cta-foreground: var(--primary-cta-foreground);
+  --color-primary-cta: var(--primary-cta);
   --color-link: var(--link);
   --color-popover-foreground: var(--popover-foreground);
   --color-popover: var(--popover);
@@ -158,6 +169,9 @@
   --onboarding-modal-shadow: 0 24px 80px 8px #00000012;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 12%);
   --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
+  --composer-header-bg: color-mix(in srgb, var(--background) 94%, black);
+  --primary-cta: #11171c;
+  --primary-cta-foreground: #fff;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -262,6 +276,27 @@
 }
 
 .dark {
+  --app-shell-bg: var(--background);
+  --session-composer-mask-bg: var(--app-shell-bg);
+  --foreground-tertiary: rgb(245 245 244 / 24%);
+  --sidebar-surface-image:
+    linear-gradient(transparent 35%, rgb(255 255 255 / 6%)),
+    linear-gradient(135deg, rgb(255 255 255 / 4%), transparent 60%);
+  --composer-header-bg: color-mix(in srgb, var(--app-shell-bg) 97%, white);
+  --composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white);
+  --primary-cta: #e8ecf0;
+  --primary-cta-foreground: #11171c;
+  --menu-surface-bg: var(--composer-surface-bg);
+  --card-surface-bg: color-mix(
+    in srgb,
+    color-mix(in srgb, var(--card) 95%, white) 75%,
+    transparent
+  );
+  --menu-surface-border: rgb(255 255 255 / 8%);
+  --menu-surface-backdrop-filter: blur(24px) saturate(120%);
+  --segmented-active-bg: rgb(255 255 255 / 12%);
+  --segmented-inactive-bg: transparent;
+  --segmented-trough-bg: rgb(255 255 255 / 6%);
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 0 0 0;
   --onboarding-wizard-background: #131315;
@@ -457,40 +492,39 @@
 
 .composer-reference-surface {
   border-color: color(srgb 0.129412 0 0.0509804 / 0.1);
-  background-color: rgba(255, 255, 255, 0.8);
+  background-color: color-mix(in srgb, white 80%, var(--background));
   background-image: none;
 }
 
 .dark .composer-reference-surface {
   border-width: 0.5px;
   border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--composer-surface-bg);
 }
 
-/* --background is the opaque palette canvas; flatten tints over it to mask the stack. */
-.composer-workspace-surface {
-  background:
-    linear-gradient(
-      color-mix(in oklch, var(--muted) 70%, transparent),
-      color-mix(in oklch, var(--muted) 70%, transparent)
-    ),
-    var(--background);
+.composer-context-bar {
+  position: relative;
+  z-index: 20;
+  width: calc(100% - 24px);
+  margin-inline: 12px;
+  margin-bottom: -0.5px;
+  padding: 6px 8px;
+  background-color: var(--composer-header-bg);
+  border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
+  border-bottom: none;
+  border-radius: 16px 16px 0 0;
 }
 
-/* Preserve the translucent dark tray while matching the mock's single warm
-   surface across queued rows and workspace metadata in light themes. */
+.composer-context-bar.rounded-t-none {
+  border-top-width: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+/* Queued rows and workspace metadata form one continuous composer surface. */
 .composer-queued-surface {
-  background-color: color-mix(in oklab, var(--tray) 40%, transparent);
-}
-
-:root:not(.dark) .composer-workspace-surface,
-:root:not(.dark) .composer-queued-surface {
-  background:
-    linear-gradient(
-      color-mix(in oklch, var(--muted) 85%, transparent),
-      color-mix(in oklch, var(--muted) 85%, transparent)
-    ),
-    var(--background);
+  background-color: var(--composer-header-bg);
+  background-image: none;
 }
 
 .composer-subagent-surface {
@@ -512,6 +546,11 @@
     color-mix(in oklch, var(--brand-accent) 8%, transparent),
     transparent 70%
   );
+}
+
+/* Only the active grid pane keeps the glow. */
+[data-grid-session][data-active="false"] .side-chat-backdrop {
+  background: none;
 }
 
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
@@ -580,6 +619,31 @@
   transition: none;
 }
 
+.session-header-glass {
+  isolation: isolate;
+}
+
+.session-header-glass::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 -12px;
+  background: linear-gradient(135deg, rgb(255 255 255 / 48%), rgb(255 255 255 / 22%));
+  -webkit-backdrop-filter: blur(28px) saturate(145%);
+  backdrop-filter: blur(28px) saturate(145%);
+  -webkit-mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+  mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+  pointer-events: none;
+  content: "";
+}
+
+.dark .session-header-glass::before {
+  background: linear-gradient(
+    135deg,
+    rgb(255 255 255 / 6%),
+    color-mix(in srgb, var(--app-shell-bg) 42%, transparent) 60%
+  );
+}
+
 @starting-style {
   .workspace-panel-motion[data-state="open"][data-animate-visibility] {
     width: 0 !important;
@@ -590,15 +654,36 @@
 
 /* The transparent <main> shows the palette canvas through. */
 .app-shell {
-  background: var(--background);
+  background: var(--shell-background, var(--background));
+}
+
+:root:not(.dark) .conversations-sidebar {
+  background: var(--sidebar-background, var(--sidebar));
+}
+
+.dark .app-shell {
+  --sidebar-edge-border: color-mix(in srgb, var(--foreground) 4%, transparent);
+
+  background-color: var(--app-shell-bg) !important;
+  background-image: url("./assets/omnigent-center-glow.svg") !important;
+  background-position: right center;
+  background-repeat: no-repeat;
+  background-size: calc(100% - var(--app-sidebar-width, 0px)) 100%;
+}
+
+.dark .omnigent-native-sidebar-surface,
+.dark .omnigent-sidebar-panel {
+  background-color: var(--sidebar);
+  background-image: var(--sidebar-surface-image);
+  background-position: 0 0;
+  background-size: auto;
+  background-clip: padding-box;
 }
 
 /* A desktop peek floats over the chat instead of pushing it aside, so its
- * gradient layers need an opaque base rather than the translucent card color. */
-:root:not(.dark):not([data-theme]) .conversations-sidebar.is-peek,
-:root:not(.dark)[data-theme] .conversations-sidebar.is-peek,
-.dark:not([data-theme]) .conversations-sidebar.is-peek,
-.dark[data-theme] .conversations-sidebar.is-peek {
+ * gradient needs an opaque base rather than a translucent palette color. */
+:root:not([data-theme]) .conversations-sidebar.is-peek,
+:root[data-theme] .conversations-sidebar.is-peek {
   background-color: var(--card-solid);
 }
 
@@ -608,42 +693,38 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
 }
 .dark .conversations-sidebar {
-  border-right: 1px solid rgb(255 255 255 / 2%);
+  border-right: 1px solid var(--sidebar-edge-border);
   box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
 }
 
-/* Below md the sidebar is a full-screen overlay ON TOP of the chat, so it has
- * to be opaque — the rules above set `background` as a shorthand, which resets
- * background-color and would otherwise let the conversation show through the
- * translucent layers. Restores what Sidebar.tsx's max-md:bg-card-solid does on
- * desktop. Above md the sidebar pushes content aside instead of covering it,
- * so it keeps its translucent canvas there. */
+.dark .workspace-panel-motion {
+  --workspace-panel-border: rgb(255 255 255 / 8%);
+
+  border-left-color: var(--workspace-panel-border);
+}
+
+.dark .workspace-panel-motion .workspace-tab-strip {
+  border-bottom-color: var(--workspace-panel-border);
+}
+
+.dark .workspace-panel-motion .workspace-panel-header-divider {
+  border-color: var(--workspace-panel-border);
+}
+
+/* Below md the sidebar is a full-screen overlay on top of the chat, so every
+ * palette and mode needs an opaque base. */
 @media (width < 48rem) {
-  :root:not(.dark):not([data-theme]) .conversations-sidebar,
-  :root:not(.dark)[data-theme] .conversations-sidebar,
-  .dark:not([data-theme]) .conversations-sidebar,
-  .dark[data-theme] .conversations-sidebar {
+  :root:not([data-theme]) .conversations-sidebar,
+  :root[data-theme] .conversations-sidebar {
     background-color: var(--card-solid);
   }
 }
 
-/* Fade scrolling content before it reaches the transparent header or composer.
- * Both ramps are 32px; the header's control band occupies the first 48px. */
+/* Let conversation content scroll behind the glass header, then fade it into
+ * the composer at the bottom. */
 .chat-scroll-fade {
-  mask-image: linear-gradient(
-    to bottom,
-    transparent 48px,
-    black 80px,
-    black calc(100% - 32px),
-    transparent 100%
-  );
-  -webkit-mask-image: linear-gradient(
-    to bottom,
-    transparent 48px,
-    black 80px,
-    black calc(100% - 32px),
-    transparent 100%
-  );
+  mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
 /* A pinned plan already clears the header, so only fade into the composer. */
@@ -653,9 +734,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 }
 
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
- * Must land BELOW the fade above: the mask is fully opaque only from 80px,
- * so a smaller margin parks the row in the transparent band — scrolled
- * "to the top" yet invisible. Kept next to the fade so they can't desync. */
+ * Keep it below the overlaid glass header after programmatic navigation. */
 .turn-fold-row {
   scroll-margin-top: 88px;
 }
@@ -681,11 +760,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   );
 }
 
-/* Elevated surfaces — frosted glass effect with backdrop blur.
- * Targets top-level cards only. A bg-card nested inside another bg-card
- * (e.g. FilesPanel inside the workspace panel, toolbars inside the
- * composer) is an interior fill, and re-decorating it with its own
- * border/shadow visually carves the parent card into pieces.
+/* Elevated surfaces — one palette-aware frosted treatment for every bg-card.
  * :not([data-collapsed]) skips closed rails/drawers/sidebars: they
  * collapse to w-0 with their utility borders removed, but this rule's
  * border+shadow would still paint them as a thin glowing strip along the
@@ -697,23 +772,15 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
  * Both rails (Workspace, Conversations) are excluded — they paint their own
  * canvas layers above, not a glass card. */
 .dark
-  :is(.bg-card, [class*="md:bg-card"]):not(
-    :is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])
-  ):not([data-collapsed]):not([aria-label="Workspace"]):not([aria-label="Conversations"]) {
+  :is(.bg-card, [class*="md:bg-card"]):not([data-collapsed]):not([aria-label="Workspace"]):not(
+    [aria-label="Conversations"]
+  ) {
   /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
    * build) collapses the pair and keeps only the last declaration. */
-  -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
-  backdrop-filter: blur(32px) saturate(180%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-top-color: rgba(255, 255, 255, 0.14);
-  background-image: linear-gradient(
-    135deg,
-    rgba(255, 255, 255, 0.04) 0%,
-    rgba(255, 255, 255, 0) 60%
-  );
-  box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.22),
-    0 1px 3px rgba(0, 0, 0, 0.16);
+  -webkit-backdrop-filter: var(--menu-surface-backdrop-filter) !important;
+  backdrop-filter: var(--menu-surface-backdrop-filter) !important;
+  background-color: var(--card-surface-bg);
+  border: 1px solid var(--menu-surface-border);
 }
 
 /* Side panels (FileViewer, TerminalsPanel, FilesPanelDrawer) manage their own
@@ -739,6 +806,14 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   background: transparent !important;
 }
 
+/* The workspace rail owns the panel edge. Its full-height tab surfaces must
+ * not pick up a second border from the shared bg-card treatment. */
+.dark
+  aside[aria-label="Workspace"]
+  :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+  border: none !important;
+}
+
 /* When maximized the workspace panel covers the full content area; use an
  * opaque background so the chat underneath doesn't bleed through. */
 aside[aria-label="Workspace"][data-maximized] {
@@ -752,18 +827,34 @@ aside[aria-label="Workspace"][data-maximized] {
 
 /* Popovers/menus — same glass treatment */
 .dark [data-slot="popover-content"],
-.dark [data-slot="select-content"],
-.dark [role="menu"],
-.dark [data-radix-popper-content-wrapper] > * {
+.dark [data-slot="select-content"]:not(.menu-surface),
+.dark [role="menu"]:not(.menu-surface),
+.dark [data-radix-popper-content-wrapper] > :not(.menu-surface) {
   /* -webkit- before unprefixed — see comment on the bg-card rule above. */
   -webkit-backdrop-filter: blur(24px) saturate(150%) !important;
   backdrop-filter: blur(24px) saturate(150%) !important;
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-/* macOS Electron needs room for traffic lights and a window drag surface.
- * Mark <html> standalone, or .omnigent-app in the embed: its CSS build maps
- * html selectors to that scope root. */
+:root:not(.dark) .menu-surface {
+  background-color: #fff;
+  border: 1px solid rgb(0 0 0 / 8%);
+}
+
+.dark .menu-surface {
+  background-color: var(--menu-surface-bg);
+  border: 1px solid var(--menu-surface-border);
+  -webkit-backdrop-filter: var(--menu-surface-backdrop-filter);
+  backdrop-filter: var(--menu-surface-backdrop-filter);
+}
+
+/* Native clearance uses window pixels, independent of rem and page zoom.
+ * The preload supplies zoom; older shells fall back to 100%.
+ * The embed build maps html selectors onto the .omnigent-app scope root. */
+html[data-electron-mac] {
+  --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
+  --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
+}
 @media (min-width: 48rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
   .app-shell:not([data-sidebar-open]) .canvas-page-heading {
@@ -802,7 +893,7 @@ aside[aria-label="Workspace"][data-maximized] {
   /* Reserve the full drag strip so the session list starts below the
    * window furniture and stays outside the drag region. */
   html[data-electron-mac] .sidebar-header-row {
-    height: 3rem;
+    height: var(--mac-titlebar-height);
     padding: 0;
   }
   /* The chat header's own open-sidebar button is redundant here: the title-bar
@@ -813,42 +904,41 @@ aside[aria-label="Workspace"][data-maximized] {
   html[data-electron-mac] .chat-header-sidebar-toggle {
     display: none;
   }
-  /* Float the peek card below the 3rem drag strip, with the same 0.5rem
+  /* Float the peek card below the 48px drag strip, with the same 0.5rem
    * breathing room as its other edges. The docked sidebar is unaffected. */
   html[data-electron-mac] .conversations-sidebar.is-peek {
-    top: 3.5rem;
+    top: calc(var(--mac-titlebar-height) + 0.5rem);
   }
   /* The peek card already clears the drag strip, so it needs no reserved
    * header row above its content. */
   html[data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
     display: none;
   }
-  /* The settings sidebar swaps the header row for a "Back" row, which would now
-   * sit under the traffic lights. Push it below them — it has no cluster to
-   * align beside the lights, so it clears them vertically instead. */
-  html[data-electron-mac] .settings-sidebar-header {
-    padding-top: 3.5rem;
-  }
+}
+/* The settings sidebar's "Back" row, docked or in the phone drawer, has no
+ * cluster to align beside the lights, so it clears them vertically instead. */
+html[data-electron-mac] .settings-sidebar-header {
+  padding-top: calc(var(--mac-titlebar-height) + 0.5rem);
 }
 /* Match the full desktop header; controls opt out of dragging below. */
 html[data-electron-mac] .electron-drag-strip {
   position: absolute;
   inset: 0 0 auto 0;
-  height: 3rem;
+  height: var(--mac-titlebar-height);
   -webkit-app-region: drag;
 }
 /* Canvas clears the native title bar, including focus
  * and compact conversation states where the board is hidden. */
-[data-electron-mac] .canvas-workspace {
-  margin-top: 3rem;
+html[data-electron-mac] .canvas-workspace {
+  margin-top: var(--mac-titlebar-height);
 }
-/* Pin the cluster beside the lights independently of the sidebar. The top
- * inset centers 1.5rem buttons in the 3rem bar; visually reorder the toggle
- * without changing the Search → Settings → toggle tab order. */
+/* Align to the native lights at y=24px, regardless of the host rem size.
+ * Keep the cluster independent of sidebar open, collapsed, and peek states. */
 html[data-electron-mac] .electron-sidebar-header-actions {
   position: absolute;
-  top: 0.75rem;
-  left: 5.5rem;
+  top: calc(var(--mac-titlebar-height) / 2);
+  left: var(--mac-traffic-light-width);
+  transform: translateY(-50%);
   /* Above the sidebar, which is a positioned sibling at z-index 50 with an
    * opaque gradient background — at any lower layer it paints straight over
    * this cluster (the buttons still measure correctly in the DOM, which is why
@@ -864,32 +954,29 @@ html[data-electron-mac] .electron-sidebar-header-actions {
     order: -1;
   }
 }
-/* With the sidebar closed the chat header's left slot reaches the window
- * corner where the traffic lights float and the title-bar cluster
- * (Search/Settings/toggle) sits. Pad the slot past both (same 10.5rem the
- * maximized rail uses below) so the conversation breadcrumb starts to the
- * right of the Settings cog — it then truncates within the header flex and
- * never collides with the right-hand action cluster. Applied to the slot, not
- * the header bar, so that right cluster stays put. */
+/* Clear the fixed native-control area plus the font-relative action cluster
+ * when the collapsed sidebar exposes the chat header at the window edge. */
 html[data-electron-mac] .traffic-light-clearance {
-  padding-left: 10.5rem;
+  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
 }
-/* A maximized workspace rail breaks out to inset-0 (the left sidebar collapses
- * on entry), so its tab strip starts at the window's top-left corner — where
- * the traffic lights float (0–5rem) and the title-bar cluster sits (5rem–10rem,
- * z above the rail). Pad the strip past both so its leftmost tab icon clears
- * them. Only the maximized rail reaches this corner; the docked rail sits right
- * of the sidebar and is untouched.
- *
- * Skip the clearance when the sidebar is reopened over a maximized rail: the
- * sidebar (z above the rail) then covers the window corner, so the lights and
- * cluster sit over IT, not the strip — the strip starts right of the sidebar
- * with nothing to clear, and the padding would shove the tabs into the middle. */
+/* A maximized rail reaches the same window corner while the sidebar is closed.
+ * Once the sidebar opens, the rail starts to its right and needs no clearance. */
 html[data-electron-mac]
   .app-shell:not([data-sidebar-open])
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
-  padding-left: 10.5rem;
+  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+}
+/* Below md the phone header and drawer carry their own controls, so drop the
+ * title-bar cluster and start those headers right of the lights. */
+@media (width < 48rem) {
+  html[data-electron-mac] .electron-sidebar-header-actions {
+    display: none;
+  }
+  html[data-electron-mac] .traffic-light-clearance,
+  html[data-electron-mac] .sidebar-header-row {
+    padding-left: var(--mac-traffic-light-width);
+  }
 }
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
  * Scoped from <html> to cover portals outside AppShell on macOS only. */
@@ -1346,6 +1433,15 @@ html[data-electron-mac] .breadcrumb-folder {
   --diffs-font-features: "liga" 0, "calt" 0;
 }
 
+/* Share one opaque comment surface so diff selection cannot tint the cards. */
+.pull-request-comment-surface {
+  background-color: var(--card-solid);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--muted) 20%, transparent),
+    color-mix(in srgb, var(--muted) 20%, transparent)
+  );
+}
+
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
  * hide the native one so both don't show. */
 .transcript-hide-native-scrollbar {
@@ -1356,9 +1452,8 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* The virtualized transcript holds its own read position across history
- * prepends and in-flow changes above the list (Transcript.tsx). Its rows are
- * absolutely positioned, so native anchoring can't see them and would only
- * double-count the in-flow part. */
+ * prepends, row re-measures and changes above the list (Transcript.tsx), so
+ * native anchoring would double-count each of them. */
 [data-virtualized-transcript] {
   overflow-anchor: none;
 }
@@ -1853,14 +1948,16 @@ html[data-electron-mac] .breadcrumb-folder {
  * static-state declarations (class specificity beats * for those visible
  * properties); this universal rule collapses every other transition-* and
  * animate-* timer so users who request reduced motion don't see any
- * sweeping change we forgot to scope. */
+ * sweeping change we forgot to scope. Transitions get 0s, not a tiny
+ * duration: `transition-property` defaults to `all`, so any nonzero duration
+ * lands every style change on every element a frame late. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    transition-duration: 0s !important;
     scroll-behavior: auto !important;
   }
 }
@@ -2192,11 +2289,18 @@ html[data-electron-mac] .breadcrumb-folder {
 .tiptap-md-content .ProseMirror a {
   color: var(--primary);
   text-decoration: underline;
+  cursor: pointer;
 }
 .tiptap-md-content .ProseMirror hr {
   border: none;
   border-top: 1px solid var(--border);
   margin: 1.5em 0;
+}
+/* Soft line breaks (TipTapSoftBreak.ts) hold a hard-wrapped paragraph's source
+   newlines; their collapsible space reads as a word gap instead of the line
+   break ProseMirror's break-spaces would draw. */
+.tiptap-md-content .ProseMirror .md-soft-break {
+  white-space: normal;
 }
 /* Raw-HTML passthrough blocks (TipTapHtmlPassthrough.ts). Hidden blocks
    (comments, bare wrapper tags) keep the bytes without visual presence;
@@ -2210,6 +2314,18 @@ html[data-electron-mac] .breadcrumb-folder {
   color: var(--muted-foreground);
   font-weight: 500;
   margin: 0.75em 0 0.25em;
+}
+/* Footnote definitions show their source, read-only (see TipTapFootnotes). */
+.tiptap-md-content .ProseMirror .md-footnote-definitions,
+.tiptap-md-content .ProseMirror .md-link-definitions {
+  color: var(--muted-foreground);
+  font-size: 0.875em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0.75em 0;
+}
+.tiptap-md-content .ProseMirror .md-footnote-reference {
+  color: var(--muted-foreground);
 }
 /* GitHub-style images: never overflow the editor column. Explicit <img
    width/height> are applied as inline styles by the node view (see
@@ -2315,12 +2431,16 @@ html[data-electron-mac] .breadcrumb-folder {
 @media (min-width: 48rem) {
   :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
-    background: var(--custom-light-sidebar);
+    background-color: var(--custom-light-sidebar);
+    background-image: none;
+    -webkit-backdrop-filter: blur(20px) saturate(1.12);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   .dark[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
-    background: var(--custom-dark-sidebar);
+    background-color: var(--sidebar);
+    background-image: var(--sidebar-surface-image);
+    -webkit-backdrop-filter: blur(20px) saturate(1.12);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   :root[data-theme="custom"][data-custom-translucent-sidebar]
@@ -2392,6 +2512,9 @@ html[data-electron-mac] .breadcrumb-folder {
 .turn-fold-row-enter {
   display: grid;
   grid-template-rows: 0fr;
+}
+/* Starts with the trace's collapse (the fold closes a frame after it mounts). */
+[data-state="closed"] > .turn-fold-row-enter {
   animation: turn-fold-row-in 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 .turn-fold-row-enter > * {
@@ -2399,9 +2522,12 @@ html[data-electron-mac] .breadcrumb-folder {
   overflow: hidden;
 }
 @media (prefers-reduced-motion: reduce) {
-  .turn-fold-row-enter {
+  [data-state="closed"] > .turn-fold-row-enter {
     grid-template-rows: 1fr;
     animation: none;
+  }
+  [data-state="closed"] > .turn-fold-row-enter > * {
+    overflow: visible;
   }
 }
 

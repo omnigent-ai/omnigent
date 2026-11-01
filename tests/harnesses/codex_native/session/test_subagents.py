@@ -14,7 +14,12 @@ import pytest
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
+    read_bridge_state,
     write_bridge_state,
+)
+from tests.harnesses.codex_native.forwarder._support import (
+    _posted_cumulative_tokens,
+    _usage_event,
 )
 from tests.harnesses.codex_native.session._support import (
     _elicitation_tracker,
@@ -369,15 +374,43 @@ def test_forwarder_dedupes_replay_and_live_child_item(
 def test_forwarder_registers_subagent_activity_before_child_events(
     tmp_path: Path,
     activity_method: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A native spawn activity creates the child before its events arrive."""
+    workspace = tmp_path / "read-only-workspace"
+    workspace.mkdir(mode=0o555)
+    monkeypatch.chdir(workspace)
+    parent_state = CodexNativeBridgeState(
+        session_id="conv_parent",
+        socket_path=str(tmp_path / "app-server.sock"),
+        thread_id="thread_parent",
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id="turn_parent",
+    )
+    write_bridge_state(tmp_path, parent_state)
     posted: list[tuple[str, dict[str, Any]]] = []
     codex_client = _PerThreadFakeCodexClient(
         thread_responses={"thread_child": _child_resume_response(text="backfilled child output")}
     )
     codex_client.events = [
         _subagent_activity_started_event(method=activity_method),
+        {
+            "method": "turn/started",
+            "params": {"threadId": "thread_child", "turn": {"id": "turn_child"}},
+        },
         _child_agent_message_event(item_id="child_live", text="live child output"),
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "thread_child", "turn": {"id": "turn_child"}},
+        },
+        {
+            "method": "turn/started",
+            "params": {"threadId": "thread_child", "turn": {"id": "turn_followup"}},
+        },
+        {
+            "method": "turn/failed",
+            "params": {"threadId": "thread_child", "turn": {"id": "turn_followup"}},
+        },
     ]
 
     async def run() -> None:
@@ -401,6 +434,81 @@ def test_forwarder_registers_subagent_activity_before_child_events(
     assert [post["data"]["item_data"]["content"][0]["text"] for post in child_posts] == [
         "backfilled child output",
         "live child output",
+    ]
+    statuses = [
+        body["data"]["status"]
+        for path, body in posted
+        if path == "/v1/sessions/conv_child/events"
+        and body.get("type") == "external_session_status"
+    ]
+    assert statuses == ["running", "idle", "running", "failed"]
+    assert read_bridge_state(tmp_path) == parent_state
+    assert list(workspace.iterdir()) == []
+
+
+def test_forwarder_child_usage_excludes_inherited_totals_across_restart(
+    tmp_path: Path,
+) -> None:
+    """A forked child posts only its own usage, including after a forwarder restart.
+
+    Codex 0.149 seeds a forked child with the parent's totals and repeats them in
+    the child's later frames. A restarted forwarder never sees the seed, so it
+    must reuse the inherited totals recorded in the bridge directory.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+
+    async def run(events: list[dict[str, Any]]) -> None:
+        codex_client = _PerThreadFakeCodexClient(
+            thread_responses={"thread_child": _child_resume_response()}
+        )
+        codex_client.events = events
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_parent",
+            client=codex_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        )
+
+    asyncio.run(
+        run(
+            [
+                _usage_event("thread_parent", (2500, 1000, 110), (1500, 1000, 10)),
+                _collab_item_started_event(),
+                _usage_event(
+                    "thread_child", (2500, 1000, 110), (1500, 1000, 10), "turn_thread_parent"
+                ),
+                _usage_event("thread_parent", (4500, 2000, 160), (2000, 1000, 50)),
+                _usage_event("thread_child", (2800, 1000, 140), (300, 0, 30)),
+            ]
+        )
+    )
+    # The restarted forwarder re-registers the child, as an interrupted-turn
+    # replay does, and the resumed child reports its full Codex totals again.
+    asyncio.run(
+        run(
+            [
+                _usage_event("thread_parent", (4500, 2000, 160), (2000, 1000, 50)),
+                _collab_item_completed_event(),
+                _usage_event("thread_child", (2800, 1000, 140), (300, 0, 30)),
+                _usage_event("thread_child", (3500, 1300, 180), (700, 300, 40)),
+            ]
+        )
+    )
+
+    assert _posted_cumulative_tokens(posted, "conv_child") == [
+        (0, 0, 0),
+        (300, 0, 30),
+        (300, 0, 30),
+        (1000, 300, 70),
+    ]
+    assert _posted_cumulative_tokens(posted, "conv_parent") == [
+        (2500, 1000, 110),
+        (4500, 2000, 160),
+        (4500, 2000, 160),
     ]
 
 

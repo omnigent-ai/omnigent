@@ -358,7 +358,8 @@ def test_record_to_row_shape_and_coercions() -> None:
     }
 
 
-def test_record_to_row_redacts_token_like_text_fields() -> None:
+@pytest.mark.parametrize("captured_stack", [False, True])
+def test_record_to_row_redacts_token_like_text_fields(captured_stack: bool) -> None:
     secret = "aB3" + "xY7" * 12
     try:
         raise ValueError(f"credential={secret}")
@@ -376,6 +377,9 @@ def test_record_to_row_redacts_token_like_text_fields() -> None:
             func="do_it",
         )
     record.attributes = {"upstream_response": secret, "attempt": 3}
+    if captured_stack:
+        record.exc_info = None
+        record.captured_stack_trace = f'File "{secret}.py", line 1, in blocking_call'
 
     row = dl.record_to_row(record, source="runner")
 
@@ -386,6 +390,9 @@ def test_record_to_row_redacts_token_like_text_fields() -> None:
     assert secret not in attributes["upstream_response"]
     assert attributes["attempt"] == "3"
     assert "[REDACTED]" in str(row)
+    if captured_stack:
+        assert "blocking_call" in str(row["stack_trace"])
+        assert "[REDACTED]" in str(row["stack_trace"])
 
 
 def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1033,6 +1040,93 @@ def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatc
 def test_process_identity_unset_is_none() -> None:
     # OSS / local: nothing set anywhere.
     assert dl._process_identity() == (None, None)
+
+
+_HOSTED_API = "https://example.databricks.com/api/2.0/omnigent"
+
+
+@pytest.fixture
+def _data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    return tmp_path
+
+
+def _fail_get(url: str, **kwargs: object) -> httpx.Response:
+    raise AssertionError(f"unexpected probe of {url}")
+
+
+def test_publish_origin_identity_probes_without_changing_auth_state(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unauthenticated header can attribute logs but cannot update login state.
+    from omnigent.cli_auth import load_databricks_org_id
+
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        calls.append(url)
+        return httpx.Response(401, headers={"x-databricks-org-id": "123456"})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert dl.publish_origin_identity(_HOSTED_API) == "123456"
+    assert calls == [f"{_HOSTED_API}/v1/me"]
+    assert dl._process_identity()[0] == "123456"
+    assert load_databricks_org_id(_HOSTED_API) is None
+    assert not (_data_dir / "auth_tokens.json").exists()
+
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity(_HOSTED_API) == "123456"
+
+
+def test_publish_origin_identity_prefers_url_selector(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity(f"{_HOSTED_API}?o=123") == "123"
+    assert dl._process_identity()[0] == "123"
+
+
+def test_publish_origin_identity_skips_non_workspace_servers(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity("http://127.0.0.1:6767") is None
+    assert dl.publish_origin_identity("https://omnigents-1.aws.databricksapps.com") is None
+    assert dl._process_identity() == (None, None)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(401),
+        httpx.Response(401, headers={"x-databricks-org-id": "not-an-id"}),
+    ],
+)
+def test_publish_origin_identity_ignores_missing_or_malformed_header(
+    _data_dir: Path,
+    origin_identity_probe: None,
+    monkeypatch: pytest.MonkeyPatch,
+    response: httpx.Response,
+) -> None:
+    monkeypatch.setattr(httpx, "get", lambda url, **kwargs: response)
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert dl._process_identity()[0] is None
+
+
+def test_publish_origin_identity_probes_unreachable_server_once(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def unreachable(url: str, **kwargs: object) -> httpx.Response:
+        calls.append(url)
+        raise httpx.ConnectError("unreachable")
+
+    monkeypatch.setattr(httpx, "get", unreachable)
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert len(calls) == 1
 
 
 def test_record_to_row_prefers_record_workspace_id(monkeypatch: pytest.MonkeyPatch) -> None:

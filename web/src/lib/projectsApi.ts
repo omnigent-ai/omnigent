@@ -11,6 +11,7 @@
 // (`id`, `name`), so no boundary conversion is needed.
 
 import { authenticatedFetch } from "./identity";
+import { apiErrorFromResponse } from "./sessionsApi";
 
 /**
  * Default session settings a project stores, pre-filled into the new-chat
@@ -50,6 +51,12 @@ export interface ProjectConfig {
    * the harness's own configured default.
    */
   model?: string;
+  /**
+   * Default reasoning effort for new sessions with the default agent (e.g.
+   * `"high"`), from that harness's ladder; Codex validates it against the
+   * model's ladder. Unset = the harness's own configured effort.
+   */
+  effort?: string;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */
@@ -89,7 +96,7 @@ export async function listProjects(): Promise<Project[]> {
 /** Fetch a single project (including its `config`) by id. 404s if not owned. */
 export async function getProject(id: string): Promise<Project> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`);
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 

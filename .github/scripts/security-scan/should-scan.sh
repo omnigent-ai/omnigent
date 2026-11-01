@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Decides whether a PR's diff should be put through the Security Scan.
-# Called by .github/workflows/security-gate.yml.
+# Called by security-gate.yml for CI access and security-scan.yml for scanning.
 #
 # We scan UNTRUSTED authors and skip trusted ones. "Trusted" is GitHub's
 # native author_association: OWNER / MEMBER / COLLABORATOR -- people with a
@@ -45,7 +45,9 @@
 #                               optional -- used only to trust private-membership
 #                               maintainer AUTHORS, not for the label waiver)
 #          GH_TOKEN, REPO, PR  (for the label lookup + author check)
-# Out:     `scan=true|false` and `reason=<text>` on $GITHUB_OUTPUT.
+#          PR_AUTHOR_TYPE, PR_HEAD_REPO, REPO (GitHub event identity)
+#          CI_ACCESS_ONLY      (true only for the compatibility CI gate)
+# Out:     `scan=true|false`, `dependabot=true|false`, and `reason` on $GITHUB_OUTPUT.
 
 set -euo pipefail
 
@@ -84,6 +86,28 @@ case "${EVENT_NAME:-}" in
     exit 0
     ;;
 esac
+
+# Dependabot CI access does not waive the merge-blocking diff scan. Require
+# GitHub's bot type and same-repository head, including when association is trusted.
+if [[ "${PR_AUTHOR:-}" == 'dependabot[bot]' ]]; then
+  if has_skip_label; then
+    echo "dependabot=false" >> "$GITHUB_OUTPUT"
+    emit false "'$SKIP_LABEL' waiver (label requires a Triage+ collaborator to apply)"
+    exit 0
+  fi
+  if [[ "${PR_AUTHOR_TYPE:-}" == 'Bot' && -n "${REPO:-}" && "${PR_HEAD_REPO:-}" == "$REPO" ]]; then
+    echo "dependabot=true" >> "$GITHUB_OUTPUT"
+    if [[ "${CI_ACCESS_ONLY:-false}" == 'true' ]]; then
+      emit false "verified same-repository Dependabot; validate action pins before CI"
+    else
+      emit true "verified Dependabot still requires Security Scan"
+    fi
+  else
+    echo "dependabot=false" >> "$GITHUB_OUTPUT"
+    emit true "unverified Dependabot identity or fork; requires Security Scan"
+  fi
+  exit 0
+fi
 
 # Author is a known maintainer? `author_association` only reports MEMBER when
 # the org membership is PUBLIC, so a maintainer with private membership shows up

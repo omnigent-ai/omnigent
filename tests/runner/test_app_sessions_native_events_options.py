@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -124,11 +127,13 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError])
 async def test_events_effort_change_on_native_session_returns_503_when_bridge_not_ready(
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
 ) -> None:
     """
-    Bridge-not-ready RuntimeError surfaces as 503 from /events.
+    A bridge-not-ready RuntimeError or a tmux OSError surfaces as 503 from /events.
 
     Sister to the happy-path test. Pins that the failure mode of the
     native effort dispatch (tmux pane gone / bridge dir not yet
@@ -145,10 +150,11 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s
-        raise RuntimeError("tmux target is not advertised")
+        raise error_type("tmux target is not advertised")
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -422,6 +428,7 @@ async def test_events_compact_on_native_session_types_slash_command(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Record the call (including auto_confirm) without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, auto_confirm))
@@ -493,11 +500,51 @@ async def test_events_compact_on_native_session_types_slash_command(
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_native_session_returns_503_when_bridge_not_ready(
+async def test_events_clear_on_claude_native_types_clear_into_the_tui(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Bridge-not-ready RuntimeError surfaces as 503 from /events.
+    POST ``/events`` with ``{"type":"clear"}`` on a claude-native session types
+    Claude Code's own ``/clear`` into the pane and returns 200.
+
+    Claude Code's /clear hook rotates the terminal onto a fresh Omnigent
+    session, so the web /clear must run inside Claude Code.
+    """
+    captured: list[str] = []
+
+    def _fake_inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        """Record the typed command without touching tmux."""
+        captured.append(command)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "0d1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            "/v1/sessions/0d1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a/events",
+            json={"type": "clear"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert captured == ["/clear"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError])
+async def test_events_compact_on_native_session_returns_503_when_bridge_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    """
+    A bridge-not-ready RuntimeError or a tmux OSError surfaces as 503 from /events.
 
     Sister to the happy-path test. When the tmux pane isn't attached
     there is no live Claude to compact, so the native compact handler
@@ -513,10 +560,11 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s, auto_confirm
-        raise RuntimeError("tmux target is not advertised")
+        raise error_type("tmux target is not advertised")
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -658,6 +706,54 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
     )
     # /compact is a control signal, not a state change.
     assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_codex_native_types_clear_into_the_tui(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"clear"}`` on a codex-native session types
+    Codex's own ``/clear`` into its tmux pane and returns 200.
+
+    Codex's /clear starts a fresh thread in the same terminal; the forwarder
+    then rotates the Omnigent session, so the web /clear must run inside Codex.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    tmux_calls: list[tuple[str, list[str]]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        """Record tmux send-keys calls without touching tmux."""
+        tmux_calls.append((socket_path, list(args)))
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+
+    conv_id = "5b6a0c3d0f1e4a7b8c9d0e1f2a3b4c5d"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=terminal_registry
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, resp.text
+    socket = str(instance.socket_path)
+    assert tmux_calls == [
+        (socket, ["send-keys", "-t", "main", "C-u"]),
+        (socket, ["send-keys", "-l", "-t", "main", "/clear"]),
+        (socket, ["send-keys", "-t", "main", "Enter"]),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1190,55 +1286,20 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
 
 
 class _FakeOpenCodeCompactClient:
-    """OpenCode client stub recording ``summarize`` calls for compact tests.
+    """OpenCode client stub recording ``compact`` calls."""
 
-    Stands in for :class:`omnigent.harnesses.opencode_native.client.OpenCodeClient` so
-    the opencode-native compact handler's model-resolution + ``/summarize``
-    call is observable without a live ``opencode serve``.
-    """
-
-    def __init__(
-        self,
-        *,
-        session: Any,
-        messages: list[dict[str, Any]],
-        summarize_error: BaseException | None = None,
-    ) -> None:
-        """
-        Initialize with the session/messages the handler will resolve from.
-
-        :param session: The :class:`OpenCodeSession` ``get_session`` returns
-            (or ``None``).
-        :param messages: The list ``list_messages`` returns.
-        :param summarize_error: When set, ``summarize`` raises it instead of
-            recording the call (drives the 503 path).
-        :returns: None.
-        """
-        self._session = session
-        self._messages = messages
-        self._summarize_error = summarize_error
-        self.summarize_calls: list[tuple[str, str, str]] = []
+    def __init__(self, *, compact_error: BaseException | None = None) -> None:
+        self._compact_error = compact_error
+        self.compact_calls: list[str] = []
         self.closed = False
 
-    async def get_session(self, session_id: str) -> Any:
-        """Return the scripted session."""
-        del session_id
-        return self._session
-
-    async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
-        """Return the scripted messages."""
-        del session_id
-        return self._messages
-
-    async def summarize(self, session_id: str, *, provider_id: str, model_id: str) -> bool:
-        """Record the compaction call (or raise the scripted error)."""
-        if self._summarize_error is not None:
-            raise self._summarize_error
-        self.summarize_calls.append((session_id, provider_id, model_id))
-        return True
+    async def compact(self, session_id: str) -> dict[str, Any]:
+        if self._compact_error is not None:
+            raise self._compact_error
+        self.compact_calls.append(session_id)
+        return {"id": "msg_compaction", "type": "compaction"}
 
     async def aclose(self) -> None:
-        """Mark the client closed (the handler always closes in ``finally``)."""
         self.closed = True
 
 
@@ -1246,11 +1307,9 @@ class _FakeOpenCodeCompactServer:
     """``OpenCodeNativeServer`` stub whose ``client()`` returns a fixed stub."""
 
     def __init__(self, client: _FakeOpenCodeCompactClient) -> None:
-        """Wrap *client* so :meth:`client` returns it."""
         self._client = client
 
     def client(self, *, directory: str | None = None) -> _FakeOpenCodeCompactClient:
-        """Return the fixed compact client."""
         del directory
         return self._client
 
@@ -1260,71 +1319,37 @@ async def _drive_opencode_native_compact(
     tmp_path: Path,
     *,
     conv_id: str,
-    session_payload: dict[str, Any] | None,
-    messages: list[dict[str, Any]],
-    model_override: str | None,
-    summarize_error: BaseException | None = None,
+    compact_error: BaseException | None = None,
+    with_server: bool = True,
 ) -> tuple[httpx.Response, _FakeOpenCodeCompactClient]:
-    """
-    Build an opencode-native runner app and POST a ``compact`` control event.
-
-    Registers a pre-built opencode terminal so session creation skips the real
-    ``_auto_create_opencode_terminal`` launch, injects a live fake server into
-    ``_AUTO_OPENCODE_SERVERS``, and stubs ``read_bridge_state`` so the handler
-    resolves an ``opencode_session_id`` (+ optional ``model_override``).
-
-    :param conv_id: Conversation id to create and compact.
-    :param session_payload: Payload for the :class:`OpenCodeSession`
-        ``get_session`` returns, or ``None`` for no session.
-    :param messages: Messages ``list_messages`` returns.
-    :param model_override: Bridge-state ``model_override`` (qualified
-        ``provider/model``), or ``None``.
-    :param summarize_error: When set, ``summarize`` raises it (503 path).
-    :returns: ``(response, fake_client)`` for the compact POST.
-    """
+    """Create an opencode-native session and POST a ``compact`` control event."""
     from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
     from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _AUTO_OPENCODE_SERVERS, _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
-    opencode_native_spec = _harness_spec("opencode-native")
+    spec = _harness_spec("opencode-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the opencode-native spec for any agent_id."""
         del agent_id, session_id
-        return opencode_native_spec
+        return spec
 
-    # A pre-registered opencode terminal makes the create path's auto-launch a
-    # no-op (the per-session ensure-lock sees a live terminal and skips it).
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("opencode", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("opencode", "main")] = instance
-
-    session = (
-        OpenCodeSession.from_payload(session_payload) if session_payload is not None else None
-    )
-    client = _FakeOpenCodeCompactClient(
-        session=session, messages=messages, summarize_error=summarize_error
-    )
-    server = _FakeOpenCodeCompactServer(client)
-
+    client = _FakeOpenCodeCompactClient(compact_error=compact_error)
     state = OpenCodeNativeBridgeState(
         session_id=conv_id,
         server_base_url="http://127.0.0.1:1",
         opencode_session_id="ses_x",
-        model_override=model_override,
     )
     monkeypatch.setattr(opencode_native_bridge, "read_bridge_state", lambda _dir: state)
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
         terminal_registry=terminal_registry,
     )
-
     try:
         async with _runner_client(app) as http_client:
             create_resp = await http_client.post(
@@ -1333,11 +1358,10 @@ async def _drive_opencode_native_compact(
             )
             assert create_resp.status_code == 201, create_resp.text
             _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            # Inject AFTER create so the create flow's cleanup cannot evict it.
-            _AUTO_OPENCODE_SERVERS[conv_id] = server
+            if with_server:
+                _AUTO_OPENCODE_SERVERS[conv_id] = _FakeOpenCodeCompactServer(client)
             resp = await http_client.post(
-                f"/v1/sessions/{conv_id}/events",
-                json={"type": "compact"},
+                f"/v1/sessions/{conv_id}/events", json={"type": "compact"}
             )
         return resp, client
     finally:
@@ -1345,263 +1369,153 @@ async def _drive_opencode_native_compact(
         _session_event_queues_ref.pop(conv_id, None)
 
 
-def test_resolve_opencode_compact_model_prefers_latest_assistant_message() -> None:
-    """
-    The latest assistant message's live model wins over session/override.
-
-    On a MESSAGE the model keys are ``providerID`` + ``modelID``. The chain
-    must iterate in reverse and ignore user-role messages, picking the live
-    model even when a session ``model`` and a ``model_override`` also resolve.
-    """
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
-    from omnigent.runner.app import _resolve_opencode_compact_model
-
-    session = OpenCodeSession.from_payload(
-        {"id": "ses_x", "model": {"providerID": "stale", "id": "stale-model"}}
-    )
-    messages = [
-        {"info": {"role": "user"}, "parts": []},
-        {"info": {"role": "assistant", "providerID": "openai", "modelID": "gpt-old"}, "parts": []},
-        {"info": {"role": "user"}, "parts": []},
-        {
-            "info": {
-                "role": "assistant",
-                "providerID": "anthropic",
-                "modelID": "claude-sonnet-4-5",
-            },
-            "parts": [],
-        },
-    ]
-
-    provider_id, model_id = _resolve_opencode_compact_model(
-        session, messages, "override-prov/override-model"
-    )
-
-    assert (provider_id, model_id) == ("anthropic", "claude-sonnet-4-5")
-
-
-def test_resolve_opencode_compact_model_falls_back_to_session_model() -> None:
-    """
-    With no usable assistant message, the session ``model`` field resolves.
-
-    On the SESSION object the keys are ``providerID`` + ``id`` (NOT
-    ``modelID``). An assistant message missing ``modelID`` must be skipped so
-    the session field is used.
-    """
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
-    from omnigent.runner.app import _resolve_opencode_compact_model
-
-    session = OpenCodeSession.from_payload(
-        {"id": "ses_x", "model": {"providerID": "anthropic", "id": "claude-opus-4"}}
-    )
-    # Assistant message without a modelID is not usable → fall through.
-    messages = [{"info": {"role": "assistant", "providerID": "anthropic"}, "parts": []}]
-
-    provider_id, model_id = _resolve_opencode_compact_model(session, messages, None)
-
-    assert (provider_id, model_id) == ("anthropic", "claude-opus-4")
-
-
-def test_resolve_opencode_compact_model_falls_back_to_model_override() -> None:
-    """
-    With no message/session model, ``model_override`` splits on the first ``/``.
-
-    A model id may itself contain ``/`` (e.g. an OpenRouter slug), so only the
-    FIRST separator delimits provider from model.
-    """
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
-    from omnigent.runner.app import _resolve_opencode_compact_model
-
-    session = OpenCodeSession.from_payload({"id": "ses_x"})
-
-    provider_id, model_id = _resolve_opencode_compact_model(
-        session, [], "openrouter/anthropic/claude-3.5"
-    )
-
-    assert (provider_id, model_id) == ("openrouter", "anthropic/claude-3.5")
-
-
-def test_resolve_opencode_compact_model_returns_none_when_unresolvable() -> None:
-    """
-    Nothing resolvable → ``(None, None)`` so the handler 204s to AP-side.
-
-    Covers the live Omnigent flow: the session is created without a model and
-    has no assistant turn yet, and no override is set.
-    """
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
-    from omnigent.runner.app import _resolve_opencode_compact_model
-
-    session = OpenCodeSession.from_payload({"id": "ses_x"})
-
-    assert _resolve_opencode_compact_model(session, [], None) == (None, None)
-    # A bare token without ``/`` is not a qualified override.
-    assert _resolve_opencode_compact_model(None, [], "not-qualified") == (None, None)
-
-
 @pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_summarizes_from_assistant_message(
+async def test_events_compact_on_opencode_native_calls_compact(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    opencode-native compact resolves the live model and calls ``/summarize``.
+    """opencode-native compact calls ``POST /compact`` with no model and returns 200.
 
-    The model comes from the latest assistant message (``providerID`` +
-    ``modelID``) because Omnigent creates the session without a model. A 200
-    return is load-bearing: the Omnigent server reads it to skip its AP-side
-    compaction (the native ``/summarize`` path was previously dead, always
-    204ing because ``session.raw["model"]`` is empty).
+    The 200 is load-bearing: the Omnigent server reads it to skip its own
+    compaction for this session.
     """
     resp, client = await _drive_opencode_native_compact(
-        monkeypatch,
-        tmp_path,
-        conv_id="f67241520c2101c4de5f81b976467bad",
-        session_payload={"id": "ses_x"},
-        messages=[
-            {
-                "info": {
-                    "role": "assistant",
-                    "providerID": "anthropic",
-                    "modelID": "claude-sonnet-4-5",
-                },
-                "parts": [],
-            }
-        ],
-        model_override=None,
+        monkeypatch, tmp_path, conv_id="f67241520c2101c4de5f81b976467bad"
     )
-
-    assert resp.status_code == 200, (
-        f"opencode-native compact must 200 once /summarize is accepted; "
-        f"got {resp.status_code}: {resp.text}"
-    )
-    assert client.summarize_calls == [("ses_x", "anthropic", "claude-sonnet-4-5")], (
-        f"summarize must run with the assistant message's model; got {client.summarize_calls!r}."
-    )
-    assert client.closed, "the handler must close the client in its finally block."
+    assert resp.status_code == 200, resp.text
+    assert client.compact_calls == ["ses_x"]
+    assert client.closed
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_summarizes_from_session_model(
+async def test_events_compact_on_opencode_native_503_when_compact_raises(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    With no assistant message, the session ``model`` field drives ``/summarize``.
-
-    Covers create-with-model / TUI ``switchModel`` sessions: the SESSION keys
-    are ``providerID`` + ``id``.
-    """
-    resp, client = await _drive_opencode_native_compact(
-        monkeypatch,
-        tmp_path,
-        conv_id="7b333fd1a0e1c32b3961f98930f41bf3",
-        session_payload={
-            "id": "ses_x",
-            "model": {"providerID": "anthropic", "id": "claude-opus-4"},
-        },
-        messages=[],
-        model_override=None,
-    )
-
-    assert resp.status_code == 200, f"got {resp.status_code}: {resp.text}"
-    assert client.summarize_calls == [("ses_x", "anthropic", "claude-opus-4")], (
-        f"summarize must run with the session model; got {client.summarize_calls!r}."
-    )
-
-
-@pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_summarizes_from_model_override(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """
-    With no message/session model, bridge-state ``model_override`` resolves it.
-
-    The override is a qualified ``provider/model`` string split on the first
-    ``/``.
-    """
-    resp, client = await _drive_opencode_native_compact(
-        monkeypatch,
-        tmp_path,
-        conv_id="e45977bad8d13b2fdc00eb2bbdae2bd7",
-        session_payload={"id": "ses_x"},
-        messages=[],
-        model_override="openai/gpt-5",
-    )
-
-    assert resp.status_code == 200, f"got {resp.status_code}: {resp.text}"
-    assert client.summarize_calls == [("ses_x", "openai", "gpt-5")], (
-        f"summarize must run with the override model; got {client.summarize_calls!r}."
-    )
-
-
-@pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_503_when_model_unresolvable(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """
-    No resolvable model → 503 and ``/summarize`` is never called.
-
-    Without a model the compaction has nowhere to go; 503 tells the caller
-    to switch the model first.
-    """
-    resp, client = await _drive_opencode_native_compact(
-        monkeypatch,
-        tmp_path,
-        conv_id="90c89e7e5e9131aa4bb062fd427927ae",
-        session_payload={"id": "ses_x"},
-        messages=[],
-        model_override=None,
-    )
-
-    assert resp.status_code == 503, (
-        f"opencode-native compact must 503 when no model resolves; "
-        f"got {resp.status_code}: {resp.text}"
-    )
-    assert client.summarize_calls == [], (
-        f"summarize must NOT run when no model resolves; got {client.summarize_calls!r}."
-    )
-
-
-@pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_503_when_summarize_raises(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """
-    A failing ``/summarize`` surfaces 503 with the opencode error code.
-
-    The Omnigent server must see the failure (rather than a silent fallback)
-    so it does not run a duplicate compaction.
-    """
+    """A failing ``/compact`` surfaces 503 so the server does not double-compact."""
     from omnigent.harnesses.opencode_native.client import OpenCodeClientError
 
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
         tmp_path,
         conv_id="309c268a432cb4dbda4e8c15585578ee",
-        session_payload={"id": "ses_x"},
-        messages=[
-            {
-                "info": {
-                    "role": "assistant",
-                    "providerID": "anthropic",
-                    "modelID": "claude-sonnet-4-5",
-                },
-                "parts": [],
-            }
-        ],
-        model_override=None,
-        summarize_error=OpenCodeClientError("summarize failed: 500"),
+        compact_error=OpenCodeClientError("compact failed: 409"),
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json().get("error") == "opencode_native_compact_failed"
+    assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_opencode_native_503_when_not_active(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no live server the compact reports 503 and never calls OpenCode."""
+    resp, client = await _drive_opencode_native_compact(
+        monkeypatch,
+        tmp_path,
+        conv_id="90c89e7e5e9131aa4bb062fd427927ae",
+        with_server=False,
+    )
+    assert resp.status_code == 503, resp.text
+    assert client.compact_calls == []
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_opencode_native_relaunches_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``/clear`` relaunches OpenCode without resuming, forking, or seeding."""
+    from omnigent.runner import native_controls
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "4f1c2b7e9d0a4c55b1e7a3c9d2f60a18"
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
     )
 
-    assert resp.status_code == 503, (
-        f"opencode-native compact must 503 on a failed /summarize; "
-        f"got {resp.status_code}: {resp.text}"
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_auto_create(*args: Any, **kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(native_controls, "_auto_create_opencode_terminal", _fake_auto_create)
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("opencode", "main")] = instance
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
     )
-    assert resp.json().get("error") == "opencode_native_compact_failed"
-    assert client.closed, "the handler must close the client even on failure."
+    async with _runner_client(app) as http_client:
+        create_resp = await http_client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_1"}
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await http_client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 1
+    assert calls[0]["fresh"] is True
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_opencode_native_waits_for_an_idle_reap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``/clear`` relaunches OpenCode only after a reap holding the terminal lock finishes.
+
+    The relaunch reuses the session's tool relay before it registers the new pane;
+    interleaved with a reap, the reap would close the relay the new pane uses.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = f"conv_{uuid.uuid4().hex[:12]}"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation[conv_id] = {("opencode", "main"): instance}
+    relaunches: list[str] = []
+
+    async def _record_relaunch(session_id: str, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        relaunches.append(session_id)
+
+    monkeypatch.setattr(native_controls, "_auto_create_opencode_terminal", _record_relaunch)
+    app, _pm = await _build_app_for_spec(
+        _harness_spec("opencode-native"), terminal_registry=terminal_registry
+    )
+    async with _runner_client(app) as http_client:
+        create_resp = await http_client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        lock = app.state.native_terminal_ensure_locks["opencode"].setdefault(
+            conv_id, asyncio.Lock()
+        )
+        async with lock:
+            clear = asyncio.create_task(
+                http_client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+            )
+            await asyncio.sleep(0.2)
+            assert not relaunches, "/clear relaunched OpenCode while the lock was held"
+        resp = await clear
+        assert resp.status_code == 200, resp.text
+        assert relaunches == [conv_id]
 
 
 @pytest.mark.asyncio
@@ -1797,6 +1711,7 @@ async def test_events_model_change_on_native_session_types_slash_command(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, confirm_hint))
@@ -1875,6 +1790,9 @@ async def _post_model_change_with_status_sequence(
     picker_source: str = "bridge",
     empty_session_catalog: bool = False,
     stored_catalog_rows: list[dict[str, object]] | None = None,
+    pane_idle_after_polls: int | None = None,
+    model_env: dict[str, str] | None = None,
+    expected_command: str | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -1895,15 +1813,20 @@ async def _post_model_change_with_status_sequence(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
-        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         commands.append(command)
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
     monkeypatch.setattr(
         claude_native_bridge,
         "read_model_env",
-        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+        lambda _bridge_dir: (
+            {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"}
+            if model_env is None
+            else model_env
+        ),
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
@@ -1937,7 +1860,11 @@ async def _post_model_change_with_status_sequence(
     monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
     # No tmux behind these tests: the in-loop dialog check must not spend a
     # real 1 s tmux-info wait per poll.
-    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", lambda _b, *, hint: False)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "confirm_dialog_if_open",
+        lambda _b, *, hint: False,
+    )
     monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.3)
     monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
 
@@ -1953,6 +1880,17 @@ async def _post_model_change_with_status_sequence(
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
+    if pane_idle_after_polls is not None:
+        polls = 0
+
+        def _turn_settles(_bridge_dir: Any, *, hint: str) -> bool:
+            nonlocal polls
+            polls += 1
+            if polls >= pane_idle_after_polls:
+                app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = "idle"
+            return False
+
+        monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", _turn_settles)
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
@@ -1974,7 +1912,7 @@ async def _post_model_change_with_status_sequence(
             json={"type": "model_change", "model": model},
         )
     switch_rejected = empty_session_catalog or stored_catalog_rows == []
-    assert commands == ([] if switch_rejected else [f"/model {model}"])
+    assert commands == ([] if switch_rejected else [expected_command or f"/model {model}"])
     return response
 
 
@@ -1993,6 +1931,90 @@ async def test_events_model_change_confirms_against_the_status_file(
         ["claude-opus-4-6", "claude-opus-4-6", "claude-opus-4-7"],
     )
     assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.parametrize(
+    ("selected_model", "pin_model", "status_model", "status_code"),
+    [
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7[1m]", 204),
+        (
+            "system.ai.claude-opus-4-7[1m]",
+            "system.ai.claude-opus-4-7[1m]",
+            "claude-opus-4-7[1m]",
+            204,
+        ),
+        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
+        ("opus[1m]", "system.ai.claude-opus-4-7[1M]", "claude-opus-4-7[1m]", 204),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6[1m]", 503),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 503),
+        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
+        ("opus", None, "claude-opus-4-7", 503),
+    ],
+    ids=[
+        "gateway-pin",
+        "canonical-spelling",
+        "bracket-alias",
+        "uppercase-bracket-alias",
+        "uppercase-pin-marker",
+        "different-generation",
+        "different-context",
+        "bracket-alias-different-context",
+        "uppercase-bracket-alias-different-context",
+        "unpinned-alias",
+    ],
+)
+async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    selected_model: str,
+    pin_model: str | None,
+    status_model: str,
+    status_code: int,
+) -> None:
+    """An unchanged model confirms only the pin's exact generation and context."""
+
+    async def _skip_terminal_creation(**_kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal",
+        _skip_terminal_creation,
+    )
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        [status_model],
+        model=selected_model,
+        picker_values=(selected_model,),
+        model_env={"ANTHROPIC_DEFAULT_OPUS_MODEL": pin_model} if pin_model else {},
+    )
+    assert resp.status_code == status_code, resp.text
+
+
+@pytest.mark.parametrize("translation", ["alias", "custom-slot", "picker"])
+@pytest.mark.parametrize("marker", ["[1m]", "[1M]"])
+async def test_events_model_change_does_not_confirm_plain_pin_for_marked_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    translation: str,
+    marker: str,
+) -> None:
+    """A translation must not confirm the plain sibling of a 1M pick."""
+    plain = "system.ai.claude-opus-4-7"
+    model_env = {
+        "alias": {"ANTHROPIC_DEFAULT_OPUS_MODEL": plain},
+        "custom-slot": {"ANTHROPIC_CUSTOM_MODEL_OPTION": plain},
+        "picker": {},
+    }[translation]
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model=plain + marker,
+        model_env=model_env,
+        picker_values=(plain,) if translation == "picker" else (),
+        expected_command="/model opus" if translation == "alias" else f"/model {plain}",
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
 
 
 @pytest.mark.parametrize("picker_source", ["bridge", "catalog", "session"])
@@ -2034,6 +2056,34 @@ async def test_bound_claude_switch_preserves_private_model_id(
             model=selected,
         )
     assert response.status_code == 204, response.text
+
+
+async def test_bound_claude_switch_does_not_fold_private_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inference_config import inference_config_scope
+
+    selected = "private/claude-opus-4-7"
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": selected,
+                    "model_allowlist": [selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config):
+        response = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            ["claude-opus-4-7"],
+            model=selected,
+        )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unconfirmed"
 
 
 async def test_events_managed_glm_switch_rejects_an_unchanged_terminal(
@@ -2152,6 +2202,702 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
     assert resp.status_code == 204, resp.text
 
 
+_BOOT_SESSION_ID = "68c7c1acc5eeec3978c5e62043da51a6"
+
+# Virtual seconds one confirm poll costs when the request runs on a `_VirtualClock`.
+_VIRTUAL_CONFIRM_POLL_S = 0.25
+
+
+class _VirtualClock:
+    """A ``time`` stand-in whose ``sleep`` advances ``monotonic`` instead of blocking."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+async def _post_model_change_through_a_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wait: Callable[..., None],
+    inject: Callable[..., None],
+    status: Callable[[Any], str | None],
+    clock: _VirtualClock | None = None,
+    dialog_deadlines: list[float | None] | None = None,
+    dialog: Callable[..., bool] | None = None,
+) -> httpx.Response:
+    """Run one claude-native ``model_change`` against a scripted terminal boot.
+
+    ``wait``, ``inject`` and ``status`` stand in for the bridge's prompt wait,
+    slash-command injection and statusLine read. The confirm poll is tightened
+    so the unconfirmed path stays fast; its window is left to the handler.
+
+    With a ``clock`` the handler reads it instead of the wall clock and each
+    confirm poll costs it ``_VIRTUAL_CONFIRM_POLL_S``, so the budget arithmetic
+    holds exactly on a loaded machine. The stand-ins advance it for the time
+    they would take. ``dialog_deadlines`` collects the instant each in-request
+    dialog check stops sending keys at (``None`` when it runs unbounded).
+    ``dialog`` replaces the stand-in for ``confirm_dialog_if_open``.
+
+    :returns: The ``/events`` response.
+    """
+    monkeypatch.setattr(claude_native_bridge, "wait_for_input_ready", wait)
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", inject)
+    monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", status)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
+
+    def _no_dialog(_bridge_dir: Any, *, hint: str) -> bool:
+        del hint
+        if dialog_deadlines is not None:
+            dialog_deadlines.append(_injection_deadline())
+        if clock is not None:
+            clock.sleep(_VIRTUAL_CONFIRM_POLL_S)
+        return False
+
+    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", dialog or _no_dialog)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": _BOOT_SESSION_ID, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        if clock is not None:
+            monkeypatch.setattr(native_controls, "time", clock)
+        return await client.post(
+            f"/v1/sessions/{_BOOT_SESSION_ID}/events",
+            json={"type": "model_change", "model": "claude-opus-4-7"},
+        )
+
+
+def _injection_deadline() -> float | None:
+    """The instant the bridge call running now stops sending keys at, if bound."""
+    flag = claude_native_bridge._INJECTION_CANCEL_EVENT.get()
+    return flag.at if isinstance(flag, native_controls._ClaudeControlDeadline) else None
+
+
+def _prompt_wait_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The structured prompt-wait records the model-change handler logged."""
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_native_model_change_prompt_wait"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_takes_its_baseline_after_a_slow_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A switch asked for mid-boot is typed after the boot and judged against it.
+
+    While Claude Code starts, the statusLine snapshot is empty, so a baseline
+    read at the top of the request is ``None``. The switch then lands under a
+    spelling outside the expected set (a gateway's own id for the model), which
+    only reads as a change against the booted pane's model.
+    """
+    events: list[str] = []
+    state = {"booted": False, "switched": False}
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        events.append("wait")
+        time.sleep(0.05)
+        state["booted"] = True
+
+    def _status(bridge_dir: Any) -> str | None:
+        del bridge_dir
+        if not state["booted"]:
+            return None
+        value = "gateway-claude-opus-4-7" if state["switched"] else "claude-opus-4-6"
+        events.append(f"status:{value}")
+        return value
+
+    def _inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir
+        assert state["booted"], f"{command!r} was typed before the prompt was up"
+        events.append("inject")
+        state["switched"] = True
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        resp = await _post_model_change_through_a_boot(
+            monkeypatch, wait=_wait, inject=_inject, status=_status
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert events[:3] == ["wait", "status:claude-opus-4-6", "inject"], events
+    (waited,) = _prompt_wait_events(caplog)
+    assert waited.session_id == _BOOT_SESSION_ID
+    assert waited.attributes["timed_out"] is False
+    assert waited.attributes["waited_ms"] >= 50
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_spends_its_budget_on_the_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow boot comes out of the request's budget instead of adding to it.
+
+    The server abandons the request after ~20s and rolls the pick back, so the
+    prompt wait is capped by what is left of the budget, the injection is
+    handed only what the wait did not use, and the confirm window shrinks to
+    fit. Its own 10s default stays in place here: only the clipping keeps a
+    switch that never lands inside the budget. The request runs on virtual
+    time, so none of this depends on how fast the machine is.
+    """
+    clock = _VirtualClock()
+    started_at = clock.now
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_PROMPT_WAIT_S", 5.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 1.5)
+    budgets: dict[str, float] = {}
+    deadlines: list[float | None] = []
+    dialog_deadlines: list[float | None] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, timeout_s
+        budgets["wait"] = ready_timeout_s
+        deadlines.append(_injection_deadline())
+        clock.sleep(0.4)
+
+    def _inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        ready_timeout_s: float | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        del bridge_dir, command
+        assert ready_timeout_s is not None
+        budgets["inject"] = ready_timeout_s
+        deadlines.append(_injection_deadline())
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-6",
+        clock=clock,
+        dialog_deadlines=dialog_deadlines,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
+    # The 5s cap is clipped to the 1.5s budget, then the boot's 0.4s is subtracted.
+    assert budgets["wait"] == pytest.approx(1.5)
+    assert budgets["inject"] == pytest.approx(1.1)
+    # The prompt wait, the injection and every in-request dialog answer stop
+    # sending keys at the instant the request's budget ends.
+    assert deadlines == [pytest.approx(started_at + 1.5)] * 2
+    assert dialog_deadlines
+    assert dialog_deadlines == [pytest.approx(started_at + 1.5)] * len(dialog_deadlines)
+    # The confirm window ran out with the budget (give or take one poll), not its 10s default.
+    assert clock.now - started_at <= 1.5 + _VIRTUAL_CONFIRM_POLL_S
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_keeps_a_short_injection_wait_after_a_long_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boot that uses up the prompt budget still leaves the injection a 1 s wait.
+
+    The injection re-checks readiness itself, and one torn capture right after
+    the prompt rendered must not fail the switch while the request still has
+    budget. The floor stays clipped by the request deadline.
+    """
+    clock = _VirtualClock()
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_PROMPT_WAIT_S", 1.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 3.0)
+    budgets: dict[str, float] = {}
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, timeout_s
+        budgets["wait"] = ready_timeout_s
+        clock.sleep(0.95)
+
+    def _inject(
+        bridge_dir: Any, *, command: str, ready_timeout_s: float | None = None, **_kwargs: Any
+    ) -> None:
+        del bridge_dir, command
+        assert ready_timeout_s is not None
+        budgets["inject"] = ready_timeout_s
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-6",
+        clock=clock,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert budgets["wait"] == pytest.approx(1.0)
+    assert budgets["inject"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["wait", "inject"])
+async def test_events_model_change_reports_a_tmux_failure_as_503(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """A tmux failure while waiting for the prompt or typing is a 503, not an unhandled error."""
+    typed: list[str] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        if stage == "wait":
+            raise OSError("tmux: command not found")
+
+    def _inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir
+        typed.append(command)
+        raise OSError("tmux: command not found")
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch, wait=_wait, inject=_inject, status=lambda _bridge_dir: None
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_failed"
+    # No person can act on this, so the reply names the log, not the raw text.
+    detail = resp.json()["detail"]
+    assert detail.startswith("Request failed on the runner; see the runner log for details:")
+    assert "command not found" not in detail
+    assert typed == ([] if stage == "wait" else ["/model claude-opus-4-7"])
+
+
+_PASSWORD_PANE_TAIL = (
+    " Last terminal output:\n"
+    "✔ Unity Gateway connected\n"
+    "• Enter password to configure settings for Claude Code.\n"
+    "Password:"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "error", "expected_detail"),
+    [
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudePromptTimeout(
+                "Claude Code terminal did not become ready within 9.0s. "
+                "The message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's input box never appeared. It may still be starting, or waiting "
+            "on a prompt such as a password. Check the terminal, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            id="launcher-password-prompt",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation="Open the sign-in link and sign in.",
+            ),
+            "Claude Code can't start until you sign in to Databricks. "
+            "Finish the sign-in in the terminal, then switch models again.",
+            id="sign-in",
+        ),
+        pytest.param(
+            "inject",
+            claude_native_bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request before "
+                "changing settings."
+            ),
+            "Claude is waiting for an answer to a question or prompt. "
+            "Answer it, then switch models again.",
+            id="permission-prompt",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeTerminalDialog(
+                "Claude Code is waiting for an answer in its terminal (Trust this folder?), "
+                "so the message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+            "answer or dismiss it, then switch models again." + _PASSWORD_PANE_TAIL,
+            id="dialog",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeTerminalExited(
+                "The Claude Code terminal has exited (status 1)." + _PASSWORD_PANE_TAIL,
+                exit_status="1",
+            ),
+            "The Claude Code terminal has exited. Relaunch it, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            id="exited",
+        ),
+    ],
+)
+async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error: Exception,
+    expected_detail: str,
+) -> None:
+    """A switch refused by a terminal awaiting the person names what to do, not the log path."""
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        if stage == "wait":
+            raise error
+
+    def _inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir, command
+        raise error
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch, wait=_wait, inject=_inject, status=lambda _bridge_dir: None
+    )
+
+    assert resp.status_code == 503, resp.text
+    expected = {"error": "claude_native_model_failed", "detail": expected_detail}
+    if isinstance(
+        error,
+        claude_native_bridge.ClaudeSignInPending
+        | claude_native_bridge.ClaudeTerminalDialog
+        | claude_native_bridge.ClaudeUserPromptPending,
+    ):
+        # Only a pane awaiting the person's answer is flagged; an exit or timeout is a failure.
+        expected["waiting_on_person"] = True
+    assert resp.json() == expected
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_skips_the_dialog_check_once_its_budget_lapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boot that spends the whole budget ends the confirm window without driving the pane."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_PROMPT_WAIT_S", 5.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 1.5)
+    dialog_checks: list[str] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        clock.sleep(1.6)
+
+    def _dialog(_bridge_dir: Any, *, hint: str) -> bool:
+        dialog_checks.append(hint)
+        return False
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=lambda _bridge_dir, *, command, **_kwargs: None,
+        status=lambda _bridge_dir: "claude-opus-4-6",
+        clock=clock,
+        dialog=_dialog,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
+    assert dialog_checks == []
+
+
+def test_claude_control_deadline_wait_returns_once_the_budget_lapses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``wait`` cannot block past the budget, so a blocked waiter sees the deadline too."""
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 0.2)
+    deadline = native_controls._ClaudeControlDeadline()
+
+    started = time.monotonic()
+    assert deadline.wait() is True
+    assert deadline.wait(5.0) is True
+    assert time.monotonic() - started < 2.0
+
+
+def _tui_composer(draft: str = "") -> str:
+    """A Claude input box holding ``draft``, framed the way the bridge locates it."""
+    return (
+        "──────────────────────────────\n"
+        f"❯ {draft}\n"
+        "──────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+
+
+_TUI_SWITCH_DIALOG = "  Switch model?\n  This will invalidate the prompt cache.\n"
+
+
+class _SlowSwitchTui:
+    """A Claude TUI that lags behind the keys it is sent, on a virtual clock.
+
+    The typed command echoes ``draft_after_s`` after the paste, and the
+    ``/model`` dialog opens ``dialog_after_s`` after the submit; ``None`` means
+    that never happens. Once open, the dialog swallows every Enter, as a
+    repainting TUI drops keys. ``sent`` logs each key with the virtual time it
+    arrived at.
+    """
+
+    def __init__(
+        self,
+        clock: _VirtualClock,
+        *,
+        draft_after_s: float | None,
+        dialog_after_s: float | None,
+    ) -> None:
+        self.sent: list[tuple[float, str]] = []
+        self._clock = clock
+        self._draft_after_s = draft_after_s
+        self._dialog_after_s = dialog_after_s
+        self._pasted_at: float | None = None
+        self._submitted_at: float | None = None
+
+    def run_tmux(self, _socket_path: str, *args: str) -> None:
+        """Stand-in for ``_run_tmux``: log the key and track paste and submit."""
+        # The real helper refuses a cancelled delivery before it reaches tmux.
+        claude_native_bridge._check_injection_cancelled()
+        now = self._clock.monotonic()
+        self.sent.append((now, args[-1]))
+        if "-l" in args:
+            self._pasted_at = now
+        elif args[-1] == "Enter" and self._submitted_at is None:
+            self._submitted_at = now
+
+    def capture_pane(
+        self, _socket_path: str, _tmux_target: str, *, join_wrapped: bool = False
+    ) -> str:
+        """Stand-in for ``_capture_pane``: the pane as the lagging TUI shows it now."""
+        del join_wrapped
+        claude_native_bridge._check_injection_cancelled()
+        now = self._clock.monotonic()
+        if self._submitted_at is not None:
+            dialog_open = (
+                self._dialog_after_s is not None
+                and now - self._submitted_at >= self._dialog_after_s
+            )
+            return _TUI_SWITCH_DIALOG if dialog_open else _tui_composer()
+        echoed = (
+            self._pasted_at is not None
+            and self._draft_after_s is not None
+            and now - self._pasted_at >= self._draft_after_s
+        )
+        return _tui_composer("/model claude-opus-4-7" if echoed else "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("draft_after_s", "dialog_after_s"),
+    [(None, None), (3.0, 3.8)],
+    ids=["submit-never-echoes", "confirm-enter-swallowed"],
+)
+async def test_events_model_change_sends_no_key_past_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    draft_after_s: float | None,
+    dialog_after_s: float | None,
+) -> None:
+    """A slow submission or dialog cannot type into the terminal after the request failed.
+
+    The boot takes the whole prompt wait, so what is left of the budget is less
+    than the paste, dialog watch and confirm retries can spend. Each must stop
+    at the request's deadline: a key sent after it would apply the model once
+    the server has already rolled the pick back.
+    """
+    clock = _VirtualClock()
+    started_at = clock.now
+    budget_s = native_controls._CLAUDE_CONTROL_BUDGET_S
+    tui = _SlowSwitchTui(clock, draft_after_s=draft_after_s, dialog_after_s=dialog_after_s)
+    pane_dir = tmp_path / "bridge"
+    pane_dir.mkdir()
+    (pane_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": "/tmp/fake.sock", "tmux_target": "claude:0.0"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", tui.run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", tui.capture_pane)
+    real_inject = claude_native_bridge.inject_slash_command
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        clock.sleep(native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S)
+
+    def _inject(bridge_dir: Any, **kwargs: Any) -> None:
+        # The real injection, aimed at the fake pane's bridge directory.
+        del bridge_dir
+        real_inject(pane_dir, **kwargs)
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-6",
+        clock=clock,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_failed"
+    keys = [key for _, key in tui.sent]
+    clear_composer = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
+    assert keys[:4] == ["Space", clear_composer, "/model claude-opus-4-7", "Enter"], keys
+    late = [
+        (round(at - started_at, 2), key) for at, key in tui.sent if at >= started_at + budget_s
+    ]
+    assert late == [], f"keys reached the terminal after the {budget_s}s budget: {late}"
+    assert (
+        clock.now - started_at <= budget_s + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_keeps_a_switch_that_landed_before_its_budget_lapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow recreation can spend the budget in the dialog watch after ``/model``.
+
+    Claude applies the switch at once and opens no dialog, but the watch for one
+    outlasts the request's budget and the injection is cancelled. The statusLine
+    already shows the pick, so the reply is success, not a rollback.
+    """
+    clock = _VirtualClock()
+    submitted = False
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        clock.sleep(native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S)
+
+    def _inject(bridge_dir: Any, **kwargs: Any) -> None:
+        nonlocal submitted
+        del bridge_dir, kwargs
+        submitted = True
+        clock.sleep(native_controls._CLAUDE_CONTROL_BUDGET_S)
+        raise claude_native_bridge.ClaudeInjectionCancelled("budget lapsed in the dialog watch")
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-7" if submitted else "claude-opus-4-6",
+        clock=clock,
+    )
+
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_fails_and_logs_when_the_prompt_never_renders(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A terminal still booting when the wait lapses fails before anything is typed."""
+    typed: list[str] = []
+    status_reads: list[str] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        raise claude_native_bridge.ClaudePromptTimeout(
+            "Claude Code terminal did not become ready within 9.0s"
+        )
+
+    def _status(bridge_dir: Any) -> str | None:
+        del bridge_dir
+        status_reads.append("read")
+        return None
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        resp = await _post_model_change_through_a_boot(
+            monkeypatch,
+            wait=_wait,
+            inject=lambda _bridge_dir, *, command, **_kwargs: typed.append(command),
+            status=_status,
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_failed"
+    assert typed == []
+    assert status_reads == []
+    (waited,) = _prompt_wait_events(caplog)
+    assert waited.attributes["timed_out"] is True
+    assert waited.attributes["error_type"] == "ClaudePromptTimeout"
+    assert waited.attributes["budget_ms"] == round(
+        native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S * 1000
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [{"type": "effort_change", "effort": "high"}, {"type": "compact"}],
+    ids=["effort_change", "compact"],
+)
+async def test_events_settings_controls_cap_their_prompt_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    event: dict[str, Any],
+) -> None:
+    """Effort and compact stop waiting for a booting prompt inside the server's budget.
+
+    Uncapped, a live-but-booting pane earns the slow-boot extension (up to
+    180s), far past the ~20s the server waits for these controls. The whole
+    injection also stops sending keys once that budget is spent, so a slow
+    submit or dialog cannot apply the control after the server reported it failed.
+    """
+    caps: list[float | None] = []
+    key_deadlines: list[float | None] = []
+
+    def _fake_inject(
+        bridge_dir: Any, *, command: str, ready_timeout_s: float | None = None, **_kwargs: Any
+    ) -> None:
+        del bridge_dir, command
+        caps.append(ready_timeout_s)
+        key_deadlines.append(_injection_deadline())
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": _BOOT_SESSION_ID, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{_BOOT_SESSION_ID}/events", json=event)
+
+    assert resp.status_code in (200, 204), resp.text
+    assert caps == [pytest.approx(native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S)]
+    (key_deadline,) = key_deadlines
+    assert key_deadline is not None
+    assert key_deadline - time.monotonic() == pytest.approx(
+        native_controls._CLAUDE_CONTROL_BUDGET_S, abs=5.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_stays_queued_when_the_turn_settles_mid_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch typed into a busy pane is queued even if the turn ends before the deadline.
+
+    Claude applies the queued ``/model`` after the turn settles, which can land after
+    the confirmation window. An idle pane at the last poll is not a refusal.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+        pane_idle_after_polls=2,
+    )
+    assert resp.status_code == 204, resp.text
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("pins", "picker_values", "picked", "expected_command"),
@@ -2234,9 +2980,10 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Record the injected command without touching tmux."""
-        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         captured.append(command)
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
@@ -2474,6 +3221,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s

@@ -90,6 +90,96 @@ def test_delivery_identity_and_original_enqueue_time_survive_retry_and_restore(
     assert redrained is not None and redrained.interrupted is interrupted
 
 
+def test_completed_lifecycle_classifies_a_later_skip_by_stable_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 100.0
+    monkeypatch.setattr(
+        pending_inputs, "time", SimpleNamespace(time=lambda: now, monotonic=lambda: now)
+    )
+    first = pending_inputs.record("conv", [_text_block("first")], stable_id="a" * 32)
+    pending_inputs.mark_lifecycle(
+        "conv",
+        "a" * 32,
+        stage="native_turn_completed",
+        reason_code="response_completed",
+        lifecycle_response_id="resp_first",
+    )
+    pending_inputs.mark_delivery_stage("conv", first, "forward_accepted")
+    now = 105.0
+    pending_inputs.record("conv", [_text_block("second")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "second")
+    [skipped] = match.skipped
+    classified = pending_inputs.classify_missing_native_record(skipped)
+
+    assert classified.pending_id == first
+    assert pending_inputs.delivery_attributes(classified) == {
+        "input_stable_id": "a" * 32,
+        "pending_id": first,
+        "delivery_attempt_id": skipped.delivery_attempt_id,
+        "input_enqueued_at_ms": skipped.input_enqueued_at_ms,
+        "last_delivery_stage": "native_turn_completed",
+        "pending_age_ms": 5000,
+        "cause_class": "accepted_missing_native_record",
+        "reason_code": "completed_without_native_record",
+        "lifecycle_response_id": "resp_first",
+    }
+
+
+def test_cancelled_lifecycle_is_drained_as_interrupted_not_missing() -> None:
+    first = pending_inputs.record("conv", [_text_block("first")], stable_id="a" * 32)
+    assert (
+        pending_inputs.mark_lifecycle(
+            "conv",
+            "a" * 32,
+            stage="native_turn_cancelled",
+            cause_class="interrupted_or_lifecycle",
+            reason_code="response_cancelled",
+        )
+        == first
+    )
+    pending_inputs.mark_interrupted("conv", [first])
+    pending_inputs.record("conv", [_text_block("second")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "second")
+
+    assert match.skipped == []
+    [interrupted] = match.uncertain
+    assert interrupted.pending_id == first
+    assert interrupted.cause_class == "interrupted_or_lifecycle"
+    assert interrupted.reason_code == "response_cancelled"
+
+
+@pytest.mark.parametrize("mismatch", [None, "session", "pending", "attempt", "stable", "missing"])
+def test_lifecycle_without_client_id_requires_its_exact_delivery_attempt(
+    mismatch: str | None,
+) -> None:
+    first = pending_inputs.record("conv", [_text_block("first")])
+    second = pending_inputs.record("conv", [_text_block("second")])
+    identity = pending_inputs.delivery_attributes_for("conv", first)
+    attempt = str(identity["delivery_attempt_id"])
+
+    matched = pending_inputs.mark_lifecycle(
+        "other" if mismatch == "session" else "conv",
+        "a" * 32 if mismatch == "stable" else None,
+        pending_id=second if mismatch == "pending" else first,
+        delivery_attempt_id=(
+            "b" * 32 if mismatch == "attempt" else None if mismatch == "missing" else attempt
+        ),
+        stage="native_turn_completed",
+    )
+
+    assert matched == (first if mismatch is None else None)
+    assert pending_inputs.delivery_attributes_for("conv", first)["last_delivery_stage"] == (
+        "native_turn_completed" if mismatch is None else "server_queued"
+    )
+    assert (
+        pending_inputs.delivery_attributes_for("conv", second)["last_delivery_stage"]
+        == "server_queued"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _clean_pending_inputs_index() -> Iterator[None]:
     """
@@ -707,6 +797,33 @@ def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_restoring_a_removed_entry_preserves_its_missing_record_disposition(
+    hold: bool, uncertain: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An eviction or non-held drain must not turn an ambiguous receipt into a loss."""
+    now = [100.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    if uncertain:
+        pending_inputs.mark_uncertain("conv_a")
+    drained = pending_inputs.resolve_oldest("conv_a", hold=hold)
+    assert drained is not None
+    if hold:
+        now[0] += pending_inputs._TTL_S + 1
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+    pending_inputs.restore("conv_a", drained)
+    later = pending_inputs.record("conv_a", [_text_block("later")])
+    matched = pending_inputs.resolve_matching_text("conv_a", "later")
+
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert [entry.pending_id for entry in matched.uncertain] == ([first] if uncertain else [])
+    assert [entry.pending_id for entry in matched.skipped] == ([] if uncertain else [first])
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
 def test_pending_ids_lists_queued_unheld_entries_in_queue_order() -> None:
     """The interrupt route reads the queue before it forwards the Stop."""
     first = pending_inputs.record("conv_a", [_text_block("first")])
@@ -993,3 +1110,49 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
 
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.pending_ids("conv_a") == []
+
+
+@pytest.mark.parametrize("command", ["/probe-cmd", "!git status", "exit", "QUIT", ":wq"])
+def test_queued_command_recorded_after_a_plain_follow_up_is_not_lost(command: str) -> None:
+    """
+    A command queued before a plain prompt can be recorded after it, or never.
+
+    Claude folds the plain prompt in at the next tool call but holds a "/" or
+    "!" command until the turn ends; an exit word quits without a record. So
+    the older entry is not known lost.
+    """
+    pending_inputs.record("conv", [_text_block(command)], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("plain follow-up")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "plain follow-up", claude_commands=True)
+
+    assert match.matched is not None
+    assert match.skipped == []
+    [uncertain] = match.uncertain
+    assert uncertain.content == [_text_block(command)]
+
+
+@pytest.mark.parametrize(
+    ("older", "claude_commands"),
+    [
+        ("first plain", True),
+        ("exit the loop early", True),
+        # Only Claude Code runs these itself; another harness records them in order.
+        ("!git status", False),
+        ("exit", False),
+    ],
+)
+def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
+    older: str, claude_commands: bool
+) -> None:
+    """A plain older entry jumped over is still reported as lost."""
+    pending_inputs.record("conv", [_text_block(older)], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("second plain")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text(
+        "conv", "second plain", claude_commands=claude_commands
+    )
+
+    [skipped] = match.skipped
+    assert skipped.content == [_text_block(older)]
+    assert match.uncertain == []

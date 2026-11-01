@@ -7,6 +7,7 @@ import base64
 import contextlib
 import json
 import os
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
@@ -17,7 +18,6 @@ from typing import Any
 import click
 import httpx
 import pytest
-import tomllib
 import yaml
 from PIL import Image
 
@@ -689,6 +689,15 @@ class _FakeCodexAppServerClient:
             raise self.error
         return self.response
 
+    def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+        """
+        Report that the fake connection receives the thread's notifications.
+
+        :param _thread_id: Codex thread id.
+        :returns: ``True``.
+        """
+        return True
+
     async def iter_events(self) -> Any:
         """
         Return an empty event stream.
@@ -908,6 +917,74 @@ def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
     :param expected: Whether it classifies as an unreadable thread.
     """
     assert codex_native_app_server.is_unreadable_thread_error(exc) is expected
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "thread 019e already has an active writer"}
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32603, "message": "thread 019e already has an active writer"}
+            ),
+            False,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "no rollout found for thread id 019e"}
+            ),
+            False,
+        ),
+        (RuntimeError("thread 019e already has an active writer"), False),
+    ],
+)
+def test_is_active_writer_error(exc: BaseException, expected: bool) -> None:
+    """Only codex's ``-32600`` writer refusal counts as another app-server holding the thread."""
+    assert codex_native_app_server.is_active_writer_error(exc) is expected
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": (
+                        "no rollout found for thread id 019e96aa-0be2-7343-8d3b-6f914d60936d"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32603, "message": "no rollout found for thread id 019e96aa"}
+            ),
+            False,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "thread 019e already has an active writer"}
+            ),
+            False,
+        ),
+        (RuntimeError("no rollout found for thread id 019e96aa"), False),
+    ],
+)
+def test_is_missing_rollout_error(exc: BaseException, expected: bool) -> None:
+    """
+    Only codex's ``-32600 no rollout found`` resume refusal counts as a missing rollout.
+
+    :param exc: Exception raised by the resume request.
+    :param expected: Whether it classifies as a missing rollout.
+    """
+    assert codex_native_app_server.is_missing_rollout_error(exc) is expected
 
 
 def test_codex_resume_permission_params_parse_legacy_flags() -> None:
@@ -2804,6 +2881,101 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         for _, payload in posted_events
         if payload["type"] == "external_conversation_item"
     ] == ["after clear"]
+
+
+def test_forwarder_rotation_redirects_viewers_of_the_cleared_session(
+    tmp_path: Path,
+) -> None:
+    """
+    A native Codex ``/clear`` tells the old session where its terminal went.
+
+    Without the notice and ``external_session_superseded`` event, a browser
+    on the old session keeps showing the cleared conversation while the
+    replacement only appears as a new sidebar entry.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_old",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_old",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    old_session_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve Omnigent calls made during Codex session rotation.
+
+        :param request: HTTP request from the forwarder.
+        :returns: Fake Omnigent response.
+        """
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_codex",
+                    "runner_id": "runner_123",
+                    "labels": {"omnigent.wrapper": "codex-native-ui"},
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "PATCH" and path in {
+            "/v1/sessions/conv_new",
+            "/v1/sessions/conv_old",
+        }:
+            return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1]})
+        if request.method == "POST" and path.endswith("/transfer"):
+            return httpx.Response(200, json={"id": "terminal_codex_main"})
+        if request.method == "POST" and path == "/v1/sessions/conv_old/events":
+            old_session_events.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(500, json={"error": f"unexpected {request.method} {path}"})
+
+    async def run() -> bool:
+        """
+        Rotate onto a new native thread.
+
+        :returns: Whether the forwarder rotated.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as ap_client:
+            target = codex_native_forwarder._ForwarderTarget(
+                session_id="conv_old",
+                thread_id="thread_old",
+                delta_coalescer=codex_native_forwarder._OutputTextDeltaCoalescer(
+                    ap_client, "conv_old"
+                ),
+                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                    ap_client, "conv_old"
+                ),
+                elicitation_tracker=_elicitation_tracker(),
+            )
+            return await codex_native_forwarder._maybe_rotate_session_on_thread_started(
+                ap_client=ap_client,
+                target=target,
+                bridge_dir=tmp_path,
+                app_server_url="ws://127.0.0.1:9876",
+                event=_thread_started_event("thread_new"),
+            )
+
+    assert asyncio.run(run())
+    assert [event["type"] for event in old_session_events] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    assert old_session_events[0]["data"] == {"status": "idle"}
+    notice = old_session_events[1]["data"]["item_data"]
+    assert notice["agent"] == "codex-native-ui"
+    assert "(/c/conv_new)" in notice["content"][0]["text"]
+    assert old_session_events[2]["data"] == {"target_conversation_id": "conv_new"}
 
 
 def test_forwarder_rotation_failure_preserves_old_target(
@@ -5904,7 +6076,13 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
-    assert [event for event in session_events if event.session_id == "conv_old"] == []
+    # The cleared session gets only the /clear notice and redirect, never a
+    # stale child-thread event.
+    assert [event.body["type"] for event in session_events if event.session_id == "conv_old"] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
     assert hook_posts == []
     assert fake_client.responses == []
 
@@ -6792,6 +6970,118 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: 
         "response_id": "codex_turn_123",
         "source_id": "thread_123:turn_123:call_abc123:output",
     }
+
+
+@pytest.mark.parametrize(
+    ("raw_command", "typed_command"),
+    [
+        # Real app-server captures of ``thread/shellCommand`` items (codex 0.159).
+        ("/bin/bash -lc 'echo hi && pwd'", "echo hi && pwd"),
+        ('/bin/bash -lc "printf \\"x  y\\\\n\\" | cat"', 'printf "x  y\\n" | cat'),
+        ("/bin/bash -lc \"ls -la ~ && echo \\\\\"'$done'", "ls -la ~ && echo \\$done"),
+        ("/bin/bash -lc 'for i in 1 2; do\n  echo $i\ndone'", "for i in 1 2; do\n  echo $i\ndone"),
+        ("pwsh -NoProfile -Command ls", "pwsh -NoProfile -Command ls"),
+    ],
+)
+def test_user_shell_command_recovers_the_typed_command(
+    raw_command: str, typed_command: str
+) -> None:
+    """The mirrored input must equal the web ``!command`` so its bubble settles."""
+    item = {"type": "commandExecution", "source": "userShell", "command": raw_command}
+
+    assert codex_native_forwarder._user_shell_command(item) == typed_command
+    assert codex_native_forwarder._user_shell_command({**item, "source": "agent"}) is None
+
+
+@pytest.mark.parametrize("live", [True, False], ids=["live", "resume-backfill"])
+def test_forwarder_mirrors_user_shell_command_as_terminal_command(
+    tmp_path: Path, live: bool
+) -> None:
+    """A ``thread/shellCommand`` run is a terminal command, not a model tool call."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    started_item = {
+        "type": "commandExecution",
+        "id": "shell_1",
+        "command": "/bin/bash -lc 'gcloud auth list'",
+        "cwd": "/repo",
+        "source": "userShell",
+        "status": "inProgress",
+    }
+    completed_item = {
+        **started_item,
+        "status": "completed",
+        "aggregatedOutput": "No credentialed accounts.\n",
+        "exitCode": 1,
+    }
+
+    def event(method: str, **params: Any) -> dict[str, Any]:
+        return {
+            "method": method,
+            "params": {"threadId": "thread_123", "turnId": "turn_123", **params},
+        }
+
+    events = (
+        [
+            event("item/started", item=started_item),
+            event("item/commandExecution/outputDelta", itemId="shell_1", delta="No credentialed"),
+        ]
+        if live
+        else []
+    )
+    events.append(event("item/completed", item=completed_item))
+    state = codex_native_forwarder._CodexForwarderState()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
+                client, "conv_123", flush_interval_seconds=60.0, flush_char_threshold=1000
+            )
+            for codex_event in events:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=codex_event,
+                    delta_coalescer=coalescer,
+                    forwarder_state=state,
+                )
+            await coalescer.close()
+
+    asyncio.run(run())
+
+    assert [payload["data"] for payload in posted] == [
+        {
+            "item_type": "terminal_command",
+            "item_data": {"kind": "input", "input": "gcloud auth list"},
+            "response_id": "codex_turn_123",
+            "source_id": "thread_123:turn_123:shell_1:input",
+        },
+        {
+            "item_type": "terminal_command",
+            "item_data": {
+                "kind": "output",
+                "stdout": "No credentialed accounts.\n\n[exit code: 1]",
+                "stderr": None,
+            },
+            "response_id": "codex_turn_123",
+            "source_id": "thread_123:turn_123:shell_1:output",
+        },
+    ]
 
 
 def test_forwarder_surfaces_failed_command_exit_code() -> None:
@@ -11521,6 +11811,64 @@ def test_clone_codex_rollout_returns_none_for_unsafe_target_id(
     assert result is None
 
 
+@pytest.mark.parametrize(
+    ("recorded_models", "clone_model", "cloned"),
+    [
+        # Codex would compact on the source's last model before the clone's first turn.
+        (["system.ai.gpt-6-1-sol", "system.ai.gpt-6-astra"], "system.ai.gpt-6-1-sol", False),
+        # Only the last turn matters, and gateway and Codex spellings compare equal.
+        (["system.ai.gpt-6-astra", "system.ai.gpt-6-1-sol"], "gpt-6.1-sol", True),
+        ([], "system.ai.gpt-6-1-sol", True),
+        (["system.ai.gpt-6-astra"], None, True),
+    ],
+    ids=["last-turn-other-model", "last-turn-same-model", "no-recorded-model", "no-clone-model"],
+)
+def test_clone_codex_rollout_declines_source_whose_last_turn_used_another_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_models: list[str],
+    clone_model: str | None,
+    cloned: bool,
+) -> None:
+    """A fork launching on a model other than the source's last turn is not cloned."""
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    source_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_source"))
+    rollout = _write_source_rollout(
+        codex_home=source_home, thread_id=source_thread, source_cwd="/repo/src"
+    )
+    with rollout.open("a", encoding="utf-8") as handle:
+        for index, model in enumerate(recorded_models, start=2):
+            turn = {"turn_id": f"turn_{index}", "cwd": "/repo/src", "model": model}
+            handle.write(json.dumps({"type": "turn_context", "payload": turn}) + "\n")
+    clone_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_clone"))
+
+    def clone() -> Path | None:
+        return codex_native._clone_codex_rollout(
+            source_session_id="conv_source",
+            source_thread_id=source_thread,
+            target_thread_id="019eaa11-1111-7222-8333-444455556666",
+            clone_codex_home=clone_home,
+            clone_workspace=tmp_path / "clone",
+            clone_model=clone_model,
+        )
+
+    if cloned:
+        assert clone() is not None
+    else:
+        # A declined clone tells the caller that only an item rebuild carries the history.
+        with pytest.raises(codex_native._CodexForkModelMismatchError, match="gpt-6-astra"):
+            clone()
+    assert bool(list(clone_home.glob("sessions/**/*.jsonl"))) is cloned
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
     tmp_path: Path,
@@ -12855,6 +13203,8 @@ def test_rollout_records_use_terminal_launch_permission_args(
     turn_context = next(r for r in records if r["type"] == "turn_context")["payload"]
     assert turn_context["approval_policy"] == "never"
     assert turn_context["sandbox_policy"] == {"type": "danger-full-access"}
+    # A recorded model would make Codex compact on it before a turn on another model.
+    assert "model" not in turn_context
 
 
 # --- #2745: routing summary surfaced in the startup-timeout error ---

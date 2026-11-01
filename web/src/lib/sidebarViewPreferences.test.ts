@@ -14,16 +14,31 @@ describe("sidebarViewPreferences", () => {
     expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
   });
 
-  it("round-trips a stored selection", () => {
-    const view = { grouping: "status", ordering: "status", show: ["updated", "branch"] } as const;
-    writeSidebarViewPreferences(view);
-    expect(readSidebarViewPreferences()).toEqual(view);
+  it.each(["status", "created", "updated", "harness"] as const)(
+    "round-trips %s grouping",
+    (grouping) => {
+      const view = { grouping, ordering: "created", show: ["updated", "branch"] } as const;
+      writeSidebarViewPreferences(view);
+      expect(readSidebarViewPreferences()).toEqual(view);
+    },
+  );
+
+  it("restores saved Status grouping while preserving ordering and metadata", () => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ grouping: "status", ordering: "created", show: ["branch"] }),
+    );
+    expect(readSidebarViewPreferences()).toEqual({
+      grouping: "status",
+      ordering: "created",
+      show: ["branch"],
+    });
   });
 
   it("falls back per field on unknown or corrupt values", () => {
     localStorage.setItem(
       "omnigent:sidebar-view",
-      JSON.stringify({ grouping: "project", ordering: "updated", show: ["pr", "branch", 3] }),
+      JSON.stringify({ grouping: "project", ordering: "status", show: ["pr", "branch", 3] }),
     );
     expect(readSidebarViewPreferences()).toEqual({
       grouping: "default",

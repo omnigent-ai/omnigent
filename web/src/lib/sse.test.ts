@@ -182,6 +182,18 @@ describe("parseEvent — response.output_item.done (message)", () => {
       messageId: "codex:thread_1:turn_1:agentMessage:item_1",
     } satisfies MessageDone);
   });
+
+  it("carries a known assistant phase and drops an unknown one", () => {
+    const item = { id: "it_1", type: "message", response_id: "resp_1", content: [] };
+    const known = parseEvent("response.output_item.done", {
+      item: { ...item, phase: "final_answer" },
+    });
+    expect(known).toMatchObject({ type: "message_done", phase: "final_answer" });
+    const unknown = parseEvent("response.output_item.done", {
+      item: { ...item, phase: "summary" },
+    });
+    expect(unknown).not.toHaveProperty("phase");
+  });
 });
 
 describe("parseEvent — response.output_item.done (reasoning)", () => {
@@ -416,6 +428,39 @@ describe("parseEvent — response.output_item.done error level", () => {
     const plainError = plain?.type === "error" ? plain.error : null;
     expect(plainError).not.toBeNull();
     expect(plainError).not.toHaveProperty("level");
+  });
+
+  it("keeps a classified item's title, cause and remediation for the live card", () => {
+    const message =
+      'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",' +
+      '"message":"model: anthropic/claude-opus-4-8"}}';
+    const item = {
+      id: "err_2",
+      response_id: "resp_2",
+      type: "error",
+      source: "execution",
+      code: "RuntimeError",
+      message,
+      title: "Model unavailable",
+      cause: message,
+      remediation: "Choose a different model with the model picker or /model.",
+    };
+    const ev = parseEvent("response.output_item.done", { item });
+    expect(ev).toMatchObject({
+      type: "error",
+      source: "execution",
+      itemId: "err_2",
+      responseId: "resp_2",
+      error: {
+        code: "RuntimeError",
+        message,
+        title: "Model unavailable",
+        cause: message,
+        remediation: item.remediation,
+      },
+    });
+    const error = ev?.type === "error" ? ev.error : null;
+    expect(error).not.toHaveProperty("level");
   });
 });
 

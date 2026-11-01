@@ -30,8 +30,9 @@
 # arm64 hosts (Apple Silicon laptops, arm64 clusters) as well as amd64.
 # Nothing below is arch-specific: the python/node base images are
 # multi-arch and apt/pip/npm/COPY-from-node all resolve per-arch under
-# buildx. Amd64-only consumers (Modal, Daytona, CoreWeave) keep pulling
-# the amd64 variant from the manifest list, unchanged.
+# buildx. Only web-builder is pinned to $BUILDPLATFORM (see that stage).
+# Amd64-only consumers (Modal, Daytona, CoreWeave) keep pulling the
+# amd64 variant from the manifest list, unchanged.
 #
 # Build (from repo root):
 #
@@ -70,9 +71,13 @@ ARG NODE_VERSION=22
 # /web/omnigent/server/static/web-ui, which the server builder overlays.
 # Server-only: the host target never reaches this stage.
 #
+# Pinned to the build host's platform: the bundle is arch-independent
+# (plain JS/CSS/HTML), and vite's native bundler has stalled indefinitely
+# at "rendering chunks" under QEMU arm64 emulation, timing out releases.
+#
 # Behind a corporate npm proxy, pass it through:
 #   --build-arg NPM_CONFIG_REGISTRY=https://npm-proxy.example.com
-FROM node:${NODE_VERSION}-slim AS web-builder
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}
 # pnpm 11 uses PNPM_CONFIG_ settings; npm uses NPM_CONFIG_.
@@ -83,6 +88,7 @@ WORKDIR /web
 # source edits. The electron package JSON is included so the root workspace is
 # structurally complete, but we --filter web to avoid downloading Electron.
 COPY pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY patches/ ./patches/
 COPY web/package.json ./web/
 COPY web/electron/package.json ./web/electron/
 
@@ -359,9 +365,9 @@ RUN set -eu; \
 # state. Pinned + SHA256-verified per arch, like agy above; to bump, update
 # GH_VERSION and both SHA256s from the release's `gh_<ver>_checksums.txt` at
 # https://github.com/cli/cli/releases.
-ARG GH_VERSION=2.100.0
-ARG GH_SHA256_AMD64=e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be
-ARG GH_SHA256_ARM64=ea4e7a581a32ccad6cc7923cb1576ac5859ba4b9a16ab22eb8f8a96e78e2e961
+ARG GH_VERSION=2.103.0
+ARG GH_SHA256_AMD64=fdd768eb70f6409f80fcfa9f3a1c0adf0fc98d827ab3ce0bed2ac22762c5d786
+ARG GH_SHA256_ARM64=7f322df34e624d14f5ec0c4acb121fd6dfa14392fdbbd1066aa8e0a05ac3721e
 RUN set -eu; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \

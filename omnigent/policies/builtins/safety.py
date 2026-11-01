@@ -76,14 +76,20 @@ _GOOSE_NATIVE_OS_TOOLS = frozenset(
     }
 )
 
-# opencode-native permission CATEGORIES (the ``permission`` field of a
-# ``permission.asked`` event, mapped to the policy-event tool name by the SSE
-# forwarder — live-verified against 1.17.7). opencode collapses write/edit/patch
-# into ``edit``; ``bash`` is its shell tool (``ShellID.ToolID``). ``bash`` /
-# ``read`` / ``edit`` overlap the lowercase pi set above, but list them
-# explicitly so opencode coverage does not silently depend on that set, and add
-# the file-search categories (``grep`` / ``glob``) pi lacks.
-_OPENCODE_NATIVE_OS_TOOLS = frozenset({"bash", "edit", "read", "grep", "glob"})
+# opencode 2.x ``permission.asked`` actions (write/patch collapse into ``edit``).
+# The ``opencode_*`` MCP resource builtins reach MCP servers under no relay tool
+# name and have no config switch, so they are gated as OS tools too.
+_OPENCODE_NATIVE_OS_TOOLS = frozenset(
+    {
+        "shell",
+        "edit",
+        "read",
+        "grep",
+        "glob",
+        "opencode_list_mcp_resources",
+        "opencode_read_mcp_resource",
+    }
+)
 
 # Codex in-process harness tool names surfaced as observational
 # ``ToolCallRequest`` events. The codex app-server executor translates
@@ -259,8 +265,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Hermes Agent tools** (``terminal``, ``execute_code``,
       ``read_file``, ``write_file``, ``search_files``) — surfaced
       via the ``pre_tool_call`` shell hook.
-    - **opencode native tools** (``bash``, ``edit``, ``read``,
-      ``grep``, ``glob``) — opencode's permission CATEGORIES, surfaced
+    - **opencode native actions** (``shell``, ``edit``, ``read``,
+      ``grep``, ``glob``) — opencode's permission actions, surfaced
       via the SSE forwarder's ``permission.asked`` → policy-evaluate
       path. opencode collapses write/edit/patch into ``edit``.
 
@@ -355,7 +361,117 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+# Agent tools that create or reshape unattended work. The builder injects
+# ``ask_on_scheduled_task_change`` into every engine and exempts these names
+# from its no-policy fast path; both read this set so they cannot drift.
+SCHEDULED_TASK_APPROVAL_TOOLS: frozenset[str] = frozenset(
+    {"sys_scheduled_task_create", "sys_scheduled_task_update"}
+)
+
+
+# Settings a user weighs before approving, shown first in this order so
+# unexpected extra arguments cannot push them out of the prompt.
+_SCHEDULED_TASK_SETTINGS = (
+    "name",
+    "agent_id",
+    "rrule",
+    "timezone",
+    "state",
+    "host_id",
+    "workspace",
+    "execution_target",
+    "project_name",
+    "project_id",
+    "session_mode",
+    "session_id",
+    "permission_mode",
+    "max_cost_usd",
+    "model_override",
+    "reasoning_effort",
+    "prompt",
+)
+_PREVIEW_VALUE_CHARS = 60
+_PREVIEW_EXTRA_CHARS = 200
+
+
+def _clip(value: str) -> str:
+    """Bound a preview value, marking the cut so it cannot pass for the whole value."""
+    if len(value) > _PREVIEW_VALUE_CHARS:
+        return value[: _PREVIEW_VALUE_CHARS - 3] + "..."
+    return value
+
+
+def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
+    """``key=value`` pairs for every argument but ``skip``, each value bounded.
+
+    Known settings come first and are never dropped; other arguments follow and
+    are capped as a group. The free-text prompt can be long enough to push the
+    settings out of the card's truncated argument preview, so it is reported by
+    length only.
+    """
+
+    def pair(key: str) -> str:
+        value = str(args[key])
+        if key == "prompt":
+            return f"prompt={len(value)} chars"
+        return f"{key}={_clip(value)}"
+
+    known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key != skip]
+    keys = sorted(key for key in args if key not in _SCHEDULED_TASK_SETTINGS and key != skip)
+    extra: list[str] = []
+    remaining = _PREVIEW_EXTRA_CHARS
+    for index, key in enumerate(keys):
+        item = pair(key)
+        size = len(item) + (2 if extra else 0)
+        suffix = 5 if index < len(keys) - 1 else 0
+        if size + suffix > remaining:
+            extra.append("...")
+            break
+        extra.append(item)
+        remaining -= size
+    return ", ".join([*known, *extra])
+
+
+def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
+    """ASK for user approval before an agent creates or updates a scheduled task.
+
+    Matches ``event["target"]`` (the dispatched tool identity) rather than
+    ``data["name"]``, which an earlier policy may have transformed. Reads
+    and ``sys_scheduled_task_delete`` are not gated here: deleting a task
+    only removes future runs instead of scheduling new unattended work.
+
+    :param event: Policy event dict.
+    :returns: ASK if a scheduled task is being created or updated, ALLOW
+        otherwise.
+    """
+    if event.get("type") != "tool_call":
+        return _ALLOW
+    tool = event.get("target")
+    if tool not in SCHEDULED_TASK_APPROVAL_TOOLS:
+        return _ALLOW
+    data = event.get("data")
+    args = data.get("arguments") if isinstance(data, dict) else None
+    if not isinstance(args, dict):
+        args = {}
+    action = "create" if tool == "sys_scheduled_task_create" else "update"
+    if not args:
+        preview = f"{action} a scheduled task (details unavailable)"
+    elif action == "create":
+        name = _clip(str(args.get("name") or "(unnamed)"))
+        settings = _scheduled_task_settings(args, skip="name")
+        preview = f"create scheduled task {name!r} ({settings or 'no settings'})"
+    else:
+        task_id = _clip(str(args.get("scheduled_task_id") or "(no id)"))
+        settings = _scheduled_task_settings(args, skip="scheduled_task_id")
+        preview = f"update scheduled task {task_id} ({settings or 'no fields'})"
+    return {
+        "result": "ASK",
+        "reason": f"Agent wants to {preview}. Approve?",
+    }
+
+
 # ── Skill blocking ──────────────────────────────────────────────────────────
+
 
 # Omnigent runner tools that load skills in non-native (SDK) harnesses.
 _SKILL_TOOLS = frozenset({"load_skill", "read_skill_file"})
@@ -364,6 +480,9 @@ _SKILL_TOOLS = frozenset({"load_skill", "read_skill_file"})
 # evaluated server-side at ``POST /v1/sessions/{id}/policies/evaluate``.
 # The tool takes a ``skill`` argument with the skill name.
 _NATIVE_SKILL_TOOL = "Skill"
+
+# opencode's ``skill`` permission action; the forwarder passes the skill id as ``skill``.
+_OPENCODE_SKILL_ACTION = "skill"
 
 
 def block_skills(blocked: list[str]) -> PolicyCallable:
@@ -453,9 +572,9 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
                     }
                 return _ALLOW
 
-            # Path 2: Claude Code / Codex native Skill tool.
-            # Fired via PreToolUse hook → Omnigent /policies/evaluate.
-            if tool == _NATIVE_SKILL_TOOL:
+            # Path 2: Claude Code / Codex native Skill tool, or opencode's
+            # ``skill`` permission action; both carry the name as ``skill``.
+            if tool in (_NATIVE_SKILL_TOOL, _OPENCODE_SKILL_ACTION):
                 skill_name = args.get("skill")
                 if skill_name and _is_blocked(skill_name):
                     return {
@@ -777,7 +896,7 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "covers Omnigent sys_os_* tools, Claude Code and Codex native tools "
         "(Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep), "
         "Cursor native tools (Shell), Pi native tools (read, bash, write, edit), "
-        "opencode native tools (bash, edit, read, grep, glob), "
+        "opencode native tools (shell, edit, read, grep, glob), "
         "Goose native tools (developer__shell and the developer__* file tools), "
         "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
         "params_schema": None,

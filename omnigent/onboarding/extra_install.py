@@ -92,7 +92,7 @@ def extra_install_command(extra: str) -> list[str]:
         # on PATH.
         return ["uv", "pip", "install", "--python", sys.executable, target]
 
-    return [sys.executable, "-m", "pip", "install", target]
+    return [sys.executable, "-P", "-m", "pip", "install", target]
 
 
 def extra_install_display(extra: str) -> str:

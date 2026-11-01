@@ -1,8 +1,95 @@
 """Failure evidence cannot override attribution, leak credentials, or reject an edge."""
 
+import json
+
 import pytest
 
-from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
+from omnigent.native.failure_telemetry import (
+    exception_code_origin,
+    failure_log_attributes,
+    normalize_failure_context,
+    provider_error_context_from_text,
+)
+
+
+@pytest.mark.parametrize("prefer_framework", [False, True])
+def test_code_origin_can_name_the_caller_instead_of_a_library_leaf(prefer_framework: bool) -> None:
+    with pytest.raises(ValueError) as raised:
+        json.loads("private-runner-data")
+    origin = exception_code_origin(
+        raised.value, prefer_module_prefix=__name__ if prefer_framework else None
+    )
+    assert origin is not None
+    assert origin.startswith(__name__ if prefer_framework else "json.")
+    assert origin.rsplit(":", 1)[1].isdigit()
+    assert len(origin) <= 256
+    assert "private-runner-data" not in origin
+    assert __file__ not in origin
+
+
+def test_code_origin_does_not_invent_a_traceback() -> None:
+    assert exception_code_origin(RuntimeError("private-runner-data")) is None
+    assert exception_code_origin(None) is None
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_provider_error_json_retains_only_typed_inference_facts(nested: bool) -> None:
+    envelope = {
+        "error": {
+            "type": "invalid_request_error",
+            "code": "array_above_max_length",
+            "param": "input[3].content",
+            "message": "private provider message",
+        },
+        "request_id": "unqualified-inference-request",
+        "gateway_request_id": "gateway-request",
+        "status_code": 400,
+        "origin": "forged",
+        "session_id": "forged",
+    }
+    text = json.dumps(envelope)
+    if nested:
+        text = json.dumps({"error_code": "BAD_REQUEST", "message": text})
+    assert provider_error_context_from_text(text) == {
+        "provider_error_type": "invalid_request_error",
+        "provider_error_code": "array_above_max_length",
+        "provider_error_param": "input[3].content",
+        "native_error_request_id": "unqualified-inference-request",
+        "gateway_request_id": "gateway-request",
+        "http_status": 400,
+        "inference_detail_source": "provider_error_json",
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "plain failure",
+        "{malformed",
+        json.dumps({"type": "message", "code": "not-a-provider-error"}),
+        json.dumps({"error": "unstructured", "request_id": "not-proven-inference"}),
+        json.dumps({"error": {"code": "oversized"}, "padding": "x" * 17000}),
+        '{"error":' + '{"nested":' * 1200 + "null" + "}" * 1201,
+    ],
+    ids=["missing", "prose", "malformed", "unmarked-json", "unstructured", "oversized", "deep"],
+)
+def test_unusable_provider_error_text_adds_no_inferred_facts(text: object) -> None:
+    assert provider_error_context_from_text(text) == {}
+
+
+def test_provider_error_json_stops_after_three_envelopes_and_redacts_fields() -> None:
+    text = json.dumps({"error": {"code": "unreachable-leaf"}})
+    for index in range(4):
+        text = json.dumps({"error_code": f"wrapper_{index}", "message": text})
+    context = provider_error_context_from_text(text)
+    assert context["provider_error_code"] == "wrapper_1"
+    assert "unreachable-leaf" not in str(context)
+    context = provider_error_context_from_text(
+        json.dumps({"error": {"code": 0, "param": 'password="synthetic secret"'}})
+    )
+    assert context["provider_error_code"] == "0"
+    assert context["provider_error_param"] == 'password="[REDACTED]"'
 
 
 @pytest.mark.parametrize("value", [None, [], "bad", 17, {"http_status": True}])

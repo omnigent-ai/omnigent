@@ -1,0 +1,8 @@
+{
+  "name": "omnigent-harness-opencode",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@opencode/cli": "2.0.32"
+  }
+}

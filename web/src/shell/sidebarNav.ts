@@ -1,4 +1,4 @@
-import type { Conversation } from "@/hooks/useConversations";
+import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
@@ -211,38 +211,22 @@ export function filterConversations(
   });
 }
 
-// Sort by `updated_at` desc so the order matches the row's relative-time
-// pill. The active chat uses its frozen snapshot from
-// `activeOverride` instead of its live `updated_at`, so sending a message
-// in the chat you're already viewing doesn't move it.
-//
-// `frozenKeys` (when non-null) pins EVERY row's sort key at its
-// first-seen value: a row's key is read from the map, or captured into it
-// on first sight. The sidebar passes its map while the pointer is inside
-// the list, so background `updated_at` bumps can't slide rows under the
-// cursor — a mid-interaction reorder sends clicks, right-clicks, and the
-// renames they trigger to the wrong session. Rows first seen while frozen
-// (a folder expanding, a page loading) capture their key on entry, and
-// the caller clears the map when the pointer leaves so the order snaps
-// back to reality.
-export function sortByUpdatedAtDesc(
+// Newest first; equal timestamps fall back to id, so arrival order never shows.
+// Freeze update timestamps for the active chat and hovered list; creation
+// timestamps stay immutable, including when the selected order changes.
+export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
   frozenKeys?: Map<string, number> | null,
+  sortBy: SessionSortBy = "updated_at",
 ): Conversation[] {
   const effective = (c: Conversation): number => {
-    if (frozenKeys) {
-      const frozen = frozenKeys.get(c.id);
-      if (frozen !== undefined) return frozen;
-      // Capture the override value for the active row so dropping the
-      // override mid-hover (navigating to another chat) can't move it.
-      const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
-      frozenKeys.set(c.id, live);
-      return live;
-    }
-    return activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const updatedAt = frozenKeys?.get(c.id) ?? live;
+    frozenKeys?.set(c.id, updatedAt);
+    return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort((a, b) => effective(b) - effective(a));
+  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */
@@ -258,30 +242,30 @@ export function statusBucket(c: Conversation, unseen: boolean, hasDraft: boolean
   return "Done";
 }
 
-export const UPDATED_BUCKETS = [
-  "Today",
-  "Yesterday",
-  "Previous 7 days",
-  "Previous 30 days",
-  "Older",
+export const DATE_BUCKETS = [
+  "today",
+  "yesterday",
+  "in the last 7 days",
+  "in the last 30 days",
+  "earlier",
 ] as const;
-export type UpdatedBucket = (typeof UPDATED_BUCKETS)[number];
+export type DateBucket = (typeof DATE_BUCKETS)[number];
 
-/** Bucket an `updated_at` (unix seconds) by local calendar day relative to `now`. */
-export function updatedBucket(updatedAt: number, now: Date): UpdatedBucket {
+/** Bucket a timestamp (unix seconds) by local calendar day relative to `now`. */
+export function dateBucket(timestamp: number, now: Date): DateBucket {
   // Local midnights via the Date constructor, so DST days aren't an hour off.
   const midnight = (daysAgo: number) =>
     new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo).getTime();
-  const at = updatedAt * 1000;
-  if (at >= midnight(0)) return "Today";
-  if (at >= midnight(1)) return "Yesterday";
-  if (at >= midnight(7)) return "Previous 7 days";
-  if (at >= midnight(30)) return "Previous 30 days";
-  return "Older";
+  const at = timestamp * 1000;
+  if (at >= midnight(0)) return "today";
+  if (at >= midnight(1)) return "yesterday";
+  if (at >= midnight(7)) return "in the last 7 days";
+  if (at >= midnight(30)) return "in the last 30 days";
+  return "earlier";
 }
 
 /**
- * Split `rows` into non-empty groups in `order`, keeping input order within each
+ * Split `rows` into groups in `order`, keeping input order within each
  * group. A row with no key (or one outside `order`) lands in the last group
  * rather than vanishing.
  */
@@ -289,6 +273,7 @@ export function groupConversations<K extends string>(
   rows: readonly Conversation[],
   keyOf: (c: Conversation) => K | undefined,
   order: readonly K[],
+  keepEmpty?: K,
 ): { title: K; conversations: Conversation[] }[] {
   const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
   const fallback = byKey.get(order[order.length - 1]);
@@ -299,7 +284,7 @@ export function groupConversations<K extends string>(
   }
   return order.flatMap((title) => {
     const conversations = byKey.get(title) ?? [];
-    return conversations.length > 0 ? [{ title, conversations }] : [];
+    return conversations.length > 0 || title === keepEmpty ? [{ title, conversations }] : [];
   });
 }
 
