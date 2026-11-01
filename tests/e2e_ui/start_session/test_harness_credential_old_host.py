@@ -264,7 +264,8 @@ def test_setup_dialog_save_against_old_host_gives_prompt_feedback(old_host_serve
     """Saving a key in the setup dialog against the old host answers promptly.
 
     The user journey behind the report: pick the v0.6.0 host, pick a Claude
-    agent (needs-auth there), open "Set up" → "Set up auth", paste a key, Save.
+    agent (needs-auth there), open "Set up" → "Use an API key or gateway URL instead",
+    paste a key, Save.
     On the buggy build the save spins ~30s with no feedback, then toasts
     ``Couldn't save the credential: host ... did not respond to store_secret
     within 30s``. The UI must surface feedback well before that dead wait, and
@@ -299,7 +300,9 @@ async def _drive_setup_dialog_save(base_url: str) -> None:
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
             await expect(setup).to_be_visible(timeout=60_000)
             await setup.click()
-            await page.get_by_test_id("harness-setup-add-credential").click(timeout=15_000)
+            await page.get_by_role("button", name="Use an API key or gateway URL instead").click(
+                timeout=15_000
+            )
             await expect(page.get_by_test_id("harness-credential-form")).to_be_visible(
                 timeout=5_000
             )
