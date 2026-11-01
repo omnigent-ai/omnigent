@@ -325,6 +325,8 @@ async def test_signer_backed_home_rejects_symlink_temp_root(
     assert not list(real_root.iterdir())
 
 
+# Simulates Windows chmod on POSIX; native Windows fails the temp-root check first.
+@pytest.mark.posix_only
 async def test_signer_backed_home_rejects_mode_windows_chmod_cannot_set(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
