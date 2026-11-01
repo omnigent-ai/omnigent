@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  effortAfterModelChange,
   effortLevelsForConv,
   modelPickerKindForConv,
+  selectedModelForPicker,
+  sdkEffortFamilyForHarness,
   shouldShowEffortPicker,
   shouldShowModelPicker,
-} from "./ChatPage";
+} from "@/lib/composerCapabilities";
 
 // These pin the composer capability gates (effort levels, model picker, effort
 // picker). Wrapper labels are authoritative; the resolved harness is the fallback
@@ -14,6 +17,63 @@ import {
 // label-less sub-agent child.
 
 const NATIVE = "claude-code-native-ui";
+
+it.each([
+  { kind: "claude", requested: "request", reported: "report", expected: "report" },
+  { kind: "codex", requested: "request", reported: "", expected: "request" },
+  { kind: "claude", requested: "request", reported: "wire-model", expected: "catalog-row" },
+  {
+    kind: "claude",
+    requested: "opus",
+    reported: "system.ai.claude-opus-4-8[1m]",
+    expected: "opus[1m]",
+  },
+  {
+    kind: "codex",
+    requested: "opus",
+    reported: "SYSTEM.AI.CLAUDE-OPUS-4-8[1M]",
+    expected: "opus[1m]",
+  },
+  {
+    kind: "claude",
+    requested: "opus",
+    reported: "system.ai.claude-sonnet-5[1m]",
+    expected: "system.ai.claude-sonnet-5[1m]",
+  },
+  { kind: "configured", requested: null, reported: "report", expected: "report" },
+] as const)(
+  "resolves the selected model from $kind request=$requested report=$reported",
+  ({ kind, requested, reported, expected }) => {
+    expect(
+      selectedModelForPicker(
+        kind,
+        [
+          { id: "catalog-row", model: "wire-model" },
+          { id: "opus", model: "claude-opus-4-8" },
+          { id: "opus[1m]", model: "claude-opus-4-8[1m]" },
+          { id: "sonnet", model: "claude-sonnet-5" },
+        ],
+        requested,
+        reported,
+      ),
+    ).toBe(expected);
+  },
+);
+
+it.each([
+  { effort: null, expected: null },
+  { effort: "unsupported", expected: null },
+  { effort: "high", expected: "high" },
+])("preserves only compatible explicit effort ($effort)", ({ effort, expected }) => {
+  expect(effortAfterModelChange(effort, ["low", "high"])).toBe(expected);
+});
+
+it("uses declared effort families only for SDK harnesses", () => {
+  const families = { "claude-sdk": "anthropic", "antigravity-native": "gemini" };
+  expect(sdkEffortFamilyForHarness("claude-sdk", families)).toBe("anthropic");
+  expect(sdkEffortFamilyForHarness("antigravity-native", families)).toBeNull();
+  expect(sdkEffortFamilyForHarness(null, families)).toBeNull();
+});
 
 describe("effortLevelsForConv", () => {
   it("returns the extended ladder (xhigh, max) for claude-code-native-ui", () => {

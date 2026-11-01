@@ -18,6 +18,7 @@ from omnigent.runner.resource_registry import (
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
+    TerminalLifecycle,
 )
 from omnigent.terminals import registry as terminal_registry_module
 from omnigent.terminals.registry import TerminalRegistry
@@ -108,12 +109,15 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
         "auxiliary" if role == CODEX_NATIVE_TERMINAL_ROLE else "required"
     )
     excerpt = records[0].attributes["terminal_last_output"]
-    if role == CODEX_NATIVE_TERMINAL_ROLE and capture == "1":
+    assert records[0].attributes["terminal_exit_during_startup"] == "true"
+    if capture == "1":
         assert "unexpected argument" in excerpt
         assert "[REDACTED]" in excerpt
+        assert records[0].attributes["terminal_last_output_status"] == "captured"
     else:
         assert excerpt is None
         assert "unexpected argument" not in str(row)
+        assert records[0].attributes["terminal_last_output_status"] == "withheld"
     assert "private-startup-token" not in str(row)
     assert published == []
     assert terminals.get("failed-child", "native", "main") is None
@@ -165,3 +169,55 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
     assert "private-startup-token" not in message
     assert "thread discovery timed out" not in message
     assert len(message) < 4500
+
+
+@pytest.mark.parametrize(
+    ("reached_input_ready", "pane", "expected_status"),
+    [
+        (False, "Error: Claude Code exited with code 1", "captured"),
+        (False, "", "unavailable"),
+        (True, "Error: Claude Code exited with code 1", None),
+    ],
+)
+async def test_observed_exit_before_input_ready_records_redacted_pane(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    reached_input_ready: bool,
+    pane: str,
+    expected_status: str | None,
+) -> None:
+    """A native agent dying before its input is ready keeps its last pane in telemetry."""
+    resources = SessionResourceRegistry(terminal_registry=TerminalRegistry())
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    secret = "private-startup-token-" * 20
+    instance._remember_pane_snapshot(f"Authorization: Bearer {secret}\n{pane}" if pane else "")
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.resource_registry"):
+        await resources._finalize_terminal_exit(
+            session_id="startup-exit",
+            terminal_name="claude",
+            session_key="main",
+            lifecycle=TerminalLifecycle.REQUIRED,
+            instance=instance,
+            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+            reached_input_ready=reached_input_ready,
+        )
+
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    ]
+    attributes = record.attributes
+    assert attributes.get("terminal_last_output_status") == expected_status
+    row = str(record_to_row(record, "runner"))
+    assert "private-startup-token" not in row
+    if expected_status == "captured":
+        assert attributes["terminal_exit_during_startup"] == "true"
+        assert "Claude Code exited with code 1" in attributes["terminal_last_output"]
+        assert "[REDACTED]" in attributes["terminal_last_output"]
+    else:
+        assert attributes["terminal_last_output"] is None
+    if reached_input_ready:
+        # A normal exit after the session was usable is not a startup failure.
+        assert "terminal_exit_during_startup" not in attributes
