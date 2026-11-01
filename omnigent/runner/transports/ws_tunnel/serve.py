@@ -1282,6 +1282,8 @@ async def _serve_tunnel_once(
                 reconnect=reconnect,
                 attempt=attempt,
                 downtime_s=_round_seconds(downtime_s),
+                # Spawn-to-connected time of a fresh runner (fork or exec included).
+                process_age_ms=None if reconnect else _process_age_ms(),
                 pid=os.getpid(),
                 **diagnostics.snapshot(),
             ),
@@ -1988,3 +1990,14 @@ class _CloseDetails:
 def _round_seconds(value: float | None) -> float | None:
     """Round a duration for a debug-log attribute; ``None`` passes through."""
     return None if value is None else round(value, 3)
+
+
+def _process_age_ms() -> int | None:
+    """Milliseconds since this process was created, or ``None`` if unknown."""
+    import psutil
+
+    try:
+        created_at = psutil.Process().create_time()
+    except psutil.Error:
+        return None
+    return round((time.time() - created_at) * 1000)

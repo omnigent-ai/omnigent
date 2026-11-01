@@ -20,7 +20,7 @@ import contextlib
 import threading
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -47,6 +47,7 @@ from omnigent.server.auth import (
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
 from omnigent.terminals.ws_common import WS_CLOSE_WRONG_REPLICA
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -600,9 +601,12 @@ async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> Non
     factory = _FakeRunnerWSFactory(conn)
     set_runner_ws_factory(factory)
 
-    with TestClient(app).websocket_connect(
-        "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
-    ) as ws:
+    with (
+        capture_debug_rows("server") as rows,
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
+        ) as ws,
+    ):
         # The runner emits one binary frame, then closes cleanly.
         msg = ws.receive_bytes()
         assert msg == pty_bytes
@@ -612,6 +616,10 @@ async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> Non
     assert factory.calls == [
         "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
     ]
+    # One timing row per attach, for the first frame only.
+    (first_output,) = [row for row in rows if row["event_name"] == "terminal_attach_first_output"]
+    assert first_output["session_id"] == "conv_ws"
+    assert int(cast(dict[str, str], first_output["attributes"])["first_output_ms"]) >= 0
 
 
 async def test_attach_terminal_proxy_forwards_await_launch(app: FastAPI) -> None:

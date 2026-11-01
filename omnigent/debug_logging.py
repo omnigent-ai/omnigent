@@ -37,6 +37,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -551,6 +552,47 @@ def debug_event(
     if user_id is not None:
         extra["user_id"] = user_id
     return extra
+
+
+class StageTimings:
+    """Split one operation's wall time into named, back-to-back stages.
+
+    Each :meth:`mark` closes the stage that ran since the previous mark (or
+    since construction), so a long function records its stages without
+    re-indenting them into ``with`` blocks::
+
+        timings = StageTimings()
+        await fetch_config()
+        timings.mark("config")
+        await spawn_tmux()
+        timings.mark("tmux_launch")
+        _logger.info("launched", extra=debug_event("launched", **timings.attributes()))
+
+    :param clock: Monotonic clock returning seconds, e.g. :func:`time.monotonic`.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._started_at = clock()
+        self._last = self._started_at
+        self._stages: dict[str, float] = {}
+
+    def mark(self, stage: str) -> None:
+        """Close *stage*; a repeated name adds to its earlier time.
+
+        :param stage: Short stage name, e.g. ``"catalog"``.
+        """
+        now = self._clock()
+        self._stages[stage] = self._stages.get(stage, 0.0) + (now - self._last)
+        self._last = now
+
+    def attributes(self) -> dict[str, Any]:
+        """Return ``{"<stage>_ms": ..., "total_ms": ...}`` rounded to milliseconds.
+
+        Typed ``Any`` so it unpacks into :func:`debug_event` attributes.
+        """
+        stages = {f"{name}_ms": round(seconds * 1000) for name, seconds in self._stages.items()}
+        return {**stages, "total_ms": round((self._clock() - self._started_at) * 1000)}
 
 
 def _stack_trace(record: logging.LogRecord) -> str | None:

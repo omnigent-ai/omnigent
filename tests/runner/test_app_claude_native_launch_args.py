@@ -1311,6 +1311,7 @@ async def _auto_create_claude_terminal_for_test(
     session_id: str,
     workspace: Path,
     registry: object,
+    publish_event: object | None = None,
 ) -> None:
     """
     Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
@@ -1319,6 +1320,7 @@ async def _auto_create_claude_terminal_for_test(
     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
     :param registry: Session resource registry double.
+    :param publish_event: Event publisher double; a plain ``Mock`` by default.
     :returns: None. Raises whatever the auto-create path raises.
     """
     from unittest.mock import AsyncMock, Mock
@@ -1335,7 +1337,7 @@ async def _auto_create_claude_terminal_for_test(
     await orchestration._auto_create_claude_terminal(
         session_id,
         registry,
-        Mock(),
+        publish_event if publish_event is not None else Mock(),
         server_client=AsyncMock(spec=httpx.AsyncClient),
         session_init=_claude_auto_create_session_init(session_id, workspace),
         auth_token_factory=lambda: None,
@@ -1392,6 +1394,63 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
     registry.launch_required_terminal.assert_awaited_once()
+
+
+async def test_auto_create_claude_terminal_logs_stage_timings(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A launched Claude pane logs how long each launch stage took."""
+    import logging
+    from unittest.mock import Mock
+
+    from omnigent.entities.session_resources import SessionResourceView
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.return_value = SessionResourceView(
+        id="terminal_claude_main",
+        type="terminal",
+        session_id="conv_timed_launch",
+        name="claude:main",
+        metadata={"running": True},
+    )
+    # Stop right after the launch row: the steps past it need a live pane.
+    publish_event = Mock(side_effect=RuntimeError("stop after launch"))
+
+    with (
+        caplog.at_level(logging.INFO, logger="omnigent.runner.app"),
+        pytest.raises(RuntimeError, match="stop after launch"),
+    ):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id="conv_timed_launch",
+            workspace=bridge_dir,
+            registry=registry,
+            publish_event=publish_event,
+        )
+
+    (record,) = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_terminal_launched"
+    ]
+    assert record.attributes["terminal_id"] == "terminal_claude_main"
+    stages = (
+        "bridge",
+        "launch_metadata",
+        "resume_transcript",
+        "launch_config",
+        "catalog",
+        "prepare_terminal",
+        "tmux_launch",
+    )
+    for stage in stages:
+        assert record.attributes[f"{stage}_ms"] >= 0
+    assert record.attributes["total_ms"] >= sum(
+        record.attributes[f"{stage}_ms"] for stage in stages
+    ) - len(stages)
 
 
 @pytest.mark.parametrize(

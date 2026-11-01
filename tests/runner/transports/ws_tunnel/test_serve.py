@@ -1284,6 +1284,8 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert attributes["attempt"] == 1
     assert attributes["pid"] == os.getpid()
     assert attributes["downtime_s"] is None
+    # A first connect reports how long the process took to come up.
+    assert attributes["process_age_ms"] >= 0
     assert attributes["protocol_keepalive_source"] == "websockets_connection"
     assert attributes["protocol_ping_interval_s"] == keepalive[0]
     assert attributes["protocol_ping_timeout_s"] == keepalive[1]
@@ -1346,6 +1348,7 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert reconnected["reconnect"] is True
     assert reconnected["attempt"] == 2
     assert reconnected["downtime_s"] >= 1.5
+    assert reconnected["process_age_ms"] is None
     assert json.loads(captured["sent"])["connection_id"] == "conn-reconnect"
 
 
