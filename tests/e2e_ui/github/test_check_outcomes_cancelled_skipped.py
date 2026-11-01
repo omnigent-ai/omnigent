@@ -99,6 +99,10 @@ def test_cancelled_and_skipped_checks_get_their_own_pills(
     base_url, session_id = pr_session
     page: Page = request.getfixturevalue("page")
     rail = open_pull_requests_tab(page, base_url, session_id)
+    linked_prs = rail.get_by_role("list", name="Pull requests")
+    expect(linked_prs.get_by_role("button", name="2 passed")).to_be_visible()
+    expect(linked_prs.get_by_role("button", name=re.compile("cancelled|skipped"))).to_have_count(0)
+    linked_prs.get_by_role("button", name=re.compile(r"^acme\/app #4242")).click()
     expect(rail.get_by_role("link", name=f"{PR_TITLE} #{PR_NUMBER}")).to_be_visible(timeout=30_000)
     checks = rail.get_by_role("heading", name="Checks").locator("..")
     pills = checks.get_by_role("button", name=PILL)

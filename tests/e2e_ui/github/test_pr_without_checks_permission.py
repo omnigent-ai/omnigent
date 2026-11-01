@@ -94,7 +94,12 @@ def test_branch_pr_resolves_when_checks_are_forbidden(
     page: Page = request.getfixturevalue("page")
     rail = open_pull_requests_tab(page, base_url, session_id)
     no_pr = rail.get_by_text(re.compile(rf"No open PR for\s*{BRANCH}"))
-    expect(_pr_header(rail).or_(no_pr)).to_be_visible(timeout=30_000)
+    row = rail.get_by_role("list", name="Pull requests").get_by_role(
+        "button", name=re.compile(r"^example\/project #42")
+    )
+    expect(row.or_(no_pr)).to_be_visible(timeout=30_000)
+    if row.count():
+        row.click()
     page.screenshot(path=str(tmp_path / "branch-pr.png"), animations="disabled")
     calls = [json.loads(line) for line in (binary / "gh-calls.log").read_text().splitlines()]
     assert any(c["args"][:2] == ["pr", "view"] and c["rc"] == 1 for c in calls), calls
@@ -111,12 +116,15 @@ def test_linked_pr_resolves_when_checks_are_forbidden(
     page: Page = request.getfixturevalue("page")
     rail = open_pull_requests_tab(page, base_url, session_id)
     no_pr = rail.get_by_text(re.compile(rf"No open PR for\s*{BRANCH}"))
-    expect(_pr_header(rail).or_(no_pr)).to_be_visible(timeout=30_000)
+    row = rail.get_by_role("list", name="Pull requests").get_by_role(
+        "button", name=re.compile(r"^example\/project #42")
+    )
+    expect(row.or_(no_pr)).to_be_visible(timeout=30_000)
     rail.get_by_role("button", name="Link a PR", exact=True).click()
     rail.get_by_label("Pull request URL").fill(PR_URL)
     rail.get_by_role("button", name="Link", exact=True).click()
-    picker = rail.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("#42", timeout=30_000)
+    expect(rail.get_by_label("Pull request URL")).to_have_count(0)
+    row.click()
     unreachable = rail.get_by_text(re.compile(r"Can.t reach the upstream repo"))
     expect(_pr_header(rail).or_(unreachable)).to_be_visible(timeout=30_000)
     page.screenshot(path=str(tmp_path / "linked-pr.png"), animations="disabled")

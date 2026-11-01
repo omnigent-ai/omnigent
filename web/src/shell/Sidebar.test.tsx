@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
@@ -16,7 +17,7 @@ import { useEffect } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
 import * as readStateHooks from "@/hooks/useUnseenConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { ARIA_MOD_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -51,6 +52,7 @@ const {
   pinnedIdsRef,
   projectSessionsMock,
   projectSessionsLoadingRef,
+  projectSessionsNextPage,
   useHostsMock,
   usePullRequestInfoMock,
   useSessionWorktreesMock,
@@ -81,6 +83,9 @@ const {
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
   projectSessionsLoadingRef: { current: false },
+  // Per-project server-page stub: a folder listed here reports another page
+  // and calls its function from fetchNextPage.
+  projectSessionsNextPage: { current: {} as Record<string, () => unknown> },
   useHostsMock: vi.fn(),
   usePullRequestInfoMock: vi.fn(),
   useSessionWorktreesMock: vi.fn(),
@@ -132,14 +137,15 @@ vi.mock("@/hooks/useConversations", async () => {
       data:
         projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
     }),
-    useProjectSessions: (project: string, enabled: boolean) => {
+    useProjectSessions: (project: string, enabled: boolean, _sortBy: unknown, archived = false) => {
       const override = projectSessionsMock.current[project];
       const loading = enabled && projectSessionsLoadingRef.current;
       const rows = !enabled
         ? []
         : (override ??
           conversationsRef.current.filter(
-            (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
+            (c) =>
+              (c.labels?.omni_project ?? null) === project && (c.archived === true) === archived,
           ));
       return {
         data:
@@ -152,8 +158,8 @@ vi.mock("@/hooks/useConversations", async () => {
         isLoading: loading,
         isError: false,
         error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
+        fetchNextPage: projectSessionsNextPage.current[project] ?? vi.fn(),
+        hasNextPage: enabled && project in projectSessionsNextPage.current,
         isFetchingNextPage: false,
       };
     },
@@ -182,6 +188,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
 import { useSessionImportStore } from "@/store/sessionImport";
 import * as identity from "@/lib/identity";
 
@@ -315,6 +322,7 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
   projectSessionsLoadingRef.current = false;
+  projectSessionsNextPage.current = {};
   pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
@@ -570,7 +578,8 @@ describe("Sidebar session list", () => {
     selectSessionFilter(view);
 
     expect(screen.getByText("pinned-session")).toBe(pinned);
-    expect(screen.getByText("filed-session")).toBe(filed);
+    if (view === "archived") expect(screen.queryByText("filed-session")).toBeNull();
+    else expect(screen.getByText("filed-session")).toBe(filed);
     expect(screen.getByTestId("session-filter")).toBe(filter);
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
     expect(within(sessions).getByRole("status")).toHaveTextContent(
@@ -582,7 +591,8 @@ describe("Sidebar session list", () => {
     }
     selectSessionFilter("mine");
     expect(screen.getByText("pinned-session")).toBe(pinned);
-    expect(screen.getByText("filed-session")).toBe(filed);
+    if (view === "archived") expect(screen.getByText("filed-session")).toBeInTheDocument();
+    else expect(screen.getByText("filed-session")).toBe(filed);
   });
 
   it("reveals a thin, theme-aware scrollbar only while scrolling", () => {
@@ -1259,6 +1269,20 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
   });
 
+  it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/tasks/task_abc123");
+
+    // Automations is highlighted on the detail route — same pill as the list page.
+    expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
+      "bg-[var(--sidebar-active)]",
+    );
+    // The detail route must not activate New session.
+    expect(screen.getByTestId("new-chat-button").className).not.toContain(
+      "bg-[var(--sidebar-active)]",
+    );
+  });
+
   it("does NOT close the sidebar when the footer Settings is tapped", () => {
     // No onNavClick on the footer Settings link: on mobile the overlay stays
     // open and swaps to the settings section list rather than collapsing onto
@@ -1405,10 +1429,9 @@ describe("Sidebar session list", () => {
     await waitFor(() => {
       const tooltip = screen.getByTestId("session-tooltip-content");
       expect(tooltip).toHaveTextContent(title);
-      // The tooltip mirrors the pinned-project flyout's compact HoverCard look
-      // (bg-popover surface), not the old wide card.
-      expect(tooltip.className).toContain("bg-popover");
-      expect(tooltip.className).not.toContain("bg-card-solid");
+      // Session details use the shared translucent menu surface, not an opaque card.
+      expect(tooltip).toHaveClass("menu-surface");
+      expect(tooltip).not.toHaveClass("bg-popover", "bg-card-solid");
       // The title matches sidebar row names through the shared compact class,
       // which resolves to the same text-ui step as Appearance content.
       const tooltipTitle = tooltip.querySelector("p.sidebar-compact-text");
@@ -2607,6 +2630,232 @@ describe("Sidebar project sections", () => {
   });
 });
 
+// An expanded folder lists five sessions; each "Show more" lists five more.
+describe("Sidebar project Show more", () => {
+  // Filed sessions, newest first: conv_filed_0 … conv_filed_{count - 1}.
+  const filedSessions = (count: number) =>
+    Array.from({ length: count }, (_, i) =>
+      conv(`conv_filed_${i}`, "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        updated_at: 100 - i,
+      }),
+    );
+  const filedIds = (count: number) => filedSessions(count).map((c) => c.id);
+  const folderRowIds = () =>
+    Array.from(
+      screen
+        .getByText("Customer X")
+        .closest("section")!
+        .querySelectorAll("[data-sidebar-session-id]"),
+      (row) => row.getAttribute("data-sidebar-session-id"),
+    );
+  const toggleFolder = () => fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+
+  function LocationProbe() {
+    return <div data-testid="loc">{useLocation().pathname}</div>;
+  }
+  // Mounted on a session route so useParams resolves the open session.
+  function renderOnSession(sessionId: string) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[`/c/${sessionId}`]}>
+              <Routes>
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+              <LocationProbe />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("lists five more sessions per click until none remain", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(12));
+    renderSidebar();
+    toggleFolder();
+
+    expect(folderRowIds()).toEqual(filedIds(5));
+    // The hand cursor, like the session rows' links.
+    expect(screen.getByTestId("project-show-more")).toHaveClass("cursor-pointer");
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(filedIds(10));
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(filedIds(12));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+  });
+
+  it.each([
+    {
+      reduceMotion: false,
+      animated: ["UL", "LI", "LI", "LI", "LI", "LI"],
+      listKeyframes: [
+        { height: "140px", overflow: "hidden" },
+        { height: "280px", overflow: "hidden" },
+      ],
+    },
+    { reduceMotion: true, animated: [], listKeyframes: undefined },
+  ])(
+    "slides the list open over the rows Show more adds (reduced motion: $reduceMotion)",
+    ({ reduceMotion, animated, listKeyframes }) => {
+      projectsMock.push("Customer X");
+      mockConversations(filedSessions(12));
+      // jsdom has no layout or Web Animations: lists measure 28px per row, and
+      // animations are recorded instead of played.
+      const animate = vi.fn();
+      Object.defineProperty(Element.prototype, "animate", { configurable: true, value: animate });
+      Object.defineProperty(HTMLUListElement.prototype, "offsetHeight", {
+        configurable: true,
+        get(this: HTMLUListElement) {
+          return this.children.length * 28;
+        },
+      });
+      const matchMedia = window.matchMedia;
+      window.matchMedia = (query: string) => ({
+        ...matchMedia(query),
+        matches: reduceMotion && query === "(prefers-reduced-motion: reduce)",
+      });
+      try {
+        renderSidebar();
+        toggleFolder();
+        fireEvent.click(screen.getByTestId("project-show-more"));
+
+        expect(animate.mock.contexts.map((element) => (element as Element).tagName)).toEqual(
+          animated,
+        );
+        expect(animate.mock.calls[0]?.[0]).toEqual(listKeyframes);
+      } finally {
+        Reflect.deleteProperty(Element.prototype, "animate");
+        Reflect.deleteProperty(HTMLUListElement.prototype, "offsetHeight");
+        window.matchMedia = matchMedia;
+      }
+    },
+  );
+
+  it("offers no Show more for a folder of five sessions", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(5));
+    renderSidebar();
+    toggleFolder();
+
+    expect(folderRowIds()).toEqual(filedIds(5));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+  });
+
+  it("starts each expansion at five sessions", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(12));
+    renderSidebar();
+    toggleFolder();
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toHaveLength(10);
+
+    toggleFolder();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(5));
+  });
+
+  it("lists loaded sessions before fetching the folder's next server page", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(7));
+    const fetchNextPage = vi.fn();
+    projectSessionsNextPage.current["Customer X"] = fetchNextPage;
+    renderSidebar();
+    toggleFolder();
+
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(filedIds(7));
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    // Every loaded row is listed but the server has more, so the next click fetches.
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("badges Show more with the state of the sessions it hides", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      ...filedSessions(5),
+      conv("conv_awaiting", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        updated_at: 1,
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+    toggleFolder();
+
+    expect(
+      within(screen.getByTestId("project-show-more")).getByText("Needs response"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    const row = document.querySelector<HTMLElement>('[data-sidebar-session-id="conv_awaiting"]')!;
+    expect(within(row).getByText("Needs response")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+  });
+
+  it("lists the open session when it sits past the first five", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(12));
+    renderOnSession("conv_filed_7");
+
+    // The folder auto-expands for the open session and grows a whole page to list it.
+    expect(folderRowIds()).toEqual(filedIds(10));
+    expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
+  });
+
+  it("keeps a folder's listed rows when an older session is filed into it", async () => {
+    projectsMock.push("Customer X");
+    const older = conv("conv_older", "Claude Code", { updated_at: 1 });
+    mockConversations([...filedSessions(6), older]);
+    renderSidebar();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(5));
+
+    // Filing keeps updated_at, so the moved session sorts below the folder's six.
+    mockConversations([...filedSessions(6), { ...older, labels: { omni_project: "Customer X" } }]);
+    const row = screen.getByRole("link", { name: /conv_older/ }).closest("li")!;
+    fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("move-to-project"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Customer X/ }));
+    // Re-render with the moved row, as the pointer does over the list mid-drag.
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
+
+    expect(folderRowIds()).toEqual(filedIds(5));
+    expect(screen.queryByRole("link", { name: "conv_older" })).toBeNull();
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual([...filedIds(6), "conv_older"]);
+  });
+
+  it("steps the session hotkey past the sessions behind Show more", () => {
+    projectsMock.push("Customer X", "Customer Y");
+    mockConversations([
+      ...filedSessions(7),
+      conv("conv_other_folder", "Claude Code", {
+        labels: { omni_project: "Customer Y" },
+        updated_at: 1,
+      }),
+    ]);
+    localStorage.setItem(
+      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+      JSON.stringify(["Customer X", "Customer Y"]),
+    );
+    renderOnSession("conv_filed_4");
+
+    fireEvent.keyDown(window, {
+      code: "BracketRight",
+      ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
+    });
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
+  });
+});
+
 // A collapsed project bubbles up its hidden rows' marker, using the same
 // SessionStateBadge a row shows. Only while collapsed.
 describe("Sidebar collapsed project marker", () => {
@@ -3731,6 +3980,162 @@ describe("Sidebar view options", () => {
     expect(usePullRequestInfoMock).toHaveBeenCalledWith("conv_gh");
   });
 
+  it.each([
+    {
+      merge_state_status: "DIRTY",
+      checks: { failing: 0, pending: 0 },
+      label: "Merge conflicts",
+      icon: "git-compare-arrows",
+    },
+    {
+      merge_state_status: "BLOCKED",
+      checks: { failing: 1, pending: 1 },
+      label: "Checks failing",
+      icon: "circle-x",
+    },
+    {
+      merge_state_status: "BLOCKED",
+      checks: { failing: 0, pending: 1 },
+      label: "Checks running",
+      icon: "circle-dot",
+    },
+    {
+      merge_state_status: "CLEAN",
+      checks: { failing: 0, pending: 0 },
+      label: "Ready to merge",
+      icon: "circle-check",
+    },
+  ])(
+    "keeps live PR status when a newer stored summary has the same lifecycle: $label",
+    async ({ label, icon, ...status }) => {
+      const url = "https://github.com/omnigent-ai/omnigent/pull/419";
+      const checkedAt = Date.now() / 1000 - 600;
+      usePullRequestInfoMock.mockReturnValue({
+        dataUpdatedAt: (checkedAt - 60) * 1000,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: { url, number: 419, state: "OPEN", is_draft: false, ...status },
+        },
+      });
+      mockConversations([
+        conv("conv_gh", "Codex", {
+          workspace: "/Users/me/omnigent",
+          pull_request: {
+            url,
+            provider: "github",
+            repository: "omnigent-ai/omnigent",
+            number: 419,
+            state: "open",
+            state_checked_at: checkedAt,
+          },
+        }),
+      ]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      const row = await screen.findByTestId("session-tooltip-pr");
+      expect(row).toHaveTextContent(`PR#419 · ${label}`);
+      expect(row).not.toHaveTextContent("as of");
+      expect(row.querySelector(`.lucide-${icon}`)).toBeInTheDocument();
+    },
+  );
+
+  it.each([{ isError: true }, { isEnabled: false }])(
+    "keeps cached lifecycle without stale merge readiness when live info is unavailable: %j",
+    async (queryState) => {
+      usePullRequestInfoMock.mockReturnValue({
+        ...queryState,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: { number: 419, state: "OPEN", is_draft: false, merge_state_status: "CLEAN" },
+        },
+      });
+      mockConversations([conv("conv_gh", "Codex", { workspace: "/Users/me/omnigent" })]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      expect(await screen.findByTestId("session-tooltip-pr")).toHaveTextContent(/^PR#419 · Open$/);
+    },
+  );
+
+  it.each([
+    {
+      storedNumber: 419,
+      storedState: "MERGED",
+      storedDraft: false,
+      liveState: "OPEN",
+      expected: "Merged",
+    },
+    {
+      storedNumber: 420,
+      storedState: "MERGED",
+      storedDraft: false,
+      liveState: "OPEN",
+      expected: "Ready to merge",
+    },
+    {
+      storedNumber: 419,
+      storedState: "OPEN",
+      storedDraft: true,
+      liveState: "OPEN",
+      expected: "Draft",
+    },
+    {
+      storedNumber: 419,
+      storedState: "OPEN",
+      storedDraft: false,
+      liveState: "CLOSED",
+      expected: "Open",
+    },
+  ])(
+    "uses a newer stored lifecycle only for the same PR: $storedNumber",
+    async ({ storedNumber, storedState, storedDraft, liveState, expected }) => {
+      const now = Date.now();
+      usePullRequestInfoMock.mockReturnValue({
+        dataUpdatedAt: now - 10_000,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: {
+            url: "https://github.com/omnigent-ai/omnigent/pull/419",
+            number: 419,
+            state: liveState,
+            is_draft: false,
+            merge_state_status: "CLEAN",
+          },
+        },
+      });
+      mockConversations([
+        conv("conv_gh", "Codex", {
+          workspace: "/Users/me/omnigent",
+          pull_request: {
+            url: `https://github.com/omnigent-ai/omnigent/pull/${storedNumber}`,
+            provider: "github",
+            repository: "omnigent-ai/omnigent",
+            number: storedNumber,
+            state: storedState,
+            is_draft: storedDraft,
+            state_checked_at: now / 1000,
+          },
+        }),
+      ]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      expect(await screen.findByTestId("session-tooltip-pr")).toHaveTextContent(
+        `PR#419 · ${expected}`,
+      );
+    },
+  );
+
   it("shows the tracked PR number when gh can't resolve its state", async () => {
     // gh unauthenticated: `pr` is null, but the association carries the number.
     usePullRequestInfoMock.mockReturnValue({
@@ -3762,6 +4167,61 @@ describe("Sidebar view options", () => {
       // Number only, no "· Open/Draft" suffix, since there's no resolved state.
       expect(screen.getByTestId("session-tooltip-pr")).toHaveTextContent(/^PR#7918$/);
     });
+  });
+
+  it("shows the server's stored PR while the host is offline", async () => {
+    usePullRequestInfoMock.mockReturnValue({ data: undefined });
+    mockConversations([
+      conv("conv_offline", "Codex", {
+        workspace: "/Users/me/omnigent",
+        pull_request: {
+          url: "https://github.com/omnigent-ai/omnigent/pull/7918",
+          provider: "github",
+          repository: "omnigent-ai/omnigent",
+          number: 7918,
+          title: "Ship it",
+          state: "MERGED",
+          is_draft: false,
+        },
+      }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_offline" }), {
+      pointerType: "mouse",
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("session-tooltip-repo")).toHaveTextContent("Repoomnigent");
+      expect(screen.getByTestId("session-tooltip-pr")).toHaveTextContent("PR#7918 · Merged");
+    });
+  });
+
+  it("says how old a stale stored PR state is", async () => {
+    usePullRequestInfoMock.mockReturnValue({ data: undefined });
+    mockConversations([
+      conv("conv_stale", "Codex", {
+        workspace: "/Users/me/omnigent",
+        pull_request: {
+          url: "https://github.com/omnigent-ai/omnigent/pull/7918",
+          provider: "github",
+          repository: "omnigent-ai/omnigent",
+          number: 7918,
+          state: "OPEN",
+          is_draft: false,
+          state_checked_at: Date.now() / 1000 - 2 * 3600,
+        },
+      }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_stale" }), {
+      pointerType: "mouse",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("session-tooltip-pr")).toHaveTextContent(
+        "PR#7918 · Open (as of 2h ago)",
+      ),
+    );
   });
 
   it("skips the GitHub lookup for a session without a workspace", async () => {
@@ -4065,6 +4525,74 @@ describe("sidebar_grouping_ui release flag", () => {
     fireEvent.click(screen.getByRole("button", { name: "Shared" }));
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
+
+  it.each(["first-class", "legacy"])(
+    "shows owned archived %s project members only, then restores live members",
+    (membership) => {
+      projectsMock.push("Alpha", "Empty");
+      const filed =
+        membership === "first-class"
+          ? { project_id: "p_Alpha" }
+          : { labels: { omni_project: "Alpha" } };
+      const live = conv("live_filed", "Claude Code", filed);
+      const archived = conv("archived_filed", "Claude Code", {
+        ...filed,
+        archived: true,
+        labels: { ...("labels" in filed ? filed.labels : {}), [PINNED_LABEL_KEY]: "1" },
+      });
+      seedPins(["archived_filed"]);
+      const unfiled = conv("archived_unfiled", "Claude Code", { archived: true });
+      const shared = conv("archived_shared", "Claude Code", {
+        ...filed,
+        archived: true,
+        owner: "other@example.com",
+      });
+      mockConversations([live, archived, unfiled, shared]);
+      // Folder pages can contain members outside the global archived window.
+      const older = conv("older_archived_filed", "Claude Code", { ...filed, archived: true });
+      const original = useConvMock.getMockImplementation()!;
+      useConvMock.mockImplementation((...args) =>
+        args[4] === "archived"
+          ? ({
+              ...original(...args),
+              data: {
+                pages: [{ data: [archived, unfiled, shared], has_more: false }],
+                pageParams: [undefined],
+              },
+            } as ReturnType<typeof useConversations>)
+          : original(...args),
+      );
+      projectSessionsMock.current.Alpha = [live];
+      const view = renderGroupingSidebar();
+      fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
+      expect(screen.getByText("live_filed")).toBeInTheDocument();
+
+      projectSessionsMock.current.Alpha = [archived, older, shared];
+      selectSessionFilter("archived");
+      const folder = screen.getByRole("button", { name: "Alpha" }).closest("section")!;
+      const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+      expect(within(folder).getByText("archived_filed")).toBeInTheDocument();
+      expect(within(folder).getByText("older_archived_filed")).toBeInTheDocument();
+      expect(within(folder).queryByText("archived_shared")).toBeNull();
+      expect(screen.queryByText("live_filed")).toBeNull();
+      expect(within(sessions).getByText("archived_unfiled")).toBeInTheDocument();
+      expect(within(sessions).queryByText("archived_filed")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Empty" }));
+      expect(screen.getByText("No archived sessions")).toBeInTheDocument();
+      expect(
+        within(screen.getByRole("button", { name: "Empty" }).closest("section")!).queryByRole(
+          "link",
+          { name: "new session" },
+        ),
+      ).toBeNull();
+
+      projectSessionsMock.current.Alpha = [live];
+      selectSessionFilter("mine");
+      expect(within(folder).getByText("live_filed")).toBeInTheDocument();
+      expect(screen.queryByText("archived_filed")).toBeNull();
+      view.unmount();
+    },
+  );
 
   it("keeps a shared session with a colliding project label in the Shared list", () => {
     projectsMock.push("Alpha");

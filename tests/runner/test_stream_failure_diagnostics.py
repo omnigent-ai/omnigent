@@ -279,7 +279,7 @@ async def test_oversized_pane_snapshot_is_bounded(tmp_path: Path) -> None:
 
 
 def _required_terminal_exit(
-    session_was_idle: bool, expected_close: bool = False
+    session_was_idle: bool, expected_close: bool = False, closed_outside_omnigent: bool = False
 ) -> TerminalExitEvent:
     """Build the exit the registry publishes when the session's Claude pane dies."""
     return TerminalExitEvent(
@@ -294,6 +294,7 @@ def _required_terminal_exit(
         last_output="Waiting for the API key helper...\n",
         session_was_idle=session_was_idle,
         expected_close=expected_close,
+        closed_outside_omnigent=closed_outside_omnigent,
     )
 
 
@@ -335,6 +336,28 @@ async def test_expected_close_of_the_pane_publishes_no_terminal_failure() -> Non
         _session_event_queues_ref.pop(_CONV_ID, None)
 
     assert statuses == []
+
+
+@pytest.mark.asyncio
+async def test_session_killed_outside_omnigent_names_that_cause() -> None:
+    """A Claude session killed outside Omnigent fails with that cause, not a bare exit."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.launch_failure import TERMINAL_CLOSED_OUTSIDE_OMNIGENT
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    app = _make_app(cause="unused")
+    publish = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        publish(_required_terminal_exit(session_was_idle=False, closed_outside_omnigent=True))
+        statuses = _failed_statuses(_CONV_ID)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert len(statuses) == 1
+    error = statuses[0]["error"]
+    assert error["code"] == "required_terminal_exited"
+    assert error["title"] == TERMINAL_CLOSED_OUTSIDE_OMNIGENT.title
+    assert error["message"].startswith(TERMINAL_CLOSED_OUTSIDE_OMNIGENT.title)
 
 
 @pytest.mark.asyncio

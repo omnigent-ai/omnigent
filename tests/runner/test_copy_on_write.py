@@ -91,6 +91,7 @@ def test_harness_spawn_transports_prepared_session_namespace(spec, tmp_path, mon
         p, "copy_on_write_namespace", (1, 2, 3)
     )
     registry = Mock()
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "unknown"}
     registry.resolve_environment.return_value = environment
     env = _build_spawn_env_from_spec(
         agent, "openai-agents", session_id="session", resource_registry=registry
