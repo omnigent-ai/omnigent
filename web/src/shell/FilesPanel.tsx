@@ -45,6 +45,8 @@ import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { useScrollRestore } from "./useScrollRestore";
+import { FileInfoDialog } from "./FileInfoDialog";
+import { FilesPanelFocusContext, type FileRowInfo } from "./FileRowActions";
 
 interface FilesPanelProps {
   conversationId?: string;
@@ -289,6 +291,13 @@ export function FilesPanel({
   const [debouncedTreeExclude, setDebouncedTreeExclude] = useState("");
   const [showSearchFilters, setShowSearchFilters] = useState(false);
   const [directoryRefreshToken, setDirectoryRefreshToken] = useState(0);
+  const panelFocusRef = useRef<HTMLDivElement>(null);
+  const [fileInfo, setFileInfo] = useState<FileRowInfo | null>(null);
+  const [fileInfoReturnFocus, setFileInfoReturnFocus] = useState<HTMLElement | null>(null);
+  const openFileInfo = useCallback((info: FileRowInfo, returnFocus: HTMLElement | null) => {
+    setFileInfo(info);
+    setFileInfoReturnFocus(returnFocus);
+  }, []);
   const [refreshingFiles, setRefreshingFiles] = useState(false);
   // The drawer (onClose) adds an X close button to the header. Both the drawer
   // and the inline rail (frameless) fill their parent's height and drop the
@@ -486,8 +495,12 @@ export function FilesPanel({
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
 
-  return (
+  const panel = (
     <div
+      ref={panelFocusRef}
+      tabIndex={-1}
+      role="region"
+      aria-label={flatView ? "Changes" : "Files"}
       className={cn(
         "@container/filespanel overflow-hidden bg-card",
         fillHeight ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
@@ -689,6 +702,7 @@ export function FilesPanel({
             sort={changedSort}
             conversationId={conversationId}
             runnerWentOffline={runnerWentOffline}
+            onOpenInfo={openFileInfo}
           />
         )}
         {!showAsleepHint && !flatView && (
@@ -723,9 +737,20 @@ export function FilesPanel({
             onExitSearch={exitTreeSearch}
             scrollParentRef={scrollRef}
             refreshToken={directoryRefreshToken}
+            onOpenInfo={openFileInfo}
           />
         )}
       </section>
+      <FileInfoDialog
+        info={fileInfo}
+        onOpenChange={(open) => {
+          if (!open) setFileInfo(null);
+        }}
+        returnFocus={fileInfoReturnFocus}
+      />
     </div>
+  );
+  return (
+    <FilesPanelFocusContext.Provider value={panelFocusRef}>{panel}</FilesPanelFocusContext.Provider>
   );
 }
