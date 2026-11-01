@@ -264,6 +264,7 @@ import {
   dateBucket,
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
+  canManageSessionLifecycle,
   sessionBelongsToProject,
   sessionsListAcceptsDrop,
 } from "./sidebarNav";
@@ -4070,6 +4071,7 @@ function ConversationMenuItems({
   isPinned,
   isArchived,
   isOwner,
+  canManageLifecycle,
   sharingOff,
   isSingleUser,
   canStop,
@@ -4094,6 +4096,8 @@ function ConversationMenuItems({
   isPinned: boolean;
   isArchived: boolean;
   isOwner: boolean;
+  // Owner or owner-level (admin) viewer: gates Stop, Archive and Delete.
+  canManageLifecycle: boolean;
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off): disables the
   // Share item for everyone, independent of the per-user ownership check.
   sharingOff: boolean;
@@ -4360,7 +4364,7 @@ function ConversationMenuItems({
         already known-offline (canStop). Owner-gated like Delete:
         non-owners see it disabled with an explanatory tooltip. */}
       {canStop &&
-        (isOwner ? (
+        (canManageLifecycle ? (
           <C.Item
             data-testid="stop-conversation"
             variant="destructive"
@@ -4384,7 +4388,7 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
-      {isOwner ? (
+      {canManageLifecycle ? (
         <C.Item data-testid="archive-conversation" onSelect={runArchive}>
           {isArchived ? (
             <ArchiveRestoreIcon className="size-3.5" />
@@ -4419,7 +4423,7 @@ function ConversationMenuItems({
           along, so it reuses the slot, the trash icon, and the destructive
           styling rather than adding a button beneath it. Single-user mode has no
           sharing, so it keeps the plain owner Delete. */}
-      {isOwner || isSingleUser ? (
+      {canManageLifecycle || isSingleUser ? (
         <C.Item
           data-testid="delete-conversation"
           variant="destructive"
@@ -4856,15 +4860,16 @@ function ConversationRowImpl({
   const [forkOpen, setForkOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
-  // Every row action gates on ownership alone — the sidebar carries no
-  // effective-permission level, so rename/share/move/drag are owner-only and
-  // non-owners get a read-only row. (Finer-grained edit/manage affordances
-  // live on the open-session view, which fetches the caller's real level.)
+  // Rename/share/move/drag gate on ownership, so non-owners get a read-only
+  // row; Stop/Archive/Delete also accept the row's owner-level
+  // `permission_level` (admins). (Finer-grained edit/manage affordances live
+  // on the open-session view, which fetches the caller's real level.)
   // Also the id Leave revokes: leaving is a self-revoke, so it needs the
   // viewer's own id — resolved by the time a non-owned row renders, since
   // `isOwner` below is derived from it. From context (ViewerIdContext).
   const viewerId = useContext(ViewerIdContext);
   const isOwner = isOwnedByViewer(conversation, viewerId);
+  const canManageLifecycle = canManageSessionLifecycle(conversation, viewerId);
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off) reported by
   // /v1/info — disables the row's Share item even for managers. Fail open
   // (share enabled) while the capability probe is still loading. From context.
@@ -5175,6 +5180,7 @@ function ConversationRowImpl({
     isPinned,
     isArchived,
     isOwner,
+    canManageLifecycle,
     sharingOff,
     isSingleUser,
     canStop,
@@ -5552,10 +5558,10 @@ function ConversationRowImpl({
                   </TooltipTrigger>
                 </Tooltip>
               )}
-              {/* Archive is owner-only, same as the kebab's Archive item; non-owners
+              {/* Gated like the kebab's Archive item; viewers without owner level
               don't get the quick affordance and instead see that item disabled
               with an explanation. */}
-              {isOwner && (
+              {canManageLifecycle && (
                 <Tooltip disableHoverableContent>
                   <TooltipContent>
                     <TooltipArrow />
@@ -6571,32 +6577,40 @@ function BulkActionBar({
     [selectedConversations, viewerId],
   );
 
+  // Move stays on `ownedSelected`: projects are a My-sessions-only tool.
+  const manageableSelected = useMemo(
+    () => selectedConversations.filter((c) => canManageSessionLifecycle(c, viewerId)),
+    [selectedConversations, viewerId],
+  );
+
   const archivedSelected = useMemo(
-    () => ownedSelected.filter((c) => c.archived === true),
-    [ownedSelected],
+    () => manageableSelected.filter((c) => c.archived === true),
+    [manageableSelected],
   );
 
   const nonArchivedSelected = useMemo(
-    () => ownedSelected.filter((c) => c.archived !== true),
-    [ownedSelected],
+    () => manageableSelected.filter((c) => c.archived !== true),
+    [manageableSelected],
   );
 
   const allSelectedSameArchiveGroup =
-    ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
+    manageableSelected.length > 0 &&
+    (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
   const count = selectedIds.size;
   const isBusy = bulkArchive.isPending || bulkDelete.isPending || bulkMove.isPending;
 
-  // Delete acts only on owned rows, so surface that count on the control when it
-  // differs from "N selected" — otherwise a mixed-ownership selection (reachable
-  // in projects scope, where a folder can hold others' sessions) reads
-  // "3 selected" while Delete hits fewer. Used for both the tooltip (visual) and
-  // the aria-label (assistive tech). Archive needs no such hint: its gate
-  // (`allSelectedSameArchiveGroup`) only enables it when every owned row shares
-  // one archive state, and archived rows never appear in a selectable section.
+  // Delete acts only on manageable rows, so surface that count on the control
+  // when it differs from "N selected" — otherwise a mixed-ownership selection
+  // (reachable in projects scope, where a folder can hold others' sessions)
+  // reads "3 selected" while Delete hits fewer. Used for both the tooltip
+  // (visual) and the aria-label (assistive tech). Archive needs no such hint:
+  // its gate (`allSelectedSameArchiveGroup`) only enables it when every
+  // manageable row shares one archive state, and archived rows never appear in
+  // a selectable section.
   const deleteLabel =
-    ownedSelected.length > 0 && ownedSelected.length !== count
-      ? `Delete ${ownedSelected.length}`
+    manageableSelected.length > 0 && manageableSelected.length !== count
+      ? `Delete ${manageableSelected.length}`
       : "Delete";
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
@@ -6611,8 +6625,8 @@ function BulkActionBar({
   const [branchesToDelete, setBranchesToDelete] = useState<Set<string>>(new Set());
 
   const worktreeSelected = useMemo(
-    () => ownedSelected.filter((c) => c.git_branch),
-    [ownedSelected],
+    () => manageableSelected.filter((c) => c.git_branch),
+    [manageableSelected],
   );
   const allBranchesSelected =
     worktreeSelected.length > 0 && worktreeSelected.every((c) => branchesToDelete.has(c.id));
@@ -6695,7 +6709,7 @@ function BulkActionBar({
   }
 
   function handleDelete() {
-    const ids = ownedSelected.map((c) => c.id);
+    const ids = manageableSelected.map((c) => c.id);
     if (ids.length === 0) return;
     setConfirmDeleteOpen(false);
     // The rows leave the sidebar optimistically, so the selection is already
@@ -6891,8 +6905,8 @@ function BulkActionBar({
                   type="button"
                   variant="ghost"
                   size="icon-xs"
-                  className={cn("shrink-0", ownedSelected.length > 0 && "text-destructive")}
-                  disabled={isBusy || ownedSelected.length === 0}
+                  className={cn("shrink-0", manageableSelected.length > 0 && "text-destructive")}
+                  disabled={isBusy || manageableSelected.length === 0}
                   onClick={() => setConfirmDeleteOpen(true)}
                   aria-label={deleteLabel}
                   data-testid="bulk-delete"
@@ -6927,7 +6941,7 @@ function BulkActionBar({
       >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
+            <DialogTitle>Delete {manageableSelected.length} session(s)?</DialogTitle>
             <DialogDescription>
               This will permanently delete the selected sessions and all their history. This cannot
               be undone.
@@ -7015,7 +7029,7 @@ function BulkActionBar({
               onClick={handleDelete}
               disabled={bulkDelete.isPending}
             >
-              Delete {ownedSelected.length} session(s)
+              Delete {manageableSelected.length} session(s)
             </Button>
           </DialogFooter>
         </DialogContent>
