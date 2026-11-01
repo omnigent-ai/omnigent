@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,15 @@ from omnigent.spec.skill_sources import (
     _harness_family,
     resolve_harness_skills,
 )
+from tests._helpers.providers import isolate_provider_resolution
+
+
+@pytest.fixture(autouse=True)
+def _default_claude_launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Ignore a developer's configured Claude launch, which the native menu would probe."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "default-config"))
+    for name in ("OMNIGENT_CLAUDE_LAUNCHER", "OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _write_skill(skills_dir: Path, name: str, *, user_invocable: bool | None = None) -> None:
@@ -951,6 +962,128 @@ def test_claude_provider_skips_install_path_outside_plugins_root(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
     assert "sp:using-superpowers" not in names
+
+
+def _configure_claude_launch(config_home: Path, launches: Path, script: str) -> None:
+    """Make the native Claude command a script that records its launch, then runs *script*."""
+    launcher = config_home / "claude-launcher"
+    launcher.write_text(
+        f"#!{sys.executable}\nimport json, os, sys, time\n"
+        f"with open({str(launches)!r}, 'a') as out:\n"
+        "    out.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n')\n" + script
+    )
+    launcher.chmod(0o755)
+    (config_home / "config.yaml").write_text(
+        json.dumps({"harness": {"claude-native": {"command": str(launcher), "args": ["--"]}}})
+    )
+
+
+def _print_init(plugins: list[dict[str, str]]) -> str:
+    event = {"type": "system", "subtype": "init", "plugins": plugins}
+    return f"print({json.dumps(event)!r})\n"
+
+
+@pytest.mark.posix_only
+def test_claude_native_lists_plugins_the_configured_launch_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launcher's session-only plugin shows in the menu; settings disables and installs win."""
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
+    )
+    launch_dirs = tmp_path / "launch"
+    for plugin, skill in (("dev-productivity", "review"), ("sp", "stale"), ("off", "hidden")):
+        _write_skill(launch_dirs / plugin / "skills", skill)
+    ws = tmp_path / "ws"
+    (ws / ".claude").mkdir(parents=True)
+    (ws / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"off@mkt": False}})
+    )
+    launches = tmp_path / "launches.jsonl"
+    _configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        launches,
+        _print_init(
+            [
+                {"name": "builtin-tools", "path": "builtin", "source": "builtin-tools@builtin"},
+                {
+                    "name": "dev-productivity",
+                    "path": str(launch_dirs / "dev-productivity"),
+                    "source": "dev-productivity@inline",
+                },
+                {"name": "sp", "path": str(launch_dirs / "sp"), "source": "sp@mkt"},
+                {"name": "off", "path": str(launch_dirs / "off"), "source": "off@mkt"},
+            ]
+        ),
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    warnings: list[str] = []
+    ctx = replace(_ctx(ws, home), warnings=warnings)
+
+    names = {s.name for s in resolve_harness_skills(ctx, "claude-native")}
+
+    assert {"dev-productivity:review", "sp:installed"} <= names
+    assert not names & {"sp:stale", "off:hidden"}
+    assert warnings == []
+    [launch] = [json.loads(line) for line in launches.read_text().splitlines()]
+    argv = launch["argv"]
+    assert argv[:3] == ["--", "-p", "/model"]
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"disableAllHooks": True}
+    assert Path(launch["cwd"]).resolve() == home.resolve()
+
+
+@pytest.mark.posix_only
+def test_claude_launch_is_probed_only_for_a_customized_native_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    launches = tmp_path / "launches.jsonl"
+
+    resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    _configure_claude_launch(config_home, launches, _print_init([]))
+    resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-sdk")
+
+    assert not launches.exists()
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize(
+    ("script", "summary"),
+    [
+        ("sys.exit(3)\n", "did not report its plugins"),
+        ("time.sleep(30)\n", "timed out after 0.5s"),
+    ],
+    ids=["no-init", "timeout"],
+)
+def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str, summary: str
+) -> None:
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
+    )
+    _configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        tmp_path / "launches.jsonl",
+        script,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.plugin_discovery.LAUNCH_PLUGINS_TIMEOUT_S", 0.5
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    warnings: list[str] = []
+
+    skills = resolve_harness_skills(
+        replace(_ctx(tmp_path / "ws", home), warnings=warnings), "claude-native"
+    )
+
+    assert "sp:installed" in {s.name for s in skills}
+    assert warnings == [
+        "Claude plugins added by the configured launch are missing: the launch "
+        f"{summary}; see the host log for details."
+    ]
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(
