@@ -82,8 +82,19 @@ const EXAMPLES: Example[] = [
   },
 ];
 
-/** Mounted on the Automations page only after its first successful load. */
-export function AutomationsIntro({ onClose }: { onClose: () => void }) {
+/**
+ * Mounted on the Automations page only after its first successful load.
+ *
+ * @param openCount - Bumped to reopen the guide at its first step, even after
+ *   it was dismissed.
+ */
+export function AutomationsIntro({
+  onClose,
+  openCount = 0,
+}: {
+  onClose: () => void;
+  openCount?: number;
+}) {
   const info = useServerInfo();
   const viewerId = useViewerId();
   const rebasePath = useRebasePath();
@@ -96,8 +107,9 @@ export function AutomationsIntro({ onClose }: { onClose: () => void }) {
       : `omnigent:automations-intro:v1:${JSON.stringify([server, mountPath, viewerId])}`;
   return (
     <IntroDialog
-      key={storageKey ?? JSON.stringify([getOmnigentHostGeneration(), mountPath, viewerId])}
+      key={`${storageKey ?? JSON.stringify([getOmnigentHostGeneration(), mountPath, viewerId])}:${openCount}`}
       storageKey={storageKey}
+      reopened={openCount > 0}
       info={info}
       onClose={onClose}
     />
@@ -106,16 +118,18 @@ export function AutomationsIntro({ onClose }: { onClose: () => void }) {
 
 function IntroDialog({
   storageKey,
+  reopened,
   info,
   onClose,
 }: {
   storageKey: string | null;
+  reopened: boolean;
   info: ServerInfo;
   onClose: () => void;
 }) {
   const appName = useAppName();
   const [open, setOpen] = useState(() => {
-    if (storageKey === null) return true;
+    if (reopened || storageKey === null) return true;
     try {
       return localStorage.getItem(storageKey) !== "seen";
     } catch {

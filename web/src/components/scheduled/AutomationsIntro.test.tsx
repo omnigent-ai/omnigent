@@ -23,12 +23,17 @@ const fullInfo: ServerInfo = {
   features: { session_orchestration: true },
 };
 
-function intro(info: ServerInfo | "loading" = fullInfo, basename = "", onClose = () => {}) {
+function intro(
+  info: ServerInfo | "loading" = fullInfo,
+  basename = "",
+  onClose = () => {},
+  openCount = 0,
+) {
   return (
     <MemoryRouter>
       <RoutingProvider value={basenamedRouting(basename)}>
         <CapabilitiesProvider info={info}>
-          <AutomationsIntro onClose={onClose} />
+          <AutomationsIntro onClose={onClose} openCount={openCount} />
         </CapabilitiesProvider>
       </RoutingProvider>
     </MemoryRouter>
@@ -111,6 +116,21 @@ describe("Automations first-visit introduction", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     view.unmount();
     render(intro());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("reopens at the first step after it was dismissed", () => {
+    const view = render(intro());
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    fireEvent.click(screen.getByRole("button", { name: "See examples" }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    view.rerender(intro(fullInfo, "", () => {}, 1));
+    expect(screen.getByRole("dialog", { name: "Introducing Automations" })).toBeVisible();
+    expect(screen.getByText("1 of 4 · Run on a schedule")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+    view.rerender(intro(fullInfo, "", () => {}, 1));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
