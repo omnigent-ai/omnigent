@@ -1,10 +1,32 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useState } from "react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useContext, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+const { copyTextMock, downloadMock, revealMock } = vi.hoisted(() => ({
+  copyTextMock: vi.fn(() => Promise.resolve()),
+  downloadMock: vi.fn(() => Promise.resolve()),
+  revealMock: vi.fn(),
+}));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+vi.mock("./RevealInFileManager", async (importOriginal) => {
+  const actual = await importOriginal<typeof RevealInFileManagerModule>();
+  return {
+    ...actual,
+    revealInFileManager: revealMock,
+    revealLabel: (directory: boolean) => (directory ? "Open in Finder" : "Show in Finder"),
+    useRevealTarget: function useRevealTarget(path: string | null) {
+      const base = useContext(actual.RevealBaseContext);
+      return path
+        ? { hostId: "local", path: `/workspace/${[base, path].filter(Boolean).join("/")}` }
+        : null;
+    },
+  };
+});
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileContentModule>()),
+  downloadWorkspaceFile: downloadMock,
+}));
 
 // Drive lazy-directory listings from a fixture so the tree's central
 // `useWorkspaceDirectories` controller resolves nested lazy dirs without a
@@ -33,11 +55,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 }));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
-import {
-  ROW_ACTION_SIZE_CLASS,
-  ROW_META_SLOT_CLASS,
-  ROW_STATUS_SLOT_CLASS,
-} from "./fileStatusUtils";
+import type * as FileContentModule from "@/hooks/useFileContent";
+import type * as RevealInFileManagerModule from "./RevealInFileManager";
+import userEvent from "@testing-library/user-event";
+import { ROW_ACTION_SIZE_CLASS, ROW_STATUS_SLOT_CLASS } from "./fileStatusUtils";
+import { ROW_MENU_SLOT_CLASS } from "./FileRowActions";
 import { FolderTree } from "./FolderTree";
 
 afterEach(() => {
@@ -118,6 +140,100 @@ describe("FolderTree runner-offline state", () => {
   });
 });
 
+describe("FolderTree row action paths", () => {
+  it("joins a rerooted tree path once for menu actions and Info", async () => {
+    const path = "src/same name # % ' Ω.ts";
+    const onOpenInfo = vi.fn();
+    renderTree({ files: [file(path)], browseLocation: "packages/app", onOpenInfo });
+
+    fireEvent.contextMenu(screen.getByText("same name # % ' Ω.ts"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
+    expect(copyTextMock).toHaveBeenCalledWith(`packages/app/${path}`);
+
+    fireEvent.contextMenu(screen.getByText("same name # % ' Ω.ts"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Download" }));
+    expect(downloadMock).toHaveBeenCalledWith("conv_abc", `packages/app/${path}`);
+
+    fireEvent.contextMenu(screen.getByText("same name # % ' Ω.ts"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "File info" }));
+    expect(onOpenInfo).toHaveBeenCalledWith(
+      expect.objectContaining({ path: `packages/app/${path}`, name: "same name # % ' Ω.ts" }),
+      expect.any(HTMLElement),
+    );
+  });
+
+  it("keeps duplicate search basenames distinct and copies absolute outside paths", async () => {
+    const user = userEvent.setup();
+    const sameName = "same # % ' Ω.txt";
+    renderTree({
+      files: [],
+      searchQuery: "same",
+      searchResults: [file(`left/${sameName}`), file(`right/${sameName}`)],
+      browseLocation: "packages/app",
+    });
+    const kebabs = [
+      screen.getByRole("button", { name: `More actions for left/${sameName}` }),
+      screen.getByRole("button", { name: `More actions for right/${sameName}` }),
+    ];
+    expect(kebabs).toHaveLength(2);
+    await user.click(kebabs[1]);
+    await user.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
+    expect(copyTextMock).toHaveBeenCalledWith(`packages/app/right/${sameName}`);
+
+    cleanup();
+    copyTextMock.mockClear();
+    renderTree({ files: [file("deeper/report.txt")], browseLocation: "/tmp/outside" });
+    fireEvent.click(screen.getByRole("button", { name: "Copy path: report.txt" }));
+    expect(copyTextMock).toHaveBeenCalledWith("/tmp/outside/deeper/report.txt");
+  });
+
+  it("routes actions for same-named files at different depths to each full path", async () => {
+    const user = userEvent.setup();
+    const onOpenInfo = vi.fn();
+    const paths = ["packages/app/a/x.ts", "packages/app/a/b/x.ts"];
+    renderTree({
+      files: [],
+      searchQuery: "x.ts",
+      searchResults: [file("a/x.ts", 11), file("a/b/x.ts", 22)],
+      browseLocation: "packages/app",
+      onOpenInfo,
+    });
+    const actionRows = ["a/x.ts", "a/b/x.ts"].map((relativePath) => {
+      const label = screen.getByText(relativePath);
+      const row = label.closest('[data-slot="context-menu-trigger"]');
+      expect(row).not.toBeNull();
+      return row as HTMLElement;
+    });
+    expect(actionRows).toHaveLength(2);
+
+    const exerciseRow = async (index: number, relativePath: string, path: string) => {
+      const kebab = within(actionRows[index]).getByRole("button", {
+        name: `More actions for ${relativePath}`,
+      });
+      await user.click(kebab);
+      await user.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
+      expect(copyTextMock).toHaveBeenLastCalledWith(path);
+
+      await user.click(kebab);
+      await user.click(await screen.findByRole("menuitem", { name: "Download" }));
+      expect(downloadMock).toHaveBeenLastCalledWith("conv_abc", path);
+
+      await user.click(kebab);
+      await user.click(await screen.findByRole("menuitem", { name: "File info" }));
+      expect(onOpenInfo).toHaveBeenLastCalledWith(
+        expect.objectContaining({ path, name: "x.ts" }),
+        expect.any(HTMLElement),
+      );
+
+      await user.click(kebab);
+      await user.click(await screen.findByRole("menuitem", { name: "Show in Finder" }));
+      expect(revealMock).toHaveBeenLastCalledWith({ hostId: "local", path: `/workspace/${path}` });
+    };
+    await exerciseRow(0, "a/x.ts", paths[0]);
+    await exerciseRow(1, "a/b/x.ts", paths[1]);
+  });
+});
+
 describe("FolderTree sorting", () => {
   it("groups directories ahead of files, then sorts files by name", () => {
     renderTree({
@@ -176,7 +292,7 @@ describe("FolderTree file size / download alignment", () => {
     expect(slot).toHaveClass("relative");
     expect(size).toHaveClass("text-sm");
     // Size hides on hover but keeps its width to avoid a layout shift.
-    expect(size).toHaveClass("group-hover:invisible");
+    expect(size).toHaveClass("group-hover:invisible", "group-has-[:focus-visible]:invisible");
 
     const download = screen.getByRole("button", { name: /download readme\.md/i });
     // Button sits in an absolutely-positioned overlay inside the same slot.
@@ -245,8 +361,9 @@ describe("FolderTree trailing column", () => {
     for (const button of copyButtons) {
       expect(button).toHaveAttribute("data-size", "icon-sm");
       // The copy button lives inside the fixed-width trailing column...
-      const slot = button.closest(`.${ROW_META_SLOT_CLASS}`);
+      const slot = button.closest(`.${ROW_MENU_SLOT_CLASS.replaceAll(" ", ".")}`);
       expect(slot, "every row's copy button must sit in the trailing column").not.toBeNull();
+      expect(slot).toHaveClass("w-20");
       // ...paired with the download button on its LEFT (copy is the rightmost
       // control), or with a spacer standing in for the download where there is
       // none (folders, deleted files) so the pair keeps one x on every row.
