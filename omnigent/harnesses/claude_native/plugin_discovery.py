@@ -40,7 +40,8 @@ def _plugin_dirs(plugins: object) -> dict[str, Path]:
     for plugin in plugins if isinstance(plugins, list) else ():
         if not isinstance(plugin, dict):
             continue
-        key = plugin.get("source") or plugin.get("name")
+        # Settings and installs key plugins by source; a bare name could evade their disables.
+        key = plugin.get("source")
         path = plugin.get("path")
         # Built-in plugins report the path "builtin" and ship no files to read.
         if not (

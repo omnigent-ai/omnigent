@@ -977,7 +977,10 @@ def _print_init(plugins: list[dict[str, str]]) -> str:
 def test_claude_native_lists_plugins_the_configured_launch_loads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A launcher's session-only plugin shows in the menu; settings disables and installs win."""
+    """A launcher's session-only plugin shows in the menu; settings disables and installs win.
+
+    A record without ``source`` cannot be matched to settings keys, so it is ignored.
+    """
     home = _claude_home_with_plugin(
         tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
     )
@@ -1003,6 +1006,7 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
                 },
                 {"name": "sp", "path": str(launch_dirs / "sp"), "source": "sp@mkt"},
                 {"name": "off", "path": str(launch_dirs / "off"), "source": "off@mkt"},
+                {"name": "off", "path": str(launch_dirs / "off")},
             ]
         ),
     )
