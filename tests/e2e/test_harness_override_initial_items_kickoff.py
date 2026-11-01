@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import os
 import secrets
-import socket
 import subprocess
 import sys
 import time
@@ -43,19 +42,12 @@ import pytest
 import yaml
 
 from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.live_server import find_free_port
 
 REPO = Path(__file__).resolve().parents[2]
 
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MARKER = "KICKOFF-ANSWERED-BY-SPEC-CLAUDE-SDK-BRAIN"
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.fixture
@@ -70,7 +62,7 @@ def rig(tmp_path: Path) -> Iterator[dict[str, Any]]:
     for var in ("NO_PROXY", "no_proxy"):
         os.environ[var] = "127.0.0.1,localhost," + os.environ.get(var, "")
 
-    mock_port, server_port = _free_port(), _free_port()
+    mock_port, server_port = find_free_port(), find_free_port()
     mock_url = f"http://127.0.0.1:{mock_port}"
     base_url = f"http://127.0.0.1:{server_port}"
     binding_token = secrets.token_urlsafe(32)

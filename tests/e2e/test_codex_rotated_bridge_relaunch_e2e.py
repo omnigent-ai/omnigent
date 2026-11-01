@@ -30,8 +30,9 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.native_session import create_native_session
 from tests._helpers.server_runner import server_runner
+from tests._helpers.session import send_user_text
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallback_mock_llm
-from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker, _send_user_text
+from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker
 
 _REPO = Path(__file__).resolve().parents[2]
 _MODEL = "gpt-5.4-mini"
@@ -172,7 +173,7 @@ def test_rotated_codex_session_relaunches_into_its_bridge_directory(
             configure_mock_llm(mock_url, [{"text": reply}], key="bridge-relaunch", match=prompt)
             set_fallback_mock_llm(mock_url, key="bridge-relaunch", text=reply)
             if terminal is None:
-                _send_user_text(client, session_id=session_id, text=prompt)
+                send_user_text(client, session_id=session_id, text=prompt)
             else:
                 _wait(
                     lambda: codex_terminal_interactive(

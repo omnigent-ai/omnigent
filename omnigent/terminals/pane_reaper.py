@@ -40,7 +40,10 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 _logger = logging.getLogger(__name__)
 
@@ -66,6 +69,7 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
         "claude",
         "codex",
         "cursor",
+        "devin",
         "goose",
         "hermes",
         "kiro",
@@ -91,26 +95,30 @@ class PaneRef(NamedTuple):
         ``terminal_resource_id("claude", "main")`` — used for pane-scoped close.
     :param terminal_name: Harness short-name, e.g. ``"claude"``.
     :param socket_path: tmux socket for the attached-client probe.
+    :param instance: The terminal the scan listed, so a reap leaves a pane that
+        replaced it in the meantime alone. ``None`` when the caller has none.
     """
 
     conversation_id: str
     terminal_id: str
     terminal_name: str
     socket_path: Path
+    instance: TerminalInstance | None = None
 
 
-def resolve_native_pane_idle_timeout_s() -> float:
+def resolve_native_pane_idle_timeout_s(
+    default_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
+) -> float:
     """Resolve the native-pane idle window in seconds.
 
     Honors :envvar:`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S` (``0`` disables pane
-    reaping); otherwise the 1-hour default. An unparseable or negative value
-    logs a warning and falls back to the default rather than failing the runner
-    at boot — an env typo shouldn't take the runner down or (worse) make the
-    reaper act on a bogus window.
+    reaping); otherwise the supplied default, normally the runner's configured
+    idle timeout. An unparseable or negative value logs a warning and falls
+    back to that default rather than failing the runner at boot.
     """
     raw = os.environ.get(_IDLE_TIMEOUT_ENV)
     if not raw:
-        return float(_DEFAULT_IDLE_TIMEOUT_S)
+        return float(default_timeout_s)
     try:
         value = float(raw)
     except ValueError:
@@ -118,17 +126,17 @@ def resolve_native_pane_idle_timeout_s() -> float:
             "%s=%r is not a number; using default %ss",
             _IDLE_TIMEOUT_ENV,
             raw,
-            _DEFAULT_IDLE_TIMEOUT_S,
+            default_timeout_s,
         )
-        return float(_DEFAULT_IDLE_TIMEOUT_S)
+        return float(default_timeout_s)
     if value < 0:
         _logger.warning(
             "%s=%r is negative; using default %ss",
             _IDLE_TIMEOUT_ENV,
             raw,
-            _DEFAULT_IDLE_TIMEOUT_S,
+            default_timeout_s,
         )
-        return float(_DEFAULT_IDLE_TIMEOUT_S)
+        return float(default_timeout_s)
     return value
 
 

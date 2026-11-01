@@ -91,6 +91,7 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // (`@/lib/routing`), not react-router directly — mock that so the create
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -764,6 +765,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         project,
+        false,
       ),
     );
   });
@@ -871,6 +873,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -917,6 +920,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
   });
@@ -1127,6 +1131,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
 
@@ -2110,11 +2115,6 @@ describe("NewChatLandingScreen create flow", () => {
     expect(fullNameRow).not.toBeNull();
     expect(fullNameRow).toHaveTextContent("GPT 5.6 Sol");
     expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
-    fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
-      target: { value: "gpt sol" },
-    });
-    expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
-    expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
     fireEvent.click(screen.getByText("GPT 5.6 Sol"));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");

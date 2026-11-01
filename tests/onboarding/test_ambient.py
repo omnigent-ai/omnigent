@@ -14,6 +14,7 @@ count, so a wrong field turns the test red.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -539,7 +540,19 @@ def test_codex_config_custom_provider_detected(clean_env) -> None:
     assert detect_providers() == [_ISAAC_STYLE_DETECTION]
 
 
-def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> None:
+@pytest.mark.parametrize(
+    ("settings", "refresh_interval", "timeout"),
+    [
+        ("timeout_ms = 5000\nrefresh_interval_ms = 1500000", 1_500_000, 5_000),
+        ("", 0, 20_000),
+        ("timeout_ms = 0\nrefresh_interval_ms = -1", 0, 20_000),
+        ('timeout_ms = "slow"\nrefresh_interval_ms = "often"', 0, 20_000),
+        ("timeout_ms = true\nrefresh_interval_ms = true", 0, 20_000),
+    ],
+)
+def test_codex_config_provider_transport_reads_base_url_and_auth(
+    clean_env, settings: str, refresh_interval: int, timeout: int
+) -> None:
     """``codex_config_provider_transport`` returns base_url + a shell auth command.
 
     The runtime-routing counterpart of the detection: pi-native reads this to
@@ -551,13 +564,20 @@ def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> N
         codex_config_provider_transport,
     )
 
-    _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
+    _write_codex_config(
+        clean_env,
+        _ISAAC_STYLE_CODEX_CONFIG.replace(
+            "timeout_ms = 5000\nrefresh_interval_ms = 1500000", settings
+        ),
+    )
     transport = codex_config_provider_transport(_codex_config_path(), "Databricks")
     assert transport is not None
     assert transport.base_url == "https://example.ai-gateway.cloud.databricks.com/codex/v1"
     assert transport.auth_command == (
         "jq -r .access_token /home/user/.databricks/model-serving-token.json"
     )
+    assert transport.auth_refresh_interval_ms == refresh_interval
+    assert transport.auth_timeout_ms == timeout
 
 
 def test_codex_config_provider_transport_missing_table_returns_none(clean_env) -> None:
@@ -976,6 +996,23 @@ def test_claude_managed_gateway_display_name(
     assert ambient.claude_managed_gateway_display_name() == expected
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (_ISAAC_CLAUDE_SETTINGS, "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, "apiKeyHelper": "t"}, None),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}}, None),
+        ({"apiKeyHelper": "print-token"}, None),
+    ],
+)
+def test_claude_managed_gateway_routes(
+    clean_env, monkeypatch, payload: object, expected: str | None
+) -> None:
+    """Only a credentialed, non-Anthropic managed gateway owns Claude routing."""
+    _write_managed_settings(clean_env, monkeypatch, payload)
+    assert ambient.claude_managed_gateway_routes() == expected
+
+
 def test_claude_managed_gateway_missing_file_is_graceful(clean_env, monkeypatch) -> None:
     """An absent settings file yields (None, False) rather than raising."""
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (clean_env / "nope.json",))
@@ -993,6 +1030,68 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     low.write_text(json.dumps(_ISAAC_CLAUDE_SETTINGS))
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
     assert ambient.claude_managed_gateway() == (None, False)
+
+
+def _claude_code_managed_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    managed_dir = tmp_path / "claude-code"
+    managed_dir.mkdir()
+    monkeypatch.setattr(
+        ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_dir / "managed-settings.json",)
+    )
+    return managed_dir
+
+
+def test_claude_code_managed_mcp_presence_counts_unparseable_file(tmp_path, monkeypatch) -> None:
+    """An unparseable file still counts as deployed, as it does for Claude Code."""
+    managed_dir = _claude_code_managed_dir(tmp_path, monkeypatch)
+    assert not ambient.claude_code_managed_mcp_present()
+
+    (managed_dir / "managed-mcp.json").write_text("not json")
+    assert ambient.claude_code_managed_mcp_present()
+
+
+@pytest.mark.parametrize(
+    ("platform", "own_dir", "other_dir"),
+    [("darwin", "macos", "linux"), ("linux", "linux", "macos")],
+)
+def test_claude_code_managed_mcp_reads_only_this_platforms_directory(
+    tmp_path, monkeypatch, platform: str, own_dir: str, other_dir: str
+) -> None:
+    managed_dirs = {"macos": tmp_path / "macos", "linux": tmp_path / "linux"}
+    for managed_dir in managed_dirs.values():
+        managed_dir.mkdir()
+    monkeypatch.setattr(ambient, "_CLAUDE_CODE_MACOS_MANAGED_DIR", managed_dirs["macos"])
+    monkeypatch.setattr(ambient, "_CLAUDE_CODE_LINUX_MANAGED_DIR", managed_dirs["linux"])
+    monkeypatch.setattr(
+        ambient,
+        "CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        tuple(managed_dir / "managed-settings.json" for managed_dir in managed_dirs.values()),
+    )
+    monkeypatch.setattr(ambient.sys, "platform", platform)
+
+    assert ambient.claude_code_managed_mcp_paths() == (managed_dirs[own_dir] / "managed-mcp.json",)
+    (managed_dirs[other_dir] / "managed-mcp.json").write_text("{}")
+    assert not ambient.claude_code_managed_mcp_present()
+    (managed_dirs[own_dir] / "managed-mcp.json").write_text("{}")
+    assert ambient.claude_code_managed_mcp_present()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs file permissions"
+)
+def test_claude_code_managed_mcp_presence_follows_permission_errors(tmp_path, monkeypatch) -> None:
+    """An unreadable file still counts, but one in an unsearchable directory does not."""
+    managed_dir = _claude_code_managed_dir(tmp_path, monkeypatch)
+    managed_mcp = managed_dir / "managed-mcp.json"
+    managed_mcp.write_text("{}")
+    managed_mcp.chmod(0)
+    assert ambient.claude_code_managed_mcp_present()
+
+    managed_dir.chmod(0)
+    try:
+        assert not ambient.claude_code_managed_mcp_present()
+    finally:
+        managed_dir.chmod(0o700)
 
 
 def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -> None:

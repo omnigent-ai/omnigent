@@ -16,7 +16,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
@@ -31,6 +31,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.entities.conversation import NON_CONTENT_ITEM_TYPES
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -103,7 +104,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native.native_terminal import request_with_429_retry
+from omnigent.native.native_terminal import post_initial_prompt, request_with_429_retry
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
@@ -301,7 +302,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
             or native_codex_launch_base_url(launch) is not None
         )
         defers_to_codex_config = not native_codex_launch_pins_model_provider(launch)
-    except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
+    except Exception:
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
         routes_through_provider = False
     if routes_through_provider and not defers_to_codex_config:
@@ -320,7 +321,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         if not _codex_auth_json_has_available_credential(source.auth_path):
             return HARNESS_NEEDS_AUTH
         return None
-    except Exception:  # noqa: BLE001 - readiness must never raise.
+    except Exception:
         _logger.debug("codex readiness: local auth check failed", exc_info=True)
         return HARNESS_NEEDS_AUTH
 
@@ -662,7 +663,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+    except Exception:
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -863,12 +864,13 @@ def _run_with_remote_server(
                 headers.update(new_headers)
 
             if prompt:
-                await _post_initial_prompt(
+                await post_initial_prompt(
                     base_url=base_url,
                     headers=headers,
                     session_id=prepared.session_id,
                     prompt=prompt,
                     auth=attach_auth,
+                    harness_name="Codex",
                 )
                 record_startup_event("initial_prompt_submitted")
             await _attach_terminal_resource(
@@ -1098,50 +1100,6 @@ async def _wait_for_codex_terminal_ready(
     raise click.ClickException(
         f"The runner did not create the Codex terminal for {session_id!r} within {timeout_s:.0f}s."
     )
-
-
-async def _post_initial_prompt(
-    *,
-    base_url: str,
-    headers: dict[str, str],
-    session_id: str,
-    prompt: str,
-    auth: httpx.Auth | None,
-) -> None:
-    """
-    Send the first Codex prompt through Omnigent instead of the app-server.
-
-    :param base_url: Omnigent server base URL.
-    :param headers: HTTP auth headers for Omnigent requests.
-    :param session_id: Session id, e.g. ``"conv_abc123"``.
-    :param prompt: User prompt text.
-    :param auth: Optional refresh-capable HTTP auth for long-lived
-        Databricks-backed sessions.
-    :returns: None.
-    :raises click.ClickException: If Omnigent rejects the prompt.
-    """
-    from omnigent.cli_auth import open_server_client
-
-    async with open_server_client(
-        base_url,
-        headers=headers,
-        auth=auth,
-        timeout=httpx.Timeout(30.0),
-    ) as client:
-        resp = await client.post(
-            f"/v1/sessions/{url_component(session_id)}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": prompt}],
-                },
-            },
-        )
-    if resp.status_code >= 400:
-        raise click.ClickException(
-            f"Codex initial prompt failed ({resp.status_code}): {error_text(resp)}"
-        )
 
 
 async def _prepare_codex_terminal(
@@ -2105,7 +2063,7 @@ def _codex_resume_rollout_path(codex_home: Path, external_session_id: str) -> Pa
     existing = _find_codex_rollout(codex_home, external_session_id)
     if existing is not None:
         return existing
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     partition = (
         codex_home / "sessions" / now.strftime("%Y") / now.strftime("%m") / now.strftime("%d")
     )
@@ -2310,10 +2268,10 @@ def _codex_rollout_records_from_session_items(
         items,
         interrupted_response_ids=interrupted_response_ids,
     )
-    items = _codex_items_with_outputs_in_call_order(items)
+    items = _codex_items_with_outputs_in_call_order(
+        [item for item in items if _session_item_response_id(item) not in interrupted_response_ids]
+    )
     for index, item in enumerate(items):
-        if _session_item_response_id(item) in interrupted_response_ids:
-            continue
         item_call_id = item.get("call_id")
         if (
             item.get("type") == "function_call_output"
@@ -2329,17 +2287,22 @@ def _codex_rollout_records_from_session_items(
         if item.get("type") == "compaction":
             compacted_msgs = item.get("compacted_messages")
             if isinstance(compacted_msgs, list) and compacted_msgs:
-                replacement_history = [
-                    {
-                        **message,
-                        "content": sanitize_replayed_image_blocks(message["content"]),
-                    }
-                    if isinstance(message, dict)
-                    and message.get("type") == "message"
-                    and "content" in message
-                    else message
-                    for message in compacted_msgs
-                ]
+                replacement_history: list[object] = []
+                for message in compacted_msgs:
+                    if isinstance(message, dict):
+                        if message.get("type") == "message" and "content" in message:
+                            message = {
+                                **message,
+                                "content": sanitize_replayed_image_blocks(message["content"]),
+                            }
+                        elif message.get("type") == "function_call" and isinstance(
+                            message.get("arguments"), str
+                        ):
+                            message = {
+                                **message,
+                                "arguments": _codex_replayed_arguments(message["arguments"]),
+                            }
+                    replacement_history.append(message)
                 replacement_call_ids = {
                     message.get("call_id")
                     for message in replacement_history
@@ -2420,41 +2383,43 @@ def _codex_items_with_outputs_in_call_order(
     items: list[_JsonObject],
 ) -> list[_JsonObject]:
     """
-    Reorder each contiguous run of tool outputs to match their calls' order.
+    Reorder tool outputs separated only by metadata to match their calls' order.
 
     Parallel tool outputs are stored in completion order, but Codex keeps them
     in call order, and providers that pair outputs by position reject the swap.
 
     :param items: Flat Omnigent item dicts in chronological order.
-    :returns: Items with every run of ``function_call_output`` items sorted by
-        the position of its ``function_call``; unmatched outputs keep their
-        relative order at the end of the run.
+    :returns: Items with output slots sorted by their calls' positions, preserving
+        metadata positions and all content or compaction boundaries. Unmatched
+        outputs keep their relative order at the end of the run.
     """
     call_positions: dict[str, int] = {}
     for position, item in enumerate(items):
         call_id = item.get("call_id")
         if item.get("type") == "function_call" and isinstance(call_id, str):
             call_positions.setdefault(call_id, position)
-    ordered: list[_JsonObject] = []
-    run: list[_JsonObject] = []
+    ordered = list(items)
+    output_positions: list[int] = []
 
     def flush_run() -> None:
-        run.sort(
+        outputs = sorted(
+            (ordered[position] for position in output_positions),
             key=lambda output: (
                 (0, call_positions[call_id])
                 if isinstance(call_id := output.get("call_id"), str) and call_id in call_positions
                 else (1, 0)
-            )
+            ),
         )
-        ordered.extend(run)
-        run.clear()
+        for position, output in zip(output_positions, outputs, strict=True):
+            ordered[position] = output
+        output_positions.clear()
 
-    for item in items:
-        if item.get("type") == "function_call_output":
-            run.append(item)
-            continue
-        flush_run()
-        ordered.append(item)
+    for position, item in enumerate(items):
+        item_type = item.get("type")
+        if item_type == "function_call_output":
+            output_positions.append(position)
+        elif item_type == "compaction" or item_type not in NON_CONTENT_ITEM_TYPES:
+            flush_run()
     flush_run()
     return ordered
 
@@ -2711,6 +2676,18 @@ def _codex_message_payload_from_session_item(item: _JsonObject) -> _JsonObject |
 _MAX_REPLAYED_ARGUMENTS_CHARS = 900_000
 
 
+def _codex_replayed_arguments(arguments: str) -> str:
+    """Replace oversized tool arguments with a bounded replay marker."""
+    if len(arguments) <= _MAX_REPLAYED_ARGUMENTS_CHARS:
+        return arguments
+    _logger.warning(
+        "Replaying oversized Codex function_call arguments as a stub: chars=%d", len(arguments)
+    )
+    return json.dumps(
+        {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
+    )
+
+
 def _codex_function_call_payload_from_session_item(
     item: _JsonObject,
 ) -> _JsonObject | None:
@@ -2743,21 +2720,10 @@ def _codex_function_call_payload_from_session_item(
             "Cannot synthesize Codex resume rollout: Omnigent function_call "
             f"{item_id!r} has non-string arguments."
         )
-    if len(arguments) > _MAX_REPLAYED_ARGUMENTS_CHARS:
-        # An apply_patch mirror carries whole files for added or deleted ones. One
-        # oversized call would fail every request in the thread, so replay a stub.
-        _logger.warning(
-            "Replaying an oversized Codex function_call as a stub: name=%s chars=%d",
-            name,
-            len(arguments),
-        )
-        arguments = json.dumps(
-            {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
-        )
     payload: _JsonObject = {
         "type": "function_call",
         "name": name,
-        "arguments": arguments,
+        "arguments": _codex_replayed_arguments(arguments),
         "call_id": call_id,
     }
     # The Responses API rejects a replayed namespaced call without it.
@@ -2902,7 +2868,7 @@ def _codex_rollout_timestamp() -> str:
     :returns: ISO-8601 timestamp with ``Z`` suffix, e.g.
         ``"2026-06-08T12:34:56.789Z"``.
     """
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 async def _patch_external_session_id(

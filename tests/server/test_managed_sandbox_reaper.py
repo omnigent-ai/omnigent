@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost, current_workspace_id
 from omnigent.db.enum_codecs import encode_host_status
 from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -672,3 +674,129 @@ async def test_identity_and_termination_run_off_event_loop_thread() -> None:
     assert await reaper.sweep_once(now=now) == 1
     assert modal.identity_threads == modal.termination_threads
     assert modal.identity_threads[0] != event_loop_thread
+
+
+class _OwnerLauncher(_RecordingLauncher):
+    """An owner-identity launcher: each instance acts as whoever it is bound to."""
+
+    owner_credential_provider = "databricks"
+
+    def __init__(self, built: list[_OwnerLauncher], connected: set[str] | None = None) -> None:
+        super().__init__("databricks")
+        self.owner: str | None = None
+        self.connected = connected
+        built.append(self)
+
+    def bind_owner_credential(self, resolve: Callable[[], object]) -> None:
+        resolve()
+
+    def terminate(self, sandbox_id: str) -> None:
+        # Like the real launcher, an unconnected owner is refused at first use.
+        if self.connected is not None and self.owner not in self.connected:
+            raise OwnerCredentialMissingError("Connect Databricks first")
+        self.terminated.append(f"{self.owner}:{sandbox_id}")
+
+
+def _alice_and_bob_stale_hosts(now: int) -> _FakeHostStore:
+    return _FakeHostStore(
+        {
+            7: [
+                replace(
+                    _host(
+                        "h_a",
+                        provider="databricks",
+                        sandbox_id="sb-a",
+                        updated_at=now - 2 * _DAY_S,
+                    ),
+                    user_id="alice",
+                ),
+                replace(
+                    _host(
+                        "h_b",
+                        provider="databricks",
+                        sandbox_id="sb-b",
+                        updated_at=now - 3 * _DAY_S,
+                    ),
+                    user_id="bob",
+                ),
+            ]
+        }
+    )
+
+
+def _owner_reaper(
+    hosts: _FakeHostStore,
+    *,
+    connected: set[str] | None = None,
+    broken: str | None = None,
+) -> tuple[ManagedSandboxReaper, dict[str, _OwnerLauncher]]:
+    """Build a reaper whose launchers record, per owner, the last one bound to them."""
+    built: list[_OwnerLauncher] = []
+    current: dict[str, _OwnerLauncher] = {}
+
+    def resolve(user: str) -> None:
+        if user == broken:
+            raise RuntimeError("connection store unavailable")
+        built[-1].owner = user
+        current[user] = built[-1]
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                launcher_factory=lambda: _OwnerLauncher(built, connected),  # type: ignore[arg-type]
+                token_ttl_s=3600,
+                provider="databricks",
+            ),
+        ),
+        reaper=ManagedSandboxReaperConfig(enabled=True, terminate_after_offline_days=1),
+        owner_credentials={"databricks": resolve},
+    )
+    reaper = ManagedSandboxReaper(host_store=hosts, sandbox_config=deployment)  # type: ignore[arg-type]
+    return reaper, current
+
+
+async def test_owner_identity_reaps_each_sandbox_as_its_own_owner() -> None:
+    now = 4_000_000
+    reaper, current = _owner_reaper(_alice_and_bob_stale_hosts(now))
+
+    assert await reaper.sweep_once(now=now) == 2
+
+    assert current["alice"].terminated == ["alice:sb-a"]
+    assert current["bob"].terminated == ["bob:sb-b"]
+
+
+async def test_disconnected_owner_stays_pending_while_other_owners_are_reaped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = 4_000_000
+    connected = {"bob"}
+    hosts = _alice_and_bob_stale_hosts(now)
+    reaper, current = _owner_reaper(hosts, connected=connected)
+
+    with caplog.at_level(logging.WARNING):
+        assert await reaper.sweep_once(now=now) == 1
+    # An expected wait for the owner, logged once per sweep without a traceback.
+    (record,) = [r for r in caplog.records if "h_a" in r.getMessage()]
+    assert record.levelno == logging.WARNING and record.exc_info is None
+
+    assert current["bob"].terminated == ["bob:sb-b"]
+    assert current["alice"].terminated == []
+    # Detached but not cleared: the terminating id keeps alice's sandbox queued.
+    assert hosts.hosts[7]["h_a"].terminating_sandbox_id == "sb-a"
+
+    connected.add("alice")
+    assert await reaper.sweep_once(now=now) == 1
+
+    assert current["alice"].terminated == ["alice:sb-a"]
+    assert hosts.hosts[7]["h_a"].terminating_sandbox_id is None
+
+
+async def test_one_owner_launcher_failing_to_build_does_not_stop_the_sweep() -> None:
+    now = 4_000_000
+    reaper, current = _owner_reaper(_alice_and_bob_stale_hosts(now), broken="alice")
+
+    assert await reaper.sweep_once(now=now) == 1
+
+    assert current["bob"].terminated == ["bob:sb-b"]
+    assert "alice" not in current

@@ -30,6 +30,7 @@ from omnigent.runtime.workflow import (
     _build_qwen_spawn_env,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.providers import isolate_provider_resolution
 
 # (harness name, builder callable, HARNESS_<H>_CWD env var)
 _BUILDERS = [
@@ -46,16 +47,8 @@ _BUILDERS = [
 
 @pytest.fixture(autouse=True)
 def _isolate_global_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Point OMNIGENT_CONFIG_HOME at an empty temp dir so the developer's real
-    ``~/.omnigent/config.yaml`` cannot influence provider/model resolution.
-
-    Also stub ``detect_providers`` so ambient CLI config files (e.g.
-    ``~/.codex/config.toml``) on a developer's machine cannot leak into the
-    provider resolution path and cause spurious failures (matches the
-    isolation pattern in ``test_runner_dispatch.py`` / ``test_cli.py``).
-    """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    """Keep the developer's provider config and ambient CLI logins out of resolution."""
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
 
 
 def _make_spec(harness: str) -> AgentSpec:

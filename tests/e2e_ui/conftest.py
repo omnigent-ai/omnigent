@@ -50,6 +50,7 @@ from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import filelock
 import httpx
@@ -65,6 +66,7 @@ from tests._helpers.compat import (
     server_executable,
 )
 from tests._helpers.native_session import create_native_session
+from tests._helpers.operator_agents import operator_agent_store, post_operator_session
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests._helpers.workspace_geometry import (
     workspace_bar_needs_collapse as workspace_bar_needs_collapse,
@@ -80,6 +82,7 @@ from tests.helpers.ui_configuration import (
     _ALLOW_DEV_BASE_URL_ENV,
     ServerState,
     prepared_repro_environment,
+    validate_native_claude_mock_routing,
 )
 from tests.helpers.ui_configuration import (
     _CLAUDE_MOCK_MODEL as _CLAUDE_MOCK_MODEL,
@@ -89,6 +92,9 @@ from tests.helpers.ui_configuration import (
 )
 from tests.helpers.ui_configuration import (
     pytest_configure as pytest_configure,
+)
+from tests.helpers.ui_configuration import (
+    pytest_unconfigure as pytest_unconfigure,
 )
 from tests.helpers.ui_configuration import (
     temp_omnigent_mock_config as _temp_omnigent_mock_config,
@@ -154,6 +160,24 @@ def open_right_rail(page: Page) -> None:
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+
+
+def stub_session_pull_requests(
+    page: Page, listed: Callable[[], list[dict[str, Any]]], unlink: Callable[[str], None]
+) -> None:
+    """Answer the server's stored PR list for tests that stub the PR resources.
+
+    :param page: Playwright page, before it navigates.
+    :param listed: Returns the session's linked PRs as the stub currently has them.
+    :param unlink: Receives each URL the panel unlinks with ``DELETE``.
+    """
+
+    def respond(route: Route) -> None:
+        if route.request.method == "DELETE":
+            unlink(parse_qs(urlsplit(route.request.url).query)["url"][0])
+        route.fulfill(json={"object": "list", "data": listed(), "synced": True})
+
+    page.route(re.compile(r"/v1/sessions/[^/]+/pull-requests(?:\?|$)"), respond)
 
 
 def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:
@@ -321,6 +345,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     :param parser: The pytest option parser.
     """
     parser.addoption(
+        "--ui-dependency-smoke",
+        action="store_true",
+        default=False,
+        help="Deprecated; removal in 0.21.0. Run compatibility smoke and Codex sidecar consumers.",
+    )
+    parser.addoption(
+        "--ui-codex-sidecar-only",
+        action="store_true",
+        help="Run consumers of the Codex Responses sidecar before splitting into shards.",
+    )
+    parser.addoption(
         "--ui-base-url",
         default=None,
         help=(
@@ -428,11 +463,23 @@ def pytest_collection_modifyitems(
     bucket. That averages cost across shards without maintaining a
     durations file.
 
-    No-op unless both ``--splits`` and ``--group`` are passed, so local
-    runs and the non-sharded suites are unaffected. ``trylast`` lets the
-    repo-wide known-failures marking in ``tests/conftest.py`` tag items
-    first; markers travel with the items the slice keeps.
+    Optional sidecar selection precedes the split and includes indirect fixture
+    consumers. ``trylast`` lets repo-wide known-failure marking tag items first;
+    markers travel with the items the slice keeps.
     """
+    dependency = config.getoption("--ui-dependency-smoke")
+    if config.getoption("--ui-codex-sidecar-only") or dependency:
+        selected = [
+            item
+            for item in items
+            if "mocked_native_codex_session" in item.fixturenames
+            or (dependency and item.get_closest_marker("compat_smoke") is not None)
+        ]
+        if not selected:
+            raise pytest.UsageError("No Codex sidecar consumers collected")
+        config.hook.pytest_deselected(items=[item for item in items if item not in selected])
+        items[:] = selected
+
     splits = config.getoption("--splits")
     group = config.getoption("--group")
     if splits is None and group is None:
@@ -1232,7 +1279,8 @@ def live_server(
     set_fallback_mock_llm(mock_url, "gpt-4o-mini", "Mock LLM response.")
 
     try:
-        yield base_url
+        with operator_agent_store(base_url, f"sqlite:///{db_path}", artifact_dir):
+            yield base_url
     finally:
         _server_state.clear()
         if runner_proc.poll() is None:
@@ -2340,11 +2388,18 @@ def _stop_recorded_context(item: pytest.Item) -> None:
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(
     item: pytest.Item, call: pytest.CallInfo[None]
-) -> Generator[None, None, None]:
-    """Stop the recording when the test body ends, before later fixtures tear down.
+) -> Generator[None, Any, None]:
+    """Finalize recordings and reject skipped tests in selected sidecar runs.
 
     The ``context`` behind ``page`` otherwise outlives the session fixtures' teardown."""
-    yield
+    outcome = yield
+    report = outcome.get_result()
+    if (
+        item.config.getoption("--ui-codex-sidecar-only")
+        or item.config.getoption("--ui-dependency-smoke")
+    ) and report.skipped:
+        report.outcome = "failed"
+        report.longrepr = f"Selected sidecar test skipped: {report.longrepr}"
     if call.when == "call" and _recording_requested(item):
         _stop_recorded_context(item)
 
@@ -2555,23 +2610,26 @@ def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None
     bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
 
 
-def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
+def _create_bundled_session(
+    base_url: str, runner_id: str, yaml_text: str, *, operator_authored: bool = False
+) -> str:
     """Register a session-scoped agent from *yaml_text* and bind its session.
 
-    The multipart ``POST /v1/sessions`` both registers the agent and creates
-    the session it is scoped to, returning that ``session_id`` directly — so
-    no separate create call is needed.
+    HTTP uploads validate user-authored specs. Operator fixtures with Python
+    tools or host paths use trusted local registration before creating by id.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
     :param yaml_text: The agent spec body.
+    :param operator_authored: Provision a trusted operator fixture through local stores.
     :returns: The new session/conversation id.
     """
 
     data = yaml_text.encode()
     bundle_bytes = bundle_files({"config.yaml": data})
 
-    create = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
+    provision = post_operator_session if operator_authored else post_session_bundle
+    create = provision(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
     create.raise_for_status()
     session_id = str(create.json()["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
@@ -2743,6 +2801,7 @@ def _create_native_codex_session(
     runner_id: str,
     *,
     model: str | None = None,
+    labels: dict[str, str] | None = None,
 ) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
@@ -2766,6 +2825,7 @@ def _create_native_codex_session(
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
     :param model: Optional Codex model to pin in the wrapper spec.
+    :param labels: Extra session labels set at create, before Codex launches.
     :returns: The new session/conversation id.
     """
     # Keep workspace session-local; runner-wide cwd changes other file surfaces.
@@ -2774,7 +2834,7 @@ def _create_native_codex_session(
         base_url,
         harness="codex",
         model=model,
-        metadata={"workspace": str(_REPO_ROOT)},
+        metadata={"workspace": str(_REPO_ROOT), "labels": labels or {}},
     )
     session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
@@ -2829,7 +2889,9 @@ def native_claude_mock_session_context(
     Workflow-owned runners are already configured. Standalone tests temporarily
     install a mock provider regardless of ambient credential placeholders.
     ``terminal_launch_args`` are persisted on the session and passed to ``claude``.
+    Callers request ``claude_managed_settings`` to expose real machine routing.
     """
+    validate_native_claude_mock_routing(mock_llm_server_url)
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(
@@ -2858,6 +2920,7 @@ def native_claude_mock_session(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
+    claude_managed_settings: None,
 ) -> Iterator[tuple[str, str]]:
     """A real Claude CLI using an explicitly configured mock provider."""
     with native_claude_mock_session_context(
@@ -2871,18 +2934,22 @@ def native_codex_mock_session(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
 ) -> Iterator[tuple[str, str]]:
     """A real Codex CLI using an explicitly configured mock provider.
 
     Workflow-owned runners reuse their startup config; standalone tests install
-    a temporary mock provider regardless of ambient credentials.
+    a temporary mock provider regardless of ambient credentials. Indirect fixture
+    parameters supply session labels before Codex launches.
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(
         mock_llm_server_url, "codex", workflow_owned=bool(_server_state.get("workflow_owned"))
     ):
-        session_id = _create_native_codex_session(live_server, runner_id)
+        session_id = _create_native_codex_session(
+            live_server, runner_id, labels=getattr(request, "param", None)
+        )
         try:
             yield (live_server, session_id)
         finally:

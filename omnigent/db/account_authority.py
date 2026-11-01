@@ -146,7 +146,7 @@ def require_active_account(
     session: Session,
     user_id: str | None,
     *,
-    generation: str | None | _GenerationDefault = _GenerationDefault.CONTEXT,
+    generation: str | _GenerationDefault | None = _GenerationDefault.CONTEXT,
     related_accounts: Mapping[str, str | None] | None = None,
 ) -> str | None:
     """Validate the captured generation under the writer's account lock.

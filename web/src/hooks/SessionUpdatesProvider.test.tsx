@@ -84,7 +84,7 @@ function seedProjectFolder(client: QueryClient, project: string, ids: string[]):
     last_id: ids.at(-1) ?? null,
     has_more: false,
   };
-  client.setQueryData(["project-sessions", project], {
+  client.setQueryData(["project-sessions", project, "updated_at", false], {
     pages: [page],
     pageParams: [undefined],
   } satisfies ConversationsInfiniteData);
@@ -335,8 +335,30 @@ describe("SessionUpdatesProvider project folders", () => {
     const folder = client.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Sprint 42",
+      "updated_at",
+      false,
     ]);
     expect(folder!.pages[0].data[0]!.pending_elicitations_count).toBe(1);
+  });
+
+  it("keeps streamed archived rows in archived folder caches and drops them from live caches", () => {
+    const client = new QueryClient();
+    const row = { ...conv("conv_filed"), archived: true };
+    const liveKey = ["project-sessions", "Sprint 42", "updated_at", false];
+    const archivedKey = ["project-sessions", "Sprint 42", "updated_at", true];
+    for (const key of [liveKey, archivedKey]) {
+      client.setQueryData(key, {
+        pages: [{ data: [row], has_more: false }],
+        pageParams: [undefined],
+      });
+    }
+    renderProvider(client, ["/"]);
+    act(() => frameHandler()({ type: "changed", items: [{ ...row, title: "Renamed archive" }] }));
+
+    expect(
+      client.getQueryData<ConversationsInfiniteData>(archivedKey)!.pages[0].data[0]?.title,
+    ).toBe("Renamed archive");
+    expect(client.getQueryData<ConversationsInfiniteData>(liveKey)!.pages[0].data).toEqual([]);
   });
 
   it("evicts a removed session from a project folder's cache", () => {
@@ -350,6 +372,8 @@ describe("SessionUpdatesProvider project folders", () => {
     const folder = client.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Sprint 42",
+      "updated_at",
+      false,
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
   });
