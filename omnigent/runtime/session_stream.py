@@ -43,7 +43,12 @@ from omnigent.debug_logging import (
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.native.input_diagnostics import input_attributes
-from omnigent.runtime import disconnect_outcome, inflight_text, pending_elicitations
+from omnigent.runtime import (
+    disconnect_outcome,
+    inflight_text,
+    pending_client_tool_calls,
+    pending_elicitations,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -341,6 +346,10 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
     # type is a single dict lookup and a return. A suppressed event is
     # always a text delta, never an elicitation, so this still runs.
     pending_elicitations.record_publish(conversation_id, event)
+    # Side-channel: keep the pending-client-tool-call index in step
+    # with the SSE stream, the same way as the elicitations index
+    # above — a suppressed event is never an action_required call.
+    pending_client_tool_calls.record_publish(conversation_id, event)
     if live_event is None:
         return 0
     with _lock:

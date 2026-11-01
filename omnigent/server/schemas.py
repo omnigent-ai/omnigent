@@ -1121,6 +1121,16 @@ class CreateResponseRequest(BaseModel):
         or missing ``function.name``, e.g.
         ``[{"type": "function", "function": {"name": "get_weather",
         "description": "...", "parameters": {...}}}]``.
+    :param client_side_tool_names: Bare names from ``tools`` the sender
+        has authoritatively verified are client-owned (not a spec/server
+        tool merged into the same list). Always a subset of the names in
+        ``tools``; always sent explicitly by this server's own runner,
+        including ``[]`` when the true client-owned set is empty. ``None``
+        only when the sender can't compute this at all (an older runner,
+        or a direct/synthetic caller) — the harness then fails CLOSED and
+        treats nothing as client-owned, rather than guessing from
+        ``tools`` (which would re-admit the exact spec/client ambiguity
+        this field exists to resolve).
     :param tool_choice: Ignored — agent controls this. Silently
         dropped.
     :param max_output_tokens: Output token cap, e.g. ``32``.
@@ -1175,6 +1185,15 @@ class CreateResponseRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     tools: list[dict[str, Any]] | None = None
+    # Authoritative client-trusted subset of ``tools`` by bare name, when the
+    # sender (the runner, merging spec + request-supplied tool schemas into
+    # one ``tools`` list) can compute it. ``None`` when the sender is older
+    # or doesn't track ownership (e.g. a direct/synthetic caller); the
+    # harness then falls back to treating every name in ``tools`` as a
+    # client-owned candidate, which can over-include a spec-declared tool
+    # merged into the same list. See
+    # ``omnigent.runner.app._compute_client_side_tool_names``.
+    client_side_tool_names: list[str] | None = None
     tool_choice: dict[str, Any] | str | None = None
     max_output_tokens: int | None = None
     frequency_penalty: float | None = None
@@ -2360,6 +2379,20 @@ class SessionResponse(BaseModel):
         Empty list when no prompts are outstanding. Sourced from
         the Omnigent server's in-memory
         :mod:`omnigent.runtime.pending_elicitations` index.
+    :param pending_client_tool_calls: Outstanding client-declared
+        tool calls on this session at the moment the snapshot was
+        built — the original ``response.output_item.done`` event
+        dicts for each ``function_call`` still parked as
+        ``action_required``. Lets a client that disconnected while a
+        call was outstanding (or opened the session fresh) discover
+        and answer it after reconnecting, since the live SSE stream
+        has no replay. Empty list when nothing is outstanding.
+        Sourced from the Omnigent server's in-memory
+        :mod:`omnigent.runtime.pending_client_tool_calls` index.
+        Absent (empty) on an older server — a client should fall back
+        to its own reconnect handling when this is always empty and
+        the ``/v1/info`` capability flag of the same name is also
+        absent.
     :param pending_inputs: Accepted messages awaiting consumption, each
         ``{"pending_id", "content"}``. Includes durable managed-startup
         inputs and native messages awaiting a transcript receipt. Clients
@@ -2464,6 +2497,7 @@ class SessionResponse(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     pending_elicitations: list[dict[str, Any]] = Field(default_factory=list)
+    pending_client_tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     # Durable startup inputs plus ordinary native inputs awaiting a receipt.
     # Each {"pending_id", "content"} restores a pending bubble on reconnect.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)

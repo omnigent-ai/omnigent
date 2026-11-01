@@ -938,11 +938,24 @@ def _schema_tool_name(schema: _JsonObject) -> str | None:
     """
     Extract a tool's function name from its OpenAI-format schema.
 
-    :param schema: A tool schema dict in nested OpenAI format, e.g.
-        ``{"type": "function", "function": {"name": "Read", ...}}``.
+    Accepts both the flat form (``{"name": "Read", ...}``, as a server-
+    discovered tool schema may arrive) and the nested/wrapped form
+    (``{"type": "function", "function": {"name": "Read", ...}}``).
+    Checking the flat form first mirrors
+    ``_executor_adapter._normalize_tool_schemas``'s own precedence, so the
+    two layers agree on which shape a given schema is. Missing this form
+    previously let a flat-form spec tool go unrecognized in
+    ``_spec_names``/``_merge_request_client_tools``'s seen-set, so a
+    client re-declaring the same tool name wasn't correctly subtracted as
+    server-owned.
+
+    :param schema: A tool schema dict, flat or nested OpenAI format.
     :returns: The tool name (e.g. ``"Read"``), or ``None`` when the
-        schema is malformed / missing the ``function.name`` field.
+        schema is malformed / missing a recognizable name field.
     """
+    if "name" in schema:
+        name = schema.get("name")
+        return name if isinstance(name, str) else None
     function = schema.get("function")
     if isinstance(function, dict):
         name = function.get("name")
@@ -998,6 +1011,45 @@ def _merge_request_client_tools(
         seen.add(name)
         merged.append(tool)
     return merged
+
+
+def _compute_client_side_tool_names(
+    spec_tools: list[_JsonObject],
+    client_tools: list[_JsonObject],
+) -> frozenset[str]:
+    """
+    The turn's authoritative client-trusted tool-name set.
+
+    ``_merge_request_client_tools`` combines spec and client tools into
+    one list for the model to see, so by itself it no longer distinguishes
+    who owns a given call. This is the single source of truth for that
+    question: client names minus any name a spec tool already claims — a
+    collision resolves to server/spec ownership, mirroring
+    ``_merge_request_client_tools``'s own builtins-win precedence. The
+    harness/executor uses this set (propagated via
+    ``harness_body["client_side_tool_names"]``) to decide whether a parked
+    tool call counts as a human wait for the idle watchdog and whether it
+    belongs in the reconnect snapshot.
+
+    :param spec_tools: Spec-derived builtin + MCP tool schemas for this
+        turn.
+    :param client_tools: Request-supplied client-side tool schemas for
+        this turn.
+    :returns: Bare tool names the request genuinely declared as
+        client-side, excluding any name a spec tool already claims.
+    """
+    spec_names = {
+        name
+        for t in spec_tools
+        if isinstance(t, dict) and (name := _schema_tool_name(t)) is not None
+    }
+    return frozenset(
+        name
+        for t in client_tools
+        if isinstance(t, dict)
+        and (name := _schema_tool_name(t)) is not None
+        and name not in spec_names
+    )
 
 
 def _should_dispatch_tool_locally(
@@ -5698,18 +5750,20 @@ def create_runner_app(
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
             harness_body["tools"] = merged_tools
-        _spec_names = {
-            name
-            for t in _spec_tools
-            if isinstance(t, dict) and (name := _schema_tool_name(t)) is not None
-        }
-        ctx.client_side_tool_names = frozenset(
-            name
-            for t in _client_tools
-            if isinstance(t, dict)
-            and (name := _schema_tool_name(t)) is not None
-            and name not in _spec_names
-        )
+        ctx.client_side_tool_names = _compute_client_side_tool_names(_spec_tools, _client_tools)
+        # Propagate the authoritative ownership set to the harness alongside
+        # the merged tool list: ``harness_body["tools"]`` mixes spec and
+        # client tools indistinguishably, so the harness cannot otherwise
+        # tell which of its parked calls a connected client actually owns
+        # (idle-watchdog hold, and reconnect-snapshot membership, both
+        # depend on this). Always sent explicitly, including an empty list
+        # (zero client tools, or every client name collided with a spec
+        # name) — omitting the field on an empty result would leave the
+        # harness with no explicit signal and no way to distinguish "zero
+        # client tools" from "this sender doesn't compute the set", which
+        # must fail closed, not fail open. Sorted for a stable, diffable
+        # wire value.
+        harness_body["client_side_tool_names"] = sorted(ctx.client_side_tool_names)
 
         await _ensure_native_terminal_for_turn(conv, harness_name)
 

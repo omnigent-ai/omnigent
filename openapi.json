@@ -6050,6 +6050,11 @@
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
+          "client_tool_wait_exempt_from_idle_watchdog": {
+            "default": true,
+            "title": "Client Tool Wait Exempt From Idle Watchdog",
+            "type": "boolean"
+          },
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"
@@ -6115,6 +6120,11 @@
           },
           "needs_setup": {
             "title": "Needs Setup",
+            "type": "boolean"
+          },
+          "pending_client_tool_calls": {
+            "default": true,
+            "title": "Pending Client Tool Calls",
             "type": "boolean"
           },
           "picker": {
@@ -8729,6 +8739,15 @@
             ],
             "description": "For sub-agent sessions, the parent conversation's id, e.g. `\"conv_parent987\"`. `None` for top-level sessions. Lets clients identify a session as a child and link back to its parent without an extra round-trip \u2014 the same conversation row exposes this via `parent_conversation_id` internally.",
             "title": "Parent Session Id"
+          },
+          "pending_client_tool_calls": {
+            "description": "Outstanding client-declared tool calls on this session at the moment the snapshot was built \u2014 the original `response.output_item.done` event dicts for each `function_call` still parked as `action_required`. Lets a client that disconnected while a call was outstanding (or opened the session fresh) discover and answer it after reconnecting, since the live SSE stream has no replay. Empty list when nothing is outstanding. Sourced from the Omnigent server's in-memory `omnigent.runtime.pending_client_tool_calls` index. Absent (empty) on an older server \u2014 a client should fall back to its own reconnect handling when this is always empty and the `/v1/info` capability flag of the same name is also absent.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Pending Client Tool Calls",
+            "type": "array"
           },
           "pending_elicitations": {
             "description": "Outstanding approval prompts on this session at the moment the snapshot was built \u2014 the original `response.elicitation_request` event dicts. Lets the UI render the ApprovalCard on cold load, since the live SSE stream has no replay and a prompt emitted before the user opened the chat would otherwise vanish. Empty list when no prompts are outstanding. Sourced from the Omnigent server's in-memory `omnigent.runtime.pending_elicitations` index.",

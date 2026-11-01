@@ -447,6 +447,60 @@ def test_publishing_non_elicitation_event_leaves_pending_index_untouched() -> No
     pending_elicitations.reset_for_tests()
 
 
+# ── Side-channel: pending-client-tool-calls index ─────────────────────
+
+
+def test_publishing_action_required_event_updates_pending_client_tool_index() -> None:
+    """
+    Publishing an ``action_required`` function_call event registers the
+    call in the per-conversation pending-client-tool-calls index.
+
+    Wiring it to ``session_stream.publish`` is what makes a parked call
+    visible to a client that reconnects after missing the live event —
+    a regression that decouples them would silently reintroduce the bug
+    this index exists to fix.
+    """
+    from omnigent.runtime import pending_client_tool_calls
+
+    pending_client_tool_calls.reset_for_tests()
+    session_stream.publish(
+        "conv_r",
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "status": "action_required",
+                "call_id": "call_publish_test",
+                "name": "lookup_secret_token",
+                "arguments": "{}",
+            },
+        },
+    )
+    # 1 = the publish side-channel ran. If 0, the import or call in
+    # ``session_stream.publish`` was removed; a reconnecting client
+    # would never see the parked call again.
+    assert len(pending_client_tool_calls.snapshot_for("conv_r")) == 1
+    pending_client_tool_calls.reset_for_tests()
+
+
+def test_publishing_non_tool_call_event_leaves_pending_client_tool_index_untouched() -> None:
+    """
+    A regular SSE event does NOT register anything in the
+    pending-client-tool-calls index — the hot publish path's type
+    filter must reject everything else.
+    """
+    from omnigent.runtime import pending_client_tool_calls
+
+    pending_client_tool_calls.reset_for_tests()
+    session_stream.publish(
+        "conv_s",
+        {"type": "response.output_text.delta", "delta": "hello"},
+    )
+    session_stream.publish("conv_s", {"type": "response.completed"})
+    assert pending_client_tool_calls.snapshot_for("conv_s") == []
+    pending_client_tool_calls.reset_for_tests()
+
+
 # ── Idle keepalive: session.heartbeat ────────────────────────────────
 
 

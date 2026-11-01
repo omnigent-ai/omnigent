@@ -4505,6 +4505,122 @@ async def test_get_session_replays_pending_elicitations(
     pending_elicitations.reset_for_tests()
 
 
+async def test_get_session_replays_pending_client_tool_calls(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/sessions/{id}`` includes outstanding ``action_required``
+    client-tool calls in ``pending_client_tool_calls`` so a client that
+    disconnected while a call was parked (or opened the session fresh)
+    can discover and answer it after reconnecting.
+
+    Without this snapshot, the live SSE stream's no-replay design means
+    a call parked before the client (re)connected would never render —
+    the reconnecting client would have no way to know the turn is
+    waiting on it, and the turn would eventually fail the idle
+    watchdog. Also pins that this field is strictly additive:
+    ``pending_elicitations`` carries its own, unrelated entry
+    unchanged when both kinds are outstanding on the same session.
+    """
+    from omnigent.runtime import pending_client_tool_calls, pending_elicitations
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    pending_client_tool_calls.reset_for_tests()
+    pending_elicitations.reset_for_tests()
+
+    # An elicitation is outstanding too, to prove the two indexes never
+    # bleed into each other's field.
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elicit_alongside"},
+    )
+    pending_client_tool_calls.record_publish(
+        session_id,
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "id": "fc_snapshot_test",
+                "type": "function_call",
+                "status": "action_required",
+                "name": "lookup_secret_token",
+                "arguments": "{}",
+                "call_id": "call_snapshot_test",
+                "agent": "test-agent",
+            },
+        },
+    )
+
+    resp = await client.get(f"/v1/sessions/{session_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    # Field present even when empty — keeps the wire shape stable for a
+    # client that always reads it.
+    assert "pending_client_tool_calls" in body, (
+        f"snapshot must include pending_client_tool_calls field; got keys {sorted(body.keys())}. "
+        f"If absent, SessionResponse dropped the field or the GET handler "
+        f"isn't reading the index."
+    )
+    pending_calls = body["pending_client_tool_calls"]
+    # 1 = the outstanding call was carried into the snapshot. If 0, the
+    # handler isn't calling snapshot_for; if > 1, the snapshot is
+    # bleeding across sessions.
+    assert len(pending_calls) == 1
+    call_event = pending_calls[0]
+    assert call_event["type"] == "response.output_item.done"
+    assert call_event["item"]["call_id"] == "call_snapshot_test"
+    assert call_event["item"]["status"] == "action_required"
+    assert call_event["item"]["name"] == "lookup_secret_token"
+
+    # pending_elicitations is untouched by the sibling index existing —
+    # the two fields are strictly additive, never cross-populated.
+    assert len(body["pending_elicitations"]) == 1
+    assert body["pending_elicitations"][0]["elicitation_id"] == "elicit_alongside"
+
+    pending_client_tool_calls.reset_for_tests()
+    pending_elicitations.reset_for_tests()
+
+
+async def test_info_reports_pending_client_tool_calls_capability(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/info`` advertises ``pending_client_tool_calls: true`` so a
+    client can detect snapshot support before it ever opens a session —
+    the capability flag and the field's presence on the snapshot are
+    the same signal, and a client against an older server (where the
+    flag and field are both absent) should keep its own reconnect
+    workaround instead.
+    """
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["pending_client_tool_calls"] is True
+
+
+async def test_info_reports_client_tool_wait_watchdog_exemption_capability(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/info`` advertises ``client_tool_wait_exempt_from_idle_watchdog``
+    as a capability bit SEPARATE from ``pending_client_tool_calls``.
+
+    A client can need one without the other: a reconnect-recovery consumer
+    that never cares how long the server will wait on an unanswered call, or
+    a client that only wants to stop padding its own timeout budget without
+    adopting snapshot-based reconnect recovery. Collapsing both into one bit
+    would force a client to assume behavior it hasn't actually observed.
+    """
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    body = resp.json()
+    # A distinct key from pending_client_tool_calls — a client reading one
+    # must not assume the other is also present/true.
+    assert body["client_tool_wait_exempt_from_idle_watchdog"] is True
+    assert "pending_client_tool_calls" in body
+
+
 # ── GET /v1/sessions/{id}/items ──────────────────────────
 
 
