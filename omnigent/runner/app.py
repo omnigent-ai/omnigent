@@ -7960,6 +7960,10 @@ def create_runner_app(
         _session_cursor_model_names=_session_cursor_model_names,
         _session_harness_name=_session_harness_name,
         _session_spec_cache=_session_spec_cache,
+        # Defined further down; bound late so the route can call it.
+        _sync_session_agent=lambda session_id, agent_id, revision: _sync_session_agent(
+            session_id, agent_id, revision
+        ),
         server_client=server_client,
     )
 

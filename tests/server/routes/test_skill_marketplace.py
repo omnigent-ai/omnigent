@@ -1283,16 +1283,18 @@ def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None
 async def test_a_marketplace_change_reaches_a_warm_sessions_next_turn(
     market, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A running session kept its cached spec, since nothing about its agent
-    # changed, while its menu listed the newly installed skill. The turn's
-    # revision now carries the owner's installs, so the runner rebuilds the
-    # spec (as it does for any new revision) on the next turn.
+    # Installs change the turn's agent revision, and a slash command sends it
+    # with the resolve request, which runs before the turn reaches the runner.
     import json
 
     client, _app, artifact_store = market
     forwarded: list[str] = []
+    resolved: list[str | None] = []
 
     def runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/skills/resolve"):
+            resolved.append(json.loads(request.content).get("agent_revision"))
+            return httpx.Response(200, json={"meta_text": "<skill>review</skill>"})
         if request.method == "POST" and request.url.path.endswith("/events"):
             forwarded.append(json.loads(request.content)["agent_revision"])
         return httpx.Response(202, json={"queued": True})
@@ -1335,6 +1337,15 @@ async def test_a_marketplace_change_reaches_a_warm_sessions_next_turn(
         await client.patch(f"/v1/installed-skills/{skill_id}", json={"enabled": False})
         after_disable = await turn()
         assert after_disable not in (warm, after_install)
+        # Slash first: the resolve itself carries the revision after the change.
+        await client.patch(f"/v1/installed-skills/{skill_id}", json={"enabled": True})
+        slash = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "slash_command", "data": {"kind": "skill", "name": "review"}},
+        )
+        assert slash.status_code == 202, slash.text
+        assert resolved[-1] is not None and resolved[-1] != after_disable
+        assert resolved[-1] == forwarded[-1]
 
 
 @pytest.mark.asyncio
@@ -1348,8 +1359,12 @@ async def test_source_and_policy_changes_reach_a_warm_sessions_next_turn(
     from tests.server.helpers import build_agent_bundle
 
     forwarded: list[str] = []
+    resolved: list[str | None] = []
 
     def runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/skills/resolve"):
+            resolved.append(json.loads(request.content).get("agent_revision"))
+            return httpx.Response(200, json={"meta_text": "<skill>review</skill>"})
         if request.method == "POST" and request.url.path.endswith("/events"):
             forwarded.append(json.loads(request.content)["agent_revision"])
         return httpx.Response(202, json={"queued": True})
@@ -1409,7 +1424,14 @@ async def test_source_and_policy_changes_reach_a_warm_sessions_next_turn(
         ) as runner_client,
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client,
     ):
-        assert await turn(client) != readded
+        # Slash first under the tighter policy: the resolve already carries it.
+        slash = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "slash_command", "data": {"kind": "skill", "name": "review"}},
+        )
+        assert slash.status_code == 202, slash.text
+        assert resolved[-1] is not None and resolved[-1] != readded
+        assert await turn(client) == resolved[-1]
 
 
 def test_a_skills_filter_selects_an_install_by_its_label_too(db_uri: str, tmp_path: Path) -> None:

@@ -7864,6 +7864,8 @@ async def _resolve_skill_meta_text_via_runner(
     runner_client: httpx.AsyncClient,
     *,
     legacy_name: str | None = None,
+    agent_id: str | None = None,
+    agent_revision: str | None = None,
 ) -> str:
     """
     Resolve a skill's hidden ``<skill>`` meta text on the bound runner.
@@ -7885,16 +7887,24 @@ async def _resolve_skill_meta_text_via_runner(
         for directory ``review``. Retried once when the runner rejects
         ``skill_name`` but lists this name, as runners from before
         directory-name invocation do.
+    :param agent_id: The session's agent id, sent with *agent_revision*.
+    :param agent_revision: The turn's effective agent revision, so the runner
+        rebuilds a stale spec before resolving; runners that predate it ignore it.
     :returns: The hidden ``<skill>`` meta text for a single
         ``input_text`` block.
     :raises OmnigentError: If the skill is not exposed for the session
         (the runner 404s with the available list), or the runner is
         unreachable / errors while resolving.
     """
+    payload_out: dict[str, str] = {"name": skill_name, "arguments": arguments}
+    if agent_revision:
+        payload_out["agent_revision"] = agent_revision
+        if agent_id:
+            payload_out["agent_id"] = agent_id
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/skills/resolve",
-            json={"name": skill_name, "arguments": arguments},
+            json=payload_out,
             timeout=10.0,
         )
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -7930,7 +7940,12 @@ async def _resolve_skill_meta_text_via_runner(
         available = payload.get("available", [])
         if legacy_name is not None and isinstance(available, list) and legacy_name in available:
             return await _resolve_skill_meta_text_via_runner(
-                session_id, legacy_name, arguments, runner_client
+                session_id,
+                legacy_name,
+                arguments,
+                runner_client,
+                agent_id=agent_id,
+                agent_revision=agent_revision,
             )
         raise OmnigentError(
             f"Skill {skill_name!r} not found. Available skills: {available}",
@@ -8001,12 +8016,16 @@ async def _dispatch_skill_slash_command_to_runner(
     import uuid
 
     skill_name, arguments = _parse_skill_slash_command(body)
+    # The caller's revision includes the owner's installed skills and policy.
+    revision = agent_revision or mcp_selection_revision(agent.bundle_location, conv.labels)
     meta_text = await _resolve_skill_meta_text_via_runner(
         session_id,
         skill_name,
         arguments,
         runner_client,
         legacy_name=(legacy_skill_names or {}).get(skill_name),
+        agent_id=conv.agent_id,
+        agent_revision=revision,
     )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return startup_input.input_id
@@ -8061,9 +8080,7 @@ async def _dispatch_skill_slash_command_to_runner(
         "role": "user",
         "content": meta_content,
         "agent_id": conv.agent_id,
-        # The caller's revision includes the owner's installed skills.
-        "agent_revision": agent_revision
-        or mcp_selection_revision(agent.bundle_location, conv.labels),
+        "agent_revision": revision,
         "model": agent.name,
         "has_mcp_servers": has_mcp_servers,
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
