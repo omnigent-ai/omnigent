@@ -97,6 +97,7 @@ import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { subagentTabId } from "@/lib/subagentTabs";
 
 const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
 
@@ -240,5 +241,51 @@ describe("mobile side-chats drawer", () => {
 
     expect(screen.getByTestId("side-chats-panel-drawer")).toHaveAttribute("data-state", "open");
     expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+});
+
+describe("phone menu with a harness that can't start side chats", () => {
+  const initialStoreState = useChatStore.getState();
+  beforeEach(() => useChatStore.setState({ ...initialStoreState, sessionHarness: null }));
+  afterEach(() => useChatStore.setState(initialStoreState));
+
+  const openActionsMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Session actions" }), {
+      button: 0,
+    });
+
+  it("offers Side chats for sub-agent tabs restored from storage", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSubagentTabs: [subagentTabId("conv_child")],
+      selectedSideChatId: subagentTabId("conv_child"),
+    });
+    renderShell();
+
+    openActionsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("subagent-tab-pane")).toBeInTheDocument();
+  });
+
+  it("offers Side chats once a sub-agent tab opens, without a reload", () => {
+    renderShell();
+    openActionsMenu();
+    expect(screen.queryByRole("menuitem", { name: "Side chats" })).toBeNull();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    // Opened at desktop width, so the signal reveals only the rail.
+    act(() => {
+      useChatStore.setState({
+        sideChatToOpen: { childId: subagentTabId("conv_child"), parentId: "conv_ws" },
+      });
+    });
+    openActionsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("subagent-tab-pane")).toBeInTheDocument();
   });
 });

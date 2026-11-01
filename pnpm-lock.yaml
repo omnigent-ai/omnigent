@@ -28,7 +28,7 @@ overrides:
   browserslist: 4.28.8
   fast-uri: 3.1.9
   '@xmldom/xmldom': 0.8.15
-  qs: 6.16.0
+  qs: 6.16.1
   query-string: 9.5.0
   '@hono/node-server': 1.19.15
   hono: 4.13.13
@@ -104,8 +104,8 @@ importers:
   .github/ci-deps:
     dependencies:
       '@anthropic-ai/claude-code':
-        specifier: 2.1.283
-        version: 2.1.283
+        specifier: 2.1.295
+        version: 2.1.295
       '@earendil-works/pi-coding-agent':
         specifier: 1.3.0
         version: 1.3.0(@aws-sdk/credential-provider-node@3.972.84)(@modelcontextprotocol/sdk@1.32.1(supports-color@10.2.2)(zod@4.6.7))(@smithy/signature-v4@5.7.4)(supports-color@10.2.2)(ws@8.22.0)(zod@4.6.7)
@@ -417,7 +417,7 @@ importers:
     devDependencies:
       '@storybook/react-vite':
         specifier: ^10.6.1
-        version: 10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12))(supports-color@10.2.2)(typescript@6.0.3)(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))
+        version: 10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12))(supports-color@10.2.2)(typescript@6.0.3)(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))
       '@tailwindcss/vite':
         specifier: 4.3.1
         version: 4.3.1(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))
@@ -473,11 +473,11 @@ importers:
         specifier: 8.5.29
         version: 8.5.29
       prettier:
-        specifier: ^3.8.3
-        version: 3.9.5
+        specifier: ^3.9.10
+        version: 3.9.10
       storybook:
         specifier: ^10.6.2
-        version: 10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12)
+        version: 10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12)
       tailwindcss:
         specifier: 4.3.1
         version: 4.3.1
@@ -578,52 +578,52 @@ packages:
   '@antfu/install-pkg@2.1.0':
     resolution: {integrity: sha512-sdg9NxU3zR4Mnawfbc/x6GB5Wf17WYud5qOuEuxXjaKpYpMkISSJEjItGebXJ2bQ4DIcly4NYH23mtkGJjvKUw==}
 
-  '@anthropic-ai/claude-code-darwin-arm64@2.1.283':
-    resolution: {integrity: sha512-GczpJ+FvnOYvxn6XPGHbdqJEZMves6Vc0WKS/g1N2eG39EKKAHxG77e+w4Rjtmf8xgCxNY36Jf/IOfbcyus4zA==}
+  '@anthropic-ai/claude-code-darwin-arm64@2.1.295':
+    resolution: {integrity: sha512-qGetxxeqaqHR7Ev5AfTFfYuze0S99d27DV2IuFfjXigY9CKkLUy2jf3cCXjt8y4BAlGyNrqwKmIdrCjwtjAe8g==}
     cpu: [arm64]
     os: [darwin]
 
-  '@anthropic-ai/claude-code-darwin-x64@2.1.283':
-    resolution: {integrity: sha512-yL10X6RsEbc7O5cO9H9dDkQef8owqxShDsE32Z4L712vlVIM2qaYuhvgmn/n2Ra0Y2VmwkoMy6+36+/5vnYlqg==}
+  '@anthropic-ai/claude-code-darwin-x64@2.1.295':
+    resolution: {integrity: sha512-tmxIaD+X7GRatzp6yrgB3Gwg9zRmBdZOMf1imwLrISco2eiCBQbillVg5t//xO3F6tpRx/wsYXq/6CmeZx3HgQ==}
     cpu: [x64]
     os: [darwin]
 
-  '@anthropic-ai/claude-code-linux-arm64-musl@2.1.283':
-    resolution: {integrity: sha512-JcZDkbhkSdyuwSmZUlzEXOQiIn4U8vGwbxkU/MoFymU93RfmpmOUnj3TZALyNll0t86b0IpiYCXWFfaKu7ZUUw==}
+  '@anthropic-ai/claude-code-linux-arm64-musl@2.1.295':
+    resolution: {integrity: sha512-ao8kyoHS+XXIu6QieUthb5VilbkEtbCBEzbam97fWF/67vzZrogJX/RiJMhLZbrKX9L5avo7sh+eK6k85BDPlA==}
     cpu: [arm64]
     os: [linux]
     libc: [musl]
 
-  '@anthropic-ai/claude-code-linux-arm64@2.1.283':
-    resolution: {integrity: sha512-1hGh4eQHoxNJSfA/0/id5lXFdO5yRScwtUlBNMu1fPxUSwiFosLQjPDv/KdgfVZ3xjVtqJWPbjtKQ1TsxfpcDg==}
+  '@anthropic-ai/claude-code-linux-arm64@2.1.295':
+    resolution: {integrity: sha512-JgQigCZCbsTnJQMLBjzeIpx001jlw+QlSR08SsAW7p0hjUR73DczX4NpO2lq/+RPm8w48KhM8DxJqhUmAMV5+Q==}
     cpu: [arm64]
     os: [linux]
     libc: [glibc]
 
-  '@anthropic-ai/claude-code-linux-x64-musl@2.1.283':
-    resolution: {integrity: sha512-OrIYVYkqfszCu5w0aeVSCRBjJdvXkAOmqmtYjIWWy0ZcUGP14VkD3wtEPi/iELdYsGQutAkY5Y/5bMewftURug==}
+  '@anthropic-ai/claude-code-linux-x64-musl@2.1.295':
+    resolution: {integrity: sha512-S/cMn4k8uzumMYMPATbx0i14ooSi8cLFr/WMyfFKQc8H/FRMhaZ4rWCmBJnttWP2s93YiU5KsAifYf3324DtFg==}
     cpu: [x64]
     os: [linux]
     libc: [musl]
 
-  '@anthropic-ai/claude-code-linux-x64@2.1.283':
-    resolution: {integrity: sha512-q9+Ke42t/I6oLb/bTmh6sI24jMw4KNwz3QbQLp9dVQ8ipQChfAW5L11SX8jcDzVCW/P2tId7ftI+lgBURvz9uQ==}
+  '@anthropic-ai/claude-code-linux-x64@2.1.295':
+    resolution: {integrity: sha512-nC9RZ6ZArEavyAiFdEtGK6/XPhjfE79tP2tCh+PjmRUxSO/6W3IuXv/rmo8c6u2UzHyvgKodRj1z6UcBGlbnyA==}
     cpu: [x64]
     os: [linux]
     libc: [glibc]
 
-  '@anthropic-ai/claude-code-win32-arm64@2.1.283':
-    resolution: {integrity: sha512-y/zroDb121XZ9m0tQ+y6JTWX/wjAKChcCziFmQhrHQ7FteOSkD0lJSgmwT292ghDWeM69ZwV0ongd21IitNpyA==}
+  '@anthropic-ai/claude-code-win32-arm64@2.1.295':
+    resolution: {integrity: sha512-DOc5gff2KqGH+VPqs7J7D7iurRI0/V2OX8aIZN33bS0lOgU5IuYmWjEDoD9yFQRlOC2ebuD9ks00cYU+yI6/xQ==}
     cpu: [arm64]
     os: [win32]
 
-  '@anthropic-ai/claude-code-win32-x64@2.1.283':
-    resolution: {integrity: sha512-XzfHFpTbCWd0paru/fv0heHH8cfcxM9DkyOcB+B3taoUBpnhygnw5DzSq3/00kvt+BuNbibpIctiSWu2NHaEEQ==}
+  '@anthropic-ai/claude-code-win32-x64@2.1.295':
+    resolution: {integrity: sha512-absbtyFKyhebVBSilCIj/JXVERLjXDAo4ID3nVRwNb52HCXfjd+g+b1THrq6NCNXCVcrpC+skkNfBqqy0N726A==}
     cpu: [x64]
     os: [win32]
 
-  '@anthropic-ai/claude-code@2.1.283':
-    resolution: {integrity: sha512-/8Y1pe7M15qMOU7RwUEjpFcM8XGVXNzWrWRXXp/0HlGm1k8FcOCxYMA9VR237JUUzzx5DkcQaGvELAo4si7TwA==}
+  '@anthropic-ai/claude-code@2.1.295':
+    resolution: {integrity: sha512-PTdE5NdqwwyCmtbX/0WAuosyip8DkwC6M5mAJv+b9KGuxMFnkTJbc2b3EY6FYdo5ZTWkm6MN8reA9YWWMrLR+g==}
     engines: {node: '>=22.0.0'}
     hasBin: true
 
@@ -7833,8 +7833,8 @@ packages:
     deprecated: No longer maintained. Please contact the author of the relevant native addon; alternatives are available.
     hasBin: true
 
-  prettier@3.9.5:
-    resolution: {integrity: sha512-/FVl766LpUfB5vXgCYOYa0MeV/441Ia99AeICQIQFTY/Nw0roZwULcXpku5i1/m5kt/baz+s4Zogspd839HSMg==}
+  prettier@3.9.10:
+    resolution: {integrity: sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==}
     engines: {node: '>=14'}
     hasBin: true
 
@@ -7953,8 +7953,8 @@ packages:
     peerDependencies:
       react: ^18.2.0
 
-  qs@6.16.0:
-    resolution: {integrity: sha512-h6fhOIaRrID2CbEY2fqs+7t+UXZo+MLAnU5gRIq85uFtdiUPCdsApMlHhXogKVM4HM2DVbIjGNTTYH2OcmP1vA==}
+  qs@6.16.1:
+    resolution: {integrity: sha512-5Px6J7rfHBAGUhNQ3es4YzcOdBBw0SDcVtThJml4RdnKw4tKs2epA0kPZ+K8X+WiHktT93RHVcQ/3ym5aTCgtg==}
     engines: {node: '>=0.6'}
 
   query-string@9.5.0:
@@ -9674,40 +9674,40 @@ snapshots:
       package-manager-detector: 1.9.0
       tinyexec: 1.3.1
 
-  '@anthropic-ai/claude-code-darwin-arm64@2.1.283':
+  '@anthropic-ai/claude-code-darwin-arm64@2.1.295':
     optional: true
 
-  '@anthropic-ai/claude-code-darwin-x64@2.1.283':
+  '@anthropic-ai/claude-code-darwin-x64@2.1.295':
     optional: true
 
-  '@anthropic-ai/claude-code-linux-arm64-musl@2.1.283':
+  '@anthropic-ai/claude-code-linux-arm64-musl@2.1.295':
     optional: true
 
-  '@anthropic-ai/claude-code-linux-arm64@2.1.283':
+  '@anthropic-ai/claude-code-linux-arm64@2.1.295':
     optional: true
 
-  '@anthropic-ai/claude-code-linux-x64-musl@2.1.283':
+  '@anthropic-ai/claude-code-linux-x64-musl@2.1.295':
     optional: true
 
-  '@anthropic-ai/claude-code-linux-x64@2.1.283':
+  '@anthropic-ai/claude-code-linux-x64@2.1.295':
     optional: true
 
-  '@anthropic-ai/claude-code-win32-arm64@2.1.283':
+  '@anthropic-ai/claude-code-win32-arm64@2.1.295':
     optional: true
 
-  '@anthropic-ai/claude-code-win32-x64@2.1.283':
+  '@anthropic-ai/claude-code-win32-x64@2.1.295':
     optional: true
 
-  '@anthropic-ai/claude-code@2.1.283':
+  '@anthropic-ai/claude-code@2.1.295':
     optionalDependencies:
-      '@anthropic-ai/claude-code-darwin-arm64': 2.1.283
-      '@anthropic-ai/claude-code-darwin-x64': 2.1.283
-      '@anthropic-ai/claude-code-linux-arm64': 2.1.283
-      '@anthropic-ai/claude-code-linux-arm64-musl': 2.1.283
-      '@anthropic-ai/claude-code-linux-x64': 2.1.283
-      '@anthropic-ai/claude-code-linux-x64-musl': 2.1.283
-      '@anthropic-ai/claude-code-win32-arm64': 2.1.283
-      '@anthropic-ai/claude-code-win32-x64': 2.1.283
+      '@anthropic-ai/claude-code-darwin-arm64': 2.1.295
+      '@anthropic-ai/claude-code-darwin-x64': 2.1.295
+      '@anthropic-ai/claude-code-linux-arm64': 2.1.295
+      '@anthropic-ai/claude-code-linux-arm64-musl': 2.1.295
+      '@anthropic-ai/claude-code-linux-x64': 2.1.295
+      '@anthropic-ai/claude-code-linux-x64-musl': 2.1.295
+      '@anthropic-ai/claude-code-win32-arm64': 2.1.295
+      '@anthropic-ai/claude-code-win32-x64': 2.1.295
 
   '@anthropic-ai/sdk@0.129.0(zod@4.6.7)':
     dependencies:
@@ -13323,9 +13323,9 @@ snapshots:
     dependencies:
       react: 18.3.1
 
-  '@storybook/builder-vite@10.6.1(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12))(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))':
+  '@storybook/builder-vite@10.6.1(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12))(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))':
     dependencies:
-      storybook: 10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12)
+      storybook: 10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12)
       ts-dedent: 2.3.0
       vite: 8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0)
 
@@ -13335,28 +13335,28 @@ snapshots:
     dependencies:
       react: 18.3.1
 
-  '@storybook/react-dom-shim@10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12))':
+  '@storybook/react-dom-shim@10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12))':
     dependencies:
       react: 18.3.1
       react-dom: 18.3.1(react@18.3.1)
-      storybook: 10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12)
+      storybook: 10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12)
     optionalDependencies:
       '@types/react': 19.2.17
       '@types/react-dom': 19.2.7(@types/react@19.2.17)
 
-  '@storybook/react-vite@10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12))(supports-color@10.2.2)(typescript@6.0.3)(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))':
+  '@storybook/react-vite@10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12))(supports-color@10.2.2)(typescript@6.0.3)(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))':
     dependencies:
       '@joshwooding/vite-plugin-react-docgen-typescript': 0.7.0(typescript@6.0.3)(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))
       '@rollup/pluginutils': 5.4.0
-      '@storybook/builder-vite': 10.6.1(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12))(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))
-      '@storybook/react': 10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12))(supports-color@10.2.2)(typescript@6.0.3)
+      '@storybook/builder-vite': 10.6.1(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12))(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))
+      '@storybook/react': 10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12))(supports-color@10.2.2)(typescript@6.0.3)
       empathic: 2.1.0
       magic-string: 1.4.3
       react: 18.3.1
       react-docgen: 8.0.4(supports-color@10.2.2)
       react-dom: 18.3.1(react@18.3.1)
       resolve: 1.22.13
-      storybook: 10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12)
+      storybook: 10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12)
       tsconfig-paths: 4.2.0
       vite: 8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0)
     optionalDependencies:
@@ -13367,15 +13367,15 @@ snapshots:
       - rollup
       - supports-color
 
-  '@storybook/react@10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12))(supports-color@10.2.2)(typescript@6.0.3)':
+  '@storybook/react@10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12))(supports-color@10.2.2)(typescript@6.0.3)':
     dependencies:
       '@storybook/global': 5.0.0
-      '@storybook/react-dom-shim': 10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12))
+      '@storybook/react-dom-shim': 10.6.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12))
       react: 18.3.1
       react-docgen: 8.0.4(supports-color@10.2.2)
       react-docgen-typescript: 2.4.0(typescript@6.0.3)
       react-dom: 18.3.1(react@18.3.1)
-      storybook: 10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12)
+      storybook: 10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12)
     optionalDependencies:
       '@types/react': 19.2.17
       '@types/react-dom': 19.2.7(@types/react@19.2.17)
@@ -14653,7 +14653,7 @@ snapshots:
       http-errors: 2.0.1
       iconv-lite: 0.7.3
       on-finished: 2.4.1
-      qs: 6.16.0
+      qs: 6.16.1
       raw-body: 3.0.2
       type-is: 2.1.0
     transitivePeerDependencies:
@@ -15694,7 +15694,7 @@ snapshots:
       once: 1.4.0
       parseurl: 1.3.3
       proxy-addr: 2.0.8
-      qs: 6.16.0
+      qs: 6.16.1
       range-parser: 1.3.0
       router: 2.2.0(supports-color@10.2.2)
       send: 1.2.1(supports-color@10.2.2)
@@ -18096,7 +18096,7 @@ snapshots:
       tunnel-agent: 0.6.0
     optional: true
 
-  prettier@3.9.5: {}
+  prettier@3.9.10: {}
 
   pretty-format@27.5.1:
     dependencies:
@@ -18252,7 +18252,7 @@ snapshots:
     dependencies:
       react: 18.3.1
 
-  qs@6.16.0:
+  qs@6.16.1:
     dependencies:
       es-define-property: 1.0.1
       side-channel: 1.1.1
@@ -19328,7 +19328,7 @@ snapshots:
 
   stdin-discarder@0.2.2: {}
 
-  storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.5)(react@18.3.1)(vitest@4.1.12):
+  storybook@10.6.2(@types/react@19.2.17)(prettier@3.9.10)(react@18.3.1)(vitest@4.1.12):
     dependencies:
       '@storybook/global': 5.0.0
       '@storybook/icons': 2.1.0(react@18.3.1)
@@ -19349,7 +19349,7 @@ snapshots:
       ws: 8.22.0
     optionalDependencies:
       '@types/react': 19.2.17
-      prettier: 3.9.5
+      prettier: 3.9.10
     transitivePeerDependencies:
       - bufferutil
       - react
@@ -19671,7 +19671,7 @@ snapshots:
 
   typed-rest-client@1.8.11:
     dependencies:
-      qs: 6.16.0
+      qs: 6.16.1
       tunnel: 0.0.6
       underscore: 1.13.8
 
