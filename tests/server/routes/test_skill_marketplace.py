@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import shutil
 import tarfile
 import threading
 from dataclasses import replace
@@ -210,6 +211,23 @@ async def test_a_source_directory_is_browsed_installed_and_updated(
         assert installed.status_code == 201, installed.text
         row = installed.json()["data"][0]
         assert row["path"] == "team-a/skills/lint"
+        # Only the entry the install came from is marked: not a same-named skill
+        # at another path, nor the same path at another ref.
+        write_skill(mono / "skills", "lint", "Root lint")
+        root_catalog = (await client.get(f"/v1/skill-sources/{root.json()['id']}/catalog")).json()
+        root_lint = next(s for s in root_catalog["skills"] if s["path"] == "skills/lint")
+        assert root_lint["installed_scopes"] == [] and root_lint["installed_id"] is None
+        other_ref = await client.post(
+            "/v1/skill-sources",
+            json={"source": "https://github.com/acme/mono/tree/v2/team-a"},
+        )
+        v2_catalog = (
+            await client.get(f"/v1/skill-sources/{other_ref.json()['id']}/catalog")
+        ).json()
+        assert v2_catalog["skills"][0]["installed_scopes"] == []
+        main_catalog = (await client.get(f"/v1/skill-sources/{source['id']}/catalog")).json()
+        assert main_catalog["skills"][0]["installed_scopes"] == ["user"]
+        shutil.rmtree(mono / "skills" / "lint")
         updated = await client.post(f"/v1/installed-skills/{row['id']}/update")
         assert updated.status_code == 200, updated.text
         # The skill moves within the repository: the update follows it by name.

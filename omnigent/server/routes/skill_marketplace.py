@@ -41,7 +41,12 @@ from omnigent.skills.overlay import (
     is_root_manifest,
     validate_skill_tarball,
 )
-from omnigent.skills.policy import DEFAULT_POLICY, SkillPolicyError, SkillsMarketplacePolicy
+from omnigent.skills.policy import (
+    DEFAULT_POLICY,
+    SkillPolicyError,
+    SkillsMarketplacePolicy,
+    default_ref,
+)
 from omnigent.skills.service import (
     FetchedCatalog,
     PackagedSkill,
@@ -252,14 +257,19 @@ def _skill_location(skill_name: str, scope: str, owner: str | None) -> str:
 def _catalog_response(
     fetched: FetchedCatalog, installed: list[InstalledSkill]
 ) -> SkillCatalogResponse:
-    """Mark each entry with the caller's installs of it, scope by scope."""
-    by_name: dict[str, dict[str, str]] = {}
+    """Mark each entry with the caller's installs of it, scope by scope.
+
+    An install marks only the entry it came from: the same repository, the
+    same ref (``HEAD`` and no ref are the default branch) and the same path,
+    so a same-named skill elsewhere still offers Install.
+    """
+    by_entry: dict[tuple[str, str], dict[str, str]] = {}
     for skill in installed:
-        if skill.source_url == fetched.url:
-            by_name.setdefault(skill.name, {})[skill.scope] = skill.id
+        if skill.source_url == fetched.url and default_ref(skill.ref) == default_ref(fetched.ref):
+            by_entry.setdefault((skill.name, skill.path), {})[skill.scope] = skill.id
     skills = []
     for entry in fetched.entries:
-        scopes = by_name.get(entry.name, {})
+        scopes = by_entry.get((entry.name, entry.path), {})
         skills.append(
             CatalogSkill(
                 name=entry.name,
