@@ -4851,7 +4851,8 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             type="session.child_session.updated",
             conversation_id=parent_id,
             child_session_id=conv.id,
-            child=summary.model_dump(mode="json"),
+            # No agent store here; omitting agent_name keeps the merged value from the snapshot.
+            child=summary.model_dump(mode="json", exclude={"agent_name"}),
         )
         session_stream.publish(parent_id, event.model_dump())
 
@@ -11272,6 +11273,7 @@ def _child_session_summary_from_conversation(
     last_message_preview: str | None,
     *,
     cached_status: str | None = None,
+    agent_name: str | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -11291,8 +11293,8 @@ def _child_session_summary_from_conversation(
     rows take ``tool`` from their labels instead of the title.
 
     ``busy`` is derived from the relay-fed ``_session_status_cache``
-    (the tasks table has been removed). ``agent_id`` and ``agent_name``
-    are read from the conversation row directly.
+    (the tasks table has been removed). ``agent_id`` is read from the
+    conversation row; the caller resolves ``agent_name`` from it.
 
     :param conv: A child :class:`Conversation` row
         (``kind="sub_agent"``) from
@@ -11309,6 +11311,8 @@ def _child_session_summary_from_conversation(
         live ``_session_status_cache``; a status-edge publisher passes the
         edge's own value so a burst of transitions fans out one summary per
         edge instead of the latest status repeated.
+    :param agent_name: Name of the child's bound agent, e.g.
+        ``"codex-native-ui"``, or ``None`` when not resolved.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11386,10 +11390,9 @@ def _child_session_summary_from_conversation(
         session_name=session_name,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        # agent_id comes from the conversation row; agent_name and task_id
-        # are no longer available from the (removed) tasks table.
+        # task_id is no longer available from the (removed) tasks table.
         agent_id=conv.agent_id,
-        agent_name=None,
+        agent_name=agent_name,
         current_task_id=None,
         current_task_status=current_task_status,
         busy=busy,
