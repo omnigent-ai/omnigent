@@ -1,7 +1,7 @@
 # AndroidX Core requires compileSdk 37; AGP 9.4 requires Gradle 9.6 or newer.
 # CI runs Gradle and Robolectric on JDK 21; app bytecode targets Java 17.
 [versions]
-agp = "9.4.1"
+agp = "9.5.0"
 androidxCore = "1.19.1"
 androidxActivity = "1.12.4"
 androidxWebkit = "1.15.0"
