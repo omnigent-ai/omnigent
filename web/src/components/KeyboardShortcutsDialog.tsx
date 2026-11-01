@@ -31,10 +31,13 @@ import {
   NEW_BROWSER_TAB_KEYS,
   NEW_TERMINAL_KEYS,
   newSessionShortcutKeys,
+  NEXT_TAB_KEYS,
   PIN_SESSION_KEYS,
+  PREVIOUS_TAB_KEYS,
   sessionNumberShortcutKeys,
   QUIT_KEYS,
   RELOAD_KEYS,
+  REOPEN_TAB_KEYS,
   settingsShortcutKeys,
   SHIFT_KEY,
   SPLIT_TERMINAL_KEYS,
@@ -184,6 +187,13 @@ const DESKTOP_COMMAND_SHORTCUTS: Shortcut[] = [
   { label: "Quit Omnigent", keys: [...QUIT_KEYS] },
 ];
 
+// Desktop menu chords for the workspace rail's tabs.
+const DESKTOP_TAB_SHORTCUTS: Shortcut[] = [
+  { label: "Show the previous workspace tab", keys: [...PREVIOUS_TAB_KEYS] },
+  { label: "Show the next workspace tab", keys: [...NEXT_TAB_KEYS] },
+  { label: "Reopen the last closed tab", keys: [...REOPEN_TAB_KEYS] },
+];
+
 // Desktop menu chords that act on the browser tab in the workspace rail.
 const DESKTOP_BROWSER_SHORTCUTS: Shortcut[] = [
   { label: "Reload the browser tab", keys: [...RELOAD_KEYS] },
@@ -282,7 +292,10 @@ function shortcutGroupsFor(
             }
             return item;
           })
-          .concat(desktopCommands && browser ? DESKTOP_BROWSER_SHORTCUTS : []),
+          .concat(
+            desktopCommands ? DESKTOP_TAB_SHORTCUTS : [],
+            desktopCommands && browser ? DESKTOP_BROWSER_SHORTCUTS : [],
+          ),
       };
     }
     if (group.title === "Panes") {

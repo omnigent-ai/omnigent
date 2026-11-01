@@ -3,7 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
-import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { SESSION_HOST_PROTOCOL } from "@/lib/nativeBridge";
+import { getSessionSlim } from "@/lib/sessionsApi";
+import type * as SessionsApi from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
@@ -12,6 +16,14 @@ import {
   openBrowserTab,
   useBrowserTabs,
 } from "./useBrowserTabs";
+
+// Unknown hosts stay public-only unless a test gives the session one.
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApi>()),
+  getSessionSlim: vi.fn(async () => {
+    throw new Error("offline");
+  }),
+}));
 
 afterEach(() => {
   cleanup();
@@ -241,6 +253,164 @@ describe("browser soft tabs", () => {
     expect(restored.result.current.tabs).toEqual([firstId, secondId]);
     const other = renderHook(() => useBrowserTabs("session-b"));
     expect(other.result.current.tabs).toEqual([]);
+  });
+
+  it.each([
+    {
+      name: "refuses it",
+      open: () => Promise.resolve({ ok: false, error: "browser view cap reached — close one" }),
+      error: "browser view cap reached — close one",
+    },
+    {
+      name: "fails",
+      open: () => Promise.reject(new Error("disconnected")),
+      error: "Error: disconnected",
+    },
+  ])("adds no tab when the view for a reopened page $name", async ({ open, error }) => {
+    Object.assign(window, { omnigentDesktop: { browserOpenOrNavigate: vi.fn(open) } });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    let outcome: { ok: boolean; error?: string } | undefined;
+    await act(async () => {
+      outcome = await result.current.reopen("https://example.com/");
+    });
+    expect(outcome).toEqual({ ok: false, error });
+    expect(result.current.tabs).toEqual([]);
+  });
+
+  it("keeps a reopen that finishes after a session switch out of the session on screen", async () => {
+    let finish: (result: { ok: boolean }) => void = () => {};
+    const browserOpenOrNavigate = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    Object.assign(window, { omnigentDesktop: { browserOpenOrNavigate } });
+    writeSessionWorkspaceState("session-b", {
+      openBrowsers: ["b-tab"],
+      selectedBrowserId: "b-tab",
+    });
+    const { result, rerender } = renderHook(({ id }) => useBrowserTabs(id), {
+      initialProps: { id: "session-a" },
+    });
+    let reopened: Promise<unknown> = Promise.resolve();
+    act(() => {
+      reopened = result.current.reopen("https://example.com/");
+    });
+    rerender({ id: "session-b" });
+    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalled());
+    await act(async () => {
+      finish({ ok: true });
+      await reopened;
+    });
+
+    expect(result.current.tabs).toEqual(["b-tab"]);
+    expect(result.current.selected).toBe("b-tab");
+    // The reopened tab still belongs to the session it was reopened in.
+    expect(readSessionWorkspaceState("session-a").openBrowsers).toHaveLength(1);
+  });
+
+  it("selects a reopened tab only if nothing was selected after it was requested", async () => {
+    const pending: ((result: { ok: boolean }) => void)[] = [];
+    const browserOpenOrNavigate = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+    Object.assign(window, { omnigentDesktop: { browserOpenOrNavigate } });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    let first: Promise<unknown> = Promise.resolve();
+    let second: Promise<unknown> = Promise.resolve();
+    act(() => {
+      first = result.current.reopen("https://first.example/");
+      second = result.current.reopen("https://second.example/");
+    });
+    // Each view opens once the session's host is looked up.
+    await waitFor(() => expect(pending).toHaveLength(2));
+    // The later request finishes first and keeps the selection when the earlier one lands.
+    await act(async () => {
+      pending[1]!({ ok: true });
+      await second;
+    });
+    const secondTab = result.current.selected;
+    await act(async () => {
+      pending[0]!({ ok: true });
+      await first;
+    });
+    expect(result.current.tabs).toHaveLength(2);
+    expect(result.current.selected).toBe(secondTab);
+
+    // A tab picked while a reopen is pending stays picked.
+    let third: Promise<unknown> = Promise.resolve();
+    act(() => {
+      third = result.current.reopen("https://third.example/");
+    });
+    const picked = result.current.tabs[0]!;
+    act(() => result.current.select(picked));
+    await waitFor(() => expect(pending).toHaveLength(3));
+    await act(async () => {
+      pending[2]!({ ok: true });
+      await third;
+    });
+    expect(result.current.tabs).toHaveLength(3);
+    expect(result.current.selected).toBe(picked);
+  });
+
+  it("asks the view for a tab's page when the strip hasn't loaded it", async () => {
+    const browserHasView = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValue({ exists: true, url: "https://example.com/" });
+    Object.assign(window, { omnigentDesktop: { browserHasView } });
+    writeSessionWorkspaceState("session-a", {
+      openBrowsers: ["tab-1"],
+      selectedBrowserId: "tab-1",
+    });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    expect(result.current.urlFor("tab-1")).toBeUndefined();
+    expect(await result.current.pageUrl("tab-1")).toBe("https://example.com/");
+  });
+
+  it("adds and selects a reopened page's tab once its view opens", async () => {
+    const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, { omnigentDesktop: { browserOpenOrNavigate } });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    await act(async () => {
+      await result.current.reopen("https://example.com/");
+    });
+    const tabId = result.current.selected!;
+    expect(result.current.tabs).toEqual([tabId]);
+    expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+      browserViewId("session-a", tabId),
+      "https://example.com/",
+      undefined,
+      { force: true },
+    );
+  });
+
+  it("reopens with the host the session inherits, so its localhost pages can load", async () => {
+    const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, { omnigentDesktop: { browserOpenOrNavigate } });
+    vi.mocked(getSessionSlim).mockImplementation(
+      async (id: string) =>
+        ({
+          id,
+          hostId: id === "parent" ? "this-mac" : null,
+          parentSessionId: id === "session-a" ? "parent" : null,
+          labels: {},
+        }) as unknown as Session,
+    );
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    await act(async () => {
+      await result.current.reopen("http://localhost:3000/");
+    });
+    expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+      browserViewId("session-a", result.current.selected!),
+      "http://localhost:3000/",
+      undefined,
+      { force: true, sourceHostId: "this-mac", sessionHostProtocol: SESSION_HOST_PROTOCOL },
+    );
   });
 
   it("closes only the target view and selects a neighbor, then no browser", async () => {
