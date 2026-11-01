@@ -38,6 +38,7 @@ from omnigent.harnesses.claude_native.bridge import (
     prepare_bridge_dir,
     read_permission_hook_config,
 )
+from omnigent.harnesses.claude_native.main import claude_tool_env_file
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
     CodexNativeBridgeState,
@@ -2584,6 +2585,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_ENV_FILE": claude_tool_env_file(),
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     assert spec.command == "claude"

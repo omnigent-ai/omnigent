@@ -14,7 +14,7 @@
 
 "use strict";
 
-const { contextBridge, ipcRenderer, webFrame } = require("electron");
+const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
@@ -99,6 +99,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:open-path", listener);
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
+  /**
+   * Subscribe to the find bar opening (Cmd/Ctrl+F or Edit > Find…), so the
+   * page can render content it would otherwise virtualize away. Returns an
+   * unsubscribe function.
+   * @param {() => void} callback
+   * @returns {() => void}
+   */
+  onFindOpened: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("omnigent:find-opened", listener);
+    return () => ipcRenderer.removeListener("omnigent:find-opened", listener);
+  },
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
@@ -120,6 +132,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /** Reveal one of this machine's files in the OS file manager. */
   revealFile: (hostId, path) => ipcRenderer.invoke("omnigent:reveal-file", hostId, path),
+  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
+  chooseDirectory: (defaultPath) => ipcRenderer.invoke("omnigent:choose-directory", defaultPath),
+  /**
+   * This machine's path for a File dropped from the OS file manager. Resolves
+   * "" when it has none or the page isn't the pinned server.
+   */
+  getPathForFile: (file) =>
+    ipcRenderer.invoke("omnigent:dropped-file-path", webUtils.getPathForFile(file)),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this
@@ -145,6 +165,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  // Windows' built-in ssh can't share one connection, so it gets this later.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Connect a machine the user reaches over SSH to the window's server as
+         * a host. Consent and ssh prompts happen in a shell-owned window.
+         * Resolves `{ ok, error?, canceled?, identity? }`.
+         */
+        connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
+      }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**
@@ -236,7 +267,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, rememberedArcaHostId?: string}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, sessionHostProtocol?: number, rememberedArcaHostId?: string}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),
@@ -266,14 +297,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
-  browserScreenshot: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId }),
+  browserScreenshot: (conversationId, opts) =>
+    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, opts }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
-  browserPerformAction: (conversationId, action, params) =>
-    ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params }),
+  browserPerformAction: (conversationId, action, params, opts) =>
+    ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params, opts }),
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
-  browserExecute: (conversationId, js) =>
-    ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js }),
+  browserExecute: (conversationId, js, opts) =>
+    ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, opts }),
   /**
    * Destroy the conversation's view (explicit close — unmount only detaches).
    * @param {string} conversationId

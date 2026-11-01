@@ -107,8 +107,9 @@ export function nullsToUndefined(wire: SessionListWireItem): SessionListWireItem
  *
  * Lets the merge skip rewriting rows that are already up to date, so a
  * snapshot frame (which restates the whole watch-set, mostly unchanged)
- * doesn't churn the cache and re-render the sidebar. `labels` is compared
- * structurally because every parsed frame yields a fresh object reference.
+ * doesn't churn the cache and re-render the sidebar. `labels` and
+ * `pull_request` are compared structurally because every parsed frame yields
+ * a fresh object reference.
  *
  * @param conv - The cached conversation row.
  * @param wire - The incoming wire item overlaying it.
@@ -122,7 +123,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels") {
+    if (key === "labels" || key === "pull_request") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);

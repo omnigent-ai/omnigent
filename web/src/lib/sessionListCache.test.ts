@@ -132,6 +132,27 @@ describe("mergeItemsIntoPages", () => {
     expect(after!.pages[0].data[0].labels).toEqual({ x: "2" });
   });
 
+  it("compares pull request summaries by value", () => {
+    const pullRequest = {
+      url: "https://github.com/acme/repo/pull/7",
+      provider: "github",
+      repository: "acme/repo",
+      number: 7,
+      state: "OPEN",
+    };
+    const before = data([conv("a", { pull_request: pullRequest })]);
+    const same = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", pull_request: { ...pullRequest } }],
+    ]);
+    const merged = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", pull_request: { ...pullRequest, state: "MERGED" } }],
+    ]);
+
+    expect(mergeItemsIntoPages(before, same, DEFAULT_FILTERS, NO_ACTIVE).data).toBe(before);
+    const { data: after } = mergeItemsIntoPages(before, merged, DEFAULT_FILTERS, NO_ACTIVE);
+    expect(after!.pages[0].data[0].pull_request?.state).toBe("MERGED");
+  });
+
   it("does not report ids absent from any page (structural additions)", () => {
     const before = data([conv("a")]);
     const items = new Map<string, SessionListWireItem>([

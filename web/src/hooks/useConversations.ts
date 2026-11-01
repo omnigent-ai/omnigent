@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef } from "react";
+import { useCallback, useContext, useEffect, useRef } from "react";
 import { useViewerId } from "./useViewerId";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { revokePermission } from "@/lib/permissionsApi";
@@ -70,6 +70,7 @@ import {
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
+import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
 
@@ -234,6 +235,17 @@ export interface Conversation {
    * detection only — never displayed. See `comments_count`.
    */
   comments_updated_at?: number | null;
+  /**
+   * The session's first linked pull request as the server last stored it, so
+   * list surfaces show it while the host is offline. Absent on older servers.
+   */
+  pull_request?: SessionPullRequestSummary | null;
+  /**
+   * Whether the server has imported the session's PRs from its host, so a
+   * missing `pull_request` means "none" rather than "not known yet". Absent on
+   * older servers.
+   */
+  pull_requests_synced?: boolean | null;
   /**
    * The requesting user's "last seen" wall-clock baseline (seconds) for
    * this session, or null/undefined when they've never seen it. Per-viewer,
@@ -739,6 +751,7 @@ export function useConversations(
 /**
  * One palette search group; keyed outside `["conversations"]`, which patches rows
  * live. Dropped once unobserved, so a later search never shows a stale row.
+ * Matches archived sessions too, so a search still finds them.
  */
 export function useSessionSearch(
   searchQuery: string,
@@ -754,7 +767,7 @@ export function useSessionSearch(
         after: pageParam,
         searchQuery,
         searchScope,
-        includeArchived: false,
+        includeArchived: true,
         queryClient,
         limit,
       }),
@@ -2170,7 +2183,7 @@ export interface ProjectSummary {
  * dual-reads first-class projects (with id, incl. empty ones) and legacy
  * label-projects (id=null), unioned by name and sorted.
  */
-export function useProjects() {
+export function useProjects({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery<ProjectSummary[]>({
     queryKey: ["projects"],
     queryFn: async ({ signal }) => {
@@ -2179,6 +2192,7 @@ export function useProjects() {
       return (await res.json()) as ProjectSummary[];
     },
     staleTime: 30_000,
+    enabled,
   });
 }
 
@@ -2286,6 +2300,22 @@ export async function resolveOrCreateProjectId(name: string): Promise<string> {
     if (created) return created.id;
     throw err;
   }
+}
+
+/**
+ * {@link resolveOrCreateProjectId}, then refresh the cached project list so
+ * pickers and the sidebar show a project it just created.
+ */
+export function useResolveOrCreateProjectId(): (name: string) => Promise<string> {
+  const queryClient = useQueryClient();
+  return useCallback(
+    async (name: string) => {
+      const id = await resolveOrCreateProjectId(name);
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      return id;
+    },
+    [queryClient],
+  );
 }
 
 /**

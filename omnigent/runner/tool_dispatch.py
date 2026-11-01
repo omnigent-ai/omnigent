@@ -3508,6 +3508,14 @@ async def _execute_session_create(
     if placement != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
     message = args.get("message")
+    profile_fields = ("sandbox_provider", "sandbox_profile_id", "sandbox_profile_revision")
+    selection = {key: args[key] for key in profile_fields if args.get(key) is not None}
+    if selection and placement != "managed":
+        return json.dumps({"error": "Sandbox profile selection requires placement='managed'"})
+    if any(not isinstance(value, str) or not value.strip() for value in selection.values()):
+        return json.dumps({"error": "Sandbox selection fields must be nonempty strings"})
+    if selection.get("sandbox_profile_revision") and not selection.get("sandbox_profile_id"):
+        return json.dumps({"error": "sandbox_profile_revision requires sandbox_profile_id"})
     if placement != "child" and message is not None:
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
@@ -3550,6 +3558,7 @@ async def _execute_session_create(
         headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
         if placement == "managed":
             body["host_type"] = "managed"
+            body.update(selection)
             initial_items = body.pop("initial_items", None)
             if isinstance(initial_items, list) and initial_items:
                 body["initial_input"] = initial_items[0]
@@ -3571,8 +3580,18 @@ async def _execute_session_create(
 
             info = await server_client.get("/v1/info")
             info.raise_for_status()
+            info_data = info.json()
+            if selection.get("sandbox_profile_id"):
+                features = info_data.get("features") if isinstance(info_data, dict) else None
+                if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:
+                    return json.dumps(
+                        {
+                            "error": "This server does not advertise sandbox profile support; "
+                            "no session was created."
+                        }
+                    )
             host_id = (
-                uuid.uuid4().hex if info.json().get("request_managed_sandbox_host_id") else None
+                uuid.uuid4().hex if info_data.get("request_managed_sandbox_host_id") else None
             )
             if host_id is not None:
                 body["host_id"] = host_id
@@ -4754,9 +4773,12 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "session_mode",
+    "session_id",
     "workspace",
     "host_id",
     "execution_target",
+    "project_id",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4769,12 +4791,39 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "reasoning_effort",
     "permission_mode",
     "max_cost_usd",
+    "session_mode",
+    "session_id",
     "workspace",
     "host_id",
     "execution_target",
     "state",
+    "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# Fields a server accepts only once it advertises ``scheduled_task_session_modes``.
+_SCHEDULED_TASK_SESSION_FIELDS = ("session_mode", "session_id")
+
+
+async def _scheduled_task_session_fields_refusal(
+    server_client: httpx.AsyncClient, tool_name: str, payload: _JsonObject
+) -> str | None:
+    """An error for session fields this server would reject, or ``None`` to send them.
+
+    An older server forbids unknown fields, so the payload would fail with a 422
+    that does not say why. Asked only when the call carries one of the fields; an
+    unreadable ``/v1/info`` counts as unsupported, as for task projects.
+    """
+    if not any(field in payload for field in _SCHEDULED_TASK_SESSION_FIELDS):
+        return None
+    info = await server_client.get("/v1/info", timeout=30.0)
+    if info.status_code < 400 and info.json().get("scheduled_task_session_modes") is True:
+        return None
+    return json.dumps(
+        {
+            "error": f"{tool_name}: this Omnigent server does not support session_mode or "
+            "session_id; omit them to start a new session on every run"
+        }
+    )
 
 
 def _scheduled_task_url(task_id: object) -> str | None:
@@ -4782,6 +4831,42 @@ def _scheduled_task_url(task_id: object) -> str | None:
     if not isinstance(task_id, str) or not _SCHEDULED_TASK_ID_RE.fullmatch(task_id):
         return None
     return f"/v1/scheduled-tasks/{task_id.lower()}"
+
+
+async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> str:
+    """
+    Return the id of the caller's project named *name*, creating it if missing.
+
+    Uses the projects API the web picker uses, so a typed name files sessions
+    and automations into the same project. A create that loses a race to the
+    same name (409) reuses the project the other request made.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param name: The project name, e.g. ``"nightly triage"``.
+    :returns: The project id.
+    :raises ValueError: If the name is blank or the project can't be resolved.
+    """
+    trimmed = name.strip()
+    if not trimmed:
+        raise ValueError("project_name must not be empty")
+
+    async def find() -> str | None:
+        resp = await server_client.get("/v1/projects", timeout=30.0)
+        if resp.status_code >= 400:
+            raise ValueError(f"could not list projects: {resp.text[:200]}")
+        projects = resp.json().get("data", [])
+        return next((p["id"] for p in projects if p.get("name") == trimmed), None)
+
+    existing = await find()
+    if existing is not None:
+        return existing
+    created = await server_client.post("/v1/projects", json={"name": trimmed}, timeout=30.0)
+    if created.status_code < 400:
+        return str(created.json()["id"])
+    racer = await find() if created.status_code == 409 else None
+    if racer is not None:
+        return racer
+    raise ValueError(f"could not create project {trimmed!r}: {created.text[:200]}")
 
 
 async def _execute_scheduled_task_tool(
@@ -4811,12 +4896,40 @@ async def _execute_scheduled_task_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if "project_name" in args and "project_id" in args:
+        return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
+    raw_project_name = args.get("project_name")
+    if "project_name" in args and not isinstance(raw_project_name, str):
+        return json.dumps(
+            {"error": f"{tool_name}: project_name must be a string; use project_id: null to clear"}
+        )
+    project_name = raw_project_name if isinstance(raw_project_name, str) else None
+    wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
+        "project_name" in args or "project_id" in args
+    )
 
     try:
+        if wants_project:
+            # Older servers reject the field; refuse before creating a project for it.
+            info = await server_client.get("/v1/info", timeout=30.0)
+            if info.status_code >= 400 or info.json().get("scheduled_task_projects") is not True:
+                return json.dumps(
+                    {
+                        "error": f"{tool_name}: this server does not support automation "
+                        "projects; retry without project_name or project_id"
+                    }
+                )
         if tool_name == "sys_scheduled_task_list":
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
+            refusal = await _scheduled_task_session_fields_refusal(
+                server_client, tool_name, payload
+            )
+            if refusal is not None:
+                return refusal
+            if project_name is not None:
+                payload["project_id"] = await _project_id_for_name(server_client, project_name)
             resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
@@ -4831,7 +4944,23 @@ async def _execute_scheduled_task_tool(
                 resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
-                resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                refusal = await _scheduled_task_session_fields_refusal(
+                    server_client, tool_name, payload
+                )
+                if refusal is not None:
+                    return refusal
+                resp = None
+                if project_name is not None:
+                    # Confirm the task first so a bad id doesn't leave a new project behind.
+                    existing = await server_client.get(task_url, timeout=30.0)
+                    if existing.status_code >= 400:
+                        resp = existing
+                    else:
+                        payload["project_id"] = await _project_id_for_name(
+                            server_client, project_name
+                        )
+                if resp is None:
+                    resp = await server_client.patch(task_url, json=payload, timeout=30.0)
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -5068,11 +5197,12 @@ async def _execute_session_query_tool(
 
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
+        include_archived = args.get("include_archived") is True
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+            _session_list_filters(agent_name, include_archived),
         )
         if isinstance(window, str):
             return window
@@ -5081,6 +5211,7 @@ async def _execute_session_query_tool(
             conversation_id,
             server_client,
             agent_name,
+            include_archived=include_archived,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -6004,11 +6135,31 @@ def _project_agent_list(
     }
 
 
+def _session_list_filters(agent_name: object, include_archived: bool) -> _JsonObject:
+    """
+    The ``sys_session_list`` filters a continuation cursor is bound to.
+
+    ``include_archived`` is recorded only when set, so cursors issued before
+    the flag existed still match a call that omits it.
+
+    :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
+    :param include_archived: Whether archived sessions are listed.
+    :returns: The filter mapping, e.g. ``{"agent_name": None}``.
+    """
+    filters: _JsonObject = {
+        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None
+    }
+    if include_archived:
+        filters["include_archived"] = True
+    return filters
+
+
 async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
     *,
+    include_archived: bool = False,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6029,6 +6180,7 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
+    :param include_archived: Also list archived sessions in the global view.
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -6042,6 +6194,7 @@ async def _session_list_via_rest(
         else await _collect_global_sessions(
             server_client,
             agent_name,
+            include_archived=include_archived,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
         )
@@ -6052,7 +6205,7 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        filters=_session_list_filters(agent_name, include_archived),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -6304,6 +6457,7 @@ async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
     *,
+    include_archived: bool = False,
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
@@ -6322,6 +6476,8 @@ async def _collect_global_sessions(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
+    :param include_archived: Also return archived sessions, each marked
+        ``archived``.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
@@ -6329,6 +6485,8 @@ async def _collect_global_sessions(
     params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
+    if include_archived:
+        params["include_archived"] = "true"
     if after is not None:
         params["after"] = after
     try:
@@ -6362,6 +6520,8 @@ async def _collect_global_sessions(
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),
+                # Only an archive-inclusive listing can return archived rows.
+                **({"archived": r.get("archived") is True} if include_archived else {}),
             }
             for r in rows
         ],
