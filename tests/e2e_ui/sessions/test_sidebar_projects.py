@@ -320,36 +320,44 @@ def test_project_actions_are_keyboard_accessible_on_desktop(
     ],
     ids=["phone", "ipad-portrait", "ipad-landscape", "narrow-mouse"],
 )
-def test_project_menu_is_visible_without_hover(
+def test_project_actions_follow_the_input_type(
     browser: Browser,
     page: Page,
     seeded_session: tuple[str, str],
     viewport: dict[str, int],
     has_touch: bool,
 ) -> None:
-    """Touch folders expose a menu containing New session without a long press."""
+    """Touch folders act through the long-press menu; a narrow mouse keeps the controls."""
     base_url, session_id = seeded_session
     project = f"Project with a long name to check action overlap {uuid.uuid4().hex[:6]}"
     page.goto(f"{base_url}/c/{session_id}")
     _move_to_new_project(page, _row(page, session_id), project)
-    page.get_by_role("button", name=project, exact=True).hover()
+    _folder_header(page, project).hover()
     expect(page.get_by_role("link", name=f"New session in {project}", exact=True)).to_be_visible()
 
     context = browser.new_context(viewport=viewport, has_touch=has_touch)
     touch = context.new_page()
     try:
         touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
-        header = touch.get_by_role("button", name=project, exact=True)
+        header = _folder_header(touch, project)
         expect(header).to_be_visible()
         shortcut = touch.get_by_role(
             "link", name=f"New session in {project}", exact=True, include_hidden=True
         )
+        kebab = touch.get_by_role(
+            "button", name=f"Project actions for {project}", include_hidden=True
+        )
         if has_touch:
-            expect(shortcut).to_be_hidden()
-        else:
-            expect(shortcut).to_be_visible()
-        kebab = touch.get_by_role("button", name=f"Project actions for {project}")
+            _assert_touch_folder_uses_long_press(touch, header, shortcut, kebab, project)
+            touch.get_by_test_id("project-new-session-menu").tap()
+            expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
+            if viewport["width"] < 768:
+                expect(
+                    touch.get_by_role("button", name="Open sidebar", exact=True)
+                ).to_be_visible()
+            return
 
+        expect(shortcut).to_be_visible()
         for expanded in [True, False]:
             if header.get_attribute("aria-expanded") != str(expanded).lower():
                 header.click()
@@ -365,30 +373,55 @@ def test_project_menu_is_visible_without_hover(
                 );
             }""")
             title_box = header.locator("span.truncate").bounding_box()
-            action_box = (kebab if has_touch else shortcut).bounding_box()
+            action_box = shortcut.bounding_box()
             assert title_box is not None and action_box is not None
             assert title_box["x"] + title_box["width"] <= action_box["x"]
 
         before = header.get_attribute("aria-expanded")
-        if has_touch:
-            kebab.tap()
-        else:
-            kebab.click()
-        menu_item = touch.get_by_test_id("project-new-session-menu")
-        if has_touch:
-            expect(menu_item).to_be_visible()
-        else:
-            expect(menu_item).to_be_hidden()
-        expect(
-            touch.get_by_role("button", name=project, exact=True, include_hidden=True)
-        ).to_have_attribute("aria-expanded", before)
-        if has_touch:
-            menu_item.tap()
-        else:
-            touch.keyboard.press("Escape")
-            shortcut.click()
+        kebab.click()
+        expect(touch.get_by_test_id("project-new-session-menu")).to_be_hidden()
+        expect(_folder_header(touch, project, include_hidden=True)).to_have_attribute(
+            "aria-expanded", before
+        )
+        touch.keyboard.press("Escape")
+        shortcut.click()
         expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
-        if viewport["width"] < 768:
-            expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
+        expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
     finally:
         context.close()
+
+
+def _folder_header(page: Page, project: str, *, include_hidden: bool = False) -> Locator:
+    """The folder's header button; a collapsed folder appends its marker's label to the name."""
+    return page.get_by_role(
+        "button", name=re.compile(rf"^{re.escape(project)}( |$)"), include_hidden=include_hidden
+    )
+
+
+def _assert_touch_folder_uses_long_press(
+    page: Page, header: Locator, shortcut: Locator, kebab: Locator, project: str
+) -> None:
+    """Touch folders paint no header controls; a stationary hold opens their menu."""
+    for expanded in [True, False]:
+        if header.get_attribute("aria-expanded") != str(expanded).lower():
+            header.tap()
+        expect(shortcut).to_be_hidden()
+        expect(kebab).to_be_hidden()
+        # No control column is reserved, so the title keeps the row's own inset.
+        assert header.evaluate("element => getComputedStyle(element).paddingRight") == "8px"
+
+    before = header.get_attribute("aria-expanded")
+    box = header.bounding_box()
+    assert box is not None, "folder header has no touch target bounds"
+    point = {"x": round(box["x"] + box["width"] / 2), "y": round(box["y"] + box["height"] / 2)}
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
+    try:
+        page.wait_for_timeout(750)
+        expect(page.get_by_test_id("project-new-session-menu")).to_be_visible()
+    finally:
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        cdp.detach()
+    expect(_folder_header(page, project, include_hidden=True)).to_have_attribute(
+        "aria-expanded", before
+    )
