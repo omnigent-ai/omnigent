@@ -317,7 +317,8 @@ def build_opencode_omnigent_mcp_server(
         _TOOL_RELAY_POST_TIMEOUT_S,
         build_mcp_config,
     )
-    from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
+    from omnigent.native.native_bridge_common import native_bridge_data_dir
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
 
     claude_cfg = build_mcp_config(bridge_dir, python_executable=python_executable)
     # build_mcp_config returns {"mcpServers": {"<name>": {command, args, env}}};
@@ -359,7 +360,7 @@ def build_opencode_omnigent_mcp_server(
     else:
         raise ValueError("Claude MCP server environment is malformed")
     # opencode serve runs with a filtered env; the relay must still find its bridge root.
-    entry["environment"] = {**env, DATA_DIR_ENV_VAR: str(data_dir())}
+    entry["environment"] = {**env, DATA_DIR_ENV_VAR: str(native_bridge_data_dir())}
     return {str(name): entry}
 
 

@@ -35,7 +35,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.native import native_bridge_common
-from omnigent.process_logging import data_dir
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -222,7 +221,7 @@ def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
 
 
 _STATE_VERSION = 1
-_BRIDGE_ROOT = data_dir() / "opencode-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "opencode-native"
 _ID_HASH_CHARS = 32
 
 

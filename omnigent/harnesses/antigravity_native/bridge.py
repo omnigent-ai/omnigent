@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.native import native_bridge_common
-from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
+from omnigent.process_logging import DATA_DIR_ENV_VAR
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -37,7 +37,7 @@ _STATE_FILE = "state.json"
 # the tmux/TUI section at the end of this module). Written by the runner after
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
-_BRIDGE_ROOT = data_dir() / "antigravity-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "antigravity-native"
 _ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 # Prefix of the launcher-minted placeholder conversation id (see
@@ -521,7 +521,7 @@ def build_mcp_config(
                     # Pin the relay to the RUNNER's real home and data dir so its
                     # bridge-root validation matches where the bridge dir lives. See docstring.
                     "HOME": str(Path.home()),
-                    DATA_DIR_ENV_VAR: str(data_dir()),
+                    DATA_DIR_ENV_VAR: str(native_bridge_common.native_bridge_data_dir()),
                 },
             }
         }

@@ -370,3 +370,82 @@ def test_bridge_root_follows_the_configured_data_dir(
     )
 
     assert Path(imported.stdout.strip()) == tmp_path / dirname
+
+
+_NATIVE_BRIDGE_HARNESSES = pytest.mark.parametrize(
+    ("harness", "dirname"),
+    [
+        ("antigravity_native", "antigravity-native"),
+        ("codex_native", "codex-native"),
+        ("opencode_native", "opencode-native"),
+        ("pi_native", "pi-native"),
+    ],
+)
+
+
+def _run_python(code: str, *, cwd: Path, data_dir: str) -> str:
+    """Run *code* in a fresh interpreter with *cwd* and ``OMNIGENT_DATA_DIR``."""
+    repo_root = Path(__file__).resolve().parents[1]
+    pythonpath = os.pathsep.join(filter(None, [str(repo_root), os.environ.get("PYTHONPATH")]))
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=cwd,
+        env={**os.environ, "OMNIGENT_DATA_DIR": data_dir, "PYTHONPATH": pythonpath},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+@_NATIVE_BRIDGE_HARNESSES
+def test_bridge_root_anchors_a_relative_data_dir_in_the_launch_directory(
+    tmp_path: Path, harness: str, dirname: str
+) -> None:
+    """A relative data dir becomes absolute against the host's working directory."""
+    launch_dir = tmp_path / "launch"
+    launch_dir.mkdir()
+
+    root = _run_python(
+        f"from omnigent.harnesses.{harness} import bridge; print(bridge._BRIDGE_ROOT)",
+        cwd=launch_dir,
+        data_dir="state",
+    )
+
+    # The child's cwd is the real path, so compare against the resolved launch dir.
+    assert Path(root).is_absolute()
+    assert Path(root) == launch_dir.resolve() / "state" / dirname
+
+
+@_NATIVE_BRIDGE_HARNESSES
+def test_relay_in_another_workspace_accepts_the_runner_bridge_dir(
+    tmp_path: Path, harness: str, dirname: str
+) -> None:
+    """The pinned data dir lets a relay started in the workspace find the runner's bridge."""
+    launch_dir = tmp_path / "launch"
+    workspace = tmp_path / "workspace"
+    launch_dir.mkdir()
+    workspace.mkdir()
+
+    runner_root, pinned_data_dir = _run_python(
+        f"from omnigent.harnesses.{harness} import bridge\n"
+        "from omnigent.native import native_bridge_common\n"
+        "print(bridge._BRIDGE_ROOT)\n"
+        "print(native_bridge_common.native_bridge_data_dir())",
+        cwd=launch_dir,
+        data_dir="state",
+    ).splitlines()
+    assert Path(pinned_data_dir) == launch_dir.resolve() / "state"
+
+    # The relay runs in the session's workspace with only the pinned data dir.
+    relay_root = _run_python(
+        f"from pathlib import Path\n"
+        f"from omnigent.harnesses.{harness} import bridge\n"
+        "from omnigent.harnesses.claude_native import bridge as relay\n"
+        f"relay._trusted_parent_for_bridge_dir(Path({str(Path(runner_root) / 'sess')!r}))\n"
+        "print(bridge._BRIDGE_ROOT)",
+        cwd=workspace,
+        data_dir=pinned_data_dir,
+    )
+
+    assert Path(relay_root) == Path(runner_root) == launch_dir.resolve() / "state" / dirname
