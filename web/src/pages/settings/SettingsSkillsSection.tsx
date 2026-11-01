@@ -84,7 +84,12 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
   const update = useUpdateInstalledSkill();
   const remove = useDeleteInstalledSkill();
   const [viewing, setViewing] = useState<InstalledSkill | null>(null);
-  const [removing, setRemoving] = useState<InstalledSkill | null>(null);
+  const [removing, setRemovingState] = useState<InstalledSkill | null>(null);
+  // Each removal dialog starts clean: an earlier refusal belongs to another skill.
+  const setRemoving = (skill: InstalledSkill | null) => {
+    remove.reset();
+    setRemovingState(skill);
+  };
   const skills = useMemo(
     () => installed.data?.pages.flatMap((page) => page.data) ?? [],
     [installed.data],
@@ -354,7 +359,10 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
             </span>
             <Button
               variant="link"
-              onClick={() => setPreview(null)}
+              onClick={() => {
+                navigation.current += 1;
+                setPreview(null);
+              }}
               componentId="settings.skills.preview_close"
             >
               Back to sources

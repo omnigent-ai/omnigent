@@ -359,6 +359,12 @@ describe("SettingsSkillsSection", () => {
     const dialog = screen.getByRole("dialog");
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("Not the owner");
     expect(screen.getByTestId("installed-skill-review")).toBeInTheDocument();
+    // Cancelled and opened again, the dialog does not carry the earlier refusal.
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(within(row).getByRole("button", { name: "Remove review" }));
+    const reopened = await screen.findByRole("dialog");
+    expect(within(reopened).queryByRole("alert")).toBeNull();
   });
 
   it("updates, and removes behind a confirmation that can be cancelled", async () => {
@@ -470,6 +476,25 @@ describe("SettingsSkillsSection", () => {
     );
     expect(screen.queryByText(/Previewing/)).toBeNull();
     expect(screen.getByTestId("skill-source-src1")).toHaveAttribute("aria-current", "true");
+
+    // Back to sources is a navigation too: a preview still pending cannot replace the sources.
+    state.previewGate = null;
+    fireEvent.click(screen.getByRole("button", { name: /Preview skills/ }));
+    await screen.findByText(/Previewing/);
+    state.previewGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const previews = calls.filter((c) => c.url === "/v1/skill-catalog").length;
+    fireEvent.click(screen.getByRole("button", { name: /Preview skills/ }));
+    await waitFor(() =>
+      expect(calls.filter((c) => c.url === "/v1/skill-catalog").length).toBe(previews + 1),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Back to sources" }));
+    release();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Preview skills/ })).not.toBeDisabled(),
+    );
+    expect(screen.queryByText(/Previewing/)).toBeNull();
   });
 
   it("lets an admin add and remove sources", async () => {
