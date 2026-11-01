@@ -1226,8 +1226,9 @@ def register_resource_routes(
                 status_code=500,
                 content={"error": {"code": "git_status_failed", "message": exc.reason}},
             )
-        data = [
-            {
+        data: list[dict[str, Any]] = []
+        for rec in raw_changes:
+            entry: dict[str, Any] = {
                 "object": "session.environment.filesystem.entry",
                 "path": rec["path"],
                 "name": rec["path"].split("/")[-1],
@@ -1237,8 +1238,11 @@ def register_resource_routes(
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
             }
-            for rec in raw_changes
-        ]
+            if "staged" in rec:
+                entry["staged"] = rec["staged"]
+            if "unstaged" in rec:
+                entry["unstaged"] = rec["unstaged"]
+            data.append(entry)
         return JSONResponse(
             status_code=200,
             content={"object": "list", "data": data, "has_more": False},
