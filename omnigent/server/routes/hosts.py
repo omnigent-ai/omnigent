@@ -44,6 +44,7 @@ from omnigent.host.frames import (
     CAP_HARNESS_LOGIN,
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_DRAINING_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
@@ -95,7 +96,7 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import Host, HostStore, host_is_live
+from omnigent.stores.host_store import Host, HostStore, host_draining_error, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -718,6 +719,135 @@ class HostModelOptionsResponse(BaseModel):
     error: str | None = None
 
 
+class HostDrainReport(BaseModel):
+    """The host's own latest report of its launch fence.
+
+    :param generation: Drain generation the report describes.
+    :param draining: Whether the host's fence is up.
+    :param pending_launches: Launch frames the host received that have not
+        settled — queued, in preflight, or inside the shielded spawn.
+    :param running_runners: Runner processes the host is tracking.
+    :param complete: The host's close-ack for ``generation``.
+    :param reported_at: Unix epoch seconds the report arrived.
+    """
+
+    generation: int
+    draining: bool
+    pending_launches: int
+    running_runners: int
+    complete: bool
+    reported_at: float
+
+
+class HostDrainStatusResponse(BaseModel):
+    """Launch-fence (drain) state of one host.
+
+    ``safe_to_restart`` is the operator's signal: the fence is up, the host's
+    current connection supports drain, and the host acknowledged the current
+    generation with nothing queued or mid-spawn. Anything uncertain — an old
+    host build, a host that has not reconnected since the upgrade, or a
+    pending acknowledgement — reads ``False``. Running runners are reported
+    but never block it: drain stops launches, it does not stop sessions.
+
+    :param host_id: Host identifier.
+    :param state: ``"active"`` (not draining), ``"draining"`` (waiting for the
+        host's acknowledgement), ``"drained"`` (safe to restart), or
+        ``"unsupported"`` (draining, but the host cannot acknowledge).
+    :param safe_to_restart: Whether restarting the host loses no launch.
+    :param draining: Whether new runner launches are refused.
+    :param generation: Current drain generation (bumped on drain and undrain).
+    :param drain_started_at: Unix epoch seconds the drain began.
+    :param drain_requested_by: User who started the drain.
+    :param drain_support: ``"supported"``, ``"unsupported"``, or ``"unknown"``
+        (no connection since the server learned to ask).
+    :param acked_generation: Generation the host acknowledged, if any.
+    :param acked_at: Unix epoch seconds of that acknowledgement.
+    :param host_online: Whether the host is live (cross-replica).
+    :param host_report: The host's latest fence report, when its tunnel is
+        on this replica.
+    :param server_pending_launches: Launch round-trips this replica is still
+        awaiting on the host's tunnel, when it is on this replica.
+    :param reason: One-line explanation of ``state``.
+    """
+
+    host_id: str
+    state: str
+    safe_to_restart: bool
+    draining: bool
+    generation: int
+    drain_started_at: int | None
+    drain_requested_by: str | None
+    drain_support: str
+    acked_generation: int | None
+    acked_at: int | None
+    host_online: bool
+    host_report: HostDrainReport | None
+    server_pending_launches: int | None
+    reason: str
+
+
+def _drain_status_response(
+    host: Host,
+    conn: HostConnection | None,
+) -> HostDrainStatusResponse:
+    """Build the operator-facing drain status for a host.
+
+    :param host: The host row (cross-replica source of truth for the fence).
+    :param conn: The host's live connection on this replica, or ``None``.
+    :returns: The drain status, conservative on every unknown.
+    """
+    support = (
+        "unknown"
+        if host.drain_supported is None
+        else ("supported" if host.drain_supported else "unsupported")
+    )
+    if not host.draining:
+        state, reason = "active", "host accepts new runner launches"
+    elif support == "unsupported":
+        state = "unsupported"
+        reason = (
+            "host build does not support drain; it cannot acknowledge, so it is "
+            "never reported safe — upgrade the host and reconnect it first"
+        )
+    elif host.drain_complete:
+        state = "drained"
+        reason = "host acknowledged: new launches refused, none queued or mid-spawn"
+    elif support == "unknown":
+        state = "draining"
+        reason = "host has not connected since drain support was added; waiting for it"
+    else:
+        state = "draining"
+        reason = "waiting for the host to acknowledge (launches still queued or in flight)"
+    report = conn.drain_report if conn is not None else None
+    return HostDrainStatusResponse(
+        host_id=host.host_id,
+        state=state,
+        safe_to_restart=host.drain_complete,
+        draining=host.draining,
+        generation=host.drain_generation,
+        drain_started_at=host.drain_started_at,
+        drain_requested_by=host.drain_requested_by,
+        drain_support=support,
+        acked_generation=host.drain_acked_generation,
+        acked_at=host.drain_acked_at,
+        host_online=host_is_live(host),
+        host_report=(
+            HostDrainReport(
+                generation=report.generation,
+                draining=report.draining,
+                pending_launches=report.pending_launches,
+                running_runners=report.running_runners,
+                complete=report.complete,
+                reported_at=conn.drain_report_at or 0.0,
+            )
+            if report is not None and conn is not None
+            else None
+        ),
+        server_pending_launches=len(conn.pending_launches) if conn is not None else None,
+        reason=reason,
+    )
+
+
 class LaunchRunnerRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/runners``.
 
@@ -879,8 +1009,9 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
             ``name``, ``owner``, ``status``, ``sandbox_provider``,
-            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            no connected host has reported it to this replica).
+            ``configured_harnesses``, ``gateway_inference`` (``None`` when
+            no connected host has reported it to this replica), and
+            ``draining`` (new launches refused).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -925,6 +1056,8 @@ def create_hosts_router(
                 # gateway-backed".
                 "gateway_inference": host_registry.gateway_inference(host.host_id),
                 "interactive_shells": host_registry.interactive_shells(host.host_id),
+                # Launches on a draining host are refused; pickers can say so.
+                "draining": host.draining,
             }
             if (
                 harness_setup_enabled
@@ -986,6 +1119,7 @@ def create_hosts_router(
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
+            "draining": host.draining,
             "runners": [],
         }
         if (
@@ -1073,6 +1207,98 @@ def create_hosts_router(
             ),
             error=error if isinstance(error, str) and error else None,
         )
+
+    async def _owned_host(request: Request, host_id: str) -> tuple[str | None, Host]:
+        """Resolve a host the caller owns, for the drain routes."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        return user_id, host
+
+    def _push_drain(host: Host) -> HostConnection | None:
+        """Deliver the fence to the host now when its tunnel is on this replica.
+
+        Another replica's tunnel picks the change up on its next keepalive tick.
+        """
+        conn = host_registry.get(host.host_id)
+        if conn is not None:
+            try:
+                host_registry.send_drain(conn, host.drain_generation, host.draining)
+            except ConnectionError:
+                return None
+        return conn
+
+    @router.get("/hosts/{host_id}/drain", response_model=HostDrainStatusResponse)
+    async def get_host_drain(request: Request, host_id: str) -> HostDrainStatusResponse:
+        """Report a host's launch fence and whether it is safe to restart.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The drain status.
+        :raises HTTPException: 404 if the host does not exist, 403 if it is
+            not the caller's.
+        """
+        _user_id, host = await _owned_host(request, host_id)
+        return _drain_status_response(host, host_registry.get(host.host_id))
+
+    @router.post("/hosts/{host_id}/drain", response_model=HostDrainStatusResponse)
+    async def start_host_drain(request: Request, host_id: str) -> HostDrainStatusResponse:
+        """Fence every new runner launch on a host, keeping running sessions.
+
+        Idempotent: draining an already-draining host keeps its generation.
+        Persisted on the hosts row, so it survives a server restart and is
+        enforced inside launch admission on every replica.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The drain status after the transition.
+        :raises HTTPException: 404 if the host does not exist, 403 if it is
+            not the caller's.
+        """
+        user_id, host = await _owned_host(request, host_id)
+        drained = await asyncio.to_thread(host_store.start_drain, host.host_id, user_id)
+        if drained is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        _logger.info(
+            "Host %s drain requested by %s (generation %d)",
+            host.host_id,
+            user_id,
+            drained.drain_generation,
+            extra=debug_event(
+                "host_drain_started", host_id=host.host_id, generation=drained.drain_generation
+            ),
+        )
+        add_audit_attrs(host_id=host.host_id)
+        return _drain_status_response(drained, _push_drain(drained))
+
+    @router.delete("/hosts/{host_id}/drain", response_model=HostDrainStatusResponse)
+    async def stop_host_drain(request: Request, host_id: str) -> HostDrainStatusResponse:
+        """Lift a host's launch fence (undrain). Idempotent.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The drain status after the transition.
+        :raises HTTPException: 404 if the host does not exist, 403 if it is
+            not the caller's.
+        """
+        user_id, host = await _owned_host(request, host_id)
+        undrained = await asyncio.to_thread(host_store.stop_drain, host.host_id)
+        if undrained is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        _logger.info(
+            "Host %s undrained by %s (generation %d)",
+            host.host_id,
+            user_id,
+            undrained.drain_generation,
+            extra=debug_event(
+                "host_drain_stopped", host_id=host.host_id, generation=undrained.drain_generation
+            ),
+        )
+        add_audit_attrs(host_id=host.host_id)
+        return _drain_status_response(undrained, _push_drain(undrained))
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(
@@ -1474,6 +1700,9 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
+            if result.get("error_code") == HOST_DRAINING_ERROR_CODE:
+                # The fence went up after admission; the host refused at receipt.
+                raise host_draining_error(target.host)
             refusal_code = classify_launch_refusal(
                 result.get("error_code"),
                 result.get("error"),

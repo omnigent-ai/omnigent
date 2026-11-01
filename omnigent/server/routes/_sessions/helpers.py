@@ -6361,7 +6361,11 @@ async def _launch_runner_on_host_locked(
     host_conn: HostConnection,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
-    from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
+    from omnigent.host.frames import (
+        HOST_DRAINING_ERROR_CODE,
+        HostLaunchRunnerFrame,
+        encode_host_frame,
+    )
     from omnigent.runner.identity import token_bound_runner_id
 
     await host_registry.admit_launch(host_conn, conv.id)
@@ -6497,6 +6501,15 @@ async def _launch_runner_on_host_locked(
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
+            if result.get("error_code") == HOST_DRAINING_ERROR_CODE:
+                # The fence went up between admission and the frame reaching
+                # the host. Fail like an admission-time rejection so every
+                # caller surfaces HOST_DRAINING instead of a generic refusal.
+                raise OmnigentError(
+                    f"host {host_conn.hello.name!r} is draining for maintenance and is "
+                    "not accepting new runner launches; retry after it is undrained",
+                    code=ErrorCode.HOST_DRAINING,
+                )
             return _HostLaunchAttempt(
                 runner_id=new_runner_id,
                 error_code=result.get("error_code"),

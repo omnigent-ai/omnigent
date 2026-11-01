@@ -236,6 +236,11 @@ class ErrorCode:
         indistinguishable from a completed enumeration, so the caller
         silently loses the remaining rows. The caller's remedy is to
         restart the enumeration without the cursor.
+    :cvar HOST_DRAINING: The target host is draining for maintenance: an
+        operator fenced new runner launches on it (HTTP 503). Existing runners
+        keep running; the launch succeeds once the host is undrained or the
+        session moves to another host. Distinct from ``RUNNER_UNAVAILABLE`` so
+        clients can say *why* instead of suggesting a reconnect.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -260,6 +265,9 @@ class ErrorCode:
     UPSTREAM_CANCELLED = "upstream_cancelled"
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
+    # Keep the string equal to frames.HOST_DRAINING_ERROR_CODE — a draining
+    # host's wire refusal passes through as the API error code.
+    HOST_DRAINING = "host_draining"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -320,6 +328,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
     ErrorCode.STALE_CURSOR: 400,
+    # 503: a valid launch the host will accept again after maintenance.
+    ErrorCode.HOST_DRAINING: 503,
 }
 
 
@@ -364,6 +374,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
+    # An operator fenced the host; the deployment, not the caller, must change.
+    ErrorCode.HOST_DRAINING: ErrorCategory.CONFIG,
 }
 
 
@@ -410,6 +422,8 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.LOGIN_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
+    # Maintenance window: the launch succeeds once the host is undrained.
+    ErrorCode.HOST_DRAINING: ErrorImpact.TRANSIENT,
 }
 
 
@@ -452,6 +466,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
+    ErrorCode.HOST_DRAINING: ErrorPhase.RUNNER_LAUNCH,
 }
 
 

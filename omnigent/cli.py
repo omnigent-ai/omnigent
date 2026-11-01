@@ -9252,7 +9252,8 @@ class _HostGroup(click.Group):
     --server <url>`` when ``<url>`` is URL-like or the empty local-mode
     marker. A leading positional token that matches a registered
     management subcommand (``enable``, ``disable``, ``status``, ``stop``,
-    ``stop-session``, ``reset-id``) still dispatches to that subcommand, and
+    ``stop-session``, ``drain``, ``drain-status``, ``undrain``, ``reset-id``)
+    still dispatches to that subcommand, and
     other unknown tokens fall through to Click's normal unknown-command error.
     """
 
@@ -11492,6 +11493,202 @@ def host_stop_session(
             click.echo(f"Failed to stop session {session_id!r}.", err=True)
             continue
         click.echo(f"Stopped session {session_id}.")
+
+
+def _drain_server_url(ctx: click.Context, server: str | None) -> str:
+    """Resolve the server a drain command talks to (flag, group, config, local).
+
+    :param ctx: Click context carrying group-level options.
+    :param server: The subcommand's ``--server`` value, or ``None``.
+    :returns: Server base URL.
+    :raises click.ClickException: If no server is configured or reachable.
+    """
+    if server is None:
+        server = _host_group_option(ctx, "server")
+    resolved = _resolve_host_server(server)
+    if resolved is None:
+        resolved = local_server_url_if_healthy()
+    if resolved is None:
+        raise click.ClickException(
+            "No server was supplied and no local Omnigent server is reachable."
+        )
+    return resolved
+
+
+def _drain_host_id(host_id: str | None) -> str:
+    """Default a drain command's host to this machine's host identity.
+
+    :param host_id: Explicit host id argument, or ``None``.
+    :returns: The host id to act on.
+    :raises click.ClickException: If none was given and this machine has none.
+    """
+    if host_id:
+        return host_id
+    from omnigent.host.identity import load_host_identity_if_present
+
+    identity = load_host_identity_if_present()
+    if identity is None:
+        raise click.ClickException(
+            "No HOST_ID given and this machine has no host identity; pass the host id "
+            f"(see `{cli_invocation()} host status --json` or GET /v1/hosts)."
+        )
+    return identity.host_id
+
+
+def _drain_request(base_url: str, method: str, host_id: str) -> _HostJsonObject:
+    """Call one ``/v1/hosts/{id}/drain`` endpoint and return its JSON body.
+
+    :param base_url: Server base URL.
+    :param method: ``"GET"``, ``"POST"`` (drain), or ``"DELETE"`` (undrain).
+    :param host_id: Host to act on.
+    :returns: The decoded drain status.
+    :raises click.ClickException: On a transport or HTTP failure.
+    """
+    from omnigent.harnesses.claude_native.bridge import url_component
+
+    result = _host_http_json(
+        base_url=base_url,
+        method=method,
+        path=f"/v1/hosts/{url_component(host_id)}/drain",
+        host_id=host_id,
+    )
+    if result.status_code == 0 or result.status_code >= 400 or not isinstance(result.body, dict):
+        status = f" ({result.status_code})" if result.status_code else ""
+        raise click.ClickException(
+            f"Drain request for host {host_id!r} failed{status}: {_host_error_text(result.body)}"
+        )
+    return result.body
+
+
+def _echo_drain_status(status: _HostJsonObject, *, json_output: bool) -> None:
+    """Print a drain status as JSON or as an aligned summary.
+
+    :param status: Body returned by the drain endpoints.
+    :param json_output: Emit raw JSON instead of the summary.
+    """
+    if json_output:
+        click.echo(json.dumps(status, indent=2, sort_keys=True))
+        return
+    safe = status.get("safe_to_restart") is True
+    report = status.get("host_report")
+    pending = report.get("pending_launches") if isinstance(report, dict) else None
+    running = report.get("running_runners") if isinstance(report, dict) else None
+    verdict = (
+        _cli_style("SAFE to restart", fg="green", bold=True)
+        if safe
+        else _cli_style("NOT safe to restart", fg="yellow", bold=True)
+    )
+    click.echo(f"Host {status.get('host_id')}: {status.get('state')} — {verdict}")
+    rows = [
+        ("why", str(status.get("reason"))),
+        ("generation", f"{status.get('generation')} (acked {status.get('acked_generation')})"),
+        ("support", str(status.get("drain_support"))),
+        ("online", str(status.get("host_online"))),
+        (
+            "pending",
+            "unknown (host tunnel not on this replica)" if pending is None else str(pending),
+        ),
+        ("runners", "unknown" if running is None else str(running)),
+    ]
+    for label, value in rows:
+        click.echo(f"  {label + ':':<12}{value}")
+
+
+@host.command("drain")
+@click.argument("host_id", required=False)
+@click.option("--server", default=None, help="Server that owns the host.")
+@click.option(
+    "--wait",
+    "wait_s",
+    type=float,
+    default=None,
+    help="Poll until the host reports safe to restart, up to this many seconds.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
+@click.pass_context
+def host_drain(
+    ctx: click.Context,
+    host_id: str | None,
+    server: str | None,
+    wait_s: float | None,
+    json_output: bool,
+) -> None:
+    """
+    Stop new runner launches on a host, keeping its running sessions.
+
+    Exits 0 once the host is safe to restart (immediately without --wait),
+    and 1 when --wait elapses first.
+
+    \f
+    :param ctx: Click context carrying group-level options.
+    :param host_id: Host to drain; defaults to this machine's host identity.
+    :param server: Omnigent server that owns the host.
+    :param wait_s: Seconds to wait for the close-ack, or ``None`` not to wait.
+    :param json_output: Emit JSON.
+    """
+    base_url = _drain_server_url(ctx, server)
+    target = _drain_host_id(host_id)
+    status = _drain_request(base_url, "POST", target)
+    if wait_s is not None:
+        deadline = time.monotonic() + wait_s
+        while status.get("safe_to_restart") is not True and time.monotonic() < deadline:
+            time.sleep(1.0)
+            status = _drain_request(base_url, "GET", target)
+    _echo_drain_status(status, json_output=json_output)
+    if wait_s is not None and status.get("safe_to_restart") is not True:
+        ctx.exit(1)
+
+
+@host.command("drain-status")
+@click.argument("host_id", required=False)
+@click.option("--server", default=None, help="Server that owns the host.")
+@click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
+@click.pass_context
+def host_drain_status(
+    ctx: click.Context,
+    host_id: str | None,
+    server: str | None,
+    json_output: bool,
+) -> None:
+    """
+    Show a host's launch fence and whether it is safe to restart.
+
+    Exits 0 when safe to restart, 1 otherwise, so scripts can gate on it.
+
+    \f
+    :param ctx: Click context carrying group-level options.
+    :param host_id: Host to inspect; defaults to this machine's host identity.
+    :param server: Omnigent server that owns the host.
+    :param json_output: Emit JSON.
+    """
+    status = _drain_request(_drain_server_url(ctx, server), "GET", _drain_host_id(host_id))
+    _echo_drain_status(status, json_output=json_output)
+    if status.get("safe_to_restart") is not True:
+        ctx.exit(1)
+
+
+@host.command("undrain")
+@click.argument("host_id", required=False)
+@click.option("--server", default=None, help="Server that owns the host.")
+@click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
+@click.pass_context
+def host_undrain(
+    ctx: click.Context,
+    host_id: str | None,
+    server: str | None,
+    json_output: bool,
+) -> None:
+    """
+    Lift a host's launch fence so it accepts new runner launches again.
+
+    \f
+    :param ctx: Click context carrying group-level options.
+    :param host_id: Host to undrain; defaults to this machine's host identity.
+    :param server: Omnigent server that owns the host.
+    :param json_output: Emit JSON.
+    """
+    status = _drain_request(_drain_server_url(ctx, server), "DELETE", _drain_host_id(host_id))
+    _echo_drain_status(status, json_output=json_output)
 
 
 @host.command("reset-id")

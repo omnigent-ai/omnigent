@@ -34,11 +34,13 @@ from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
+    CAP_LAUNCH_DRAIN,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
+    HostDrainStatusFrame,
     HostFsResultFrame,
     HostHarnessLoginCancelResultFrame,
     HostHarnessLoginCompletedFrame,
@@ -394,6 +396,13 @@ def create_host_tunnel_router(
                 managed_token=managed_token,
             )
             host_persisted = True
+            # Every connection must earn its own close-ack: reset it, and
+            # record whether this build can be fenced at all.
+            drain_host = await asyncio.to_thread(
+                host_store.note_drain_connect,
+                host_id,
+                supported=CAP_LAUNCH_DRAIN in frame.capabilities,
+            )
             if persisted_host.account_generation is not None:
                 from omnigent.db.account_authority import bind_account_authority
 
@@ -409,6 +418,10 @@ def create_host_tunnel_router(
                 # sandbox, not a user machine reconnecting on a managed host id.
                 registered_with_managed_token=managed_token is not None,
             )
+            # No await since register: the fence is the first frame this
+            # connection carries, ahead of any launch frame.
+            if drain_host is not None:
+                host_registry.send_drain(conn, drain_host.drain_generation, drain_host.draining)
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
@@ -452,6 +465,8 @@ def create_host_tunnel_router(
                         host_id=host_id,
                         host_store=host_store,
                         connection_id=frame.connection_id,
+                        conn=conn,
+                        host_registry=host_registry,
                     ),
                     name=f"host-heartbeat:{host_id}",
                 )
@@ -870,6 +885,10 @@ async def _receive_loop(
                     _logger.exception("on_host_update callback failed for %s", host_id)
             continue
 
+        if isinstance(frame, HostDrainStatusFrame):
+            await _record_drain_report(conn, host_id, host_store, frame)
+            continue
+
         if isinstance(frame, HostLaunchRunnerResultFrame):
             future = conn.pending_launches.pop(frame.request_id, None)
             if future is not None and not future.done():
@@ -1280,8 +1299,14 @@ async def _heartbeat_loop(
     host_id: str,
     host_store: HostStore,
     connection_id: str | None = None,
+    conn: HostConnection | None = None,
+    host_registry: HostRegistry | None = None,
 ) -> None:
-    """Serialize host-liveness writes independently of socket pings."""
+    """Serialize host-liveness writes independently of socket pings.
+
+    With *conn* and *host_registry*, each successful heartbeat also delivers a
+    drain transition another replica committed for this host.
+    """
     failure_count = 0
     last_failure_log_at = 0.0
     while True:
@@ -1339,6 +1364,66 @@ async def _heartbeat_loop(
             )
             failure_count = 0
             last_failure_log_at = 0.0
+        if conn is not None and host_registry is not None:
+            try:
+                await _reconcile_drain(conn, host_id, host_store, host_registry)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.warning("Drain reconcile failed for host %s", host_id, exc_info=True)
+
+
+async def _record_drain_report(
+    conn: HostConnection,
+    host_id: str,
+    host_store: HostStore,
+    frame: HostDrainStatusFrame,
+) -> None:
+    """Keep a host's latest fence report and persist a close-ack.
+
+    :param conn: Connection the report arrived on (still current).
+    :param host_id: Reporting host.
+    :param host_store: Store the acknowledgement is written to.
+    :param frame: The host's ``host.drain_status`` report.
+    """
+    conn.drain_report = frame
+    conn.drain_report_at = time.time()
+    acked = False
+    if frame.draining and frame.complete and frame.pending_launches == 0:
+        acked = await asyncio.to_thread(host_store.record_drain_ack, host_id, frame.generation)
+    _logger.info(
+        "Host %s drain status: generation=%d draining=%s pending_launches=%d "
+        "running_runners=%d complete=%s acked=%s",
+        host_id,
+        frame.generation,
+        frame.draining,
+        frame.pending_launches,
+        frame.running_runners,
+        frame.complete,
+        acked,
+        extra=debug_event(
+            "host_drain_status",
+            host_id=host_id,
+            generation=frame.generation,
+            pending_launches=frame.pending_launches,
+            complete=frame.complete,
+        ),
+    )
+
+
+async def _reconcile_drain(
+    conn: HostConnection,
+    host_id: str,
+    host_store: HostStore,
+    host_registry: HostRegistry,
+) -> None:
+    """Deliver a drain transition another replica committed to this host."""
+    if not host_registry.supports_launch_drain(conn):
+        return
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is not None:
+        with contextlib.suppress(ConnectionError):
+            host_registry.send_drain(conn, host.drain_generation, host.draining)
 
 
 async def _ping_loop(

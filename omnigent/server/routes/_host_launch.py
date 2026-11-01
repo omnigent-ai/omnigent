@@ -32,7 +32,7 @@ from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
-from omnigent.stores.host_store import Host, HostStore, host_is_live
+from omnigent.stores.host_store import Host, HostStore, host_draining_error, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 if TYPE_CHECKING:
@@ -210,6 +210,35 @@ def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentErr
     return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
 
+async def reject_if_host_draining(
+    host_store: HostStore | None,
+    host_id: str,
+    user_id: str | None,
+) -> None:
+    """Fail a session create targeting a draining host before any row exists.
+
+    A UX pre-check only — :func:`resolve_host_launch` and
+    :meth:`HostStore.admit_launch` are the enforcing checks. Silent for a host
+    the caller does not own, so the later authorization error stays the one a
+    non-owner sees.
+
+    :param host_store: Persistent host registrations, or ``None`` (no hosts).
+    :param host_id: The host the create targets.
+    :param user_id: Authenticated caller, or ``None`` when auth is disabled.
+    :raises OmnigentError: ``HOST_DRAINING`` when the host is draining.
+    """
+    import asyncio
+
+    if host_store is None:
+        return
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or not getattr(host, "draining", False):
+        return
+    if user_id is not None and host.user_id != user_id:
+        return
+    raise host_draining_error(host)
+
+
 def resolve_host_launch(
     *,
     user_id: str | None,
@@ -253,7 +282,11 @@ def resolve_host_launch(
         a different user.
     :raises OmnigentError: 409 (CONFLICT) if the host is genuinely offline,
         or 400 (WRONG_REPLICA) if it is live but its tunnel is on another
-        replica (a wrong-replica landing — the caller re-addresses keyless).
+        replica (a wrong-replica landing — the caller re-addresses keyless),
+        or 503 (HOST_DRAINING) when an operator fenced launches on the host.
+        The drain check runs after authorization so it reveals nothing to a
+        non-owner, and before any caller side effect (worktree, binding);
+        :meth:`HostStore.admit_launch` re-checks it under the row lock.
     """
     host = resolve_host_owner(
         user_id=user_id,
@@ -296,4 +329,6 @@ def resolve_host_launch(
             user_id=host.user_id,
         )
 
+    if getattr(host, "draining", False):
+        raise host_draining_error(host)
     return HostLaunchTarget(host=host, conn=conn, conv=conv)

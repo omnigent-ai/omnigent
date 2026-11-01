@@ -61,6 +61,10 @@ LAUNCH_HANDLER_FAILED_ERROR_CODE = "launch_handler_failed"
 # Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log
 # tail, whose last line the server keeps when it shortens the report for storage.
 RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
+# when a draining host refuses a launch: an operator fenced new runner launches
+# on it for maintenance. Shared by the daemon (producer) and the server, which
+# maps it to ``ErrorCode.HOST_DRAINING``.
+HOST_DRAINING_ERROR_CODE = "host_draining"
 
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
@@ -83,6 +87,10 @@ CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
+# The host honours ``host.set_drain`` (refuses launches at frame receipt) and
+# reports generation-bound ``host.drain_status``. A host without it can never
+# be declared safe to restart.
+CAP_LAUNCH_DRAIN = "launch_drain"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -100,6 +108,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_WORKTREE_CREATE_BUDGET,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_LAUNCH_DRAIN,
 ]
 
 
@@ -211,6 +220,8 @@ class HostFrameKind(str, Enum):
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_SESSION_CHUNK = "host.import_local_session_chunk"
     IMPORT_LOCAL_DONE = "host.import_local_done"
+    SET_DRAIN = "host.set_drain"
+    DRAIN_STATUS = "host.drain_status"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -1450,6 +1461,49 @@ class HostImportLocalDoneFrame:
     failures: list[_JsonObject] = field(default_factory=list)
 
 
+@dataclass
+class HostSetDrainFrame:
+    """Server → host: enter or leave the launch fence for one drain generation.
+
+    One-way; the host answers with :class:`HostDrainStatusFrame`. Frames on a
+    tunnel are ordered, so every launch frame the server sent before this one
+    is counted as pending and every launch frame after it is refused.
+
+    :param generation: Server-assigned, monotonically increasing drain
+        generation, e.g. ``3``. A host ignores a frame older than the newest
+        generation it has seen in this process.
+    :param draining: ``True`` to refuse new launches, ``False`` to lift the
+        fence (undrain).
+    """
+
+    generation: int
+    draining: bool
+
+
+@dataclass
+class HostDrainStatusFrame:
+    """Host → server: the launch fence's state for one drain generation.
+
+    Sent on every ``host.set_drain`` and again whenever the pending-launch count
+    changes while draining. ``complete`` is the close-ack: the host refuses new
+    launches for ``generation`` and has no launch queued or mid-spawn.
+
+    :param generation: Drain generation this report describes, e.g. ``3``.
+    :param draining: Whether the host's fence is up.
+    :param pending_launches: Launch frames received but not yet settled — queued
+        behind the lifecycle lock, in preflight, or inside the shielded spawn
+        thread (including a cancelled spawn whose teardown is still running).
+    :param running_runners: Runner processes the host is tracking.
+    :param complete: ``True`` only when draining and ``pending_launches == 0``.
+    """
+
+    generation: int
+    draining: bool
+    pending_launches: int
+    running_runners: int
+    complete: bool
+
+
 HostFrame = (
     HostHelloFrame
     | HostConnectionErrorFrame
@@ -1512,6 +1566,8 @@ HostFrame = (
     | HostImportLocalSessionFrame
     | HostImportLocalSessionChunkFrame
     | HostImportLocalDoneFrame
+    | HostSetDrainFrame
+    | HostDrainStatusFrame
 )
 
 
@@ -2173,6 +2229,25 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "failures": frame.failures,
             }
         )
+    if isinstance(frame, HostSetDrainFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SET_DRAIN.value,
+                "generation": frame.generation,
+                "draining": frame.draining,
+            }
+        )
+    if isinstance(frame, HostDrainStatusFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.DRAIN_STATUS.value,
+                "generation": frame.generation,
+                "draining": frame.draining,
+                "pending_launches": frame.pending_launches,
+                "running_runners": frame.running_runners,
+                "complete": frame.complete,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -2611,6 +2686,19 @@ def _decode_known_host_frame(
             return _decode_import_local_session_chunk(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
+        case HostFrameKind.SET_DRAIN:
+            return HostSetDrainFrame(
+                generation=_required_int(msg, "generation"),
+                draining=_required_bool(msg, "draining"),
+            )
+        case HostFrameKind.DRAIN_STATUS:
+            return HostDrainStatusFrame(
+                generation=_required_int(msg, "generation"),
+                draining=_required_bool(msg, "draining"),
+                pending_launches=_required_int(msg, "pending_launches"),
+                running_runners=_required_int(msg, "running_runners"),
+                complete=_required_bool(msg, "complete"),
+            )
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 

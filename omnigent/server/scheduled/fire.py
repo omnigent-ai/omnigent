@@ -695,6 +695,29 @@ async def _run_fire_for_task(
     await recorder.check()
     try:
         await dispatch(conv, effective)
+    except OmnigentError as exc:
+        if exc.code != ErrorCode.HOST_DRAINING:
+            _logger.exception(
+                "scheduled fire: launch/dispatch failed for task %s (session %s)",
+                task.id,
+                conv.id,
+            )
+            await recorder.finish(
+                "failed",
+                conversation_id=conv.id,
+                error="runner launch/dispatch failed",
+                error_code="launch_failed",
+            )
+            return
+        # The fence went up between preflight and launch admission.
+        _logger.warning("scheduled fire: task %s host is draining (session %s)", task.id, conv.id)
+        await recorder.finish(
+            "failed",
+            conversation_id=conv.id,
+            error=exc.message,
+            error_code=ErrorCode.HOST_DRAINING,
+        )
+        return
     except Exception:
         # The session + grant are already persisted and owner-visible, so a
         # launch/dispatch failure still records a run — just a failed one.
@@ -1079,6 +1102,10 @@ async def _resolve_owner_host(deps: FireDeps, task: ScheduledTask) -> str:
         if task.user_id is not None and host.account_generation != task.account_generation:
             continue
         if getattr(host, "sandbox_provider", None) is not None:
+            continue
+        # A draining host takes no new launches; picking the next online host
+        # is this resolver's existing placement rule, not a retry.
+        if getattr(host, "draining", False):
             continue
         if deps.host_registry.get(host.host_id) is not None:
             return str(host.host_id)
@@ -1658,6 +1685,13 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
         raise _CannotLaunchScheduledFire(
             "automations cannot use an existing sandbox; select a new sandbox for each run",
             error_code="existing_sandbox_not_allowed",
+        )
+    if getattr(host, "draining", False):
+        # Checked before the session is created, for scheduled fires and
+        # run-now alike (a paused task's run-now takes this same path).
+        raise _CannotLaunchScheduledFire(
+            f"connected host {host_id!r} is draining for maintenance",
+            error_code=ErrorCode.HOST_DRAINING,
         )
 
 

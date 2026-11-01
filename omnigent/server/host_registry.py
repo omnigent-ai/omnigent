@@ -43,11 +43,14 @@ from omnigent.harness_accounts import HarnessAccounts
 from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
+    CAP_LAUNCH_DRAIN,
+    HostDrainStatusFrame,
     HostHelloFrame,
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
+    HostSetDrainFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     encode_host_frame,
@@ -481,6 +484,12 @@ class HostConnection:
     :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
     :param pending_skill_content: Per-request futures for transient SKILL.md reads.
     :param pending_mcp_tools: Per-request futures for lazy MCP discovery.
+    :param drain_generation_sent: Newest ``host.set_drain`` generation sent on
+        this connection (``0`` = none), so the reconcile loop resends only on
+        change.
+    :param drain_report: Latest ``host.drain_status`` the host sent on this
+        connection, or ``None`` before the first report.
+    :param drain_report_at: Unix epoch float that report arrived.
     """
 
     workspace_id: int
@@ -592,6 +601,9 @@ class HostConnection:
     pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
         default_factory=dict,
     )
+    drain_generation_sent: int = 0
+    drain_report: HostDrainStatusFrame | None = None
+    drain_report_at: float | None = None
 
     def enqueue(self, data: str, *, app_ping_ts: int | None = None) -> None:
         """Queue a frame on the socket loop, retaining local timing metadata."""
@@ -904,6 +916,33 @@ class HostRegistry:
         with self._lock:
             reported = self._interactive_shells.get(_canonical_host_id(host_id))
         return list(reported) if reported is not None else None
+
+    @staticmethod
+    def supports_launch_drain(conn: HostConnection) -> bool:
+        """Whether the connected host build honours ``host.set_drain``."""
+        return CAP_LAUNCH_DRAIN in conn.hello.capabilities
+
+    def send_drain(self, conn: HostConnection, generation: int, draining: bool) -> bool:
+        """Send the launch-fence state to a host when it is newer than what it has.
+
+        A host that does not advertise the drain capability gets nothing —
+        it would ignore the frame, and the server's admission guard still
+        fences launches it would otherwise receive.
+
+        :param conn: The live host connection.
+        :param generation: Current drain generation from the hosts row.
+        :param draining: Whether that generation fences launches.
+        :returns: ``True`` when a frame was enqueued.
+        :raises ConnectionError: If the connection was replaced.
+        """
+        if generation <= conn.drain_generation_sent or not self.supports_launch_drain(conn):
+            return False
+        self.send_text(
+            conn,
+            encode_host_frame(HostSetDrainFrame(generation=generation, draining=draining)),
+        )
+        conn.drain_generation_sent = generation
+        return True
 
     async def admit_launch(
         self,

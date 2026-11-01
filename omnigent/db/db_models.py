@@ -1314,6 +1314,18 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param drain_generation: Monotonic launch-fence generation, bumped on
+        every drain start and undrain. ``0`` for a host never drained.
+    :param drain_started_at: Unix epoch seconds the current drain started;
+        non-``NULL`` means new runner launches on this host are refused.
+    :param drain_requested_by: User who started the current drain.
+    :param drain_acked_generation: Drain generation the host acknowledged as
+        complete (fence up, no launch queued or mid-spawn). Cleared on every
+        drain transition and every host reconnect.
+    :param drain_acked_at: Unix epoch seconds of that acknowledgement.
+    :param drain_supported: Whether the host's last connection advertised the
+        launch-drain capability. ``NULL`` means it has not connected since
+        the column was added — unknown, never safe.
     """
 
     __tablename__ = "hosts"
@@ -1346,6 +1358,14 @@ class SqlHost(OmnigentBase):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    drain_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="0", default=0
+    )
+    drain_started_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    drain_requested_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    drain_acked_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    drain_acked_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    drain_supported: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     __table_args__ = (
         CheckConstraint(

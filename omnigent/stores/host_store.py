@@ -93,6 +93,16 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param drain_generation: Monotonic launch-fence generation, bumped on
+        every drain start and undrain; ``0`` for a host never drained.
+    :param drain_started_at: Unix epoch seconds the current drain began, or
+        ``None`` when the host accepts launches.
+    :param drain_requested_by: User who started the current drain.
+    :param drain_acked_generation: Generation the host acknowledged as
+        complete, or ``None``.
+    :param drain_acked_at: Unix epoch seconds of that acknowledgement.
+    :param drain_supported: Whether the host's last connection advertised
+        the launch-drain capability; ``None`` when unknown.
     """
 
     host_id: str
@@ -107,6 +117,42 @@ class Host:
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
     account_generation: str | None = None
+    drain_generation: int = 0
+    drain_started_at: int | None = None
+    drain_requested_by: str | None = None
+    drain_acked_generation: int | None = None
+    drain_acked_at: int | None = None
+    drain_supported: bool | None = None
+
+    @property
+    def draining(self) -> bool:
+        """Whether new runner launches on this host are fenced."""
+        return self.drain_started_at is not None
+
+    @property
+    def drain_complete(self) -> bool:
+        """Whether the host acknowledged the current drain generation.
+
+        Conservative: an unknown or missing capability is never complete.
+        """
+        return (
+            self.draining
+            and self.drain_supported is True
+            and self.drain_acked_generation == self.drain_generation
+        )
+
+
+def host_draining_error(host: Host) -> OmnigentError:
+    """Build the error a launch on a draining host fails with.
+
+    :param host: The draining host.
+    :returns: ``HOST_DRAINING`` (HTTP 503) naming the host.
+    """
+    return OmnigentError(
+        f"host {host.name!r} is draining for maintenance and is not accepting new "
+        "runner launches; retry after it is undrained",
+        code=ErrorCode.HOST_DRAINING,
+    )
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -182,6 +228,12 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        drain_generation=row.drain_generation or 0,
+        drain_started_at=row.drain_started_at,
+        drain_requested_by=row.drain_requested_by,
+        drain_acked_generation=row.drain_acked_generation,
+        drain_acked_at=row.drain_acked_at,
+        drain_supported=row.drain_supported,
     )
 
 
@@ -480,6 +532,12 @@ class HostStore:
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
         terminating_sandbox_id = row.terminating_sandbox_id
+        # A rotated identity is the same machine: keep its launch fence.
+        drain_values = {
+            "drain_generation": row.drain_generation or 0,
+            "drain_started_at": row.drain_started_at,
+            "drain_requested_by": row.drain_requested_by,
+        }
 
         bound_ids = list(
             session.execute(
@@ -524,6 +582,7 @@ class HostStore:
             sandbox_id=sandbox_id,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
+            **drain_values,
         )
         session.add(new_row)
         session.flush()
@@ -615,6 +674,12 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            drain_generation=existing.drain_generation or 0,
+            drain_started_at=existing.drain_started_at,
+            drain_requested_by=existing.drain_requested_by,
+            drain_acked_generation=existing.drain_acked_generation,
+            drain_acked_at=existing.drain_acked_at,
+            drain_supported=existing.drain_supported,
         )
 
     def set_offline(self, host_id: str, *, cancelled: Callable[[], bool] | None = None) -> None:
@@ -1289,6 +1354,11 @@ class HostStore:
                 or (owner is not None and host.user_id != owner)
             ):
                 raise OmnigentError("host is no longer available", code=ErrorCode.UNAUTHORIZED)
+            # The launch fence: checked under the host row lock, so a drain
+            # that commits first is always seen and one that commits after
+            # this launch is admitted reaches the host after its frame.
+            if host.drain_started_at is not None:
+                raise host_draining_error(_row_to_host(host))
             meta = session.execute(
                 select(SqlConversationMetadata)
                 .where(
@@ -1315,6 +1385,129 @@ class HostStore:
                 )
 
         run_write_transaction(self._lifecycle_session, "admit_runner_launch", write)
+
+    def _locked_live_host(self, session: Session, host_id: str) -> SqlHost | None:
+        """Load and row-lock a non-deleted host, serializing with launch admission."""
+        row = session.execute(
+            select(SqlHost)
+            .where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if row is None or row.deleted_at is not None:
+            return None
+        return row
+
+    def start_drain(self, host_id: str, requested_by: str | None) -> Host | None:
+        """
+        Fence new runner launches on a host (idempotent).
+
+        A host already draining keeps its generation, so repeating the call
+        never invalidates an acknowledgement the host already sent.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param requested_by: Operator starting the drain, or ``None``.
+        :returns: The host after the transition, or ``None`` when absent.
+        """
+        now = now_epoch()
+
+        def write(session: Session) -> Host | None:
+            row = self._locked_live_host(session, host_id)
+            if row is None:
+                return None
+            if row.drain_started_at is None:
+                row.drain_generation = (row.drain_generation or 0) + 1
+                row.drain_started_at = now
+                row.drain_requested_by = requested_by
+                row.drain_acked_generation = None
+                row.drain_acked_at = None
+            return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "start_host_drain", write)
+
+    def stop_drain(self, host_id: str) -> Host | None:
+        """
+        Lift a host's launch fence (idempotent).
+
+        Bumps the generation so a late acknowledgement for the finished drain
+        can never satisfy a later one.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The host after the transition, or ``None`` when absent.
+        """
+
+        def write(session: Session) -> Host | None:
+            row = self._locked_live_host(session, host_id)
+            if row is None:
+                return None
+            if row.drain_started_at is not None:
+                row.drain_generation = (row.drain_generation or 0) + 1
+                row.drain_started_at = None
+                row.drain_requested_by = None
+                row.drain_acked_generation = None
+                row.drain_acked_at = None
+            return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "stop_host_drain", write)
+
+    def note_drain_connect(self, host_id: str, *, supported: bool) -> Host | None:
+        """
+        Record a fresh host connection's drain capability and reset its ack.
+
+        Every connection must re-acknowledge: the connecting process may not
+        be the one that acknowledged, and may not support drain at all.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param supported: Whether the hello advertised the drain capability.
+        :returns: The host after the update, or ``None`` when absent.
+        """
+
+        def write(session: Session) -> Host | None:
+            row = self._locked_live_host(session, host_id)
+            if row is None:
+                return None
+            row.drain_supported = supported
+            row.drain_acked_generation = None
+            row.drain_acked_at = None
+            return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "note_host_drain_connect", write)
+
+    def record_drain_ack(self, host_id: str, generation: int) -> bool:
+        """
+        Record a host's close-ack for one drain generation.
+
+        Conditional on that generation still being the current, active drain
+        and on the host's connection supporting drain, so a stale or
+        superseded acknowledgement is dropped.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param generation: The generation the host reported complete.
+        :returns: ``True`` when the acknowledgement was recorded.
+        """
+        now = now_epoch()
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.deleted_at.is_(None),
+                        SqlHost.drain_started_at.is_not(None),
+                        SqlHost.drain_generation == generation,
+                        SqlHost.drain_supported.is_(True),
+                    )
+                    .values(drain_acked_generation=generation, drain_acked_at=now)
+                ),
+            )
+            return result.rowcount == 1
+
+        return run_write_transaction(self._session_immediate, "record_host_drain_ack", write)
 
     def delete_host(self, host_id: str) -> Host | None:
         """

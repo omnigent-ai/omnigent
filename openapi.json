@@ -3259,6 +3259,194 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostDrainReport": {
+        "description": "The host's own latest report of its launch fence.",
+        "properties": {
+          "complete": {
+            "description": "The host's close-ack for `generation`.",
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "draining": {
+            "description": "Whether the host's fence is up.",
+            "title": "Draining",
+            "type": "boolean"
+          },
+          "generation": {
+            "description": "Drain generation the report describes.",
+            "format": "int64",
+            "title": "Generation",
+            "type": "integer"
+          },
+          "pending_launches": {
+            "description": "Launch frames the host received that have not settled \u2014 queued, in preflight, or inside the shielded spawn.",
+            "format": "int64",
+            "title": "Pending Launches",
+            "type": "integer"
+          },
+          "reported_at": {
+            "description": "Unix epoch seconds the report arrived.",
+            "format": "double",
+            "title": "Reported At",
+            "type": "number"
+          },
+          "running_runners": {
+            "description": "Runner processes the host is tracking.",
+            "format": "int64",
+            "title": "Running Runners",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation",
+          "draining",
+          "pending_launches",
+          "running_runners",
+          "complete",
+          "reported_at"
+        ],
+        "title": "HostDrainReport",
+        "type": "object"
+      },
+      "HostDrainStatusResponse": {
+        "description": "Launch-fence (drain) state of one host.\n\n`safe_to_restart` is the operator's signal: the fence is up, the host's\ncurrent connection supports drain, and the host acknowledged the current\ngeneration with nothing queued or mid-spawn. Anything uncertain \u2014 an old\nhost build, a host that has not reconnected since the upgrade, or a\npending acknowledgement \u2014 reads `False`. Running runners are reported\nbut never block it: drain stops launches, it does not stop sessions.",
+        "properties": {
+          "acked_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds of that acknowledgement.",
+            "title": "Acked At"
+          },
+          "acked_generation": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Generation the host acknowledged, if any.",
+            "title": "Acked Generation"
+          },
+          "drain_requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "User who started the drain.",
+            "title": "Drain Requested By"
+          },
+          "drain_started_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds the drain began.",
+            "title": "Drain Started At"
+          },
+          "drain_support": {
+            "description": "`\"supported\"`, `\"unsupported\"`, or `\"unknown\"` (no connection since the server learned to ask).",
+            "title": "Drain Support",
+            "type": "string"
+          },
+          "draining": {
+            "description": "Whether new runner launches are refused.",
+            "title": "Draining",
+            "type": "boolean"
+          },
+          "generation": {
+            "description": "Current drain generation (bumped on drain and undrain).",
+            "format": "int64",
+            "title": "Generation",
+            "type": "integer"
+          },
+          "host_id": {
+            "description": "Host identifier.",
+            "title": "Host Id",
+            "type": "string"
+          },
+          "host_online": {
+            "description": "Whether the host is live (cross-replica).",
+            "title": "Host Online",
+            "type": "boolean"
+          },
+          "host_report": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HostDrainReport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The host's latest fence report, when its tunnel is on this replica."
+          },
+          "reason": {
+            "description": "One-line explanation of `state`.",
+            "title": "Reason",
+            "type": "string"
+          },
+          "safe_to_restart": {
+            "description": "Whether restarting the host loses no launch.",
+            "title": "Safe To Restart",
+            "type": "boolean"
+          },
+          "server_pending_launches": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Launch round-trips this replica is still awaiting on the host's tunnel, when it is on this replica.",
+            "title": "Server Pending Launches"
+          },
+          "state": {
+            "description": "`\"active\"` (not draining), `\"draining\"` (waiting for the host's acknowledgement), `\"drained\"` (safe to restart), or `\"unsupported\"` (draining, but the host cannot acknowledge).",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id",
+          "state",
+          "safe_to_restart",
+          "draining",
+          "generation",
+          "drain_started_at",
+          "drain_requested_by",
+          "drain_support",
+          "acked_generation",
+          "acked_at",
+          "host_online",
+          "host_report",
+          "server_pending_launches",
+          "reason"
+        ],
+        "title": "HostDrainStatusResponse",
+        "type": "object"
+      },
       "HostModelOptionsResponse": {
         "description": "Pre-launch model choices resolved by a host harness.\n\n`error` carries the host's reason for an empty catalog \u2014 a probe that\nfailed on the host is not a transport failure, so the request still\nsucceeds and the picker can say WHY it is empty instead of a generic\n\"Models unavailable\".",
         "properties": {
@@ -11745,7 +11933,7 @@
     },
     "/v1/hosts": {
       "get": {
-        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details \u2014 `host_id`, `name`, `owner`, `status`, `sandbox_provider`, `configured_harnesses`, and `gateway_inference` (`None` when no connected host has reported it to this replica).",
+        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details \u2014 `host_id`, `name`, `owner`, `status`, `sandbox_provider`, `configured_harnesses`, `gateway_inference` (`None` when no connected host has reported it to this replica), and `draining` (new launches refused).",
         "operationId": "list_hosts_v1_hosts_get",
         "responses": {
           "200": {
@@ -12002,6 +12190,134 @@
           }
         },
         "summary": "Create Host Directory",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/drain": {
+      "delete": {
+        "description": "Lift a host's launch fence (undrain). Idempotent.\n\n**Returns:** The drain status after the transition.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist, 403 if it is not the caller's.",
+        "operationId": "stop_host_drain_v1_hosts__host_id__drain_delete",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostDrainStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Host Drain",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "get": {
+        "description": "Report a host's launch fence and whether it is safe to restart.\n\n**Returns:** The drain status.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist, 403 if it is not the caller's.",
+        "operationId": "get_host_drain_v1_hosts__host_id__drain_get",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostDrainStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Drain",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "post": {
+        "description": "Fence every new runner launch on a host, keeping running sessions.\n\nIdempotent: draining an already-draining host keeps its generation.\nPersisted on the hosts row, so it survives a server restart and is\nenforced inside launch admission on every replica.\n\n**Returns:** The drain status after the transition.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist, 403 if it is not the caller's.",
+        "operationId": "start_host_drain_v1_hosts__host_id__drain_post",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostDrainStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Host Drain",
         "tags": [
           "hosts"
         ]

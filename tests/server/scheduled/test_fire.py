@@ -32,6 +32,7 @@ from starlette.datastructures import Headers
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
 from omnigent.server.scheduled import fire as fire_mod
@@ -351,6 +352,8 @@ class _FakeHost:
     sandbox_provider: str | None = None
     # A dormant managed host still has its provider, even without a sandbox id.
     sandbox_id: str | None = None
+    # An operator fenced new launches on this host (drain).
+    draining: bool = False
 
 
 class _FakeSandboxConfig:
@@ -3104,4 +3107,107 @@ async def test_continue_dispatch_failure_records_a_failed_run() -> None:
 
     assert [(run["status"], run["error_code"], run["conversation_id"]) for run in store.runs] == [
         ("failed", "launch_failed", "conv_prev")
+    ]
+
+
+# ── Host drain (launch fence) ────────────────────────────────────────────────
+
+
+def _draining_host_deps(
+    store: FakeScheduledTaskStore, conversations: FakeConversationStore
+) -> FireDeps:
+    host = _FakeHost("host_1", "alice@example.com", draining=True)
+    return _deps(
+        store,
+        conversation_store=conversations,
+        host_store=FakeHostStore({host.host_id: host}),
+        host_registry=FakeHostRegistry(online={host.host_id}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduled_fire_on_draining_host_fails_before_session_creation() -> None:
+    conversations = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
+    on_fire = build_on_fire(_draining_host_deps(store, conversations))
+
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conversations.created == []
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("failed", ErrorCode.HOST_DRAINING)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_now_on_paused_task_still_respects_the_drain() -> None:
+    """Run-now bypasses the paused state, never the launch fence."""
+    conversations = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(user_id="alice@example.com", state="paused")}
+    )
+    run_now = build_run_now(_draining_host_deps(store, conversations))
+
+    assert await run_now(0, "task_1") is True
+    await _drain()
+
+    assert conversations.created == []
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("failed", ErrorCode.HOST_DRAINING)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_owner_host_skips_draining_hosts() -> None:
+    hosts = {
+        "host_1": _FakeHost("host_1", "alice@example.com", draining=True),
+        "host_2": _FakeHost("host_2", "alice@example.com"),
+    }
+    deps = _deps(
+        FakeScheduledTaskStore(rows={}),
+        host_store=FakeHostStore(hosts),
+        host_registry=FakeHostRegistry(online={"host_1", "host_2"}),
+    )
+    resolved = await fire_mod._resolve_owner_host(
+        deps, _task(user_id="alice@example.com", host_id=None)
+    )
+    assert resolved == "host_2"
+
+
+@pytest.mark.asyncio
+async def test_drain_racing_dispatch_records_host_draining() -> None:
+    """The fence went up after preflight; admission refuses inside the launch."""
+    conversations = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(_conv: Any, _task: Any) -> None:
+        raise OmnigentError("host is draining", code=ErrorCode.HOST_DRAINING)
+
+    run_now = build_run_now(
+        _deps(store, conversation_store=conversations), launch_dispatch=_launch
+    )
+    assert await run_now(0, "task_1") is True
+    await _drain()
+
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == ErrorCode.HOST_DRAINING
+    assert store.runs[0]["conversation_id"] == "conv_1", "the session survives for a retry"
+
+
+@pytest.mark.asyncio
+async def test_other_structured_dispatch_error_still_records_launch_failed() -> None:
+    """Only HOST_DRAINING gets its own code; other structured errors stay generic."""
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(_conv: Any, _task: Any) -> None:
+        raise OmnigentError("host is no longer available", code=ErrorCode.UNAUTHORIZED)
+
+    run_now = build_run_now(_deps(store), launch_dispatch=_launch)
+    assert await run_now(0, "task_1") is True
+    await _drain()
+
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("failed", "launch_failed")
     ]

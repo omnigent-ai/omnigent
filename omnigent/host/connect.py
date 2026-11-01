@@ -71,6 +71,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    HOST_DRAINING_ERROR_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     RUNNER_LOG_TAIL_HEADING,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -81,6 +82,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostDrainStatusFrame,
     HostFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
@@ -126,6 +128,7 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSetDrainFrame,
     HostSkillContentFrame,
     HostSkillContentResultFrame,
     HostSkillsFrame,
@@ -385,6 +388,8 @@ def _connect_marker_path(log_path: Path) -> Path:
 # Collect adopted children every two seconds. Process discovery runs off-loop;
 # exit-status collection uses nonblocking waits.
 _ORPHAN_REAP_INTERVAL_S = 2.0
+# Receipt-time fence decision for a launch frame that arrived while draining.
+_LAUNCH_REFUSED = object()
 
 
 def _install_child_subreaper() -> bool:
@@ -1438,6 +1443,18 @@ class HostProcess:
         # Launch request ids whose runner process has been spawned; a handler
         # fault after that point is not reported as a failed launch.
         self._spawned_launch_requests: set[str] = set()
+        # Launch fence (operator drain). ``_drain_generation`` is the newest
+        # generation seen in this process; ``_draining`` is checked at frame
+        # receipt, so a launch frame is either counted or refused, never both.
+        self._drain_generation = 0
+        self._draining = False
+        # Launches admitted at frame receipt that have not settled yet, and
+        # cancelled spawns whose teardown still runs. Their sum is what a
+        # drain waits on before it acknowledges.
+        self._inflight_launches: set[object] = set()
+        self._abandoned_spawn_tasks: set[asyncio.Task[None]] = set()
+        self._drain_report_lock = asyncio.Lock()
+        self._drain_report_tasks: set[asyncio.Task[None]] = set()
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -2167,6 +2184,10 @@ class HostProcess:
                 )
                 self._runner_stop_tasks.add(task)
                 task.add_done_callback(self._runner_stop_tasks.discard)
+                # Registered before the cancellation settles the launch's
+                # admission, so a drain never sees a zero-pending gap.
+                self._abandoned_spawn_tasks.add(task)
+                task.add_done_callback(self._abandoned_spawn_settled)
                 raise
             except OSError as exc:
                 return self._launch_failed(
@@ -2535,6 +2556,109 @@ class HostProcess:
             # window, then move on.
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5.0)
+
+    def _pending_launch_count(self) -> int:
+        """Launches the drain must wait for: admitted, queued, or mid-spawn."""
+        return len(self._inflight_launches) + len(self._abandoned_spawn_tasks)
+
+    def _drain_status(self) -> HostDrainStatusFrame:
+        """Snapshot the launch fence for a ``host.drain_status`` report."""
+        pending = self._pending_launch_count()
+        return HostDrainStatusFrame(
+            generation=self._drain_generation,
+            draining=self._draining,
+            pending_launches=pending,
+            running_runners=len(self._runners),
+            complete=self._draining and pending == 0,
+        )
+
+    def _admit_launch_at_receipt(self) -> object | None:
+        """Count a launch frame from the moment it is received.
+
+        :returns: An admission token to settle once the launch finishes, or
+            ``None`` when the fence is up and the launch must be refused.
+        """
+        if self._draining:
+            return None
+        token = object()
+        self._inflight_launches.add(token)
+        return token
+
+    def _settle_launch_admission(self, token: object) -> None:
+        """Release a launch admission (idempotent); report if it completes a drain."""
+        if token not in self._inflight_launches:
+            return
+        self._inflight_launches.discard(token)
+        if self._draining and self._pending_launch_count() == 0:
+            self._schedule_drain_report()
+
+    def _abandoned_spawn_settled(self, task: asyncio.Task[None]) -> None:
+        """Forget a finished abandoned-spawn teardown; it may complete a drain."""
+        self._abandoned_spawn_tasks.discard(task)
+        if self._draining and self._pending_launch_count() == 0:
+            self._schedule_drain_report()
+
+    def _apply_set_drain(self, frame: HostSetDrainFrame) -> None:
+        """Raise or lift the launch fence; must run at frame receipt.
+
+        A frame older than the newest generation this process has seen is
+        stale (an undrain racing a re-drain) and leaves the fence unchanged.
+        """
+        if frame.generation < self._drain_generation:
+            _logger.info(
+                "Ignoring stale host.set_drain generation %d (current %d)",
+                frame.generation,
+                self._drain_generation,
+            )
+            return
+        changed = (frame.generation, frame.draining) != (self._drain_generation, self._draining)
+        self._drain_generation = frame.generation
+        self._draining = frame.draining
+        if changed:
+            state = "draining: refusing new runner launches" if frame.draining else "undrained"
+            _logger.info(
+                "Host launch fence %s (generation %d, %d pending launch(es), %d runner(s))",
+                state,
+                frame.generation,
+                self._pending_launch_count(),
+                len(self._runners),
+            )
+            print(f"  ~ Host {state} (generation {frame.generation})", flush=True)
+
+    def _schedule_drain_report(self) -> None:
+        """Send the current fence state to the server in the background."""
+        task = asyncio.create_task(self._send_drain_report(), name="host-drain-status")
+        self._drain_report_tasks.add(task)
+        task.add_done_callback(self._drain_report_tasks.discard)
+
+    async def _send_drain_report(self) -> None:
+        """Report the fence state on the live tunnel, best-effort.
+
+        Serialized and snapshotted at send time, so reports reach the server
+        in state order. A report lost to a dropped tunnel is recovered on
+        reconnect: the server re-sends ``host.set_drain`` and this answers it.
+        """
+        async with self._drain_report_lock:
+            ws = self._ws
+            if ws is None:
+                return
+            try:
+                await self._send_text(ws, encode_host_frame(self._drain_status()))
+            except Exception:
+                _logger.debug("Could not send host.drain_status", exc_info=True)
+
+    def _launch_refused_draining(
+        self, frame: HostLaunchRunnerFrame
+    ) -> HostLaunchRunnerResultFrame:
+        """Refuse a launch that arrived after the fence went up."""
+        return self._launch_failed(
+            frame,
+            (
+                f"host {self._identity.name!r} is draining "
+                f"(generation {self._drain_generation}) and refuses new runner launches"
+            ),
+            error_code=HOST_DRAINING_ERROR_CODE,
+        )
 
     def _track_pending_runner_launch(
         self, runner_id: str, completion: asyncio.Future[None]
@@ -5034,6 +5158,8 @@ class HostProcess:
             # race where shutdown took an incomplete snapshot of those tasks.
             try:
                 await self._quiesce_frame_tasks()
+                for report in list(self._drain_report_tasks):
+                    report.cancel()
                 await self._drain_runner_stop_tasks()
                 if self._maintenance_janitor is not None:
                     await self._maintenance_janitor.shutdown()
@@ -5529,7 +5655,19 @@ class HostProcess:
                     # loop exits or reconnects, so handle them inline. Ordinary
                     # request frames run concurrently below; exceptions raised
                     # on those detached tasks are intentionally contained.
-                    self._raise_connection_error_from_raw(raw)
+                    frame = self._decode_inbound_host_frame(raw)
+                    if isinstance(frame, HostConnectionErrorFrame):
+                        self._raise_connection_error(frame)
+                    if isinstance(frame, HostSetDrainFrame):
+                        # The fence changes at receipt, in frame order: every
+                        # launch frame ahead of this one is already counted,
+                        # and every one behind it is refused.
+                        self._apply_set_drain(frame)
+                        self._schedule_drain_report()
+                        continue
+                    launch_admission: object | None = None
+                    if isinstance(frame, HostLaunchRunnerFrame):
+                        launch_admission = self._admit_launch_at_receipt() or _LAUNCH_REFUSED
                     # Each request frame is handled on its own task so a slow
                     # handler (a model-options CLI exec, a long git walk) can't
                     # head-of-line block the frames behind it — measured
@@ -5538,7 +5676,7 @@ class HostProcess:
                     # request_id, so completion order doesn't matter; the one
                     # ordering that does (launch vs stop) is preserved by
                     # _runner_lifecycle_lock in _dispatch_host_frame.
-                    self._start_frame_task(ws, raw)
+                    self._start_frame_task(ws, raw, launch_admission=launch_admission)
         finally:
             if (diagnostics := self._diagnostics_for(ws)) is not None:
                 diagnostics.freeze()
@@ -5610,23 +5748,42 @@ class HostProcess:
 
     def _raise_connection_error_from_raw(self, raw: str) -> None:
         """Handle connection-level frames before request-task dispatch."""
-        try:
-            frame = decode_host_frame(raw)
-        except ValueError:
-            return
+        frame = self._decode_inbound_host_frame(raw)
         if isinstance(frame, HostConnectionErrorFrame):
             self._raise_connection_error(frame)
 
-    def _start_frame_task(self, ws: websockets.asyncio.client.ClientConnection, raw: str) -> None:
+    @staticmethod
+    def _decode_inbound_host_frame(raw: str) -> object | None:
+        """Decode a host frame for receipt-time handling; ``None`` if it is not one."""
+        try:
+            return decode_host_frame(raw)
+        except ValueError:
+            return None
+
+    def _start_frame_task(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        raw: str,
+        *,
+        launch_admission: object | None = None,
+    ) -> None:
         """Handle one inbound frame on its own task, off the receive loop.
 
         :param ws: The open tunnel connection, passed through to the handler.
         :param raw: The raw text frame received off the socket.
+        :param launch_admission: For a launch frame, the receipt-time fence
+            decision: an admission token, or ``_LAUNCH_REFUSED``.
         :returns: None.
         """
-        task = asyncio.create_task(self._run_frame_handler(ws, raw), name="host-frame")
+        task = asyncio.create_task(
+            self._run_frame_handler(ws, raw, launch_admission=launch_admission),
+            name="host-frame",
+        )
         self._frame_tasks.add(task)
         task.add_done_callback(self._frame_tasks.discard)
+        if launch_admission is not None and launch_admission is not _LAUNCH_REFUSED:
+            # Also covers a task cancelled before it ever ran its handler.
+            task.add_done_callback(lambda _t: self._settle_launch_admission(launch_admission))
 
     async def _quiesce_frame_tasks(self) -> None:
         """Cancel and await every in-flight host frame handler."""
@@ -5649,7 +5806,11 @@ class HostProcess:
                     self._runner_stop_tasks.discard(task)
 
     async def _run_frame_handler(
-        self, ws: websockets.asyncio.client.ClientConnection, raw: str
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        raw: str,
+        *,
+        launch_admission: object | None = None,
     ) -> None:
         """Run one frame handler, containing its failures.
 
@@ -5659,11 +5820,15 @@ class HostProcess:
 
         :param ws: The open tunnel connection the handler replies on.
         :param raw: The raw text frame received off the socket.
+        :param launch_admission: Receipt-time fence decision for a launch frame.
         :returns: None.
         """
         started_at = time.monotonic()
         try:
-            await self._handle_raw_message(ws, raw)
+            if launch_admission is None:
+                await self._handle_raw_message(ws, raw)
+            else:
+                await self._handle_raw_message(ws, raw, launch_admission=launch_admission)
         except ConnectionClosed:
             # The tunnel died while this frame was in flight; the reconnect
             # loop owns recovery.
@@ -5687,7 +5852,11 @@ class HostProcess:
                 )
 
     async def _handle_raw_message(
-        self, ws: websockets.asyncio.client.ClientConnection, raw: str
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        raw: str,
+        *,
+        launch_admission: object | None = None,
     ) -> None:
         """Decode one inbound text frame and route it to a handler.
 
@@ -5698,6 +5867,7 @@ class HostProcess:
 
         :param ws: The open tunnel connection, used to send replies.
         :param raw: The raw text frame received off the socket.
+        :param launch_admission: Receipt-time fence decision for a launch frame.
         :returns: None.
         """
         try:
@@ -5732,12 +5902,17 @@ class HostProcess:
         raw_kind = carrier.get("kind")
         kind = raw_kind if isinstance(raw_kind, str) else type(frame).__name__
         with telemetry.consume_frame_span(kind, carrier):
-            await self._dispatch_host_frame(ws, frame)
+            if launch_admission is None:
+                await self._dispatch_host_frame(ws, frame)
+            else:
+                await self._dispatch_host_frame(ws, frame, launch_admission=launch_admission)
 
     async def _dispatch_host_frame(
         self,
         ws: websockets.asyncio.client.ClientConnection,
         frame: object,
+        *,
+        launch_admission: object | None = None,
     ) -> None:
         """Handle a decoded host frame and send its result back.
 
@@ -5745,13 +5920,25 @@ class HostProcess:
         :param frame: A decoded host frame (one of the
             ``Host*Frame`` request types); unrecognized frame types are
             ignored.
+        :param launch_admission: For a launch frame, the fence decision taken
+            when the receive loop read it; ``None`` (a direct caller) decides
+            here.
         :returns: None.
         """
         if isinstance(frame, HostConnectionErrorFrame):
             # Defensive for direct callers; production handles this inline in
             # _serve_frames so detached request tasks cannot swallow it.
             self._raise_connection_error(frame)
-        if isinstance(frame, HostLaunchRunnerFrame):
+        if isinstance(frame, HostSetDrainFrame):
+            # Defensive for direct callers; production applies it at receipt.
+            self._apply_set_drain(frame)
+            await self._send_text(ws, encode_host_frame(self._drain_status()))
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            if launch_admission is None:
+                launch_admission = self._admit_launch_at_receipt() or _LAUNCH_REFUSED
+            if launch_admission is _LAUNCH_REFUSED:
+                await self._send_text(ws, encode_host_frame(self._launch_refused_draining(frame)))
+                return
             completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             if frame.binding_token.strip():
                 self._track_pending_runner_launch(
@@ -5762,37 +5949,43 @@ class HostProcess:
             launch_fault: BaseException | None = None
             launch_result: HostLaunchRunnerResultFrame | None = None
             try:
-                async with self._runner_lifecycle_lock:
-                    launch_result = await self._handle_launch(frame)
-            except Exception as exc:  # noqa: BLE001 — a pre-spawn fault still owes a result
-                launch_fault = exc
-                # Do not report failure after spawn: servers may terminate the
-                # launch or revoke its binding before the runner connects.
-                # Before the spawn no runner can connect, and staying silent
-                # would make the server wait out its result timeout as if the
-                # host were merely slow.
-                if frame.request_id not in self._spawned_launch_requests:
-                    launch_result = self._launch_failed(
-                        frame,
-                        f"host failed to handle the launch request: {exc}",
-                        error_code=LAUNCH_HANDLER_FAILED_ERROR_CODE,
-                    )
-            finally:
-                self._spawned_launch_requests.discard(frame.request_id)
-                completion.set_result(None)
-            if launch_result is not None:
                 try:
-                    await self._send_text(ws, encode_host_frame(launch_result))
-                except ConnectionClosed:
-                    if launch_fault is None:
-                        raise
-                    # The answer was lost with the tunnel; the fault (re-raised
-                    # below, chain intact) is still the diagnostic to record.
-            if launch_fault is not None:
-                # Answered, but still unexplained: re-raise so the frame task
-                # records the traceback, which is the only diagnostic an
-                # unexpected fault leaves behind.
-                raise launch_fault
+                    async with self._runner_lifecycle_lock:
+                        launch_result = await self._handle_launch(frame)
+                except Exception as exc:  # noqa: BLE001 — a pre-spawn fault still owes a result
+                    launch_fault = exc
+                    # Do not report failure after spawn: servers may terminate the
+                    # launch or revoke its binding before the runner connects.
+                    # Before the spawn no runner can connect, and staying silent
+                    # would make the server wait out its result timeout as if the
+                    # host were merely slow.
+                    if frame.request_id not in self._spawned_launch_requests:
+                        launch_result = self._launch_failed(
+                            frame,
+                            f"host failed to handle the launch request: {exc}",
+                            error_code=LAUNCH_HANDLER_FAILED_ERROR_CODE,
+                        )
+                finally:
+                    self._spawned_launch_requests.discard(frame.request_id)
+                    completion.set_result(None)
+                if launch_result is not None:
+                    try:
+                        await self._send_text(ws, encode_host_frame(launch_result))
+                    except ConnectionClosed:
+                        if launch_fault is None:
+                            raise
+                        # The answer was lost with the tunnel; the fault (re-raised
+                        # below, chain intact) is still the diagnostic to record.
+                if launch_fault is not None:
+                    # Answered, but still unexplained: re-raise so the frame task
+                    # records the traceback, which is the only diagnostic an
+                    # unexpected fault leaves behind.
+                    raise launch_fault
+            finally:
+                # Only once the runner is registered (or its abandoned spawn's
+                # teardown is tracked) and its result is on the wire, so the
+                # server sees the result before any close-ack it enables.
+                self._settle_launch_admission(launch_admission)
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
                 stop_result = await self._handle_stop(frame)

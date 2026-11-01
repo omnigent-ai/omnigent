@@ -88,6 +88,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.UPSTREAM_CANCELLED, 499),
         (ErrorCode.UPSTREAM_PERMISSION_DENIED, 403),
         (ErrorCode.STALE_CURSOR, 400),
+        (ErrorCode.HOST_DRAINING, 503),
     ],
 )
 def test_all_error_codes_have_http_status_mapping(code: str, expected_status: int) -> None:
@@ -134,6 +135,7 @@ def test_every_error_code_has_a_concrete_category() -> None:
         (ErrorCode.UPSTREAM_CANCELLED, ErrorCategory.UPSTREAM),
         (ErrorCode.UPSTREAM_PERMISSION_DENIED, ErrorCategory.UPSTREAM),
         (ErrorCode.STALE_CURSOR, ErrorCategory.USER),
+        (ErrorCode.HOST_DRAINING, ErrorCategory.CONFIG),
     ],
 )
 def test_code_category_mapping(code: str, expected_category: ErrorCategory) -> None:
@@ -211,6 +213,7 @@ def test_every_error_code_has_an_impact() -> None:
         (ErrorCode.FORBIDDEN, ErrorImpact.BENIGN),
         (ErrorCode.UPSTREAM_PERMISSION_DENIED, ErrorImpact.BENIGN),
         (ErrorCode.STALE_CURSOR, ErrorImpact.BENIGN),
+        (ErrorCode.HOST_DRAINING, ErrorImpact.TRANSIENT),
     ],
 )
 def test_code_impact_mapping(code: str, expected_impact: ErrorImpact) -> None:

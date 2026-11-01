@@ -1081,6 +1081,12 @@ def register_core_routes(
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+        if body.host_id is not None:
+            from omnigent.server.routes._host_launch import reject_if_host_draining
+
+            await reject_if_host_draining(
+                getattr(request.app.state, "host_store", None), body.host_id, user_id
+            )
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
@@ -1381,8 +1387,13 @@ def register_core_routes(
         # (mirroring the JSON path — a bad workspace never produces a
         # session) and persist the canonical path the host returned.
         if parsed_metadata.host_id is not None:
+            from omnigent.server.routes._host_launch import reject_if_host_draining
             from omnigent.server.routes._session_create_validation import (
                 validate_uploaded_bundle_host_workspace,
+            )
+
+            await reject_if_host_draining(
+                getattr(request.app.state, "host_store", None), parsed_metadata.host_id, user_id
             )
 
             os_env = getattr(spec, "os_env", None)

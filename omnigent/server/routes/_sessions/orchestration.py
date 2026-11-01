@@ -421,7 +421,7 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
-from omnigent.stores.host_store import Host, HostStore, host_is_live
+from omnigent.stores.host_store import Host, HostStore, host_draining_error, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.sandbox_profile_store import PROFILE_LABEL_PREFIX, public_profile
@@ -4564,6 +4564,13 @@ async def _run_managed_launch(
         resolve_managed_agent_label,
     )
 
+    if relaunch_host is not None and getattr(relaunch_host, "draining", False):
+        # A new sandbox generation under a draining host identity is a launch
+        # side effect; refuse it before the provider is touched.
+        reason = host_draining_error(relaunch_host).message
+        tracker.fail(session_id, reason)
+        _publish_sandbox_status(session_id, "failed", reason)
+        return
     try:
         profile = await saved_profile(
             sandbox_profiles,
@@ -4876,6 +4883,10 @@ async def _maybe_relaunch_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or host.sandbox_provider is None:
         return False
+    if getattr(host, "draining", False):
+        # Waking or re-provisioning is a launch side effect; refuse it before
+        # the tracker or the provider is touched.
+        raise host_draining_error(host)
     if host_is_live(host):
         host_registry = getattr(app_state, "host_registry", None)
         host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -4980,6 +4991,9 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
 
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
+        return False
+    if getattr(host, "draining", False):
+        # Leave the live tunnels alone; a launch on them meets the fence.
         return False
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))

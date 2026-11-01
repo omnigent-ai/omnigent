@@ -18,6 +18,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostDrainStatusFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
@@ -62,6 +63,7 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSetDrainFrame,
     HostSkillContentFrame,
     HostSkillContentResultFrame,
     HostSkillsFrame,
@@ -2878,3 +2880,34 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                 }
             )
         )
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostSetDrainFrame(generation=3, draining=True),
+        HostSetDrainFrame(generation=4, draining=False),
+        HostDrainStatusFrame(
+            generation=3, draining=True, pending_launches=2, running_runners=5, complete=False
+        ),
+        HostDrainStatusFrame(
+            generation=3, draining=True, pending_launches=0, running_runners=5, complete=True
+        ),
+    ],
+)
+def test_drain_frames_round_trip(frame: HostSetDrainFrame | HostDrainStatusFrame) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"kind": "host.set_drain", "generation": "3", "draining": True},
+        {"kind": "host.set_drain", "generation": 3, "draining": 1},
+        {"kind": "host.drain_status", "generation": 3, "draining": True, "complete": True},
+    ],
+)
+def test_drain_frames_reject_malformed_fields(payload: dict[str, object]) -> None:
+    """A malformed fence frame never decodes, so it can never fake an ack."""
+    with pytest.raises(ValueError):
+        decode_host_frame(json.dumps(payload))
