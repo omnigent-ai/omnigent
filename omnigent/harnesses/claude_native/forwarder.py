@@ -131,9 +131,12 @@ _MAX_SEEN_DELTA_KEYS = 5000
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
-# One per Claude Task-tool subagent; appears alongside the matching
-# ``agent-<id>.jsonl`` transcript.
+# One per Claude Task-tool subagent or in-process teammate; appears alongside
+# the matching ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
+# ``taskKind`` of an agent-team teammate running inside the lead's process. No
+# tool call spawns it, so its meta has no ``toolUseId``.
+_IN_PROCESS_TEAMMATE_TASK_KIND = "in_process_teammate"
 # Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
 # stamped into each ``agent-<id>.meta.json``. Reuse the router's canonical set so
 # both the current ``Agent`` name and the still-supported ``Task`` alias match.
@@ -1956,9 +1959,16 @@ class _SubagentMeta(TypedDict):
 
     agentType: str
     description: str
+    name: str
+    taskKind: NotRequired[str]
     toolUseId: NotRequired[str]
     parentAgentId: NotRequired[str]
     spawnDepth: NotRequired[int]
+
+
+def _is_in_process_teammate(meta: _SubagentMeta) -> bool:
+    """Whether *meta* is an agent-team teammate that no tool call spawned."""
+    return "toolUseId" not in meta and meta.get("taskKind") == _IN_PROCESS_TEAMMATE_TASK_KIND
 
 
 def _read_subagent_meta(meta_path: Path) -> _SubagentMeta | None:
@@ -1970,9 +1980,15 @@ def _read_subagent_meta(meta_path: Path) -> _SubagentMeta | None:
     or malformed so the watcher can skip it gracefully and try again
     on the next tick.
 
+    An in-process teammate has no ``toolUseId``; it is accepted on its
+    ``taskKind`` alone. Fields are returned as written: ``name`` (the handle the
+    lead messages a teammate by) is not folded into the description here.
+
     :param meta_path: Path to ``agent-<id>.meta.json``.
-    :returns: Validated display and ancestry fields, or ``None`` when the
-        file is malformed or has neither a spawn call nor explicit ancestry.
+    :returns: Validated display and ancestry fields (``name`` empty when
+        the meta has none; ``taskKind`` only when written), or ``None`` when
+        the file is malformed or has neither a spawn call, explicit
+        ancestry, nor the in-process teammate ``taskKind``.
     """
     try:
         raw = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1986,7 +2002,15 @@ def _read_subagent_meta(meta_path: Path) -> _SubagentMeta | None:
         return None
     if not isinstance(description, str):
         return None
-    meta: _SubagentMeta = {"agentType": agent_type, "description": description}
+    name = raw.get("name")
+    meta: _SubagentMeta = {
+        "agentType": agent_type,
+        "description": description,
+        "name": name.strip() if isinstance(name, str) else "",
+    }
+    task_kind = raw.get("taskKind")
+    if isinstance(task_kind, str) and task_kind:
+        meta["taskKind"] = task_kind
     if "toolUseId" in raw:
         tool_use_id = raw["toolUseId"]
         if not isinstance(tool_use_id, str) or not tool_use_id:
@@ -1994,7 +2018,9 @@ def _read_subagent_meta(meta_path: Path) -> _SubagentMeta | None:
         meta["toolUseId"] = tool_use_id
     if "spawnDepth" in raw:
         spawn_depth = raw["spawnDepth"]
-        if type(spawn_depth) is not int or spawn_depth < 1:
+        # An in-process teammate is written at depth 0, beside its lead.
+        min_depth = 0 if task_kind == _IN_PROCESS_TEAMMATE_TASK_KIND else 1
+        if type(spawn_depth) is not int or spawn_depth < min_depth:
             return None
         meta["spawnDepth"] = spawn_depth
     if "parentAgentId" in raw:
@@ -2007,7 +2033,12 @@ def _read_subagent_meta(meta_path: Path) -> _SubagentMeta | None:
         ):
             return None
         meta["parentAgentId"] = parent_agent_id
-    if "toolUseId" not in meta and "parentAgentId" not in meta and meta.get("spawnDepth") != 1:
+    if (
+        "toolUseId" not in meta
+        and "parentAgentId" not in meta
+        and meta.get("spawnDepth") != 1
+        and not _is_in_process_teammate(meta)
+    ):
         return None
     return meta
 
@@ -2822,21 +2853,37 @@ async def _forward_available_subagents(
         if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
         and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
     ]
+    candidate_metas: list[tuple[Path, _SubagentMeta]] = []
+    for meta_path in candidate_meta_paths:
+        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
+        if meta is not None:
+            candidate_metas.append((meta_path, meta))
     parents_by_tool_use = (
         await asyncio.to_thread(
             _subagent_parents_by_tool_use,
             transcript_path,
             subagents_dir,
         )
-        if candidate_meta_paths
+        if any("toolUseId" in meta for _, meta in candidate_metas)
         else {}
     )
     pending: list[tuple[Path, _SubagentMeta, str | None]] = []
-    for meta_path in candidate_meta_paths:
-        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
-        if meta is None:
-            continue
+    for meta_path, meta in candidate_metas:
         tool_use_id = meta.get("toolUseId")
+        if _is_in_process_teammate(meta):
+            # An in-process teammate belongs to the team lead (this session); its
+            # teamName is not consulted. Older servers require a tool-use id, so
+            # stand in a stable one that no real spawn record can match, and label
+            # the child by the name the lead messages it by.
+            subagent_id = _subagent_id_from_meta_path(meta_path)
+            name, description = meta["name"], meta["description"]
+            teammate_meta = meta.copy()
+            teammate_meta["description"] = (
+                f"{name}: {description}" if name and description else name or description
+            )
+            teammate_meta["toolUseId"] = f"teammate:{subagent_id}"
+            pending.append((meta_path, teammate_meta, None))
+            continue
         if "parentAgentId" in meta:
             parent_subagent_id = meta["parentAgentId"]
         elif meta.get("spawnDepth") == 1:
