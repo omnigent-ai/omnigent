@@ -145,3 +145,47 @@ export function supportsEffortControl(
     effortLevelsForFamily(effortFamily).length > 0
   );
 }
+
+type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
+
+/**
+ * Resolve a structural read-only reason from session labels.
+ *
+ * The live session snapshot is checked first because child sessions do
+ * not appear in the sidebar list and because labels can change after
+ * initial navigation (for example ``sys_session_close`` marks a child
+ * ``omnigent.closed=true``). The sidebar row is only a fallback.
+ *
+ * @param activeSession - Live session snapshot, if loaded.
+ * @param activeConv - Sidebar/session-list row fallback.
+ * @returns Placeholder text for the composer when the session is
+ *   structurally read-only, or ``null`` when normal permissions apply.
+ */
+export function readOnlyReasonForSessionLabels(
+  activeSession: LabelSource,
+  activeConv: LabelSource,
+): string | null {
+  const closed =
+    activeSession?.labels?.["omnigent.closed"] ?? activeConv?.labels?.["omnigent.closed"];
+  if (closed === "true") {
+    // A codex /side child is sealed (server-computed) once its ephemeral fork's
+    // runner is gone; give it a side-chat-specific reason rather than the
+    // generic sub-agent one so the user understands it's read-only for good.
+    // "Side chat" is the nickname the server stamps on a /side fork.
+    const wrapperLabel =
+      activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
+    const nickname =
+      activeSession?.labels?.["omnigent.codex_native.agent_nickname"] ??
+      activeConv?.labels?.["omnigent.codex_native.agent_nickname"];
+    if (wrapperLabel === "codex-native-ui-subagent" && nickname === "Side chat") {
+      return "This side chat has ended and can't receive new messages";
+    }
+    return "This sub-agent session is closed";
+  }
+  const wrapper =
+    activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
+  if (wrapper === "claude-code-native-ui-subagent") {
+    return "Claude Code sub-agents are read-only";
+  }
+  return null;
+}

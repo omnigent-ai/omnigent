@@ -61,6 +61,9 @@ NO_CAPABILITIES = {
     "merging": False,
     "reviewer_editing": False,
     "comment_posting": False,
+    "review_threads": False,
+    "review_thread_replies": False,
+    "review_thread_creation": False,
     "details_editing": False,
     "attachment_uploads": False,
 }

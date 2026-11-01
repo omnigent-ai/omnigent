@@ -283,6 +283,10 @@ describe("ErrorBanner", () => {
       "client_update_required",
       "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
     ],
+    [
+      "codex_provider_auth_failed",
+      "Codex couldn't get a token from the model provider's sign-in command on the host.",
+    ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();
