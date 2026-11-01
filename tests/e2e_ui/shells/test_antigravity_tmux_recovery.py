@@ -115,6 +115,7 @@ def antigravity_model(
     home = tmp_path / "model-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(home / ".omnigent"))
     monkeypatch.setattr(
         "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT",
         home / ".omnigent" / "antigravity-native",

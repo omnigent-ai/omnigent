@@ -2,8 +2,8 @@
 
 The first visit to Automations opens a short walkthrough of recurring runs and
 the deployment's available features. Finishing or dismissing it is remembered
-in this browser for the current user, server, and app mount. There is no reopen
-button.
+in this browser for the current user, server, and app mount. The info button
+beside the Automations heading reopens it.
 
 ## Sub-features
 
@@ -11,6 +11,13 @@ button.
   automation list load successfully.
 - `walkthrough`: Next and the numbered feature buttons select a step; Done,
   Maybe later, Close, and Escape dismiss it. Outside clicks do not dismiss it.
+- `reopen`: the info button ("About automations") beside the Automations
+  heading reopens the guide at its first step after it was dismissed. Closing
+  it returns focus to that button.
+- `examples`: See examples swaps the steps for three example automations, each
+  with its schedule and prompt: a Slack bot answering product questions, a
+  first look at new PagerDuty incidents, and a daily Dependabot merge. Back
+  returns to the step the viewer left; Done dismisses the guide.
 - `capabilities`: show periodic Jira/Slack/GitHub checks only with session
   continuity and orchestration; show continuity and sandbox copy only when
   supported. Use the deployment's app name.
@@ -33,8 +40,9 @@ Preconditions: use a fresh browser context with no saved introduction dismissal.
 No agent turn or provider credentials are needed.
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_automations_introduction_first_visit`
-  covers desktop sidebar entry, mobile direct entry, all four steps, Done,
-  focus returning to New automation, and selecting Create manually after reload.
+  covers desktop sidebar entry, mobile direct entry, the examples and Back, all
+  four steps, Done, focus returning to New automation, and after a reload,
+  reopening from the info button and selecting Create manually.
 - For the command palette, select Go to Automations in a fresh browser context,
   dismiss with Maybe later, navigate away, and return. The guide stays closed.
 - For managed, repeat in a deployment containing this UI version. Check the
@@ -52,9 +60,13 @@ No agent turn or provider credentials are needed.
   the guide unmounts or the host configuration changes; it is not saved or shared with other tabs.
 - If browser storage is blocked, the guide still closes but cannot remember the
   dismissal after remounting.
-- Next and selecting a feature do not mark the introduction as seen.
+- Next, selecting a feature, and opening the examples do not mark the
+  introduction as seen.
+- The examples are read-only text with placeholder names (`#product-questions`,
+  Payments API, `acme/web`); nothing copies them into the create dialog.
 - Trigger templates check services periodically; this guide does not promise
   webhook delivery or a separate persistent memory store.
-- The template browser and task detail pages do not open the guide; returning
-  to the Automations list does if it has not been dismissed.
+- The template browser and task detail pages do not open the guide or show the
+  info button; returning to the Automations list does if it has not been
+  dismissed.
 - Automations task creation, execution, and detail pages are separate journeys.

@@ -131,10 +131,28 @@ _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
 _ANTIGRAVITY_MIN_VERSION = "1.1.13"
 
-# OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
-# installed via the ``opencode-ai`` npm package. No login/logout/status argv
-# is wired yet — readiness is binary-only until an auth check exists.
+# OpenCode native harness CLI (``opencode serve`` plus the ``--server`` TUI),
+# installed via the ``@opencode/cli`` npm package. No login/logout/status argv
+# is wired yet — readiness is binary-only until an auth check exists. Pinned
+# exactly: OpenCode ships 2.0.x patches often, so a range would install an
+# untested release.
 OPENCODE_KEY = "opencode"
+_OPENCODE_PACKAGE = "@opencode/cli@2.0.32"
+# v1 ``opencode-ai`` links the same global ``opencode`` bin and npm refuses to
+# overwrite another package's bin (EEXIST). Omnigent doesn't remove packages it
+# didn't install, so setup stops with a message instead of uninstalling it.
+_OPENCODE_INSTALL_HINT = f"npm install -g {_OPENCODE_PACKAGE}"
+# An install script that stops on purpose prints its reason on a stderr line
+# starting with this prefix, so the setup UI can show that reason verbatim.
+_INSTALLER_REASON_PREFIX = "omnigent-setup: "
+_OPENCODE_INSTALL_SCRIPT = (
+    "if npm ls -g opencode-ai --depth=0 >/dev/null 2>&1; then "
+    f'echo "{_INSTALLER_REASON_PREFIX}OpenCode 1.x (opencode-ai) is installed and owns the global '
+    "'opencode' binary. Omnigent does not remove packages; run "
+    "'npm rm -g opencode-ai' yourself, then rerun setup.\" >&2; "
+    "exit 1; "
+    f"fi; npm install -g {_OPENCODE_PACKAGE}"
+)
 
 # Goose authenticates against its own config (``goose configure`` → keyring /
 # ``~/.config/goose/config.yaml``) with no Omnigent-managed credential, and ships
@@ -218,17 +236,15 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # ``pi >= 0.79.0``; older CLIs would prompt mid-session.
         min_version=_PI_MIN_VERSION,
     ),
-    # Pin the install to the supported 1.18.x range: opencode-ai's npm ``latest``
-    # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
-    # version the runtime version-check (``check_opencode_version``,
-    # >=1.17.7,<1.19.0) then rejects. ``~1.18.0`` resolves to the latest 1.18.x.
-    # The same version bounds are enforced in setup via ``min_version`` /
-    # ``max_version_exclusive`` so the install/upgrade prompt fires before
-    # the runtime gate does.
+    # Pin the install to the supported 2.0.x line. The same bounds are enforced
+    # in setup via ``min_version`` / ``max_version_exclusive`` so the
+    # install/upgrade prompt fires before the runtime gate does.
     OPENCODE_KEY: HarnessInstallSpec(
         "OpenCode",
         "opencode",
-        "opencode-ai@~1.18.0",
+        _OPENCODE_PACKAGE,
+        install_hint=_OPENCODE_INSTALL_HINT,
+        install_command=("bash", "-c", _OPENCODE_INSTALL_SCRIPT),
         min_version=OPENCODE_MIN_VERSION,
         max_version_exclusive=OPENCODE_MAX_VERSION_EXCLUSIVE,
     ),
@@ -549,11 +565,14 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
     ),
     OPENCODE_KEY: SetupStep(
         kind="auth",
-        title="Sign in to OpenCode",
-        detail="OpenCode manages its own credentials — sign in on the host.",
+        # Optional: OpenCode's free models run without a login, so the step is
+        # informational (``status_key=None``) and never blocks readiness.
+        title="Sign in to a provider (optional)",
+        detail="OpenCode's free models work without signing in. Sign in on the host "
+        "to use your own providers.",
         action="command",
         command="opencode auth login",
-        status_key="authed",
+        status_key=None,
     ),
     PI_KEY: SetupStep(
         kind="auth",
@@ -956,7 +975,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     resolvable **and**, when the harness declares ``min_version`` /
     ``max_version_exclusive`` in its install spec, the binary's
     ``--version`` output satisfies that range. This prevents an outdated
-    native CLI (e.g. an OpenCode release outside the supported 1.17.x band)
+    native CLI (e.g. an OpenCode release outside the supported 2.x band)
     from being treated as ready during setup.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``) or
@@ -1149,10 +1168,14 @@ def _installer_failure_reason(returncode: int, stderr_tail: str) -> str:
     :param returncode: The installer's exit status.
     :param stderr_tail: The tail of the installer's stderr, possibly empty.
     :returns: A cause naming what the user can fix when the output identifies
-        one, else ``"installer exited with code <n>"``. The bare exit code is
+        one (an :data:`_INSTALLER_REASON_PREFIX` line first, then npm error
+        codes), else ``"installer exited with code <n>"``. The bare exit code is
         the fallback rather than an error, because a vendor installer's output
         is not npm-shaped and still has to produce *some* reason.
     """
+    for line in reversed(stderr_tail.splitlines()):
+        if line.startswith(_INSTALLER_REASON_PREFIX):
+            return line.removeprefix(_INSTALLER_REASON_PREFIX).strip()
     for code in _NPM_ERROR_CODE_RE.findall(stderr_tail):
         explanation = _NPM_FAILURE_REASONS.get(code)
         if explanation is not None:
