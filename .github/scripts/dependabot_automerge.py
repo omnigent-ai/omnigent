@@ -492,6 +492,19 @@ def require_current_candidate(repository: str, number: int, candidate: dict) -> 
     )
 
 
+def require_base_refresh_budget(commits: list[dict]) -> None:
+    maximum = json.loads(POLICY.read_text()).get("max_base_refreshes")
+    require(
+        type(maximum) is int and maximum >= 0,
+        "max_base_refreshes must be a non-negative integer",
+    )
+    used = sum(len(commit["parents"]) > 1 for commit in commits)
+    require(
+        used < maximum,
+        f"Base refresh limit reached ({used}/{maximum}); maintainer review required",
+    )
+
+
 def refresh_stale_base(repository: str, candidate: dict, mode: str) -> None:
     if mode != "merge":
         return
@@ -518,10 +531,7 @@ def refresh_stale_base(repository: str, candidate: dict, mode: str) -> None:
         and pull.get("commits") == len(commits),
         "Incomplete commit inventory",
     )
-    require(
-        sum(len(commit["parents"]) > 1 for commit in commits) < 3,
-        "Base refresh limit reached; maintainer review required",
-    )
+    require_base_refresh_budget(commits)
     files = paginated(f"repos/{repository}/pulls/{candidate['number']}/files")
     require(
         len(files) == pull["changed_files"] and bool(files), "Incomplete changed-file inventory"

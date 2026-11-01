@@ -31,6 +31,7 @@ function loadPreload() {
       return {
         contextBridge: { exposeInMainWorld: (name, value) => exposed.set(name, value) },
         ipcRenderer,
+        webUtils: { getPathForFile: (file) => file.path },
       };
     },
   });
@@ -44,6 +45,20 @@ function loadPreload() {
     invokes,
   };
 }
+
+describe("local folder bridge", () => {
+  it("forwards the folder chooser and resolves dropped file paths", async () => {
+    const h = loadPreload();
+    await h.desktop.chooseDirectory("/Users/me");
+    assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:choose-directory", args: "/Users/me" });
+    // main, not the preload, decides whether the page may see the path.
+    await h.desktop.getPathForFile({ path: "/Users/me/app" });
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:dropped-file-path",
+      args: "/Users/me/app",
+    });
+  });
+});
 
 describe("browser action bridge", () => {
   it("forwards typed actions to main", async () => {
