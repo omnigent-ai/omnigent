@@ -845,6 +845,57 @@ describe("leave a shared session", () => {
   });
 });
 
+describe("owner-level viewer on someone else's session", () => {
+  // The server reports permission_level 4 to admins on every session and lets
+  // them stop, archive and delete it; the row's `owner` stays the real owner.
+  const ADMIN_VIEW: Conversation = { ...CONV, owner: "runner@example.com", permission_level: 4 };
+
+  function openFilter(tab: "shared" | "mine") {
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId(`session-filter-${tab}`));
+  }
+
+  it("offers Delete and an enabled Archive instead of Leave", () => {
+    mockConversations([ADMIN_VIEW]);
+    renderSidebar();
+    openFilter("shared");
+
+    expect(screen.getByTestId("quick-archive-conversation")).toBeInTheDocument();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("leave-conversation")).toBeNull();
+    expect(screen.getByTestId("archive-conversation")).not.toHaveAttribute("data-disabled");
+    // Ownership-only actions keep their owner gate.
+    expect(screen.getByTestId("rename-conversation")).toHaveAttribute("data-disabled");
+    expect(screen.queryByTestId("move-to-project")).toBeNull();
+  });
+
+  it("keeps the row under Shared with me, not My sessions", () => {
+    mockConversations([ADMIN_VIEW]);
+    renderSidebar();
+
+    expect(screen.queryByRole("link", { name: /My Session/ })).toBeNull();
+    openFilter("shared");
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+  });
+
+  it("keeps Leave and a disabled Archive for a level-2 share", () => {
+    mockConversations([{ ...ADMIN_VIEW, permission_level: 2 }]);
+    renderSidebar();
+    openFilter("shared");
+
+    expect(screen.queryByTestId("quick-archive-conversation")).toBeNull();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("leave-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("delete-conversation")).toBeNull();
+    expect(screen.getByTestId("archive-conversation")).toHaveAttribute("data-disabled");
+  });
+});
+
 describe("quick-archive owner gate", () => {
   // Archive is owner-only: the kebab renders its Archive item disabled for
   // non-owners ("Only the session owner can archive this session"). The hover

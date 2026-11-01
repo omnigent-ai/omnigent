@@ -421,6 +421,27 @@ describe("Sidebar shift-click selection", () => {
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
 
+  it("lets an owner-level viewer bulk-delete others' sessions but not move them", async () => {
+    const theirs = conv("theirs", { owner: "someone_else", permission_level: 4 });
+    mockConversations([theirs]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
+    fireEvent.click(screen.getByRole("button", { name: /select/i }));
+    fireEvent.click(await screen.findByRole("link", { name: /^theirs/ }));
+    await waitFor(() => {
+      expect(screen.getByText("1 selected")).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("button", { name: "Delete" })).toBeEnabled();
+    expect(screen.getByTestId("bulk-move-to-project")).toBeDisabled();
+  });
+
   it("normal click after shift-select sets a new anchor", async () => {
     const sessions = [conv("s1"), conv("s2"), conv("s3"), conv("s4")];
     mockConversations(sessions);

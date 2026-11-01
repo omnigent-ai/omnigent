@@ -4,6 +4,7 @@ import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTi
 import {
   type ActiveChatOverride,
   bareConversationId,
+  canManageSessionLifecycle,
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
@@ -11,6 +12,7 @@ import {
   getConversationIconKind,
   groupConversations,
   getConversationAgentType,
+  isOwnedByViewer,
   migratePinnedConversationIds,
   orderByPinnedTimestamp,
   pinOrderWrites,
@@ -39,6 +41,35 @@ function conversation(
     archived: options.archived,
   };
 }
+
+describe("session ownership vs lifecycle access", () => {
+  const row = (owner: string | null | undefined, level: number | null): Conversation => ({
+    ...conversation("conv_x", "X", new Date(2026, 4, 14, 10)),
+    owner,
+    permission_level: level,
+  });
+
+  it("lets an owner-level viewer manage another principal's session without owning it", () => {
+    const adminView = row("runner", 4);
+
+    expect(canManageSessionLifecycle(adminView, "admin")).toBe(true);
+    expect(isOwnedByViewer(adminView, "admin")).toBe(false);
+  });
+
+  it("denies lifecycle actions on a share below owner level", () => {
+    expect(canManageSessionLifecycle(row("runner", 2), "viewer")).toBe(false);
+    expect(canManageSessionLifecycle(row("runner", 3), "viewer")).toBe(false);
+  });
+
+  it("does not treat an unknown level on someone else's row as owner", () => {
+    expect(canManageSessionLifecycle(row("runner", null), "viewer")).toBe(false);
+  });
+
+  it("allows the viewer's own and ownerless rows", () => {
+    expect(canManageSessionLifecycle(row("viewer", null), "viewer")).toBe(true);
+    expect(canManageSessionLifecycle(row(undefined, null), "viewer")).toBe(true);
+  });
+});
 
 describe("filterConversations", () => {
   it("matches title and id case-insensitively", () => {
