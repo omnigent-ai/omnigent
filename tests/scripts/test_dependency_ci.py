@@ -7,11 +7,19 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+
+from tests.scripts.test_merge_ready_compute_gate import (
+    _parse_github_output,
+)
+from tests.scripts.test_merge_ready_compute_gate import (
+    _run as _run_compute_gate,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".github/scripts/ci"
@@ -716,12 +724,15 @@ def test_workflows_connect_selection_to_jobs():
 
 
 def _run_merge_gate(
-    tmp_path: Path, snapshots: list[dict[str, Any]]
+    tmp_path: Path,
+    snapshots: list[dict[str, Any]],
+    now: str = "2026-10-19T12:00:00Z",
 ) -> subprocess.CompletedProcess[str]:
     """Run evaluate-checks.sh against a fake ``gh`` serving API snapshots.
 
     Each read of the check runs advances to the next snapshot (the last one
     repeats), so a test can model checks that GitHub updates between reads.
+    The fake date fixes the policy clock without a production override.
     """
     fixtures = tmp_path / "api.json"
     fixtures.write_text(json.dumps(snapshots))
@@ -737,11 +748,19 @@ def _run_merge_gate(
         "    count += 1\n"
         "    reads.write_text(str(count))\n"
         "api = snapshots[min(max(count, 1), len(snapshots)) - 1]\n"
-        "response = api['checks' if '/check-runs' in sys.argv[2] else 'runs']\n"
+        "endpoint = 'checks' if '/check-runs' in sys.argv[2] else 'runs'\n"
+        "if api.get('api_error') == endpoint:\n"
+        "    sys.exit(1)\n"
+        "response = api[endpoint]\n"
         "subprocess.run(['jq', '-r', sys.argv[sys.argv.index('--jq')+1]], "
         "input=json.dumps(response), text=True, check=True)\n"
     )
     gh.chmod(0o755)
+    date = tmp_path / "date"
+    date.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{int(datetime.fromisoformat(now).timestamp())}'\n"
+    )
+    date.chmod(0o755)
     return subprocess.run(
         ["bash", str(ROOT / ".github/scripts/merge-ready/evaluate-checks.sh")],
         env=dict(
@@ -755,7 +774,7 @@ def _run_merge_gate(
         ),
         text=True,
         capture_output=True,
-        timeout=30,
+        timeout=120,
     )
 
 
@@ -845,6 +864,35 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
             "Rust tests (omnidev)",
         ):
             del checks[name]
+    workflows = {
+        name: index
+        for index, name in enumerate(
+            (
+                "CI",
+                "E2E Tests",
+                "E2E UI Tests",
+                "Integration Tests",
+                "Lint",
+                "web Tests",
+                "Docker build",
+                "Android Bundle",
+            ),
+            start=1,
+        )
+    }
+    check_workflows = {
+        "Pre-commit checks": "Lint",
+        "UI coverage scope": "E2E UI Tests",
+        "UI scope": "E2E UI Tests",
+        "E2E UI result": "E2E UI Tests",
+        "E2E UI Tests (shard 0/2)": "E2E UI Tests",
+        "E2E UI Tests (shard 1/2)": "E2E UI Tests",
+        "Web coverage scope": "web Tests",
+        "Web result": "web Tests",
+        "Docker scope": "Docker build",
+        "Docker result": "Docker build",
+        "Build unsigned AAB": "Android Bundle",
+    }
     api = {
         "checks": {
             "check_runs": [
@@ -854,6 +902,7 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
                     "status": status,
                     "conclusion": result,
                     "completed_at": "2026-10-19T10:00:00Z",
+                    "check_suite": {"id": workflows[check_workflows.get(name, "CI")]},
                 }
                 for index, (name, (status, result)) in enumerate(checks.items(), start=1)
             ]
@@ -865,8 +914,9 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
                     "status": run_status,
                     "conclusion": conclusion,
                     "created_at": "2026-10-19T10:00:00Z",
+                    "check_suite_id": suite_id,
                 }
-                for name in ("CI", "E2E Tests", "E2E UI Tests", "Integration Tests")
+                for name, suite_id in workflows.items()
             ]
         },
     }
@@ -911,16 +961,18 @@ def _gate_snapshot(
             "status": "completed",
             "conclusion": "success",
             "created_at": "2026-10-19T10:00:00Z",
+            "check_suite_id": suite_id,
         }
-        for name in ("CI", "E2E UI Tests", "Integration Tests")
+        for suite_id, name in enumerate(("Lint", "CI", "E2E UI Tests", "Integration Tests"), 1)
     ] + [
         {
             "name": "E2E Tests",
             "status": status,
             "conclusion": "success" if status == "completed" else None,
             "created_at": created_at,
+            "check_suite_id": 100 + index,
         }
-        for status, created_at in e2e_runs
+        for index, (status, created_at) in enumerate(e2e_runs, 1)
     ]
     return {
         "checks": {
@@ -934,6 +986,9 @@ def _gate_snapshot(
                         if status == "completed"
                         else None
                     ),
+                    "check_suite": {
+                        "id": 1 if name == "Pre-commit checks" else 100 + len(e2e_runs)
+                    },
                 }
                 for index, (name, status) in enumerate(checks.items(), start=1)
             ]
@@ -1024,6 +1079,147 @@ def test_merge_gate_follows_the_newest_workflow_run_when_rereading(tmp_path):
     )
     assert process.returncode == 0, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 2
+
+
+@pytest.mark.parametrize(
+    ("created_at", "fresh"),
+    [
+        ("2026-10-18T11:59:59Z", False),
+        ("2026-10-18T12:00:00Z", False),
+        ("2026-10-18T12:00:01Z", True),
+    ],
+)
+def test_merge_gate_expires_original_workflow_after_24_hours(tmp_path, created_at, fresh):
+    snapshot = _gate_snapshot("completed")
+    lint = snapshot["runs"]["workflow_runs"][0]
+    lint.update(
+        created_at=created_at,
+        run_attempt=2,
+        run_started_at="2026-10-19T11:00:00Z",
+        updated_at="2026-10-19T11:30:00Z",
+    )
+    snapshot["checks"]["check_runs"][1]["completed_at"] = "2026-10-19T11:30:00Z"
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    assert (process.returncode == 0) == fresh, process.stdout + process.stderr
+    assert f"freshness_failed={str(not fresh).lower()}" in output
+    assert "api_failed=false" in output
+    if fresh:
+        assert "expires_at=2026-10-19T12:00:01Z" in output
+    else:
+        assert "`Pre-commit checks` (CI is at least 24 hours old" in output
+        assert "update the branch to run fresh CI" in output
+        assert _check_reads(tmp_path) == 1
+
+
+@pytest.mark.parametrize("new_check", [False, True])
+def test_merge_gate_ages_selected_check_suite_not_newest_workflow(tmp_path, new_check):
+    snapshot = _gate_snapshot("completed")
+    lint = snapshot["runs"]["workflow_runs"][0]
+    lint["created_at"] = "2026-10-16T10:00:00Z"
+    snapshot["runs"]["workflow_runs"].append(
+        dict(lint, check_suite_id=999, created_at="2026-10-19T11:00:00Z")
+    )
+    if new_check:
+        snapshot["checks"]["check_runs"].append(
+            dict(snapshot["checks"]["check_runs"][1], id=1000, check_suite={"id": 999})
+        )
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert (process.returncode == 0) == new_check, process.stdout + process.stderr
+    assert (
+        f"freshness_failed={str(not new_check).lower()}" in (tmp_path / "gate-output").read_text()
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["suite", "run", "created_at", "invalid_created_at", "invalid_calendar", "future_created_at"],
+)
+def test_merge_gate_fails_closed_without_valid_workflow_provenance(tmp_path, fault):
+    snapshot = _gate_snapshot("completed")
+    lint = snapshot["runs"]["workflow_runs"][0]
+    if fault == "suite":
+        del snapshot["checks"]["check_runs"][1]["check_suite"]
+    elif fault == "run":
+        snapshot["runs"]["workflow_runs"].remove(lint)
+    elif fault == "created_at":
+        del lint["created_at"]
+    else:
+        lint["created_at"] = {
+            "invalid_created_at": "not-a-timestamp",
+            "invalid_calendar": "2026-09-31T10:00:00Z",
+            "future_created_at": "2026-10-20T00:00:00Z",
+        }[fault]
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert "freshness_failed=true" in output
+    assert "`Pre-commit checks` (CI age could not be verified" in output
+
+
+@pytest.mark.parametrize("endpoint", ["checks", "runs"])
+def test_merge_gate_emits_freshness_failure_when_api_read_fails(tmp_path, endpoint):
+    snapshot = _gate_snapshot("completed")
+    snapshot["api_error"] = endpoint
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert "freshness_failed=true" in output
+    assert "GitHub API request failed; retry Merge Ready" in output
+    assert "expires_at=\n" in output
+
+    outputs = _parse_github_output(output)
+    gate = _run_compute_gate(
+        tmp_path,
+        eval_outcome="failure",
+        failed=outputs["failed"],
+        freshness_failed=outputs["freshness_failed"],
+        api_failed=outputs.get("api_failed", "false"),
+        expires_at=outputs["expires_at"],
+        dependency_required="false",
+    )
+    assert gate["state"] == "failure"
+    assert gate["post_status"] == "true"
+    assert gate["short_desc"] == "GitHub API request failed; retry Merge Ready"
+    assert "update branch" not in gate["short_desc"]
+
+
+def test_merge_gate_does_not_expire_dco_or_intentionally_skipped_checks(tmp_path):
+    snapshot = _gate_snapshot("completed")
+    dco = snapshot["checks"]["check_runs"][0]
+    del dco["check_suite"]
+    dco["completed_at"] = "2026-10-01T10:00:00Z"
+    for check in snapshot["checks"]["check_runs"][2:]:
+        check.update(conclusion="skipped", check_suite={"id": 999})
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "freshness_failed=false" in output
+    assert "expires_at=2026-10-20T10:00:00Z" in output
+
+
+@pytest.mark.parametrize("conclusion", ["success", "skipped", "no-run"])
+def test_merge_gate_stale_workflow_cannot_vouch_for_absent_checks(tmp_path, conclusion):
+    snapshot = _gate_snapshot("completed")
+    integration = snapshot["runs"]["workflow_runs"][3]
+    integration.update(created_at="2026-10-16T10:00:00Z", conclusion=conclusion)
+    if conclusion == "no-run":
+        snapshot["runs"]["workflow_runs"].remove(integration)
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    stale = conclusion == "success"
+    assert (process.returncode == 1) == stale, process.stdout + process.stderr
+    assert f"freshness_failed={str(stale).lower()}" in output
+    if stale:
+        assert "`Integration (claude-sdk)` (CI is at least 24 hours old" in output
+
+
+def test_merge_gate_expiry_includes_workflows_vouching_for_absent_checks(tmp_path):
+    snapshot = _gate_snapshot("completed")
+    snapshot["runs"]["workflow_runs"][3]["created_at"] = "2026-10-18T13:00:00Z"
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "expires_at=2026-10-19T13:00:00Z" in (tmp_path / "gate-output").read_text()
 
 
 @pytest.mark.parametrize(

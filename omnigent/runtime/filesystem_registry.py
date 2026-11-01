@@ -24,6 +24,7 @@ defines the full public interface.
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import fnmatch
 import logging
@@ -32,7 +33,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,8 @@ _logger = logging.getLogger(__name__)
 # for repos that need more (or less) headroom. It still bounds a genuinely hung
 # git so the panel surfaces a failure rather than blocking forever.
 _DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
+
+GitCommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[bytes]]
 
 
 # GIT_* variables that would redirect repository discovery or inject config
@@ -582,6 +585,10 @@ class FilesystemRegistry(ABC):
 
     # ── Concrete: snapshot (no-op default) ────────────────────────
 
+    def needs_snapshot(self, path: str) -> bool:
+        """Whether an observed edit still needs an original outside Git."""
+        return False
+
     def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
         """Seed a pre-write snapshot for *path*.
 
@@ -704,7 +711,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # before the first write/edit operation on that path this session.
         # Seeded by ``seed_snapshot`` (called from the PUT/PATCH handlers)
         # so the diff endpoint can return the true pre-modification state.
-        self._snapshots: dict[str, str] = {}
+        self._snapshots: dict[str, str | None] = {}
         self._snapshots_lock = threading.Lock()
         # Per-session snapshot ownership: session_id → set of normalized paths
         # registered by that session.  Used by ``unregister_conversation`` to
@@ -738,6 +745,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             return
         if _is_ephemeral(norm):
             return
+        with self._snapshots_lock:
+            self._snapshots.setdefault(norm, "" if operation == "created" else None)
+            self._snapshot_sessions.setdefault(session_id, set()).add(norm)
         bytes_: int | None = None
         modified_at: int | None = None
         if operation != "deleted":
@@ -781,6 +791,11 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         :returns: List of file-record dicts suitable for the
             ``workspace.changed_files`` API response, newest first.
         """
+        return self._list_observed_files(conversation_id, limit=limit)
+
+    def _list_observed_files(
+        self, conversation_id: str, *, limit: int, excluded_roots: Collection[str] = ()
+    ) -> list[dict[str, Any]]:
         with self._lock:
             events = list(self._session_events.get(conversation_id, []))
         # Track the first and last operation seen per path so that
@@ -789,6 +804,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         last_op: dict[str, str] = {}
         by_path: dict[str, _FileEvent] = {}
         for e in events:
+            if "" in excluded_roots or e.path.split("/", 1)[0] in excluded_roots:
+                continue
             # Ephemeral artifacts are filtered here as a second line of defence
             # (events injected without record_change, e.g. in tests). Harness
             # plumbing is hidden only at read time so the raw event is kept.
@@ -878,6 +895,13 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._snapshots_lock:
             return self._snapshots.get(norm)
 
+    def needs_snapshot(self, path: str) -> bool:
+        norm = _normalize_path(path, self._cwd)
+        if norm is None or Path(norm).is_absolute() or _is_ephemeral(norm):
+            return False
+        with self._snapshots_lock:
+            return norm not in self._snapshots
+
     def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
         """Seed a pre-write snapshot for *path* if one does not already exist.
 
@@ -919,7 +943,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
         as returned by :func:`_find_git_root`.
     """
 
-    def __init__(self, watch_path: Path, git_root: Path) -> None:
+    def __init__(
+        self, watch_path: Path, git_root: Path, *, run_git: GitCommandRunner | None = None
+    ) -> None:
         """Initialize the registry with a git root.
 
         :param watch_path: The workspace directory.
@@ -927,6 +953,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         super().__init__(watch_path)
         self._git_root = git_root
+        self._run_git_command = run_git
         self._optimization_start_lock = threading.Lock()
         self._optimization_started = False
         self._last_changes: list[str] | None = None
@@ -1137,12 +1164,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
         try:
-            result = subprocess.run(
-                argv,
-                cwd=str(self._git_root),
-                capture_output=True,
-                timeout=_git_timeout_seconds(),
-            )
+            result = self._run_git(argv)
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
             _logger.warning(
@@ -1232,15 +1254,10 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # spawn error / non-zero exit) raises so the diff endpoint surfaces it,
         # instead of being swallowed to ``None`` — which the endpoint turns
         # into a 404 indistinguishable from "this path has no changes".
-        argv = ["git", "status", "--porcelain", "--", git_path]
+        argv = ["git", "status", "--porcelain", "--", f":(literal){git_path}"]
         started = time.monotonic()
         try:
-            result = subprocess.run(
-                argv,
-                cwd=str(self._git_root),
-                capture_output=True,
-                timeout=_git_timeout_seconds(),
-            )
+            result = self._run_git(argv)
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
             _logger.warning(
@@ -1291,7 +1308,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         :param path: Path relative to the workspace root.
         :returns: Content of the file at HEAD, or ``None`` for new/untracked
-            files or when the subprocess fails.
+            files. Session-backed readers raise on Git failures.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -1303,23 +1320,36 @@ class GitFilesystemRegistry(FilesystemRegistry):
             return None
 
         try:
-            result = subprocess.run(
-                ["git", "show", f"HEAD:{git_path}"],
-                cwd=str(self._git_root),
-                capture_output=True,
-                timeout=_git_timeout_seconds(),
-            )
+            result = self._run_git(["git", "show", f"HEAD:{git_path}"])
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
-        except Exception:
+            missing = (
+                f"fatal: path '{git_path}' does not exist in 'HEAD'\n".encode(),
+                f"fatal: path '{git_path}' exists on disk, but not in 'HEAD'\n".encode(),
+                b"fatal: invalid object name 'HEAD'.\n",
+            )
+            if self._run_git_command is not None and result.stderr not in missing:
+                raise GitStatusUnavailable("git show could not read the HEAD baseline")
+        except GitStatusUnavailable:
+            raise
+        except Exception as exc:
             _logger.debug(
                 "GitFilesystemRegistry.get_baseline: git show failed for %r",
                 norm,
                 exc_info=True,
             )
+            if self._run_git_command is not None:
+                raise GitStatusUnavailable("git show could not read the HEAD baseline") from exc
         return None
 
     # ── Internals ─────────────────────────────────────────────────
+
+    def _run_git(self, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        if self._run_git_command is not None:
+            return self._run_git_command(argv[1:], self._git_root, _git_timeout_seconds())
+        return subprocess.run(
+            argv, cwd=str(self._git_root), capture_output=True, timeout=_git_timeout_seconds()
+        )
 
     def _skip_dir_pathspecs(self) -> list[str]:
         """Return ``:(exclude)`` pathspecs pruning :data:`_SKIP_DIRS` from status.
@@ -1407,12 +1437,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
         try:
-            result = subprocess.run(
-                argv,
-                cwd=str(self._git_root),
-                capture_output=True,
-                timeout=_git_timeout_seconds(),
-            )
+            result = self._run_git(argv)
         except (subprocess.TimeoutExpired, OSError):
             _logger.warning(
                 "GitFilesystemRegistry._run_git_numstat: %r in %s failed",
@@ -1439,6 +1464,125 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 continue
             counts[rel_path] = (added, removed)
         return counts
+
+
+class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
+    """Compose sibling Git readers with observations outside those repositories.
+
+    Discovered repositories run Git through the session's OS environment, never
+    directly in the host process. Results are read afresh, including after restart.
+    """
+
+    _run_repository_git: GitCommandRunner | None = None
+
+    def needs_snapshot(self, path: str) -> bool:
+        return self._owner(path) is None and super().needs_snapshot(path)
+
+    def with_git_runner(self, run_git: GitCommandRunner) -> MultiRepositoryFilesystemRegistry:
+        """Bind one request's executor while sharing the existing fallback history."""
+        reader = copy.copy(self)
+        deadline = time.monotonic() + 8
+
+        def bounded_run(
+            argv: list[str], cwd: Path, timeout: float
+        ) -> subprocess.CompletedProcess[bytes]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GitStatusUnavailable("Repository changes exceeded the eight-second budget")
+            return run_git(argv, cwd, min(timeout, remaining))
+
+        reader._run_repository_git = bounded_run
+        return reader
+
+    def _repository_roots(self) -> dict[str, Path]:
+        if (self._cwd / ".git").exists() and _is_git_repo(self._cwd):
+            return {"": self._cwd}
+        roots = {}
+        deadline = time.monotonic() + 0.25
+        try:
+            with os.scandir(self._cwd) as entries:
+                for count, entry in enumerate(entries, 1):
+                    if count > 65_536 or time.monotonic() > deadline:
+                        raise GitStatusUnavailable("Repository discovery limit exceeded")
+                    if entry.name in _SKIP_DIRS or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    root = Path(entry.path)
+                    if (root / ".git").exists():
+                        roots[entry.name] = root
+                        if len(roots) > 32:
+                            raise GitStatusUnavailable("Workspace exceeds 32 repositories")
+        except OSError as exc:
+            raise GitStatusUnavailable("Repository discovery could not complete") from exc
+        return roots
+
+    def _owner(self, path: str) -> tuple[str, Path] | None:
+        norm = _normalize_path(path, self._cwd)
+        if norm is None or Path(norm).is_absolute():
+            return None
+        if (self._cwd / ".git").exists() and _is_git_repo(self._cwd):
+            return "", self._cwd
+        parts = Path(norm).parts
+        if len(parts) < 2 or parts[0] in _SKIP_DIRS:
+            return None
+        root = self._cwd / parts[0]
+        return (parts[0], root) if not root.is_symlink() and (root / ".git").exists() else None
+
+    def _reader(self, root: Path) -> GitFilesystemRegistry:
+        if self._run_repository_git is None:
+            raise GitStatusUnavailable(
+                "Multi-repository changes require the session runner; reconnect to refresh"
+            )
+        # Child readers do not start optional Git configuration writes.
+        return GitFilesystemRegistry(root, root, run_git=self._run_repository_git)
+
+    @staticmethod
+    def _prefix(record: dict[str, Any], root: str) -> dict[str, Any]:
+        return (
+            {**record, "path": f"{root}/{record['path']}", "repository_root": root}
+            if root
+            else record
+        )
+
+    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+        roots = self._repository_roots()
+        records = self._list_observed_files(conversation_id, limit=10_001, excluded_roots=roots)
+        for prefix, root in sorted(roots.items()):
+            try:
+                records.extend(
+                    self._prefix(record, prefix)
+                    for record in self._reader(root).list_changed_files(
+                        conversation_id, limit=10_001
+                    )
+                )
+            except GitStatusUnavailable as exc:
+                raise GitStatusUnavailable(
+                    f"Repository {prefix or root.name!r}: {exc.reason}"
+                ) from exc
+            if len(records) > 10_000:
+                raise GitStatusUnavailable("Workspace exceeds 10000 changed files")
+        records.sort(key=lambda record: (record["modified_at"] or 0, record["path"]), reverse=True)
+        return records[:limit]
+
+    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+        owner = self._owner(path)
+        if owner is None:
+            return super().get_changed_file(session_id, path)
+        prefix, root = owner
+        norm = _normalize_path(path, self._cwd)
+        assert norm is not None
+        relative = norm[len(prefix) + 1 :] if prefix else norm
+        record = self._reader(root).get_changed_file(session_id, relative)
+        return self._prefix(record, prefix) if record else None
+
+    def get_baseline(self, path: str) -> str | None:
+        owner = self._owner(path)
+        if owner is None:
+            return super().get_baseline(path)
+        prefix, root = owner
+        norm = _normalize_path(path, self._cwd)
+        assert norm is not None
+        relative = norm[len(prefix) + 1 :] if prefix else norm
+        return self._reader(root).get_baseline(relative)
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────
@@ -1469,4 +1613,4 @@ def create_filesystem_registry(watch_path: Path) -> FilesystemRegistry:
         git_root = None
     if git_root is not None:
         return GitFilesystemRegistry(watch_path, git_root)
-    return AgentEditFilesystemRegistry(watch_path)
+    return MultiRepositoryFilesystemRegistry(watch_path)
