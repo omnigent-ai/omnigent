@@ -10,7 +10,22 @@ import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlInstalledSkill, SqlSkillPrincipal, SqlSkillSource
+from omnigent.db.db_models import (
+    SkillMetadata,
+    SqlInstalledSkill,
+    SqlSkillPrincipal,
+    SqlSkillSource,
+)
+from omnigent.db.envelope import (
+    CIPHERTEXT,
+    ENVELOPE_VERSION,
+    MAX_ENVELOPE_BYTES,
+    PLAINTEXT,
+    EnvelopeError,
+    Sealed,
+    open_envelope,
+    seal,
+)
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 
 PREVIOUS = "d0a1f879a01d"
@@ -191,8 +206,7 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
         row = SqlInstalledSkill(
             id=uuid.uuid4().hex,
             name="review",
-            display_name=None,
-            description="d" * 1024,
+            metadata_envelope=SkillMetadata(None, "d" * 1024),
             source_url="https://github.com/acme/skills.git",
             ref=None,
             commit=None,
@@ -210,8 +224,9 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
         )
         session.add(row)
         session.flush()
-        with pytest.raises(ValueError, match="description is longer than 1024"):
-            row.description = "名" * 1025
+        row.metadata_envelope = SkillMetadata(None, "名" * 1025)
+        with pytest.raises(sa.exc.StatementError, match="description is longer than 1024"):
+            session.flush()
         session.rollback()
 
 
@@ -231,8 +246,7 @@ def _installed(name: str, principal: str, *, scope: int = 2) -> SqlInstalledSkil
     return SqlInstalledSkill(
         id=uuid.uuid4().hex,
         name=name,
-        display_name=None,
-        description="d",
+        metadata_envelope=SkillMetadata(None, "d"),
         source_url="https://github.com/acme/skills.git",
         ref=None,
         commit=None,
@@ -301,3 +315,103 @@ def test_a_scope_outside_the_codec_is_refused_by_the_table(db_uri: str) -> None:
         ):
             session.flush()
         session.rollback()
+
+
+def test_skill_metadata_is_stored_as_a_plaintext_envelope_and_read_back(db_uri: str) -> None:
+    # The frontmatter is opaque bytes with an explicit variant, never text the
+    # database could index or filter on.
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        row = _installed("review", "user:alice")
+        row.metadata_envelope = SkillMetadata("Code Review", "Review a diff — 名前")
+        session.add(row)
+        session.commit()
+        stored = session.scalar(
+            sa.text("SELECT metadata_envelope FROM installed_skills WHERE name = 'review'")
+        )
+        assert bytes(stored[:2]) == bytes((ENVELOPE_VERSION, PLAINTEXT))
+        assert open_envelope(stored) == (
+            '{"display_name":"Code Review","description":"Review a diff — 名前"}'.encode()
+        )
+        session.expire_all()
+        reread = session.scalar(
+            sa.select(SqlInstalledSkill).where(SqlInstalledSkill.name == "review")
+        )
+        assert reread is not None
+        assert reread.metadata_envelope == SkillMetadata("Code Review", "Review a diff — 名前")
+
+
+def test_a_reader_recognises_the_ciphertext_variant(db_uri: str) -> None:
+    # Encryption is not configured, but a sealed row must be told apart, not misread.
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.add(_installed("review", "user:alice"))
+        session.commit()
+        sealed = seal(Sealed("kms:alias/skills", b"\x8f\x00ciphertext"))
+        assert sealed[:2] == bytes((ENVELOPE_VERSION, CIPHERTEXT))
+        assert open_envelope(sealed) == Sealed("kms:alias/skills", b"\x8f\x00ciphertext")
+        session.execute(
+            sa.text("UPDATE installed_skills SET metadata_envelope = :value"), {"value": sealed}
+        )
+        session.commit()
+        session.expire_all()
+        with pytest.raises(EnvelopeError, match="encrypted with 'kms:alias/skills'"):
+            session.scalar(sa.select(SqlInstalledSkill))
+
+
+def test_an_envelope_is_bounded_at_16383_stored_bytes() -> None:
+    # The limit counts the envelope's own bytes and a ciphertext's key reference.
+    assert len(seal(b"x" * (MAX_ENVELOPE_BYTES - 2))) == MAX_ENVELOPE_BYTES
+    with pytest.raises(EnvelopeError, match="larger than 16383"):
+        seal(b"x" * (MAX_ENVELOPE_BYTES - 1))
+    key = "kms:alias/skills"
+    room = MAX_ENVELOPE_BYTES - 4 - len(key)
+    assert len(seal(Sealed(key, b"c" * room))) == MAX_ENVELOPE_BYTES
+    with pytest.raises(EnvelopeError):
+        seal(Sealed(key, b"c" * (room + 1)))
+    for broken in (b"", b"\x02\x00", b"\x01\x07x", b"\x01\x01\x00\x09short"):
+        with pytest.raises(EnvelopeError):
+            open_envelope(broken)
+
+
+def test_a_bulk_write_cannot_slip_past_the_metadata_bounds(db_uri: str) -> None:
+    # The typed bulk path binds through the same envelope type as the ORM.
+    engine = get_or_create_engine(db_uri)
+    base = {
+        "workspace_id": 0,
+        "name": "review",
+        "source_url": "https://github.com/acme/skills.git",
+        "ref": None,
+        "commit": None,
+        "path": "skills/review",
+        "scope": 1,
+        "principal": "user:alice",
+        "owner_user_id": "alice",
+        "bundle_location": "skills/review.tar.gz",
+        "bundle_bytes": 1,
+        "bundle_entries": 1,
+        "enabled": True,
+        "user_invocable": True,
+        "installed_by": "alice",
+        "installed_at": 0,
+        "updated_at": None,
+    }
+    with Session(engine) as session:
+        for metadata, match in (
+            (SkillMetadata("L" * 257, "d"), "display_name is longer than 256"),
+            (SkillMetadata(None, "d" * 1025), "description is longer than 1024"),
+        ):
+            rows = [{**base, "id": uuid.uuid4().hex, "metadata_envelope": metadata}]
+            with pytest.raises(sa.exc.StatementError, match=match):
+                session.execute(sa.insert(SqlInstalledSkill), rows)
+            session.rollback()
+        widest = SkillMetadata("名" * 256, "\x01" * 1024)
+        session.execute(
+            sa.insert(SqlInstalledSkill),
+            [{**base, "id": uuid.uuid4().hex, "metadata_envelope": widest}],
+        )
+        session.commit()
+        stored = session.scalar(sa.text("SELECT metadata_envelope FROM installed_skills"))
+        # The widest values the bounds allow, control characters escaped, still fit.
+        assert len(stored) <= MAX_ENVELOPE_BYTES
+        assert session.scalar(sa.select(SqlInstalledSkill)).metadata_envelope == widest

@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
+    SkillMetadata,
     SqlInstalledSkill,
     SqlSkillPrincipal,
     SqlSkillSource,
@@ -165,8 +166,8 @@ def _skill_entity(row: SqlInstalledSkill) -> InstalledSkill:
     return InstalledSkill(
         id=row.id,
         name=row.name,
-        display_name=row.display_name,
-        description=row.description,
+        display_name=row.metadata_envelope.display_name,
+        description=row.metadata_envelope.description,
         source_url=row.source_url,
         ref=row.ref,
         commit=row.commit,
@@ -481,8 +482,7 @@ class SqlAlchemySkillStore(SkillStore):
                         else None
                     )
                     row.updated_at = now
-                row.display_name = item.display_name
-                row.description = item.description
+                row.metadata_envelope = SkillMetadata(item.display_name, item.description)
                 row.source_url = item.source_url
                 row.ref = item.ref
                 row.commit = item.commit
@@ -628,8 +628,7 @@ class SqlAlchemySkillStore(SkillStore):
             row.bundle_location = bundle_location
             row.bundle_bytes = bundle_bytes
             row.bundle_entries = bundle_entries
-            row.description = description
-            row.display_name = display_name
+            row.metadata_envelope = SkillMetadata(display_name, description)
             row.user_invocable = user_invocable
             if path is not None:
                 row.path = path

@@ -595,3 +595,30 @@ def test_every_write_changes_the_installed_revision(store: SqlAlchemySkillStore)
     store.delete(row.id)
     changed()
     assert store.installed_revision("bob") != store.installed_revision("alice")
+
+
+def test_descriptive_fields_round_trip_through_their_storage_envelope(
+    store: SqlAlchemySkillStore, db_uri: str
+) -> None:
+    # Callers see plain fields; the table holds one opaque, bounded envelope.
+    from omnigent.db.envelope import ENVELOPE_VERSION, PLAINTEXT
+
+    installed = _install(store, "review", display_name="Code Review", description="Review — 名")
+    assert (installed.display_name, installed.description) == ("Code Review", "Review — 名")
+    updated = store.update(
+        installed.id,
+        commit=None,
+        bundle_location="skills/review-2.tar.gz",
+        bundle_bytes=10,
+        bundle_entries=3,
+        description="Review a diff",
+        display_name=None,
+    )
+    assert updated is not None
+    assert (updated.skill.display_name, updated.skill.description) == (None, "Review a diff")
+    with get_or_create_engine(db_uri).connect() as connection:
+        stored = connection.exec_driver_sql(
+            "SELECT metadata_envelope FROM installed_skills WHERE name = 'review'"
+        ).scalar_one()
+    assert bytes(stored[:2]) == bytes((ENVELOPE_VERSION, PLAINTEXT))
+    assert store.get(installed.id).description == "Review a diff"

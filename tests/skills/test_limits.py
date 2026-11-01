@@ -5,6 +5,8 @@ from __future__ import annotations
 from sqlalchemy import String, Table
 
 from omnigent.db.db_models import (
+    SKILL_DESCRIPTION_CHARS,
+    SKILL_DISPLAY_NAME_CHARS,
     BoundedString,
     SqlInstalledSkill,
     SqlSkillPrincipal,
@@ -29,8 +31,6 @@ def _string_lengths(table: Table) -> dict[str, int]:
 def test_column_bounds_match_the_schema() -> None:
     assert _string_lengths(SqlInstalledSkill.__table__) == {
         "name": limits.MAX_NAME_CHARS,
-        "display_name": limits.MAX_DISPLAY_NAME_CHARS,
-        "description": limits.MAX_DESCRIPTION_CHARS,
         "source_url": limits.MAX_URL_CHARS,
         "ref": limits.MAX_REF_CHARS,
         "commit": limits.MAX_COMMIT_CHARS,
@@ -47,6 +47,11 @@ def test_column_bounds_match_the_schema() -> None:
         "name": limits.MAX_DISPLAY_NAME_CHARS,
         "created_by": limits.MAX_USER_ID_CHARS,
     }
+    # The frontmatter fields share one envelope; its character bounds are these limits.
+    assert (SKILL_DISPLAY_NAME_CHARS, SKILL_DESCRIPTION_CHARS) == (
+        limits.MAX_DISPLAY_NAME_CHARS,
+        limits.MAX_DESCRIPTION_CHARS,
+    )
     assert _string_lengths(SqlSkillPrincipal.__table__) == {
         "principal": limits.MAX_PRINCIPAL_CHARS,
     }
