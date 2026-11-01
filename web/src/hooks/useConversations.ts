@@ -181,8 +181,9 @@ export interface Conversation {
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
   /**
-   * A background shell outlives the session's ended turn (claude-native). The
-   * sidebar shows the session as working; `status` stays as reported.
+   * Work outlives the session's ended turn, such as a background shell or a
+   * Codex goal. The sidebar shows the session as working; `status` stays as
+   * reported.
    */
   background_work_running?: boolean;
   /**

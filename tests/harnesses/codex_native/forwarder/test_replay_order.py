@@ -282,7 +282,9 @@ async def test_subscribe_reserves_delivery_order_before_post_resume_sync(
         def is_subscribed_to_thread(self, _thread_id: str) -> bool:
             return True
 
-        async def request(self, _method: str, _params: dict) -> dict:
+        async def request(self, method: str, _params: dict) -> dict:
+            if method == "thread/goal/get":
+                return {"result": {"goal": None}}
             return {
                 "result": {
                     "thread": {
@@ -367,7 +369,11 @@ async def test_subscribe_reserves_delivery_order_before_post_resume_sync(
         await usage.close()
         await tracker.close()
 
-    assert [body["data"]["source_id"] for _url, body in client.posts] == [
+    assert [
+        body["data"]["source_id"]
+        for _url, body in client.posts
+        if body["type"] == "external_conversation_item"
+    ] == [
         "thread_1:turn_1:item_1",
         "thread_1:turn_2:item_2",
     ]

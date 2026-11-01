@@ -493,9 +493,10 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
-    # The cleared session gets only the /clear notice and redirect, never a
-    # stale child-thread event.
+    # The cleared session gets only the startup flag sync, the /clear notice and
+    # redirect, never a stale child-thread event.
     assert [event.body["type"] for event in session_events if event.session_id == "conv_old"] == [
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",

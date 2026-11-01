@@ -1441,6 +1441,18 @@ def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -
     )
 
 
+def codex_rejects_request_method(exc: CodexAppServerResponseError, method: str) -> bool:
+    """Recognize JSON-RPC and serde errors from an app-server that lacks ``method``.
+
+    :param exc: Structured JSON-RPC error returned for the request.
+    :param method: App-server method the request used, e.g. ``"thread/goal/get"``.
+    :returns: ``True`` when the server does not implement the method.
+    """
+    return exc.code == -32601 or (
+        exc.code == -32600 and f"unknown variant `{method}`" in (exc.message or "")
+    )
+
+
 async def list_codex_model_options(
     client: CodexAppServerClient, *, include_hidden: bool = False
 ) -> list[_JsonObject]:

@@ -7336,7 +7336,7 @@
           },
           "background_work_running": {
             "default": false,
-            "description": "`True` while a background shell outlives the session's ended turn (claude-native, from Claude's status file). The sidebar shows such a session as working; `status` stays as reported, so the session still takes a new message. `False` while the session's runner is offline.",
+            "description": "`True` while work outlives the session's ended turn, such as a background shell or a Codex goal that keeps running between turns. The sidebar shows such a session as working; `status` stays as reported, so the session still takes a new message. `False` while the session's runner is offline.",
             "title": "Background Work Running",
             "type": "boolean"
           },

@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerResponseError,
     CodexMessage,
     client_for_transport,
+    codex_rejects_request_method,
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -80,6 +81,7 @@ from omnigent.native._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.process_logging import log_info_once
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -198,6 +200,18 @@ _CODEX_MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request"
 _CODEX_MCP_STARTUP_STATUS_METHOD = "mcpServer/startupStatus/updated"
 _CODEX_THREAD_STATUS_CHANGED_METHOD = "thread/status/changed"
 _EXTERNAL_MCP_STARTUP_TYPE = "external_mcp_startup"
+_CODEX_THREAD_GOAL_GET_METHOD = "thread/goal/get"
+_CODEX_THREAD_GOAL_UPDATED_METHOD = "thread/goal/updated"
+_CODEX_THREAD_GOAL_CLEARED_METHOD = "thread/goal/cleared"
+_CODEX_THREAD_GOAL_METHODS = frozenset(
+    {_CODEX_THREAD_GOAL_UPDATED_METHOD, _CODEX_THREAD_GOAL_CLEARED_METHOD}
+)
+_EXTERNAL_BACKGROUND_WORK_TYPE = "external_background_work"
+# Goal states that stop the goal, mapped to the failure the sidebar shows.
+_GOAL_STOPPED_FAILURE_OUTPUT = {
+    "usageLimited": "Codex stopped the goal: usage limit reached.",
+    "budgetLimited": "Codex stopped the goal: token budget reached.",
+}
 # Codex bounds each MCP server's spawn+handshake by its per-server
 # ``startup_timeout_sec`` (codex default 10s); the round cannot outlive
 # the slowest server's budget. The synthesis settle timer mirrors that
@@ -530,6 +544,23 @@ class _CodexForwarderState:
     :param child_usage_baseline_dir: Bridge directory that persists
         ``child_usage_baselines`` across forwarder restarts. ``None`` keeps
         them in memory only.
+    :param goal_status: Codex goal status of the forwarder's own thread, e.g.
+        ``"active"``. ``None`` when the thread has no goal.
+    :param posted_background_work_running: Last ``external_background_work``
+        value posted to Omnigent. ``None`` until the first post on this
+        connection, so the first sync always reaches the server.
+    :param background_work_unsupported: Whether the Omnigent server rejected
+        ``external_background_work`` as an unknown event type, so later syncs
+        skip the post.
+    :param goal_updates: Goal notifications seen on this connection, so a goal
+        read that one overtook does not overwrite the newer state.
+    :param background_work_lock: Serializes flag posts, so an older post can
+        never land after a newer one.
+    :param goal_failure_awaits_turn: Whether a goal-limit failure went out with
+        no turn to tie it to, so the next terminal boundary on the thread is
+        absorbed instead of replacing it with idle.
+    :param turn_failure_surfaced: Whether a failed status already went out for
+        the current turn. A later thread-level failure for that turn is skipped.
     """
 
     model: str | None = None
@@ -600,6 +631,13 @@ class _CodexForwarderState:
     usage_source_threads: dict[str, str] = field(default_factory=dict)
     child_usage_baselines: dict[str, _UsageTotals] = field(default_factory=dict)
     child_usage_baseline_dir: Path | None = None
+    goal_status: str | None = None
+    posted_background_work_running: bool | None = None
+    background_work_unsupported: bool = False
+    goal_updates: int = 0
+    background_work_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    goal_failure_awaits_turn: bool = False
+    turn_failure_surfaced: bool = False
 
     def __post_init__(self) -> None:
         """
@@ -800,6 +838,23 @@ class _CodexForwarderState:
         """
         self.parent_session_id = session_id
         self.pending_child_threads.clear()
+        # The new thread has its own goal, read when it is subscribed. Its
+        # sidebar flag is unknown until that sync posts it, and a read still in
+        # flight for the old thread must not land on the new one.
+        self.goal_status = None
+        self.goal_updates += 1
+        self.posted_background_work_running = None
+        self.goal_failure_awaits_turn = False
+        self.turn_failure_surfaced = False
+
+    def background_work_running(self) -> bool:
+        """
+        Return whether work on the forwarder's thread keeps the session working.
+
+        :returns: ``True`` while the thread's goal is active, so Codex keeps
+            starting its turns between the ones that end.
+        """
+        return self.goal_status == "active"
 
     def note_pending_child_thread(
         self,
@@ -2410,6 +2465,7 @@ async def supervise_forwarder(
         try:
             async for event in client.iter_events():
                 try:
+                    superseded_session_id = target.session_id
                     rotated = await _maybe_rotate_session_on_thread_started(
                         ap_client=ap_client,
                         target=target,
@@ -2418,6 +2474,9 @@ async def supervise_forwarder(
                         event=event,
                     )
                     if rotated:
+                        await _clear_superseded_background_work(
+                            ap_client, superseded_session_id, forwarder_state
+                        )
                         forwarder_state.note_parent_rotation(target.session_id)
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
@@ -2963,6 +3022,13 @@ async def _subscribe_until_ready_inner(
             await _sync_codex_approval_mode_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
+            await _resync_thread_goal(
+                client,
+                ap_client,
+                session_id=session_id,
+                thread_id=thread_id,
+                forwarder_state=forwarder_state,
+            )
         if forwarder_state is not None and received_live_items:
             forwarder_state.resume_echo_thread_ids.add(thread_id)
         try:
@@ -3296,6 +3362,25 @@ async def _handle_event(
                 session_id=parent_session_id,
                 bridge_dir=bridge_dir,
                 params=params,
+            )
+        return
+    if method in _CODEX_THREAD_GOAL_METHODS:
+        # Goal notifications reach every thread on the connection. Only the
+        # forwarder's own thread drives the session's sidebar state.
+        event_thread_id = _thread_id_from_params(params)
+        if (
+            forwarder_state is not None
+            and event_thread_id is not None
+            and event_thread_id == expected_thread_id
+        ):
+            parent_session_id = forwarder_state.parent_session_id or session_id
+            await _handle_thread_goal_notification(
+                client,
+                session_id=parent_session_id,
+                bridge_dir=bridge_dir,
+                method=method,
+                params=params,
+                forwarder_state=forwarder_state,
             )
         return
     if _is_thread_idle_status_event(method, params) and _thread_id_from_params(params) in {
@@ -3858,6 +3943,189 @@ async def _sync_codex_approval_mode_change(
             forwarder_state.posted_approval_preset = preset
 
 
+async def _sync_background_work_running(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror whether work on the forwarder's thread outlives its turn.
+
+    The sidebar shows such a session as working without changing its turn
+    status. Posts only when the value differs from the last value accepted on
+    this connection, so the first sync always reaches the server.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Mutable forwarder state holding the goal status and
+        the last-posted value.
+    :returns: None.
+    """
+    async with forwarder_state.background_work_lock:
+        # Read under the lock: a sync that waited posts the state as it is now.
+        running = forwarder_state.background_work_running()
+        if (
+            forwarder_state.background_work_unsupported
+            or running == forwarder_state.posted_background_work_running
+        ):
+            return
+        response = await _post_session_event(
+            client,
+            session_id,
+            event_type=_EXTERNAL_BACKGROUND_WORK_TYPE,
+            data={"running": running},
+        )
+        if (
+            response is not None
+            and response.status_code == 400
+            and "Unknown event type" in response.text
+        ):
+            # The server predates the sidebar flag, so no later post can succeed.
+            log_info_once(_logger, "Omnigent server does not accept external_background_work")
+            forwarder_state.background_work_unsupported = True
+            return
+        _log_failed_session_event_post(_EXTERNAL_BACKGROUND_WORK_TYPE, response)
+        if response is not None and response.status_code < 400:
+            forwarder_state.posted_background_work_running = running
+
+
+async def _resync_thread_goal(
+    codex_client: CodexAppServerClient,
+    ap_client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Read the thread's goal after a (re)subscription and mirror it.
+
+    Codex sends goal notifications only when a goal changes, so a reconnected
+    forwarder reads the current goal. A Codex build without goals rejects the
+    request, and its threads have no goal.
+
+    :param codex_client: Connected Codex app-server client.
+    :param ap_client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param forwarder_state: Mutable forwarder state holding the goal status.
+    :returns: None.
+    """
+    response: CodexMessage = {}
+    updates = forwarder_state.goal_updates
+    try:
+        response = await codex_client.request(
+            _CODEX_THREAD_GOAL_GET_METHOD, {"threadId": thread_id}
+        )
+    except CodexAppServerResponseError as exc:
+        if not codex_rejects_request_method(exc, _CODEX_THREAD_GOAL_GET_METHOD):
+            _logger.warning("Codex thread goal read failed", exc_info=True)
+            return
+        log_info_once(
+            _logger, "Codex app-server has no thread goals; treating the thread as goal-free"
+        )
+    except Exception:  # the sidebar keeps its last value when the read fails.
+        _logger.warning("Codex thread goal read failed", exc_info=True)
+        return
+    if forwarder_state.goal_updates != updates:
+        # A goal notification arrived during the read and already synced newer state.
+        return
+    result = response.get("result")
+    goal = result.get("goal") if isinstance(result, dict) else None
+    status = goal.get("status") if isinstance(goal, dict) else None
+    forwarder_state.goal_status = status if isinstance(status, str) else None
+    await _sync_background_work_running(
+        ap_client, session_id=session_id, forwarder_state=forwarder_state
+    )
+
+
+async def _handle_thread_goal_notification(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    method: str,
+    params: _JsonObject,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror a goal update on the forwarder's thread to the sidebar.
+
+    An active goal keeps the session working between Codex's turns. A goal
+    Codex stopped for a usage or token-budget limit surfaces as one failure,
+    unless the current turn already reported a failure.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory, for the turn running now.
+    :param method: ``"thread/goal/updated"`` or ``"thread/goal/cleared"``.
+    :param params: Codex goal notification params.
+    :param forwarder_state: Mutable forwarder state holding the goal status.
+    :returns: None.
+    """
+    previous_status = forwarder_state.goal_status
+    status: str | None = None
+    if method != _CODEX_THREAD_GOAL_CLEARED_METHOD:
+        goal = params.get("goal")
+        raw_status = goal.get("status") if isinstance(goal, dict) else None
+        status = raw_status if isinstance(raw_status, str) else None
+    forwarder_state.goal_status = status
+    forwarder_state.goal_updates += 1
+    await _sync_background_work_running(
+        client, session_id=session_id, forwarder_state=forwarder_state
+    )
+    failure_output = _GOAL_STOPPED_FAILURE_OUTPUT.get(status) if status is not None else None
+    if (
+        failure_output is None
+        or status == previous_status
+        or forwarder_state.turn_failure_surfaced
+    ):
+        return
+    turn_id = _turn_id_from_payload(params)
+    if turn_id is None:
+        # Codex may leave the turn out; the failure then belongs to the turn running now.
+        bridge_state = read_bridge_state(bridge_dir)
+        turn_id = bridge_state.active_turn_id if bridge_state is not None else None
+    if turn_id is not None:
+        # The turn's own terminal boundary must not replace this failure with idle.
+        forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    else:
+        # The turn's start was missed, so its boundary is recognized when it arrives.
+        forwarder_state.goal_failure_awaits_turn = True
+    forwarder_state.turn_failure_surfaced = True
+    await _post_status(client, session_id, "failed", output=failure_output)
+
+
+async def _clear_superseded_background_work(
+    client: httpx.AsyncClient,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Clear the sidebar flag of the session a ``/clear`` superseded.
+
+    The forwarder stops following that session's thread after rotation, so
+    nothing else would clear a flag it had posted there.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Superseded Omnigent conversation id, e.g. ``"conv_old"``.
+    :param forwarder_state: Mutable forwarder state holding the last-posted value.
+    :returns: None.
+    """
+    # Waits for a post still in flight to the superseded session.
+    async with forwarder_state.background_work_lock:
+        if forwarder_state.posted_background_work_running is not True:
+            return
+        response = await _post_session_event(
+            client,
+            session_id,
+            event_type=_EXTERNAL_BACKGROUND_WORK_TYPE,
+            data={"running": False},
+        )
+        _log_failed_session_event_post(_EXTERNAL_BACKGROUND_WORK_TYPE, response)
+
+
 async def _maybe_fail_turn_on_certificate_failure(
     client: httpx.AsyncClient,
     *,
@@ -3904,6 +4172,7 @@ async def _maybe_fail_turn_on_certificate_failure(
     if turn_id in forwarder_state.surfaced_terminal_error_turns:
         return True
     forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    forwarder_state.turn_failure_surfaced = True
     thread_id = _thread_id_from_params(params)
     if codex_client is not None and thread_id is not None:
         try:
@@ -4027,6 +4296,7 @@ async def _maybe_handle_turn_event(
                     return True
                 if turn_id is not None:
                     forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+                forwarder_state.turn_failure_surfaced = True
             compaction_model: str | None = None
             selected_model = forwarder_state.model if forwarder_state is not None else None
             if (
@@ -4064,6 +4334,8 @@ async def _maybe_handle_turn_event(
                 # A new turn opens a fresh reasoning block: the next reasoning
                 # delta must emit ``response.reasoning.started`` again.
                 forwarder_state.reasoning_stream_item_id = None
+                forwarder_state.turn_failure_surfaced = False
+                forwarder_state.goal_failure_awaits_turn = False
                 # An in-TUI ``/model`` switch writes config.toml (the cost-policy
                 # source of truth) but emits no notification. Re-read it at turn
                 # start so a switch made since the last turn lands ``model_override``
@@ -4370,6 +4642,8 @@ async def _handle_terminal_turn_boundary_inner(
     handled = terminal.handled
     if terminal.edge is not None:
         await _post_turn_status_edge(client, session_id, terminal.edge)
+        if forwarder_state is not None and terminal.edge.status == "failed":
+            forwarder_state.turn_failure_surfaced = True
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -5297,6 +5571,14 @@ def _prepare_terminal_turn_event(
     :returns: Whether the event was handled and its optional status edge.
     """
     terminal_turn_id = _terminal_turn_id_from_params(params)
+    if (
+        forwarder_state is not None
+        and forwarder_state.goal_failure_awaits_turn
+        and terminal_turn_id is not None
+    ):
+        # A goal-limit failure that named no turn belongs to this boundary.
+        forwarder_state.goal_failure_awaits_turn = False
+        forwarder_state.surfaced_terminal_error_turns.add(terminal_turn_id)
     if (
         forwarder_state is not None
         and terminal_turn_id is not None
