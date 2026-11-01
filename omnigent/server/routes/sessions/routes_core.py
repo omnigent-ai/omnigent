@@ -31,7 +31,12 @@ from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
 from omnigent.db.utils import generate_agent_id, generate_file_id
-from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
+from omnigent.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    set_current_runner_id,
+    set_current_user_id,
+)
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -41,6 +46,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -135,6 +141,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _grant_default_public,
+    _is_codex_native_subagent,
     _live_settings_change,
     _LiveSettingsChange,
     _multipart_missing_detail,
@@ -158,6 +165,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
     _resolve_harness,
+    _runner_supports_side_chat_settings,
     _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
@@ -190,6 +198,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _validate_session_model_selection,
     ensure_runner_connected,
 )
+from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -230,6 +239,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
 from omnigent.util.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -568,6 +578,12 @@ def register_core_routes(
             parse_repo_workspace,
         )
 
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+        if profile_catalog is not None:
+            profile = await asyncio.to_thread(profile_catalog.get_session_snapshot, session_id)
+            if profile is not None:
+                sandbox_provider = profile["provider"]
+
         # Reject an unconfigured provider on the POST rather than in the
         # background launch.
         if sandbox_provider is not None and sandbox_config.for_provider(sandbox_provider) is None:
@@ -641,6 +657,7 @@ def register_core_routes(
             agent_store=agent_store,
             agent_id=agent_id,
             host_id=requested_host_id,
+            sandbox_profiles=profile_catalog,
         )
         _start_managed_launch_task(
             session_id,
@@ -761,6 +778,7 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 permission_store=permission_store,
                 conversation=conversation,
+                sandbox_profiles=getattr(request.app.state, "sandbox_profiles", None),
             )
         conn = target.conn
         await host_registry.admit_launch(conn, session_id)
@@ -777,6 +795,18 @@ def register_core_routes(
                 f"Session {session_id!r} already has a runner bound",
                 code=ErrorCode.CONFLICT,
             )
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+        if profile_catalog is not None:
+            try:
+                await asyncio.to_thread(profile_catalog.require_session_host, session_id, host_id)
+            except Exception:
+                with contextlib.suppress(ValueError):
+                    await asyncio.to_thread(
+                        conversation_store.clear_runner_id,
+                        session_id,
+                        expected_binding=dataclasses.replace(target.conv, runner_id=runner_id),
+                    )
+                raise
         set_current_runner_id(runner_id)
         add_audit_attrs(runner_id=runner_id)
         _logger.info(
@@ -1299,7 +1329,29 @@ def register_core_routes(
                 runner_router=runner_router,
             )
 
+        sandbox_profile = await prepare_profile(
+            request,
+            parsed_metadata,
+            user_id=user_id,
+            inherited_session_id=parsed_metadata.parent_session_id,
+        )
+        if sandbox_profile is not None and parsed_metadata.host_type == "managed":
+            parsed_metadata = parsed_metadata.model_copy(
+                update={"sandbox_provider": sandbox_profile["provider"]}
+            )
+
         bundle_bytes = await bundle.read()
+        parsed_metadata = parsed_metadata.model_copy(
+            update={
+                "labels": {
+                    **parsed_metadata.labels,
+                    CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(
+                        request.headers,
+                        parent_labels=parent_conv.labels if parent_conv is not None else None,
+                    ),
+                }
+            }
+        )
         # Validate the bundle BEFORE any row exists: the external-host
         # branch below needs the spec's os_env.cwd for workspace
         # validation, and _create_session_from_bundle reuses the parsed
@@ -1367,6 +1419,7 @@ def register_core_routes(
         )
         from omnigent.models.model_catalog import spec_harness
         from omnigent.server.routes._session_harness_readiness import (
+            require_codex_plan_launch_support,
             validate_create_harness_readiness,
         )
 
@@ -1379,6 +1432,12 @@ def register_core_routes(
             conversation_store=conversation_store,
             host_store=getattr(request.app.state, "host_store", None),
             parent=parent_conv,
+        )
+        require_codex_plan_launch_support(
+            harness=spec_harness(spec),
+            host_id=parsed_metadata.host_id,
+            labels=parsed_metadata.labels,
+            host_registry=getattr(request.app.state, "host_registry", None),
         )
         with creation_stage("create_persistence_ms"):
             result = await asyncio.to_thread(
@@ -1394,6 +1453,7 @@ def register_core_routes(
                 created_by=user_id,
                 agent_store=agent_store,
             )
+        await record_profile(request, result.session_id, sandbox_profile, conversation_store)
         session_created(
             result.session_id,
             inherited_runner_id,
@@ -1811,7 +1871,9 @@ def register_core_routes(
         :param visibility: Ownership/archive filter for the sidebar tabs.
             ``"mine"`` returns only sessions the caller owns (owner-level
             grant). ``"shared"`` returns only sessions accessible but not
-            owned. ``"archived"`` returns only archived sessions.
+            owned. ``"archived"`` returns only archived sessions; with
+            ``project``, only owned sessions are returned so first-class
+            project names resolve within the caller's projects.
             ``"all"`` (default) returns all accessible non-archived
             sessions, matching the legacy behaviour.
         :returns: A :class:`PaginatedList` of
@@ -1840,7 +1902,8 @@ def register_core_routes(
         #   like-named project stays out of the viewer's own folder.
         # mine/shared require an identity anchor (owned_by / accessible_by).
         # Passing None into the store's shared_only path raises ValueError.
-        # "archived" carries no ownership semantics — preserve it in no-auth.
+        # "archived" is owner-scoped with a project (name resolution needs owned_by);
+        # without a project it includes accessible archives. Preserve it in no-auth.
         effective_visibility = visibility
         if user_id is None and visibility in ("mine", "shared"):
             effective_visibility = "all"
@@ -1858,7 +1921,7 @@ def register_core_routes(
             archived_only_param = False
         elif effective_visibility == "archived":
             accessible_by_param = user_id
-            owned_by_param = None
+            owned_by_param = user_id if project else None
             shared_only_param = False
             # archived_only=True implies include_archived=True — the store
             # filters to archived=True regardless of include_archived.
@@ -2268,6 +2331,10 @@ def register_core_routes(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason="authentication required",
             )
+        # WebSockets bypass the HTTP middleware that attributes debug-log rows
+        # to the request's user; this handler task is per-connection, so the
+        # binding cannot leak across sockets.
+        set_current_user_id(user_id)
         await websocket.accept()
         _logger.info(
             "session-updates stream connected",
@@ -3018,17 +3085,44 @@ def register_core_routes(
         if conv is None:
             raise _session_not_found()
         previous_runner_id = conv.runner_id
+        previous_runner_binding = conv
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
         if body.runner_id is not None:
+            add_audit_attrs(
+                previous_runner_id=previous_runner_id,
+                previous_host_id=conv.host_id,
+                requested_runner_id=body.runner_id
+                if len(body.runner_id) <= 256
+                and body.runner_id.isascii()
+                and (body.runner_id == "" or body.runner_id.isprintable())
+                else None,
+                binding_action="clear" if body.runner_id == "" else "bind",
+            )
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
             if body.runner_id == "":
                 try:
-                    await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                    if profile_catalog is not None:
+                        await asyncio.to_thread(
+                            profile_catalog.reassign_runner,
+                            conv,
+                            None,
+                            conversation_store=conversation_store,
+                            host_store=getattr(request.app.state, "host_store", None),
+                            user_id=user_id,
+                        )
+                    else:
+                        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
                 _logger.info(
                     "Session unbound from runner",
-                    extra=debug_event("session_runner_unbound", session_id=session_id),
+                    extra=debug_event(
+                        "session_runner_unbound",
+                        session_id=session_id,
+                        previous_runner_id=previous_runner_id,
+                        previous_host_id=conv.host_id,
+                    ),
                 )
             else:
                 from omnigent.server.routes import sessions as _sf
@@ -3061,11 +3155,30 @@ def register_core_routes(
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
                 try:
-                    await asyncio.to_thread(
-                        conversation_store.replace_runner_id, session_id, runner_id
+                    handled = profile_catalog is not None and await asyncio.to_thread(
+                        profile_catalog.reassign_runner,
+                        conv,
+                        runner_id,
+                        conversation_store=conversation_store,
+                        host_store=getattr(request.app.state, "host_store", None),
+                        user_id=user_id,
                     )
+                    if not handled:
+                        if profile_catalog is None:
+                            await asyncio.to_thread(
+                                conversation_store.replace_runner_id, session_id, runner_id
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                conversation_store.replace_runner_id,
+                                session_id,
+                                runner_id,
+                                expected_binding=conv,
+                            )
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
+                except ValueError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
                 set_current_runner_id(runner_id)
                 _logger.info(
                     "Session bound to runner",
@@ -3073,6 +3186,8 @@ def register_core_routes(
                         "session_runner_bound",
                         session_id=session_id,
                         runner_id=runner_id,
+                        previous_runner_id=previous_runner_id,
+                        previous_host_id=conv.host_id,
                         operation="bind",
                         stage="runner_launch",
                     ),
@@ -3122,12 +3237,46 @@ def register_core_routes(
                     and conv.inference_snapshot is not None
                     and not parent_initialized
                 ):
-                    if previous_runner_id is None:
-                        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
-                    else:
-                        await asyncio.to_thread(
-                            conversation_store.replace_runner_id, session_id, previous_runner_id
+                    if handled:
+                        restored = await asyncio.to_thread(
+                            conversation_store.rollback_runner_reassignment,
+                            previous_runner_binding,
+                            expected_runner_id=runner_id,
+                            expected_host_id=conv.host_id,
                         )
+                        if not restored:
+                            _logger.info(
+                                "Retaining a newer binding or the last runner/host association"
+                            )
+                    elif profile_catalog is None:
+                        if previous_runner_id is None:
+                            await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                        else:
+                            await asyncio.to_thread(
+                                conversation_store.replace_runner_id,
+                                session_id,
+                                previous_runner_id,
+                            )
+                    else:
+                        rollback_binding = dataclasses.replace(
+                            previous_runner_binding, runner_id=runner_id
+                        )
+                        try:
+                            if previous_runner_id is None:
+                                await asyncio.to_thread(
+                                    conversation_store.clear_runner_id,
+                                    session_id,
+                                    expected_binding=rollback_binding,
+                                )
+                            else:
+                                await asyncio.to_thread(
+                                    conversation_store.replace_runner_id,
+                                    session_id,
+                                    previous_runner_id,
+                                    expected_binding=rollback_binding,
+                                )
+                        except ValueError:
+                            _logger.info("Retaining a newer runner/host binding")
                     raise OmnigentError(
                         "The runner did not accept this session's saved inference configuration",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -3186,7 +3335,35 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-        live_model_change = not body.silent and (model_override is not None or clear_model)
+        # Ephemeral side threads have no terminal; apply their saved picks on the next turn.
+        defer_side_settings = (
+            conv is not None
+            and _is_codex_native_subagent(conv)
+            and is_side_chat_child(conv.labels)
+        )
+        if defer_side_settings and clear_model:
+            raise OmnigentError(
+                "Choose a specific model for this side chat; resetting its model is not supported.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if (
+            defer_side_settings
+            and not body.silent
+            and (model_override is not None or clear_model or effort is not None or clear_effort)
+        ):
+            assert conv is not None
+            if not await _runner_supports_side_chat_settings(
+                conv, conversation_store, getattr(request.app.state, "tunnel_registry", None)
+            ):
+                raise OmnigentError(
+                    "This runner cannot apply side-chat settings. Update the host and restart the session.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+        live_model_change = (
+            not body.silent
+            and not defer_side_settings
+            and (model_override is not None or clear_model)
+        )
         wake_for_model_change = (
             live_model_change
             and conv is not None
@@ -3218,6 +3395,11 @@ def register_core_routes(
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
+            label_updates=(
+                {EFFORT_RESET_LABEL: "true" if clear_effort else "false"}
+                if defer_side_settings and (clear_effort or effort is not None)
+                else None
+            ),
         )
         if update_result is None:
             raise _session_not_found()
@@ -3263,7 +3445,7 @@ def register_core_routes(
             _cancel_pending_archive_stop(session_id)
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
-        live_forward = not body.silent
+        live_forward = not body.silent and not defer_side_settings
         codex_native = (
             updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
             == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
@@ -3724,6 +3906,12 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        sandbox_profile = await prepare_profile(
+            request, body, user_id=user_id, inherited_session_id=source_id
+        )
+        if sandbox_profile is not None and body.host_type == "managed":
+            body = body.model_copy(update={"sandbox_provider": sandbox_profile["provider"]})
+
         from omnigent.server.routes.sandbox_inference import (
             actual_harness,
             configured_snapshot,
@@ -3933,7 +4121,9 @@ def register_core_routes(
         # bound target is actually codex-native (the label is inert elsewhere,
         # so refuse to stamp it on a non-Codex fork). Stamped via extra_labels,
         # which the store applies AFTER the drop so the opt-in wins.
-        extra_labels: dict[str, str] = {}
+        extra_labels: dict[str, str] = {
+            CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(request.headers)
+        }
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":
@@ -4173,6 +4363,22 @@ def register_core_routes(
             await drop_unused_copy()
             raise
 
+        try:
+            await record_profile(request, new_conv.id, sandbox_profile, conversation_store)
+        except Exception:
+            if clone_location is not None and agent_store is not None:
+                try:
+                    # Keep the copy if session rollback failed and still references it.
+                    if (
+                        await asyncio.to_thread(conversation_store.get_conversation, new_conv.id)
+                        is None
+                    ):
+                        await asyncio.to_thread(agent_store.delete, fork_agent_id)
+                        await drop_unused_copy()
+                except Exception:
+                    _logger.exception("Failed to remove rejected fork's agent copy")
+            raise
+
         # Create the fork-owned rows the rewritten items now reference —
         # before the fork is announced or returned, so no reader sees the ids
         # dangling. Each row points at the SOURCE's blob (blob_key), so no
@@ -4226,20 +4432,16 @@ def register_core_routes(
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
 
-        # Managed host: schedule the fork's own BACKGROUND sandbox provision
-        # and return immediately, exactly like a managed create. The host is
-        # registered to the forking caller, so the sandbox resolves THEIR
-        # credentials, never the source owner's. An omitted workspace inherits
-        # ALL of the repositories the source recorded (read off the SOURCE,
-        # since a fork never inherits the labels itself), so cloning a
-        # multi-repo sandbox session lands the fork with every repo.
+        # Provision in the background with the caller's credentials. Use explicit
+        # workspaces, else workspace, else every repository recorded on the source.
         try:
             if body.host_type == "managed":
-                fork_workspaces = (
-                    ([body.workspace] if body.workspace is not None else [])
-                    if workspace_set
-                    else read_managed_repo_workspaces(source.labels)
-                )
+                if "workspaces" in fields_set:
+                    fork_workspaces = list(body.workspaces or [])
+                elif workspace_set:
+                    fork_workspaces = [body.workspace] if body.workspace is not None else []
+                else:
+                    fork_workspaces = read_managed_repo_workspaces(source.labels)
                 await _schedule_managed_launch(
                     request,
                     session_id=new_conv.id,

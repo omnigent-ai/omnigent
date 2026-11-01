@@ -80,6 +80,7 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
+from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
@@ -1026,55 +1027,11 @@ def _structured_ask_user_question(
         questions, malformed options, etc.) — caller falls back to
         the binary preview-only render.
     """
-    if not isinstance(tool_input, dict):
-        return None
-    questions_raw = tool_input.get("questions")
-    if not isinstance(questions_raw, list) or not questions_raw:
-        return None
-    questions: list[dict[str, Any]] = []
-    for entry in questions_raw:
-        if not isinstance(entry, dict):
-            continue
-        question_text = entry.get("question")
-        if not isinstance(question_text, str) or not question_text:
-            continue
-        options_raw = entry.get("options")
-        if not isinstance(options_raw, list):
-            continue
-        options: list[dict[str, Any]] = []
-        for opt in options_raw:
-            if isinstance(opt, dict):
-                label = opt.get("label")
-                if not isinstance(label, str) or not label:
-                    continue
-                option: dict[str, Any] = {"label": label}
-                description = opt.get("description")
-                if isinstance(description, str) and description:
-                    option["description"] = description
-                # ``preview`` is an optional richer snippet some
-                # Claude builds attach to an option (rendered as a
-                # <pre> below the option list when selected). Ride
-                # it through verbatim so the UI can surface it.
-                preview = opt.get("preview")
-                if isinstance(preview, str) and preview:
-                    option["preview"] = preview
-                options.append(option)
-            elif isinstance(opt, str) and opt:
-                options.append({"label": opt})
-        if not options:
-            continue
-        question: dict[str, Any] = {
-            "question": question_text,
-            "options": options,
-            "multiSelect": entry.get("multiSelect") is True,
-        }
-        header = entry.get("header")
-        if isinstance(header, str) and header:
-            question["header"] = header
-        questions.append(question)
-    if not questions:
-        return None
-    return {"questions": questions}
+    # Shared with the claude-sdk elicitation bridge, which can't import
+    # server-route code; imported lazily to keep this module's import graph.
+    from omnigent.server.ask_user_question import structured_ask_user_question
+
+    return structured_ask_user_question(tool_input)
 
 
 def _canonical_tool_input(tool_input: dict[str, Any] | None) -> dict[str, Any]:
@@ -4391,6 +4348,7 @@ async def _create_and_publish_codex_child(
     # Stable title so the (parent, title) unique index prevents race-condition
     # duplicate rows when the forwarder retries a failed registration.
     title = f"codex-native-ui-subagent:{thread_id}"
+    side_chat = is_side_chat_child(labels)
     try:
         child = await asyncio.to_thread(
             conversation_store.create_conversation,
@@ -4400,6 +4358,12 @@ async def _create_and_publish_codex_child(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+            model_override=(
+                (concrete_reported_model(parent_conv.reported_model) or parent_conv.model_override)
+                if side_chat
+                else None
+            ),
+            reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)
@@ -5309,22 +5273,23 @@ def _truncate_label(value: str, limit: int = _LABEL_VALUE_MAX_LEN) -> str:
     return value[: limit - 1] + "…"
 
 
-# Marks the log lines dropped between a runner exit's summary and its last line.
+# Marks the log lines dropped between a runner exit's summary and its cause.
 _ELIDED_LOG_LINES_MARKER = "\n…\n"
 # Shortest summary kept ahead of that line, e.g. "runner process exited with code 1".
 _RUNNER_EXIT_SUMMARY_MIN_CHARS = 40
+_RUNNER_NON_ERROR_LOG_LINE_RE = re.compile(
+    r"^(?:DEBUG|INFO|WARN(?:ING)?)\s+\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s"
+)
 
 
 def _truncate_error_message_label(message: str) -> str:
     """Fit a failure message into one label, keeping a runner exit's cause.
 
     A host's runner-exit report is a summary, then the runner's log tail under
-    :data:`RUNNER_LOG_TAIL_HEADING`. The tail's last line names the cause, e.g.
-    ``"error: runner tunnel rejected by server (HTTP 401 ...)"``, but head
-    truncation keeps only the summary and the start of a traceback, so a
-    reloaded session would no longer show why the runner died. For such a
-    report, keep the start of the summary and the whole last line. Any other
-    message is head-truncated by :func:`_truncate_label`.
+    :data:`RUNNER_LOG_TAIL_HEADING`. Keep the last failure line ahead of
+    trailing upload or cleanup diagnostics, falling back to the final log
+    line when no cause is available. Any other message is head-truncated by
+    :func:`_truncate_label`.
 
     :param message: The failure message, e.g. ``"runner process exited with
         code 1 (log on host: ~/x.log)\\n--- runner log tail ---\\n...\\nerror: boom"``.
@@ -5334,14 +5299,18 @@ def _truncate_error_message_label(message: str) -> str:
     if len(message) <= _LABEL_VALUE_MAX_LEN:
         return message
     summary, heading, tail = message.partition(f"\n{RUNNER_LOG_TAIL_HEADING}\n")
-    tail_lines = tail.strip().splitlines()
+    tail_lines = [line.strip() for line in tail.splitlines() if line.strip()]
     if not heading or not tail_lines:
         return _truncate_label(message)
+    cause_line = next(
+        (line for line in reversed(tail_lines) if not _RUNNER_NON_ERROR_LOG_LINE_RE.match(line)),
+        tail_lines[-1],
+    )
     budget = _LABEL_VALUE_MAX_LEN - len(_ELIDED_LOG_LINES_MARKER)
     summary_reserve = min(len(summary), _RUNNER_EXIT_SUMMARY_MIN_CHARS)
-    last_line = _truncate_label(tail_lines[-1].strip(), budget - summary_reserve)
-    summary = _truncate_label(summary, budget - len(last_line))
-    return f"{summary}{_ELIDED_LOG_LINES_MARKER}{last_line}"
+    cause_line = _truncate_label(cause_line, budget - summary_reserve)
+    summary = _truncate_label(summary, budget - len(cause_line))
+    return f"{summary}{_ELIDED_LOG_LINES_MARKER}{cause_line}"
 
 
 async def _persist_session_status_error_labels(
@@ -5797,6 +5766,30 @@ def _publish_btw_sidechat(
         truncated=truncated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+async def _runner_supports_side_chat_settings(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    tunnel_registry: TunnelRegistry | None,
+) -> bool:
+    """Read the parent runner's advertised support; a child's runner binding may be stale."""
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
+
+    if (
+        tunnel_registry is None
+        or not _is_codex_native_subagent(conv)
+        or not is_side_chat_child(conv.labels)
+        or not conv.parent_conversation_id
+    ):
+        return False
+    parent = await asyncio.to_thread(
+        conversation_store.get_conversation, conv.parent_conversation_id
+    )
+    connection = (
+        tunnel_registry.get(parent.runner_id) if parent is not None and parent.runner_id else None
+    )
+    return connection is not None and CAP_SIDE_CHAT_SETTINGS in connection.hello.capabilities
 
 
 async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
@@ -6821,6 +6814,8 @@ async def _wait_for_managed_runner_tunnel(
     runner_id: str,
     tunnel_registry: TunnelRegistry,
     tracker: ManagedLaunchTracker,
+    *,
+    settle_failure: bool = True,
 ) -> bool:
     """
     Wait for a launched managed runner to connect, failing the launch on timeout.
@@ -6829,8 +6824,9 @@ async def _wait_for_managed_runner_tunnel(
     :param runner_id: Runner id returned by the host launch frame.
     :param tunnel_registry: Runner tunnel registry to wait on.
     :param tracker: Managed launch tracker to settle on failure.
-    :returns: ``True`` when the runner connected; ``False`` after publishing
-        and retaining a failed launch status.
+    :param settle_failure: Publish and settle a timeout immediately. Callers
+        with rollback work can defer settlement until cleanup finishes.
+    :returns: ``True`` when the runner connected; ``False`` on timeout.
     """
     from omnigent.server.routes import sessions as _facade
 
@@ -6851,8 +6847,9 @@ async def _wait_for_managed_runner_tunnel(
         ),
     )
     reason = "managed runner did not connect after launch"
-    tracker.fail(session_id, reason)
-    _publish_sandbox_status(session_id, "failed", reason)
+    if settle_failure:
+        tracker.fail(session_id, reason)
+        _publish_sandbox_status(session_id, "failed", reason)
     return False
 
 
@@ -10799,6 +10796,12 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.stores.sandbox_profile_store import PROFILE_LABEL_PREFIX
+
+    if any(key.startswith(PROFILE_LABEL_PREFIX) for key in labels):
+        raise OmnigentError(
+            "Sandbox profile labels are server-owned", code=ErrorCode.INVALID_INPUT
+        )
     from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
     if any(key.startswith(MCP_SELECTION_PREFIX) for key in labels):

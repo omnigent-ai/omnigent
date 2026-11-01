@@ -24,6 +24,39 @@ import jwt
 
 _logger = logging.getLogger(__name__)
 
+REAUTH_MAX_AGE_ENV = "OMNIGENT_OIDC_REAUTH_MAX_AGE"
+# Nonzero: Entra caps id_token exp at auth_time + max_age. Freshness is
+# enforced by the callback's auth_time >= reauth_at check.
+DEFAULT_REAUTH_MAX_AGE_SECONDS = 300
+
+
+def parse_reauth_max_age(raw: str | None) -> int:
+    """
+    Read the ``max_age`` a forced re-auth sends, from :data:`REAUTH_MAX_AGE_ENV`.
+
+    A value that is not a positive integer falls back to the default with a
+    warning, so a typo cannot bring back a token that expires on arrival.
+
+    :param raw: The env var's value, e.g. ``"90"``; ``None`` or blank when unset.
+    :returns: Seconds to send as ``max_age``, e.g. ``300``.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return DEFAULT_REAUTH_MAX_AGE_SECONDS
+    try:
+        seconds = int(value)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        _logger.warning(
+            "%s must be a positive number of seconds; using %d",
+            REAUTH_MAX_AGE_ENV,
+            DEFAULT_REAUTH_MAX_AGE_SECONDS,
+        )
+        return DEFAULT_REAUTH_MAX_AGE_SECONDS
+    return seconds
+
+
 # ── PKCE helpers (RFC 7636) ──────────────────────────────────────
 
 
@@ -188,9 +221,11 @@ class OIDCConfig:
         the user's email identity, e.g. ``"preferred_username"`` for
         IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
         ``"email"``. Only affects the generic-OIDC path.
+    :param reauth_max_age_seconds: ``max_age`` sent on a forced re-auth,
+        from ``OMNIGENT_OIDC_REAUTH_MAX_AGE``, e.g. ``300``.
     :param require_reauth: When ``False``, forced re-authentication
         logins (CLI tickets, device consent) still send
-        ``prompt=login``/``max_age=0`` but skip verifying the
+        ``prompt=login`` and ``max_age`` but skip verifying the
         id_token's ``auth_time``. Validated for every provider, but
         GitHub never forces re-authentication, so it has no effect there.
     """
@@ -212,6 +247,7 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    reauth_max_age_seconds: int = DEFAULT_REAUTH_MAX_AGE_SECONDS
     require_reauth: bool = True
 
     @property
@@ -324,6 +360,7 @@ class OIDCConfig:
             )
 
         session_ttl_hours = int(os.environ.get("OMNIGENT_OIDC_SESSION_TTL_HOURS", "8"))
+        reauth_max_age_seconds = parse_reauth_max_age(os.environ.get(REAUTH_MAX_AGE_ENV))
         logout_redirect_uri = (
             os.environ.get("OMNIGENT_OIDC_LOGOUT_REDIRECT_URI", "").strip() or None
         )
@@ -498,5 +535,6 @@ class OIDCConfig:
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
+            reauth_max_age_seconds=reauth_max_age_seconds,
             require_reauth=require_reauth,
         )
