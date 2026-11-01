@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,10 +21,16 @@ from tests._helpers.providers import isolate_provider_resolution
 
 
 @pytest.fixture(autouse=True)
-def _default_claude_launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Ignore a developer's configured Claude launch, which the native menu would probe."""
+def _default_claude_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _no_configured_claude_launch: Callable[[], bool],
+) -> None:
+    """Check the real launch, ignoring a developer's configured one, which the menu would probe."""
+    monkeypatch.setattr(
+        plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
+    )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "default-config"))
-    monkeypatch.setattr(plugin_discovery, "_launch_plugins", None)
     for name in ("OMNIGENT_CLAUDE_LAUNCHER", "OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
         monkeypatch.delenv(name, raising=False)
 
@@ -1112,6 +1119,59 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
         "Claude plugins added by the configured launch are missing: the launch "
         f"{summary}; see the host log for details."
     ]
+
+
+@pytest.mark.parametrize(
+    ("config_text", "launcher", "warning"),
+    [
+        (
+            "harness: [\n",
+            "",
+            "Claude plugins added by a configured launch may be missing: the Omnigent "
+            "config could not be read; see the host log for details.",
+        ),
+        (
+            None,
+            "",
+            "Claude plugins added by a configured launch may be missing: the Omnigent "
+            "config could not be read; see the host log for details.",
+        ),
+        (
+            "harness: [\n",
+            "wrapper",
+            "Claude plugins added by the configured launch are missing: the launch "
+            "did not report its plugins; see the host log for details.",
+        ),
+    ],
+    ids=["malformed", "unreadable", "malformed-with-launcher"],
+)
+def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_text: str | None,
+    launcher: str,
+    warning: str,
+) -> None:
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
+    )
+    config_path = isolate_provider_resolution(monkeypatch, tmp_path / "config") / "config.yaml"
+    if config_text is None:
+        # Opening a directory fails even as root, which can read a mode-000 file.
+        config_path.mkdir()
+    else:
+        config_path.write_text(config_text)
+    if launcher:
+        monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", launcher)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    warnings: list[str] = []
+
+    skills = resolve_harness_skills(
+        replace(_ctx(tmp_path / "ws", home), warnings=warnings), "claude-native"
+    )
+
+    assert "sp:installed" in {s.name for s in skills}
+    assert warnings == [warning]
 
 
 @pytest.mark.posix_only

@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tarfile
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -364,7 +365,10 @@ def test_incomplete_codex_catalog_reports_warnings_and_is_cached_only_briefly(
 @pytest.mark.posix_only
 @pytest.mark.parametrize("shared_discovery", [True, False], ids=["shared", "separate"])
 def test_cold_claude_catalogs_share_one_stalled_launch_probe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared_discovery: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shared_discovery: bool,
+    _no_configured_claude_launch: Callable[[], bool],
 ) -> None:
     """Concurrent catalogs fall back after one probe timeout, not one timeout each.
 
@@ -372,7 +376,9 @@ def test_cold_claude_catalogs_share_one_stalled_launch_probe(
     """
     for name in ("OMNIGENT_CLAUDE_LAUNCHER", "OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(plugin_discovery, "_launch_plugins", None)
+    monkeypatch.setattr(
+        plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
+    )
     monkeypatch.setattr(plugin_discovery, "LAUNCH_PLUGINS_TIMEOUT_S", 3.0)
     home = tmp_path / "home"
     skill = home / ".claude" / "skills" / "local" / "SKILL.md"

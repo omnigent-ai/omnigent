@@ -23,7 +23,10 @@ _launch_plugins: tuple[tuple[str, ...], float, dict[str, Path] | Exception] | No
 
 
 def claude_launch_is_customized() -> bool:
-    """Whether native Claude starts through a configured command, arguments or launcher plugin."""
+    """Whether native Claude starts through a configured command, arguments or launcher plugin.
+
+    :raises OSError, yaml.YAMLError: The Omnigent config could not be read.
+    """
     from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
     from omnigent.config import load_effective_config
     from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
@@ -60,6 +63,7 @@ def claude_launch_plugin_dirs() -> dict[str, Path]:
     launcher adds with ``--plugin-dir``, before it would contact a model.
 
     :raises OSError, subprocess.SubprocessError, ValueError: The launch did not report its plugins.
+    :raises yaml.YAMLError: The Omnigent config is malformed.
     """
     global _launch_plugins
     from omnigent.harnesses.claude_native.main import _claude_model_probe_invocation

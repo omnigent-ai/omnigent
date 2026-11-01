@@ -783,11 +783,23 @@ def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
         claude_launch_plugin_dirs,
     )
 
-    if not ctx.is_native or not claude_launch_is_customized():
+    if not ctx.is_native:
+        return {}
+    try:
+        customized = claude_launch_is_customized()
+    except (OSError, yaml.YAMLError) as exc:
+        _log.warning("Could not read the Omnigent config to find the Claude launch: %s", exc)
+        if ctx.warnings is not None:
+            ctx.warnings.append(
+                "Claude plugins added by a configured launch may be missing: the Omnigent "
+                "config could not be read; see the host log for details."
+            )
+        return {}
+    if not customized:
         return {}
     try:
         return claude_launch_plugin_dirs()
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+    except (OSError, subprocess.SubprocessError, ValueError, yaml.YAMLError) as exc:
         summary = (
             f"timed out after {exc.timeout:g}s"
             if isinstance(exc, subprocess.TimeoutExpired)
