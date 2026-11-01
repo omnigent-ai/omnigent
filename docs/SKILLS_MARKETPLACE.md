@@ -96,7 +96,9 @@ include them.
 - Only administrators add or remove browsable sources and install for
   Everyone. The single local user of `omnigent server` is one: it signs in
   as the reserved `local` user, which every database creates as an
-  administrator. Deleting a source
+  administrator. The managed local runtime (`OMNIGENT_LOCAL_SINGLE_USER`)
+  is administrator too, whatever identity it signs the user in as.
+  Deleting a source
   does not remove skills already installed from it.
 - Anyone can preview a repository by URL and install from it for themselves,
   unless `allow_url_install` is off.
