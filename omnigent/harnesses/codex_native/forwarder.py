@@ -569,8 +569,17 @@ class _CodexForwarderState:
         absorbed instead of replacing it with idle.
     :param turn_failure_surfaced: Whether a failed status already went out for
         the current turn. A later thread-level failure for that turn is skipped.
-    :param has_background_terminals: Whether the last listing of the thread's
-        background terminals found any still running.
+    :param background_terminals: Composer rows for the thread's running background
+        terminals as last listed, e.g. ``[{"id": "1234", "command": "npm run dev"}]``.
+        ``None`` until a listing succeeds on this connection, or when Codex cannot
+        list them.
+    :param posted_background_tasks: Last terminal list Omnigent accepted on this
+        connection. ``None`` until the first post, and once a failed status edge
+        has reached the server, which clears its tally, so the next sync sends
+        the list again.
+    :param background_tasks_unsupported: Whether the Omnigent server rejected a
+        terminal list posted without the flag, as a server from before the list
+        does, so later syncs post the flag only.
     :param background_terminals_supported: ``False`` once the Codex app-server
         rejects the terminal listing, so later turns do not ask again.
     :param background_terminal_poll: The task re-listing running background
@@ -654,7 +663,9 @@ class _CodexForwarderState:
     background_work_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     goal_failure_awaits_turn: bool = False
     turn_failure_surfaced: bool = False
-    has_background_terminals: bool = False
+    background_terminals: list[_JsonObject] | None = None
+    posted_background_tasks: list[_JsonObject] | None = None
+    background_tasks_unsupported: bool = False
     background_terminals_supported: bool = True
     background_terminal_poll: asyncio.Task[None] | None = None
     goal_unknown: bool = False
@@ -865,10 +876,27 @@ class _CodexForwarderState:
         self.goal_status = None
         self.goal_updates += 1
         self.goal_unknown = False
-        self.has_background_terminals = False
+        self.background_terminals = None
         self.posted_background_work_running = None
+        self.posted_background_tasks = None
         self.goal_failure_awaits_turn = False
         self.turn_failure_surfaced = False
+
+    @property
+    def has_background_terminals(self) -> bool:
+        """Whether the last listing found a background terminal still running."""
+        return bool(self.background_terminals)
+
+    async def forget_posted_terminals(self) -> None:
+        """
+        Make the next sync send the terminal list again.
+
+        Call once a failed status edge has reached the server, which clears its
+        background-task tally. Taking the lock waits out a list post still in
+        flight, so its answer cannot record the list as stored afterwards.
+        """
+        async with self.background_work_lock:
+            self.posted_background_tasks = None
 
     def background_work_running(self) -> bool:
         """
@@ -3983,33 +4011,45 @@ async def _sync_background_work_running(
     forwarder_state: _CodexForwarderState,
 ) -> None:
     """
-    Mirror whether work on the forwarder's thread outlives its turn.
+    Mirror the work on the forwarder's thread that outlives its turn.
 
     The sidebar shows such a session as working without changing its turn
-    status. Posts only when the value differs from the last value accepted on
-    this connection, so the first sync always reaches the server.
+    status, and the composer lists its running background terminals. Each
+    value is posted only when it differs from the last one accepted on this
+    connection, so the first sync always reaches the server.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :param forwarder_state: Mutable forwarder state holding the goal status and
-        the last-posted value.
+    :param forwarder_state: Mutable forwarder state holding the goal status,
+        the terminal list and the last-posted values.
     :returns: None.
     """
     async with forwarder_state.background_work_lock:
+        if forwarder_state.background_work_unsupported:
+            return
         # Read under the lock: a sync that waited posts the state as it is now.
         running = forwarder_state.background_work_running()
-        if (
-            forwarder_state.background_work_unsupported
-            or running == forwarder_state.posted_background_work_running
-            # An unread goal may still be active, so only a running terminal is news.
-            or (not running and forwarder_state.goal_unknown)
+        tasks = forwarder_state.background_terminals
+        data: _JsonObject = {}
+        # An unread goal may still be active, so only a running terminal is news.
+        if running != forwarder_state.posted_background_work_running and (
+            running or not forwarder_state.goal_unknown
         ):
+            data["running"] = running
+        if (
+            tasks is not None
+            and not forwarder_state.background_tasks_unsupported
+            and tasks != forwarder_state.posted_background_tasks
+        ):
+            data["background_task_count"] = len(tasks)
+            data["background_tasks"] = tasks
+        if not data:
             return
         response = await _post_session_event(
             client,
             session_id,
             event_type=_EXTERNAL_BACKGROUND_WORK_TYPE,
-            data={"running": running},
+            data=data,
         )
         if (
             response is not None
@@ -4020,9 +4060,22 @@ async def _sync_background_work_running(
             log_info_once(_logger, "Omnigent server does not accept external_background_work")
             forwarder_state.background_work_unsupported = True
             return
+        if (
+            response is not None
+            and response.status_code == 400
+            and "running" not in data
+            and "requires data.running" in response.text
+        ):
+            # The server predates the composer list, so only flag changes can reach it.
+            log_info_once(_logger, "Omnigent server does not accept background terminal lists")
+            forwarder_state.background_tasks_unsupported = True
+            return
         _log_failed_session_event_post(_EXTERNAL_BACKGROUND_WORK_TYPE, response)
         if response is not None and response.status_code < 400:
-            forwarder_state.posted_background_work_running = running
+            if "running" in data:
+                forwarder_state.posted_background_work_running = running
+            if tasks is not None and "background_task_count" in data:
+                forwarder_state.posted_background_tasks = tasks
 
 
 async def _read_thread_goal(
@@ -4111,6 +4164,49 @@ async def _resync_background_work(
     )
 
 
+async def _list_background_terminals(
+    codex_client: CodexAppServerClient, thread_id: str
+) -> list[_JsonObject]:
+    """
+    Return every background terminal of a thread, following the listing's pages.
+
+    :param codex_client: Connected Codex app-server client.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :returns: The terminals as Codex lists them, e.g.
+        ``[{"processId": "1234", "command": "npm run dev", "cwd": "/repo"}]``.
+    """
+    terminals: list[_JsonObject] = []
+    params: _JsonObject = {"threadId": thread_id}
+    while True:
+        response = await codex_client.request(_CODEX_BACKGROUND_TERMINALS_LIST_METHOD, params)
+        result = response.get("result")
+        page = result.get("data") if isinstance(result, dict) else None
+        if isinstance(page, list):
+            terminals.extend(terminal for terminal in page if isinstance(terminal, dict))
+        cursor = result.get("nextCursor") if isinstance(result, dict) else None
+        if not isinstance(cursor, str) or not cursor:
+            return terminals
+        params = {"threadId": thread_id, "cursor": cursor}
+
+
+def _background_terminal_tasks(terminals: list[_JsonObject]) -> list[_JsonObject]:
+    """
+    Turn listed background terminals into the composer's background-task rows.
+
+    :param terminals: Terminals from ``thread/backgroundTerminals/list``.
+    :returns: One row per terminal, e.g. ``[{"id": "1234", "command": "npm run dev"}]``.
+    """
+    tasks: list[_JsonObject] = []
+    for terminal in terminals:
+        task: _JsonObject = {}
+        if isinstance(terminal.get("processId"), str):
+            task["id"] = terminal["processId"]
+        if isinstance(terminal.get("command"), str):
+            task["command"] = terminal["command"]
+        tasks.append(task)
+    return tasks
+
+
 async def _refresh_background_terminals(
     ap_client: httpx.AsyncClient,
     codex_client: CodexAppServerClient,
@@ -4120,7 +4216,7 @@ async def _refresh_background_terminals(
     forwarder_state: _CodexForwarderState,
 ) -> bool:
     """
-    List the thread's background terminals once and post the flag.
+    List the thread's background terminals once and post the flag and the list.
 
     A failed listing keeps the last known terminal state, and polling goes on
     while that state has a terminal running. A Codex build that rejects the
@@ -4137,16 +4233,14 @@ async def _refresh_background_terminals(
     keep_listing = False
     if forwarder_state.background_terminals_supported:
         try:
-            response = await asyncio.wait_for(
-                codex_client.request(
-                    _CODEX_BACKGROUND_TERMINALS_LIST_METHOD, {"threadId": thread_id}
-                ),
+            terminals = await asyncio.wait_for(
+                _list_background_terminals(codex_client, thread_id),
                 timeout=_BACKGROUND_TERMINAL_LIST_TIMEOUT_SECONDS,
             )
         except CodexAppServerResponseError as exc:
             if codex_rejects_request_method(exc, _CODEX_BACKGROUND_TERMINALS_LIST_METHOD):
                 forwarder_state.background_terminals_supported = False
-                forwarder_state.has_background_terminals = False
+                forwarder_state.background_terminals = None
                 log_info_once(
                     _logger,
                     "Codex app-server cannot list background terminals; "
@@ -4159,9 +4253,7 @@ async def _refresh_background_terminals(
             _logger.warning("Codex background terminal listing failed", exc_info=True)
             keep_listing = forwarder_state.has_background_terminals
         else:
-            result = response.get("result")
-            data = result.get("data") if isinstance(result, dict) else None
-            forwarder_state.has_background_terminals = isinstance(data, list) and bool(data)
+            forwarder_state.background_terminals = _background_terminal_tasks(terminals)
             keep_listing = forwarder_state.has_background_terminals
     await _sync_background_work_running(
         ap_client, session_id=session_id, forwarder_state=forwarder_state
@@ -4306,6 +4398,7 @@ async def _handle_thread_goal_notification(
         forwarder_state.goal_failure_awaits_turn = True
     forwarder_state.turn_failure_surfaced = True
     await _post_status(client, session_id, "failed", output=failure_output)
+    await forwarder_state.forget_posted_terminals()
 
 
 async def _clear_superseded_background_work(
@@ -4314,25 +4407,30 @@ async def _clear_superseded_background_work(
     forwarder_state: _CodexForwarderState,
 ) -> None:
     """
-    Clear the sidebar flag of the session a ``/clear`` superseded.
+    Clear the sidebar flag and terminal list of the session a ``/clear`` superseded.
 
     The forwarder stops following that session's thread after rotation, so
-    nothing else would clear a flag it had posted there.
+    nothing else would clear what it had posted there.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Superseded Omnigent conversation id, e.g. ``"conv_old"``.
-    :param forwarder_state: Mutable forwarder state holding the last-posted value.
+    :param forwarder_state: Mutable forwarder state holding the last-posted values.
     :returns: None.
     """
     # Waits for a post still in flight to the superseded session.
     async with forwarder_state.background_work_lock:
-        if forwarder_state.posted_background_work_running is not True:
+        data: _JsonObject = {}
+        if forwarder_state.posted_background_work_running is True:
+            data["running"] = False
+        if forwarder_state.posted_background_tasks:
+            data["background_task_count"] = 0
+        if not data:
             return
         response = await _post_session_event(
             client,
             session_id,
             event_type=_EXTERNAL_BACKGROUND_WORK_TYPE,
-            data={"running": False},
+            data=data,
         )
         _log_failed_session_event_post(_EXTERNAL_BACKGROUND_WORK_TYPE, response)
 
@@ -4421,6 +4519,7 @@ async def _maybe_fail_turn_on_certificate_failure(
             ),
         )
         await usage_coalescer.flush()
+    await forwarder_state.forget_posted_terminals()
     return True
 
 
@@ -4535,6 +4634,8 @@ async def _maybe_handle_turn_event(
                 ),
             )
             await usage_coalescer.flush()
+        if forwarder_state is not None:
+            await forwarder_state.forget_posted_terminals()
         return True
     if method == "turn/started":
         async with _conversation_item_delivery_scope(session_id):
@@ -4865,6 +4966,7 @@ async def _handle_terminal_turn_boundary_inner(
         await _post_turn_status_edge(client, session_id, terminal.edge)
         if forwarder_state is not None and terminal.edge.status == "failed":
             forwarder_state.turn_failure_surfaced = True
+            await forwarder_state.forget_posted_terminals()
     terminal_thread_id = _thread_id_from_params(params)
     if (
         handled
@@ -5263,6 +5365,7 @@ async def _handle_thread_system_error(
         return
     forwarder_state.turn_failure_surfaced = True
     await _post_status(client, session_id, "failed", output=_SYSTEM_ERROR_FAILURE_OUTPUT)
+    await forwarder_state.forget_posted_terminals()
 
 
 def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:

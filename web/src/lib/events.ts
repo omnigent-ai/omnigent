@@ -657,6 +657,18 @@ export interface SessionCodexApprovalModeEvent {
 }
 
 /**
+ * `session.background_tasks` — background tasks that changed between turns,
+ * e.g. a codex-native session's background terminals. The count is
+ * authoritative, like the one on a `session.status` edge.
+ */
+export interface SessionBackgroundTasksEvent {
+  type: "session_background_tasks";
+  conversationId: string;
+  backgroundTaskCount: number;
+  backgroundTasks: BackgroundTaskInfo[];
+}
+
+/**
  * `session.agent_changed`: the session's bound agent changed (e.g. its
  * MCP servers were edited).
  *
@@ -1034,6 +1046,7 @@ export type StreamEvent =
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
   | SessionCodexApprovalModeEvent
+  | SessionBackgroundTasksEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

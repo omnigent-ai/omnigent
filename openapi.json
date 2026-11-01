@@ -6282,6 +6282,7 @@
             "response.reasoning_text.delta": "#/components/schemas/ReasoningTextDeltaEvent",
             "response.retry": "#/components/schemas/RetryEvent",
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
+            "session.background_tasks": "#/components/schemas/SessionBackgroundTasksEvent",
             "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
@@ -6339,6 +6340,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionCodexApprovalModeEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionBackgroundTasksEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -6531,6 +6535,56 @@
           "agent_name"
         ],
         "title": "SessionAgentChangedEvent",
+        "type": "object"
+      },
+      "SessionBackgroundTasksEvent": {
+        "description": "Background tasks of a session changed between its turns.\n\nEmitted when a codex-native forwarder's listing of its thread's background\nterminals changes. Claude's shells ride on its turn's `session.status`\nedge instead, because Claude reports them only when a turn ends.",
+        "properties": {
+          "background_task_count": {
+            "description": "Background tasks still running, e.g. `1`. `0` clears the composer's indicator.",
+            "format": "int64",
+            "title": "Background Task Count",
+            "type": "integer"
+          },
+          "background_tasks": {
+            "description": "Detail for each counted task, e.g. its command. Category: **transient** (SSE-only). The session snapshot carries the same tally, so reconnecting clients restore it.",
+            "items": {
+              "$ref": "#/components/schemas/BackgroundTaskInfo"
+            },
+            "title": "Background Tasks",
+            "type": "array"
+          },
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.background_tasks",
+            "description": "Always `\"session.background_tasks\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "background_task_count"
+        ],
+        "title": "SessionBackgroundTasksEvent",
         "type": "object"
       },
       "SessionBtwSidechatEvent": {

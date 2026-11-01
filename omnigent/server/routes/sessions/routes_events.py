@@ -241,6 +241,7 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_harness,
     _response_agent_name_from_store,
     _session_status_from_cache,
+    _set_background_tasks,
     _set_background_work_running,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
@@ -2570,9 +2571,11 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type == _EXTERNAL_BACKGROUND_WORK_TYPE:
-            # Sidebar-only flag: no status edge, so the turn status stays as reported.
+            # Sidebar flag and composer tally: no status edge, so the turn status
+            # stays as reported. A post may carry either or both.
             running = body.data.get("running")
-            if not isinstance(running, bool):
+            raw_count = body.data.get("background_task_count")
+            if (running is not None or raw_count is None) and not isinstance(running, bool):
                 raise OmnigentError(
                     f"external_background_work requires data.running to be a boolean; "
                     f"got {running!r}",
@@ -2589,6 +2592,14 @@ def register_events_routes(
                     f"integer; got {reported_at!r}",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            if raw_count is not None and (
+                not isinstance(raw_count, int) or isinstance(raw_count, bool) or raw_count < 0
+            ):
+                raise OmnigentError(
+                    f"external_background_work requires data.background_task_count to be "
+                    f"a non-negative integer; got {raw_count!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             reporter = _reporting_runner_id(request)
             if reporter is not None and conv.runner_id != reporter:
                 # A late report from a runner the session left must not overwrite its replacement.
@@ -2601,18 +2612,25 @@ def register_events_routes(
                     "the session moved to another server replica; retry the report",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            written = _set_background_work_running(
-                session_id,
-                running,
-                runner_id=reporter,
-                handoffs=handoffs_at_request,
-                reported_at=reported_at,
-            )
-            # Acknowledge only a stored report, so the runner retries one that was not.
-            if written is not None and await asyncio.wrap_future(written) is not True:
-                raise OmnigentError(
-                    "the background-work report was not stored; retry it",
-                    code=ErrorCode.RUNNER_UNAVAILABLE,
+            if running is not None:
+                written = _set_background_work_running(
+                    session_id,
+                    running,
+                    runner_id=reporter,
+                    handoffs=handoffs_at_request,
+                    reported_at=reported_at,
+                )
+                # Acknowledge only a stored report, so the runner retries one that was not.
+                if written is not None and await asyncio.wrap_future(written) is not True:
+                    raise OmnigentError(
+                        "the background-work report was not stored; retry it",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+            if raw_count is not None:
+                _set_background_tasks(
+                    session_id,
+                    raw_count,
+                    _parse_background_tasks(body.data.get("background_tasks")),
                 )
             return {"queued": False}
         if body.type == _EXTERNAL_COMPACTION_STATUS_TYPE:

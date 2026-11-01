@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionBackgroundTasksEvent,
   SessionCodexApprovalModeEvent,
   SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
@@ -1615,6 +1616,32 @@ describe("session.codex_approval_mode (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.codex_approval_mode", { approval_mode: "approve-for-me" })).toEqual([]);
+  });
+});
+
+describe("session.background_tasks (FLAT envelope)", () => {
+  it("lifts the count and each task's command", () => {
+    const events = parse("session.background_tasks", {
+      conversation_id: "conv_abc",
+      background_task_count: 1,
+      background_tasks: [{ id: "proc_0", command: "npm run dev" }],
+    });
+    expect(events).toEqual([
+      {
+        type: "session_background_tasks",
+        conversationId: "conv_abc",
+        backgroundTaskCount: 1,
+        backgroundTasks: [{ id: "proc_0", command: "npm run dev" }],
+      } satisfies SessionBackgroundTasksEvent,
+    ]);
+  });
+
+  it.each([
+    ["no conversation_id", { background_task_count: 1 }],
+    ["no count", { conversation_id: "conv_abc" }],
+    ["a negative count", { conversation_id: "conv_abc", background_task_count: -1 }],
+  ])("rejects %s", (_case, data) => {
+    expect(parse("session.background_tasks", data)).toEqual([]);
   });
 });
 

@@ -1460,18 +1460,85 @@ async def test_a_session_unbound_from_its_runner_lists_no_background_work(
     assert row["background_work_running"] is False
 
 
+async def test_external_background_work_lists_tasks_for_the_composer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner's task list publishes ``session.background_tasks`` and reaches the snapshot.
+
+    It publishes no status edge and leaves the sidebar flag alone; ``0`` clears it.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def report(count: int, commands: list[str]) -> dict[str, Any]:
+        """Post one task list and return the session snapshot after it."""
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_background_work",
+                "data": {
+                    "background_task_count": count,
+                    "background_tasks": [{"command": command} for command in commands],
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        return (await client.get(f"/v1/sessions/{session['id']}")).json()
+
+    try:
+        flagged = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": True}},
+        )
+        assert flagged.status_code == 202, flagged.text
+        published.clear()
+        listed = await report(1, ["npm run dev"])
+        cleared = await report(0, [])
+
+        assert listed["background_task_count"] == 1
+        assert [task["command"] for task in listed["background_tasks"]] == ["npm run dev"]
+        assert cleared.get("background_task_count") is None
+        assert [
+            (
+                event["type"],
+                event["background_task_count"],
+                [task["command"] for task in event["background_tasks"]],
+            )
+            for _, event in published
+        ] == [
+            ("session.background_tasks", 1, ["npm run dev"]),
+            ("session.background_tasks", 0, []),
+        ]
+        list_resp = await client.get("/v1/sessions")
+        row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+        assert row["background_work_running"] is True
+    finally:
+        sessions_module._session_background_task_count_cache.pop(session["id"], None)
+        sessions_module._session_background_tasks_cache.pop(session["id"], None)
+
+
 @pytest.mark.parametrize(
     "data",
     [
         {"running": "yes"},
         {"running": True, "reported_at": -1},
         {"running": True, "reported_at": "1"},
+        {},
+        {"background_task_count": -1},
+        {"background_task_count": True},
+        {"running": True, "background_task_count": "1"},
     ],
 )
 async def test_post_external_background_work_rejects_invalid_data(
     client: httpx.AsyncClient, data: dict[str, Any]
 ) -> None:
-    """A malformed flag or report time fails loud rather than setting the flag."""
+    """A malformed flag, count or report time fails loud rather than setting either."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 

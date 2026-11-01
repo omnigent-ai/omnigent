@@ -280,6 +280,7 @@ from omnigent.server.schemas import (
     ResponseObject,
     RetryErrorDetail,
     SandboxStatus,
+    SessionBackgroundTasksEvent,
     SessionBtwSidechatEvent,
     SessionChildSessionUpdatedEvent,
     SessionCodexApprovalModeEvent,
@@ -1417,6 +1418,47 @@ def _set_background_work_running(
     return session_live_state.persist_background_work_running(
         session_id, running, runner_id=runner_id, handoffs=handoffs, reported_at=reported_at
     )
+
+
+def _store_background_task_tally(
+    session_id: str, count: int, tasks: list[BackgroundTaskInfo] | None
+) -> None:
+    """
+    Keep a session's background-task tally for snapshots; ``0`` drops it.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param count: Background tasks still running, e.g. ``1``.
+    :param tasks: Detail for each counted task, or ``None`` when the runner
+        sent none.
+    """
+    if count > 0:
+        _session_background_task_count_cache[session_id] = count
+        _session_background_tasks_cache[session_id] = tasks or []
+    else:
+        _session_background_task_count_cache.pop(session_id, None)
+        _session_background_tasks_cache.pop(session_id, None)
+
+
+def _set_background_tasks(
+    session_id: str, count: int, tasks: list[BackgroundTaskInfo] | None
+) -> None:
+    """
+    Record and publish background tasks a runner listed between turns.
+
+    The composer shows them the same way as the shells on Claude's status edges.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param count: Background tasks still running, e.g. ``1``; ``0`` clears them.
+    :param tasks: Detail for each counted task, e.g. its command.
+    """
+    _store_background_task_tally(session_id, count, tasks)
+    event = SessionBackgroundTasksEvent(
+        type="session.background_tasks",
+        conversation_id=session_id,
+        background_task_count=count,
+        background_tasks=(tasks or []) if count > 0 else [],
+    )
+    session_stream.publish(session_id, event.model_dump())
 
 
 # Longest parked reason kept for the session list; the live stream carries it whole.
@@ -5174,15 +5216,9 @@ def _publish_status(
     # count stores the detail — possibly empty when a runner sent count-only —
     # and a ``0`` / failure clears it). ``None`` leaves both untouched.
     if background_task_count is not None:
-        if background_task_count > 0:
-            _session_background_task_count_cache[session_id] = background_task_count
-            _session_background_tasks_cache[session_id] = background_tasks or []
-        else:
-            _session_background_task_count_cache.pop(session_id, None)
-            _session_background_tasks_cache.pop(session_id, None)
+        _store_background_task_tally(session_id, background_task_count, background_tasks)
     elif status == "failed":
-        _session_background_task_count_cache.pop(session_id, None)
-        _session_background_tasks_cache.pop(session_id, None)
+        _store_background_task_tally(session_id, 0, None)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,
@@ -12578,6 +12614,7 @@ __all__ = [
     "_seed_missing_title_from_user_message",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
+    "_set_background_tasks",
     "_set_background_work_running",
     "_set_blocked_on",
     "_set_read_state",

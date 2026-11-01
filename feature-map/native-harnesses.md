@@ -106,7 +106,10 @@ implements them separately, so a fix for one harness does not reach the others.
     system error that Codex reports outside a turn; during a turn, the turn's
     own outcome decides.
   - Background work shows the working spinner with the tooltip "Working in the
-    background".
+    background". The composer lists running Claude background shells and Codex
+    background terminals as "1 background task" with each one's command. Claude's
+    list changes when a turn ends; Codex's changes within a few seconds of a
+    terminal starting or stopping.
   - Answering a prompt in Chat or the Inbox clears "Needs response" from the
     row, its status group, the dock badge and the Inbox count at once. If the
     answer fails to send, the prompt shows again. A session the sidebar had not
@@ -178,8 +181,8 @@ for `sleep 60` in a background shell and let the turn end: the row keeps its
 spinner until the sleep exits. In a Codex session, set a goal with several
 steps, then have Codex start `python3 -m http.server 8765` in the background:
 the row stays working between turns and while the server runs, and goes idle
-once both end. Codex's own terminal counts the running terminals and lists them
-with `/ps`; Omnigent's UI does not list them.
+once both end. While the server runs, the composer shows "1 background task"
+with its command, the same list Codex shows for `/ps` in its terminal.
 Answer an approval in Chat and another from the Inbox: "Needs response" clears
 at once. Block the answer request in the browser's developer tools and answer
 again: the prompt comes back. A prompt shown only in Claude's terminal has no
@@ -432,8 +435,10 @@ Cross-harness journeys:
     `tests/harnesses/codex_native/forwarder/test_background_work.py::test_active_goal_keeps_the_session_working_until_it_ends`
     and
     `tests/harnesses/codex_native/forwarder/test_background_work.py::test_goal_stopped_by_a_limit_fails_the_session_once`.
-  - Codex background terminal:
-    `tests/harnesses/codex_native/forwarder/test_background_work.py::test_running_background_terminal_keeps_the_session_working_after_its_turn`.
+  - Codex background terminal, in the sidebar and the composer:
+    `tests/harnesses/codex_native/forwarder/test_background_work.py::test_running_background_terminal_keeps_the_session_working_after_its_turn`
+    and
+    `tests/server/integration/test_sessions_endpoints.py::test_external_background_work_lists_tasks_for_the_composer`.
   - Codex system error:
     `tests/harnesses/codex_native/forwarder/test_turn_errors.py::test_system_error_fails_a_thread_no_turn_is_running`
     and

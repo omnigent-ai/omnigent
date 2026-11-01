@@ -3707,6 +3707,30 @@ class SessionCodexApprovalModeEvent(_SSEEventBase):
     approval_mode: str
 
 
+class SessionBackgroundTasksEvent(_SSEEventBase):
+    """
+    Background tasks of a session changed between its turns.
+
+    Emitted when a codex-native forwarder's listing of its thread's background
+    terminals changes. Claude's shells ride on its turn's ``session.status``
+    edge instead, because Claude reports them only when a turn ends.
+
+    :param type: Always ``"session.background_tasks"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param background_task_count: Background tasks still running, e.g. ``1``.
+        ``0`` clears the composer's indicator.
+    :param background_tasks: Detail for each counted task, e.g. its command.
+
+    Category: **transient** (SSE-only). The session snapshot carries the same
+    tally, so reconnecting clients restore it.
+    """
+
+    type: Literal["session.background_tasks"]
+    conversation_id: str
+    background_task_count: int
+    background_tasks: list[BackgroundTaskInfo] = Field(default_factory=list)
+
+
 class SessionAgentChangedEvent(_SSEEventBase):
     """
     The session's bound agent changed.
@@ -5137,6 +5161,7 @@ ServerStreamEvent = Annotated[
     | SessionCollaborationModeEvent
     | SessionPermissionModeEvent
     | SessionCodexApprovalModeEvent
+    | SessionBackgroundTasksEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
