@@ -5,14 +5,21 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 
 from omnigent.inner import _proc
 
 LAUNCH_PLUGINS_TIMEOUT_S = 10.0
+# One probe serves every workspace's catalog; a failure expires sooner so a retry probes again.
+LAUNCH_PLUGINS_TTL_S = 60.0
+FAILED_LAUNCH_PLUGINS_TTL_S = 5.0
 # Listing plugins must not run the user's session hooks.
 _PROBE_SETTINGS = json.dumps({"disableAllHooks": True})
+_launch_plugins_lock = threading.Lock()
+_launch_plugins: tuple[tuple[str, ...], float, dict[str, Path] | Exception] | None = None
 
 
 def claude_launch_is_customized() -> bool:
@@ -53,11 +60,31 @@ def claude_launch_plugin_dirs() -> dict[str, Path]:
 
     :raises OSError, subprocess.SubprocessError, ValueError: The launch did not report its plugins.
     """
+    global _launch_plugins
     from omnigent.harnesses.claude_native.main import _claude_model_probe_invocation
 
     command, launch_args, env = _claude_model_probe_invocation(
         None, ("--settings", _PROBE_SETTINGS)
     )
+    key = (command, *launch_args)
+    # Concurrent callers wait for one probe rather than each spending the timeout.
+    with _launch_plugins_lock:
+        cached = _launch_plugins
+        if cached is None or cached[0] != key or cached[1] <= time.monotonic():
+            result: dict[str, Path] | Exception
+            try:
+                result, ttl = _probe_plugin_dirs(command, launch_args, env), LAUNCH_PLUGINS_TTL_S
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                result, ttl = exc, FAILED_LAUNCH_PLUGINS_TTL_S
+            cached = _launch_plugins = (key, time.monotonic() + ttl, result)
+    if isinstance(cached[2], Exception):
+        raise cached[2]
+    return dict(cached[2])
+
+
+def _probe_plugin_dirs(
+    command: str, launch_args: list[str], env: dict[str, str]
+) -> dict[str, Path]:
     process = subprocess.Popen(
         _proc.pipe_supervised_command(command, *launch_args),
         cwd=Path.home(),
