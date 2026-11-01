@@ -94,6 +94,8 @@ const state = {
   failSecondPage: false,
   // Resolved by a test to release a held /v1/skill-catalog preview.
   previewGate: null as Promise<void> | null,
+  // Scopes triage is installed in, as the source's catalog reports it.
+  triageScopes: [] as string[],
 };
 const page = <T,>(data: T[], has_more = false, last_id: string | null = null) => ({
   data,
@@ -134,14 +136,29 @@ function script() {
     }
     if (url === "/v1/installed-skills/sk1" && method === "PATCH" && state.failPatch)
       return json({ error: { message: "Administrator access required" } }, 403);
-    if (url.startsWith("/v1/skill-sources/src1/catalog")) return json(catalog);
+    if (url.startsWith("/v1/skill-sources/src1/catalog"))
+      return json({
+        ...catalog,
+        skills: catalog.skills.map((skill) =>
+          skill.name === "triage" ? { ...skill, installed_scopes: state.triageScopes } : skill,
+        ),
+      });
     if (url.startsWith("/v1/skill-sources/src2/catalog"))
       return json({ ...catalog, skills: [{ ...catalog.skills[1], name: "deploy" }] });
     if (url === "/v1/skill-catalog" && state.previewGate) await state.previewGate;
     if (url === "/v1/skill-catalog")
       // A repository directory link: the catalog names the directory it indexed.
       return json({ ...catalog, url: "https://github.com/other/repo.git", path: "team-a" });
-    if (url === "/v1/installed-skills" && method === "POST") return json({ data: [review] }, 201);
+    if (url === "/v1/installed-skills" && method === "POST") {
+      const body = JSON.parse(String(init?.body)) as {
+        source: string;
+        names: string[];
+        scope?: string;
+      };
+      if (body.source === catalog.url && body.names.includes("triage"))
+        state.triageScopes.push(body.scope ?? "user");
+      return json({ data: [review] }, 201);
+    }
     if (url === "/v1/installed-skills/sk1" && method === "PATCH") {
       const enabled = (JSON.parse(String(init?.body)) as { enabled: boolean }).enabled;
       state.installed = state.installed.map((s) => (s.id === "sk1" ? { ...s, enabled } : s));
@@ -197,6 +214,7 @@ beforeEach(() => {
   state.secondPage = null;
   state.failSecondPage = false;
   state.previewGate = null;
+  state.triageScopes = [];
   calls.length = 0;
   fetchMock.mockReset();
   script();
@@ -272,11 +290,16 @@ describe("SettingsSkillsSection", () => {
     );
     expect(await within(triage).findByText("Installed for everyone")).toBeInTheDocument();
 
-    // Refresh re-fetches past the server's cache.
+    // Removed elsewhere (another tab): Refresh re-fetches past the server's
+    // cache, and its catalog, not the earlier install, decides the card.
+    state.triageScopes = [];
     fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
     await waitFor(() =>
       expect(calls.some((c) => c.url === "/v1/skill-sources/src1/catalog?refresh=true")).toBe(true),
     );
+    expect(
+      await within(screen.getByTestId("catalog-skill-triage")).findByTestId("install-skill-triage"),
+    ).toBeInTheDocument();
 
     // Search narrows the cards.
     fireEvent.change(screen.getByLabelText("Search skills"), { target: { value: "tri" } });

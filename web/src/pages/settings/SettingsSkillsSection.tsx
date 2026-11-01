@@ -525,9 +525,13 @@ function CatalogGrid({
   const install = useInstallSkills();
   const [search, setSearch] = useState("");
   const [scope, setScope] = useState<SkillScope>("user");
-  // Installs made from this catalog view (a URL preview is local state and
-  // never refetched), keyed by name and scope.
-  const [justInstalled, setJustInstalled] = useState<Set<string>>(() => new Set());
+  // Installs made from this catalog view, keyed by name and scope, until the
+  // server sends a newer catalog: a URL preview never refetches, while a
+  // source's catalog (after an install, or Refresh) is the authority.
+  const [acknowledged, setAcknowledged] = useState<{ catalog: SkillCatalog; keys: Set<string> }>(
+    () => ({ catalog, keys: new Set() }),
+  );
+  const justInstalled = acknowledged.catalog === catalog ? acknowledged.keys : new Set<string>();
   const installedIn = (skill: CatalogSkill, target: SkillScope) =>
     justInstalled.has(`${skill.name}:${target}`) ||
     (skill.installed_scopes
@@ -547,7 +551,11 @@ function CatalogGrid({
     install.mutate(
       { source: catalog.url, ref: catalog.ref, path: catalog.path, names: [skill.name], scope },
       {
-        onSuccess: () => setJustInstalled((prev) => new Set(prev).add(`${skill.name}:${scope}`)),
+        onSuccess: () =>
+          setAcknowledged((prev) => ({
+            catalog,
+            keys: new Set(prev.catalog === catalog ? prev.keys : []).add(`${skill.name}:${scope}`),
+          })),
       },
     );
 
