@@ -111,6 +111,21 @@ def test_agent_span_provider_only_omits_request_model(
     assert attrs["gen_ai.request.model"] == "gpt-5.1"
 
 
+def test_agent_span_records_no_request_model_when_none_was_asked_for(
+    exporter: InMemorySpanExporter,
+):
+    """The agent name may name the model for MLflow but is not a requested model."""
+    ctx = TracingContext()
+    span = ctx.start_agent_span(
+        agent_name="my-agent", user_message="hi", model="my-agent", request_model=None
+    )
+    ctx.end_agent_span(span, response="ok")
+
+    attrs = dict(_spans_by_name(exporter, "agent:")[0].attributes or {})
+    assert attrs["llm.model_name"] == "my-agent"
+    assert "gen_ai.request.model" not in attrs
+
+
 # ---
 # TOOL span gen_ai semconv attributes
 # ---
