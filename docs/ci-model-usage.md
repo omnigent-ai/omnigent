@@ -149,10 +149,11 @@ arrive later still; absence immediately after a run is inconclusive.
 ## Daily dashboard dataset
 
 Use [ci-model-usage.sql](ci-model-usage.sql) with a `workspace_id` parameter. It
-reads a rolling 60 complete days, includes legacy traffic and unmatched billing,
+reads a rolling 60 complete UTC days, includes legacy traffic and unmatched billing,
 and returns daily pipeline/model requests, tokens, workflow runs, attempts, and
 estimated USD list cost. It is a dataset query to add to an existing dashboard;
-the PR does not publish or schedule dashboard changes.
+the PR does not publish or schedule dashboard changes. Bounds and buckets use
+epoch arithmetic, so the result is independent of the SQL session timezone.
 
 Plot `usage_date` against `estimated_list_usd`, colored by `pipeline`, with filters
 for `service_principal`, repository, model endpoint, and date. Add requests and
@@ -164,10 +165,34 @@ token weight (`input + 5 × output`), matching the existing dashboard's output
 weight convention. It includes signed billing corrections and effective USD list
 prices. This remains an estimate: cache reads/writes and model-specific rates
 can change relative request costs. Cache tokens are already part of total input
-and must not be added again. Missing billing remains NULL; zero-token or unmatched
-billing is preserved as `Unallocated billing`. Keep that category and `Untagged`
-visible when assessing attribution coverage.
+and must not be added again. `estimated_list_usd` is NULL for a daily group if any
+hour lacks an allocation or contains unpriced billing. `known_list_usd` exposes
+the priced subtotal, which may be incomplete; `requests_without_allocated_cost`
+and `incomplete_prices` expose the gaps. Reconcile known subtotals against priced
+billing, and inspect missing prices separately. Zero-token or unmatched billing
+is preserved as `Unallocated billing`.
+
+Legacy requesters are not assumed to equal billing `run_as`: legacy bills may
+have no principal. Until route-to-billing provenance is established, an endpoint
+hour containing both legacy and gateway requests has `mixed_routes = true` and
+its bills remain `Unallocated billing`. This deliberately withholds ambiguous
+pipeline estimates instead of charging gateway pipelines for potentially shared
+legacy usage. Keep `Unallocated billing` and `Untagged` visible when assessing
+attribution coverage. Null-principal legacy bills can be allocated among legacy
+requesters in hours containing only legacy traffic.
 
 Request tags do not backfill historical usage or become invoice line items.
 Cache-aware model pricing and reconciliation are needed for more accurate
 per-run costs; this query must not be presented as exact pipeline charges.
+
+The warehouse regression runs the actual dataset against temporary session views
+with a fixed clock. It checks UTC/Los Angeles/Kathmandu sessions, boundary dates,
+deduplication, mixed routes, partial billing, missing prices, and signed corrections.
+It reads no real usage data and creates no persistent objects. Run it explicitly:
+
+```sh
+CI_MODEL_USAGE_SQL_PROFILE=<profile> CI_MODEL_USAGE_SQL_WAREHOUSE=<warehouse-id> \
+  uv run --no-project --python 3.12 --with pytest --with databricks-sdk \
+  --with databricks-sql-connector python -m pytest \
+  --confcutdir=tests/scripts -o addopts= tests/scripts/test_ci_model_usage_sql.py
+```

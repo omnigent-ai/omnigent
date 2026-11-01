@@ -98,7 +98,7 @@ def probe(protocol: str, model: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["validate", "ocr-headers", "probe"])
+    parser.add_argument("command", choices=["validate", "probe"])
     parser.add_argument("--protocol", choices=["anthropic", "codex/v1", "mlflow/v1"])
     parser.add_argument("--model")
     args = parser.parse_args()
@@ -106,9 +106,7 @@ def main() -> None:
         parser.error("OMNIGENT_CI_PIPELINE or OMNIGENT_CI_CONTEXT must be set")
     if args.command == "validate":
         return
-    if args.command == "ocr-headers":
-        print(ocr_request_headers())
-    elif not args.protocol or not args.model:
+    if not args.protocol or not args.model:
         parser.error("probe requires --protocol and --model")
     else:
         probe(args.protocol, args.model)

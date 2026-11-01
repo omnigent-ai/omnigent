@@ -225,15 +225,30 @@ def test_sync_sdk_clients_send_only_opted_in_gateway_tags(
 
 @pytest.mark.parametrize("protocol", ["anthropic", "codex/v1", "mlflow/v1"])
 @pytest.mark.parametrize(
-    "suffix", ["", "/serving-endpoints", "/serving-endpoints/anthropic", "/ai-gateway/anthropic"]
+    ("url", "gateway"),
+    [
+        (
+            "https://dbc-1.cloud.databricks.com" + suffix,
+            "https://dbc-1.cloud.databricks.com/ai-gateway/",
+        )
+        for suffix in (
+            "",
+            "/serving-endpoints",
+            "/serving-endpoints/anthropic",
+            "/ai-gateway/anthropic",
+        )
+    ]
+    + [
+        (
+            "https://dbc-1.ai-gateway.cloud.databricks.com/anthropic",
+            "https://dbc-1.ai-gateway.cloud.databricks.com/",
+        )
+    ],
 )
-def test_ci_gateway_url_moves_workspace_routes_to_gateway(protocol: str, suffix: str) -> None:
-    assert ci_gateway_base_url("https://dbc-1.cloud.databricks.com" + suffix, protocol) == (
-        "https://dbc-1.cloud.databricks.com/ai-gateway/" + protocol
-    )
-    assert ci_gateway_base_url(
-        "https://dbc-1.ai-gateway.cloud.databricks.com/anthropic", protocol
-    ) == ("https://dbc-1.ai-gateway.cloud.databricks.com/" + protocol)
+def test_ci_gateway_url_moves_workspace_routes_to_gateway(
+    protocol: str, url: str, gateway: str
+) -> None:
+    assert ci_gateway_base_url(url, protocol) == gateway + protocol
 
 
 @pytest.mark.parametrize(
