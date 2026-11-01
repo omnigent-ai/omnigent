@@ -124,9 +124,10 @@ def resolve_host_owner(
     user_id: str | None,
     host_id: str,
     host_store: HostStore,
+    permission_store: PermissionStore | None = None,
 ) -> Host:
     """
-    Authorize that the caller owns a known host.
+    Authorize that the caller owns a known host, or is an admin when asked.
 
     Every route that reaches a host on the caller's behalf must pass
     this first so the owner check can't drift between them: the runner
@@ -140,14 +141,21 @@ def resolve_host_owner(
         or ``None`` when auth is disabled.
     :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
     :param host_store: Persistent host registrations.
-    :returns: The host record owned by the caller.
+    :param permission_store: When given, an admin passes for any host, as
+        admins do for any session. Launch and session-create paths omit it,
+        so only a host's owner can start runners on it.
+    :returns: The host record the caller may access.
     :raises HTTPException: 404 if the host is unknown; 403 if it is
-        owned by a different user.
+        owned by a different user who the caller cannot act for.
     """
     host = host_store.get_host(host_id)
     if host is None:
         raise HTTPException(status_code=404, detail="host not found")
-    if user_id is not None and host.user_id != user_id:
+    if (
+        user_id is not None
+        and host.user_id != user_id
+        and not (permission_store is not None and permission_store.is_admin(user_id))
+    ):
         raise HTTPException(status_code=403, detail="not your host")
     return host
 

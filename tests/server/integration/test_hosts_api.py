@@ -1065,6 +1065,32 @@ async def test_get_host_403_wrong_owner(
     )
 
 
+async def test_get_host_allows_admin_but_launch_stays_owner_only(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Admins reach any host like any session, but cannot launch runners on it."""
+    app, registry, host_store, conv_store = multi_user_app
+    host_id = "294391bc835cde1130ef2a02dcd2b7b3"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+    _register_fake_host(registry, host_id, "alice@test.com")
+    app.state.permission_store.ensure_user("admin@test.com", is_admin=True)
+    conv = conv_store.create_conversation(agent_id=None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        details = await client.get(
+            f"/v1/hosts/{host_id}", headers={"x-test-user": "admin@test.com"}
+        )
+        launch = await client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": conv.id, "workspace": "/tmp"},
+            headers={"x-test-user": "admin@test.com"},
+        )
+
+    assert details.status_code == 200, details.text
+    assert details.json()["host_id"] == host_id
+    assert launch.status_code == 403, launch.text
+
+
 async def test_refresh_harness_accounts_requires_owner(
     multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
