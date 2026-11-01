@@ -173,8 +173,9 @@ the header menu), and each place is a separate entry point.
   Sessions without harness information appear under Unknown harness; pins stay separate.
   Created and Updated group by their respective date, independently of ordering,
   with the Created/Updated prefix only on the first date section, followed by
-  headings such as “Yesterday” and “Earlier”. Environment metadata shows an icon
-  with its label available to screen readers. Branch also resolves the workspace's
+  headings such as “Yesterday” and “Earlier”. Environment metadata names the
+  host runner, or the sandbox type, after the host picker's icon: a cloud
+  monitor for a sandbox, a laptop otherwise. Branch also resolves the workspace's
   checked-out branch when none was recorded at session creation, without hovering.
   All groupings replace
   Projects, Shared and Sessions with titled groups; the first group's header takes

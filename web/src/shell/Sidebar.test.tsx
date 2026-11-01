@@ -3837,9 +3837,8 @@ describe("Sidebar view options", () => {
     fireEvent.click(screen.getByTestId("session-show-environment"));
     fireEvent.click(screen.getByTestId("session-show-updated"));
 
-    // Environment text is available to screen readers without widening the metadata row.
-    expect(within(row).getByTestId("session-row-meta")).toHaveTextContent("Remote·fix/retries");
-    expect(within(row).getByText("Remote")).toHaveClass("sr-only");
+    expect(within(row).getByTestId("session-row-meta")).toHaveTextContent("Build Mac·fix/retries");
+    expect(within(row).getByText("Build Mac")).not.toHaveClass("sr-only");
     expect(within(row).getByTestId("session-row-updated")).toHaveTextContent("2m");
     // With a second line, the controls and the timestamp stay on the title line.
     expect(controls()).toHaveClass("top-4", "md:top-3.5");
@@ -3847,7 +3846,6 @@ describe("Sidebar view options", () => {
     // A session without a branch omits that part rather than leaving a gap.
     const bare = screen.getByText("conv_no_branch").closest("li")!;
     expect(within(bare).getByTestId("session-row-meta")).toHaveTextContent(/^Local machine$/);
-    expect(within(bare).getByText("Local machine")).toHaveClass("sr-only");
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual([
       "updated",
       "environment",
@@ -3909,21 +3907,30 @@ describe("Sidebar view options", () => {
     expect(screen.queryByTestId("session-row-meta")).toBeNull();
   });
 
-  it("keeps the device name accessible on the environment icon", () => {
+  it("names the host runner or sandbox after the host picker's icon", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["environment"] }));
-    // A loopback server with one online host: that host is this machine.
-    isServerLocalMock.mockReturnValue(true);
     useHostsMock.mockReturnValue({
-      data: [{ host_id: "host_here", name: "Build Mac", sandbox_provider: null, status: "online" }],
+      data: [
+        { host_id: "host_mac", name: "Build Mac", sandbox_provider: null, status: "online" },
+        { host_id: "host_box", name: "managed-1a2b3c4d", sandbox_provider: "modal" },
+      ],
     });
-    mockConversations([conv("conv_here", "Codex", { status: "idle", host_id: "host_here" })]);
+    mockConversations([
+      conv("conv_runner", "Codex", { status: "idle", host_id: "host_mac" }),
+      conv("conv_sandbox", "Codex", { status: "idle", host_id: "host_box" }),
+      conv("conv_unresolved", "Codex", { status: "idle", host_id: "host_gone" }),
+    ]);
     renderGroupingSidebar();
-    const meta = within(screen.getByText("conv_here").closest("li")!).getByTestId(
-      "session-row-meta",
-    );
-    expect(meta).toHaveTextContent(/^This /);
-    expect(within(meta).getByText(/^This /)).toHaveClass("sr-only");
-    expect(meta).not.toHaveTextContent("Build Mac");
+    const meta = (title: string) =>
+      within(screen.getByText(title).closest("li")!).getByTestId("session-row-meta");
+
+    expect(meta("conv_runner")).toHaveTextContent(/^Build Mac$/);
+    expect(meta("conv_runner").querySelector(".lucide-laptop")).toBeInTheDocument();
+    expect(meta("conv_sandbox")).toHaveTextContent(/^Modal Sandbox$/);
+    expect(meta("conv_sandbox").querySelector(".lucide-monitor-cloud")).toBeInTheDocument();
+    expect(meta("conv_sandbox").querySelector(".lucide-laptop")).toBeNull();
+    // A host the list hasn't loaded falls back to its id, like the tooltip.
+    expect(meta("conv_unresolved")).toHaveTextContent(/^host_gone$/);
   });
 
   it("shows a managed-sandbox session's repo name from its label when Show → Repo is on", () => {

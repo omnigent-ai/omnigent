@@ -62,6 +62,7 @@ import {
   MessageCirclePlusIcon,
   Maximize2Icon,
   Minimize2Icon,
+  MonitorCloudIcon,
   MoreHorizontalIcon,
   PencilIcon,
   PinIcon,
@@ -288,13 +289,7 @@ import {
 } from "@/lib/pullRequestStatus";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
-import {
-  deriveRepoName,
-  localMachineLabel,
-  resolveThisMachineHostId,
-  SANDBOX_REPO_LABEL_KEY,
-} from "./NewChatDialog";
-import { useDesktopHostId } from "./RevealInFileManager";
+import { deriveRepoName, SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
@@ -4463,22 +4458,13 @@ function sessionLocationLabel(
     : (host?.name ?? conversation.host_id);
 }
 
-/** A row's short environment: the sandbox type, this device, or "Remote"; the tooltip names the host. */
-function sessionEnvironmentLabel(
+/** The host picker's icon for where a session runs: a cloud monitor for a sandbox, else a laptop. */
+function sessionLocationIcon(
   conversation: Conversation,
   hostsById: ReadonlyMap<string, Host>,
-  desktopHostId: string | null,
-): string {
-  const hostId = conversation.host_id;
-  if (!hostId || hostsById.get(hostId)?.sandbox_provider) {
-    return sessionLocationLabel(conversation, hostsById);
-  }
-  const onlineHostIds = [...hostsById.values()]
-    .filter((h) => h.status === "online" && !h.sandbox_provider)
-    .map((h) => h.host_id);
-  return hostId === resolveThisMachineHostId(desktopHostId, isCurrentServerLocal(), onlineHostIds)
-    ? localMachineLabel(navigator.userAgent)
-    : "Remote";
+): LucideIcon {
+  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
+  return host?.sandbox_provider ? MonitorCloudIcon : LaptopIcon;
 }
 
 /** A managed-sandbox session's repo name from its first `omnigent.sandbox.repo` label; null otherwise. */
@@ -4487,17 +4473,6 @@ function sessionRepoName(conversation: Conversation): string | null {
   const workspace = labels[`${SANDBOX_REPO_LABEL_KEY}.0`] ?? labels[SANDBOX_REPO_LABEL_KEY];
   // Label value is `<url>[#<branch>]`; the name is derived from the url part.
   return workspace ? deriveRepoName(workspace.split("#")[0]!) : null;
-}
-
-// Its own component so only rows showing Environment subscribe to the desktop host id.
-function SessionEnvironmentLabel({
-  conversation,
-  hostsById,
-}: {
-  conversation: Conversation;
-  hostsById: ReadonlyMap<string, Host>;
-}) {
-  return sessionEnvironmentLabel(conversation, hostsById, useDesktopHostId());
 }
 
 // Its own component so only rows showing the timestamp subscribe to the shared clock.
@@ -4512,12 +4487,14 @@ function SessionMetaLine({
   repo,
   branch,
 }: {
-  environment: ReactNode;
+  environment: { icon: LucideIcon; label: string } | null;
   repo: string | null;
   branch: string | null;
 }) {
-  const parts: { key: string; icon: LucideIcon; value: ReactNode }[] = [];
-  if (environment != null) parts.push({ key: "environment", icon: LaptopIcon, value: environment });
+  const parts: { key: string; icon: LucideIcon; value: string }[] = [];
+  if (environment !== null) {
+    parts.push({ key: "environment", icon: environment.icon, value: environment.label });
+  }
   if (repo !== null) parts.push({ key: "repo", icon: FolderGit2Icon, value: repo });
   if (branch !== null) parts.push({ key: "branch", icon: GitBranchIcon, value: branch });
   if (parts.length === 0) return null;
@@ -4531,7 +4508,7 @@ function SessionMetaLine({
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
             <Icon aria-hidden className="size-3.5 shrink-0" />
-            <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
+            <span className="truncate">{value}</span>
           </span>
         </Fragment>
       ))}
@@ -4719,6 +4696,7 @@ function SessionTooltipContent({
     : conversation.agent_name === "nessie"
       ? { name: "nessie", harness: null }
       : null;
+  const LocationIcon = sessionLocationIcon(conversation, hostsById);
 
   return (
     <TooltipContent
@@ -4751,7 +4729,7 @@ function SessionTooltipContent({
           </span>
         )}
         <span data-testid="session-tooltip-location" className="flex min-w-0 items-center gap-1.5">
-          <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+          <LocationIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
         </span>
       </p>
@@ -4979,9 +4957,12 @@ function ConversationRowImpl({
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
   const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
-  const metaEnvironment = show.includes("environment") ? (
-    <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
-  ) : null;
+  const metaEnvironment = show.includes("environment")
+    ? {
+        icon: sessionLocationIcon(conversation, hostsById),
+        label: sessionLocationLabel(conversation, hostsById),
+      }
+    : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
   const loadBranch = show.includes("branch") && gitBranch === null;
   const { data: worktrees } = useSessionWorktrees(

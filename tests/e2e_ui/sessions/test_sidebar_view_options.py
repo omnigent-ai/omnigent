@@ -224,10 +224,10 @@ def test_grouping_and_show_toggles_persist_across_reload(
     page.get_by_test_id("session-show-environment").click()
     page.get_by_test_id("session-show-repo").click()
     page.keyboard.press("Escape")
-    # Environment is icon-only visually; its label remains available to screen readers.
+    # Environment names where the session runs after its icon.
     meta = "Local machine·omnigent·fix/payment-retries"
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(meta)
-    expect(idle_row.get_by_text("Local machine", exact=True)).to_have_class("sr-only")
+    expect(idle_row.get_by_text("Local machine", exact=True)).to_be_visible()
 
     page.reload()
     expect(_section_header(page, "Updated today")).to_be_visible(timeout=30_000)
