@@ -3,7 +3,7 @@ import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFi
 
 import { createElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -58,32 +58,35 @@ afterEach(() => {
   URL.revokeObjectURL = originalRevokeObjectURL;
 });
 
-function renderPreview(
-  path: string,
-  viewer: Partial<{
-    conversationId: string;
-    workspaceRoot: string | null;
-    workspaceHome: string | null;
-    workspacePathsLoading: boolean;
-  }> = {},
-) {
+type Viewer = Partial<{
+  conversationId: string;
+  workspaceRoot: string | null;
+  workspaceHome: string | null;
+  workspacePathsLoading: boolean;
+}>;
+
+function renderPreview(path: string, viewer: Viewer = {}) {
   // Default retries stay on so a test sees whether the preview opts out of them.
   const queryClient = new QueryClient();
-  const context = {
-    openFile: () => {},
-    openGithubTab: () => {},
-    isChangedPath: () => false,
-    conversationId: "conv-1",
-    workspaceRoot: "/ws",
-    workspaceHome: "/home/agent",
-    ...viewer,
+  const tree = (current: Viewer) => {
+    const context = {
+      openFile: () => {},
+      openGithubTab: () => {},
+      isChangedPath: () => false,
+      conversationId: "conv-1",
+      workspaceRoot: "/ws",
+      workspaceHome: "/home/agent",
+      ...current,
+    };
+    const preview = createElement(
+      FileViewerContext.Provider,
+      { value: context },
+      <ToolResultImages images={[{ kind: "file", path, alt: "home.png" }]} />,
+    );
+    return <QueryClientProvider client={queryClient}>{preview}</QueryClientProvider>;
   };
-  const preview = createElement(
-    FileViewerContext.Provider,
-    { value: context },
-    <ToolResultImages images={[{ kind: "file", path, alt: "home.png" }]} />,
-  );
-  return render(<QueryClientProvider client={queryClient}>{preview}</QueryClientProvider>);
+  const view = render(tree(viewer));
+  return { queryClient, setViewer: (next: Viewer) => view.rerender(tree(next)) };
 }
 
 describe("ToolResultImages", () => {
@@ -109,23 +112,23 @@ describe("ToolResultImages", () => {
     expect(createObjectURL.mock.calls[0]![0]).toMatchObject({ type: "image/png" });
   });
 
-  it("revokes the object URL when the preview unmounts", async () => {
-    const { unmount } = renderPreview("shots/home.png");
-    await screen.findByRole("img", { name: "home.png" });
-
-    unmount();
-
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-1");
-  });
-
   it.each([
     ["an absolute path", "/ws/shots/home.png", { workspaceRoot: null }],
     ["a home-relative path", "~/shots/home.png", { workspaceHome: null }],
-  ])("waits for the workspace environment before reading %s", (_label, path, paths) => {
-    renderPreview(path, { ...paths, workspacePathsLoading: true });
+  ])("waits for the workspace environment before reading %s", async (_label, path, paths) => {
+    const { setViewer } = renderPreview(path, { ...paths, workspacePathsLoading: true });
 
     expect(screen.getByRole("status", { name: "Loading image" })).toBeVisible();
     expect(authenticatedFetch).not.toHaveBeenCalled();
+
+    setViewer({ workspaceRoot: "/ws", workspaceHome: "/ws" });
+    expect(await screen.findByRole("img", { name: "home.png" })).toHaveAttribute(
+      "src",
+      "blob:mock-1",
+    );
+    expect(requestedUrls()).toEqual([
+      "/v1/sessions/conv-1/resources/environments/default/filesystem/shots/home.png",
+    ]);
   });
 
   it("shows the chip for a missing file without retrying the read", async () => {
@@ -139,7 +142,24 @@ describe("ToolResultImages", () => {
     expect(requestedUrls()).toHaveLength(1);
   });
 
-  type Viewer = Parameters<typeof renderPreview>[1];
+  it("drops a shown image for the chip once a refresh finds the file gone", async () => {
+    const { queryClient } = renderPreview("shots/home.png");
+    expect(await screen.findByRole("img", { name: "home.png" })).toHaveAttribute(
+      "src",
+      "blob:mock-1",
+    );
+
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async () => new Response("missing", { status: 404 }),
+    );
+    await act(() => queryClient.invalidateQueries());
+
+    await waitFor(() =>
+      expect(screen.getByRole("img", { name: "home.png" })).not.toHaveAttribute("src"),
+    );
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-1");
+  });
+
   it.each<[string, () => void, string, Viewer?]>([
     [
       "the file is too large to return",

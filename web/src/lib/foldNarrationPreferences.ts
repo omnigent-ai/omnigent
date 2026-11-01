@@ -15,4 +15,5 @@ const preference = createBooleanPreference(
 
 export const readFoldAssistantNarration = preference.read;
 export const writeFoldAssistantNarration = preference.write;
+export const notifyFoldAssistantNarrationChanged = preference.notify;
 export const useFoldAssistantNarration = preference.use;

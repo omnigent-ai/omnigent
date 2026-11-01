@@ -14,7 +14,7 @@ Every tool call an agent makes renders in the chat transcript as a muted row: an
 - `tool-long-output`: a result too long to show in full keeps the truncated preview with Expand.
 - `tool-states`: running (spinner and waiting indicator), cancelled, failed turn, and no output recorded.
 - `tool-file-link`: a single-file row shows its path workspace-relative and opens it in the file viewer.
-- `tool-result-images`: with Settings > Appearance > Chat defaults > "Show images from tool results" on (off by default), an image a tool returned shows under its row without expanding it, and clicking it zooms. A file read of a raster or SVG image (Claude `Read`, `sys_os_read`, Pi and OpenCode `read`) shows the file fetched from the session's workspace; an image block in the result (an MCP image result, or a lone image block) shows from the stored output. Previews follow their row: they hide while the run is folded behind Worked or a summary line.
+- `tool-result-images`: with Settings > Appearance > Chat defaults > "Show images from tool results" on (off by default), an image a tool returned shows under its row without expanding it, and clicking it zooms. A file read of a raster or SVG image (Claude `Read`, `sys_os_read`, Codex `view_image`, Pi and OpenCode `read`) shows the file fetched from the session's workspace; an image block in the result (an MCP image result, or a lone image block) shows from the stored output. Previews follow their row: they hide while the run is folded behind Worked or a summary line.
 - `tool-run-fold`: runs fold into one summary line; the live run keeps its last three rows visible, and durable routing or dispatch cards never fold.
 
 ## How to get to it (user POV)

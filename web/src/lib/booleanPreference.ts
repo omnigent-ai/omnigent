@@ -10,6 +10,8 @@ export interface BooleanPreference {
   read: () => boolean;
   /** Persist the preference and notify readers already on screen. */
   write: (enabled: boolean) => void;
+  /** Tell readers on screen to re-read, after writing the key directly. */
+  notify: () => void;
   /** Live value of the preference, for components. */
   use: () => boolean;
 }
@@ -38,6 +40,10 @@ export function createBooleanPreference(
     }
   };
 
+  const notify = (): void => {
+    if (typeof window !== "undefined") window.dispatchEvent(new Event(changeEvent));
+  };
+
   const write = (enabled: boolean): void => {
     if (typeof window === "undefined") return;
     try {
@@ -49,7 +55,7 @@ export function createBooleanPreference(
     } catch {
       // A storage failure must not break Settings.
     }
-    window.dispatchEvent(new Event(changeEvent));
+    notify();
   };
 
   const subscribe = (listener: () => void): (() => void) => {
@@ -72,5 +78,5 @@ export function createBooleanPreference(
 
   const use = (): boolean => useSyncExternalStore(subscribe, read, () => defaultValue);
 
-  return { storageKey, defaultValue, read, write, use };
+  return { storageKey, defaultValue, read, write, notify, use };
 }

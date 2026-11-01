@@ -1,7 +1,14 @@
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
-import { SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY } from "./toolResultImagePreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  useFoldAssistantNarration,
+} from "./foldNarrationPreferences";
+import {
+  SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY,
+  useShowToolResultImages,
+} from "./toolResultImagePreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   readHiddenPickerAgents,
@@ -131,6 +138,24 @@ describe.each([
     });
     expect(localStorage.getItem(storageKey)).toBe("true");
   });
+});
+
+it.each([
+  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY, useFoldAssistantNarration],
+  ["tool result images", SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY, useShowToolResultImages],
+])("tells mounted %s readers about an import", (_label, storageKey, usePreference) => {
+  const { result } = renderHook(() => usePreference());
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: { [storageKey]: "true" } });
+  });
+  expect(result.current).toBe(true);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(result.current).toBe(false);
 });
 
 it("carries hidden picker entries through export and import and tells an open picker", () => {

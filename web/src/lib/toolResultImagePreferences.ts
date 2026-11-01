@@ -14,4 +14,5 @@ const preference = createBooleanPreference(
 
 export const readShowToolResultImages = preference.read;
 export const writeShowToolResultImages = preference.write;
+export const notifyShowToolResultImagesChanged = preference.notify;
 export const useShowToolResultImages = preference.use;

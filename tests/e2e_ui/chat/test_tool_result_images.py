@@ -36,7 +36,7 @@ _SCREENSHOT = "settings-dark.png"
 _READ_REPLY = "The dark-mode settings page looks right: the cards keep their contrast."
 _MCP_REPLY = "The preview shows the cards rendering in dark mode."
 # Long enough for the live row to be seen before the turn settles and folds.
-_REPLY_DELAY_S = 6.0
+_REPLY_DELAY_S = 20.0
 
 _AGENT_YAML = """\
 spec_version: 1

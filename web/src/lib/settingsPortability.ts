@@ -8,8 +8,14 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
-import { SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY } from "./toolResultImagePreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  notifyFoldAssistantNarrationChanged,
+} from "./foldNarrationPreferences";
+import {
+  notifyShowToolResultImagesChanged,
+  SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY,
+} from "./toolResultImagePreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
@@ -165,6 +171,8 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   // Same-tab writes fire no storage event, so the subscribable preferences
   // have to be told; otherwise an open picker keeps the pre-import set.
   notifyHiddenPickerAgentsChanged();
+  notifyFoldAssistantNarrationChanged();
+  notifyShowToolResultImagesChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

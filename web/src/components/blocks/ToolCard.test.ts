@@ -1034,10 +1034,12 @@ describe("ToolCard result images", () => {
 
   afterEach(() => writeShowToolResultImages(false));
 
-  it("shows a returned image under the collapsed row when the setting is on", () => {
-    writeShowToolResultImages(true);
+  it("shows a returned image under the collapsed row while the setting is on", () => {
     const { container } = renderCard(screenshotCall);
+    expect(screen.queryByTestId("tool-result-images")).toBeNull();
+    expect(screen.queryByRole("img", { name: "Tool result image" })).toBeNull();
 
+    act(() => writeShowToolResultImages(true));
     const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
     expect(trigger).toHaveAttribute("aria-expanded", "false");
     const previews = screen.getByTestId("tool-result-images");
@@ -1047,15 +1049,6 @@ describe("ToolCard result images", () => {
     );
     // The preview sits beside the row, so collapsing never hides it.
     expect(trigger).not.toContainElement(previews);
-  });
-
-  it("adds and removes the preview as the setting changes", () => {
-    renderCard(screenshotCall);
-    expect(screen.queryByTestId("tool-result-images")).toBeNull();
-    expect(screen.queryByRole("img", { name: "Tool result image" })).toBeNull();
-
-    act(() => writeShowToolResultImages(true));
-    expect(screen.getByTestId("tool-result-images")).toBeInTheDocument();
 
     act(() => writeShowToolResultImages(false));
     expect(screen.queryByTestId("tool-result-images")).toBeNull();

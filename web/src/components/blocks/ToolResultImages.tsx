@@ -39,9 +39,11 @@ function WorkspaceFileImage({ path, alt }: { path: string; alt: string }) {
   const waitingForPaths = resolved === null && loading && /^(?:\/|~(?:\/|$))/.test(path);
   // A best-effort preview shows the chip at once rather than retrying a missing file.
   const query = useFileContent(conversationId, resolved, { retry: false });
+  // A failed refresh keeps the old bytes cached; drop them so a deleted file shows the chip.
+  const current = query.isError ? undefined : query.data;
   const blob = useMemo(
-    () => (query.data && !query.data.truncated ? fileContentToBlob(query.data) : null),
-    [query.data],
+    () => (current && !current.truncated ? fileContentToBlob(current) : null),
+    [current],
   );
   const src = useObjectUrl(blob);
 
