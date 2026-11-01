@@ -159,7 +159,7 @@ def test_profile_binding_queries_stay_bounded_with_many_unrelated_labels(store):
     assert current.labels == expected
 
 
-@pytest.mark.parametrize("operation", ["create", "set", "delete", "fork_extra"])
+@pytest.mark.parametrize("operation", ["create", "set", "delete", "set_delete", "fork_extra"])
 def test_generic_label_writers_cannot_forge_or_clear_a_profile(store, operation):
     session = store.create_conversation()
     SandboxProfileStore(store).bind_session(session.id, PROFILE)
@@ -171,6 +171,8 @@ def test_generic_label_writers_cannot_forge_or_clear_a_profile(store, operation)
             store.set_labels(session.id, labels)
         elif operation == "delete":
             store.delete_label(session.id, "sandbox_profile:id")
+        elif operation == "set_delete":
+            store.set_labels(session.id, {}, delete_keys=["sandbox_profile:id"])
         else:
             store.fork_conversation(session.id, extra_labels=labels)
     assert SandboxProfileStore(store).get_session_snapshot(session.id) == PROFILE
