@@ -318,9 +318,10 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
 
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
 @pytest.mark.parametrize("full_fork", [False, True])
-async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_reads(
-    auth_client, auth_app, peers, db_uri, execution_target, full_fork
+async def test_scheduled_origin_allows_new_controls_children_and_reads(
+    auth_client, auth_app, peers, db_uri, monkeypatch, execution_target, full_fork
 ):
+    from omnigent.server.routes.sessions import routes_core
     from omnigent.server.scheduled.fire import FireDeps, build_on_fire
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
     from tests._helpers.polling import poll_until_async
@@ -373,12 +374,22 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
             == task.id
         )
 
+    # Managed creation succeeds now; record its launch instead of provisioning.
+    launched_by = []
+
+    async def launch(**kwargs):
+        launched_by.append(kwargs["owner"])
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
     scheduled = {"id": scheduled_id}
     auth_client.headers.update(_bind_runner(db_uri, scheduled_id))
     for depth in range(3):
         captured.clear()
+        # A scheduled run, its forks and children message the owner's sessions
+        # like any private session they own.
         result = await _send(auth_client, scheduled, target)
-        assert "Scheduled sessions cannot" in result["detail"], result
+        assert result.get("queued") is True, result
+        assert "Please inspect the PR" in json.dumps(captured)
         for placement in ("same_host", "managed"):
             result = json.loads(
                 await execute_tool(
@@ -388,8 +399,12 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
                     conversation_id=scheduled["id"],
                 )
             )
-            assert result.get("error") == "access_denied", result
-        assert not captured.get("posts")
+            if placement == "managed":
+                assert result.get("conversation_id"), result
+            else:
+                # Same-host placement needs a live host this test does not
+                # register; it must not fail on the scheduled origin.
+                assert result.get("error") != "access_denied", result
         history = json.loads(
             await execute_tool(
                 tool_name="sys_session_get_history",
@@ -408,6 +423,8 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
             assert response.status_code == 201, response.text
             scheduled = response.json()
 
+    await poll_until_async(lambda: len(launched_by) == 3, timeout_s=5)
+    assert launched_by == ["alice"] * 3
     for labels in (
         {SCHEDULED_TASK_ORIGIN_LABEL_KEY: ""},
         {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "other"},

@@ -21,6 +21,7 @@ import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
+import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
@@ -84,6 +85,7 @@ initNativeInsets();
 
 // Scope the macOS frameless-window CSS from <html> before first paint.
 applyMacElectronShellAttribute();
+applyMobileAppTargetAttribute();
 
 // The Chat/Terminal switcher lives in the header (ViewModeToggle) on every
 // shell; assert the iOS shell's legacy bottom pill hidden before the router
