@@ -301,6 +301,15 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).not.toHaveBeenCalled();
   });
 
+  it("names no model-picker shortcut, since none opens this picker", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    fireEvent.focus(await screen.findByTestId("new-chat-landing-agent-select"));
+    expect(await screen.findByTestId("new-chat-landing-agent-tooltip")).not.toHaveTextContent(
+      "Open model picker",
+    );
+  });
+
   it("offers the same agent set as the composer picker (hidden agents excluded)", async () => {
     // Filter parity with the new-session composer (selectableSessionAgents):
     // if this picker offered an agent the composer hides, a project could pin

@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
@@ -223,6 +224,25 @@ describe("CommandPalette — sessions", () => {
     fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
     expect(navigate).toHaveBeenCalledWith("/c/c99");
   });
+  it("shows each action's chord beside its row, and hides the workspace chord on grid routes", () => {
+    const chordsFor = (label: string) =>
+      Array.from(
+        screen
+          .getByText(label)
+          .closest("[cmdk-item]")!
+          .querySelectorAll<HTMLElement>('[data-slot="kbd"]'),
+      ).map((key) => key.textContent);
+    renderPalette();
+    expect(chordsFor("Go to Settings")).toEqual([MOD_KEY, ALT_KEY, ","]);
+    expect(chordsFor("Toggle conversations sidebar")).toEqual([MOD_KEY, ALT_KEY, "["]);
+    expect(chordsFor("Toggle workspace sidebar")).toEqual([MOD_KEY, ALT_KEY, "]"]);
+    expect(chordsFor("Go to Inbox")).toEqual([]);
+    cleanup();
+
+    renderPalette({ rightSidebarShortcutEnabled: false });
+    expect(chordsFor("Toggle workspace sidebar")).toEqual([]);
+  });
+
   it("lists sessions by display label with their agent type", () => {
     setSessions([conv("c1", "Fix the parser", "research-agent"), conv("c2", null)]);
     renderPalette();

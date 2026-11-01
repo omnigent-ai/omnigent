@@ -7389,6 +7389,14 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
+  it("names the model-picker shortcut in the picker's tooltip", async () => {
+    renderLanding();
+    fireEvent.focus(screen.getByTestId("new-chat-landing-agent-select"));
+    expect(await screen.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
+      "Open model picker",
+    );
+  });
+
   it("replaces a selected broken harness model label with a warning tooltip", async () => {
     renderLanding();
     breakSelectedHarness("a2", "codex-native", false);

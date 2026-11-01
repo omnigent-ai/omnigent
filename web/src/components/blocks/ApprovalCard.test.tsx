@@ -1,8 +1,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import type { ClaudeQuestion, ClaudeQuestionOption } from "@/lib/askUserQuestion";
 import {
@@ -10,6 +20,7 @@ import {
   clearAskUserQuestionDraft,
   getAskUserQuestionDraft,
 } from "@/lib/askUserQuestionDrafts";
+import type { AnyBlock } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles, type RenderItem } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
@@ -41,6 +52,73 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.getByRole("button", { name: /approve/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
     expect(screen.queryByTestId("approval-card-options")).toBeNull();
+  });
+
+  describe("the approve chord in the Approve button tooltip", () => {
+    const pending = (elicitationId: string, requestedSchema: object = {}) => ({
+      type: "elicitation",
+      elicitationId,
+      status: "pending",
+      requestedSchema,
+    });
+    const FIELD_SCHEMA = {
+      type: "object",
+      properties: { branch: { type: "string" } },
+      required: ["branch"],
+    };
+
+    afterEach(() => {
+      useChatStore.setState({ blocks: [] });
+    });
+
+    it.each([
+      {
+        name: "shows on the prompt the chord approves",
+        bound: true,
+        blocks: [pending("elic_chord")],
+        keys: [MOD_KEY, ENTER_KEY],
+      },
+      {
+        name: "hides on an older prompt, since the chord approves the newer one",
+        bound: true,
+        blocks: [pending("elic_chord"), pending("elic_newer")],
+        keys: [],
+      },
+      {
+        name: "hides on an older approval behind a newer form",
+        bound: true,
+        blocks: [pending("elic_chord"), pending("elic_form", FIELD_SCHEMA)],
+        keys: [],
+      },
+      {
+        name: "hides where nothing binds the chord, as on the standalone approval page",
+        bound: false,
+        blocks: [pending("elic_chord")],
+        keys: [],
+      },
+    ])("$name", async ({ bound, blocks, keys }) => {
+      useChatStore.setState({ blocks: blocks as AnyBlock[] });
+      if (bound) renderHook(() => useApproveHotkey());
+      render(
+        <ApprovalCard
+          elicitationId="elic_chord"
+          message="Approve running ls?"
+          phase="tool_call"
+          policyName="approve_shell_commands"
+          contentPreview="ls"
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Approve" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      expect(tooltip).toHaveTextContent("Approve");
+      const shown = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+      expect(shown.map((key) => key.textContent)).toEqual(keys);
+    });
   });
 
   it("shows the harness name instead of the synthetic policy stamp on native prompts", () => {

@@ -29,7 +29,10 @@ import { BotIcon, WandSparklesIcon, FileTextIcon, Loader2Icon, XIcon } from "luc
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
+  CompactShortcutKeys,
+  ESC_KEY,
   KeyboardShortcutTooltipContent,
+  SHIFT_KEY,
 } from "@/components/KeyboardShortcut";
 import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -74,7 +77,7 @@ import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
-import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
+import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
@@ -2591,10 +2594,9 @@ function ComposerImpl(
   // Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
   // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
   // exists and the gear isn't disabled (not read-only, unreachable, or busy).
-  useModelPickerHotkey(
-    () => setPickerOpenNonce((n) => n + 1),
-    showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable && !configBusy,
-  );
+  const modelPickerHotkeyEnabled =
+    showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable && !configBusy;
+  useModelPickerHotkey(() => setPickerOpenNonce((n) => n + 1), modelPickerHotkeyEnabled);
   const hydratedComposerContext = useMemo(
     () => composerContextFromLabels(composerSession?.labels),
     [composerSession?.labels],
@@ -3787,6 +3789,16 @@ function ComposerImpl(
     });
   };
 
+  // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
+  const composerEmptyForRecall =
+    fullText === "" && files.length === 0 && mentionedItems.length === 0;
+  // The queued row ↑ recalls: the queue tail, only while the composer takes input and
+  // is empty and quote-free.
+  const arrowUpRecallQueueId =
+    !inputDisabled && composerEmptyForRecall && draft.quotes.length === 0
+      ? composerQueuedMessages.at(-1)?.queueId
+      : undefined;
+
   const handleKeyDown = (
     e: KeyboardEvent<HTMLTextAreaElement>,
     {
@@ -3858,7 +3870,7 @@ function ComposerImpl(
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
         // Empty-composer recall takes the last queued row before browsing history.
-        if (fullText === "" && files.length === 0 && mentionedItems.length === 0) {
+        if (composerEmptyForRecall) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
           if (target !== undefined) {
             e.preventDefault();
@@ -3939,6 +3951,7 @@ function ComposerImpl(
             elsewhere never leaks in. */}
         <QueuedMessagesStrip
           messages={composerQueuedMessages}
+          arrowUpRecallQueueId={arrowUpRecallQueueId}
           onDelete={dequeueMessage}
           onEdit={(queueId) => {
             // Pull the queued message back into the composer for editing:
@@ -4283,6 +4296,7 @@ function ComposerImpl(
                       ? undefined
                       : "Only the session owner can change the permission mode"
                   }
+                  shortcut={nextFromSelected === null ? undefined : [SHIFT_KEY, "Tab"]}
                   onSelect={(mode) => void changePermission(mode)}
                   openNonce={permissionPickerOpenNonce}
                 />
@@ -4323,6 +4337,7 @@ function ComposerImpl(
                   // no message can wake (unreachable) get an inert gear.
                   disabled={isReadOnly || unreachable}
                   openNonce={pickerOpenNonce}
+                  modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
                 />
               </div>
               <ComposerMicButton
@@ -4363,15 +4378,19 @@ function ComposerImpl(
                             sendDisabledReason !== null ||
                             hasPendingElicitation
                       }
-                      title={showInterruptButton ? "Interrupt" : (sendDisabledReason ?? undefined)}
+                      title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
                       label={showInterruptButton ? "Interrupt" : "Send"}
                     />
                   </TooltipTrigger>
-                  {!showInterruptButton && !preventsKeyboardSubmit && (
-                    <KeyboardShortcutTooltipContent
-                      label="Send"
-                      keys={composerSendShortcutKeys(submitWithModEnter)}
-                    />
+                  {showInterruptButton ? (
+                    <KeyboardShortcutTooltipContent label="Interrupt" keys={[ESC_KEY]} />
+                  ) : (
+                    !preventsKeyboardSubmit && (
+                      <KeyboardShortcutTooltipContent
+                        label="Send"
+                        keys={composerSendShortcutKeys(submitWithModEnter)}
+                      />
+                    )
                   )}
                 </Tooltip>
               </TooltipProvider>
@@ -4789,6 +4808,7 @@ function SessionHarnessPicker({
   modelPickWakesSession,
   disabled,
   openNonce = 0,
+  modelPickerShortcutEnabled = false,
 }: {
   busy: boolean;
   busyRef: { current: boolean };
@@ -4811,6 +4831,8 @@ function SessionHarnessPicker({
   modelPickWakesSession: boolean;
   disabled: boolean;
   openNonce?: number;
+  /** Whether the Ctrl+Shift+M hotkey opens this picker (mirrors its enabled state). */
+  modelPickerShortcutEnabled?: boolean;
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -5233,7 +5255,17 @@ function SessionHarnessPicker({
           (sessionModelSeeded || pendingModelChange !== null) &&
           (modelPickerKind === "claude" || modelPickerKind === "codex"),
       }}
-      tooltip={<ComposerConfigTooltipRows rows={summary} />}
+      tooltip={
+        <>
+          <ComposerConfigTooltipRows rows={summary} />
+          {modelPickerShortcutEnabled && (
+            <span className="flex items-center gap-2 pt-1 text-muted-foreground">
+              Open model picker
+              <CompactShortcutKeys keys={MODEL_PICKER_KEYS} />
+            </span>
+          )}
+        </>
+      }
       tooltipTestId="composer-config-gear-tooltip"
       testId="composer-agent-menu"
     >
