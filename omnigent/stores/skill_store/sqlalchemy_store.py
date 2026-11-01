@@ -195,6 +195,15 @@ def _chunks(values: Iterable[str], size: int) -> Iterable[list[str]]:
         yield batch
 
 
+def _fits_source_row(url: str, ref: str | None, path: str) -> bool:
+    """Whether a source row could hold *url*, *ref* and *path* (as :meth:`add_source` checks)."""
+    return (
+        len(url) <= MAX_URL_CHARS
+        and (ref is None or len(ref) <= MAX_REF_CHARS)
+        and len(path) <= MAX_SOURCE_PATH_CHARS
+    )
+
+
 def _source_identity(url: str, ref: str | None, path: str):  # type: ignore[no-untyped-def]  # Select
     """The lookup ``ux_skill_sources_identity`` serves."""
     return select(SqlSkillSource).where(
@@ -253,6 +262,8 @@ class SqlAlchemySkillStore(SkillStore):
             return run_write_transaction(self._session_immediate, "add_skill_source_retry", write)
 
     def find_source(self, url: str, ref: str | None, path: str = "") -> SkillSource | None:
+        if not _fits_source_row(url, ref, path):
+            return None
         with self._session("find_skill_source") as session:
             row = session.scalar(_source_identity(url, ref, path))
             return None if row is None else _source_entity(row)
@@ -260,8 +271,12 @@ class SqlAlchemySkillStore(SkillStore):
     def listed_source_paths(self, url: str, ref: str | None, paths: Collection[str]) -> set[str]:
         """Lookups on ``ux_skill_sources_identity``, one IN-list per 100 paths."""
         found: set[str] = set()
+        # A value longer than its column cannot be a listed source, and binding it would fail.
+        candidates = {path for path in paths if _fits_source_row(url, ref, path)}
+        if not candidates:
+            return found
         with self._session("find_listed_skill_source_paths") as session:
-            for batch in _chunks(sorted(set(paths)), _NAMES_PER_QUERY):
+            for batch in _chunks(sorted(candidates), _NAMES_PER_QUERY):
                 stmt = select(SqlSkillSource.path).where(
                     SqlSkillSource.workspace_id == current_workspace_id(),
                     SqlSkillSource.url == url,

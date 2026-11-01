@@ -24,7 +24,7 @@ from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.skill_injection import effective_installed_skills, with_installed_skills
-from omnigent.skills.limits import MAX_INSTALLED_PER_OWNER, MAX_PAGE
+from omnigent.skills.limits import MAX_INSTALLED_PER_OWNER, MAX_PAGE, MAX_SOURCE_PATH_CHARS
 from omnigent.skills.service import SkillFetcher
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -1226,8 +1226,8 @@ def test_a_bundle_namespace_folder_is_a_reserved_install_name(tmp_path: Path) ->
 
 
 def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None:
-    # With URL installs off, delivery read every source page to decide which
-    # installs came from a listed one, so its work grew with the source count.
+    # With URL installs off, delivery's work follows the installed set, not the
+    # source count, and a path longer than a source row can hold still resolves.
     import sqlalchemy as sa
 
     from omnigent.db.utils import get_or_create_engine
@@ -1249,6 +1249,22 @@ def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None
         bundle_bytes=1,
         installed_by=None,
     )
+    deep = f"skills/{'d' * 190}/demo"
+    assert len(deep) > MAX_SOURCE_PATH_CHARS
+    store.install(
+        name="demo",
+        display_name=None,
+        description="d",
+        source_url=REPO_URL,
+        ref=None,
+        commit=None,
+        path=deep,
+        scope="org",
+        owner_user_id=None,
+        bundle_location="skills/demo.tar.gz",
+        bundle_bytes=1,
+        installed_by=None,
+    )
     policy = SkillsMarketplacePolicy(allow_url_install=False)
     engine = get_or_create_engine(db_uri)
     statements: list[str] = []
@@ -1260,9 +1276,8 @@ def test_delivery_work_does_not_grow_with_unrelated_sources(db_uri: str) -> None
         statements.clear()
         sa.event.listen(engine, "before_cursor_execute", count)
         try:
-            assert [s.name for s in effective_installed_skills(store, "alice", policy=policy)] == [
-                "review"
-            ]
+            delivered = effective_installed_skills(store, "alice", policy=policy)
+            assert sorted(s.name for s in delivered) == ["demo", "review"]
         finally:
             sa.event.remove(engine, "before_cursor_execute", count)
         return len(statements)

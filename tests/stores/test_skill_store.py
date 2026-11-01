@@ -7,6 +7,7 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from omnigent.db.utils import get_or_create_engine
+from omnigent.skills.limits import MAX_REF_CHARS, MAX_SOURCE_PATH_CHARS, MAX_URL_CHARS
 from omnigent.stores.skill_store import SkillInstall, SkillQuotaError, SkillValueError
 from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
 
@@ -55,6 +56,24 @@ def test_sources_dedupe_on_url_and_ref(store: SqlAlchemySkillStore) -> None:
     assert store.delete_source(first.id) is True
     assert store.delete_source(first.id) is False
     assert [s.name for s in store.list_sources().data] == ["Acme v2"]
+
+
+def test_source_lookups_answer_absent_for_values_no_source_row_can_hold(
+    store: SqlAlchemySkillStore,
+) -> None:
+    at_limit = "p" * MAX_SOURCE_PATH_CHARS
+    store.add_source(url=URL, ref=None, path="", name="root", created_by=None)
+    store.add_source(url=URL, ref=None, path=at_limit, name="deep", created_by=None)
+    too_long_url = "https://github.com/" + "a" * MAX_URL_CHARS
+    assert store.find_source(URL, None, at_limit) is not None
+    assert store.find_source(URL, None, at_limit + "p") is None
+    assert store.find_source(too_long_url, None) is None
+    assert store.find_source(URL, "r" * (MAX_REF_CHARS + 1)) is None
+    # Ancestors too long for a source row are dropped; the shorter ones still match.
+    longer = at_limit + "/skill"
+    assert store.listed_source_paths(URL, None, ["", at_limit, longer]) == {"", at_limit}
+    assert store.listed_source_paths(too_long_url, None, [""]) == set()
+    assert store.listed_source_paths(URL, "r" * (MAX_REF_CHARS + 1), [""]) == set()
 
 
 def test_concurrent_source_seeding_ends_on_one_row(

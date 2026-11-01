@@ -133,11 +133,14 @@ class SkillStore(ABC):
 
     @abstractmethod
     def find_source(self, url: str, ref: str | None, path: str = "") -> SkillSource | None:
-        """The source for this exact ``(url, ref, path)``, if any."""
+        """The source for this exact ``(url, ref, path)``; ``None`` for values no source fits."""
 
     @abstractmethod
     def listed_source_paths(self, url: str, ref: str | None, paths: Collection[str]) -> set[str]:
-        """Which of *paths* are sources of this repository and ref; point lookups only."""
+        """Which of *paths* are sources of this repository and ref; point lookups only.
+
+        A value longer than a source row holds is never one, and is not queried.
+        """
 
     @abstractmethod
     def list_sources(
