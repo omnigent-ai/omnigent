@@ -2425,7 +2425,9 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
 
     host_queries: list[str] = []
 
-    async def _fake_host_options(host_id: str) -> list[dict[str, object]] | None:
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
         host_queries.append(host_id)
         return [{"id": "opus", "displayName": "Opus"}]
 
@@ -2460,6 +2462,96 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
     assert host_queries == ["host_abc"]
     assert [m.id for m in snapshot.model_options] == ["opus"]
     assert session_id in _mod._model_options_stale
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_fills_cold_pi_catalog_from_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cold pi-native catalog falls back to the session's host.
+
+    The extension pushes the pi catalog once, at session start, into an
+    in-memory cache. A server restart while the session sleeps empties it and
+    nothing re-pushes until the session is resumed, so the picker would stay
+    hidden. The snapshot asks the session's host instead (the same source the
+    new-session picker uses) and fills the pushed cache, which a later
+    extension push still replaces.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "conv_pi_host_catalog"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._pushed_model_options_cache.clear()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    host_queries: list[tuple[str, str]] = []
+
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        host_queries.append((host_id, harness))
+        return [{"id": "omnigent/haiku", "displayName": "Haiku"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="host_abc",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert host_queries == [("host_abc", "pi-native")]
+    assert [m.id for m in snapshot.model_options] == ["omnigent/haiku"]
+    # Not stale-marked: pi's picker reads only the pushed cache.
+    assert session_id not in _mod._model_options_stale
+
+
+@pytest.mark.asyncio
+async def test_pi_host_fill_does_not_clobber_extension_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog the extension pushed mid-fetch wins over the host's rows."""
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "conv_pi_push_wins"
+    _mod._pushed_model_options_cache.clear()
+
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        _mod._pushed_model_options_cache[session_id] = [{"id": "pushed"}]
+        return [{"id": "from-host"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    await _mod._load_model_options_from_host(session_id, "host_abc", "pi-native")
+
+    assert [m["id"] for m in _mod._pushed_model_options_cache[session_id]] == ["pushed"]
 
 
 @pytest.mark.asyncio
