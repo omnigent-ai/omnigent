@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
@@ -354,6 +355,28 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     module = sys.modules.get("omnigent.server.smart_routing")
     if module is not None:
         module._runner_catalog_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_databricks_auth_memory() -> None:
+    """
+    Start every test without shared Databricks token sources or remembered profiles.
+
+    Both are meant to outlive a single client: the token sources are
+    process-global and keyed by server URL, which tests reuse, and the
+    remembered profiles live in the shared test data dir. Either would let one
+    test's resolution answer another's. The reset runs before the test, not
+    at teardown, where a test's ``Path.unlink`` patch can still be active.
+
+    :returns: None.
+    """
+    chat = sys.modules.get("omnigent.chat")
+    if chat is not None:
+        chat._databricks_auth_cache.clear()
+    executor = sys.modules.get("omnigent.inner.databricks_executor")
+    if executor is not None:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(_TEST_OMNIGENT_DATA_DIR / executor._REMEMBERED_PROFILES_FILE)
 
 
 @pytest.fixture(autouse=True)

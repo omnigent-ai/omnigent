@@ -3,6 +3,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
+import { useChatStore } from "@/store/chatStore";
 import { isNativeFindShortcut, type TranscriptGeometry, VirtualBubbleList } from "./Transcript";
 
 afterEach(cleanup);
@@ -208,6 +209,37 @@ it("keeps actions visible only on a final assistant message while idle", () => {
     "md:opacity-0",
   );
 });
+
+it("keeps the final reply's actions hover-only while a follow-up is queued", () => {
+  useChatStore.setState({
+    queuedMessages: [{ queueId: "q_1", text: "and the tests?", conversationId: "conv-1" }],
+  });
+  try {
+    render(messageList([bubble, assistantBubble], false, true));
+    const replyCopy = screen.getAllByRole("button", { name: "Copy" }).at(-1)!;
+    expect(actionFooter(replyCopy)).toHaveClass("md:opacity-0");
+  } finally {
+    useChatStore.setState({ queuedMessages: [] });
+  }
+});
+
+it.each([{ requiresRetry: true }, { waitingForHost: true }])(
+  "keeps the final reply's actions visible while a queued follow-up cannot send (%o)",
+  (blocked) => {
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_1", text: "and the tests?", conversationId: "conv-1", ...blocked },
+      ],
+    });
+    try {
+      render(messageList([bubble, assistantBubble], false, true));
+      const replyCopy = screen.getAllByRole("button", { name: "Copy" }).at(-1)!;
+      expect(actionFooter(replyCopy)).toHaveClass("opacity-100");
+    } finally {
+      useChatStore.setState({ queuedMessages: [] });
+    }
+  },
+);
 
 it("keeps every action row hover-only when the final message is from the user", () => {
   render(messageList([assistantBubble, bubble], false, true));
