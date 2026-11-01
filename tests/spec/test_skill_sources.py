@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -964,15 +965,20 @@ def test_claude_provider_skips_install_path_outside_plugins_root(
     assert "sp:using-superpowers" not in names
 
 
-def _configure_claude_launch(config_home: Path, launches: Path, script: str) -> None:
-    """Make the native Claude command a script that records its launch, then runs *script*."""
-    launcher = config_home / "claude-launcher"
+def _write_launch_recorder(launcher: Path, launches: Path, script: str) -> None:
+    """Write an executable that records its launch to *launches*, then runs *script*."""
     launcher.write_text(
         f"#!{sys.executable}\nimport json, os, sys, time\n"
         f"with open({str(launches)!r}, 'a') as out:\n"
         "    out.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n')\n" + script
     )
     launcher.chmod(0o755)
+
+
+def _configure_claude_launch(config_home: Path, launches: Path, script: str) -> None:
+    """Make the native Claude command a script that records its launch, then runs *script*."""
+    launcher = config_home / "claude-launcher"
+    _write_launch_recorder(launcher, launches, script)
     (config_home / "config.yaml").write_text(
         json.dumps({"harness": {"claude-native": {"command": str(launcher), "args": ["--"]}}})
     )
@@ -1041,6 +1047,10 @@ def test_claude_launch_is_probed_only_for_a_customized_native_launch(
     home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     launches = tmp_path / "launches.jsonl"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_launch_recorder(bin_dir / "claude", launches, _print_init([]))
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
     resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
     _configure_claude_launch(config_home, launches, _print_init([]))
@@ -1051,15 +1061,15 @@ def test_claude_launch_is_probed_only_for_a_customized_native_launch(
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize(
-    ("script", "summary"),
+    ("script", "timeout_s", "summary"),
     [
-        ("sys.exit(3)\n", "did not report its plugins"),
-        ("time.sleep(30)\n", "timed out after 0.5s"),
+        ("sys.exit(3)\n", 10.0, "did not report its plugins"),
+        ("time.sleep(30)\n", 0.5, "timed out after 0.5s"),
     ],
     ids=["no-init", "timeout"],
 )
 def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str, summary: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str, timeout_s: float, summary: str
 ) -> None:
     home = _claude_home_with_plugin(
         tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
@@ -1070,7 +1080,7 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
         script,
     )
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.plugin_discovery.LAUNCH_PLUGINS_TIMEOUT_S", 0.5
+        "omnigent.harnesses.claude_native.plugin_discovery.LAUNCH_PLUGINS_TIMEOUT_S", timeout_s
     )
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     warnings: list[str] = []
