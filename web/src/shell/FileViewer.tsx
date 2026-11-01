@@ -102,7 +102,7 @@ import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
+import { type ChangedSort, groupChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
   MONACO_SPLIT_BREAKPOINT,
@@ -437,18 +437,27 @@ function FileViewerBody({
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
   const onScreen = open && isActiveViewport && mediaActive;
-  // Video playback reads the complete binary on demand, never the capped JSON preview.
-  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path, {
-    visible: onScreen,
-  });
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const isDeletedFile =
+    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  // Video playback reads the complete binary on demand, never the capped JSON preview.
+  const fileQuery = useFileContent(
+    conversationId,
+    isVideoFile(path) || isDeletedFile ? null : path,
+    {
+      visible: onScreen,
+    },
+  );
 
   // Build the navigable file list from all changed files (including deleted),
   // sorted the same way FilesPanel sorts its flat view so the "X/N" index
   // matches the Changes list position. Memoized so the sort runs only when the
   // changed-files list or sort order changes, not on every viewer re-render.
   const navigableFiles = useMemo(
-    () => [...(changedFiles.data?.data ?? [])].sort(compareChangedFiles(sort)).map((f) => f.path),
+    () =>
+      groupChangedFiles(changedFiles.data?.data ?? [], sort).flatMap((group) =>
+        group.files.map((file) => file.path),
+      ),
     [changedFiles.data?.data, sort],
   );
   const currentNavIdx = navigableFiles.indexOf(path);
@@ -798,8 +807,6 @@ function FileViewerBody({
     !isVideo &&
     !isModel &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
-  const isDeletedFile =
-    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
 
@@ -818,8 +825,9 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
+  const effectiveDiffActive = diffActive || isDeletedFile;
   const requestedDiff =
-    open && isActiveViewport && diffActive && !isImage && !isPdf && !isVideo && !isModel;
+    open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
   const linkedDiff =
     requestedDiff &&
@@ -915,7 +923,7 @@ function FileViewerBody({
       : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
+    effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
 
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
@@ -1260,7 +1268,7 @@ function FileViewerBody({
       setCommentsOpen((prev) => !prev);
     },
   });
-  if (!isPdf && isDiffAvailable) {
+  if (!isPdf && !isDeletedFile && isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
       label: viewMode === "diff" ? "Exit diff view" : "Show diff",
@@ -1797,6 +1805,13 @@ function FileViewerBody({
             !diffQuery.data ? (
               <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                 Loading diff…
+              </div>
+            ) : diffQuery.data.baseline_state === "unknown" ? (
+              <div
+                role="status"
+                className="flex items-center justify-center p-8 text-muted-foreground text-ui"
+              >
+                Original content unavailable
               </div>
             ) : (
               // Keep viewer state on resize without computing the CSS-hidden copy's diff.

@@ -23,7 +23,8 @@ and the recording protocol for comparing revisions.
 ## How to get to it (user POV)
 
 - `files`: open a session's Workspace panel, select Files, then a Markdown file.
-- `changes`: select a changed Markdown file, then exit diff to edit it.
+- `changes`: select an existing changed Markdown file, then exit diff to edit it.
+  Deleted files stay in diff; select another file to continue editing.
 - `direct-link`: open a session URL with a selected Markdown file.
 - `chat-link`: follow a Markdown file link in a message; a line citation opens
   Source at that line, rather than the rich editor, and a range (`:12-18`,
