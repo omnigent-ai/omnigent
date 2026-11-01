@@ -507,6 +507,21 @@ input correlation IDs when available. It contains no file paths, state bytes,
 startup-error text, or user input. Error wording, wait budgets, and undelivered
 input handling are unchanged.
 
+## Harness IPC directory recovery
+
+The process manager recreates its private temporary root and per-instance
+directory before spawning a harness, including when replacing a live harness
+whose socket pathname disappeared. It restores the current process's
+namespace-qualified `AP_PID` owner claim so orphan cleanup recognizes the
+directory as live. Recreated directories use mode `0700`; bound sockets use
+`0600`. This recovery also runs with diagnostic capture disabled.
+
+A missing socket parent otherwise causes uvicorn's `create_unix_server` to
+raise `FileNotFoundError`, followed by an exited-during-spawn error in the
+runner. Continued deletion during startup, permission errors and filesystem
+failures can still prevent binding; retain the harness traceback to distinguish
+these cases.
+
 ## Verification
 
 ```sh

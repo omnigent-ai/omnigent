@@ -386,6 +386,7 @@ async def test_session_deletion_cancels_recovery_before_inbox_teardown() -> None
         ("in_progress", None),
         ("failed", "runner_disconnected"),
         ("failed", "runner_failed_to_start"),
+        ("failed", "runner_process_crash"),
     ],
 )
 async def test_reconcile_delivers_interrupted_dispatch_once_it_finishes(

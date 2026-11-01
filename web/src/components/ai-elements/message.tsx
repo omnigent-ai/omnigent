@@ -589,7 +589,7 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
-function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
@@ -632,7 +632,7 @@ export const MessageResponse = memo(
   }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
     const messageComponents = useMemo(
-      () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
+      () => ({ ...components, pre: components?.pre ?? ChatCodeBlockPre, table: ChatTable }),
       [components],
     );
 

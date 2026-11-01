@@ -16,6 +16,8 @@ import asyncio
 import json
 import logging
 import os
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1644,3 +1646,44 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
     assert sorted(path.name for path in workspace.iterdir()) == []
     assert not (Path.cwd() / config_dir).exists()
     registry.launch_required_terminal.assert_not_called()
+
+
+def test_claude_terminal_env_unsets_tmux_for_bash_tool_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude's Bash commands must not reach the private tmux server running Claude."""
+    monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
+    env_file = build_native_claude_terminal_env(None)["CLAUDE_ENV_FILE"]
+
+    # Claude Code sources the env file before each Bash command it runs.
+    result = subprocess.run(
+        ["bash", "-c", f'. {shlex.quote(env_file)}; echo "${{TMUX-unset}} ${{TMUX_PANE-unset}}"'],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMUX": "/tmp/omnigent-terminal-ab12/tmux.sock,4242,0",
+            "TMUX_PANE": "%0",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "unset unset"
+
+
+@pytest.mark.parametrize("source", ["ambient", "provider"])
+def test_claude_terminal_env_keeps_a_user_claude_env_file(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A user's own CLAUDE_ENV_FILE is left in place instead of the tmux scrub."""
+    user_file = "/home/user/claude-env.sh"
+    config = None
+    if source == "ambient":
+        monkeypatch.setenv("CLAUDE_ENV_FILE", user_file)
+    else:
+        monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
+        config = ClaudeNativeUcodeConfig(env={"CLAUDE_ENV_FILE": user_file})
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert terminal_env.get("CLAUDE_ENV_FILE", user_file) == user_file
