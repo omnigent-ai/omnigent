@@ -2810,6 +2810,7 @@ class _KeptSessionExecutor(Executor):
         self.closed: list[str] = []
         self.close_requested = asyncio.Event()
         self.close_released = asyncio.Event()
+        self.turn_released = asyncio.Event()
         if not blocking_close:
             self.close_released.set()
 
@@ -2837,6 +2838,9 @@ class _KeptSessionExecutor(Executor):
             elif self.stop_outcome == "ends_after_close":
                 await self.close_requested.wait()
                 yield TextChunk(text=" more")
+            elif self.stop_outcome == "errors_on_release":
+                await self.turn_released.wait()
+                yield ExecutorError(message="native session crashed")
         finally:
             self.turn_unwound = True
 
@@ -2958,6 +2962,62 @@ async def test_turn_ending_after_unconfirmed_interrupt_detaches_executor(
     assert executor.closed == ["sk"]
     assert adapter._executor is replacement
     assert replacement.closed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_attached", [True, False])
+async def test_turn_failing_after_later_unconfirmed_interrupt_reaps_only_its_executor(
+    replacement_attached: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that fails after a later turn's unconfirmed interrupt leaves later state alone."""
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
+    )
+    first = _KeptSessionExecutor("errors_on_release")
+    second = _KeptSessionExecutor("never_stops")
+    replacement = _KeptSessionExecutor("completes")
+    executors = iter([first, second, replacement])
+    adapter = ExecutorAdapter(executor_factory=lambda: next(executors), session_key="sk")
+
+    async def start_unconfirmed_turn(executor: _KeptSessionExecutor, response_id: str):
+        ctx = TurnContext(
+            response_id=response_id, event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        adapter._in_flight[response_id] = ctx
+        task = asyncio.create_task(
+            adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        )
+        await asyncio.wait_for(executor.turn_started.wait(), timeout=5)
+        response = await asyncio.wait_for(adapter._handle_interrupt_event(), timeout=5)
+        assert response.status_code == 204
+        assert adapter._executor is None
+        return task
+
+    first_task = await start_unconfirmed_turn(first, "resp_1")
+    second_task = await start_unconfirmed_turn(second, "resp_2")
+    second_cleanup = adapter._abandoned_executor_cleanup
+    assert second_cleanup is not None
+    if replacement_attached:
+        assert adapter._ensure_executor() is replacement
+
+    first.turn_released.set()
+    await asyncio.wait_for(first_task, timeout=5)
+    assert adapter._executor is (replacement if replacement_attached else None)
+    assert adapter._abandoned_executor_cleanup is second_cleanup, (
+        "a retry must keep waiting on the second executor's reap, not a no-op"
+    )
+    assert await asyncio.wait_for(second_cleanup, timeout=5)
+    assert replacement.interrupted == []
+    assert replacement.closed == []
+    second_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await second_task
 
 
 def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None:

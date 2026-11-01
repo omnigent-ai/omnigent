@@ -227,8 +227,6 @@ class ExecutorAdapter(HarnessApp):
         # Set when the latest run_turn has unwound, so an interrupt can confirm the stop.
         self._turn_finished = asyncio.Event()
         self._turn_finished.set()
-        # The turn whose executor an unconfirmed interrupt already abandoned.
-        self._unconfirmed_interrupt_turn: asyncio.Event | None = None
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -620,16 +618,19 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
-            if self._unconfirmed_interrupt_turn is turn_finished:
-                self._unconfirmed_interrupt_turn = None
-            elif not clean_exit:
-                self._abandon_executor(self._executor)
+            if not clean_exit:
+                self._abandon_executor(executor)
             turn_finished.set()
 
-    def _abandon_executor(self, executor: Executor | None) -> None:
-        """Detach *executor*, then reap it in the background so no later turn can reuse it."""
-        if self._executor is executor:
-            self._executor = None
+    def _abandon_executor(self, executor: Executor) -> None:
+        """Detach *executor* and reap it in the background so no later turn can reuse it.
+
+        No-op once *executor* is detached: whoever detached it owns its teardown, and a
+        late-ending turn must not reap the executor that replaced it.
+        """
+        if self._executor is not executor:
+            return
+        self._executor = None
         cleanup = asyncio.create_task(self._safe_interrupt(executor, self._session_key))
         self._abandoned_executor_cleanup = cleanup
         self._bg_tasks.add(cleanup)
@@ -693,7 +694,6 @@ class ExecutorAdapter(HarnessApp):
                 self._session_key,
                 exc_info=True,
             )
-            self._unconfirmed_interrupt_turn = turn_finished
             self._abandon_executor(executor)
         return response
 
