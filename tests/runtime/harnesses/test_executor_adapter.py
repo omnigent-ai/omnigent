@@ -2796,9 +2796,13 @@ class _KeptSessionExecutor(Executor):
 
     :param stop_outcome: What the native turn yields once interrupted.
     :param blocking_close: Whether ``close_session`` waits for ``close_released``.
+    :param blocking_interrupt: Whether ``interrupt_session`` waits for ``interrupt_released``,
+        finishing normally even when cancelled, as Claude's forced client close does.
     """
 
-    def __init__(self, stop_outcome: str, *, blocking_close: bool = False) -> None:
+    def __init__(
+        self, stop_outcome: str, *, blocking_close: bool = False, blocking_interrupt: bool = False
+    ) -> None:
         import asyncio
 
         super().__init__()
@@ -2811,8 +2815,12 @@ class _KeptSessionExecutor(Executor):
         self.close_requested = asyncio.Event()
         self.close_released = asyncio.Event()
         self.turn_released = asyncio.Event()
+        self.interrupt_released = asyncio.Event()
+        self.interrupt_cancelled = False
         if not blocking_close:
             self.close_released.set()
+        if not blocking_interrupt:
+            self.interrupt_released.set()
 
     def resumes_after_interrupt(self) -> bool:
         return True
@@ -2845,7 +2853,13 @@ class _KeptSessionExecutor(Executor):
             self.turn_unwound = True
 
     async def interrupt_session(self, session_key: str) -> bool:
+        import asyncio
+
         self.interrupted.append(session_key)
+        try:
+            await self.interrupt_released.wait()
+        except asyncio.CancelledError:
+            self.interrupt_cancelled = True
         self.stop_requested.set()
         return True
 
@@ -2855,7 +2869,9 @@ class _KeptSessionExecutor(Executor):
         self.closed.append(session_key)
 
 
-async def _interrupt_kept_session_turn(stop_outcome: str, *, blocking_close: bool = False):
+async def _interrupt_kept_session_turn(
+    stop_outcome: str, *, blocking_close: bool = False, blocking_interrupt: bool = False
+):
     """Start a turn on a :class:`_KeptSessionExecutor`, interrupt it, and return the pieces."""
     import asyncio
 
@@ -2863,7 +2879,9 @@ async def _interrupt_kept_session_turn(stop_outcome: str, *, blocking_close: boo
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    executor = _KeptSessionExecutor(stop_outcome, blocking_close=blocking_close)
+    executor = _KeptSessionExecutor(
+        stop_outcome, blocking_close=blocking_close, blocking_interrupt=blocking_interrupt
+    )
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
     ctx = TurnContext(response_id="resp_1", event_queue=asyncio.Queue(), cancelled=asyncio.Event())
     adapter._in_flight["resp_1"] = ctx
@@ -2936,6 +2954,35 @@ async def test_interrupt_closes_kept_session_when_turn_never_stops(
     with contextlib.suppress(asyncio.CancelledError):
         await run_task
     assert adapter._executor is None
+
+
+@pytest.mark.asyncio
+async def test_interrupt_answers_by_deadline_without_cancelling_slow_native_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The response stays bounded, and a slow native interrupt is reaped, not cancelled."""
+    import asyncio
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
+    )
+    adapter, executor, run_task, response = await _interrupt_kept_session_turn(
+        "never_stops", blocking_interrupt=True
+    )
+
+    assert response.status_code == 204
+    assert adapter._executor is None
+    cleanup = adapter._abandoned_executor_cleanup
+    assert cleanup is not None
+    assert not cleanup.done()
+    executor.interrupt_released.set()
+    assert await asyncio.wait_for(cleanup, timeout=5)
+    assert executor.interrupted == ["sk"]
+    assert not executor.interrupt_cancelled
+    assert executor.closed == ["sk"]
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,7 @@ re-prompting exposes two coupled defects that live in real product code:
    error ``Agent is already processing. Specify streamingBehavior ('steer' or
    'followUp') to queue the message.`` straight at the user.
 
-Both tests drive the REAL product code paths. They assert the *correct*
+The tests drive the REAL product code paths. They assert the *correct*
 post-fix behavior, so they FAIL on the buggy build (the reproduction) and PASS
 once the interrupt slice is widened to cover the reap and every RPC prompt
 carries ``streamingBehavior``. Neither test needs the ``pi`` CLI: facet 1
@@ -34,6 +34,8 @@ import sys
 import textwrap
 from typing import Any
 
+import pytest
+
 from omnigent.inner.executor import TurnComplete
 from omnigent.inner.pi_executor import (
     PiExecutor,
@@ -41,6 +43,8 @@ from omnigent.inner.pi_executor import (
     _PiSessionState,
 )
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+from omnigent.runtime.harnesses._scaffold import TurnContext
+from tests._helpers.polling import poll_until_async
 
 # A child process that arms a SIGTERM-ignoring handler, prints ``READY`` once
 # the handler is live, then sleeps. Models a wedged Pi subprocess that will NOT
@@ -54,6 +58,30 @@ _WEDGED_CHILD = textwrap.dedent(
     time.sleep(30)
     """
 )
+# Also closes its stdin, so Pi's abort write fails and the interrupt falls back to closing.
+_WEDGED_CHILD_WITHOUT_STDIN = "import os\nos.close(0)\n" + _WEDGED_CHILD
+
+
+async def _start_wedged_pi_session(
+    executor: PiExecutor, script: str
+) -> asyncio.subprocess.Process:
+    """Wire a real wedged child into *executor*'s ``sess`` the way a live turn does."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    rpc = _PiRpcSession(process=proc)
+    rpc._read_task = asyncio.create_task(rpc._reader())
+    rpc._stderr_task = asyncio.create_task(rpc._stderr_reader())
+    executor._session_states["sess"] = _PiSessionState(rpc=rpc)
+    # Wait until the SIGTERM-ignoring handler is armed so the reap genuinely races it.
+    ready = await rpc.read_line(timeout=10.0)
+    assert ready == "READY", f"wedged child never became ready: {ready!r}"
+    return proc
 
 
 async def test_safe_interrupt_kills_wedged_pi_subprocess() -> None:
@@ -65,30 +93,8 @@ async def test_safe_interrupt_kills_wedged_pi_subprocess() -> None:
     child. The fix gives the slice room for the full reap.
     """
     executor = PiExecutor(pi_path="/bin/true")  # never spawns pi; child injected below
-
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-c",
-        _WEDGED_CHILD,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    # Wire the real subprocess into a real _PiRpcSession / _PiSessionState the
-    # way a live turn does.
-    rpc = _PiRpcSession(process=proc)
-    rpc._read_task = asyncio.create_task(rpc._reader())
-    rpc._stderr_task = asyncio.create_task(rpc._stderr_reader())
-    executor._session_states["sess"] = _PiSessionState(rpc=rpc)
-
+    proc = await _start_wedged_pi_session(executor, _WEDGED_CHILD)
     try:
-        # Wait until the child has armed its SIGTERM-ignoring handler so the
-        # interrupt genuinely races the reap (not a startup race that dies to
-        # the first SIGTERM).
-        ready = await rpc.read_line(timeout=10.0)
-        assert ready == "READY", f"wedged child never became ready: {ready!r}"
-
         adapter = ExecutorAdapter(executor_factory=lambda: executor)
 
         # Drive the REAL abnormal-exit interrupt path.
@@ -102,6 +108,37 @@ async def test_safe_interrupt_kills_wedged_pi_subprocess() -> None:
             "cancelled close()'s inner process.wait() before its own "
             "TimeoutError -> SIGKILL fallback could run (facet 1)."
         )
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+
+
+async def test_interrupt_handler_kills_wedged_pi_subprocess_after_failed_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupt answered before Pi's fallback close finishes still kills the process."""
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.2
+    )
+    executor = PiExecutor(pi_path="/bin/true")
+    proc = await _start_wedged_pi_session(executor, _WEDGED_CHILD_WITHOUT_STDIN)
+    try:
+        adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sess")
+        adapter._ensure_executor()
+        adapter._in_flight["resp_1"] = TurnContext(
+            response_id="resp_1", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        adapter._turn_finished = asyncio.Event()
+
+        response = await asyncio.wait_for(adapter._handle_interrupt_event(), timeout=1.0)
+
+        assert response.status_code == 204
+        assert adapter._executor is None
+        cleanup = adapter._abandoned_executor_cleanup
+        assert cleanup is not None
+        await asyncio.wait_for(cleanup, timeout=10.0)
+        await poll_until_async(lambda: proc.returncode is not None, timeout_s=3.0)
     finally:
         if proc.returncode is None:
             proc.kill()

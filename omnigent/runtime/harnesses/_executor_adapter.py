@@ -622,16 +622,21 @@ class ExecutorAdapter(HarnessApp):
                 self._abandon_executor(executor)
             turn_finished.set()
 
-    def _abandon_executor(self, executor: Executor) -> None:
+    def _abandon_executor(
+        self, executor: Executor, pending_interrupt: asyncio.Task[bool] | None = None
+    ) -> None:
         """Detach *executor* and reap it in the background so no later turn can reuse it.
 
         No-op once *executor* is detached: whoever detached it owns its teardown, and a
-        late-ending turn must not reap the executor that replaced it.
+        late-ending turn must not reap the executor that replaced it. The reap finishes
+        *pending_interrupt* instead of starting another interrupt.
         """
         if self._executor is not executor:
             return
         self._executor = None
-        cleanup = asyncio.create_task(self._safe_interrupt(executor, self._session_key))
+        cleanup = asyncio.create_task(
+            self._safe_interrupt(executor, self._session_key, pending_interrupt)
+        )
         self._abandoned_executor_cleanup = cleanup
         self._bg_tasks.add(cleanup)
         cleanup.add_done_callback(self._bg_tasks.discard)
@@ -682,19 +687,24 @@ class ExecutorAdapter(HarnessApp):
             await executor.interrupt_session(self._session_key)
             return response
         turn_finished = self._turn_finished
+        # The deadline bounds only this response: cancelling the executor's fallback cleanup
+        # could skip its process kill, so a late interrupt keeps running for the reap.
+        interrupt = asyncio.create_task(executor.interrupt_session(self._session_key))
+        self._bg_tasks.add(interrupt)
+        interrupt.add_done_callback(self._bg_tasks.discard)
         try:
             async with asyncio.timeout(_INTERRUPT_SETTLE_TIMEOUT_S):
-                await executor.interrupt_session(self._session_key)
+                await asyncio.shield(interrupt)
                 await turn_finished.wait()
         except Exception:
-            if turn_finished.is_set():
+            if interrupt.done() and turn_finished.is_set():
                 return response
             _logger.warning(
                 "inner session %s did not confirm the interrupt; dropping it",
                 self._session_key,
                 exc_info=True,
             )
-            self._abandon_executor(executor)
+            self._abandon_executor(executor, interrupt)
         return response
 
     async def _prepare_turn_retry(self) -> bool:
@@ -702,12 +712,18 @@ class ExecutorAdapter(HarnessApp):
         cleanup = self._abandoned_executor_cleanup
         return cleanup is not None and await asyncio.shield(cleanup)
 
-    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> bool:
+    async def _safe_interrupt(
+        self,
+        executor: Executor | None,
+        session_key: str,
+        pending_interrupt: asyncio.Task[bool] | None = None,
+    ) -> bool:
         """Best-effort bounded interrupt + close of a detached abandoned executor.
 
         Scheduled from run_turn's finally and awaited before any recovery retry. The interrupt
         gets a short slice; the reap (close_session + close) always runs under its own budget so
-        a wedged interrupt can never starve the subprocess reap.
+        a wedged interrupt can never starve the subprocess reap. A *pending_interrupt* already
+        started by the interrupt handler is awaited in place of a new one, and never cancelled.
 
         An interrupt that only proves the harness is already gone
         (:data:`_HARNESS_ALREADY_GONE_ERRORS`) logs a warning naming the cause; every other
@@ -717,7 +733,10 @@ class ExecutorAdapter(HarnessApp):
             return True
         try:
             await asyncio.wait_for(
-                executor.interrupt_session(session_key), timeout=_INTERRUPT_SLICE_S
+                executor.interrupt_session(session_key)
+                if pending_interrupt is None
+                else asyncio.shield(pending_interrupt),
+                timeout=_INTERRUPT_SLICE_S,
             )
         except _HARNESS_ALREADY_GONE_ERRORS as exc:
             _logger.warning(
