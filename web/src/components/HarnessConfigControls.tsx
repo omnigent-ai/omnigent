@@ -3,7 +3,9 @@ import { type ReactNode, useState } from "react";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectSeparator,
   SelectTrigger,
   SelectValue,
@@ -11,6 +13,7 @@ import {
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
+import { MODEL_CATALOG_BROWSE_MIN, groupByModelCreator } from "@/lib/modelCreators";
 import type { NativeModelOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -52,8 +55,9 @@ export type { NativeModelLabelFields } from "@/lib/composerModelLabel";
  * @param testId Trigger test id.
  * @param ariaLabel Accessible name for the trigger (the visible ConfigRow label
  *   is visual-only, so pass it here to name the control for AT).
- * @param models Harness models, listed after "Default". Empty when the harness
- *   resolves its own catalog and only the two sentinels are expressible.
+ * @param models Harness models, listed after "Default" and headed by creator
+ *   once a long catalog spans several. Empty when the harness resolves its own
+ *   catalog and only the two sentinels are expressible.
  * @param defaultLabel Label for the "no explicit model" row. Defaults to
  *   "Default"; pass the resolved form (e.g. `Default (gpt-5.5)`) where the
  *   catalog names which model that is.
@@ -92,6 +96,20 @@ export function RoutingModelSelect({
   componentId?: string;
   children?: ReactNode;
 }) {
+  const modelItem = (m: RoutingModelOption) => (
+    <SelectItem
+      key={m.id}
+      value={m.id}
+      data-model-id={m.id}
+      data-active={activeModelId === m.id ? "true" : undefined}
+    >
+      {m.label}
+    </SelectItem>
+  );
+  const groups =
+    models && models.length >= MODEL_CATALOG_BROWSE_MIN
+      ? groupByModelCreator(models, (m) => ({ id: m.id, displayName: m.label }))
+      : [];
   return (
     // valueHasNoPii assumes a bounded catalog; drop it if reused for typed values.
     <Select value={value} onValueChange={onValueChange} componentId={componentId} valueHasNoPii>
@@ -111,16 +129,14 @@ export function RoutingModelSelect({
           <SelectItem value={MODEL_SELECT_SMART}>{SMART_ROUTING_LABEL}</SelectItem>
         )}
         <SelectItem value={MODEL_SELECT_DEFAULT}>{defaultLabel}</SelectItem>
-        {(models ?? []).map((m) => (
-          <SelectItem
-            key={m.id}
-            value={m.id}
-            data-model-id={m.id}
-            data-active={activeModelId === m.id ? "true" : undefined}
-          >
-            {m.label}
-          </SelectItem>
-        ))}
+        {groups.length > 1
+          ? groups.map(({ creator, items }) => (
+              <SelectGroup key={creator.id}>
+                <SelectLabel>{creator.label}</SelectLabel>
+                {items.map(modelItem)}
+              </SelectGroup>
+            ))
+          : (models ?? []).map(modelItem)}
         {children}
       </SelectContent>
     </Select>
