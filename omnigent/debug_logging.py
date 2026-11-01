@@ -76,6 +76,12 @@ _session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id"
 _runner_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_runner_id", default=None)
 _request_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_request_id", default=None)
 
+# Log sources whose own OMNIGENT_RUNNER_ID names the runner they belong to.
+# A server or host that inherited the var must not claim its records.
+_RUNNER_OWNED_SOURCES = frozenset({"runner", "harness"})
+# This process's log source, recorded once by configure_process_logging.
+_process_source: str | None = None
+
 
 # Ambient lifecycle phase for the code currently executing. Set with
 # ``phase_scope`` around each region (runner launch, harness setup/startup, turn)
@@ -309,6 +315,28 @@ def current_user_id() -> str | None:
 def set_current_request_id(request_id: str | None) -> None:
     """Bind the server HTTP request id; host-frame request ids are separate."""
     _request_id_var.set(request_id or None)
+
+
+def set_process_source(source: str) -> None:
+    """Record this process's log source (``"runner"``, ``"harness"``, ``"server"``, ...)."""
+    global _process_source
+    _process_source = source
+
+
+def current_runner_id(source: str | None = None) -> str | None:
+    """Best-available runner attribution for a record or span.
+
+    Request- or lifecycle-bound ContextVar first. Unlike :func:`current_user_id`,
+    the process env (``OMNIGENT_RUNNER_ID``) counts only when *source* (default:
+    this process's, see :func:`set_process_source`) is a runner or harness,
+    whose own id it names.
+    """
+    bound = _runner_id_var.get()
+    if bound:
+        return bound
+    if (source or _process_source) in _RUNNER_OWNED_SOURCES:
+        return os.environ.get(RUNNER_ID_ENV_VAR) or None
+    return None
 
 
 def set_current_runner_id(runner_id: str | None) -> None:
@@ -569,12 +597,7 @@ def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
         attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
     for key, value in (
         ("request_id", getattr(record, "request_id", None) or _request_id_var.get()),
-        (
-            "runner_id",
-            getattr(record, "runner_id", None)
-            or _runner_id_var.get()
-            or (os.environ.get(RUNNER_ID_ENV_VAR) if source in {"runner", "harness"} else None),
-        ),
+        ("runner_id", getattr(record, "runner_id", None) or current_runner_id(source)),
     ):
         if value:
             attrs.setdefault(key, redact_log_text(str(value)))
@@ -658,7 +681,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "session_id": (
             getattr(record, "session_id", None)
             or current_session_id()
-            or (runner_primary_session_id() if source in {"runner", "harness"} else None)
+            or (runner_primary_session_id() if source in _RUNNER_OWNED_SOURCES else None)
         ),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
