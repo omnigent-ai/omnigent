@@ -3,6 +3,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useState,
@@ -18,7 +19,17 @@ import {
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey } from "@/lib/sessionListCache";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
-import { dedupeSessionRows, mergeScopeRows, sessionRowsPage } from "@/lib/sidebarData";
+import {
+  dedupeSessionRows,
+  mergeScopeRows,
+  type ScopeCacheData,
+  sessionRowsPage,
+} from "@/lib/sidebarData";
+import {
+  applyLocalElicitationResolutions,
+  observeSessionPendingCounts,
+  useLocalElicitationResolutions,
+} from "@/lib/localElicitationResolutions";
 import {
   sidebarConfig,
   SidebarConfigContext,
@@ -42,6 +53,32 @@ export type SidebarListQuery = Pick<
   ReturnType<typeof useConversations>,
   "data" | "error" | "isError" | "isLoading" | "isFetching" | "isFetchingNextPage" | "hasNextPage"
 > & { fetchNextPage: () => unknown; refetch?: () => unknown };
+
+/** Apply `apply` to every page's rows; returns `data` itself when no row changed. */
+function overlayPageRows(
+  data: ScopeCacheData | undefined,
+  apply: (rows: Conversation[]) => Conversation[],
+): ScopeCacheData | undefined {
+  if (!data) return data;
+  let changed = false;
+  const pages = data.pages.map((page) => {
+    const rows = apply(page.data);
+    if (rows === page.data) return page;
+    changed = true;
+    return { ...page, data: rows };
+  });
+  return changed ? { ...data, pages } : data;
+}
+
+/** Pinned-query counterpart of `overlayPageRows`. */
+function overlayPinnedRows<Data extends { conversations: Conversation[] }>(
+  data: Data | undefined,
+  apply: (rows: Conversation[]) => Conversation[],
+): Data | undefined {
+  if (!data) return data;
+  const conversations = apply(data.conversations);
+  return conversations === data.conversations ? data : { ...data, conversations };
+}
 
 function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
@@ -109,24 +146,58 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       return next;
     });
   }, []);
-  const mineRows = useMemo(() => mine.data?.pages.flatMap((p) => p.data) ?? [], [mine.data]);
-  const sharedRows = useMemo(
+  const rawMineRows = useMemo(() => mine.data?.pages.flatMap((p) => p.data) ?? [], [mine.data]);
+  const rawSharedRows = useMemo(
     () => (sharedActive ? (shared.data?.pages.flatMap((p) => p.data) ?? []) : []),
     [shared.data, sharedActive],
   );
   const pinnedRows = pinned.data?.conversations;
   const viewerId = useViewerId();
-  const loadedRows = useMemo(
+  // Answers the server has not yet reflected are subtracted from the derived rows below.
+  // Observation reads the raw counts, so the server's own count drops release them.
+  const localResolutions = useLocalElicitationResolutions();
+  const applyLocalResolutions = useCallback(
+    (rows: Conversation[]) => applyLocalElicitationResolutions(rows, localResolutions),
+    [localResolutions],
+  );
+  const rawLoadedRows = useMemo(
     () =>
       dedupeSessionRows([
         ...(pinnedRows ?? []),
         ...(sharedActive
           ? [...folders.values()].flat()
           : filterSessionScope([...folders.values()].flat(), "mine", viewerId)),
-        ...mineRows,
-        ...sharedRows,
+        ...rawMineRows,
+        ...rawSharedRows,
       ]).filter((row) => !row.archived),
-    [mineRows, sharedRows, pinnedRows, folders, sharedActive, viewerId],
+    [rawMineRows, rawSharedRows, pinnedRows, folders, sharedActive, viewerId],
+  );
+  useEffect(() => {
+    observeSessionPendingCounts(rawLoadedRows);
+  }, [rawLoadedRows]);
+  const loadedRows = useMemo(
+    () => applyLocalResolutions(rawLoadedRows),
+    [applyLocalResolutions, rawLoadedRows],
+  );
+  const mineRows = useMemo(
+    () => applyLocalResolutions(rawMineRows),
+    [applyLocalResolutions, rawMineRows],
+  );
+  const sharedRows = useMemo(
+    () => applyLocalResolutions(rawSharedRows),
+    [applyLocalResolutions, rawSharedRows],
+  );
+  const mineData = useMemo(
+    () => overlayPageRows(mine.data, applyLocalResolutions),
+    [mine.data, applyLocalResolutions],
+  );
+  const sharedData = useMemo(
+    () => overlayPageRows(shared.data, applyLocalResolutions),
+    [shared.data, applyLocalResolutions],
+  );
+  const pinnedData = useMemo(
+    () => overlayPinnedRows(pinned.data, applyLocalResolutions),
+    [pinned.data, applyLocalResolutions],
   );
   const inboxRows = useMemo(
     () =>
@@ -134,6 +205,14 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         ? loadedRows
         : loadedRows.filter((row) => sessionVisibility(row, viewerId) === "mine"),
     [loadedRows, config.inboxIncludesShared, viewerId],
+  );
+  // The server's counts, before answers in flight are subtracted.
+  const serverInboxRows = useMemo(
+    () =>
+      config.inboxIncludesShared
+        ? rawLoadedRows
+        : rawLoadedRows.filter((row) => sessionVisibility(row, viewerId) === "mine"),
+    [rawLoadedRows, config.inboxIncludesShared, viewerId],
   );
   const comments = useCommentInbox(inboxRows);
   const inboxCount = sumPendingApprovals(inboxRows) + comments.items.length;
@@ -198,6 +277,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         : undefined,
     [mine.data, shared.data, sharedActive, loadedRows],
   );
+  const mineView = { ...mine, data: mineData };
+  const sharedView = { ...shared, data: sharedData };
   return {
     config,
     view,
@@ -209,18 +290,21 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     selectedView,
     registerView,
     pinsIncludeShared,
-    mine,
-    shared,
+    mine: mineView,
+    shared: sharedView,
     all,
-    inbox: config.inboxIncludesShared ? all : mine,
-    pinned,
+    inbox: config.inboxIncludesShared ? all : mineView,
+    pinned: { ...pinned, data: pinnedData },
     loadedRows,
     loadedData,
+    serverLoadedRows: rawLoadedRows,
     inboxRows,
+    serverInboxRows,
     inboxCount,
     comments,
     watchedIds,
     registerFolder,
+    applyLocalResolutions,
     watermark: merged.watermark,
   };
 }
@@ -273,8 +357,8 @@ export function useSidebarData() {
 
 /** Read shared rows without mounting another session-list query. */
 export function useLoadedConversations() {
-  const { loadedData: data, all } = useSidebarData();
-  return { data, isLoading: data === undefined && all.isLoading };
+  const { loadedData: data, serverLoadedRows: serverRows, all } = useSidebarData();
+  return { data, serverRows, isLoading: data === undefined && all.isLoading };
 }
 
 /** Register the mounted sidebar's persisted selection; unmount releases its demand. */

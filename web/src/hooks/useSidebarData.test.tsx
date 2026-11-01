@@ -4,7 +4,14 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
-import { sessionRowsPage } from "@/lib/sidebarData";
+import { sessionRowsPage, type ScopeCacheData } from "@/lib/sidebarData";
+import {
+  acknowledgeLocalElicitationResolution,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+  resetLocalElicitationResolutionsForTests,
+  useLocalElicitationResolutions,
+} from "@/lib/localElicitationResolutions";
 import type { Conversation } from "./useConversations";
 import { SidebarDataProvider, useLoadedConversations, useSidebarData } from "./useSidebarData";
 import { useArchivedSessions } from "./useScopeCache";
@@ -38,6 +45,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   client.clear();
+  resetLocalElicitationResolutionsForTests();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -130,4 +138,120 @@ it("refreshes mine every 60 seconds and shared every 180 seconds", async () => {
   expect(scopeCalls("mine")).toHaveLength(3);
   expect(scopeCalls("shared")).toHaveLength(1);
   expect(fetchMock.mock.calls.some(([url]) => String(url).includes("pinned=true"))).toBe(false);
+});
+
+const MINE_QUERY_KEY = ["conversations", "", false, null, "mine"];
+
+function setCachedMineCount(count: number) {
+  client.setQueryData<ScopeCacheData>(
+    MINE_QUERY_KEY,
+    (data) =>
+      data && {
+        ...data,
+        pages: data.pages.map((page) => ({
+          ...page,
+          data: page.data.map((item) =>
+            item.id === "mine" ? { ...item, pending_elicitations_count: count } : item,
+          ),
+        })),
+      },
+  );
+}
+
+it("subtracts an answer in flight from the derived rows until the server count drops", async () => {
+  const { result } = renderHook(
+    () => ({
+      sidebar: useSidebarData(),
+      resolutions: useLocalElicitationResolutions(),
+    }),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.sidebar.inboxCount).toBe(3));
+
+  let holdToken = 0;
+  act(() => {
+    holdToken = beginLocalElicitationResolution("elicit_1", ["mine"], { nativeDelivery: false });
+  });
+  expect(result.current.sidebar.inboxCount).toBe(2);
+  expect(
+    result.current.sidebar.mine.data?.pages[0]?.data.find((item) => item.id === "mine")
+      ?.pending_elicitations_count,
+  ).toBe(0);
+  // The cached page keeps the server's count; the hold lives only in the derived rows.
+  expect(
+    client
+      .getQueryData<ScopeCacheData>(MINE_QUERY_KEY)
+      ?.pages[0]?.data.find((item) => item.id === "mine")?.pending_elicitations_count,
+  ).toBe(1);
+
+  act(() => acknowledgeLocalElicitationResolution("elicit_1", holdToken));
+  act(() => setCachedMineCount(0));
+  await waitFor(() => expect(result.current.resolutions.answeredElicitationIds.size).toBe(0));
+  expect(result.current.sidebar.inboxCount).toBe(2);
+});
+
+it.each([
+  ["was pending at the answer", 2, null],
+  ["arrived after the answer", 1, 2],
+] as const)(
+  "never shows the other prompt as answered when it %s",
+  async (_case, atAnswer, arrival) => {
+    const counts: number[] = [];
+    const { result } = renderHook(
+      () => {
+        const sidebar = useSidebarData();
+        const count = sidebar.loadedRows.find(
+          (item) => item.id === "mine",
+        )?.pending_elicitations_count;
+        if (count !== undefined) counts.push(count);
+        return sidebar;
+      },
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.inboxCount).toBe(3));
+    act(() => setCachedMineCount(atAnswer));
+    await waitFor(() => expect(counts.at(-1)).toBe(atAnswer));
+
+    let holdToken = 0;
+    act(() => {
+      holdToken = beginLocalElicitationResolution("elicit_1", ["mine"], { nativeDelivery: false });
+    });
+    act(() => acknowledgeLocalElicitationResolution("elicit_1", holdToken));
+    if (arrival !== null) {
+      act(() => setCachedMineCount(arrival));
+      await waitFor(() => expect(counts.at(-1)).toBe(arrival - 1));
+    }
+    const bothCountedAt = counts.length;
+    act(() => setCachedMineCount(1));
+    await waitFor(() => expect(result.current.inboxCount).toBe(3));
+
+    expect(counts.slice(bothCountedAt)).not.toContain(0);
+    expect(counts.at(-1)).toBe(1);
+  },
+);
+
+it("shows the server count of a folder row loaded after its prompt was answered", async () => {
+  const { result } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.inboxCount).toBe(3));
+
+  act(() => {
+    beginLocalElicitationResolution("elicit_1", ["folder"], { nativeDelivery: false });
+  });
+  // The server already removed the answered prompt; another one is still pending.
+  await act(async () => result.current.registerFolder("project", [row("folder")]));
+
+  expect(result.current.inboxCount).toBe(4);
+});
+
+it("restores the count when the POST for an answer in flight fails", async () => {
+  const { result } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.inboxCount).toBe(3));
+
+  let holdToken = 0;
+  act(() => {
+    holdToken = beginLocalElicitationResolution("elicit_1", ["mine"], { nativeDelivery: false });
+  });
+  expect(result.current.inboxCount).toBe(2);
+  act(() => cancelLocalElicitationResolution("elicit_1", holdToken));
+  expect(result.current.inboxCount).toBe(3);
 });
