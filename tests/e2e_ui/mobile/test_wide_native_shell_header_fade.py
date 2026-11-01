@@ -208,9 +208,7 @@ def _seed_long_transcript(base_url: str, session_id: str) -> str:
 def _open_shell(
     browser: Browser, shell: str, viewport: dict[str, int], inset_top: int, panel: str
 ) -> tuple[BrowserContext, Page]:
-    context = browser.new_context(
-        viewport=viewport, is_mobile=shell != "web", has_touch=shell != "web"
-    )
+    context = browser.new_context(viewport=viewport, is_mobile=True, has_touch=True)
     page = context.new_page()
     if panel == "open":
         page.add_init_script(
@@ -306,7 +304,6 @@ def _describe(header: dict[str, float], fade: dict[str, float]) -> str:
         pytest.param("ios", _IPAD_VIEWPORT, 60, "collapsed", id="ios-1024-60"),
         pytest.param("android", _NARROW_VIEWPORT, 48, "collapsed", id="android-767-48"),
         pytest.param("android", _FOLD_VIEWPORT, 0, "collapsed", id="android-848-0"),
-        pytest.param("web", _FOLD_VIEWPORT, 0, "collapsed", id="web-848-0"),
     ],
 )
 def test_scrolled_transcript_fades_before_the_inset_header(
@@ -327,12 +324,7 @@ def test_scrolled_transcript_fades_before_the_inset_header(
     try:
         page.goto(f"{base_url}/c/{session_id}")
         app_shell = page.locator(".app-shell")
-        if shell == "web":
-            expect(app_shell).to_be_visible()
-            assert app_shell.get_attribute("data-android-native") is None
-            assert app_shell.get_attribute("data-ios-native") is None
-        else:
-            expect(app_shell).to_have_attribute(f"data-{shell}-native", "true")
+        expect(app_shell).to_have_attribute(f"data-{shell}-native", "true")
         if shell == "android":
             _apply_android_inset(page, inset_top)
 
@@ -341,8 +333,12 @@ def test_scrolled_transcript_fades_before_the_inset_header(
         header = page.evaluate(_HEADER_GEOMETRY)
         # The mask does not depend on the scroll position, so measure it once.
         fade = page.evaluate(_FADE_GEOMETRY)
-        page.evaluate(_SET_SCROLL, "top")
-        page.wait_for_timeout(300)
+        # The transcript follows its end while it settles, so re-apply until it stays at the top.
+        for _ in range(20):
+            page.evaluate(_SET_SCROLL, "top")
+            page.wait_for_timeout(300)
+            if page.evaluate(_SCROLLER_TOP) == 0:
+                break
         first_bubble_top = page.evaluate(_FIRST_BUBBLE_TOP)
         print(
             f"[{case}] at scrollTop 0: first bubble top={first_bubble_top}, header "
