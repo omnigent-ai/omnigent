@@ -956,6 +956,20 @@ def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
     }
 
 
+def _mark_mcp_error(response: McpResponse) -> McpResponse:
+    """Flag an SDK MCP handler response as a tool error, in both spellings.
+
+    ``claude_agent_sdk.create_sdk_mcp_server`` builds the wire result from the
+    handler's snake_case ``is_error`` only (``CallToolResult(isError=
+    result.get("is_error", False))``), so a response carrying just ``isError``
+    reaches the model as a success. ``isError`` is kept for native MCP
+    clients and existing readers of these dicts.
+    """
+    response["is_error"] = True
+    response["isError"] = True
+    return response
+
+
 def _build_mcp_tools(
     tool_schemas: list[ToolSpec],
     tool_executor: ToolExecutor | None,
@@ -983,16 +997,18 @@ def _build_mcp_tools(
         def _make_handler(tool_name: str) -> Callable[[ToolArgs], Awaitable[McpResponse]]:
             async def handler(args: ToolArgs) -> McpResponse:
                 if tool_executor is None:
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json_dumps_transport_safe(
-                                    {"error": f"No tool executor for '{tool_name}'"}
-                                ),
-                            }
-                        ],
-                    }
+                    return _mark_mcp_error(
+                        {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json_dumps_transport_safe(
+                                        {"error": f"No tool executor for '{tool_name}'"}
+                                    ),
+                                }
+                            ],
+                        }
+                    )
                 try:
                     # ``tool_executor`` is declared as ``Awaitable[ToolResult]``
                     # so we always await. The isinstance guard below preserves
@@ -1012,18 +1028,19 @@ def _build_mcp_tools(
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")
                     ):
-                        response["isError"] = True
+                        return _mark_mcp_error(response)
                     return response
                 except Exception as exc:  # noqa: BLE001 — tool handler converts any error to MCP error response
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json_dumps_transport_safe({"error": str(exc)}),
-                            }
-                        ],
-                        "isError": True,
-                    }
+                    return _mark_mcp_error(
+                        {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json_dumps_transport_safe({"error": str(exc)}),
+                                }
+                            ],
+                        }
+                    )
 
             return handler
 
