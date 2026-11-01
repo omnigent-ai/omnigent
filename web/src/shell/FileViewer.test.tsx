@@ -258,6 +258,8 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  /** Esc closes through `onClose` too, as a workspace file tab does. */
+  escapeCloses?: boolean;
 }
 
 /**
@@ -281,6 +283,7 @@ function viewerTree({
   onClose = vi.fn(),
   sort,
   onNavigateTo,
+  escapeCloses = false,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -299,6 +302,7 @@ function viewerTree({
           conversationId="conv_1"
           path={path}
           onClose={onClose}
+          onCloseTab={escapeCloses ? onClose : undefined}
           sort={sort}
           onNavigateTo={onNavigateTo}
         />
@@ -1378,6 +1382,37 @@ describe("classifyAndRemapComments", () => {
 // full-screen overlay (non-frameless). On desktop the viewer is embedded in
 // the tabbed Files rail (frameless), where tabs own open/close, so the back
 // button is hidden there.
+
+describe("FileViewer Escape ownership", () => {
+  it("marks itself as owning Escape while Escape would close its tab", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(
+      <>
+        {viewerTree({ open: true, escapeCloses: true, syncUrl: false })}
+        <button type="button">Chat</button>
+      </>,
+    );
+    const viewer = screen.getByTestId("file-viewer");
+    expect(viewer).toHaveAttribute("data-escape-owner");
+
+    // Working in the chat leaves Escape to the chat.
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Chat" }));
+    expect(viewer).not.toHaveAttribute("data-escape-owner");
+    fireEvent.mouseDown(viewer);
+    expect(viewer).toHaveAttribute("data-escape-owner");
+
+    // Find keeps Escape for closing itself.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    expect(viewer).not.toHaveAttribute("data-escape-owner");
+  });
+
+  it("doesn't own Escape when Escape doesn't close it", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(viewerTree({ open: true }));
+    expect(screen.getByTestId("file-viewer")).not.toHaveAttribute("data-escape-owner");
+  });
+});
 
 describe("FileViewer header close affordance", () => {
   it.each([false, true])("invokes onClose for a mobile overlay (frameless=%s)", (frameless) => {

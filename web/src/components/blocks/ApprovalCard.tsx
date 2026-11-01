@@ -50,9 +50,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useDescendantSession } from "@/hooks/useChildSessions";
 import {
   type AskUserQuestionPayload,
-  castAskUserQuestionPayload,
+  askUserQuestionPayloadOf,
   exitPlanModePlan,
-  parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
 import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
@@ -254,6 +253,11 @@ interface ApprovalCardProps {
   onSubmit?: SubmitApprovalFn;
   /** Set when the prompt was mirrored up from a sub-agent session. */
   requester?: SubagentRequester | null;
+  /**
+   * Whether keys pressed outside this card drive its question form. Only the
+   * question the chat answers from the keyboard sets this.
+   */
+  keyboardActive?: boolean;
   /** Extra classes for the card container, e.g. to drop its border when embedded. */
   className?: string;
 }
@@ -282,6 +286,7 @@ export function ApprovalCard({
   agyPermission,
   onSubmit,
   requester,
+  keyboardActive,
   className,
 }: ApprovalCardProps) {
   // In a side-chat pane this resolves to the child id, so the verdict targets
@@ -368,8 +373,7 @@ export function ApprovalCard({
   // JSON for backwards compatibility with elicitations published
   // before the structured field was added.
   const askPayload: AskUserQuestionPayload | null = useMemo(
-    () =>
-      castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview),
+    () => askUserQuestionPayloadOf({ askUserQuestion, contentPreview }),
     [askUserQuestion, contentPreview],
   );
   // Remount the question form when the same elicitation carries new questions.
@@ -911,6 +915,7 @@ export function ApprovalCard({
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
+            keyboardActive={keyboardActive}
           />
         ) : isCodexCommandApproval ? (
           <>
@@ -999,9 +1004,12 @@ export function ApprovalCard({
 export function ElicitationCard({
   item,
   onSubmit,
+  keyboardActive,
 }: {
   item: Extract<RenderItem, { kind: "elicitation" }>;
   onSubmit?: SubmitApprovalFn;
+  /** Whether keys pressed outside the card drive its question form. */
+  keyboardActive?: boolean;
 }) {
   // A sub-agent's prompt is mirrored into its ancestors' streams with
   // ``targetSessionId`` naming the sub-agent that asked.
@@ -1033,6 +1041,7 @@ export function ElicitationCard({
       agyPermission={item.agyPermission}
       onSubmit={onSubmit}
       requester={requester}
+      keyboardActive={keyboardActive}
     />
   );
 }

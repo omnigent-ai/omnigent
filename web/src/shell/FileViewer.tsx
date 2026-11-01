@@ -992,11 +992,15 @@ function FileViewerBody({
   // file makes it active) and flipped by clicks / focus moves. When the user
   // works in the chat/composer, Cmd+F falls through to the browser's find.
   const viewerIsActiveSurfaceRef = useRef(true);
+  // Mirrors the ref for rendering, which marks the viewer as owning Escape.
+  const [viewerIsActiveSurface, setViewerIsActiveSurface] = useState(true);
   useEffect(() => {
     // Opening the viewer (or switching files within it) makes it the active
     // surface again. Keyed on `open` too, so reopening the same path after the
     // user had clicked into the chat re-seeds the ref instead of staying stale.
-    if (open) viewerIsActiveSurfaceRef.current = true;
+    if (!open) return;
+    viewerIsActiveSurfaceRef.current = true;
+    setViewerIsActiveSurface(true);
   }, [open, path]);
   useEffect(() => {
     if (!open) return;
@@ -1005,6 +1009,7 @@ function FileViewerBody({
       const target = e.target;
       if (root !== null && target instanceof Node) {
         viewerIsActiveSurfaceRef.current = root.contains(target);
+        setViewerIsActiveSurface(viewerIsActiveSurfaceRef.current);
       }
     };
     window.addEventListener("mousedown", track, true);
@@ -1965,11 +1970,16 @@ function FileViewerBody({
     </>
   );
 
+  // Escape closes this file's tab (see above), so page-wide Escape shortcuts leave it alone.
+  const ownsEscape =
+    open && onCloseTab !== undefined && !searchOpen && (syncUrl || viewerIsActiveSurface);
+
   if (frameless) {
     return (
       <div
         ref={setViewerRoot}
         data-testid="file-viewer"
+        data-escape-owner={ownsEscape ? "" : undefined}
         style={{ paddingBottom: keyboardInset || undefined }}
         className={cn(
           "flex flex-col flex-1 min-h-0 overflow-hidden bg-card",
@@ -1985,6 +1995,7 @@ function FileViewerBody({
     <aside
       ref={setFramedViewerRoot}
       data-testid="file-viewer"
+      data-escape-owner={ownsEscape ? "" : undefined}
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",

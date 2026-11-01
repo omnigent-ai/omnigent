@@ -47,6 +47,7 @@ vi.mock("@/store/chatStore", () => ({
     selector({ sessionStatus: h.sessionStatus }),
 }));
 
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { executionLogTabKey } from "@/hooks/useChildSessions";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 
@@ -128,6 +129,31 @@ describe("ExecutionLogsPanel open/close gating", () => {
     const { onClose } = renderPanel({ open: true });
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes on Escape from the page without declining a pending question", () => {
+    const onReject = vi.fn();
+    render(
+      <AskUserQuestionForm
+        elicitationId="elic_logs"
+        questions={[
+          { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+        ]}
+        onSubmit={vi.fn()}
+        onReject={onReject}
+        keyboardActive
+      />,
+    );
+    const { onClose } = renderPanel({ open: true });
+    fireEvent.click(screen.getByText("No items"));
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    // Also with focus in the question's own text field.
+    const custom = screen.getByTestId("ask-user-question-custom-input");
+    custom.focus();
+    fireEvent.keyDown(custom, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(2);
+    expect(onReject).not.toHaveBeenCalled();
   });
 
   it("fires onClose when the header close button is clicked", () => {
