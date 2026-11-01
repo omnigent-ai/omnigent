@@ -2010,6 +2010,10 @@ def create_app(
         _warn_on_empty_picker_restriction(
             agent_store, picker_curation, app_inst.state.suppressed_agent_names
         )
+        if sandbox_config is not None:
+            from omnigent.server.managed_hosts import warn_unknown_agent_images
+
+            warn_unknown_agent_images(sandbox_config, agent_store)
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.

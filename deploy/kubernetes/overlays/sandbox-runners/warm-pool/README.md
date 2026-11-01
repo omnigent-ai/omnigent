@@ -85,6 +85,11 @@ The host image must still support the requested harness. Use a new versioned
 pool name when changing modes or other profile settings so old spare Pods do
 not serve the previous profile.
 
+An agent listed under `sandbox.kubernetes.agents` with its own `image` is never
+served by a shared pool (shared Pods run the fleet image); it uses a dedicated
+`--agent-name NAME` pool, whose template is generated with that agent's image,
+or falls back to direct provisioning.
+
 Per-agent admission-time credential injection does not apply to an unlabeled
 shared pool. Do not relabel allocated Pods to trigger it: admission already ran
 when the Pod was created. Use `--agent-name NAME` for deployments that rely on
