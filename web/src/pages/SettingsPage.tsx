@@ -128,9 +128,11 @@ import {
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useConversations,
+  useProjects,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { ProjectRowIcon } from "@/shell/ProjectPicker";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
@@ -2912,6 +2914,11 @@ function ArchivedSection() {
   // whose sessions sit on later pages.
   const namesQuery = useArchivedProjectNames();
   const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
+  const projectsQuery = useProjects();
+  const projectIcons = useMemo(
+    () => new Map((projectsQuery.data ?? []).map(({ name, icon }) => [name, icon])),
+    [projectsQuery.data],
+  );
 
   // A picked project can vanish from the option set for good (its last
   // archived session deleted or restored, possibly by another client). Once
@@ -3067,17 +3074,20 @@ function ArchivedSection() {
                 data-testid="archived-project-filter"
                 className="w-56"
               >
-                <SelectValue />
+                <SelectValue className="min-w-0 flex-1" />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
+              <SelectContent position="popper" align="start" className="max-w-80">
                 <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
                 {items.map((name) => (
                   <SelectItem
                     key={name}
                     value={projectToSelectValue(name)}
                     data-testid={`archived-project-option-${name}`}
+                    textValue={name}
+                    className="*:[span]:last:min-w-0"
                   >
-                    {name}
+                    <ProjectRowIcon icon={projectIcons.get(name)} />
+                    <span className="min-w-0 flex-1 truncate">{name}</span>
                   </SelectItem>
                 ))}
               </SelectContent>
