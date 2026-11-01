@@ -60,10 +60,16 @@ and a skill the bundle itself carries always wins a name collision.
 A session picks up installs, updates, removals, enable or disable changes,
 source changes and policy changes on its next turn: the change moves the
 session's agent revision, so the runner fetches the bundle again before that
-turn. A terminal or native TUI harness that is already open reads its
-skills at launch and keeps them until that terminal restarts. With the feature switched off, installed rows stay in the database but nothing
-reads them: the routes are absent and neither discovery nor served bundles
-include them.
+turn. A turn that starts with a skill's slash command carries the revision
+to the runner before the skill is resolved, so it runs the current copy. A
+sandboxed environment the session reuses is granted the current skill
+directories and loses the old ones. A terminal or native TUI harness that
+is already open reads its skills at launch and keeps them until that
+terminal restarts.
+
+With the feature switched off, installed rows stay in the database but
+nothing reads them: the routes are absent and neither discovery nor served
+bundles include them.
 
 ## Scope and permissions
 
