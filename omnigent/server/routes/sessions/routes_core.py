@@ -226,6 +226,7 @@ from omnigent.server.session_orchestration import (
     record_team_asker,
     require_orchestration_source,
     require_project_read_access,
+    validate_team_role,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -1112,6 +1113,7 @@ def register_core_routes(
                         "labels": {**body.labels, **inherited.get("labels", {})},
                     }
                 )
+        validate_team_role(request, body.labels)
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,

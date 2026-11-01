@@ -984,6 +984,14 @@ class SysSessionCreateTool(Tool):
                                 "in the session's own git worktree, e.g. 'team/backend-api'."
                             ),
                         },
+                        "team_role": {
+                            "type": "string",
+                            "description": (
+                                "Optional with an independent placement. The session's role on "
+                                "this project's team, e.g. 'Backend'; one line, at most 40 "
+                                "characters. It is shown on the Canvas and in sys_session_list."
+                            ),
+                        },
                         "base_branch": {
                             "type": "string",
                             "description": (

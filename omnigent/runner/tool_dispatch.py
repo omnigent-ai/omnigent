@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
-from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY, TEAM_ROLE_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -3580,6 +3580,9 @@ async def _execute_session_create(
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
         body.pop("parent_session_id")
+        team_role = args.get("team_role")
+        if isinstance(team_role, str):
+            body["labels"] = {TEAM_ROLE_LABEL_KEY: team_role}
         # The server derives the same host/workspace from this bound source.
         headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
         if placement == "managed":
@@ -5379,6 +5382,7 @@ async def _session_get_info_via_rest(
             "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
                 CREATED_BY_SESSION_LABEL_KEY
             ),
+            "team_role": (_string_mapping(snap.get("labels")) or {}).get(TEAM_ROLE_LABEL_KEY),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
             # Effective model: a per-session override wins over the
@@ -6568,6 +6572,7 @@ async def _collect_global_sessions(
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),
+                "team_role": (_string_mapping(r.get("labels")) or {}).get(TEAM_ROLE_LABEL_KEY),
                 # Only an archive-inclusive listing can return archived rows.
                 **({"archived": r.get("archived") is True} if include_archived else {}),
             }

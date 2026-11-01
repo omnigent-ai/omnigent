@@ -67,7 +67,11 @@ import {
   type CanvasLayout,
 } from "@/canvas/canvasStorage";
 import { usePullRequests, type CanvasPullRequests } from "@/canvas/pullRequests";
+import { AddAgentDialog } from "@/canvas/AddAgentDialog";
+import { BringSessionsDialog } from "@/canvas/BringSessionsDialog";
+import { teamEdges } from "@/canvas/canvasTeam";
 import { SessionCard, type SessionCardNode } from "@/canvas/SessionCard";
+import { TeamEdge } from "@/canvas/TeamEdge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
@@ -81,6 +85,7 @@ import { ProjectRowIcon } from "@/shell/ProjectPicker";
 import "@xyflow/react/dist/style.css";
 
 const nodeTypes = { session: SessionCard };
+const edgeTypes = { team: TeamEdge };
 const proOptions = { hideAttribution: true };
 const FIT_VIEW = { padding: 0.2, maxZoom: 1 };
 const SNAP_GRID: [number, number] = [GRID_STEP, GRID_STEP];
@@ -159,6 +164,8 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
+  const [addAgentSession, setAddAgentSession] = useState<Conversation | null>(null);
+  const [bringSessionsOpen, setBringSessionsOpen] = useState(false);
   // The URL names the canvas; without it, reopen the viewer's last selection
   // once identity is known. Never hydrate an authenticated view from the
   // anonymous storage slot while embedded identity is still resolving.
@@ -279,6 +286,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
           conversation: session,
           pullRequest: requests[session.id] ?? null,
           onOpen: openSession,
+          onAddAgent: setAddAgentSession,
         },
         selectable: true,
         focusable: false,
@@ -562,6 +570,11 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
     );
   }
 
+  const edges = teamEdges(visibleSessions);
+  const otherSessions = sessions.filter(
+    (session) => !visibleSessions.some((visible) => visible.id === session.id),
+  );
+
   const emptyState = visibleSessions.length === 0 && (
     <div className="pointer-events-none absolute inset-0 z-[5] flex items-center justify-center p-6 text-center text-muted-foreground">
       <strong className="font-medium text-foreground">
@@ -654,7 +667,9 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
       >
         <ReactFlow<SessionCardNode>
           nodes={nodes}
+          edges={edges}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
           onNodeClick={(_event, node) => openSession(node.id)}
@@ -683,6 +698,18 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
           />
         </ReactFlow>
         {emptyState}
+        {activeProject && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="absolute right-6 top-4 z-10 bg-card"
+            data-testid="canvas-add-sessions"
+            onClick={() => setBringSessionsOpen(true)}
+          >
+            Add sessions
+          </Button>
+        )}
         <Button
           type="button"
           size="icon-lg"
@@ -698,6 +725,19 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
           <PlusIcon className="size-5" />
         </Button>
       </div>
+      <AddAgentDialog
+        session={addAgentSession}
+        onAdded={refresh}
+        onClose={() => setAddAgentSession(null)}
+      />
+      {activeProject && (
+        <BringSessionsDialog
+          open={bringSessionsOpen}
+          projectName={activeProject.name}
+          sessions={otherSessions}
+          onClose={() => setBringSessionsOpen(false)}
+        />
+      )}
     </div>
   );
 }

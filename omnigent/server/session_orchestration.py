@@ -19,12 +19,16 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    TEAM_BRIEFED_LABEL_KEY,
     TEAM_REPLY_TO_LABEL_KEY,
+    TEAM_ROLE_LABEL_KEY,
     ConversationStore,
 )
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed
 
+_MAX_TEAM_ROLE_LENGTH = 40
+_TEAM_LEAD_ROLE = "team lead"
 OUTSIDE_PROJECT_MESSAGE = "That session is outside this session's project"
 
 
@@ -122,6 +126,56 @@ def same_project_filing(
         second_root.project_id,
         second_root.labels.get(PROJECT_LABEL_KEY),
     )
+
+
+def team_brief(role: str) -> str:
+    """Explain a team member's position, ahead of its first message."""
+    duties = (
+        "The user talks to you about this project. Break their requests down, hand the work to "
+        "teammates, create more with sys_session_create (placement='same_host', with a "
+        "branch_name so each one gets its own worktree), combine the results, and report back."
+        if role.strip().casefold() == _TEAM_LEAD_ROLE
+        else "Do the work teammates hand you, and tell them when you need something from them."
+    )
+    return (
+        f"[System: You are the {role.strip()} on this project's team. Your teammates are the "
+        "other sessions in this project: find them and their roles with sys_session_list, read "
+        "their work with sys_session_get_history, and send them work with sys_session_message. "
+        f"You are told when a teammate you messaged finishes. {duties} You cannot reach other "
+        "projects or answer approvals, which stay with the user. Your first task follows.]"
+    )
+
+
+def validate_team_role(request: Request, labels: dict[str, str]) -> None:
+    """Refuse a team role that could not be shown on one line or placed in a brief."""
+    role = labels.get(TEAM_ROLE_LABEL_KEY)
+    if role is None or not request.app.state.feature_flags.enabled(Feature.CANVAS):
+        return
+    if not role.strip() or len(role) > _MAX_TEAM_ROLE_LENGTH or not role.isprintable():
+        raise OmnigentError(
+            f"A team role must be one line of 1–{_MAX_TEAM_ROLE_LENGTH} characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def with_team_brief(
+    request: Request, conversations: ConversationStore, session: Conversation, body: Any
+) -> Any:
+    """Put a team member's brief ahead of its first message, once."""
+    role = session.labels.get(TEAM_ROLE_LABEL_KEY)
+    content = body.data.get("content")
+    if (
+        role is None
+        or TEAM_BRIEFED_LABEL_KEY in session.labels
+        or not request.app.state.feature_flags.enabled(Feature.CANVAS)
+        or body.type != "message"
+        or body.data.get("role", "user") != "user"
+        or not isinstance(content, list)
+    ):
+        return body
+    conversations.set_labels(session.id, {TEAM_BRIEFED_LABEL_KEY: "1"})
+    brief = {"type": "input_text", "text": team_brief(role)}
+    return body.model_copy(update={"data": {**body.data, "content": [brief, *content]}})
 
 
 def record_team_asker(

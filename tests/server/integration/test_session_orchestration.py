@@ -14,6 +14,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    TEAM_ROLE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -1361,3 +1362,65 @@ async def test_same_host_worker_can_start_in_its_own_worktree(
     ):
         assert refusal in (await create(**arguments))["error"]
     assert len(worktree_requests) == 1
+
+
+@pytest.mark.parametrize("canvas_enabled", [True, False])
+async def test_team_role_briefs_the_first_message_once(
+    auth_client, auth_app, peers, db_uri, canvas_enabled
+):
+    source, target, captured = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, *([Feature.CANVAS] if canvas_enabled else [])})
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(target["id"], {TEAM_ROLE_LABEL_KEY: "Backend"})
+
+    assert (await _send(auth_client, source, target, "First task")).get("queued") is True
+    assert (await _send(auth_client, source, target, "Second task")).get("queued") is True
+
+    delivered = [json.dumps(post) for post in captured["posts"]]
+    assert "First task" in delivered[0] and "Second task" in delivered[1]
+    assert ("the Backend on this project" in delivered[0]) is canvas_enabled
+    assert "on this project" not in delivered[1]
+
+    # An unrelated session with no role is never briefed.
+    captured.clear()
+    other = await _create_session_as(auth_client, "", "alice")
+    await _send(auth_client, source, other, "Plain task")
+    assert "on this project" not in json.dumps(captured["posts"])
+
+
+async def test_team_role_is_validated_and_reported(auth_client, auth_app, peers, db_uri):
+    source, _, _ = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, Feature.CANVAS})
+    )
+
+    async def create(role):
+        return await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": source["agent_id"], "labels": {TEAM_ROLE_LABEL_KEY: role}},
+        )
+
+    for rejected in (" ", "x" * 41, "two\nlines"):
+        assert (await create(rejected)).status_code == 400
+    created = await create("Team lead")
+    assert created.status_code == 201, created.text
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": created.json()["id"]}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert info["team_role"] == "Team lead"
+
+
+def test_team_brief_names_each_roles_duties():
+    from omnigent.server.session_orchestration import team_brief
+
+    lead = team_brief(" Team LEAD ")
+    assert "the Team LEAD on" in lead and "report back" in lead
+    teammate = team_brief("Backend")
+    assert "the Backend on" in teammate and "report back" not in teammate

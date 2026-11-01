@@ -47,6 +47,10 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   created with a first task, wakes the sender once with a system notice when it
   finishes or fails, and also when it starts waiting on an approval. Notices stop
   when either session leaves the project. Other sessions are not told.
+- `team-roles`: with `canvas` enabled, a session created with a team role, from the
+  Canvas or `sys_session_create`'s `team_role`, gets a brief explaining its team and
+  duties ahead of its first message; text typed directly into a native terminal skips
+  it. `sys_session_list` and `sys_session_get_info` report each `team_role`.
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
