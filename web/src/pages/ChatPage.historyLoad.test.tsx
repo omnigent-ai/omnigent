@@ -341,22 +341,39 @@ describe("KeepBottomOnResize", () => {
     }
   });
 
-  it("disconnects the observer and cancels a queued follow-up frame", () => {
+  it("disconnects the observer, removes its listeners and cancels a queued follow-up frame", () => {
     const { metrics } = makeScrollRoot();
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
-    const { unmount } = render(<KeepBottomOnResize />);
+    const addListener = vi.spyOn(document, "addEventListener");
+    const removeListener = vi.spyOn(document, "removeEventListener");
+    try {
+      const { unmount } = render(<KeepBottomOnResize />);
 
-    metrics.clientHeight = 650;
-    act(() => resize?.());
-    expect(frames.size).toBe(1);
+      metrics.clientHeight = 650;
+      act(() => resize?.());
+      expect(frames.size).toBe(1);
 
-    unmount();
+      unmount();
 
-    expect(disconnectSpy).toHaveBeenCalledOnce();
-    expect(cancelAnimationFrame).toHaveBeenCalled();
-    expect(frames.size).toBe(0);
+      expect(disconnectSpy).toHaveBeenCalledOnce();
+      expect(cancelAnimationFrame).toHaveBeenCalled();
+      expect(frames.size).toBe(0);
+      const pointerListeners = addListener.mock.calls.filter(([type]) =>
+        type.startsWith("pointer"),
+      );
+      expect(pointerListeners.map(([type]) => type)).toEqual([
+        "pointerdown",
+        "pointerup",
+        "pointercancel",
+      ]);
+      for (const [type, listener, options] of pointerListeners)
+        expect(removeListener).toHaveBeenCalledWith(type, listener, options);
+    } finally {
+      addListener.mockRestore();
+      removeListener.mockRestore();
+    }
   });
 });
 
