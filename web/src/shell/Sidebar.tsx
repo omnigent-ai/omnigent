@@ -3234,6 +3234,7 @@ function projectMarkerState(
   startingConversationId: string | null,
 ): SessionState | null {
   let awaiting = 0;
+  let terminalReason: string | undefined;
   let running = false;
   let starting = false;
   let error = false;
@@ -3243,6 +3244,7 @@ function projectMarkerState(
     const state = getSessionState(c, errors[i]);
     if (state?.kind === "awaiting") {
       awaiting += state.count;
+      terminalReason ??= state.terminalReason;
     } else if (state?.kind === "running") {
       running = true;
     } else if (c.id === startingConversationId) {
@@ -3256,6 +3258,7 @@ function projectMarkerState(
     }
   }
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
+  if (terminalReason) return { kind: "awaiting", count: 0, terminalReason };
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
   if (error) return { kind: "error" };
@@ -5844,6 +5847,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "owner",
   "pending_elicitations_count",
   "background_work_running",
+  "blocked_on",
   "provisional",
 ];
 

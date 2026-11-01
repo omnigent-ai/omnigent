@@ -44,6 +44,12 @@ it("enters Working immediately and requires ten uninterrupted idle seconds per s
   expect([...result.current]).toEqual([]);
 });
 
+it("leaves a turn parked on a terminal prompt out of Working", () => {
+  const parked: Conversation = { ...running, blocked_on: "permission prompt" };
+  const { result } = renderHook(() => useSidebarWorkingIds([parked], null, true));
+  expect([...result.current]).toEqual([]);
+});
+
 it("holds Working while a background shell outlives the turn", () => {
   const shells: Conversation = { ...idle, background_work_running: true };
   const { result, rerender } = renderHook(({ rows }) => useSidebarWorkingIds(rows, null, true), {

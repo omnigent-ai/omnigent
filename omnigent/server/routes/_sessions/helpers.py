@@ -247,6 +247,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_blocked_on_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -1418,6 +1419,41 @@ def _set_background_work_running(
     )
 
 
+# Longest parked reason kept for the session list; the live stream carries it whole.
+_BLOCKED_ON_LIST_MAX_CHARS = 128
+
+
+def _set_blocked_on(session_id: str, blocked_on: str | None) -> None:
+    """
+    Record why a session's agent is parked on a terminal prompt, if it is.
+
+    Called for every published status edge: an edge without a reason means
+    the session is no longer parked. The session list shows a parked session
+    as needing input even when no web card exists for the prompt.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param blocked_on: The edge's reason, e.g. ``"permission prompt"``, or ``None``.
+    """
+    reason = blocked_on[:_BLOCKED_ON_LIST_MAX_CHARS] if blocked_on else ""
+    _session_blocked_on_cache[session_id] = reason
+    session_live_state.persist_blocked_on(session_id, reason or None)
+
+
+def _blocked_on_for(conversation_id: str, db_value: str | None) -> str | None:
+    """
+    Return the session-list ``blocked_on`` value for one session.
+
+    :param conversation_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param db_value: The row's persisted reason, used when this replica has
+        published no status edge for the session.
+    :returns: Why the session's agent is parked on a terminal prompt, or ``None``.
+    """
+    cached = _session_blocked_on_cache.get(conversation_id)
+    if cached is not None:
+        return cached or None
+    return db_value or None
+
+
 async def _collect_descendant_conversation_ids(
     conversation_store: ConversationStore,
     root_id: str,
@@ -1535,6 +1571,7 @@ async def _apply_liveness_to_items(
             # Background shells end with their runner, which may die without
             # reporting it; the runner re-reports on reconnect.
             item.background_work_running = False
+            item.blocked_on = None
 
 
 def _targeted_elicitation_event(
@@ -5041,6 +5078,7 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    _set_blocked_on(session_id, blocked_on)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
@@ -12363,6 +12401,7 @@ __all__ = [
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
     "_background_task_delivery_status",
+    "_blocked_on_for",
     "_build_actor",
     "_build_evaluation_context",
     "_build_new_item",
@@ -12540,6 +12579,7 @@ __all__ = [
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
     "_set_background_work_running",
+    "_set_blocked_on",
     "_set_read_state",
     "_signal_harness_elicitation_resolved_by_id",
     "_signal_terminal_resolved_harness_elicitation",

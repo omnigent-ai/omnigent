@@ -1,8 +1,8 @@
 """Best-effort persistence of per-session live state to the conversations table.
 
 The sidebar's live fields — ``runner_online``, turn ``status``, the
-pending-approval count, and the background-shell flag — were historically
-served from in-memory caches
+pending-approval count, the background-shell flag, and the parked reason —
+were historically served from in-memory caches
 that exist only on the server replica holding a session's runner tunnel
 (the tunnel registry, the SSE-relay status cache, and the
 pending-elicitations index). Under host_id replica sharding a session
@@ -76,6 +76,8 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Last parked reason persisted per session (``""`` = not parked), for dedupe.
+_last_blocked_on: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Handoffs to another replica per session. A write queued before a handoff sees
 # the count change and is skipped, so it cannot overwrite the new owner's value.
 _handoffs: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
@@ -103,6 +105,7 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+    _last_blocked_on.clear()
     _handoffs.clear()
     _last_liveness_stamp.clear()
 
@@ -242,6 +245,7 @@ def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state and queued writes for a session handed off."""
     _handoffs[session_id] = _handoffs.get(session_id, 0) + 1
     _last_status.pop(session_id, None)
+    _last_blocked_on.pop(session_id, None)
 
 
 def persist_scheduled_run_completion(
@@ -395,6 +399,38 @@ def clear_background_work_running(session_id: str, runner_id: str, *, unseen_sin
         ),
         session_id,
         False,
+    )
+
+
+def persist_blocked_on(session_id: str, blocked_on: str | None) -> None:
+    """
+    Persist why a running session's agent is parked on a terminal prompt.
+
+    Called wherever ``_session_blocked_on_cache`` is written, which is every
+    published status edge. Deduplicated: only a change reaches the database.
+
+    :param session_id: Session/conversation identifier.
+    :param blocked_on: The reason, e.g. ``"permission prompt"``, or ``None``
+        when the session is not parked.
+    """
+    value = blocked_on or ""
+    if _store is None or _last_blocked_on.get(session_id) == value:
+        return
+    _last_blocked_on[session_id] = value
+
+    def _evict() -> None:
+        # See persist_live_status._evict: a dropped write must not leave the
+        # dedupe cache asserting this value reached the database.
+        if _last_blocked_on.get(session_id) == value:
+            _last_blocked_on.pop(session_id, None)
+
+    _submit_while_owned(
+        session_id,
+        "blocked_on",
+        _store.set_blocked_on,
+        session_id,
+        value or None,
+        on_failure=_evict,
     )
 
 
