@@ -113,6 +113,28 @@ class MainActivity : AppCompatActivity() {
     private lateinit var connectionCancel: Button
     private var pinnedOrigin: String? = null
 
+    // Bumped on every server load so a late cookie callback can't load a stale one.
+    private var loadGeneration = 0
+
+    // True while [releaseSessionCookies] waits on an expiry for the current load.
+    private var releasingSessionCookies = false
+
+    // The server whose crash-recovery page waits for that release to finish.
+    private var recoveryAfterRelease: String? = null
+
+    // CookieManager.setCookie's completion is async; substitutable so a test
+    // can hold the callback across a server switch (SessionTokenBindingTest).
+    @androidx.annotation.VisibleForTesting
+    internal var installSessionCookie: (String, String, (Boolean) -> Unit) -> Unit =
+        { url, value, callback ->
+            CookieManager.getInstance().setCookie(url, value) { callback(it) }
+        }
+
+    // Reads the Cookie header a request to the URL would carry; a test seam like
+    // [installSessionCookie].
+    @androidx.annotation.VisibleForTesting
+    internal var readCookies: (String) -> String? = { CookieManager.getInstance().getCookie(it) }
+
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
     private var pendingNavigatePath: String? = null
@@ -346,13 +368,16 @@ class MainActivity : AppCompatActivity() {
         if (serverAuthentication(originOf(serverUrl)) != ServerAuthentication.OIDC) {
             oidcSession?.stop()
             connectionOverlay.visibility = View.GONE
-            webView.loadUrl(serverUrl)
+            loadReleasingSessionCookies(serverUrl, pinnedOrigin)
             return
         }
         // A page left running under the cover keeps calling its server and could start a
         // sign-in of its own; the session's page loads fresh once it is ready.
         if (webView.url != null) webView.loadUrl(BLANK_PAGE)
-        oidcController().connect(serverUrl, interactive)
+        // Clear another port's session before sign-in sets this server's cookie; the old
+        // session stops first so its renewals can't reinstall the cookie meanwhile.
+        oidcSession?.stop()
+        releaseSessionCookies(pinnedOrigin) { oidcController().connect(serverUrl, interactive) }
     }
 
     private fun oidcController(): OidcSessionController =
@@ -1029,21 +1054,26 @@ class MainActivity : AppCompatActivity() {
             // The local recovery page has no bridge — surface the pill straight
             // away as the recovery affordance.
             revealServerSwitcherNow()
-            // Offline page (no network) so it can't re-trigger the crash.
-            webView.loadDataWithBaseURL(
-                null,
-                recoveryErrorHtml(serverUrl),
-                "text/html",
-                "utf-8",
-                null,
-            )
+            // Its Reload link would skip a pending release; show it once the old session is gone.
+            if (releasingSessionCookies) {
+                recoveryAfterRelease = serverUrl
+                return
+            }
+            showRecoveryPage(serverUrl)
             return
         }
 
         // Reload the user's route; a blank or foreign URL falls back to the root.
         val reloadUrl =
             if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
-        webView.loadUrl(reloadUrl)
+        // A pending release finishes this server's load (or native connect) itself.
+        if (releasingSessionCookies) return
+        loadReleasingSessionCookies(reloadUrl, pinnedOrigin)
+    }
+
+    // Offline page (no network) so it can't re-trigger the crash.
+    private fun showRecoveryPage(serverUrl: String) {
+        webView.loadDataWithBaseURL(null, recoveryErrorHtml(serverUrl), "text/html", "utf-8", null)
     }
 
     /**
@@ -1244,14 +1274,14 @@ class MainActivity : AppCompatActivity() {
             buildString {
                 append(name).append('=').append(token).append("; Path=/")
                 if (secure) append("; Secure")
-                append("; SameSite=Lax")
+                append("; SameSite=Lax; HttpOnly")
             }
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
-        cookies.setCookie(origin, cookie) { accepted ->
+        installSessionCookie(origin, cookie) { accepted ->
             // setCookie's callback is async — re-check the WebView is still alive.
-            if (isDestroyed || !::webView.isInitialized) return@setCookie
+            if (isDestroyed || !::webView.isInitialized) return@installSessionCookie
             authLog(
                 "setCookie accepted=$accepted present=${cookies
                     .getCookie(
@@ -1261,7 +1291,7 @@ class MainActivity : AppCompatActivity() {
             // A rejected cookie means the reload would land unauthenticated,
             // bounce to login, and re-launch the browser — burning the retry
             // budget on a failure that retrying can't fix. Stay put instead.
-            if (!accepted) return@setCookie
+            if (!accepted) return@installSessionCookie
             cookies.flush()
             webView.loadUrl(origin)
         }
@@ -1416,6 +1446,89 @@ class MainActivity : AppCompatActivity() {
         // An OIDC server's page stays covered while its manifest is read.
         connectServer(serverUrl, interactive)
     }
+
+    /** Load [serverUrl] once [releaseSessionCookies] has cleared [origin]'s host. */
+    private fun loadReleasingSessionCookies(
+        serverUrl: String,
+        origin: String?,
+    ) = releaseSessionCookies(origin) { webView.loadUrl(serverUrl) }
+
+    /**
+     * Run [then] once no other origin's session is left for [origin]'s host:
+     * cookies are host-scoped, not port-scoped. The owner per host is recorded;
+     * an unrecorded host is ambiguous only if another saved server shares it.
+     */
+    private fun releaseSessionCookies(
+        origin: String?,
+        then: () -> Unit,
+    ) {
+        val generation = ++loadGeneration
+        releasingSessionCookies = false
+        recoveryAfterRelease = null
+        val host = origin?.let { Uri.parse(it).host }
+        if (origin == null || host == null) return then()
+        val store = ServerStore(this)
+        val owner = store.sessionCookieOwner(host) ?: unrecordedSessionOwner(store, host, origin)
+        val proceed = {
+            store.recordSessionCookieOwner(host, origin)
+            val recovery = recoveryAfterRelease
+            recoveryAfterRelease = null
+            if (recovery != null) showRecoveryPage(recovery) else then()
+        }
+        if (owner == origin) return proceed()
+        releasingSessionCookies = true
+        expireSessionCookies(origin, generation) { cleared ->
+            if (isDestroyed || generation != loadGeneration) return@expireSessionCookies
+            releasingSessionCookies = false
+            if (cleared) {
+                proceed()
+            } else {
+                // Never hand the old session to this server; let the user retry.
+                startActivity(Intent(this, ConnectActivity::class.java))
+                finish()
+            }
+        }
+    }
+
+    private fun unrecordedSessionOwner(
+        store: ServerStore,
+        host: String,
+        origin: String,
+    ): String? {
+        val shared =
+            store.recentServers().any { url ->
+                val other = originOf(url)
+                other != null && other != origin && Uri.parse(other).host == host
+            }
+        return if (shared) null else origin
+    }
+
+    private fun expireSessionCookies(
+        origin: String,
+        generation: Int,
+        done: (Boolean) -> Unit,
+    ) {
+        val expiry = "; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/"
+        val expired = mutableListOf("ap_session=$expiry")
+        if (origin.startsWith("https://")) expired += "__Host-ap_session=$expiry; Secure"
+
+        fun expireFrom(index: Int) {
+            // A newer load owns the cookie store now; stop writing.
+            if (generation != loadGeneration) return
+            if (index == expired.size) return done(!hasSessionCookie(origin))
+            installSessionCookie(origin, expired[index]) { accepted ->
+                if (accepted) expireFrom(index + 1) else done(false)
+            }
+        }
+        expireFrom(0)
+    }
+
+    // A cookie the expiry couldn't reach (e.g. a parent-domain one) still counts.
+    private fun hasSessionCookie(origin: String): Boolean =
+        readCookies(origin)
+            ?.split(';')
+            ?.map { it.trim().substringBefore('=') }
+            ?.any { it == "ap_session" || it == "__Host-ap_session" } == true
 
     private fun updateServerSwitcherWidth(containerWidthPx: Int) {
         if (containerWidthPx <= 0) return
