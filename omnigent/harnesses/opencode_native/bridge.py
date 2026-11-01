@@ -40,7 +40,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from omnigent.native import native_bridge_common
-from omnigent.process_logging import data_dir
 
 _logger = logging.getLogger(__name__)
 
@@ -244,8 +243,7 @@ def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
 
 
 _STATE_VERSION = 1
-# Test override; ``None`` resolves under ``OMNIGENT_DATA_DIR`` at call time.
-_BRIDGE_ROOT: Path | None = None
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "opencode-native"
 _ID_HASH_CHARS = 32
 
 
@@ -253,16 +251,14 @@ def bridge_root() -> Path:
     """
     Return the configured OpenCode-native bridge root.
 
-    Follows ``OMNIGENT_DATA_DIR``, so a host with a custom data directory
-    keeps each conversation's OpenCode database there. Tests may monkeypatch
-    :data:`_BRIDGE_ROOT` to isolate bridge files.
+    Follows ``OMNIGENT_DATA_DIR`` (anchored when the module loads), so a host
+    with a custom data directory keeps each conversation's OpenCode database
+    there. Tests may monkeypatch :data:`_BRIDGE_ROOT` to isolate bridge files.
 
     :returns: Absolute root for OpenCode-native bridge directories, e.g.
         ``Path("~/.omnigent/opencode-native")``.
     """
-    if _BRIDGE_ROOT is not None:
-        return _BRIDGE_ROOT
-    return data_dir() / "opencode-native"
+    return _BRIDGE_ROOT
 
 
 @dataclass(frozen=True)

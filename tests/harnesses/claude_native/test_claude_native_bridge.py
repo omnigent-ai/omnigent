@@ -7930,7 +7930,10 @@ def test_opencode_native_bridge_dir_under_custom_data_dir_is_trusted(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
     )
-    monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", None)
+    # The root OpenCode computes when it loads under this data dir.
+    monkeypatch.setattr(
+        opencode_native_bridge, "_BRIDGE_ROOT", tmp_path / "data" / "opencode-native"
+    )
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     bridge_dir = opencode_native_bridge.prepare_bridge_dir("conv_oc")
 

@@ -33,7 +33,6 @@ from omnigent.databricks_ai_gateway import (
     with_gateway_attribution,
 )
 from omnigent.models import model_catalog
-from omnigent.process_logging import DATA_DIR_ENV_VAR
 
 if TYPE_CHECKING:
     from databricks.sdk.core import Config
@@ -420,6 +419,8 @@ def build_opencode_omnigent_mcp_server(
         _TOOL_RELAY_POST_TIMEOUT_S,
         build_mcp_config,
     )
+    from omnigent.native.native_bridge_common import native_bridge_data_dir
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
 
     claude_cfg = build_mcp_config(bridge_dir, python_executable=python_executable)
     # build_mcp_config returns {"mcpServers": {"<name>": {command, args, env}}};
@@ -456,13 +457,8 @@ def build_opencode_omnigent_mcp_server(
         env = dict(env_value)
     else:
         raise ValueError("Claude MCP server environment is malformed")
-    # opencode serve drops OMNIGENT_* env; serve-mcp needs the same data dir to
-    # accept a bridge dir under a custom OMNIGENT_DATA_DIR.
-    data_dir_value = os.environ.get(DATA_DIR_ENV_VAR)
-    if data_dir_value:
-        env[DATA_DIR_ENV_VAR] = data_dir_value
-    if env:
-        entry["environment"] = env
+    # opencode serve runs with a filtered env; the relay must still find its bridge root.
+    entry["environment"] = {**env, DATA_DIR_ENV_VAR: str(native_bridge_data_dir())}
     return {str(name): entry}
 
 
