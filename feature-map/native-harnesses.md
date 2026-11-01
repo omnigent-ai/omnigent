@@ -269,7 +269,7 @@ columns name one journey test per harness; "—" means none exists yet.
 | `hermes-native` | `omnigent hermes` | no | tests/e2e_ui/messages/test_native_hermes_render_parity.py::test_native_hermes_message_render_parity | tests/e2e/test_hermes_native_policy_hook_path_e2e.py::test_hermes_native_policy_hook_path_lets_the_tool_run | — |
 | `kimi-native` | `omnigent kimi` | no | — | tests/e2e/test_kimi_native_steering_e2e.py::test_midturn_steer_is_applied_not_queued | — |
 | `kiro-native` | `omnigent kiro` | no | tests/e2e_ui/messages/test_native_kiro_render_parity.py::test_native_kiro_message_render_parity | tests/e2e/test_kiro_native_cli_e2e.py::test_kiro_native_cli_smoke | — |
-| `opencode-native` | `omnigent opencode` | no | — | tests/e2e/test_opencode_native_startup_cancel_leak_e2e.py::test_opencode_native_startup_cancel_reaps_serve | — |
+| `opencode-native` | `omnigent opencode` | no | — | tests/e2e/test_host_opencode_native_mock_e2e.py::test_reply_reaches_the_bound_mock_and_renders_once | — |
 | `pi-native` | `omnigent pi` | no | — | tests/e2e/test_pi_native_send_now_steer_e2e.py::test_pi_native_send_now_steers_into_active_turn | [pi-native-e2e-dev](../.claude/skills/pi-native-e2e-dev/SKILL.md) |
 | `qwen-native` | `omnigent qwen` | no | — | tests/e2e/test_qwen_native_subagent_wake_e2e.py::test_qwen_native_subagent_completion_wakes_parent | — |
 
@@ -930,17 +930,37 @@ Cross-harness journeys:
   interrupts through the runner's real event route, and the next idle settles
   a sub-agent dispatch as cancelled with its output.
   `tests/runner/test_native_interrupt_runner.py::test_opencode_interrupt_fallbacks`
-  covers missing native session state and a failed abort. Neither runs
-  OpenCode. With the CLI on `PATH`,
-  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`
-  (opt-in `OMNIGENT_E2E_OPENCODE_NATIVE=1`) checks the abort call against a
-  real server, and the matrix test covers cancelling during startup. No test
-  interrupts a running OpenCode turn: configure an OpenAI-compatible loopback
-  provider that holds the reply open, interrupt once the request arrives, then
-  confirm the session goes idle without turning busy again, a reply released
-  afterwards never appears, and a follow-up in the same session completes. The
-  harness bench does not register opencode-native, so its interrupt probe does
-  not apply.
+  covers missing native session state and a failed interrupt. Neither runs
+  OpenCode. With OpenCode 2.0.x on `PATH`,
+  `tests/e2e/test_host_opencode_native_mock_e2e.py::test_interrupt_settles_a_held_reply_and_the_next_turn_works`
+  interrupts a running turn while the scripted model holds its reply, checks
+  the session stays idle and the released reply never appears, then completes
+  a follow-up. The harness bench does not register opencode-native, so its
+  interrupt probe does not apply.
+- **opencode-native journeys (own environment, scripted model):** needs
+  `@opencode/cli` 2.0.18–2.0.x and tmux on `PATH`, in e2e mock mode:
+  `uv run --no-sync pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v`.
+  An isolated host binds `opencode-native` to a chat-wire provider on the mock
+  model server, so each test scripts its replies and checks the request the
+  mock received: reply and routing (`launch-web`), shell approval allow with the
+  tool output in the next request and deny (`approvals`), interrupt, model
+  switch (`model-and-effort`), fork, and `/compact`. For `cleanup`,
+  `tests/e2e/test_opencode_native_startup_cancel_leak_e2e.py::test_opencode_native_startup_cancel_reaps_serve`
+  (Linux only) cancels a session during startup and checks its `opencode serve`
+  is reaped. CI runs these, the wire-contract test and the OpenCode import e2e in
+  the `E2E Harness (opencode)` job, which installs the pinned CLI and sets
+  `OMNIGENT_E2E_OPENCODE_REQUIRED=1` so a missing or unsupported CLI fails rather
+  than skips; the sharded E2E lane skips them. The wire-contract test,
+  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`,
+  checks the API contract without credentials. Live-model checks remain opt-in
+  (`OMNIGENT_E2E_OPENCODE_NATIVE=1`): `tests/e2e/test_host_opencode_native_e2e.py`
+  on OpenCode's free model for multi-delta streaming and import from the user's
+  store. The browser question form
+  (`interactive-input`) is
+  `tests/e2e_ui/approvals/test_opencode_question.py::test_opencode_question_round_trips_through_web`,
+  which feeds the forwarder a form event without running OpenCode. Not covered
+  by any of these: catch-up after the server's event stream drops (component
+  tests replay captured events), images, and steering into a running turn.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.
@@ -1115,6 +1135,13 @@ checks do not prove live providers, browser rendering or thought-signature parit
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
-- OpenCode accepts an abort even when nothing is running, so an accepted
-  interrupt does not prove a turn was stopped. Check the session state and the
-  model request instead.
+- OpenCode answers an interrupt even when nothing is running, and Stop returns
+  success either way, so an accepted interrupt does not prove a turn was
+  stopped. Check the session state and the model request instead.
+- OpenCode's scripted journeys bind the harness to the mock in their own
+  host's config. Do not add that binding to the shared verification instance:
+  any inference binding changes how the runner builds every harness's spec,
+  so Claude and Codex runs there would no longer match production defaults.
+- Script OpenCode replies to require the turn's tools, as the mock suite does.
+  A tool-less request to the same model (for example a session title) could
+  otherwise consume the turn's reply.
