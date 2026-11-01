@@ -21,9 +21,10 @@ from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
 from omnigent.server.scheduled.dispatch_scheduler import (
@@ -2694,3 +2695,58 @@ async def test_changing_where_a_task_runs_starts_a_new_session(
 
     assert moved.status_code == 200, moved.text
     assert (moved.json()["session_mode"], moved.json()["session_id"]) == ("continue", None)
+
+
+@pytest.mark.parametrize("canvas_enabled", [True, False])
+async def test_project_boundary_scopes_an_agents_automations(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str, canvas_enabled: bool
+) -> None:
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.CANVAS} if canvas_enabled else ())
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    project_a = await _make_project(auth_client, "Project A")
+    project_b = await _make_project(auth_client, "Project B")
+    lead, teammate, outsider = (_owned_session(db_uri) for _ in range(3))
+    conversations.set_conversation_project(lead, project_a)
+    conversations.set_conversation_project(teammate, project_a)
+    conversations.set_conversation_project(outsider, project_b)
+    as_lead = {**_headers(), ORCHESTRATION_SOURCE_HEADER: lead}
+
+    async def create(headers: dict[str, str], **fields: object) -> httpx.Response:
+        return await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(**fields), headers=headers
+        )
+
+    filed = await create(as_lead)
+    assert filed.status_code == 200, filed.text
+    assert filed.json()["project_id"] == (project_a if canvas_enabled else None)
+    continued = await create(as_lead, session_mode="continue", session_id=teammate)
+    assert continued.status_code == 200, continued.text
+    # The owner's own requests keep every project available.
+    foreign = await create(_headers(), project_id=project_b)
+    assert foreign.status_code == 200, foreign.text
+    foreign_url = f"/v1/scheduled-tasks/{foreign.json()['id']}"
+
+    refused = 403 if canvas_enabled else 200
+    assert (await create(as_lead, project_id=project_b)).status_code == refused
+    crossing = await create(as_lead, session_mode="continue", session_id=outsider)
+    assert crossing.status_code == refused
+    moved = await auth_client.patch(
+        f"/v1/scheduled-tasks/{filed.json()['id']}",
+        json={"project_id": project_b},
+        headers=as_lead,
+    )
+    assert moved.status_code == refused
+
+    hidden = 404 if canvas_enabled else 200
+    assert (await auth_client.get(foreign_url, headers=as_lead)).status_code == hidden
+    renamed = await auth_client.patch(foreign_url, json={"name": "taken"}, headers=as_lead)
+    assert renamed.status_code == hidden
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=as_lead)
+    listed_ids = {task["id"] for task in listed.json()["scheduled_tasks"]}
+    assert continued.json()["id"] in listed_ids
+    assert (foreign.json()["id"] in listed_ids) is not canvas_enabled
+    assert (await auth_client.delete(foreign_url, headers=as_lead)).status_code == hidden
+    survived = await auth_client.get(foreign_url, headers=_headers())
+    assert survived.status_code == (200 if canvas_enabled else 404)

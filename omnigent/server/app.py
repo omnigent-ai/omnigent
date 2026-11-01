@@ -2303,6 +2303,7 @@ def create_app(
 
     host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
+    app.state.project_store = project_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.picker_curation = picker_curation

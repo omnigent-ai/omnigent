@@ -220,7 +220,12 @@ from omnigent.server.schemas import (
     SessionResponse,
     UpdateSessionRequest,
 )
-from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.session_orchestration import (
+    inherited_project_fields,
+    project_list_scope,
+    require_orchestration_source,
+    require_project_read_access,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -1080,6 +1085,21 @@ def register_core_routes(
                         "Sender host/workspace is invalid for independent creation",
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
+        if source is not None:
+            inherited = await asyncio.to_thread(
+                inherited_project_fields, request, conversation_store, source
+            )
+            if inherited:
+                # Explicit git/workspace values keep the source's placement over project defaults.
+                body = type(body).model_validate(
+                    {
+                        **body.model_dump(exclude_unset=True),
+                        **inherited,
+                        "git": body.git,
+                        "workspace": body.workspace,
+                        "labels": {**body.labels, **inherited.get("labels", {})},
+                    }
+                )
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -1701,6 +1721,9 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
+        await asyncio.to_thread(
+            require_project_read_access, request, user_id, conversation_store, session_id
+        )
         return await _get_session_snapshot(
             conversation_store,
             session_id,
@@ -1887,6 +1910,11 @@ def register_core_routes(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        boundary_project = await asyncio.to_thread(
+            project_list_scope, request, user_id, conversation_store
+        )
+        if boundary_project is not None:
+            project = boundary_project
         # Map the visibility filter to store-level ACL params.
         # "mine": only sessions the caller owns — no accessible_by needed
         #   because owner-level implies access.
@@ -1931,7 +1959,7 @@ def register_core_routes(
             # the store resolves the project NAME to the caller's own project id.
             # The flat list (project=None) and Unfiled (project="") stay unscoped so
             # shared sessions still surface for the "Shared with me" tab.
-            owned_by_param = user_id if project else None
+            owned_by_param = user_id if project or boundary_project is not None else None
             shared_only_param = False
             include_archived_param = include_archived
             archived_only_param = False

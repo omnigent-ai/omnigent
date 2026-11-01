@@ -8,9 +8,10 @@ import pytest
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.server.feature_flags import FeatureFlags
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
+    PROJECT_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
@@ -1170,3 +1171,125 @@ async def test_same_host_creation_across_replicas(
         assert worker.parent_conversation_id is None
         assert worker.host_id == host_id and worker.workspace == "/worker"
         assert len(launches) == 1 and launches[0].session_id == worker.id
+
+
+async def _create_project(client, name):
+    response = await client.post("/v1/projects", json={"name": name})
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+@pytest.mark.parametrize("canvas_enabled", [True, False])
+async def test_project_boundary_scopes_agent_tools_when_canvas_is_enabled(
+    auth_client, auth_app, peers, db_uri, canvas_enabled
+):
+    source, same_project, _ = peers
+    other_project = await _create_session_as(auth_client, "", "alice")
+    unfiled = await _create_session_as(auth_client, "", "alice")
+    child_response = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": source["agent_id"], "parent_session_id": source["id"]},
+    )
+    assert child_response.status_code == 201, child_response.text
+    child = child_response.json()
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, *([Feature.CANVAS] if canvas_enabled else [])})
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    project_a = await _create_project(auth_client, "Project A")
+    project_b = await _create_project(auth_client, "Project B")
+    store.set_conversation_project(source["id"], project_a)
+    # A legacy label of the same name is the same project, as in the sidebar.
+    store.set_labels(same_project["id"], {PROJECT_LABEL_KEY: "Project A"})
+    store.set_conversation_project(other_project["id"], project_b)
+
+    async def call(tool_name, **arguments):
+        return json.loads(
+            await execute_tool(
+                tool_name=tool_name,
+                arguments=json.dumps(arguments),
+                server_client=auth_client,
+                conversation_id=source["id"],
+            )
+        )
+
+    assert (await _send(auth_client, source, same_project)).get("queued") is True
+    assert "error" not in await call("sys_session_get_history", conversation_id=child["id"])
+    for outside in (other_project, unfiled):
+        sent = await _send(auth_client, source, outside)
+        history = await call("sys_session_get_history", conversation_id=outside["id"])
+        info = await call("sys_session_get_info", session_id=outside["id"])
+        agent = await call("sys_agent_get", session_id=outside["id"])
+        if canvas_enabled:
+            assert "outside this session's project" in sent["detail"]
+            assert history["error"] == "session_out_of_tree"
+            assert "error" in info
+            assert agent["error"] == "access_denied"
+        else:
+            assert sent.get("queued") is True
+            assert "error" not in history
+            assert "error" not in info
+            assert "error" not in agent
+    listed = {row["session_id"] for row in (await call("sys_session_list"))["sessions"]}
+    assert {source["id"], same_project["id"]} <= listed
+    assert (other_project["id"] in listed) is not canvas_enabled
+    assert (unfiled["id"] in listed) is not canvas_enabled
+
+    shared = await auth_client.put(
+        f"/v1/sessions/{other_project['id']}/permissions",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"user_id": "bob", "level": LEVEL_READ},
+    )
+    assert shared.status_code == (403 if canvas_enabled else 200), shared.text
+
+    # Requests from outside an agent tool call keep the owner's full access.
+    response = await auth_client.get(f"/v1/sessions/{other_project['id']}/items")
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("filing", ["project_id", "legacy_label", "unfiled"])
+async def test_independent_session_joins_creator_project(
+    auth_client, auth_app, peers, db_uri, monkeypatch, filing
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    source, _, _ = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, Feature.CANVAS})
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    auth_app.state.host_store.upsert_on_connect(host_id, host_id, "alice")
+    store.set_host_id(source["id"], host_id, workspace="/worker")
+    project_a = await _create_project(auth_client, "Project A")
+    project_other = await _create_project(auth_client, "Project Other")
+    if filing == "project_id":
+        store.set_conversation_project(source["id"], project_a)
+    if filing == "legacy_label":
+        store.set_labels(source["id"], {PROJECT_LABEL_KEY: "Legacy team"})
+
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"agent_id": source["agent_id"], "project_id": project_other},
+    )
+
+    assert response.status_code == 201, response.text
+    created = store.get_conversation(response.json()["id"])
+    assert created.workspace == "/worker"
+    assert created.project_id == (project_a if filing == "project_id" else None)
+    assert created.labels.get(PROJECT_LABEL_KEY) == (
+        "Legacy team" if filing == "legacy_label" else None
+    )

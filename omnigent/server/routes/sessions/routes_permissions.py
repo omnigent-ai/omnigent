@@ -63,6 +63,7 @@ from omnigent.server.schemas import (
     PolicySummary,
     SkillSummary,
 )
+from omnigent.server.session_orchestration import require_project_read_access
 from omnigent.spec.types import (
     FunctionPolicySpec,
     PolicySpec,
@@ -114,6 +115,9 @@ def register_permissions_routes(
         user_id = _require_user(request, auth_provider)
         await _require_access(
             user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
+        )
+        await asyncio.to_thread(
+            require_project_read_access, request, user_id, conversation_store, session_id
         )
         # Server-wide sharing policy gate (see SharingMode). Applied only
         # to *new* grants — revoke/list and owner grants are unaffected.

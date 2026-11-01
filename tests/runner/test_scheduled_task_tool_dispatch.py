@@ -18,6 +18,7 @@ import json
 import jsonschema
 import pytest
 
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import (
     _ALL_LOCAL_TOOLS,
     _NATIVE_RELAY_BUILTIN_TOOLS,
@@ -57,25 +58,52 @@ class _RecordingClient:
 
     def __init__(self, response: _Resp | None = None, *, info: _Resp | None = None) -> None:
         self.calls: list[tuple[str, str, dict[str, object] | None]] = []
+        self.sources: list[str | None] = []
         self._response = response or _Resp(body={"id": "t1"})
         self._info = info or _Resp(
             body={"scheduled_task_projects": True, "scheduled_task_session_modes": True}
         )
 
-    async def get(self, url: str, *, timeout: object = None) -> _Resp:
+    def _record_source(self, headers: dict[str, str] | None) -> None:
+        self.sources.append((headers or {}).get(ORCHESTRATION_SOURCE_HEADER))
+
+    async def get(
+        self, url: str, *, headers: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
         self.calls.append(("GET", url, None))
+        if url != "/v1/info":
+            self._record_source(headers)
         return self._info if url == "/v1/info" else self._response
 
-    async def post(self, url: str, *, json: dict | None = None, timeout: object = None) -> _Resp:
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: object = None,
+    ) -> _Resp:
         self.calls.append(("POST", url, json))
+        self._record_source(headers)
         return self._response
 
-    async def patch(self, url: str, *, json: dict | None = None, timeout: object = None) -> _Resp:
+    async def patch(
+        self,
+        url: str,
+        *,
+        json: dict | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: object = None,
+    ) -> _Resp:
         self.calls.append(("PATCH", url, json))
+        self._record_source(headers)
         return self._response
 
-    async def delete(self, url: str, *, timeout: object = None) -> _Resp:
+    async def delete(
+        self, url: str, *, headers: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
         self.calls.append(("DELETE", url, None))
+        self._record_source(headers)
         return self._response
 
 
@@ -237,15 +265,24 @@ class _ProjectsClient(_RecordingClient):
         self.projects = projects
         self.create_status = create_status
 
-    async def get(self, url: str, *, timeout: object = None) -> _Resp:
+    async def get(
+        self, url: str, *, headers: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
         if url != "/v1/projects":
-            return await super().get(url, timeout=timeout)
+            return await super().get(url, headers=headers, timeout=timeout)
         self.calls.append(("GET", url, None))
         return _Resp(body={"data": list(self.projects)})
 
-    async def post(self, url: str, *, json: dict | None = None, timeout: object = None) -> _Resp:
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: object = None,
+    ) -> _Resp:
         if url != "/v1/projects":
-            return await super().post(url, json=json, timeout=timeout)
+            return await super().post(url, json=json, headers=headers, timeout=timeout)
         self.calls.append(("POST", url, json))
         if self.create_status == 409:
             # Another request created the same name first.
@@ -341,11 +378,13 @@ async def test_project_args_are_refused_on_a_server_without_task_projects(
 @pytest.mark.asyncio
 async def test_update_by_name_on_an_unknown_task_creates_no_project() -> None:
     class _MissingTaskClient(_ProjectsClient):
-        async def get(self, url: str, *, timeout: object = None) -> _Resp:
+        async def get(
+            self, url: str, *, headers: dict[str, str] | None = None, timeout: object = None
+        ) -> _Resp:
             if url.startswith("/v1/scheduled-tasks/"):
                 self.calls.append(("GET", url, None))
                 return _Resp(status_code=404, body={"detail": "Scheduled task not found"})
-            return await super().get(url, timeout=timeout)
+            return await super().get(url, headers=headers, timeout=timeout)
 
     client = _MissingTaskClient([])
     out = await _execute_scheduled_task_tool(
@@ -488,3 +527,36 @@ async def test_update_forwards_session_fields() -> None:
     )
     _, _, body = client.calls[-1]
     assert body == {"session_mode": "continue", "session_id": None}
+
+
+@pytest.mark.asyncio
+async def test_task_calls_identify_the_calling_session() -> None:
+    """The server applies its project boundary from this identity."""
+    client = _RecordingClient()
+    task_id = "a" * 32
+    for tool_name, arguments in (
+        ("sys_scheduled_task_list", {}),
+        ("sys_scheduled_task_create", {"name": "n", "prompt": "p", "rrule": "r", "agent_id": "a"}),
+        ("sys_scheduled_task_update", {"scheduled_task_id": task_id, "name": "renamed"}),
+        ("sys_scheduled_task_delete", {"scheduled_task_id": task_id}),
+    ):
+        await _execute_scheduled_task_tool(
+            tool_name, json.dumps(arguments), server_client=client, conversation_id="conv_lead"
+        )
+    assert client.sources == ["conv_lead"] * 4
+
+
+@pytest.mark.asyncio
+async def test_project_name_is_refused_inside_the_project_boundary() -> None:
+    client = _RecordingClient(
+        info=_Resp(body={"scheduled_task_projects": True, "features": {"canvas": True}})
+    )
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(
+            {"name": "n", "prompt": "p", "rrule": "r", "agent_id": "a", "project_name": "New"}
+        ),
+        server_client=client,
+    )
+    assert "stay in this session's project" in out
+    assert client.calls == [("GET", "/v1/info", None)]

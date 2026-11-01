@@ -164,6 +164,13 @@ def _route_identifier(value: object, kind: str) -> str:
     return value
 
 
+def _orchestration_source_headers(conversation_id: str | None) -> dict[str, str]:
+    """Identify the calling session so the server can apply its project boundary."""
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+    return {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id else {}
+
+
 def _session_url(session_id: object) -> str:
     """Build a session URL from one identifier, retaining legacy prefixed ids."""
     return f"/v1/sessions/{_route_identifier(session_id, 'Session')}"
@@ -4883,6 +4890,7 @@ async def _execute_scheduled_task_tool(
     arguments: str,
     *,
     server_client: httpx.AsyncClient | None,
+    conversation_id: str | None = None,
 ) -> str:
     """
     Runner-local handler for the ``sys_scheduled_task_*`` family.
@@ -4917,6 +4925,7 @@ async def _execute_scheduled_task_tool(
         "project_name" in args or "project_id" in args
     )
 
+    source_headers = _orchestration_source_headers(conversation_id)
     try:
         if wants_project:
             # Older servers reject the field; refuse before creating a project for it.
@@ -4928,8 +4937,18 @@ async def _execute_scheduled_task_tool(
                         "projects; retry without project_name or project_id"
                     }
                 )
+            # A named project may not exist yet, and the boundary keeps agents from adding one.
+            if project_name is not None and info.json().get("features", {}).get("canvas") is True:
+                return json.dumps(
+                    {
+                        "error": f"{tool_name}: automations stay in this session's project; "
+                        "retry without project_name"
+                    }
+                )
         if tool_name == "sys_scheduled_task_list":
-            resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+            resp = await server_client.get(
+                "/v1/scheduled-tasks", headers=source_headers, timeout=30.0
+            )
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
             refusal = await _scheduled_task_session_fields_refusal(
@@ -4939,7 +4958,9 @@ async def _execute_scheduled_task_tool(
                 return refusal
             if project_name is not None:
                 payload["project_id"] = await _project_id_for_name(server_client, project_name)
-            resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
+            resp = await server_client.post(
+                "/v1/scheduled-tasks", json=payload, headers=source_headers, timeout=30.0
+            )
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
             if not task_id:
@@ -4950,7 +4971,7 @@ async def _execute_scheduled_task_tool(
                     {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
                 )
             if tool_name == "sys_scheduled_task_delete":
-                resp = await server_client.delete(task_url, timeout=30.0)
+                resp = await server_client.delete(task_url, headers=source_headers, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
                 refusal = await _scheduled_task_session_fields_refusal(
@@ -4961,7 +4982,9 @@ async def _execute_scheduled_task_tool(
                 resp = None
                 if project_name is not None:
                     # Confirm the task first so a bad id doesn't leave a new project behind.
-                    existing = await server_client.get(task_url, timeout=30.0)
+                    existing = await server_client.get(
+                        task_url, headers=source_headers, timeout=30.0
+                    )
                     if existing.status_code >= 400:
                         resp = existing
                     else:
@@ -4969,7 +4992,9 @@ async def _execute_scheduled_task_tool(
                             server_client, project_name
                         )
                 if resp is None:
-                    resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                    resp = await server_client.patch(
+                        task_url, json=payload, headers=source_headers, timeout=30.0
+                    )
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -5201,7 +5226,7 @@ async def _execute_session_query_tool(
             continued=continued,
         )
     if tool_name == "sys_session_get_history":
-        return await _session_get_history_via_rest(args, server_client)
+        return await _session_get_history_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_get_info":
         return await _session_get_info_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_share":
@@ -5295,6 +5320,7 @@ async def _session_get_info_via_rest(
         resp = await server_client.get(
             f"{_session_url(raw_target)}",
             params={"include_items": "false", "include_liveness": "false"},
+            headers=_orchestration_source_headers(conversation_id),
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -5474,6 +5500,7 @@ async def _session_share_via_rest(
         resp = await server_client.put(
             f"{_session_url(target)}/permissions",
             json={"user_id": user_id, "level": level_by_name[level_name]},
+            headers=_orchestration_source_headers(conversation_id),
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -5562,7 +5589,7 @@ async def _execute_agent_tool(
     if not isinstance(session_id, str) or not session_id:
         return json.dumps({"error": f"{tool_name} requires a non-empty 'session_id' string"})
     if tool_name == "sys_agent_get":
-        return await _agent_get_via_rest(session_id, server_client)
+        return await _agent_get_via_rest(session_id, conversation_id, server_client)
     return await _agent_download_via_rest(
         session_id,
         args,
@@ -5575,6 +5602,7 @@ async def _execute_agent_tool(
 
 async def _agent_get_via_rest(
     session_id: str,
+    conversation_id: str | None,
     server_client: httpx.AsyncClient,
 ) -> str:
     """
@@ -5591,7 +5619,11 @@ async def _agent_get_via_rest(
     :returns: JSON agent-metadata object, or a JSON error object.
     """
     try:
-        resp = await server_client.get(f"{_session_url(session_id)}/agent", timeout=30.0)
+        resp = await server_client.get(
+            f"{_session_url(session_id)}/agent",
+            headers=_orchestration_source_headers(conversation_id),
+            timeout=30.0,
+        )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_agent_get failed: {exc}"})
     if resp.status_code == 404:
@@ -5688,7 +5720,11 @@ async def _agent_download_via_rest(
         or a JSON error object.
     """
     try:
-        resp = await server_client.get(f"{_session_url(session_id)}/agent/contents", timeout=60.0)
+        resp = await server_client.get(
+            f"{_session_url(session_id)}/agent/contents",
+            headers=_orchestration_source_headers(conversation_id),
+            timeout=60.0,
+        )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_agent_download failed: {exc}"})
     if resp.status_code == 404:
@@ -5734,6 +5770,7 @@ async def _agent_list_fetch(
     path: str,
     server_client: httpx.AsyncClient,
     *,
+    conversation_id: str | None = None,
     after: str | None,
     limit: int,
     exhausted: bool = False,
@@ -5761,7 +5798,12 @@ async def _agent_list_fetch(
             params["visibility"] = "all"
         if after is not None:
             params["after"] = after
-        resp = await server_client.get(path, params=params, timeout=30.0)
+        resp = await server_client.get(
+            path,
+            params=params,
+            headers=_orchestration_source_headers(conversation_id),
+            timeout=30.0,
+        )
     except Exception:  # noqa: BLE001
         return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
@@ -6026,6 +6068,7 @@ async def _agent_list_via_rest(
         _agent_list_fetch(
             "/v1/sessions",
             server_client,
+            conversation_id=conversation_id,
             after=cursor_state["session_agents"][1],
             limit=source_limit,
             exhausted=cursor_state["session_agents"][0] == _DISCOVERY_END,
@@ -6178,6 +6221,7 @@ async def _session_list_via_rest(
         else await _collect_global_sessions(
             server_client,
             agent_name,
+            conversation_id=conversation_id,
             include_archived=include_archived,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
@@ -6441,6 +6485,7 @@ async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
     *,
+    conversation_id: str | None,
     include_archived: bool = False,
     after: str | None,
     limit: int,
@@ -6474,7 +6519,12 @@ async def _collect_global_sessions(
     if after is not None:
         params["after"] = after
     try:
-        resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
+        resp = await server_client.get(
+            "/v1/sessions",
+            params=params,
+            headers=_orchestration_source_headers(conversation_id),
+            timeout=30.0,
+        )
     except Exception:  # noqa: BLE001
         return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
@@ -6570,6 +6620,7 @@ async def _session_parent_id(
 
 async def _session_get_history_via_rest(
     args: _JsonObject,
+    conversation_id: str | None,
     server_client: httpx.AsyncClient,
 ) -> str:
     """
@@ -6613,6 +6664,7 @@ async def _session_get_history_via_rest(
         resp = await server_client.get(
             f"{_session_url(target_id)}/items",
             params={"limit": tail_items, "order": "desc"},
+            headers=_orchestration_source_headers(conversation_id),
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -7161,6 +7213,7 @@ async def execute_tool(
                 tool_name,
                 arguments,
                 server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
