@@ -108,6 +108,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    pending_interruption_marker,
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
@@ -166,6 +167,8 @@ _TURN_EVENT_WARN_SECONDS = 600.0
 # warning cadence is unchanged.
 _TURN_EVENT_POLL_SECONDS = 5.0
 _TURN_COMPLETED_DRAIN_SECONDS = 1.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_TURN_INTERRUPT_TIMEOUT_S = 1.5
 # Wall-clock budget for the ``codex --version`` probe. A broken codex
 # build that blocks (e.g. on stdin) must not stall session startup — on
 # timeout the probe kills the process and reports the version as unknown.
@@ -2473,23 +2476,34 @@ def _build_initial_prompt(
     return "\n".join(lines)
 
 
-def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:
+def _prompt_for_turn(
+    messages: list[Message], *, is_new_thread: bool, after_interrupt: bool = False
+) -> str | list[CodexParams]:
     """
     Choose the prompt payload for a Codex turn.
 
     A fresh Codex thread must receive the full replayable
     transcript so the harness can preserve parent history on
     sub-agent calls. Resumed threads should only receive the
-    latest user message.
+    latest user message, preceded by the runner's interruption
+    marker when the thread's previous turn was interrupted.
 
     :param messages: Conversation history.
     :param is_new_thread: ``True`` when starting a fresh Codex
         thread.
+    :param after_interrupt: ``True`` when the resumed thread's
+        previous turn was interrupted and no input has followed.
     :returns: A string prompt or a list of content block dicts.
     """
     if is_new_thread:
         return _build_initial_prompt(messages)
-    return _extract_latest_user_content(messages)
+    latest_user_content = _extract_latest_user_content(messages)
+    marker = pending_interruption_marker(messages) if after_interrupt else None
+    if marker is None:
+        return latest_user_content
+    if isinstance(latest_user_content, list):
+        return [{"type": "input_text", "text": marker}, *latest_user_content]
+    return f"{marker}\n\n{latest_user_content}"
 
 
 def _to_codex_input_items(
@@ -2831,6 +2845,9 @@ class _CodexAppServerSession:
         self._native_progress_observed = False
         self._reader_started_turn: str | None = None
         self._reader_completed_turn: str | None = None
+        self._interrupted_turn_id: str | None = None
+        # Whether the next turn's input must carry the runner's interruption marker.
+        self._interruption_marker_pending = False
         self._next_id = 1
         self._started = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -3724,7 +3741,10 @@ class _CodexAppServerSession:
                 if message.get("role") == "user":
                     message["content"] = goal_objective
                     break
-        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
+        after_interrupt = self._interruption_marker_pending
+        prompt = _prompt_for_turn(
+            prompt_messages, is_new_thread=is_new_thread, after_interrupt=after_interrupt
+        )
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
@@ -3773,6 +3793,8 @@ class _CodexAppServerSession:
             "turn/start",
             turn_params,
         )
+        if after_interrupt:
+            self._interruption_marker_pending = False
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
@@ -4145,7 +4167,7 @@ class _CodexAppServerSession:
                         self._certificate_failure = None
                     if not final_response:
                         final_response = _latest_buffered_agent_message(message_buffers)
-                    if not final_response:
+                    if not final_response and _codex_turn_status(turn) != "interrupted":
                         final_response = await self._drain_turn_completed_tail(
                             active_turn_id=active_turn_id,
                             message_buffers=message_buffers,
@@ -4255,15 +4277,28 @@ class _CodexAppServerSession:
         return True
 
     async def interrupt_turn(self) -> bool:
-        if self.thread_id is None or self.active_turn_id is None:
+        turn_id = self.active_turn_id
+        if self.thread_id is None:
             return False
-        await self._request(
-            "turn/interrupt",
-            {
-                "threadId": self.thread_id,
-                "turnId": self.active_turn_id,
-            },
-        )
+        # Arming without an active turn is harmless: the marker is sent only if history holds it.
+        self._interruption_marker_pending = True
+        if turn_id is None:
+            return False
+        if turn_id in (self._interrupted_turn_id, self._reader_completed_turn):
+            return True
+        self._interrupted_turn_id = turn_id
+        try:
+            await self._request(
+                "turn/interrupt",
+                {
+                    "threadId": self.thread_id,
+                    "turnId": turn_id,
+                },
+            )
+        except BaseException:
+            if self._interrupted_turn_id == turn_id:
+                self._interrupted_turn_id = None
+            raise
         return True
 
     async def _interrupt_failed_turn(self, cause: str) -> None:
@@ -4870,16 +4905,17 @@ class CodexExecutor(Executor):
     def supports_live_message_queue(self) -> bool:
         return True
 
+    def resumes_after_interrupt(self) -> bool:
+        return True
+
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
         if state is None or state.app_session is None:
             return False
-        # Best-effort interrupt to halt the in-flight turn; a failure just
-        # falls through to the close below.
         try:
-            await asyncio.wait_for(
+            return await asyncio.wait_for(
                 state.app_session.interrupt_turn(),
-                timeout=0.5,
+                timeout=_TURN_INTERRUPT_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
@@ -4887,11 +4923,8 @@ class CodexExecutor(Executor):
                 session_key,
                 exc,
             )
-        # Always drop the session (resets thread_id) so the next turn starts a
-        # fresh thread and replays full history. A resumed thread sends only
-        # the latest user message, which would bypass the runner's
-        # "[System: interrupted]" marker and silently continue the abandoned
-        # request. See claude_sdk_executor.interrupt_session for the rationale.
+        # The turn may still be running, so drop the thread; the next turn starts
+        # a fresh one and replays history, including the interruption marker.
         try:
             await self.close_session(session_key)
             return True

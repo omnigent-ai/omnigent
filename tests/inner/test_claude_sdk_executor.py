@@ -19,12 +19,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (
+    INTERRUPTION_MARKER_TEXT,
     ExecutorConfig,
     ExecutorError,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
 )
 
@@ -199,6 +201,19 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("new two", prompt)
         self.assertNotIn("old one", prompt)
         self.assertNotIn("old two", prompt)
+
+    def test_resumed_session_trailing_run_starts_at_interruption_marker(self):
+        """A kept session already saw the interrupted request; send a pending marker onward."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead."},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True, after_interrupt=True)
+        self.assertEqual(prompt, f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertEqual(prompt, "Summarize instead.")
 
     def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
         """A multimodal message in the trailing run keeps structured blocks for all."""
@@ -3050,49 +3065,115 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
-    def test_interrupt_session_interrupts_then_drops_session(self):
-        """A user interrupt fires a safe interrupt, then drops the session.
+    def _interrupt_query_then_follow_up(self, *, compacts: bool):
+        """Interrupt a running query, optionally after a CLI compaction, then send a follow-up."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-        ``run_turn`` decides whether to resume via
-        ``session_key in self._clients``. Dropping the session after an
-        interrupt is what forces the next turn to rebuild from full
-        history (with the runner's ``[System: interrupted]`` marker)
-        instead of resuming a live session whose transcript still holds
-        the abandoned prompt. If ``_clients`` were left populated, the
-        next turn would resume and silently continue the canceled
-        instruction.
-        """
-        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
-
-        interrupt = AsyncMock()
+        queries: list[object] = []
+        connect_calls: list[object] = []
         disconnect = AsyncMock()
-        client = type("Client", (), {"interrupt": interrupt, "disconnect": disconnect})()
+        interrupt_calls: list[object] = []
+        query_started = asyncio.Event()
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _SystemMessage:
+            subtype = "hook_started"
+            data = {"hook_event": "PreCompact"}
+            hook_event_name = "PreCompact"
+
+        class _FakeSDK(_sdk_types()):
+            ResultMessage = _ResultMessage
+            SystemMessage = _SystemMessage
+
+            class ClaudeSDKClient(_SDKClient):
+                async def connect(self):
+                    connect_calls.append(self)
+                    self.result_ready = asyncio.Event()
+
+                async def query(self, prompt, session_id="default"):
+                    queries.append(prompt)
+                    query_started.set()
+                    if len(queries) > 1:
+                        self.result_ready.set()
+
+                async def receive_response(self):
+                    if compacts and len(queries) == 1:
+                        yield _SystemMessage()
+                    await self.result_ready.wait()
+                    # The first follow-up ends without assistant text.
+                    yield _ResultMessage(
+                        "claude-session-a", [None, None, "THANKS"][len(queries) - 1]
+                    )
+
+                async def interrupt(self):
+                    interrupt_calls.append(self)
+                    self.result_ready.set()
+
+                async def disconnect(self):
+                    await disconnect()
 
         async def _t():
             executor = ClaudeSDKExecutor()
-            executor._clients["session-a"] = _ClaudeClientState(client=client, model=None)
+            history = [
+                {"role": "user", "content": "Write a long essay.", "session_id": "session-a"}
+            ]
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
 
-            interrupted = await executor.interrupt_session("session-a")
+                async def _collect(messages):
+                    return [e async for e in executor.run_turn(messages, [], "")]
 
-            self.assertTrue(interrupted)
-            # Safe interrupt is attempted first to halt the in-flight turn.
-            interrupt.assert_awaited_once_with()
-            # Then the session is torn down (disconnect) and removed from
-            # _clients so the next turn cannot resume it. An empty dict here
-            # is the invariant that prevents the canceled-instruction leak.
-            disconnect.assert_awaited_once_with()
-            self.assertEqual(executor._clients, {})
+                first_turn = asyncio.create_task(_collect(history))
+                await query_started.wait()
+                self.assertTrue(await executor.interrupt_session("session-a"))
+                self.assertTrue(await executor.interrupt_session("session-a"))
+                first_events = await first_turn
 
-        _run(_t())
+                history.append({"role": "user", "content": INTERRUPTION_MARKER_TEXT})
+                follow_up_events = []
+                for text in ("Summarize instead.", "Thanks."):
+                    history.append({"role": "user", "content": text, "session_id": "session-a"})
+                    follow_up_events.append(await _collect(list(history)))
+            await asyncio.gather(*executor._cancel_close_tasks)
+            return first_events, follow_up_events
 
-    def test_interrupt_session_closes_even_when_interrupt_fails(self):
-        """A failed safe interrupt still drops the session.
+        first_events, follow_up_events = _run(_t())
+        return first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect
 
-        The session must be torn down regardless of whether the SDK's
-        ``interrupt()`` succeeds — otherwise a flaky interrupt would
-        leave the abandoned-prompt session resumable. If ``close_session``
-        is not awaited here, the interrupt-failure path leaks the session.
-        """
+    def test_interrupted_query_keeps_session_for_next_turn(self):
+        """An interrupted query ends as cancelled and the next query resumes the same client."""
+        first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect = (
+            self._interrupt_query_then_follow_up(compacts=False)
+        )
+
+        self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(len(interrupt_calls), 1)
+        self.assertEqual(len(connect_calls), 1)
+        disconnect.assert_not_awaited()
+        self.assertEqual(queries[1], f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        self.assertNotIn(INTERRUPTION_MARKER_TEXT, queries[2])
+        self.assertTrue(queries[2].endswith("Thanks."))
+        self.assertFalse(follow_up_events[0][-1].response)
+        self.assertEqual(follow_up_events[1][-1].response, "THANKS")
+
+    def test_interrupted_query_that_compacted_replays_history_in_new_client(self):
+        """A compaction the server never received is not resumed; the next turn replays history."""
+        first_events, follow_up_events, queries, connect_calls, _, _ = (
+            self._interrupt_query_then_follow_up(compacts=True)
+        )
+
+        self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(len(connect_calls), 2)
+        self.assertIn("Conversation so far:", queries[1])
+        self.assertIn("Write a long essay.", queries[1])
+        self.assertNotIn(INTERRUPTION_MARKER_TEXT, queries[2])
+        self.assertIsInstance(follow_up_events[-1][-1], TurnComplete)
+
+    def test_interrupt_session_closes_when_interrupt_fails(self):
+        """A failed interrupt drops the session so a still-running query cannot be resumed."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
 
         async def fail_interrupt():

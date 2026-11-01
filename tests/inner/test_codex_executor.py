@@ -43,6 +43,7 @@ from omnigent.inner.codex_goal_command import (
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    INTERRUPTION_MARKER_TEXT,
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -407,6 +408,174 @@ class TestCodexExecutor(unittest.TestCase):
         ]
         prompt = _prompt_for_turn(messages, is_new_thread=False)
         self.assertEqual(prompt, "Summarize our conversation.")
+
+    def test_prompt_for_existing_thread_sends_pending_interruption_marker(self):
+        interrupted_history = [
+            {"role": "user", "content": "The secret codeword is ZEBRA-99."},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+        ]
+
+        follow_up = [*interrupted_history, {"role": "user", "content": "Summarize instead."}]
+        prompt = _prompt_for_turn(follow_up, is_new_thread=False, after_interrupt=True)
+        self.assertEqual(prompt, f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        self.assertEqual(_prompt_for_turn(follow_up, is_new_thread=False), "Summarize instead.")
+
+        image = {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}
+        prompt = _prompt_for_turn(
+            [*interrupted_history, {"role": "user", "content": [image]}],
+            is_new_thread=False,
+            after_interrupt=True,
+        )
+        self.assertEqual(prompt, [{"type": "input_text", "text": INTERRUPTION_MARKER_TEXT}, image])
+
+    def test_prompt_for_existing_thread_sends_delivered_interruption_marker_once(self):
+        messages = [
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead."},
+            {"role": "assistant", "content": "Summary."},
+            {"role": "user", "content": "Thanks."},
+        ]
+        self.assertEqual(
+            _prompt_for_turn(messages, is_new_thread=False, after_interrupt=True), "Thanks."
+        )
+
+    def test_resumed_thread_sends_interruption_marker_once_after_textless_reply(self):
+        """A follow-up that ends without assistant text does not re-arm the marker."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {}},
+                    {"result": {"turn": {"id": "turn-2"}}},
+                    {"result": {"turn": {"id": "turn-3"}}},
+                ]
+            )
+            session._drain_turn_completed_tail = AsyncMock(return_value=None)
+            self.assertTrue(await session.interrupt_turn())
+
+            history = [
+                {"role": "user", "content": "Write a long essay."},
+                {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            ]
+            for turn_id, text in (("turn-2", "Summarize instead."), ("turn-3", "Thanks.")):
+                history.append({"role": "user", "content": text})
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": turn_id, "status": "completed"}},
+                    }
+                )
+                async with asyncio.timeout(10):
+                    events = [
+                        event
+                        async for event in session.run_turn(
+                            messages=list(history),
+                            tools=[],
+                            system_prompt="",
+                            model="gpt-5",
+                            cwd=".",
+                            sandbox="workspace-write",
+                        )
+                    ]
+                self.assertIsInstance(events[-1], TurnComplete)
+                self.assertFalse(events[-1].response)
+
+            turn_inputs = [
+                call.args[1]["input"]
+                for call in session._request.await_args_list
+                if call.args[0] == "turn/start"
+            ]
+            self.assertEqual(
+                turn_inputs,
+                [
+                    [
+                        {
+                            "type": "text",
+                            "text": f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.",
+                        }
+                    ],
+                    [{"type": "text", "text": "Thanks."}],
+                ],
+            )
+
+        _run(_t())
+
+    def _follow_up_inputs_after_failed_start(self, active_turn_id: str | None):
+        """Interrupt the thread, fail the follow-up's ``turn/start``, retry, and return inputs."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session.active_turn_id = active_turn_id
+            interrupt_responses = [{"result": {}}] if active_turn_id else []
+            session._request = AsyncMock(
+                side_effect=[
+                    *interrupt_responses,
+                    RuntimeError("turn/start failed"),
+                    {"result": {"turn": {"id": "turn-2"}}},
+                ]
+            )
+            session._drain_turn_completed_tail = AsyncMock(return_value=None)
+            await session.interrupt_turn()
+            session.active_turn_id = None
+
+            history = [
+                {"role": "user", "content": "Write a long essay."},
+                {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+                {"role": "user", "content": "Summarize instead."},
+            ]
+            turn_kwargs = {
+                "tools": [],
+                "system_prompt": "",
+                "model": "gpt-5",
+                "cwd": ".",
+                "sandbox": "workspace-write",
+            }
+            with self.assertRaises(RuntimeError):
+                async for _event in session.run_turn(messages=list(history), **turn_kwargs):
+                    pass
+            session._events.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-2", "status": "completed"}},
+                }
+            )
+            async with asyncio.timeout(10):
+                async for _event in session.run_turn(messages=list(history), **turn_kwargs):
+                    pass
+            return [
+                call.args[1]["input"]
+                for call in session._request.await_args_list
+                if call.args[0] == "turn/start"
+            ]
+
+        return _run(_t())
+
+    def test_follow_up_retried_after_failed_start_keeps_interruption_marker(self):
+        """The marker stays pending until Codex accepts a turn, even if no turn was active."""
+        with_marker = [
+            {"type": "text", "text": f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."}
+        ]
+        for active_turn_id in ("turn-1", None):
+            with self.subTest(active_turn_id=active_turn_id):
+                self.assertEqual(
+                    self._follow_up_inputs_after_failed_start(active_turn_id),
+                    [with_marker, with_marker],
+                )
 
     def test_build_initial_prompt_keeps_user_attachments_as_native_blocks(self):
         # A fresh thread replaying multimodal history must keep image bytes as
@@ -1394,17 +1563,8 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
-    def test_interrupt_session_interrupts_then_drops_session(self):
-        """A user interrupt halts the turn AND drops the session.
-
-        Codex resumes the same thread on the next turn and sends only the
-        latest user message, so a retained session would bypass the
-        runner's ``[System: interrupted]`` marker and continue the
-        abandoned request. Dropping the session (close resets thread_id)
-        forces the next turn to start a fresh thread and replay full
-        history. An empty ``_session_states`` is the invariant that
-        prevents the canceled-instruction leak.
-        """
+    def test_interrupt_session_interrupts_and_keeps_session(self):
+        """A user interrupt halts the turn and keeps the thread for the next turn."""
 
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
@@ -1424,10 +1584,35 @@ class TestCodexExecutor(unittest.TestCase):
 
             interrupted = await executor.interrupt_session("s1")
             self.assertTrue(interrupted)
-            # Interrupt is attempted first to halt the in-flight turn.
             self.assertTrue(fake_session.interrupted)
-            # Then the session is closed and removed so the next turn starts a
-            # fresh thread and replays full history (marker included).
+            self.assertFalse(fake_session.closed)
+            self.assertIn("s1", executor._session_states)
+            self.assertTrue(executor.resumes_after_interrupt())
+
+        _run(_t())
+
+    def test_interrupt_session_drops_session_when_interrupt_fails(self):
+        """An unconfirmed interrupt drops the thread so the next turn replays history."""
+
+        async def _t():
+            fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+            fake_session.interrupt_turn = AsyncMock(side_effect=RuntimeError("app-server gone"))
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                app_session_factory=lambda **kwargs: fake_session,
+            )
+
+            _ = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+            interrupted = await executor.interrupt_session("s1")
+            self.assertTrue(interrupted)
             self.assertTrue(fake_session.closed)
             self.assertEqual(executor._session_states, {})
 
@@ -1556,6 +1741,54 @@ class TestCodexExecutor(unittest.TestCase):
                     "turnId": "turn-1",
                 },
             )
+
+        _run(_t())
+
+    def test_app_server_interrupt_turn_interrupts_each_turn_once(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            session._request = AsyncMock(
+                side_effect=[RuntimeError("socket reset"), {"result": {}}]
+            )
+
+            with self.assertRaises(RuntimeError):
+                await session.interrupt_turn()
+            self.assertTrue(await session.interrupt_turn())
+            self.assertTrue(await session.interrupt_turn())
+            self.assertEqual(session._request.await_count, 2)
+
+            session.active_turn_id = "turn-2"
+            session._reader_completed_turn = "turn-2"
+            self.assertTrue(await session.interrupt_turn())
+            self.assertEqual(session._request.await_count, 2)
+
+        _run(_t())
+
+    def test_app_server_interrupted_turn_completes_without_waiting_for_tail(self):
+        async def _t():
+            session = _session_with_scripted_turn()
+            session._drain_turn_completed_tail = AsyncMock(return_value="late text")
+
+            events = await _run_turn_with_events(
+                session,
+                [
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1", "status": "interrupted"}},
+                    }
+                ],
+            )
+
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertFalse(events[-1].response)
+            session._drain_turn_completed_tail.assert_not_awaited()
 
         _run(_t())
 

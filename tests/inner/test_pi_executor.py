@@ -24,6 +24,7 @@ import pytest
 from omnigent.debug_logging import record_to_row
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
+    INTERRUPTION_MARKER_TEXT,
     CompactionComplete,
     ExecutorConfig,
     ExecutorError,
@@ -38,6 +39,7 @@ from omnigent.inner.pi_executor import (
     PiExecutor,
     PiSubprocessConfig,
     _build_models_json,
+    _build_pi_prompt,
     _databricks_model_wire_catalog,
     _generate_extension_js,
     _only_configured_family,
@@ -437,6 +439,27 @@ def test_split_pi_prompt_separates_text_and_images():
         ]
     )
     assert message == "what is in this image?"
+    assert images == [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
+
+
+def test_image_follow_up_after_interrupt_keeps_marker_and_image():
+    history = [
+        {"role": "user", "content": "Write a long essay."},
+        {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is in this image?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        },
+    ]
+
+    prompt = _build_pi_prompt(history, is_first_turn=False, after_interrupt=True)
+
+    assert isinstance(prompt, list)
+    message, images = _split_pi_prompt(prompt)
+    assert message == f"{INTERRUPTION_MARKER_TEXT}\nwhat is in this image?"
     assert images == [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
 
 
@@ -3580,17 +3603,7 @@ class TestSessionManagement(unittest.TestCase):
 
         _run(_test())
 
-    def test_interrupt_session_aborts_then_drops_session(self):
-        """A user interrupt aborts the turn AND drops the session.
-
-        Pi resumes the same subprocess on the next turn and sends only the
-        latest user message, so a retained session (``_has_sent_prompt``
-        still True) would bypass the runner's ``[System: interrupted]``
-        marker and continue the abandoned request. Dropping the session
-        forces a fresh subprocess that replays full history. An empty
-        ``_session_states`` is the invariant that prevents the leak.
-        """
-
+    def test_interrupt_session_aborts_once_and_keeps_session(self):
         async def _test():
             with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
                 executor = PiExecutor()
@@ -3602,14 +3615,28 @@ class TestSessionManagement(unittest.TestCase):
 
             executor._session_states["test"] = _PiSessionState(rpc=mock_rpc)
 
-            result = await executor.interrupt_session("test")
-            self.assertTrue(result)
-            # Abort is sent first to halt the in-flight turn.
-            mock_rpc.send_command.assert_called_once()
-            cmd = mock_rpc.send_command.call_args[0][0]
-            self.assertEqual(cmd["type"], "abort")
-            # Then the session rpc is closed and the state removed so the next
-            # turn starts fresh and replays full history (marker included).
+            self.assertTrue(await executor.interrupt_session("test"))
+            self.assertTrue(await executor.interrupt_session("test"))
+            mock_rpc.send_command.assert_awaited_once_with({"type": "abort", "id": "abort"})
+            mock_rpc.close.assert_not_awaited()
+            self.assertIn("test", executor._session_states)
+            self.assertTrue(executor.resumes_after_interrupt())
+
+        _run(_test())
+
+    def test_interrupt_session_drops_session_when_abort_fails(self):
+        async def _test():
+            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+                executor = PiExecutor()
+
+            mock_rpc = MagicMock()
+            mock_rpc.send_command = AsyncMock(side_effect=BrokenPipeError("pi exited"))
+            mock_rpc.close = AsyncMock()
+            from omnigent.inner.pi_executor import _PiSessionState
+
+            executor._session_states["test"] = _PiSessionState(rpc=mock_rpc)
+
+            self.assertTrue(await executor.interrupt_session("test"))
             mock_rpc.close.assert_awaited_once()
             self.assertEqual(executor._session_states, {})
 
@@ -6768,6 +6795,144 @@ def test_settled_aborted_message_evicts_session() -> None:
 
         assert [type(e) for e in events] == [ExecutorError]
         _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+@pytest.mark.parametrize("pi_version", [_SETTLED_PI_VERSION, (0, 80, 3), None])
+def test_settled_requested_abort_keeps_session_and_next_prompt_sends_marker(
+    pi_version: tuple[int, int, int] | None,
+) -> None:
+    """A user abort reads on to the run's boundary; the kept process gets the marker once."""
+
+    def at_boundary(lines: list[str]) -> list[str]:
+        if pi_version == _SETTLED_PI_VERSION:
+            return lines
+        return [line for line in lines if json.loads(line)["type"] != "agent_settled"]
+
+    async def _test() -> None:
+        aborted = _assistant_message("partial", stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial"),
+            ],
+            pi_version=pi_version,
+        )
+        first_message = {
+            "role": "user",
+            "content": "Write a long essay.",
+            "session_id": _SESSION_KEY,
+        }
+        turn = executor.run_turn([first_message], [], "system")
+        assert await anext(turn) == TextChunk(text="partial")
+
+        assert await executor.interrupt_session(_SESSION_KEY)
+        assert await executor.interrupt_session(_SESSION_KEY)
+        for frame in at_boundary(
+            [
+                _rpc_frame(type="response", command="abort", success=True),
+                _rpc_frame(type="message_end", message=aborted),
+                _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+                _rpc_frame(type="agent_settled"),
+                *_plain_answer_frames(""),
+                *_plain_answer_frames("THANKS"),
+            ]
+        ):
+            rpc._line_queue.put_nowait(frame)
+        first_rest = [event async for event in turn]
+        history = [first_message, {"role": "user", "content": INTERRUPTION_MARKER_TEXT}]
+        follow_ups = []
+        for text in ("Summarize instead.", "Thanks."):
+            history.append({"role": "user", "content": text, "session_id": _SESSION_KEY})
+            follow_ups.append(
+                [event async for event in executor.run_turn(list(history), [], "system")]
+            )
+
+        assert [type(e) for e in first_rest] == [TurnComplete]
+        assert [e.response for e in follow_ups[1] if isinstance(e, TurnComplete)] == ["THANKS"]
+        assert _SESSION_KEY in executor._session_states
+        commands = [json.loads(line) for line in rpc.process.stdin.data]
+        assert [command["type"] for command in commands] == ["prompt", "abort", "prompt", "prompt"]
+        assert commands[2]["message"] == f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."
+        assert commands[3]["message"] == "Thanks."
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_settled_requested_abort_that_compacted_evicts_session() -> None:
+    """A kept process must not hold a compaction the interrupted turn never reports."""
+
+    async def _test() -> None:
+        aborted = _assistant_message("partial", stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial"),
+            ]
+        )
+        turn = executor.run_turn(
+            [{"role": "user", "content": "Write a long essay.", "session_id": _SESSION_KEY}],
+            [],
+            "system",
+        )
+        assert await anext(turn) == TextChunk(text="partial")
+
+        assert await executor.interrupt_session(_SESSION_KEY)
+        for frame in [
+            _rpc_frame(type="response", command="abort", success=True),
+            _rpc_frame(type="message_end", message=aborted),
+            _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+            _rpc_frame(type="compaction_start", reason="threshold"),
+            _rpc_frame(
+                type="compaction_end",
+                reason="threshold",
+                result={"summary": "SUMMARY"},
+                aborted=False,
+                willRetry=False,
+            ),
+            _rpc_frame(type="agent_settled"),
+            _rpc_frame(type="response", command="get_messages", success=False, error="busy"),
+        ]:
+            rpc._line_queue.put_nowait(frame)
+        rest = [event async for event in turn]
+
+        assert [type(e) for e in rest] == [CompactionComplete, TurnComplete]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_prompt_that_never_reaches_pi_keeps_interruption_marker_pending() -> None:
+    """A follow-up whose prompt fails before Pi receives it leaves the marker for the next."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(_plain_answer_frames("OK"))
+        state = executor._session_states[_SESSION_KEY]
+        state._has_sent_prompt = True
+        state.abort_requested = True
+        external_image = {"type": "input_image", "image_url": "https://example.com/cat.png"}
+        history = [
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": [external_image], "session_id": _SESSION_KEY},
+        ]
+        rejected = [event async for event in executor.run_turn(list(history), [], "system")]
+        history.append(
+            {"role": "user", "content": "Summarize instead.", "session_id": _SESSION_KEY}
+        )
+        answered = [event async for event in executor.run_turn(list(history), [], "system")]
+
+        assert [type(e) for e in rejected] == [ExecutorError]
+        assert [e.response for e in answered if isinstance(e, TurnComplete)] == ["OK"]
+        commands = [json.loads(line) for line in rpc.process.stdin.data]
+        assert [command["message"] for command in commands] == [
+            f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."
+        ]
+        assert not state.abort_requested
 
     _run(_test())
 
