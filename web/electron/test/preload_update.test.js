@@ -10,6 +10,7 @@ function loadPreload() {
   const exposed = new Map();
   const listeners = new Map();
   const invokes = [];
+  const sends = [];
   let updateStatus = { state: "idle" };
   const ipcRenderer = {
     invoke: async (channel, args) => {
@@ -17,7 +18,7 @@ function loadPreload() {
       if (channel === "omnigent:get-update-status") return updateStatus;
       return null;
     },
-    send: () => {},
+    send: (channel, args) => sends.push({ channel, args }),
     on: (channel, listener) => listeners.set(channel, listener),
     removeListener: (channel, listener) => {
       if (listeners.get(channel) === listener) listeners.delete(channel);
@@ -43,6 +44,7 @@ function loadPreload() {
     emit: (channel, payload) => listeners.get(channel)?.({}, payload),
     hasListener: (channel) => listeners.has(channel),
     invokes,
+    sends,
   };
 }
 
@@ -127,5 +129,52 @@ describe("server-page update bridge", () => {
         .map(({ args }) => args.supported),
       [true, false],
     );
+  });
+});
+
+describe("desktop command bridge", () => {
+  it("forwards menu commands with a validated payload and unsubscribes", () => {
+    const h = loadPreload();
+    const received = [];
+    const unsubscribe = h.desktop.onDesktopCommand((payload) => received.push(payload));
+
+    h.emit("omnigent:desktop-command", {
+      command: "close",
+      browserViewId: "browser-tab:s:t",
+      closingQuits: true,
+    });
+    h.emit("omnigent:desktop-command", { command: "new-terminal", browserViewId: 7 });
+    h.emit("omnigent:desktop-command", { command: 5 });
+    h.emit("omnigent:desktop-command", null);
+    assert.deepEqual(JSON.parse(JSON.stringify(received)), [
+      { command: "close", browserViewId: "browser-tab:s:t", closingQuits: true },
+      { command: "new-terminal", browserViewId: null, closingQuits: false },
+    ]);
+
+    unsubscribe();
+    assert.equal(h.hasListener("omnigent:desktop-command"), false);
+  });
+
+  it("reports command state as plain values and asks main to close the window", async () => {
+    const h = loadPreload();
+    h.desktop.setDesktopCommandState({
+      commands: ["close", 3],
+      sessionPinned: 1,
+      sessionArchived: true,
+    });
+    h.desktop.setDesktopCommandState(undefined);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.sends)), [
+      {
+        channel: "omnigent:set-desktop-command-state",
+        args: { commands: ["close", "3"], sessionPinned: false, sessionArchived: true },
+      },
+      {
+        channel: "omnigent:set-desktop-command-state",
+        args: { commands: [], sessionPinned: false, sessionArchived: false },
+      },
+    ]);
+
+    await h.desktop.closeWindow();
+    assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:close-window", args: undefined });
   });
 });

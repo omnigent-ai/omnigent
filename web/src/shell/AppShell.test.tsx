@@ -15,7 +15,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback, useState } from "react";
+import { useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -30,7 +30,8 @@ import {
 import { setEmbedRoot } from "@/lib/host";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
-import { useFileViewer } from "./FileViewerContext";
+import { FileViewerContext, useFileViewer } from "./FileViewerContext";
+import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -413,6 +414,21 @@ function LocationDisplay() {
  * what AppShell keys the /settings sidebar pin off, so the tests need a real
  * router transition rather than a re-render.
  */
+/** A file viewer holding unsaved edits: file navigation waits until "allow leaving". */
+function DirtyFileViewerProbe() {
+  const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  const [allowLeaving, setAllowLeaving] = useState<(() => void) | null>(null);
+  useLayoutEffect(
+    () => registerNavigationGuard?.((_path, _options, navigate) => setAllowLeaving(() => navigate)),
+    [registerNavigationGuard],
+  );
+  return allowLeaving ? (
+    <button type="button" onClick={allowLeaving}>
+      allow leaving
+    </button>
+  ) : null;
+}
+
 function NavProbe() {
   const navigate = useNavigate();
   return (
@@ -530,7 +546,7 @@ function sessionShellTree(
 function renderShell(
   path: string,
   info?: ServerInfo,
-  options: { rerenderable?: boolean; sessionNavTo?: string } = {},
+  options: { rerenderable?: boolean; sessionNavTo?: string; dirtyFileViewer?: boolean } = {},
 ) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -556,6 +572,7 @@ function renderShell(
             <ForkDialogProbe />
             <NavProbe />
             {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
+            {options.dirtyFileViewer && <DirtyFileViewerProbe />}
             <LocationDisplay />
           </>
         }
@@ -5927,5 +5944,40 @@ describe("new-session browser shortcut", () => {
     fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
     expect(screen.getByText("New session route")).toBeInTheDocument();
     setEmbedRoot(null);
+  });
+});
+
+describe("AppShell desktop Close", () => {
+  type CommandListener = (event: {
+    command: string;
+    browserViewId: string | null;
+    closingQuits: boolean;
+  }) => void;
+  let sendCommand: CommandListener = () => {};
+
+  beforeEach(() => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      onDesktopCommand: (callback: CommandListener) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    resetDesktopCommandsForTests();
+  });
+
+  it("leaves the session once an open file's viewer allows dropping its unsaved edits", () => {
+    mockConversations([{ id: "conv_close", permission_level: null }]);
+    renderShell("/c/conv_close", undefined, { dirtyFileViewer: true });
+    act(() => sendCommand({ command: "close", browserViewId: null, closingQuits: false }));
+    expect(screen.queryByText("home")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(screen.getByText("home")).toBeInTheDocument();
   });
 });
