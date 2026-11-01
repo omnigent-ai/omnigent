@@ -201,6 +201,12 @@ import {
   writeFoldAssistantNarration,
 } from "@/lib/foldNarrationPreferences";
 import {
+  DEFAULT_SHOW_TOOL_RESULT_IMAGES,
+  SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY,
+  useShowToolResultImages,
+  writeShowToolResultImages,
+} from "@/lib/toolResultImagePreferences";
+import {
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
@@ -966,6 +972,29 @@ function FoldAssistantNarrationControl() {
   );
 }
 
+/** Opt-in: show images that tool calls read or return under their rows. */
+function ShowToolResultImagesControl() {
+  const enabled = useShowToolResultImages();
+  const labelId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Show images from tool results"
+        labelId={labelId}
+        description="Preview images an agent reads or a tool returns, such as screenshots, below the tool call in the chat."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={enabled}
+        onCheckedChange={writeShowToolResultImages}
+        data-testid="show-tool-result-images-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.show_tool_result_images"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
@@ -994,6 +1023,7 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
+    writeShowToolResultImages(DEFAULT_SHOW_TOOL_RESULT_IMAGES);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -1022,6 +1052,7 @@ function AppearanceSection() {
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY,
           HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
@@ -1097,6 +1128,9 @@ function AppearanceSection() {
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <FoldAssistantNarrationControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <ShowToolResultImagesControl />
             </div>
           </SettingsGroup>
 

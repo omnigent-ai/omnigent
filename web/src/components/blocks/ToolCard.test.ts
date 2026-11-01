@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
+import { writeShowToolResultImages } from "@/lib/toolResultImagePreferences";
 import { ToolCard, ToolGroupSummary, formatToolDuration } from "./ToolCard";
 import { getOutputPreview } from "./ToolCodePanel";
 import type * as ToolViewsModule from "./toolViews";
@@ -1018,6 +1019,52 @@ describe("ToolCard shell terminal theme", () => {
     act(() => writeTerminalThemeMode("light"));
     expect(terminal).toHaveAttribute("data-terminal-theme", "light");
     expect(terminal.style.getPropertyValue("--background")).toBe("");
+  });
+});
+
+describe("ToolCard result images", () => {
+  const PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const screenshotCall = {
+    name: "mcp__browser__take_screenshot",
+    arguments: { fullPage: false },
+    output: JSON.stringify({ content: [{ type: "image", data: PNG, mimeType: "image/png" }] }),
+    state: "output-available" as const,
+  };
+
+  afterEach(() => writeShowToolResultImages(false));
+
+  it("shows a returned image under the collapsed row when the setting is on", () => {
+    writeShowToolResultImages(true);
+    const { container } = renderCard(screenshotCall);
+
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    const previews = screen.getByTestId("tool-result-images");
+    expect(within(previews).getByRole("img", { name: "Tool result image" })).toHaveAttribute(
+      "src",
+      `data:image/png;base64,${PNG}`,
+    );
+    // The preview sits beside the row, so collapsing never hides it.
+    expect(trigger).not.toContainElement(previews);
+  });
+
+  it("shows no preview while the setting is off", () => {
+    renderCard(screenshotCall);
+
+    expect(screen.queryByTestId("tool-result-images")).toBeNull();
+    expect(screen.queryByRole("img", { name: "Tool result image" })).toBeNull();
+  });
+
+  it("adds and removes the preview as the setting changes", () => {
+    renderCard(screenshotCall);
+    expect(screen.queryByTestId("tool-result-images")).toBeNull();
+
+    act(() => writeShowToolResultImages(true));
+    expect(screen.getByTestId("tool-result-images")).toBeInTheDocument();
+
+    act(() => writeShowToolResultImages(false));
+    expect(screen.queryByTestId("tool-result-images")).toBeNull();
   });
 });
 

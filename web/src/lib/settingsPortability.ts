@@ -9,6 +9,7 @@
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import { SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY } from "./toolResultImagePreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
@@ -39,6 +40,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY,
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",

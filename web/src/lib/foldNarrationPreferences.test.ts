@@ -6,24 +6,46 @@ import {
   useFoldAssistantNarration,
   writeFoldAssistantNarration,
 } from "./foldNarrationPreferences";
+import {
+  SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY,
+  readShowToolResultImages,
+  useShowToolResultImages,
+  writeShowToolResultImages,
+} from "./toolResultImagePreferences";
 
 afterEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
 });
 
-describe("foldNarrationPreferences", () => {
+// Both opt-in chat toggles share one boolean-preference implementation.
+describe.each([
+  {
+    label: "foldNarrationPreferences",
+    storageKey: FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+    read: readFoldAssistantNarration,
+    write: writeFoldAssistantNarration,
+    usePreference: useFoldAssistantNarration,
+  },
+  {
+    label: "toolResultImagePreferences",
+    storageKey: SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY,
+    read: readShowToolResultImages,
+    write: writeShowToolResultImages,
+    usePreference: useShowToolResultImages,
+  },
+])("$label", ({ storageKey, read, write, usePreference }) => {
   it("is off by default and only on for the exact persisted value", () => {
-    expect(readFoldAssistantNarration()).toBe(false);
-    localStorage.setItem(FOLD_ASSISTANT_NARRATION_STORAGE_KEY, "yes");
-    expect(readFoldAssistantNarration()).toBe(false);
+    expect(read()).toBe(false);
+    localStorage.setItem(storageKey, "yes");
+    expect(read()).toBe(false);
 
-    writeFoldAssistantNarration(true);
-    expect(localStorage.getItem(FOLD_ASSISTANT_NARRATION_STORAGE_KEY)).toBe("true");
-    expect(readFoldAssistantNarration()).toBe(true);
+    write(true);
+    expect(localStorage.getItem(storageKey)).toBe("true");
+    expect(read()).toBe(true);
 
-    writeFoldAssistantNarration(false);
-    expect(localStorage.getItem(FOLD_ASSISTANT_NARRATION_STORAGE_KEY)).toBeNull();
+    write(false);
+    expect(localStorage.getItem(storageKey)).toBeNull();
   });
 
   it("falls back to the default when storage is unavailable", () => {
@@ -33,30 +55,28 @@ describe("foldNarrationPreferences", () => {
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("quota exceeded");
     });
-    expect(() => writeFoldAssistantNarration(true)).not.toThrow();
-    expect(readFoldAssistantNarration()).toBe(false);
+    expect(() => write(true)).not.toThrow();
+    expect(read()).toBe(false);
   });
 
   it("updates mounted readers on a local write and on another window's write", () => {
-    const { result } = renderHook(() => useFoldAssistantNarration());
+    const { result } = renderHook(() => usePreference());
     expect(result.current).toBe(false);
 
-    act(() => writeFoldAssistantNarration(true));
+    act(() => write(true));
     expect(result.current).toBe(true);
 
     act(() => {
-      localStorage.removeItem(FOLD_ASSISTANT_NARRATION_STORAGE_KEY);
-      window.dispatchEvent(
-        new StorageEvent("storage", { key: FOLD_ASSISTANT_NARRATION_STORAGE_KEY }),
-      );
+      localStorage.removeItem(storageKey);
+      window.dispatchEvent(new StorageEvent("storage", { key: storageKey }));
     });
     expect(result.current).toBe(false);
 
     act(() => {
-      localStorage.setItem(FOLD_ASSISTANT_NARRATION_STORAGE_KEY, "true");
+      localStorage.setItem(storageKey, "true");
       window.dispatchEvent(
         new StorageEvent("storage", {
-          key: FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          key: storageKey,
           storageArea: sessionStorage,
         }),
       );

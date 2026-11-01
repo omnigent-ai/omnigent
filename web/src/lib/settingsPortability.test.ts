@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import { SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY } from "./toolResultImagePreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   readHiddenPickerAgents,
@@ -115,6 +116,7 @@ it.each([
 describe.each([
   ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY],
   ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY],
+  ["tool result images", SHOW_TOOL_RESULT_IMAGES_STORAGE_KEY],
 ])("%s portability", (_label, storageKey) => {
   it("exports, imports, and clears the device-local preference", () => {
     localStorage.setItem(storageKey, "true");

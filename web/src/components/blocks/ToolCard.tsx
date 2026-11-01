@@ -26,6 +26,8 @@ import { terminalSurfaceStyle } from "@/lib/terminalPalette";
 import { iconForTool } from "@/lib/toolIcon";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import type { LineCounts, ToolCall } from "@/lib/toolResultSummary";
+import { useShowToolResultImages } from "@/lib/toolResultImagePreferences";
+import { toolResultImages } from "@/lib/toolResultImages";
 import {
   type ToolRunCall,
   type ToolTitle,
@@ -53,6 +55,7 @@ import {
   WrapTextButton,
   getOutputPreview,
 } from "./ToolCodePanel";
+import { ToolResultImages } from "./ToolResultImages";
 import { ToolValueView } from "./ToolValueView";
 import { type ToolBodyProps, type ToolView, toolViewFor } from "./toolViews";
 
@@ -152,6 +155,8 @@ export function ToolCard({
       ? null
       : (resolveChatFilePath(title.filePath, root, home)?.path ?? null);
   const onBodyClick = openFile && linkPath ? () => openFile(linkPath) : undefined;
+  const showImages = useShowToolResultImages();
+  const images = useMemo(() => (showImages ? toolResultImages(call) : []), [showImages, call]);
 
   return (
     <Collapsible defaultOpen={false} className="group not-prose w-full">
@@ -165,6 +170,7 @@ export function ToolCard({
         lineCounts={lineCounts}
         onBodyClick={onBodyClick}
       />
+      {images.length > 0 && <ToolResultImages images={images} />}
       {/* The whole body, code panels included, sits on the Interface font's caption step. */}
       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 text-sm [&_code]:text-sm [&_pre]:text-sm data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         <DefaultToolBody call={call} duration={displayDuration} view={view} />
