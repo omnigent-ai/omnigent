@@ -319,8 +319,8 @@ describe("browser IPC Arca context", () => {
           return { ok: true };
         },
       }),
-      getAgentContextForEvent: (_event, host) => {
-        assert.equal(host, "actual-host");
+      getAgentContextForEvent: (_event, opts) => {
+        assert.equal(opts.sourceHostId, "actual-host");
         return context;
       },
     });
@@ -535,6 +535,7 @@ it("restores URL, title and history state for the requested browser tab only", (
   });
   assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
     exists: true,
+    hostIsThisMachine: false,
     url: "https://example.com/restored",
     title: "Restored page",
     canGoBack: true,
@@ -1460,5 +1461,265 @@ it("applies navigation policy even when renderer options claim user intent", asy
     assert.equal(result.ok, false);
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0][3], { force: false, agent: true, agentContext: context });
+  }
+});
+
+describe("browser IPC sessions on this machine", () => {
+  function localNavigation({ hostId = "local", live = true, protocol = 1 } = {}) {
+    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+    const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
+    const { isHostThisMachine } = require("../src/hostIdentity");
+    let liveEnrollment = live;
+    const webContents = makeWebContents();
+    webContents.loadURL = () => {};
+    webContents.capturePage = async () => ({ toPNG: () => Buffer.from("fixture") });
+    const registry = createBrowserViewRegistry({
+      WebContentsViewCtor: () => ({ webContents, setBounds() {} }),
+      createBoundsController: createBrowserViewBoundsController,
+      sendToRenderer: () => {},
+      attachToHost: () => {},
+      detachFromHost: () => {},
+      allowsLocalhost: (context) => context?.hostIsThisMachine === true,
+      resolveHost: async (hostname) =>
+        hostname === "alias.example" ? ["127.0.0.1"] : ["93.184.215.14"],
+    });
+    const ipcMain = makeIpcMain();
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => registry,
+      getAgentContextForEvent: (_event, opts) => ({
+        sourceHostId: opts?.sourceHostId,
+        hostIsThisMachine:
+          opts?.sessionHostProtocol === 1 &&
+          isHostThisMachine(
+            { hostId: opts?.sourceHostId, serverUrl: "https://server.example" },
+            {
+              readLocalHostId: () => "local",
+              liveDaemonRecordFor: () => (liveEnrollment ? { host_id: "local" } : null),
+            },
+          ),
+      }),
+    });
+    const navigate = (url, opts = { sourceHostId: hostId, sessionHostProtocol: protocol }) =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        { conversationId: "conv", url, opts },
+      );
+    return {
+      ipcMain,
+      registry,
+      navigate,
+      webContents,
+      setLive: (value) => {
+        liveEnrollment = value;
+      },
+    };
+  }
+
+  for (const transport of ["screenshot", "snapshot", "click", "type", "legacy"]) {
+    for (const scenario of [
+      {
+        name: "same host",
+        opts: { sessionHostProtocol: 1, sourceHostId: "local" },
+        allowed: true,
+        blank: false,
+      },
+      {
+        name: "different host",
+        opts: { sessionHostProtocol: 1, sourceHostId: "remote" },
+        allowed: false,
+        blank: true,
+      },
+      {
+        name: "unknown host",
+        opts: { sessionHostProtocol: 1, sourceHostId: null },
+        allowed: false,
+        blank: false,
+      },
+      { name: "no marker", opts: { sourceHostId: "local" }, allowed: false, blank: false },
+    ]) {
+      it(`${transport}: ${scenario.name} ${scenario.allowed ? "can" : "cannot"} read a privileged view`, async () => {
+        const { navigate, ipcMain, registry, webContents } = localNavigation();
+        await navigate("http://127.0.0.1:5173");
+        const entry = registry.get("conv");
+        const loads = [];
+        let reads = 0;
+        webContents.loadURL = async (url) => {
+          loads.push(url);
+        };
+        webContents.capturePage = async () => {
+          reads++;
+          return { toPNG: () => Buffer.from("fixture") };
+        };
+        webContents.executeJavaScript = async () => {
+          reads++;
+          return "{}";
+        };
+        const channel =
+          transport === "screenshot"
+            ? "omnigent:browser-screenshot"
+            : transport === "legacy"
+              ? "omnigent:browser-execute"
+              : "omnigent:browser-perform-action";
+        const result = await ipcMain.invoke(
+          channel,
+          {},
+          {
+            conversationId: "conv",
+            opts: scenario.opts,
+            action: transport === "screenshot" || transport === "legacy" ? undefined : transport,
+            params:
+              transport === "click"
+                ? { ref: 1 }
+                : transport === "type"
+                  ? { ref: 1, text: "hello" }
+                  : undefined,
+            js:
+              transport === "legacy"
+                ? require("./fixtures/browserActions-v0.18.json").requests[0].script
+                : undefined,
+          },
+        );
+        assert.equal(result.ok, scenario.allowed);
+        assert.equal(reads, scenario.allowed ? 1 : 0);
+        assert.equal(registry.get("conv"), entry, "a denial keeps the view");
+        assert.deepEqual(loads, scenario.blank ? ["about:blank"] : []);
+        assert.equal(entry.agentContext?.hostIsThisMachine === true, !scenario.blank);
+      });
+    }
+  }
+
+  function readView(ipcMain, action, sourceHostId = "local") {
+    return ipcMain.invoke(
+      action === "screenshot" ? "omnigent:browser-screenshot" : "omnigent:browser-perform-action",
+      {},
+      {
+        conversationId: "conv",
+        action,
+        params: { ref: 1, text: "hello" },
+        opts: { sessionHostProtocol: 1, sourceHostId },
+      },
+    );
+  }
+
+  for (const destination of ["https://example.com", "http://192.168.1.1"]) {
+    it(`revokes before blanking for a moved host navigating to ${destination}`, async () => {
+      const { navigate, ipcMain, registry, webContents } = localNavigation();
+      await navigate("http://localhost:5173");
+      const blank = Promise.withResolvers();
+      const loads = [];
+      webContents.loadURL = (url) => {
+        loads.push(url);
+        return url === "about:blank" ? blank.promise : new Promise(() => {});
+      };
+      webContents.capturePage = () => {
+        assert.fail("revoked documents must never be captured or scripted");
+      };
+      webContents.executeJavaScript = webContents.capturePage;
+      const pending = navigate(destination, { sourceHostId: "remote", sessionHostProtocol: 1 });
+      assert.equal(registry.get("conv").agentContext.revoked, true);
+      const probe = () =>
+        ipcMain.invoke("omnigent:browser-has-view", {}, { conversationId: "conv" });
+      assert.equal(probe().hostIsThisMachine, true, "the local document is still committed");
+      assert.deepEqual(loads, ["about:blank"]);
+      const reads = await Promise.all(
+        ["screenshot", "snapshot", "click", "type"].flatMap((action) => [
+          readView(ipcMain, action),
+          readView(ipcMain, action, "remote"),
+        ]),
+      );
+      assert.ok(reads.every((result) => result.ok === false));
+      assert.equal(
+        await registry.shouldCancelAgentRequest({
+          webContentsId: webContents.id,
+          url: "http://localhost:5173",
+        }),
+        true,
+      );
+      blank.resolve();
+      const result = await pending;
+      assert.equal(result.ok, destination.startsWith("https:"));
+      assert.equal(probe().hostIsThisMachine, false, "the local document was removed first");
+      assert.deepEqual(
+        loads,
+        destination.startsWith("https:") ? ["about:blank", destination] : ["about:blank"],
+      );
+    });
+  }
+
+  for (const failure of ["pending", "rejecting"]) {
+    it(`denies even the old host while a mismatch blank is ${failure}`, async () => {
+      const { navigate, ipcMain, registry, webContents } = localNavigation();
+      await navigate("http://localhost:5173");
+      const blank = Promise.withResolvers();
+      webContents.loadURL = () => blank.promise;
+      const mismatch = readView(ipcMain, "screenshot", "remote");
+      assert.equal(registry.get("conv").agentContext.revoked, true);
+      const reads = await Promise.all(
+        ["screenshot", "snapshot", "click", "type"].map((action) => readView(ipcMain, action)),
+      );
+      assert.ok(reads.every((result) => result.ok === false));
+      if (failure === "rejecting") blank.reject(new Error("ERR_ABORTED"));
+      else blank.resolve();
+      assert.equal((await mismatch).ok, false);
+      if (failure === "rejecting") {
+        assert.equal(registry.get("conv").agentContext.revoked, true);
+        assert.equal((await readView(ipcMain, "screenshot")).ok, false);
+      } else {
+        assert.equal(registry.get("conv").agentContext, null);
+      }
+    });
+  }
+
+  it("rechecks live enrollment on an agent read and blanks after the daemon record disappears", async () => {
+    const { navigate, ipcMain, registry, webContents, setLive } = localNavigation();
+    await navigate("http://localhost:5173");
+    const loads = [];
+    webContents.loadURL = async (url) => loads.push(url);
+    setLive(false);
+    assert.equal((await readView(ipcMain, "screenshot")).ok, false);
+    assert.deepEqual(loads, ["about:blank"]);
+    assert.equal(registry.get("conv").agentContext, null);
+  });
+
+  for (const url of ["http://localhost:5173", "http://127.0.0.1:5173", "http://[::1]:5173"]) {
+    it(`allows an enrolled local session to open ${url}`, async () => {
+      const { navigate } = localNavigation();
+      const result = await navigate(url);
+      assert.equal(result.ok, true);
+      assert.equal(result.hostIsThisMachine, true);
+    });
+  }
+  for (const url of [
+    "http://192.168.1.1",
+    "http://169.254.169.254",
+    "http://app.localhost",
+    "http://alias.example",
+    "http://0.0.0.0",
+  ]) {
+    it(`keeps ${url} blocked for a local session`, async () => {
+      const { navigate, registry } = localNavigation();
+      assert.equal((await navigate(url)).ok, false);
+      assert.equal(registry.get("conv"), null);
+    });
+  }
+  for (const scenario of [
+    { name: "remote host", hostId: "remote" },
+    { name: "matching host without a live daemon", live: false },
+    { name: "old bundle without a protocol marker", protocol: null },
+  ]) {
+    it(`denies ${scenario.name} while retaining an existing public view`, async () => {
+      const { navigate, registry, ipcMain } = localNavigation(scenario);
+      assert.equal((await navigate("https://example.com")).ok, true);
+      const entry = registry.get("conv");
+      assert.equal((await navigate("http://localhost:5173")).ok, false);
+      assert.equal(registry.get("conv"), entry);
+      assert.equal(
+        (await ipcMain.invoke("omnigent:browser-screenshot", {}, { conversationId: "conv" })).ok,
+        true,
+      );
+    });
   }
 });

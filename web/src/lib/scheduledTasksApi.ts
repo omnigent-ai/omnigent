@@ -21,6 +21,9 @@ export type ScheduledTaskState = "active" | "paused";
  */
 export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
 
+/** Whether each run starts a new session or continues one. */
+export type ScheduledTaskSessionMode = "new" | "continue";
+
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
   "scheduled" | "starting" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
@@ -51,6 +54,10 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
+  sessionMode: ScheduledTaskSessionMode;
+  /** The session a `"continue"` task sends to; `null` until its first run creates one. */
+  sessionId: string | null;
   /** Pinned absolute workspace, or `null` (server defaults to the host home). */
   workspace: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
@@ -121,6 +128,8 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Native-harness permission mode (Claude Code); omit for the agent default. */
   permissionMode?: string | null;
+  /** `"continue"` keeps one session across runs; omit for a new session per run. */
+  sessionMode?: ScheduledTaskSessionMode;
   /** Optional pinned workspace; only valid together with `hostId`. */
   workspace?: string | null;
   /** Optional pinned host. */
@@ -155,6 +164,9 @@ export interface UpdateScheduledTaskInput {
   modelOverride?: string | null;
   reasoningEffort?: string | null;
   permissionMode?: string | null;
+  sessionMode?: ScheduledTaskSessionMode;
+  /** `null` makes a `"continue"` task's next run start the session later runs continue. */
+  sessionId?: string | null;
   workspace?: string;
   hostId?: string;
   /**
@@ -181,6 +193,8 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  session_mode?: ScheduledTaskSessionMode;
+  session_id?: string | null;
   workspace: string | null;
   host_id: string | null;
   execution_target: ScheduledTaskExecutionTarget;
@@ -263,6 +277,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    sessionMode: wire.session_mode ?? "new",
+    sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
@@ -329,6 +345,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
@@ -359,6 +376,8 @@ export async function updateScheduledTask(
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
+  if (input.sessionId !== undefined) body.session_id = input.sessionId;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;

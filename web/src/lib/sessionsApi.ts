@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Typed client for the four `/v1/sessions` endpoints introduced in
 // commit `e64a490` ("Migrate session ↔ client interactions to
 // /v1/sessions"). Mirrors `omnigent/server/routes/sessions.py`.
@@ -104,6 +105,7 @@ interface ModelUsageWire {
  * camelCase `Session` type at the parse boundary.
  */
 interface SessionResponseWire {
+  sandbox_profile?: SandboxProfile | null;
   id: string;
   agent_id: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
@@ -250,6 +252,7 @@ interface SessionResponseWire {
   }[];
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
+  side_chat_settings_supported?: boolean;
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -367,6 +370,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     codexModelOptions: wire.model_options ?? [],
+    sideChatSettingsSupported: wire.side_chat_settings_supported === true,
     ...(wire.inference_configured !== undefined
       ? {
           inferenceConfigured: wire.inference_configured,
@@ -375,6 +379,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       : {}),
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    sandboxProfile: wire.sandbox_profile ?? null,
     mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
@@ -733,7 +738,8 @@ async function importLocalSessionsBuffered(
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
  *   A `project_id` files the session into that project atomically at create
  *   and lets the server default-fill absent fields from the project config.
- * @returns The created session's id.
+ * @returns The created session's id, and the id of the session-scoped agent
+ *   created from the bundle.
  */
 export async function createBundledSession(
   bundle: File,
@@ -747,7 +753,7 @@ export async function createBundledSession(
     git?: { branch_name: string; base_branch?: string };
     mcp_registry_services?: string[];
   } = {},
-): Promise<{ id: string }> {
+): Promise<{ id: string; agentId?: string }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
@@ -768,8 +774,9 @@ export async function createBundledSession(
   // so callers don't need to care which path was taken.
   const body = (await res.json()) as {
     session_id: string;
+    agent_id?: string;
   };
-  return { id: body.session_id };
+  return { id: body.session_id, agentId: body.agent_id };
 }
 
 /**
@@ -809,9 +816,11 @@ export async function createBundledSession(
  *   `provider` names one of the server's configured sandbox providers
  *   (`null` takes its first). `workspace` is a `<url>[#<branch>]`
  *   repository the server clones into the sandbox; `null` gives the fork an
- *   empty sandbox, and leaving the key off inherits the repository the
- *   source session recorded. `hostId` names the new sandbox host, as on a
- *   managed create; omitted, the server mints one.
+ *   empty sandbox. `workspaces` selects several repositories on providers
+ *   that support them; `[]` or `null` clears the selection. Send either
+ *   `workspace` or `workspaces`; omitting both inherits every source repo.
+ *   `hostId` names the new sandbox host, as on a managed create; omitted,
+ *   the server mints one.
  */
 export async function forkSession(
   sourceId: string,
@@ -825,7 +834,15 @@ export async function forkSession(
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; workspace?: string | null; hostId?: string };
+    sandbox?: {
+      provider?: string | null;
+      hostId?: string;
+      profileId?: string;
+      profileRevision?: string;
+    } & (
+      | { workspace?: string | null; workspaces?: never }
+      | { workspace?: never; workspaces?: string[] | null }
+    );
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
   } = {},
@@ -841,8 +858,11 @@ export async function forkSession(
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
     host_id?: string;
     workspace?: string | null;
+    workspaces?: string[] | null;
     side_chat?: boolean;
   } = {};
   if (sideChat) {
@@ -877,10 +897,17 @@ export async function forkSession(
     if (sandbox.provider != null) {
       body.sandbox_provider = sandbox.provider;
     }
+    if (sandbox.profileId !== undefined) {
+      body.sandbox_profile_id = sandbox.profileId;
+      body.sandbox_profile_revision = sandbox.profileRevision;
+    }
     // Key presence is the signal here: an explicit null means "empty
     // sandbox", while omitting it inherits the source's repository.
     if (sandbox.workspace !== undefined) {
       body.workspace = sandbox.workspace;
+    }
+    if (sandbox.workspaces !== undefined) {
+      body.workspaces = sandbox.workspaces;
     }
     if (sandbox.hostId !== undefined) {
       body.host_id = sandbox.hostId;
@@ -1159,6 +1186,24 @@ export async function bindOnlyOnlineRunner(sessionId: string): Promise<Session |
 export async function getSession(sessionId: string): Promise<Session> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`);
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+export interface SessionRepositoryBranch {
+  url: string;
+  branch: string | null;
+  /** Whether this branch exists on the clone remote; null when it cannot be checked. */
+  pushed: boolean | null;
+}
+
+export async function fetchSessionRepositoryBranches(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<{ repositories: SessionRepositoryBranch[] }> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/repository-branches`,
+    { signal },
+  );
+  return readJsonOrThrow(res);
 }
 
 /**

@@ -1,3 +1,6 @@
+vi.mock("@/lib/fetchSessionHostId", () => ({
+  fetchSessionHostId: vi.fn().mockResolvedValue("local-host"),
+}));
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
@@ -2162,6 +2165,121 @@ describe("Workspace rail maximize", () => {
   });
 });
 
+describe("Sidebar across the md breakpoint", () => {
+  // Resizable viewport: matchMedia answers the md queries from `width` and
+  // fires change listeners for the queries a resize flips.
+  function mockViewportWidth(initialWidth: number) {
+    let width = initialWidth;
+    const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+    const matches = (query: string) => {
+      if (query === "(min-width: 768px)") return width >= 768;
+      if (query === "(max-width: 767.98px)") return width < 768;
+      return false;
+    };
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: matches(query),
+      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+        if (!listeners.has(query)) listeners.set(query, new Set());
+        listeners.get(query)?.add(listener);
+      },
+      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+        listeners.get(query)?.delete(listener);
+      },
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    return (nextWidth: number) =>
+      act(() => {
+        const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
+        width = nextWidth;
+        for (const [query, queryListeners] of listeners) {
+          const event = { matches: matches(query), media: query } as MediaQueryListEvent;
+          if (before.get(query) === event.matches) continue;
+          for (const listener of queryListeners) {
+            if (typeof listener === "function") listener(event);
+            else listener.handleEvent(event);
+          }
+        }
+      });
+  }
+
+  it("closes an open sidebar when the window narrows and reopens it on widening", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    resize(740);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("keeps a sidebar the user closed closed across the breakpoint", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(740);
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("keeps a drawer the user closed while narrow closed on widening", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    resize(740);
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("restores the open sidebar after leaving settings entered while narrow", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    resize(740);
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    resize(1280);
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("does not open a drawer when leaving settings while narrow", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByTestId("nav-settings"));
+
+    resize(740);
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("keeps the settings menu open when the window narrows on /settings", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([]);
+    renderShell("/settings");
+
+    resize(740);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+});
+
 describe("Subagents tab", () => {
   // A single child agent — enough to make the root "multi-agent" so the
   // Agents tab is shown.
@@ -2967,7 +3085,7 @@ describe("Right workspace card visibility", () => {
         browserViewId("conv_from", saved.selectedBrowserId!),
         "https://example.com/page",
         undefined,
-        { agent: true },
+        { agent: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
       );
       expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
       expect(readSessionWorkspaceState("conv_to").openBrowsers ?? []).toEqual([]);
@@ -5625,7 +5743,7 @@ describe("AppShell design-mode submission", () => {
   }
 
   it.each([
-    { preference: null, busy: true, backlog: false, queued: true },
+    { preference: null, busy: true, backlog: false, queued: false },
     { preference: "false", busy: true, backlog: false, queued: true },
     { preference: "true", busy: true, backlog: false, queued: false },
     { preference: "true", busy: true, backlog: true, queued: true },
@@ -5696,6 +5814,7 @@ describe("AppShell design-mode submission", () => {
   });
 
   it("preserves queued instructions when always-steer is enabled mid-session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     submitInstruction("First change");
     localStorage.setItem("omnigent:always-steer", "true");
@@ -5710,6 +5829,7 @@ describe("AppShell design-mode submission", () => {
 
   // User-opened tabs submit with their `browser-tab:` view ID, not the session ID.
   it("sends a submission from a user-opened tab in the current session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
     expect(send).not.toHaveBeenCalled();
@@ -5750,6 +5870,7 @@ describe("AppShell design-mode submission", () => {
   });
 
   it("rejects a late pointer submission after switching to another session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     chat.conversationId = "conv_other";
     submitInstruction();
