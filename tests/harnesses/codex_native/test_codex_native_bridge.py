@@ -104,6 +104,26 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_relay(tmp_path: Path) -> 
     assert json.loads(raw_data_dir) == str(data_dir())
 
 
+def test_codex_mcp_config_overrides_pin_a_relative_data_dir_as_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relay starts in the session workspace, so it must get an absolute data dir.
+
+    :param tmp_path: Stands in for the host's launch directory.
+    :param monkeypatch: Sets a relative ``OMNIGENT_DATA_DIR`` and the cwd.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", "state")
+
+    overrides = codex_mcp_config_overrides(tmp_path / "bridge")
+
+    env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
+    raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
+    pinned = Path(json.loads(raw_data_dir))
+    assert pinned.is_absolute()
+    assert pinned == Path.cwd() / "state"
+
+
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
     """
     Write bridge state with a given active turn id.

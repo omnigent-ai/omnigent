@@ -344,34 +344,6 @@ def test_reap_still_errors_on_a_module_that_raises_on_import(
     assert [r.levelno for r in records] == [logging.ERROR]
 
 
-@pytest.mark.parametrize(
-    ("harness", "dirname"),
-    [
-        ("antigravity_native", "antigravity-native"),
-        ("codex_native", "codex-native"),
-        ("opencode_native", "opencode-native"),
-        ("pi_native", "pi-native"),
-    ],
-)
-def test_bridge_root_follows_the_configured_data_dir(
-    tmp_path: Path, harness: str, dirname: str
-) -> None:
-    """Two instances with their own data dir never share, or sweep, one bridge root."""
-    imported = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            f"from omnigent.harnesses.{harness} import bridge; print(bridge._BRIDGE_ROOT)",
-        ],
-        env={**os.environ, "OMNIGENT_DATA_DIR": str(tmp_path)},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    assert Path(imported.stdout.strip()) == tmp_path / dirname
-
-
 _NATIVE_BRIDGE_HARNESSES = pytest.mark.parametrize(
     ("harness", "dirname"),
     [
@@ -383,19 +355,64 @@ _NATIVE_BRIDGE_HARNESSES = pytest.mark.parametrize(
 )
 
 
-def _run_python(code: str, *, cwd: Path, data_dir: str) -> str:
-    """Run *code* in a fresh interpreter with *cwd* and ``OMNIGENT_DATA_DIR``."""
+def _run_python(
+    code: str, *, cwd: Path | None, data_dir: str | None, home: Path | None = None
+) -> str:
+    """Run *code* in a fresh interpreter with *cwd* and ``OMNIGENT_DATA_DIR``.
+
+    :param code: Python source passed to ``-c``.
+    :param cwd: Working directory of the child, or ``None`` to inherit it.
+    :param data_dir: ``OMNIGENT_DATA_DIR`` for the child, or ``None`` to unset it.
+    :param home: Home directory for the child, or ``None`` to inherit it.
+    :returns: The child's stripped stdout.
+    """
     repo_root = Path(__file__).resolve().parents[1]
     pythonpath = os.pathsep.join(filter(None, [str(repo_root), os.environ.get("PYTHONPATH")]))
+    env = {**os.environ, "PYTHONPATH": pythonpath}
+    env.pop("OMNIGENT_DATA_DIR", None)
+    if data_dir is not None:
+        env["OMNIGENT_DATA_DIR"] = data_dir
+    if home is not None:
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
     completed = subprocess.run(
         [sys.executable, "-c", code],
         cwd=cwd,
-        env={**os.environ, "OMNIGENT_DATA_DIR": data_dir, "PYTHONPATH": pythonpath},
+        env=env,
         capture_output=True,
         text=True,
         check=True,
     )
     return completed.stdout.strip()
+
+
+def _bridge_root_code(harness: str) -> str:
+    """Return child code that prints *harness*'s import-time bridge root."""
+    return f"from omnigent.harnesses.{harness} import bridge; print(bridge._BRIDGE_ROOT)"
+
+
+@_NATIVE_BRIDGE_HARNESSES
+def test_bridge_root_follows_the_configured_data_dir(
+    tmp_path: Path, harness: str, dirname: str
+) -> None:
+    """Two instances with their own data dir never share, or sweep, one bridge root."""
+    root = _run_python(_bridge_root_code(harness), cwd=None, data_dir=str(tmp_path))
+
+    assert Path(root).is_absolute()
+    assert Path(root) == tmp_path / dirname
+
+
+@_NATIVE_BRIDGE_HARNESSES
+def test_bridge_root_defaults_to_the_home_omnigent_dir(
+    tmp_path: Path, harness: str, dirname: str
+) -> None:
+    """With no data dir override, a single instance keeps ``~/.omnigent/<harness>-native``."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    root = _run_python(_bridge_root_code(harness), cwd=None, data_dir=None, home=home)
+
+    assert Path(root) == home / ".omnigent" / dirname
 
 
 @_NATIVE_BRIDGE_HARNESSES
@@ -406,11 +423,7 @@ def test_bridge_root_anchors_a_relative_data_dir_in_the_launch_directory(
     launch_dir = tmp_path / "launch"
     launch_dir.mkdir()
 
-    root = _run_python(
-        f"from omnigent.harnesses.{harness} import bridge; print(bridge._BRIDGE_ROOT)",
-        cwd=launch_dir,
-        data_dir="state",
-    )
+    root = _run_python(_bridge_root_code(harness), cwd=launch_dir, data_dir="state")
 
     # The child's cwd is the real path, so compare against the resolved launch dir.
     assert Path(root).is_absolute()
