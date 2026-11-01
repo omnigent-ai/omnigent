@@ -7577,11 +7577,16 @@ async def _execute_os_env_tool(
             )
             owns_environment = False
         else:
+            from omnigent.inner.bundle_skills import skill_resource_roots
+
             additional_read_roots = (
                 [resource_registry.codex_skills_dir(conversation_id)]
                 if resource_registry is not None and conversation_id is not None
                 else []
             )
+            # Bundle skills sit in the runner's extraction directory, under the
+            # temp directory a bwrap sandbox hides; their scripts must stay reachable.
+            additional_read_roots += skill_resource_roots(getattr(agent_spec, "skills", ()))
             os_env = create_os_environment(
                 effective_spec, additional_read_roots=additional_read_roots
             )

@@ -125,6 +125,18 @@ the policy payload.
 
 ---
 
+### Skills marketplace controls
+
+The `skills_marketplace:` block constrains Settings → Skills for every user,
+administrators included: which repositories are browsable (`sources`, seeded at
+startup and read-only in the UI), which may be fetched at all
+(`allowed_sources`, `host/owner/repo` globs), whether **Add from URL** is
+offered (`allow_url_install`), and a per-pattern token for private
+repositories (`credentials`, naming an environment variable so the file holds
+no secret). It is enforced on every fetch path and again when a session's
+bundle is served. See [the skills marketplace guide](SKILLS_MARKETPLACE.md#operator-policy)
+for the keys and their semantics.
+
 ## For agent developers
 
 ### Adding policies to an agent spec

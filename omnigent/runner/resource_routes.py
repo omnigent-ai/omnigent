@@ -49,6 +49,7 @@ from omnigent.runner.native import (
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
     NativeLaunchContext,
+    _agent_skill_root_kwargs,
     _auto_create_qwen_terminal,
     _auto_create_repl_terminal,
     _claude_native_bridge_id_for_session,
@@ -615,6 +616,8 @@ def register_resource_routes(
                 sandbox_override=sandbox_override,
                 parent_os_env=agent_os_env,
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
+                # The agent's skill directories, as native and sys_terminal launches pass them.
+                **_agent_skill_root_kwargs(agent_spec),
             )
         except RuntimeError as exc:
             if launched_relay is not None:

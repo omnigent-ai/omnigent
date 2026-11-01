@@ -134,6 +134,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Markdown editor](./markdown-editor.md) defines the file-editor CUJ, fixed
   before/after recordings, load probes, and complementary persistence checks.
 
+- [Skills marketplace](./skills-marketplace.md) covers browsing skill
+  repositories, installing per user or for everyone, and the installed skills
+  reaching every session's slash menu.
 - [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
   review, deletion, and capability gating.
 

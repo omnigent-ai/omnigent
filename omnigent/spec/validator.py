@@ -28,6 +28,11 @@ _VALID_INPUT_MODALITIES = {"text", "image", "audio", "video", "file"}
 _VALID_OUTPUT_MODALITIES = {"text", "image", "audio"}
 
 
+def is_valid_skill_name(name: str) -> bool:
+    """Whether *name* is a skill directory name :func:`validate` accepts for a bundle."""
+    return bool(_SKILL_NAME_PATTERN.match(name)) and len(name) <= _SKILL_NAME_MAX_LEN
+
+
 @dataclass
 class ValidationError:
     """

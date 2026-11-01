@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -256,6 +256,7 @@ class TerminalRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -268,6 +269,8 @@ class TerminalRegistry:
         was created.
 
         :param program_status_app: Opt-in runtime PTY relay application identity.
+        :param additional_read_roots: Directories granted read-only to the
+            terminal's sandbox, e.g. the agent's bundle skill directories.
         :param conversation_id: The owning conversation id, e.g.
             ``"conv_abc123"``.
         :param terminal_name: The terminal's spec name from
@@ -332,6 +335,7 @@ class TerminalRegistry:
             cwd_override=cwd_override,
             sandbox_override=sandbox_override,
             conversation_link=self.conversation_link_for_id(conversation_id),
+            additional_read_roots=additional_read_roots,
         )
         stage = "terminal_spawn"
         try:

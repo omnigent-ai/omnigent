@@ -1288,11 +1288,20 @@ def test_plugin_command_marked_not_user_invocable_is_hidden(
         "kb-internal",
         "---\ndescription: model-only step\nuser-invocable: false\n---\nbody\n",
     )
+    # A scalar alias is valid YAML for a host command; only marketplace
+    # repositories get the alias-refusing parse, so this stays hidden too.
+    _write_plugin_command(
+        install / "commands",
+        "kb-aliased",
+        "---\ndescription: &summary Internal helper\nnote: *summary\n"
+        "user-invocable: false\n---\nbody\n",
+    )
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
 
     names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
     assert "knowledge-base:kb-review" in names
     assert "knowledge-base:kb-internal" not in names
+    assert "knowledge-base:kb-aliased" not in names
 
 
 def test_plugin_command_frontmatter_name_replaces_its_file_segment(

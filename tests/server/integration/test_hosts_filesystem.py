@@ -282,6 +282,8 @@ async def test_list_filesystem_survives_idle_mock_host(
                         "name": "toolkit:review",
                         "description": "Review changes",
                         "display_name": None,
+                        # A host skill names no repository; only an install does.
+                        "source": None,
                     }
                 ],
                 "warnings": [],
@@ -292,7 +294,12 @@ async def test_list_filesystem_survives_idle_mock_host(
             200,
             {
                 "skills": [
-                    {"name": "ste", "description": "STE", "display_name": "Simplified STE"}
+                    {
+                        "name": "ste",
+                        "description": "STE",
+                        "display_name": "Simplified STE",
+                        "source": None,
+                    }
                 ],
                 "warnings": [],
             },

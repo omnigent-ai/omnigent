@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   singleUser: false,
   isAdmin: false,
   customAgentsEnabled: false as boolean | undefined,
+  skillsEnabled: false,
   agentInstall: false,
   enabledConnections: [] as string[],
 }));
@@ -34,6 +35,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     single_user: mocks.singleUser,
     features: {
       custom_agents_settings_ui: mocks.customAgentsEnabled,
+      skills_marketplace: mocks.skillsEnabled,
     },
     agent_install: mocks.agentInstall,
     enabled_connections: mocks.enabledConnections,
@@ -71,6 +73,7 @@ beforeEach(() => {
   mocks.singleUser = false;
   mocks.isAdmin = false;
   mocks.customAgentsEnabled = false;
+  mocks.skillsEnabled = false;
   mocks.agentInstall = false;
   mocks.enabledConnections = [];
 });
@@ -535,4 +538,36 @@ describe("custom agent settings availability", () => {
       agentId: "agent-1",
     });
   });
+});
+
+describe("skills marketplace settings availability", () => {
+  it.each([
+    // [skills feature, custom agents feature]
+    [true, false],
+    [true, true],
+    [false, true],
+    [false, false],
+  ])(
+    "lists Skills under Customize and accepts its route with skills=%s, agents=%s",
+    (skills, agents) => {
+      mocks.skillsEnabled = skills;
+      mocks.customAgentsEnabled = agents;
+      mocks.agentInstall = agents;
+      renderBody();
+      expect(!!screen.queryByTestId("settings-nav-skills")).toBe(skills);
+      const customize = skills || agents;
+      expect(!!screen.queryByRole("heading", { name: "Customize" })).toBe(customize);
+      if (customize) {
+        const group = screen.getByRole("heading", { name: "Customize" }).parentElement;
+        if (skills) expect(group).toContainElement(screen.getByTestId("settings-nav-skills"));
+        // Harnesses moves to Customize only alongside Custom agents.
+        const harnesses = screen.getByTestId("settings-nav-harnesses");
+        if (agents) expect(group).toContainElement(harnesses);
+        else expect(group).not.toContainElement(harnesses);
+        expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(agents);
+      }
+      // An unavailable Skills route falls back to General instead of rendering.
+      expect(routeHook("/settings/skills").section).toBe(skills ? "skills" : "general");
+    },
+  );
 });

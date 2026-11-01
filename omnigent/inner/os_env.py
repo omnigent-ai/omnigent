@@ -380,6 +380,11 @@ class OSEnvironment(ABC):
     def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
         return None
 
+    def replace_sandbox_policy(self, policy: SandboxPolicy) -> None:
+        """Use *policy* for later operations; environments without a sandbox refuse."""
+        del policy
+        raise NotImplementedError("This environment has no sandbox policy to replace")
+
     def close(self) -> None:  # noqa: B027 — optional override hook; default is a no-op
         """Release any process or file resources held by the environment.
 
@@ -449,6 +454,12 @@ class _HelperProcessClient:
     def request(self, payload: OpRequest) -> OpResult:
         with self._lock:
             return self._request_locked(payload, allow_retry=True)
+
+    def replace_sandbox(self, sandbox: SandboxPolicy) -> None:
+        """Run later requests under *sandbox*; a running helper is restarted on the next one."""
+        with self._lock:
+            self.sandbox = sandbox
+            self._stop_locked()
 
     def close(self) -> None:
         with self._lock:
@@ -941,6 +952,17 @@ class CallerProcessOSEnvironment(OSEnvironment):
     @property
     def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
         return self._copy_on_write_environment
+
+    def replace_sandbox_policy(self, policy: SandboxPolicy) -> None:
+        """Use *policy* for later operations, keeping the copy-on-write mounts.
+
+        The copy-on-write roots must not change: their mounts, and the changes
+        made under them, live in the environment's keeper, not the helper.
+        """
+        if (policy.copy_on_write_roots or None) != (self.sandbox.copy_on_write_roots or None):
+            raise ValueError("Cannot change an environment's copy-on-write paths")
+        self.sandbox = policy
+        self._helper.replace_sandbox(policy)
 
     def prepare_sandbox(self, policy: SandboxPolicy) -> None:
         if self._copy_on_write_environment is not None:
