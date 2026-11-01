@@ -700,6 +700,7 @@ function AppShellImpl() {
     agentTerminal,
     openTerminals,
     environmentQuery,
+    workspacePathsLoading,
     showFilesPanel,
     changedCount,
     isChangedPath,
@@ -2282,6 +2283,7 @@ function AppShellImpl() {
       conversationId,
       workspaceRoot,
       workspaceHome,
+      workspacePathsLoading,
       sessionHostId: activeSession?.hostId ?? null,
     }),
     [
@@ -2294,6 +2296,7 @@ function AppShellImpl() {
       conversationId,
       workspaceRoot,
       workspaceHome,
+      workspacePathsLoading,
       activeSession?.hostId,
     ],
   );

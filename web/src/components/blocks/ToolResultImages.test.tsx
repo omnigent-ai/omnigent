@@ -60,9 +60,15 @@ afterEach(() => {
 
 function renderPreview(
   path: string,
-  viewer: { conversationId?: string; workspaceRoot?: string | null } = {},
+  viewer: Partial<{
+    conversationId: string;
+    workspaceRoot: string | null;
+    workspaceHome: string | null;
+    workspacePathsLoading: boolean;
+  }> = {},
 ) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // Default retries stay on so a test sees whether the preview opts out of them.
+  const queryClient = new QueryClient();
   const context = {
     openFile: () => {},
     openGithubTab: () => {},
@@ -72,7 +78,6 @@ function renderPreview(
     workspaceHome: "/home/agent",
     ...viewer,
   };
-  // createElement passes the per-test context without a constructed JSX value.
   const preview = createElement(
     FileViewerContext.Provider,
     { value: context },
@@ -113,22 +118,29 @@ describe("ToolResultImages", () => {
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-1");
   });
 
-  it("waits for the workspace root before reading an absolute path", () => {
-    renderPreview("/ws/shots/home.png", { workspaceRoot: null });
+  it.each([
+    ["an absolute path", "/ws/shots/home.png", { workspaceRoot: null }],
+    ["a home-relative path", "~/shots/home.png", { workspaceHome: null }],
+  ])("waits for the workspace environment before reading %s", (_label, path, paths) => {
+    renderPreview(path, { ...paths, workspacePathsLoading: true });
 
     expect(screen.getByRole("status", { name: "Loading image" })).toBeVisible();
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
-  it.each<[string, () => void, string, { conversationId?: string }?]>([
-    [
-      "the read fails",
-      () =>
-        vi
-          .mocked(authenticatedFetch)
-          .mockImplementation(async () => new Response("missing", { status: 404 })),
-      "a.png",
-    ],
+  it("shows the chip for a missing file without retrying the read", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async () => new Response("missing", { status: 404 }),
+    );
+    renderPreview("a.png");
+
+    const chip = await screen.findByRole("img", { name: "home.png" });
+    expect(chip).not.toHaveAttribute("src");
+    expect(requestedUrls()).toHaveLength(1);
+  });
+
+  type Viewer = Parameters<typeof renderPreview>[1];
+  it.each<[string, () => void, string, Viewer?]>([
     [
       "the file is too large to return",
       () => respondWith({ ...PNG_RESPONSE, truncated: true }),
@@ -137,6 +149,18 @@ describe("ToolResultImages", () => {
     ["neither runner nor host can serve it", () => (serveable.value = false), "a.png"],
     ["the path is unsafe", () => {}, "../outside.png"],
     ["no session is focused", () => {}, "a.png", { conversationId: undefined }],
+    [
+      "the workspace root can't be discovered",
+      () => {},
+      "/ws/shots/home.png",
+      { workspaceRoot: null, workspacePathsLoading: false },
+    ],
+    [
+      "the runner home can't be discovered",
+      () => {},
+      "~/shots/home.png",
+      { workspaceHome: null, workspacePathsLoading: false },
+    ],
   ])("shows the unavailable chip when %s", async (_label, arrange, path, viewer) => {
     arrange();
     renderPreview(path, viewer);

@@ -4,7 +4,7 @@
 
 import type { ToolCall } from "./toolResultSummary";
 import { splitToolName } from "./toolTitle";
-import { isRecord, parseToolOutput, toolErrorMessage } from "./toolValue";
+import { editErrorMessage, isRecord, parseToolOutput, toolErrorMessage } from "./toolValue";
 
 export type ToolResultImage =
   /** Bytes the stored output carries, as a `data:image/...` URI. */
@@ -46,7 +46,9 @@ export function toolResultImages(call: ToolCall): ToolResultImage[] {
   const inline = inlineOutputImages(output);
   if (inline.length > 0) return inline;
   const path = imageReadPath(call.name, call.args);
-  return path === null ? [] : [{ kind: "file", path, alt: baseName(path) }];
+  // Read tools never echo arbitrary text, so the "[error] <message>" form counts too.
+  if (path === null || editErrorMessage(output) !== null) return [];
+  return [{ kind: "file", path, alt: baseName(path) }];
 }
 
 /** The image file path a read tool opened, or `null` for any other call. */

@@ -210,6 +210,11 @@ def _open_settled_work(page: Page) -> None:
         group.first.click()
 
 
+def _expect_decoded_width(image: Locator, width: int) -> None:
+    """Wait for *image* to finish decoding, then check it shows the real picture."""
+    assert image.evaluate("img => img.decode().then(() => img.naturalWidth)") == width
+
+
 def _preview_for(page: Page, row_text: str) -> tuple[Locator, Locator]:
     """The tool row naming *row_text* and the preview strip beside it."""
     row = page.locator(_TRIGGER, has_text=row_text).first
@@ -239,7 +244,7 @@ def test_read_image_previews_under_its_row(
     expect(image).to_be_visible(timeout=60_000)
     expect(row).to_have_attribute("aria-expanded", "false")
     expect(image).to_have_attribute("src", re.compile(r"^blob:"))
-    assert image.evaluate("img => img.naturalWidth") == 640
+    _expect_decoded_width(image, 640)
     expect(page.locator(_ASSISTANT, has_text=_READ_REPLY)).to_have_count(0)
     _hold_for_recording(page, 2_500)
 
@@ -254,6 +259,9 @@ def test_read_image_previews_under_its_row(
 
     # The stored output holds no image bytes; a reload reads the file again.
     page.reload()
+    expect(page.get_by_test_id("turn-worked-fold")).to_be_visible(timeout=30_000)
+    # The settled turn is folded, so its preview stays hidden until opened.
+    expect(page.get_by_test_id("tool-result-images")).to_have_count(0)
     _open_settled_work(page)
     _row, previews = _preview_for(page, _SCREENSHOT)
     expect(previews.get_by_role("img", name=_SCREENSHOT)).to_be_visible(timeout=30_000)
@@ -287,7 +295,7 @@ def test_mcp_image_result_shows_inline(
     expect(image).to_be_visible(timeout=60_000)
     expect(row).to_have_attribute("aria-expanded", "false")
     expect(image).to_have_attribute("src", re.compile(r"^data:image/png;base64,"))
-    assert image.evaluate("img => img.naturalWidth") == 640
+    _expect_decoded_width(image, 640)
     _hold_for_recording(page, 2_500)
 
     expect(page.locator(_ASSISTANT, has_text=_MCP_REPLY).first).to_be_visible(timeout=90_000)

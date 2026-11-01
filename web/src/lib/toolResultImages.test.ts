@@ -110,6 +110,10 @@ describe("toolResultImages", () => {
     ["a running call", { state: "input-available", output: null }],
     ["a call without output", { output: null }],
     ["a failed read", { output: "<tool_use_error>File does not exist.</tool_use_error>" }],
+    [
+      "an OpenCode read that reports an error",
+      { name: "read", args: { filePath: "/ws/missing.png" }, output: "[error] File not found" },
+    ],
     ["a JSON error", { output: JSON.stringify({ error: "denied" }) }],
     ["an errored state", { state: "output-error", output: "boom" }],
   ])("shows nothing for %s", (_label, overrides) => {

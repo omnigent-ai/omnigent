@@ -1,5 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createBooleanPreference } from "./booleanPreference";
 import {
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
   readFoldAssistantNarration,
@@ -18,7 +19,23 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-// Both opt-in chat toggles share one boolean-preference implementation.
+describe("createBooleanPreference", () => {
+  it("stores only the override for a default-on preference", () => {
+    const preference = createBooleanPreference("test:default-on", true);
+    expect(preference.read()).toBe(true);
+    localStorage.setItem("test:default-on", "yes");
+    expect(preference.read()).toBe(true);
+
+    preference.write(false);
+    expect(localStorage.getItem("test:default-on")).toBe("false");
+    expect(preference.read()).toBe(false);
+
+    preference.write(true);
+    expect(localStorage.getItem("test:default-on")).toBeNull();
+  });
+});
+
+// Each opt-in chat toggle built on the helper keeps its storage contract.
 describe.each([
   {
     label: "foldNarrationPreferences",

@@ -1049,16 +1049,10 @@ describe("ToolCard result images", () => {
     expect(trigger).not.toContainElement(previews);
   });
 
-  it("shows no preview while the setting is off", () => {
-    renderCard(screenshotCall);
-
-    expect(screen.queryByTestId("tool-result-images")).toBeNull();
-    expect(screen.queryByRole("img", { name: "Tool result image" })).toBeNull();
-  });
-
   it("adds and removes the preview as the setting changes", () => {
     renderCard(screenshotCall);
     expect(screen.queryByTestId("tool-result-images")).toBeNull();
+    expect(screen.queryByRole("img", { name: "Tool result image" })).toBeNull();
 
     act(() => writeShowToolResultImages(true));
     expect(screen.getByTestId("tool-result-images")).toBeInTheDocument();
