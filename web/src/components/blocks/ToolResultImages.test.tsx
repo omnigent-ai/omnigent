@@ -160,10 +160,29 @@ describe("ToolResultImages", () => {
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-1");
   });
 
+  it("keeps a shown image through a refresh that fails for another reason", async () => {
+    const { queryClient } = renderPreview("shots/home.png");
+    await screen.findByRole("img", { name: "home.png" });
+
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async () => new Response("bad gateway", { status: 502 }),
+    );
+    await act(() => queryClient.invalidateQueries());
+
+    await waitFor(() => expect(requestedUrls()).toHaveLength(2));
+    expect(screen.getByRole("img", { name: "home.png" })).toHaveAttribute("src", "blob:mock-1");
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+  });
+
   it.each<[string, () => void, string, Viewer?]>([
     [
       "the file is too large to return",
       () => respondWith({ ...PNG_RESPONSE, truncated: true }),
+      "a.png",
+    ],
+    [
+      "the file is served as an SVG",
+      () => respondWith({ ...PNG_RESPONSE, content_type: "image/svg+xml" }),
       "a.png",
     ],
     ["neither runner nor host can serve it", () => (serveable.value = false), "a.png"],

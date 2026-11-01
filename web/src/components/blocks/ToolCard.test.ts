@@ -1085,6 +1085,35 @@ describe("ToolGroupSummary", () => {
     expect(screen.getByText("Beta tool")).toBeInTheDocument();
   });
 
+  it("shows a grouped tool's image preview only while the group is open", () => {
+    writeShowToolResultImages(true);
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const screenshot = {
+      ...toolItem("t1", "mcp__browser__take_screenshot"),
+      output: JSON.stringify({ content: [{ type: "image", data: png, mimeType: "image/png" }] }),
+    } as RenderItem;
+    try {
+      const { container } = render(
+        createElement(
+          TooltipProvider,
+          null,
+          createElement(ToolGroupSummary, { tools: [screenshot, toolItem("t2", "beta_tool")] }),
+        ),
+      );
+      const group = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+      expect(screen.queryByTestId("tool-result-images")).toBeNull();
+
+      fireEvent.click(group);
+      expect(screen.getByTestId("tool-result-images")).toBeInTheDocument();
+
+      fireEvent.click(group);
+      expect(screen.queryByTestId("tool-result-images")).toBeNull();
+    } finally {
+      writeShowToolResultImages(false);
+    }
+  });
+
   it("uses the singular 'tool' for one hidden unrecognized tool", () => {
     render(
       createElement(

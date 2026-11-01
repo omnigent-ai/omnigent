@@ -17,13 +17,14 @@ describe("imageReadPath", () => {
     ["mcp__omnigent__sys_os_read", { path: "a.webp" }, "a.webp"],
     ["read", { filePath: "/ws/a.gif" }, "/ws/a.gif"],
     ["read", { path: "a.jpeg" }, "a.jpeg"],
-    ["view_image", { path: "/tmp/x.svg" }, "/tmp/x.svg"],
+    ["view_image", { path: "/tmp/x.avif" }, "/tmp/x.avif"],
   ])("finds the image path %s reads", (name, args, expected) => {
     expect(imageReadPath(name, args)).toBe(expected);
   });
 
   it.each([
     ["a non-image file", "Read", { file_path: "/ws/notes.md" }],
+    ["an SVG, which could run scripts once opened", "Read", { file_path: "/ws/logo.svg" }],
     ["an extension only in the middle", "Read", { file_path: "/ws/a.png.txt" }],
     ["a missing path", "Read", {}],
     ["a non-string path", "sys_os_read", { path: 3 }],

@@ -6,7 +6,7 @@ import { InlineImage, LoadingImage, UnavailableImage } from "@/components/Sessio
 import { fileContentToBlob, useFileContent } from "@/hooks/useFileContent";
 import { useObjectUrl } from "@/hooks/useObjectUrl";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
-import type { ToolResultImage } from "@/lib/toolResultImages";
+import { isRasterImageType, type ToolResultImage } from "@/lib/toolResultImages";
 import { useFileViewerConversationId, useWorkspacePaths } from "@/shell/FileViewerContext";
 
 export function ToolResultImages({ images }: { images: ToolResultImage[] }) {
@@ -39,11 +39,15 @@ function WorkspaceFileImage({ path, alt }: { path: string; alt: string }) {
   const waitingForPaths = resolved === null && loading && /^(?:\/|~(?:\/|$))/.test(path);
   // A best-effort preview shows the chip at once rather than retrying a missing file.
   const query = useFileContent(conversationId, resolved, { retry: false });
-  // A failed refresh keeps the old bytes cached; drop them so a deleted file shows the chip.
-  const current = query.isError ? undefined : query.data;
+  // Keep the last bytes through a transient refresh failure; drop them once the file is gone.
+  const missing = query.isError && /^(?:404|410) /.test(query.error.message);
+  const current = missing ? undefined : query.data;
+  // Only raster bytes become a blob URL; other types (an SVG renamed .png) show the chip.
+  const previewable =
+    current !== undefined && !current.truncated && isRasterImageType(current.content_type);
   const blob = useMemo(
-    () => (current && !current.truncated ? fileContentToBlob(current) : null),
-    [current],
+    () => (previewable && current ? fileContentToBlob(current) : null),
+    [previewable, current],
   );
   const src = useObjectUrl(blob);
 
@@ -55,8 +59,8 @@ function WorkspaceFileImage({ path, alt }: { path: string; alt: string }) {
     (resolved === null && !waitingForPaths) ||
     conversationId === undefined ||
     (resolved !== null && unservable) ||
-    query.isError ||
-    query.data?.truncated === true;
+    (query.isError && current === undefined) ||
+    (current !== undefined && !previewable);
   if (unavailable) return <UnavailableImage alt={alt} />;
   return <LoadingImage />;
 }

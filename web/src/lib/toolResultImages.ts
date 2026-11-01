@@ -23,10 +23,23 @@ const IMAGE_READ_PATH_ARGS: Readonly<Record<string, readonly string[]>> = {
   view_image: ["path"],
 };
 
-const IMAGE_FILE_RE = /\.(?:png|jpe?g|gif|webp|svg|bmp|avif)$/i;
+// SVG is left out: its app-origin blob URL would run scripts if opened as a document.
+const IMAGE_FILE_RE = /\.(?:png|jpe?g|gif|webp|bmp|avif)$/i;
 
-/** Only raster types render from inline bytes, matching what tools return. */
-const INLINE_IMAGE_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const RASTER_IMAGE_MEDIA_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+  "image/avif",
+]);
+
+/** Whether `mediaType` (e.g. a served file's content type) is a raster image safe to preview. */
+export function isRasterImageType(mediaType: string | null | undefined): boolean {
+  const essence = mediaType?.split(";")[0]?.trim().toLowerCase();
+  return essence !== undefined && RASTER_IMAGE_MEDIA_TYPES.has(essence);
+}
 
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
@@ -119,7 +132,7 @@ function imageBlockDataUri(block: unknown): string | null {
   const mediaType = source === null ? block.mimeType : source.media_type;
   if (typeof data !== "string" || typeof mediaType !== "string") return null;
   const normalizedType = mediaType.toLowerCase();
-  if (!INLINE_IMAGE_MEDIA_TYPES.has(normalizedType)) return null;
+  if (!isRasterImageType(normalizedType)) return null;
   const compact = data.replace(/\s+/g, "");
   if (compact.length === 0 || !BASE64_RE.test(compact)) return null;
   return `data:${normalizedType};base64,${compact}`;

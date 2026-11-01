@@ -124,12 +124,14 @@ def image_session(
 
     :returns: A factory ``(tool_name, arguments, reply, with_mcp) -> (session_id, workspace)``.
     """
-    created: list[tuple[str, Path]] = []
+    sessions: list[str] = []
+    workspaces: list[Path] = []
 
     def create(
         tool_name: str, arguments: dict[str, object], reply: str, with_mcp: bool
     ) -> tuple[str, Path]:
         workspace = Path(tempfile.mkdtemp(prefix="omnigent-e2e-tool-images-"))
+        workspaces.append(workspace)
         image = workspace / "shots" / _SCREENSHOT
         _draw_dark_mode_screenshot(image)
         tools = ""
@@ -157,16 +159,17 @@ def image_session(
         session_id = _create_bundled_session(
             live_server, runner_id, yaml_text, operator_authored=True
         )
-        created.append((session_id, workspace))
+        sessions.append(session_id)
         return session_id, workspace
 
     try:
         yield create
     finally:
-        for session_id, workspace in created:
-            try:
+        try:
+            for session_id in sessions:
                 httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-            finally:
+        finally:
+            for workspace in workspaces:
                 shutil.rmtree(workspace, ignore_errors=True)
 
 
