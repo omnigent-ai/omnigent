@@ -2,6 +2,7 @@ import AntigravityColor from "@lobehub/icons/es/Antigravity/components/Color";
 import DevinColor from "@lobehub/icons/es/Devin/components/Color";
 import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
 import type { ComponentType } from "react";
+import { LaptopIcon, MonitorCloudIcon, type LucideIcon } from "lucide-react";
 
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import type { Conversation } from "@/hooks/useConversations";
@@ -37,6 +38,15 @@ export function sessionLocationLabel(
   return host?.sandbox_provider
     ? sandboxOptionLabel(host.sandbox_provider)
     : (host?.name ?? conversation.host_id);
+}
+
+/** The host picker's icon for where a session runs: a cloud monitor for a sandbox, else a laptop. */
+export function sessionLocationIcon(
+  conversation: Conversation,
+  hostsById: ReadonlyMap<string, Host>,
+): LucideIcon {
+  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
+  return host?.sandbox_provider ? MonitorCloudIcon : LaptopIcon;
 }
 
 /** A row's short environment: the sandbox type, this device, or "Remote"; the tooltip names the host. */
