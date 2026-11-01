@@ -1151,6 +1151,35 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("stops answering the queries the runner lists as answered by tmux", async () => {
+    // WHY: control mode forwards a pane's query after tmux has answered it, so
+    // a second reply from here would reach the program as typed input.
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    const replies = () =>
+      socket.sent.flatMap((frame) =>
+        typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+      );
+    const writePane = async (text: string) => {
+      const bytes = new TextEncoder().encode(text);
+      const data = new ArrayBuffer(bytes.length);
+      new Uint8Array(data).set(bytes);
+      socket.emit("message", { data });
+      await new Promise<void>((resolve) => {
+        term.write("", resolve);
+      });
+    };
+
+    await writePane("\x1b[6n");
+    expect(replies()).toEqual(["\x1b[1;1R"]);
+
+    socket.emit("message", { data: JSON.stringify({ type: "tmux-replies", queries: ["dsr:6"] }) });
+    await writePane("\x1b[6n\x1b[?6n");
+    expect(replies()).toEqual(["\x1b[1;1R", "\x1b[?1;1R"]);
+    session.dispose();
+  });
+
   it("setTheme swaps the terminal theme without reconnecting", () => {
     // WHY: theme changes must not tear down the live WebSocket; the socket
     // stays the same instance after setTheme(true).

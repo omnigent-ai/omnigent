@@ -55,6 +55,7 @@ from omnigent.harnesses.claude_native.bridge import (
     is_auth_slash_command,
     kill_session,
     pane_closed_by_omnigent,
+    pane_killed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
@@ -78,7 +79,7 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
 )
-from omnigent.native import native_cost_popup
+from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 
@@ -1589,7 +1590,12 @@ _TASK_COMPLETION = (
 
 
 def _read_native_user(
-    tmp_path: Path, content: Any, *, queued: str | None = None, **metadata: Any
+    tmp_path: Path,
+    content: Any,
+    *,
+    queued: str | None = None,
+    timestamp: str | None = None,
+    **metadata: Any,
 ) -> tuple[int, str | None, list[Any]]:
     entry = (
         {
@@ -1604,6 +1610,8 @@ def _read_native_user(
         if queued
         else {"type": "user", "message": {"role": "user", "content": content}, **metadata}
     )
+    if timestamp is not None:
+        entry["timestamp"] = timestamp
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(_transcript_line(entry), encoding="utf-8")
     return read_transcript_items_since(
@@ -2299,7 +2307,8 @@ def test_scheduled_wake_opens_marked_turn(tmp_path: Path) -> None:
     ]
 
 
-def test_scheduled_wake_requires_settled_turn(tmp_path: Path) -> None:
+@pytest.mark.parametrize("pending", [False, True])
+def test_scheduled_wake_requires_settled_turn(tmp_path: Path, pending: bool) -> None:
     """
     Without a settle, post-turn assistant output inherits the active id.
 
@@ -2318,6 +2327,7 @@ def test_scheduled_wake_requires_settled_turn(tmp_path: Path) -> None:
         start_line=0,
         agent_name="claude-native-ui",
         current_response_id="resp_live_turn",
+        pending_settled_response_id="resp_live_turn" if pending else None,
     )
 
     assert [item.item_type for item in result.items] == ["message"]
@@ -2326,7 +2336,12 @@ def test_scheduled_wake_requires_settled_turn(tmp_path: Path) -> None:
     assert result.current_response_id == "resp_live_turn"
 
 
-def test_scheduled_wake_not_marked_for_post_compaction_output(tmp_path: Path) -> None:
+@pytest.mark.parametrize("peer", [False, True])
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("legacy_cursor", [False, True])
+def test_scheduled_wake_not_marked_for_post_compaction_output(
+    tmp_path: Path, peer: bool, pending: bool, legacy_cursor: bool
+) -> None:
     """
     Post-compaction output in the SAME batch as the summary is no wake.
 
@@ -2342,20 +2357,41 @@ def test_scheduled_wake_not_marked_for_post_compaction_output(tmp_path: Path) ->
                 "type": "user",
                 "uuid": "compact-1",
                 "isCompactSummary": True,
+                "timestamp": "1970-01-01T00:00:02Z",
+                **({"origin": {"kind": "peer"}} if peer else {}),
                 "message": {"role": "user", "content": "Summary of the prior context."},
             }
+        )
+        + (
+            _transcript_line(
+                {
+                    "type": "user",
+                    "origin": {"kind": "peer"},
+                    "timestamp": "1970-01-01T00:00:02Z",
+                    "message": {"role": "user", "content": _TEAMMATE_MESSAGE},
+                }
+            )
+            if peer
+            else ""
         )
         + _transcript_line(_assistant_text_entry("post-compact", "continuing the task")),
         encoding="utf-8",
     )
 
-    result = read_transcript_items_from_offset(
+    reader = (
+        claude_native_bridge.read_transcript_items_since_with_position
+        if legacy_cursor
+        else read_transcript_items_from_offset
+    )
+    result = reader(
         transcript_path,
         0,
-        start_line=0,
+        **({} if legacy_cursor else {"start_line": 0}),
         agent_name="claude-native-ui",
         current_response_id="resp_prev_turn",
-        settled_response_id="resp_prev_turn",
+        settled_response_id=None if pending else "resp_prev_turn",
+        pending_settled_response_id="resp_prev_turn" if pending else None,
+        pending_settled_at=1.0 if pending else None,
     )
 
     texts = [
@@ -2366,10 +2402,131 @@ def test_scheduled_wake_not_marked_for_post_compaction_output(tmp_path: Path) ->
         if isinstance(block, dict)
     ]
     assert claude_native_bridge._SCHEDULED_WAKE_MARKER_TEXT not in texts
+    assert "[System: Message from another session]" not in texts
+    if peer:
+        assert result.items[-2].data["is_meta"] is True
     resumed = result.items[-1]
     assert resumed.data["role"] == "assistant"
     assert resumed.response_id == "resp_prev_turn"
     assert result.current_response_id == "resp_prev_turn"
+
+
+def _read_peer_turn(
+    transcript: Path,
+    turn: str,
+    prior: claude_native_bridge.TranscriptReadResult | None = None,
+    *,
+    stopped_at: float | None = 1.0,
+) -> claude_native_bridge.TranscriptReadResult:
+    """Read a peer turn from the start or the previous poll's cursor."""
+    return read_transcript_items_from_offset(
+        transcript,
+        prior.byte_offset if prior else 0,
+        start_line=prior.line_cursor if prior else 0,
+        agent_name="Claude",
+        current_response_id=prior.current_response_id if prior else "active",
+        settled_response_id="active" if turn == "settled" else None,
+        pending_settled_response_id="active" if turn == "pending" else None,
+        pending_settled_at=stopped_at if turn == "pending" else None,
+    )
+
+
+@pytest.mark.parametrize("shape", ["string", "blocks", "queued"])
+@pytest.mark.parametrize("provenance", ["peer", "handback", "meta-envelope"])
+@pytest.mark.parametrize("turn", ["settled", "pending"])
+def test_peer_message_wake_label_across_batches(
+    tmp_path: Path, shape: str, provenance: str, turn: str
+) -> None:
+    """Peer labels preserve provenance and response identity across split polls and replay."""
+    metadata: dict[str, Any] = {"origin": {"kind": "peer"}}
+    if provenance == "meta-envelope":
+        metadata = {"isMeta": True}
+    elif provenance == "handback":
+        metadata.update(
+            isMeta=True, origin={"kind": "peer", "handback": True, "senderTaskId": "agent-1"}
+        )
+    text = _TEAMMATE_MESSAGE if provenance == "meta-envelope" else "The other session finished."
+    content = [{"type": "text", "text": text}] if shape == "blocks" else text
+    _read_native_user(
+        tmp_path,
+        content,
+        queued="prompt" if shape == "queued" else None,
+        timestamp="1970-01-01T00:00:02Z",
+        **metadata,
+    )
+    transcript = tmp_path / "session.jsonl"
+    original = _read_peer_turn(transcript, "active")
+    assert original.current_response_id == "active"
+    first = _read_peer_turn(transcript, turn)
+    marker, *hidden = first.items
+    assert marker.data["content"][0]["text"] == "[System: Message from another session]"
+    assert marker.data["is_meta"] is True
+    assert marker.response_id == first.current_response_id != "active"
+    assert hidden == original.items
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(_transcript_line(_assistant_text_entry("peer-reply", "Continuing.")))
+    tail = _read_peer_turn(transcript, turn, first)
+    whole = _read_peer_turn(transcript, turn)
+    assert [*first.items, *tail.items] == whole.items == _read_peer_turn(transcript, turn).items
+    assert len(tail.items) == 1
+    assert tail.items[0].data["content"] == [{"type": "output_text", "text": "Continuing."}]
+    assert tail.items[0].response_id == tail.current_response_id
+    assert tail.current_response_id == first.current_response_id == whole.current_response_id
+
+
+@pytest.mark.parametrize(
+    "timestamp,stopped_at",
+    [
+        ("1970-01-01T00:00:00Z", 1.0),
+        ("1970-01-01T00:00:01Z", 1.0),
+        (None, 1.0),
+        ("invalid", 1.0),
+        ("1970-01-01T00:00:02Z", None),
+    ],
+)
+def test_pending_peer_label_requires_input_after_stop(
+    tmp_path: Path, timestamp: str | None, stopped_at: float | None
+) -> None:
+    _read_native_user(tmp_path, _TEAMMATE_MESSAGE, timestamp=timestamp, origin={"kind": "peer"})
+    transcript = tmp_path / "session.jsonl"
+    assert _read_peer_turn(transcript, "pending", stopped_at=stopped_at) == _read_peer_turn(
+        transcript, "active"
+    )
+
+
+@pytest.mark.parametrize("shape", ["string", "blocks", "queued"])
+@pytest.mark.parametrize("text", ["Internal guidance", _TASK_COMPLETION])
+def test_other_hidden_context_is_not_labelled_as_a_peer_message(
+    tmp_path: Path, shape: str, text: str
+) -> None:
+    """Generic meta input and task notifications do not establish a peer-message wake."""
+    content = [{"type": "text", "text": text}] if shape == "blocks" else text
+    _read_native_user(
+        tmp_path, content, queued="prompt" if shape == "queued" else None, isMeta=True
+    )
+    transcript = tmp_path / "session.jsonl"
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(_transcript_line(_assistant_text_entry("automatic-reply", "Resumed.")))
+    result = _read_peer_turn(transcript, "settled")
+    texts = [block["text"] for item in result.items for block in item.data.get("content", [])]
+    assert "[System: Message from another session]" not in texts
+    if text == "Internal guidance":
+        assert "[System: scheduled prompt fired]" in texts
+
+
+@pytest.mark.parametrize("field, value", [("type", "other"), ("commandMode", "bash")])
+def test_ignored_attachment_does_not_label_a_peer_wake(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    """Peer provenance does not make an ignored attachment a prompt."""
+    _read_native_user(tmp_path, _TEAMMATE_MESSAGE, queued="prompt", origin={"kind": "peer"})
+    transcript = tmp_path / "session.jsonl"
+    entry = json.loads(transcript.read_text())
+    entry["attachment"][field] = value
+    transcript.write_text(_transcript_line(entry))
+    result = _read_peer_turn(transcript, "settled")
+    assert result.items == []
+    assert result.current_response_id == "active"
 
 
 def test_scheduled_wake_skips_tool_results_and_real_prompts(tmp_path: Path) -> None:
@@ -6244,13 +6401,14 @@ def test_failed_expected_close_kill_leaves_no_marker(
         kill_session(bridge_dir, expected_close=True)
 
     assert not pane_closed_by_omnigent(private_dir)
+    assert not pane_killed_by_omnigent(private_dir)
 
 
 def test_kill_session_without_expected_close_leaves_no_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The stop affordance keeps its existing exit handling; it marks nothing."""
+    """The stop affordance marks Omnigent's kill but not an expected close."""
     private_dir = tmp_path / "omnigent-terminal-pane"
     private_dir.mkdir()
     bridge_dir = tmp_path / "bridge"
@@ -6267,6 +6425,7 @@ def test_kill_session_without_expected_close_leaves_no_marker(
     kill_session(bridge_dir)
 
     assert not pane_closed_by_omnigent(private_dir)
+    assert pane_killed_by_omnigent(private_dir)
 
 
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
@@ -7787,6 +7946,50 @@ async def test_start_tool_relay_accepts_codex_native_bridge_root(
     finally:
         if relay is not None:
             relay.close()
+
+
+@pytest.mark.asyncio
+async def test_observe_tool_relay_refuses_bodies_over_one_mib(tmp_path: Path) -> None:
+    """The relay is the only size limit on the curl observer hook."""
+    observed: list[object] = []
+
+    async def _observer(payload: dict[str, object]) -> None:
+        observed.append(payload)
+
+    bridge_dir = claude_native_bridge.prepare_bridge_dir("conv_limit", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=None,
+        loop=asyncio.get_running_loop(),
+        session_id="conv_limit",
+        file_change_observer=_observer,
+    )
+    try:
+        info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+        url = httpx.URL(info["url"])
+        payload = {"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_input": {}}
+        async with httpx.AsyncClient(timeout=10) as client:
+            accepted = await client.post(
+                f"{info['url']}/hook/observe-tool",
+                json=payload,
+                headers={"Authorization": f"Bearer {info['token']}"},
+            )
+        # Announce one byte over the limit; the relay must refuse without reading a body.
+        reader, writer = await asyncio.open_connection(url.host, url.port)
+        writer.write(
+            f"POST /hook/observe-tool HTTP/1.1\r\nHost: {url.host}\r\n"
+            f"Authorization: Bearer {info['token']}\r\n"
+            "Content-Type: application/json\r\nContent-Length: 1048577\r\n\r\n".encode()
+        )
+        status_line = await asyncio.wait_for(reader.readline(), timeout=10)
+        writer.close()
+    finally:
+        relay.close()
+
+    assert accepted.status_code == 200
+    assert status_line.split()[1] == b"400"
+    assert observed == [payload]
 
 
 @pytest.mark.asyncio
@@ -9989,6 +10192,33 @@ def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+@pytest.mark.parametrize("needle", ["to", "a", "edit queued"])
+def test_queued_message_hint_is_not_a_draft_for_submit_verification(needle: str) -> None:
+    """
+    A queued message leaves Claude's empty input box showing its hint, not a draft.
+
+    The hint's words are substrings of short messages, so a one-word
+    message matched the hint and its submit was reported as rejected.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            rule,
+            "❯ Press up to edit queued messages",
+            rule,
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert claude_native_bridge._draft_in_input_box(pane, needle) is False
+
+
+def test_typed_draft_is_still_seen_beside_the_queued_message_hint() -> None:
+    """A real draft in the box is still detected when the same words appear in it."""
+    rule = "─" * 40
+    pane = "\n".join([rule, "❯ to fix the bug", rule, "  Opus 4.8 (1M context) | effort:high"])
+    assert claude_native_bridge._draft_in_input_box(pane, "to") is True
+
+
 def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
     """A numbered composer draft is distinguished from an unframed menu row."""
     pane = "\n".join(
@@ -10072,6 +10302,11 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
         # 46-char title on a browser terminal only 50 columns wide.
         "── " + "t" * 75 + " ─",
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+        # A title too long for the row leaves no leading run: Claude Code
+        # truncates it and draws the padded label from the first column, then
+        # one or two glyphs. The first comes off a 42-column pane after /rename.
+        " Investigate the flaky billing webhook … ─",
+        " " + "t" * 38 + " ──",
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -10096,11 +10331,72 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "│   │   │",  # deeper nesting, same shape
         "│   ├── src",  # a ``tree`` row
         "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+        # Only a label padded from the first column may stand in for the run.
+        "  " + "t" * 38 + "… ─",  # indented like a transcript or draft row
+        "t" * 39 + "… ─",  # no padding space before the text
+        " " + "t" * 37 + " ───",  # more glyphs than Claude Code pads a label with
+        " a │ b row filling label … ─",  # a vertical glyph inside the label
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
     """Ordinary rows must not pass as a rule now that labels are allowed."""
     assert _is_box_rule(line) is False
+
+
+@pytest.mark.parametrize(
+    ("line", "start"),
+    [
+        ("─" * 40, 0),
+        ("  " + "─" * 40, 2),  # a rule typed into a draft, under the glyph
+        ("─" * 30 + " my session ─", 0),
+        (" Investigate the flaky billing webhook … ─", 0),  # padding, not indent
+    ],
+)
+def test_box_rule_start_reports_the_rule_column(line: str, start: int) -> None:
+    """A row-filling label's padding space belongs to the rule, so it starts at column 0."""
+    assert claude_native_bridge._box_rule_start(line) == start
+
+
+def test_claude_prompt_rendered_sees_prompt_under_row_filling_title() -> None:
+    """
+    A title too long for the row does not hide the input box.
+
+    Claude Code then drops the glyph run left of the title, truncates the
+    title with ``…`` and starts the rule with the label's padding space.
+    Reading that row as text left no opening rule, so every message waited
+    out the readiness budget and the timeout reaped the live pane. Pane
+    shape is taken from Claude Code 2.1.312 at 42 columns after ``/rename``.
+    """
+    pane = "\n".join(
+        [
+            "  ⎿ Session renamed to: Investigate the",
+            "    flaky billing webhook retry backoff in",
+            "    the staging cluster",
+            "                      ◐ medium · /effort",
+            " Investigate the flaky billing webhook … ─",  # opening rule
+            "❯ ",
+            "─" * 42,  # closing rule
+            "  Opus 5.5 │ medium │ 0/1M $0.00",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_composer_box_reads_draft_under_row_filling_title() -> None:
+    """The rows between a row-filling title and the closing rule are the whole box."""
+    pane = "\n".join(
+        [
+            " Investigate the flaky billing webhook … ─",
+            "❯ fix the bug",
+            "  in foo.py",
+            "─" * 42,
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert claude_native_bridge._composer_box(pane) == claude_native_bridge._ComposerBox(
+        ["❯ fix the bug", "  in foo.py"], framed=True
+    )
 
 
 def test_claude_prompt_rendered_sees_prompt_over_pasted_tree_output() -> None:
@@ -10820,19 +11116,31 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
 
 
-def test_wait_for_claude_prompt_ready_reports_a_launcher_password_prompt(
+@pytest.mark.parametrize(
+    ("prompt", "description"),
+    [
+        ("Enter password to configure settings.\nPassword:", "a password"),
+        (
+            "No Claude Code installation found. Would you like to install it? [Y/n]:",
+            "installation confirmation",
+        ),
+    ],
+    ids=["password", "install-confirmation"],
+)
+def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+    description: str,
 ) -> None:
     """
-    A launcher waiting for a password fails delivery as a terminal dialog within
-    two polls, instead of waiting out the budget and reaping the pane that holds
-    the prompt the person must answer.
+    A launcher waiting for an answer reports its prompt without reaping the pane.
     """
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captures: list[int] = []
 
     def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
         captures.append(1)
-        return "Installing launcher...\nEnter password to configure settings.\nPassword:\n"
+        return f"Installing launcher...\n{prompt}\n"
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
     monkeypatch.setattr(
@@ -10846,9 +11154,9 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_password_prompt(
             timeout_s=30.0,
         )
     assert str(raised.value).startswith(
-        "Claude Code's launch command is waiting for a password in its terminal"
+        f"Claude Code's launch command is waiting for {description} in its terminal"
     )
-    assert "Password:" in str(raised.value)
+    assert prompt in str(raised.value)
     assert len(captures) == 2
 
 
@@ -11684,6 +11992,8 @@ class _EditableComposer:
         monkeypatch.setattr(claude_native_bridge, "_run_tmux", self._run_tmux)
         monkeypatch.setattr(claude_native_bridge, "_capture_pane", self._capture_pane)
         monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+        # No Claude Code process runs behind this box for a repaint signal to reach.
+        monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 0)
 
     def _run_tmux(self, socket_path: str, *args: str) -> None:
         del socket_path
@@ -12089,6 +12399,80 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
     assert sum(args[-1] == "C-l" for args in operations) == (scenario != "scrollback")
 
 
+# Another process's output printed from the input row's cursor onward: it
+# wrapped across the closing rule, so no key can delete it. In the second, a
+# redraw of the input row already erased an idle-compaction notice's marker.
+_PRINTED_OVER_BOX_PANES = {
+    "launcher-warning": """\
+──────────────────────────────
+❯ Background token refresh failed: certificate expired. Troubleshooting step
+s: 1. Renew the certificate, then send your message again.
+  ? for shortcuts
+""",
+    "idle-compact-tail": """\
+──────────────────────────────
+❯
+ens (example-model) -> sent /compact. Use /rewind if you need to return to a spec
+ific earlier point.
+  ? for shortcuts
+""",
+}
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("draft", ["", _STALE_MULTILINE_DRAFT], ids=["empty", "hidden-draft"])
+@pytest.mark.parametrize("printed", list(_PRINTED_OVER_BOX_PANES))
+@pytest.mark.parametrize("repaint_shows_box", [True, False], ids=["repainted", "still-covered"])
+def test_output_printed_over_the_input_box_is_repainted_before_refusing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    draft: str,
+    printed: str,
+    repaint_shows_box: bool,
+) -> None:
+    """Output another process printed over the box is repainted, not refused as a draft."""
+    composer = _EditableComposer(draft, cursor=len(draft))
+    composer.install(monkeypatch)
+    covered = True
+    repaints: list[str] = []
+
+    def repaint(socket_path: str, tmux_target: str) -> int:
+        nonlocal covered
+        repaints.append(tmux_target)
+        covered = not repaint_shows_box
+        return 1
+
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", repaint)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *args: (
+            _PRINTED_OVER_BOX_PANES[printed] if covered else composer._capture_pane(*args)
+        ),
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    def inject() -> None:
+        if slash:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+        else:
+            inject_user_message(bridge_dir, content="hello from the web")
+
+    if repaint_shows_box:
+        inject()
+        assert [text.strip() for text in composer.submitted] == [
+            "/effort high" if slash else "hello from the web"
+        ]
+    else:
+        with pytest.raises(
+            claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
+        ):
+            inject()
+        assert composer.submitted == []
+    assert len(repaints) == 1
+
+
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
 @pytest.mark.parametrize("recovery", ["resize", "notice-redraw"])
 @pytest.mark.parametrize(
@@ -12154,6 +12538,8 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
         lambda *_args: claude_native_bridge._ClaudePaneState(alive=None),
     )
     bridge_dir = _picker_bridge_dir(tmp_path)
+    if pane == _REVERSE_SEARCH_PANE and not slash:
+        error = claude_native_bridge.ClaudeTerminalDialog
     with pytest.raises(error):
         if slash:
             claude_native_bridge.inject_slash_command(
@@ -12787,15 +13173,17 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
 
 
 @pytest.mark.parametrize(
-    "occupied_pane",
+    ("occupied_pane", "after_preflight"),
     [
-        _REVERSE_SEARCH_PANE,
-        _INLINE_REVERSE_SEARCH_PANE,
-        _MODEL_PICKER_PANE,
-        _SHELL_MODE_PANE,
-        _REWIND_PANE,
-        _SETTINGS_PANEL_PANE,
-        _TASK_DETAILS_PANE,
+        (_REVERSE_SEARCH_PANE, False),
+        (_INLINE_REVERSE_SEARCH_PANE, False),
+        (_MODEL_PICKER_PANE, False),
+        (_SHELL_MODE_PANE, False),
+        (_REWIND_PANE, False),
+        (_SETTINGS_PANEL_PANE, False),
+        (_TASK_DETAILS_PANE, False),
+        (_SETTINGS_PANEL_PANE, True),
+        (_TASK_DETAILS_PANE, True),
     ],
     ids=[
         "reverse-search",
@@ -12805,10 +13193,13 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "rewind",
         "settings-panel",
         "task-details-panel",
+        "settings-after-preflight",
+        "task-details-after-preflight",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
     occupied_pane: str,
+    after_preflight: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12834,7 +13225,9 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
         tmux_target="claude:0.0",
     )
 
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captured: list[list[str]] = []
+    first_capture = True
     # The surface covers the pane until Escape dismisses it; afterwards
     # the fake behaves like the live input box (paste deposits the
     # draft, Enter clears it).
@@ -12849,8 +13242,13 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
         :returns: Fake CompletedProcess; capture-pane returns the
             simulated pane, other calls return rc=0.
         """
+        nonlocal first_capture
         del kwargs
         if "capture-pane" in cmd:
+            if first_capture:
+                first_capture = False
+                if after_preflight:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if cmd[-1] == "Escape":
             tui["pane"] = _composer_pane()
@@ -13019,6 +13417,7 @@ def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
 
 
 def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -13033,12 +13432,15 @@ def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: _MCP_APPROVAL_DIALOG_PANE,
     )
+    sends = []
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: sends.append(args))
     started = time.monotonic()
     with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=30.0,
+            bridge_dir=tmp_path,
         )
     assert time.monotonic() - started < 5.0
     assert not isinstance(excinfo.value, claude_native_bridge.ClaudePromptTimeout)
@@ -13048,6 +13450,37 @@ def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
     assert "answer the prompt" in message
     assert "resend your message" in message
     assert "Esc to cancel" in message
+    assert sends == []
+
+
+@pytest.mark.parametrize("timeout_s", [0.0, 0.2, 5.0])
+def test_wait_for_claude_prompt_ready_preserves_a_panel_that_will_not_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout_s: float
+) -> None:
+    """An ignored Escape preserves the terminal and cannot renew readiness's budget."""
+    sends = _fake_tmux(monkeypatch, [_TASK_DETAILS_PANE])
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    expected_error = (
+        claude_native_bridge.ClaudeTerminalDialog
+        if timeout_s
+        else claude_native_bridge.ClaudePromptTimeout
+    )
+    with pytest.raises(expected_error):
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=timeout_s,
+            bridge_dir=tmp_path,
+            extend_for_slow_boot=False,
+        )
+    assert (
+        clock.monotonic()
+        <= min(timeout_s, claude_native_bridge._OCCUPIED_INPUT_DISMISS_TIMEOUT_S)
+        + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    )
+    assert all(args[-1] == "Escape" for args in sends)
+    assert bool(sends) == bool(timeout_s)
 
 
 def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(
@@ -14275,6 +14708,164 @@ async def test_hook_evaluate_endpoint_allows(
         assert "OMNIGENT_RELAY_URL=" in env_text and "OMNIGENT_RELAY_TOKEN=" in env_text
     finally:
         relay.close()
+
+
+_NO_POLICY_ALLOW: dict[str, object] = {
+    "result": "POLICY_ACTION_ALLOW",
+    "allow_cache_seconds": 60.0,
+}
+
+
+async def _run_shell_hook(command: str, payload: dict[str, object]) -> str:
+    """Run a hook command through /bin/sh off-loop and return its stdout."""
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["/bin/sh", "-c", command],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+@pytest.mark.asyncio
+async def test_policy_hook_command_answers_inside_no_policy_allow_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The installed hook command skips the relay while the relay's window is open.
+
+    The relay records the window from its own upstream call, and the first
+    hook after the agent adds a policy reaches the relay again. Which events
+    the shell may answer is covered in ``tests/native/test_policy_allow_cache.py``.
+    """
+    client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        args = augment_claude_args((), bridge_dir=bridge_dir, ap_server_url="http://127.0.0.1:9")
+        settings = _load_invocation_settings(args)
+        pre_entries = [
+            entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry
+        ]
+        command = pre_entries[0]["hooks"][0]["command"]
+
+        assert await _run_shell_hook(command, _PRE_TOOL_USE_PAYLOAD) == ""
+        assert client.calls == 1
+        assert await _run_shell_hook(command, _PRE_TOOL_USE_PAYLOAD) == ""
+        assert client.calls == 1, "a hook inside the window must not reach the server"
+
+        await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/tool", {"name": "sys_add_policy", "arguments": {}}
+        )
+        await _run_shell_hook(command, _PRE_TOOL_USE_PAYLOAD)
+        assert client.calls == 2, "the first hook after sys_add_policy must ask the server"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_answer_for_a_switched_bridge_opens_no_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relay evaluates its own session, so a bridge that moved on gets no window."""
+    client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        config_path = bridge_dir / claude_native_bridge._CONFIG_FILE
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        config_path.write_text(json.dumps({**config, "active_session_id": "conv_switched"}))
+
+        body = await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", _PRE_TOOL_USE_PAYLOAD
+        )
+
+        assert body == ""
+        assert client.calls == 1
+        assert policy_allow_cache._read_state(bridge_dir)[0] == 0
+    finally:
+        relay.close()
+
+
+class _HeldPolicyClient(_ScriptedPolicyClient):
+    """Scripted policy client whose first answer waits for the test to release it."""
+
+    def __init__(self, verdict: dict[str, object]) -> None:
+        super().__init__(verdict)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
+        """Hold the first POST until :attr:`release` is set, then answer it."""
+        if self.calls == 0:
+            self.entered.set()
+            await asyncio.to_thread(self.release.wait, 30)
+        return await super().post(url, json=json)
+
+
+@pytest.mark.asyncio
+async def test_late_no_policy_allow_cannot_reopen_window_after_sys_add_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ALLOW the server sent before the agent added a policy is never reused.
+
+    The relay serves requests concurrently, so a hook evaluation can still be
+    waiting on the server when ``sys_add_policy`` finishes.
+    """
+    client = _HeldPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        pending = asyncio.ensure_future(
+            asyncio.to_thread(
+                _relay_request_raw,
+                bridge_dir,
+                "/hook/claude/evaluate-policy",
+                _PRE_TOOL_USE_PAYLOAD,
+            )
+        )
+        assert await asyncio.to_thread(client.entered.wait, 30)
+        await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/tool", {"name": "sys_add_policy", "arguments": {}}
+        )
+        client.release.set()
+        assert await pending == ""
+
+        probe = policy_allow_cache.guarded_hook_command(
+            bridge_dir, "cat > /dev/null; echo asked-server"
+        )
+        assert (await _run_shell_hook(probe, _PRE_TOOL_USE_PAYLOAD)).strip() == "asked-server"
+    finally:
+        client.release.set()
+        relay.close()
+
+
+@pytest.mark.parametrize(
+    "switch",
+    ["write_active_session_id", "prepare_bridge_dir"],
+    ids=["rotation", "re_preparation"],
+)
+def test_active_session_switch_closes_allow_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, switch: str
+) -> None:
+    """Every path that changes the bridge's session closes its window.
+
+    The new session's policies were never checked. Re-preparing the bridge for
+    the session it already serves keeps the window.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_rotation", workspace=tmp_path)
+    generation = policy_allow_cache.generation(bridge_dir)
+    policy_allow_cache.record(bridge_dir, generation, _NO_POLICY_ALLOW, requested_at=time.time())
+    prepare_bridge_dir("conv_old", bridge_id="bridge_rotation", workspace=tmp_path)
+    assert policy_allow_cache._read_state(bridge_dir)[0] > 0
+
+    if switch == "write_active_session_id":
+        claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+    else:
+        prepare_bridge_dir("conv_new", bridge_id="bridge_rotation", workspace=tmp_path)
+
+    assert policy_allow_cache._read_state(bridge_dir)[0] == 0
 
 
 @pytest.mark.asyncio
