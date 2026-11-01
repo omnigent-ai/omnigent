@@ -1357,6 +1357,59 @@ describe("CreateScheduledTaskDialog project", () => {
     expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
   });
 
+  it("starts a new automation in the initial project", async () => {
+    renderWithProjects(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialProject={{ id: "proj_1", name: "Triage" }}
+      />,
+    );
+    fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("reseeds the initial project on each fresh open and ignores it when editing", () => {
+    const seed = { id: "proj_1", name: "Triage" };
+    const ui = (
+      open: boolean,
+      editingTask: ScheduledTasksApiModule.ScheduledTask | null = null,
+    ) => (
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_projects: true }}
+      >
+        <CreateScheduledTaskDialog
+          open={open}
+          onOpenChange={vi.fn()}
+          initialProject={seed}
+          editingTask={editingTask}
+        />
+      </CapabilitiesProvider>
+    );
+    const view = render(ui(true));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    view.rerender(ui(false));
+    view.rerender(ui(true));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    view.rerender(ui(false));
+    view.rerender(ui(true, scheduledTask({ projectId: null })));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+  });
+
+  it("ignores the initial project when the server does not accept task projects", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialProject={{ id: "proj_1", name: "Triage" }}
+      />,
+    );
+    fillRequired();
+    expect(await submitCreate()).not.toHaveProperty("projectId");
+  });
+
   it("blocks a second save while a typed project is being created", async () => {
     renderWithProjects();
     fillRequired();
