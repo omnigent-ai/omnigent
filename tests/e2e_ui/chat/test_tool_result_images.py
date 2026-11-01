@@ -7,6 +7,7 @@ block shows those bytes. With the setting off neither preview renders.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -167,7 +168,8 @@ def image_session(
     finally:
         try:
             for session_id in sessions:
-                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+                with contextlib.suppress(httpx.HTTPError):
+                    httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         finally:
             for workspace in workspaces:
                 shutil.rmtree(workspace, ignore_errors=True)

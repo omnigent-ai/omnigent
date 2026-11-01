@@ -174,33 +174,50 @@ describe("ToolResultImages", () => {
     expect(revokeObjectURL).not.toHaveBeenCalled();
   });
 
-  it.each<[string, () => void, string, Viewer?]>([
+  // `fetches` is whether the preview may ask the filesystem API at all.
+  it.each<[string, () => void, string, boolean, Viewer?]>([
     [
       "the file is too large to return",
       () => respondWith({ ...PNG_RESPONSE, truncated: true }),
       "a.png",
+      true,
     ],
     [
       "the file is served as an SVG",
       () => respondWith({ ...PNG_RESPONSE, content_type: "image/svg+xml" }),
       "a.png",
+      true,
     ],
-    ["neither runner nor host can serve it", () => (serveable.value = false), "a.png"],
-    ["the path is unsafe", () => {}, "../outside.png"],
-    ["no session is focused", () => {}, "a.png", { conversationId: undefined }],
+    [
+      "the server reports no content type",
+      () => respondWith({ ...PNG_RESPONSE, content_type: null }),
+      "a.png",
+      true,
+    ],
+    [
+      "the server reports a non-image type",
+      () => respondWith({ ...PNG_RESPONSE, content_type: "application/octet-stream" }),
+      "a.png",
+      true,
+    ],
+    ["neither runner nor host can serve it", () => (serveable.value = false), "a.png", false],
+    ["the path is unsafe", () => {}, "../outside.png", false],
+    ["no session is focused", () => {}, "a.png", false, { conversationId: undefined }],
     [
       "the workspace root can't be discovered",
       () => {},
       "/ws/shots/home.png",
+      false,
       { workspaceRoot: null, workspacePathsLoading: false },
     ],
     [
       "the runner home can't be discovered",
       () => {},
       "~/shots/home.png",
+      false,
       { workspaceHome: null, workspacePathsLoading: false },
     ],
-  ])("shows the unavailable chip when %s", async (_label, arrange, path, viewer) => {
+  ])("shows the unavailable chip when %s", async (_label, arrange, path, fetches, viewer) => {
     arrange();
     renderPreview(path, viewer);
 
@@ -208,6 +225,8 @@ describe("ToolResultImages", () => {
       const chip = screen.getByRole("img", { name: "home.png" });
       expect(chip).not.toHaveAttribute("src");
       expect(chip).toHaveTextContent("home.png");
+      expect(requestedUrls()).toHaveLength(fetches ? 1 : 0);
     });
+    expect(createObjectURL).not.toHaveBeenCalled();
   });
 });

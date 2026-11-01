@@ -79,6 +79,8 @@ describe("inlineOutputImages", () => {
     ["invalid base64", JSON.stringify({ ...mcpBlock, data: "not base64!" })],
     ["empty data", JSON.stringify({ ...mcpBlock, data: "" })],
     ["an SVG block", JSON.stringify({ ...mcpBlock, mimeType: "image/svg+xml" })],
+    ["a block with no media type", JSON.stringify({ type: "image", data: PNG })],
+    ["a non-image media type", JSON.stringify({ ...mcpBlock, mimeType: "text/plain" })],
     ["a URL source", JSON.stringify({ type: "image", source: { type: "url", url: "https://x" } })],
     ["a text block", JSON.stringify({ type: "text", text: "hi" })],
   ])("finds nothing in %s", (_label, output) => {

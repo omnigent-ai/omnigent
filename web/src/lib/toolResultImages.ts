@@ -44,13 +44,8 @@ export function isRasterImageType(mediaType: string | null | undefined): boolean
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 /**
- * The images to preview for a tool call, or none while it runs or when it failed.
- *
- * Output-carried images win: a harness that keeps the bytes needs no fetch.
- * Otherwise a read tool whose path names an image file yields that file.
- *
- * :param call: The tool call, e.g. `{ name: "Read", args: { file_path: "/ws/shot.png" }, ... }`.
- * :returns: Previews in output order; empty when there is nothing to show.
+ * Previews in output order for a completed, successful call, preferring stored
+ * image bytes over a recognized raster-image read path.
  */
 export function toolResultImages(call: ToolCall): ToolResultImage[] {
   const { output, state } = call;
