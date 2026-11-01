@@ -841,10 +841,27 @@ class HostRegistry:
         :returns: ``False`` only for a connected host that did not advertise the
             codex side-chat capability.
         """
+        return self.host_may_support(host_id, CAP_CODEX_SIDE_CHAT, workspace_id)
+
+    def host_may_support(
+        self, host_id: str, capability: str, workspace_id: int | None = None
+    ) -> bool:
+        """Whether a host is not known to lack a capability token.
+
+        Fails OPEN (``True``) when the host is offline/unknown: we then can't
+        prove it's too old, and the launch surfaces any real failure itself.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param capability: Capability token, e.g. ``"codex_plan_at_launch"``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: ``False`` only for a connected host that did not advertise
+            ``capability``.
+        """
         conn = self.get(host_id, workspace_id)
         if conn is None:
             return True
-        return CAP_CODEX_SIDE_CHAT in conn.hello.capabilities
+        return capability in conn.hello.capabilities
 
     def record_gateway_inference(
         self,

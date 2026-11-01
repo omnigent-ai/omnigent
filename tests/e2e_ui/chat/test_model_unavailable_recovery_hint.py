@@ -25,6 +25,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+import click
 import httpx
 import pytest
 import yaml
@@ -257,6 +258,13 @@ def test_pi_native_model_unavailable_shows_guidance_live_and_after_reload(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     """A Pi session on an unavailable model surfaces a next step, not a bare failure."""
+    from omnigent.harnesses.pi_native.main import resolve_pi_executable
+
+    # The runner resolves Pi the same way; skip now instead of waiting out the launch.
+    try:
+        resolve_pi_executable()
+    except click.ClickException as exc:
+        pytest.skip(f"this host could not launch Pi: {exc.message}")
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     try:
         runner_id = str(_server_state["runner_id"])

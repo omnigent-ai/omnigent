@@ -20,8 +20,45 @@ def test_native_message_schema(spec):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("placement", ["child", "same_host", "managed"])
-async def test_create_placement(placement, monkeypatch):
+@pytest.mark.parametrize(
+    ("placement", "profile", "capability"),
+    [
+        *[
+            (placement, profile, "enabled")
+            for placement in ("child", "same_host", "managed")
+            for profile in (
+                None,
+                {
+                    "sandbox_provider": "company",
+                    "sandbox_profile_id": "build",
+                    "sandbox_profile_revision": "v1",
+                },
+                {"sandbox_profile_revision": "v1"},
+                {"sandbox_provider": ""},
+                {"sandbox_profile_id": " "},
+                {"sandbox_profile_revision": ""},
+            )
+        ],
+        *[
+            ("managed", {"sandbox_profile_id": "build"}, capability)
+            for capability in (
+                "enabled",
+                "missing",
+                "disabled",
+                "malformed",
+                "non_bool",
+                "timeout",
+                "unavailable",
+                "invalid_json",
+            )
+        ],
+        *[
+            ("managed", {"sandbox_provider": "company"}, capability)
+            for capability in ("missing", "disabled")
+        ],
+    ],
+)
+async def test_create_placement(placement, monkeypatch, profile, capability):
     from omnigent.runner import subagent_work
 
     register = Mock()
@@ -29,9 +66,23 @@ async def test_create_placement(placement, monkeypatch):
     requests = []
 
     def handler(request):
-        if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"request_managed_sandbox_host_id": True})
         requests.append(request)
+        if request.url.path == "/v1/info":
+            if capability == "timeout":
+                raise httpx.ReadTimeout("Capability lookup timed out")
+            if capability == "unavailable":
+                return httpx.Response(503)
+            if capability == "invalid_json":
+                return httpx.Response(200, text="Unavailable")
+            info = {"request_managed_sandbox_host_id": True}
+            if capability != "missing":
+                info["features"] = {
+                    "enabled": {"sandbox_profiles": True},
+                    "disabled": {"sandbox_profiles": False},
+                    "malformed": [],
+                    "non_bool": {"sandbox_profiles": "true"},
+                }[capability]
+            return httpx.Response(200, json=info)
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(201, json={"id": uuid4().hex, "agent_id": "worker"})
@@ -48,13 +99,34 @@ async def test_create_placement(placement, monkeypatch):
                         "placement": placement,
                         "message": "Start",
                         "title": "Worker task",
+                        **(profile or {}),
                     }
                 ),
                 server_client=client,
                 conversation_id="manager",
             )
         )
+    if profile and placement != "managed":
+        assert "requires placement='managed'" in result["error"]
+        assert requests == []
+        return
+    if profile and any(not value.strip() for value in profile.values()):
+        assert "nonempty strings" in result["error"]
+        assert requests == []
+        return
+    if profile and "sandbox_profile_revision" in profile and "sandbox_profile_id" not in profile:
+        assert "requires sandbox_profile_id" in result["error"]
+        assert requests == []
+        return
+    if profile and profile.get("sandbox_profile_id") and capability != "enabled":
+        assert "error" in result, result
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("GET", "/v1/info")
+        ]
+        register.assert_not_called()
+        return
     assert "error" not in result, result
+    requests = [request for request in requests if request.url.path != "/v1/info"]
     assert len(requests) == (2 if placement == "same_host" else 1)
     body = json.loads(requests[0].content)
     if placement == "child":
@@ -69,7 +141,10 @@ async def test_create_placement(placement, monkeypatch):
         assert result["title"] == "Worker task"
         register.assert_not_called()
     if placement == "managed":
-        assert "sandbox_provider" not in body
+        if profile:
+            assert all(body[key] == value for key, value in profile.items())
+        else:
+            assert "sandbox_provider" not in body
         assert body["host_type"] == "managed"
         assert len(body["host_id"]) == 32
         assert body["initial_input"]["data"]["content"][0]["text"] == "Start"
