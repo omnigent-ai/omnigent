@@ -1,6 +1,6 @@
-// Per-device opt-in to fold a settled turn's earlier assistant messages into
-// its "Worked" row. Off by default: the last message is only a heuristic for
-// the final answer.
+// Per-device opt-in to fold a settled turn's progress messages into its "Worked" row
+// for agents without an answer label. Codex labels its answer and folds regardless; for
+// other agents the last message is only a heuristic for the answer.
 
 import { useSyncExternalStore } from "react";
 

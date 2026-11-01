@@ -15,7 +15,8 @@
 // 2. Turn folding: once settled, each work run collapses behind a
 //    "Worked" row, sub-agent notices included. Pending elicitations,
 //    routing cards, the newest notices and assistant messages stay
-//    visible (all but the last message with opt-in `foldNarration`).
+//    visible; opt-in `foldNarration` folds narration too (Codex
+//    commentary, else all but the last message).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -108,7 +109,7 @@ interface BlockRendererProps {
   showsWorking?: boolean;
   /** Start a fold containing a mid-turn user interjection open. */
   defaultExpanded?: boolean;
-  /** Opt-in: fold all but the turn's last assistant message with the work. */
+  /** Opt-in: fold progress narration (see `narrationFolds`) with the work. */
   foldNarration?: boolean;
 }
 
@@ -157,14 +158,17 @@ function isFailureItem(item: RenderItem | undefined): boolean {
   return item?.kind === "error" || item?.kind === "retry" || item?.kind === "policy_denied";
 }
 
-/** Narration folds only in a turn that finished cleanly; otherwise it explains the outcome. */
+/**
+ * Narration folds only in a turn that finished cleanly; otherwise it explains the outcome.
+ * Codex labels its messages, so its commentary folds without the opt-in.
+ */
 function foldsNarration({
   items,
   turnLifecycle,
   foldNarration = false,
 }: Pick<FoldInputs, "items" | "turnLifecycle" | "foldNarration">): boolean {
   return (
-    foldNarration &&
+    (foldNarration || items.some(hasMessagePhase)) &&
     (turnLifecycle === undefined || turnLifecycle === "completed") &&
     // A retry that later succeeded stays in the transcript; a trailing one blocks any fold.
     !items.some((item) => item.kind === "error" || item.kind === "policy_denied")
@@ -237,9 +241,8 @@ export function BlockRenderer({
     showsWorking,
   });
 
-  // A native assistant message has no reliable final-answer marker.
   // Keep each message visible even when a later tool call follows it,
-  // unless the user opted into folding all but the last message.
+  // unless the user opted into folding narration.
   const partition = partitionTurn(
     items,
     foldsNarration({ items, turnLifecycle, foldNarration }),
@@ -474,9 +477,8 @@ function isTrailingWrapup(item: RenderItem): boolean {
 }
 
 /**
- * Split work from assistant text while preserving order. Text lacks a
- * reliable final-answer marker, so every completed message stays visible
- * unless `foldNarration` asks to keep only the last one.
+ * Split work from assistant text while preserving order. Every completed
+ * message stays visible unless `foldNarration` asks to fold narration.
  */
 function partitionTurn(
   items: RenderItem[],
@@ -491,10 +493,7 @@ function partitionTurn(
     wrapup.unshift(settled[end - 1]!);
     end -= 1;
   }
-  // Keep the last non-blank message visible, even in a continued bubble.
-  const answerIndex = foldNarration
-    ? settled.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
-    : -1;
+  const foldsText = foldNarration ? narrationFolds(settled) : () => false;
   const built: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
     const item = settled[i]!;
@@ -507,8 +506,7 @@ function partitionTurn(
       built.push({ kind: "exempt", item, index: i });
       continue;
     }
-    // Blank text after the answer stays with it rather than opening a second fold.
-    const kind = item.kind === "text" && (answerIndex < 0 || i >= answerIndex) ? "text" : "work";
+    const kind = item.kind === "text" && !foldsText(item, i) ? "text" : "work";
     const previous = built[built.length - 1];
     if (previous?.kind === kind) previous.items.push(item);
     else built.push({ kind, items: [item], startIndex: i });
@@ -565,6 +563,25 @@ function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
     else target.items.unshift(...segment.items);
     return [];
   });
+}
+
+/**
+ * Which messages `foldNarration` folds, decided per bubble. One with a harness
+ * answer phase (Codex) folds only commentary; otherwise all but its last message.
+ */
+function narrationFolds(items: RenderItem[]): (item: RenderItem, index: number) => boolean {
+  const hasAnswerPhase = items.some((item) => hasMessagePhase(item) && item.phase !== "commentary");
+  if (hasAnswerPhase) return (item) => item.kind === "text" && item.phase === "commentary";
+  // Keep the last non-blank message visible, even in a continued bubble; blank
+  // text after it stays with it rather than opening a second fold.
+  const answerIndex = items.findLastIndex(
+    (item) => item.kind === "text" && item.text.trim() !== "",
+  );
+  return (_item, index) => index < answerIndex;
+}
+
+function hasMessagePhase(item: RenderItem): item is Extract<RenderItem, { kind: "text" }> {
+  return item.kind === "text" && item.phase !== undefined;
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
@@ -626,17 +643,24 @@ function TurnWorkedFold({
 }) {
   const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
   const [open, setOpen] = useState(animateCollapse || defaultOpen);
+  // Closing over the trace it replaces, the fold keeps that trace laid out as it was on
+  // screen, so only its height changes; an opened fold indents it under the row.
+  const [inPlace, setInPlace] = useState(animateCollapse && !defaultOpen);
   const userChangedOpenRef = useRef(false);
   useLayoutEffect(() => {
     // History hydration can identify an interjection after this fold mounted.
     // Honor that late default unless the user has already made their own choice.
-    if (defaultOpen && !userChangedOpenRef.current) setOpen(true);
+    if (defaultOpen && !userChangedOpenRef.current) {
+      setInPlace(false);
+      setOpen(true);
+    }
   }, [defaultOpen]);
   useEffect(() => {
-    if (!animateCollapse || defaultOpen) return;
+    // Keyed to state, not the one-render prop: a re-render before the frame must not cancel it.
+    if (!inPlace || !open) return;
     const frame = requestAnimationFrame(() => setOpen(false));
     return () => cancelAnimationFrame(frame);
-  }, [animateCollapse, defaultOpen]);
+  }, [inPlace, open]);
 
   // A USER-initiated expand (never the animateCollapse mount-close)
   // opens INSTANTLY — no height animation — and snaps the fold row to
@@ -657,6 +681,7 @@ function TurnWorkedFold({
     userChangedOpenRef.current = true;
     scrollOnOpenRef.current = next;
     setUserOpened(next);
+    setInPlace(false);
     setOpen(next);
   };
   useLayoutEffect(() => {
@@ -698,11 +723,21 @@ function TurnWorkedFold({
       className="group/turn-fold not-prose w-full"
       data-testid="turn-worked-fold"
     >
-      <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-chat outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-          <span className="shrink-0">{label}</span>
-          <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
-        </CollapsibleTrigger>
+      <div
+        ref={rowRef}
+        className={cn("turn-fold-row", inPlace && "turn-fold-row-enter")}
+        // The grown row stops clipping, so the trigger's focus ring shows.
+        onAnimationEnd={(event) => {
+          if (event.animationName === "turn-fold-row-in") setInPlace(false);
+        }}
+      >
+        {/* The grow-in collapses this wrapper; the trigger's padding would floor it. */}
+        <div>
+          <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-ui outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+            <span className="shrink-0">{label}</span>
+            <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
+          </CollapsibleTrigger>
+        </div>
       </div>
       {/* Height animation lives in index.css (it needs Radix's measured
           --radix-collapsible-content-height) and is disabled under
@@ -713,12 +748,14 @@ function TurnWorkedFold({
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
-        <div className="relative flex flex-col gap-1 pt-2 pl-4">
-          <span
-            aria-hidden
-            className="absolute top-2 bottom-0 left-1 w-px bg-border"
-            data-testid="turn-worked-fold-pin-line"
-          />
+        <div className={cn("relative flex flex-col", inPlace ? "gap-1.5" : "gap-1 pt-2 pl-4")}>
+          {!inPlace && (
+            <span
+              aria-hidden
+              className="absolute top-2 bottom-0 left-1 w-px bg-border"
+              data-testid="turn-worked-fold-pin-line"
+            />
+          )}
           {children}
         </div>
       </CollapsibleContent>
@@ -882,7 +919,7 @@ function renderItem(
       );
     case "tool":
       // Intelligent routing's fan-out sizing gets a structured plan card
-      // instead of the generic name(json) row + raw-JSON expansion.
+      // instead of the generic tool row.
       if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
         return (
           <SmartRoutingCard
@@ -897,7 +934,6 @@ function renderItem(
         <ToolCard
           key={key}
           name={item.execution.name}
-          argsSummary={item.execution.argsSummary}
           arguments={item.execution.arguments}
           output={item.output}
           state={item.state}
