@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
-from contextlib import suppress
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
 
@@ -42,6 +42,7 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlHost,
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
@@ -108,9 +109,11 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
     pinned_label_key,
+    runner_seen_is_fresh,
 )
 from omnigent.stores.conversation_store.overrides import (
     decode_session_overrides as _decode_session_overrides,
@@ -118,10 +121,22 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
+from omnigent.stores.sandbox_profile_store import (
+    PROFILE_LABEL_KEYS,
+    PROFILE_LABEL_PREFIX,
+    encode_snapshot,
+    has_profile_reference,
+    profile_from_labels,
+    profile_labels,
+    reject_profile_labels,
+    same_profile_identity,
+)
 
 _logger = logging.getLogger(__name__)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
+_RUNNER_BINDING_LIMIT = 200
+_RUNNER_HOST_LOOKUP_LIMIT = 10_000
 
 
 def _decode_session_state(
@@ -468,6 +483,7 @@ def _created_session_from_rows(
 
 def _prepare_label_updates(updates: dict[str, str]) -> dict[str, str]:
     """Return the exact label values accepted by the persistence schema."""
+    reject_profile_labels(updates)
     # Clamp by characters, matching PostgreSQL ``VARCHAR(n)`` semantics.
     return {key: value[:LABEL_VALUE_MAX_LEN] for key, value in updates.items()}
 
@@ -594,9 +610,11 @@ def _dialect_upsert_labels(
 def _fetch_labels(
     session: Session,
     conversation_id: str,
+    *,
+    keys: tuple[str, ...] | None = None,
 ) -> dict[str, str]:
     """
-    Load all guardrails labels for a conversation.
+    Load guardrails labels for a conversation, optionally restricted to exact keys.
 
     Returns an empty dict when no labels have been written
     yet — a conversation that was created before its spec
@@ -609,16 +627,13 @@ def _fetch_labels(
         Empty dict when no rows match.
     """
     with query_name_scope("omnigent.conversation_store.select_conversation_labels"):
-        rows = (
-            session.execute(
-                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id == conversation_id,
-                )
-            )
-            .tuples()
-            .all()
+        statement = select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id == conversation_id,
         )
+        if keys is not None:
+            statement = statement.where(SqlConversationLabel.key.in_(keys))
+        rows = session.execute(statement).tuples().all()
     return dict(rows)
 
 
@@ -2212,8 +2227,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         after: str | None = None,
         limit: int = 32,
     ) -> list[str]:
-        if not 1 <= limit <= 100:
-            raise ValueError("limit must be between 1 and 100")
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
         query = select(SqlConversationMetadata.id).where(
             SqlConversationMetadata.workspace_id == current_workspace_id(),
             SqlConversationMetadata.host_id == host_id,
@@ -2960,6 +2975,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
 
+        reject_profile_labels({key: ""})
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
 
     def list_conversations(
@@ -4156,7 +4172,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
     def replace_runner_id(
-        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+        self,
+        conversation_id: str,
+        runner_id: str,
+        *,
+        expected_runner_id: str | None = None,
+        expected_binding: Conversation | None = None,
     ) -> Conversation:
         """
         Atomically overwrite ``conversations.runner_id``.
@@ -4175,11 +4196,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=expected_binding is not None,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if expected_binding is not None and (
+                meta.runner_id != expected_binding.runner_id
+                or meta.host_id != expected_binding.host_id
+            ):
+                raise ValueError("The session binding changed; retry the request")
             if expected_runner_id is None:
                 meta.runner_id = runner_id
             else:
@@ -4205,7 +4235,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
-    def clear_runner_id(self, conversation_id: str) -> Conversation:
+    def clear_runner_id(
+        self, conversation_id: str, *, expected_binding: Conversation | None = None
+    ) -> Conversation:
         """
         Null out ``conversations.runner_id``. Atomic last-write-wins.
 
@@ -4217,11 +4249,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=expected_binding is not None,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if expected_binding is not None and (
+                meta.runner_id != expected_binding.runner_id
+                or meta.host_id != expected_binding.host_id
+            ):
+                raise ValueError("The session binding changed; retry the request")
             meta.runner_id = None
             return meta
 
@@ -4235,7 +4276,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
-    def clear_host_binding(self, conversation_id: str) -> Conversation:
+    def clear_host_binding(
+        self,
+        conversation_id: str,
+        *,
+        expected_host_id: str | None = None,
+        clear_profile: bool = False,
+    ) -> Conversation:
         """
         NULL ``host_id``/``workspace``/``git_branch``/``runner_id`` together.
 
@@ -4246,17 +4293,36 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
-        :returns: The updated :class:`Conversation`.
+        :param expected_host_id: When supplied, clear only if the current host
+            still matches this identity; otherwise leave every binding field unchanged.
+        :returns: The current :class:`Conversation` after the conditional clear.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         """
 
+        if expected_host_id is not None:
+            expected_host_id = uuid_to_bytes(expected_host_id).hex()
+
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if expected_host_id is not None and meta.host_id != expected_host_id:
+                return meta
+            if not clear_profile and meta.host_id is not None:
+                with self._profile_label_session(session, read_only=True) as labels:
+                    profiled = has_profile_reference(
+                        _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
+                    )
+                host = session.get(SqlHost, (current_workspace_id(), meta.host_id))
+                if profiled and host is not None and host.deleted_at is None:
+                    return meta
             meta.host_id = None
             meta.workspace = None
             meta.git_branch = None
@@ -4302,6 +4368,340 @@ class SqlAlchemyConversationStore(ConversationStore):
                 decoded = None
             statuses.append((session_id, decoded))
         return statuses
+
+    def get_runner_host_ids(self, runner_id: str) -> list[str]:
+        """Resolve legacy runner-only clients through the existing runner index."""
+        # One statement keeps a consistent snapshot during concurrent runner rotation.
+        # Discovery has its own safety budget; mutation source lookups stay smaller.
+        with self._session("resolve_runner_host") as session:
+            rows = (
+                session.execute(
+                    select(SqlConversationMetadata.host_id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.runner_id == runner_id,
+                    )
+                    .order_by(SqlConversationMetadata.id)
+                    .limit(_RUNNER_HOST_LOOKUP_LIMIT + 1)
+                )
+                .scalars()
+                .all()
+            )
+        host_ids = sorted({host_id for host_id in rows if host_id is not None})
+        if len(host_ids) > 1:
+            return host_ids[:2]
+        if len(rows) > _RUNNER_HOST_LOOKUP_LIMIT:
+            raise ValueError("Runner host lookup exceeds the safety limit; launch a new runner")
+        return host_ids
+
+    def touch_profile_runner_liveness(self, runner_id: str, now: int) -> None:
+        def write(session: Session) -> None:
+            ids = list(
+                session.scalars(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.runner_id == runner_id,
+                    )
+                    .order_by(SqlConversationMetadata.id)
+                    .limit(_RUNNER_HOST_LOOKUP_LIMIT + 1)
+                    .with_for_update()
+                )
+            )
+            if len(ids) > _RUNNER_HOST_LOOKUP_LIMIT:
+                raise ValueError(
+                    "Runner host lookup exceeds the safety limit; launch a new runner"
+                )
+            if ids:
+                # Row locks retain each runner binding until its liveness stamp commits.
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(ids),
+                    )
+                    .values(runner_last_seen=now)
+                )
+
+        run_write_transaction(self._session_immediate, "admit_profile_runner", write)
+
+    @staticmethod
+    def _runner_binding_candidates(session: Session, runner_id: str | None) -> list[Any]:
+        # Apply residual host/source checks in Python after this indexed, bounded read.
+        statement = select(
+            SqlConversationMetadata.id,
+            SqlConversationMetadata.host_id,
+            SqlConversationMetadata.workspace,
+            SqlConversationMetadata.git_branch,
+        ).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.runner_id == runner_id,
+        )
+        return list(
+            session.execute(
+                statement.order_by(SqlConversationMetadata.id).limit(_RUNNER_BINDING_LIMIT + 1)
+            )
+        )
+
+    @contextmanager
+    def _profile_label_session(
+        self, metadata_session: Session, *, read_only: bool = False
+    ) -> Iterator[Session]:
+        if self._conv_engine is self._engine:
+            yield metadata_session
+        else:
+            session_maker = self._conv_session if read_only else self._conv_session_immediate
+            operation = "check_profile_host_affinity" if read_only else "accept_sandbox_profile"
+            with session_maker(operation) as session:
+                yield session
+
+    @staticmethod
+    def _accept_profile_labels(
+        session: Session, conversation_id: str, snapshot: dict[str, Any]
+    ) -> None:
+        row = session.get(
+            SqlConversation, (current_workspace_id(), conversation_id), with_for_update=True
+        )
+        if row is None:
+            raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+        saved = profile_from_labels(
+            _fetch_labels(session, conversation_id, keys=PROFILE_LABEL_KEYS)
+        )
+        if saved is not None:
+            if not same_profile_identity(saved, snapshot):
+                raise ValueError("A session's sandbox profile cannot be changed")
+            return
+        _upsert_prepared_labels(session, conversation_id, profile_labels(snapshot), now_epoch())
+
+    def accept_sandbox_profile(self, conversation_id: str, snapshot: dict[str, Any]) -> None:
+        run_write_transaction(
+            self._conv_session_immediate,
+            "accept_sandbox_profile",
+            lambda session: self._accept_profile_labels(session, conversation_id, snapshot),
+        )
+
+    @staticmethod
+    def _can_bind_profile_host(session: Session, previous_host: str | None, host_id: str) -> bool:
+        if previous_host in (None, host_id):
+            return True
+        previous = session.get(SqlHost, (current_workspace_id(), previous_host))
+        return previous is None or previous.deleted_at is not None
+
+    def can_bind_profile_host(self, conversation_id: str, host_id: str) -> bool:
+        host_id = uuid_to_bytes(host_id).hex()
+        with self._session("check_profile_host_affinity") as session:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            return meta is not None and self._can_bind_profile_host(session, meta.host_id, host_id)
+
+    def reassign_runner_with_host(
+        self,
+        conversation_id: str,
+        host_id: str,
+        runner_id: str | None,
+        *,
+        expected_runner_id: str | None,
+        keep_hostless: bool = False,
+        profile_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        """Validate the source before accepting labels and transferring its binding."""
+        host_id = uuid_to_bytes(host_id).hex()
+
+        def write(session: Session) -> None:
+            host = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            if host is None or host.deleted_at is not None:
+                raise ValueError("The runner's host is no longer available")
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if meta is None:
+                raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+            if meta.runner_id != expected_runner_id or meta.host_id not in (None, host_id):
+                raise ValueError("The session binding changed; retry the request")
+            candidates = self._runner_binding_candidates(session, runner_id or expected_runner_id)
+            source = next(
+                (
+                    row
+                    for row in candidates
+                    if row.host_id == host_id and row.id != conversation_id
+                ),
+                None,
+            )
+            if source is None:
+                raise ValueError(
+                    "Bind the replacement session before detaching the managed runner"
+                )
+            if profile_snapshot is not None:
+                with self._profile_label_session(session) as labels:
+                    self._accept_profile_labels(labels, conversation_id, profile_snapshot)
+            if runner_id is not None and not keep_hostless:
+                meta.host_id, meta.workspace, meta.git_branch = (
+                    source.host_id,
+                    source.workspace,
+                    source.git_branch,
+                )
+            meta.runner_id = runner_id
+
+        run_write_transaction(self._session_immediate, "rotate_profiled_runner", write)
+
+    @staticmethod
+    def _profile_host_binding(
+        meta: SqlConversationMetadata, snapshot: dict[str, Any] | None
+    ) -> ProfileHostBinding:
+        return ProfileHostBinding(
+            meta.id,
+            meta.host_id,
+            meta.workspace,
+            meta.git_branch,
+            meta.runner_id,
+            encode_snapshot(snapshot) if snapshot else None,
+            meta.host_id if snapshot else None,
+        )
+
+    def get_profile_host_binding(self, conversation_id: str) -> ProfileHostBinding:
+        with self._conv_session("read_session_profile") as labels:
+            snapshot = profile_from_labels(
+                _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
+            )
+        with self._session("read_profile_host_binding") as session:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is None:
+                raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+            return self._profile_host_binding(meta, snapshot)
+
+    def bind_profiled_host(
+        self,
+        conversation_id: str,
+        host_id: str,
+        workspace: str,
+        snapshot: dict[str, Any],
+        *,
+        runner_id: str | None = None,
+        git_branch: str | None = None,
+        expected_binding: ProfileHostBinding | None = None,
+        replace_stale_runner: bool = False,
+    ) -> ProfileHostBinding:
+        host_id = uuid_to_bytes(host_id).hex()
+
+        def write(session: Session) -> ProfileHostBinding:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if meta is None:
+                raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+            if not self._can_bind_profile_host(session, meta.host_id, host_id):
+                raise ValueError("The session binding changed; retry the request")
+            if runner_id is not None and meta.runner_id is not None:
+                if (
+                    not replace_stale_runner
+                    or expected_binding is None
+                    or meta.host_id != host_id
+                    or meta.runner_id != expected_binding.runner_id
+                ):
+                    raise ValueError("The session binding changed; retry the request")
+                if runner_seen_is_fresh(meta.runner_last_seen):
+                    raise ValueError(
+                        "The previous runner is still connected; retry after disconnect"
+                    )
+            with self._profile_label_session(session) as labels:
+                saved = profile_from_labels(
+                    _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
+                )
+                previous = self._profile_host_binding(meta, saved)
+                if expected_binding is not None and previous != expected_binding:
+                    raise ValueError("The session binding changed; retry the request")
+                self._accept_profile_labels(labels, conversation_id, snapshot)
+            if git_branch is not None or meta.host_id != host_id or meta.workspace != workspace:
+                meta.git_branch = git_branch
+            meta.host_id, meta.workspace = host_id, workspace
+            if runner_id is not None:
+                meta.runner_id = runner_id
+                meta.runner_last_seen = None
+            return previous
+
+        return run_write_transaction(self._session_immediate, "bind_profiled_host", write)
+
+    def rollback_profiled_host(
+        self, previous: ProfileHostBinding, *, expected_host_id: str, expected_runner_id: str
+    ) -> bool:
+        expected_host_id = uuid_to_bytes(expected_host_id).hex()
+
+        def write(session: Session) -> bool:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), previous.session_id),
+                with_for_update=True,
+            )
+            if meta is None:
+                return False
+            if meta.host_id != expected_host_id or meta.runner_id != expected_runner_id:
+                return (meta.host_id, meta.workspace, meta.git_branch, meta.runner_id) == (
+                    previous.host_id,
+                    previous.workspace,
+                    previous.git_branch,
+                    previous.runner_id,
+                )
+            meta.host_id, meta.workspace, meta.git_branch, meta.runner_id = (
+                previous.host_id,
+                previous.workspace,
+                previous.git_branch,
+                previous.runner_id,
+            )
+            # Split databases retain the accepted reference if metadata rolls back;
+            # deleting it first could leave a live binding without its profile.
+            if previous.profile_snapshot is None and self._conv_engine is self._engine:
+                with self._profile_label_session(session) as labels:
+                    labels.execute(
+                        delete(SqlConversationLabel).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id == previous.session_id,
+                            SqlConversationLabel.key.in_(PROFILE_LABEL_KEYS),
+                        )
+                    )
+            return True
+
+        return run_write_transaction(self._session_immediate, "rollback_profiled_host", write)
+
+    def rollback_runner_reassignment(
+        self,
+        previous: Conversation,
+        *,
+        expected_runner_id: str,
+        expected_host_id: str | None,
+    ) -> bool:
+        """Undo a failed rotation without erasing a newer binding or the last host link."""
+
+        def write(session: Session) -> bool:
+            if expected_host_id is not None:
+                session.get(
+                    SqlHost, (current_workspace_id(), expected_host_id), with_for_update=True
+                )
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), previous.id),
+                with_for_update=True,
+            )
+            if meta is None:
+                raise ConversationNotFoundError(f"conversation {previous.id!r} does not exist")
+            if meta.runner_id != expected_runner_id or meta.host_id != expected_host_id:
+                return False
+            if meta.host_id is not None:
+                candidates = self._runner_binding_candidates(session, expected_runner_id)
+                if not any(
+                    row.host_id == expected_host_id and row.id != previous.id for row in candidates
+                ):
+                    return False
+            if previous.runner_id is not None:
+                meta.host_id = previous.host_id
+                meta.workspace = previous.workspace
+                meta.git_branch = previous.git_branch
+            meta.runner_id = previous.runner_id
+            return True
+
+        return run_write_transaction(self._session_immediate, "rollback_profiled_runner", write)
 
     def list_conversations_by_runner_id(
         self,
@@ -4396,11 +4796,22 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if meta.host_id is not None and meta.host_id != host_id:
+                with self._profile_label_session(session, read_only=True) as labels:
+                    profiled = has_profile_reference(
+                        _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
+                    )
+                if profiled and not self._can_bind_profile_host(session, meta.host_id, host_id):
+                    raise ValueError("A profiled session cannot be moved to a different host")
             binding_changed = meta.host_id != host_id or (
                 workspace is not None and meta.workspace != workspace
             )
@@ -5239,6 +5650,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork_labels = {
                 key: value
                 for key, value in source_labels.items()
+                if not key.startswith(PROFILE_LABEL_PREFIX)
                 if key
                 not in (
                     _INSTANCE_SCOPED_LABEL_KEYS

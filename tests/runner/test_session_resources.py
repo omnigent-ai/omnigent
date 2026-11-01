@@ -348,6 +348,40 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "targets,status",
+    [
+        ([{"url": "https://github.com/org/repo", "path": ""}], 200),
+        ([{"url": "https://github.com/org/repo", "path": "../outside"}], 400),
+        ([{"url": "https://github.com/org/repo", "path": ""}] * 11, 400),
+        ([{"path": ""}], 400),
+    ],
+)
+async def test_repository_branches_runner_contract(
+    tmp_path: Path, targets: object, status: int
+) -> None:
+    app = create_runner_app(
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/repository-branches",
+            params={"repositories": json.dumps(targets)},
+        )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {
+            "repositories": [
+                {"url": "https://github.com/org/repo", "branch": None, "pushed": None}
+            ]
+        }
+
+
+@pytest.mark.asyncio
 async def test_session_resources_new_session_lists_default_only(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1698,18 +1732,14 @@ def _make_capturing_instance(
     return instance
 
 
-class _LaunchReturningRegistry:
-    """Terminal-registry stub whose ``launch`` returns a fixed instance.
-
-    The real terminal launch helpers only call
-    ``launch`` on its terminal registry; returning a prepared instance
-    lets the test exercise the real ``_start_terminal_activity_watcher``
-    wiring without spawning a terminal.
+class _LaunchReturningRegistry(TerminalRegistry):
+    """Register a prepared instance using the real registry's ownership lookups.
 
     :param instance: The instance every ``launch`` returns.
     """
 
     def __init__(self, instance: TerminalInstance) -> None:
+        super().__init__()
         self._instance = instance
 
     async def launch(
@@ -1726,7 +1756,7 @@ class _LaunchReturningRegistry:
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
-        :param conversation_id: Session/conversation id (unused).
+        :param conversation_id: Session/conversation id that owns the instance.
         :param terminal_name: Terminal name (unused).
         :param session_key: Per-launch key (unused).
         :param spec: Terminal env spec (unused).
@@ -1737,7 +1767,6 @@ class _LaunchReturningRegistry:
         :returns: The prepared terminal instance.
         """
         del (
-            conversation_id,
             terminal_name,
             session_key,
             spec,
@@ -1746,6 +1775,7 @@ class _LaunchReturningRegistry:
             sandbox_override,
         )
         self._instance.program_status_app = program_status_app
+        _seed_registry(self, conversation_id, [self._instance])
         return self._instance
 
 

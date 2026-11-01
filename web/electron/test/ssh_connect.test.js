@@ -17,6 +17,7 @@ const {
   isPortFree,
   loginScript,
   parseSignInLink,
+  signInLinkRefusal,
   remoteCommand,
   runSshConnect,
   safeServerUrl,
@@ -190,18 +191,75 @@ describe("parseSignInLink", () => {
     assert.deepEqual(parseSignInLink(`\x1b[2m${authorizeLink(8021)}\x1b[0m\r`), {
       url: authorizeLink(8021),
       port: 8021,
+      kind: "databricks",
     });
   });
   it("opens a server's own sign-in link without a forward", () => {
     assert.deepEqual(parseSignInLink(`Opening browser for login: ${SERVER}/auth/cli?t=1`), {
       url: `${SERVER}/auth/cli?t=1`,
       port: null,
+      kind: "server",
     });
   });
   it("ignores other lines", () => {
     assert.equal(parseSignInLink("Please complete authentication by opening this link"), null);
     assert.equal(parseSignInLink("https://example.com/login"), null);
   });
+});
+
+describe("signInLinkRefusal", () => {
+  // The remote machine prints these links, so a compromised one could print anything.
+  const databricksLink = (origin, port) =>
+    `${origin}/oidc/v1/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A${port}`;
+  const withRedirect = (query) =>
+    `https://example.cloud.databricks.com/oidc/v1/authorize?client_id=databricks-cli${query}`;
+  const cases = {
+    "the server's own page": [`Opening browser for login: ${SERVER}/auth/cli?t=1`, null],
+    "a Databricks workspace calling back on 8020 to 8040": [authorizeLink(8040), null],
+    "an Azure Databricks workspace": [
+      databricksLink("https://adb-1.azuredatabricks.net", 8020),
+      null,
+    ],
+    "a workspace on the server's own origin, as the E2E's stand-in workspace": [
+      databricksLink("https://127.0.0.1:8443", 8021),
+      null,
+      "https://127.0.0.1:8443/api/2.0/omnigent",
+    ],
+    "another site posing as the server's page": [
+      "Opening browser for login: https://evil.example/auth/cli",
+      /goes to https:\/\/evil\.example, not this server/,
+    ],
+    "another site posing as a Databricks workspace": [
+      databricksLink("https://evil.example", 8020),
+      /isn't this server or a Databricks workspace/,
+    ],
+    "a callback port below 8020": [authorizeLink(22), /port 22, outside 8020 to 8040/],
+    "a callback port above 8040": [authorizeLink(8041), /port 8041, outside 8020 to 8040/],
+    "a Databricks Apps host, which serves app content, even with a valid callback": [
+      databricksLink("https://attacker-1.aws.databricksapps.com", 8020),
+      /isn't this server or a Databricks workspace/,
+    ],
+    "a workspace link with no callback": [withRedirect(""), /doesn't call back to this computer/],
+    "a workspace link with a malformed callback": [
+      withRedirect("&redirect_uri=not%20a%20url"),
+      /doesn't call back to this computer/,
+    ],
+    "a workspace link calling back to another machine": [
+      withRedirect("&redirect_uri=https%3A%2F%2Fevil.example%3A8020%2Fcb"),
+      /doesn't call back to this computer/,
+    ],
+    "a workspace link calling back to loopback without a port": [
+      withRedirect("&redirect_uri=http%3A%2F%2Flocalhost%2F"),
+      /doesn't call back to this computer/,
+    ],
+  };
+  for (const [label, [line, refusal, serverUrl = SERVER]] of Object.entries(cases)) {
+    it(`${refusal ? "refuses" : "opens"} ${label}`, () => {
+      const result = signInLinkRefusal(parseSignInLink(line), serverUrl);
+      if (refusal) assert.match(result, refusal);
+      else assert.equal(result, null);
+    });
+  }
 });
 
 describe("classifyPrompt", () => {
@@ -290,10 +348,11 @@ function fakeSession({ logins, host = { code: 0, stdout: statusOutput(), stderr:
       } else {
         calls.push(`exec install stdin=${opts.stdin}`);
         finish({
-          code: install?.code ?? 0,
+          // `null` is a real result (killed on timeout), so only a missing code means 0.
+          code: install?.code === undefined ? 0 : install.code,
           stdout: "",
           stderr: install?.stderr ?? "",
-          timedOut: false,
+          timedOut: install?.timedOut ?? false,
         });
       }
       return { promise, cancel };
@@ -418,6 +477,78 @@ describe("runSshConnect", () => {
     assert.ok(!session.calls.some((call) => call.startsWith("exec install")));
     assert.equal(session.calls.at(-1), "close");
   });
+
+  // Each install outcome is reported plainly, and the connection still closes.
+  const installFailures = {
+    "this build has no bundled installer": [
+      { logins: [{ lines: [], code: 127 }] },
+      { readInstallScript: () => null },
+      "This build doesn't include the Omnigent installer.",
+    ],
+    "the installer fails": [
+      {
+        logins: [{ lines: [], code: 127 }],
+        install: { code: 1, stderr: "Error: uv: no space left" },
+      },
+      {},
+      "Installing Omnigent on my-ec2 failed: uv: no space left",
+    ],
+    "the installer times out": [
+      { logins: [{ lines: [], code: 127 }], install: { code: null, timedOut: true } },
+      {},
+      "Installing Omnigent on my-ec2 timed out.",
+    ],
+    "omnigent is still missing after installing": [
+      {
+        logins: [
+          { lines: [], code: 127 },
+          { lines: [], code: 127 },
+        ],
+      },
+      {},
+      "Omnigent still isn't on the PATH on my-ec2.",
+    ],
+  };
+  for (const [label, [script, overrides, error]] of Object.entries(installFailures)) {
+    it(`reports when ${label}`, async () => {
+      const session = fakeSession(script);
+      const { ctx } = connectContext(session, overrides);
+
+      assert.deepEqual(await runSshConnect(ctx), { ok: false, error });
+      assert.ok(!session.calls.includes("exec host"));
+      assert.equal(session.calls.at(-1), "close");
+    });
+  }
+
+  // Refused before any forward for the link's port (8021) or a browser; the port taken
+  // up front (8020) is still released.
+  const unexpectedLinks = {
+    "a server sign-in on another site": [
+      "Opening browser for login: https://evil.example/auth/cli",
+      /goes to https:\/\/evil\.example, not this server/,
+    ],
+    "a Databricks sign-in on another site": [
+      "https://evil.example/oidc/v1/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8021",
+      /isn't this server or a Databricks workspace/,
+    ],
+  };
+  for (const [label, [line, error]] of Object.entries(unexpectedLinks)) {
+    it(`stops sign-in without a forward or browser for ${label}`, async () => {
+      const session = fakeSession({ logins: [{ lines: [line], code: 0 }] });
+      const { ctx, opened } = connectContext(session);
+
+      const result = await runSshConnect(ctx);
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, error);
+      assert.deepEqual(opened, []);
+      assert.ok(session.calls.includes("cancel-exec"));
+      assert.deepEqual(
+        session.calls.filter((call) => /^(forward|cancel)Local/.test(call)),
+        ["forwardLocal 8020", "cancelLocal 8020"],
+      );
+    });
+  }
 
   it("keeps the port it took when another tool forwards the CLI's port mid sign-in", async () => {
     let probes = 0;
@@ -810,6 +941,65 @@ describe("createSshSession", () => {
     assert.ok(spawned.some((line) => line.includes("omnigent login")));
     assert.ok(!spawned.some((line) => line.includes("omnigent host")), spawned.join("\n"));
   });
+
+  // The master either exits when asked, or is killed once the grace period ends.
+  for (const [label, exitsWhenAsked] of Object.entries({
+    "exits when asked": true,
+    "ignores the exit request, killing it after the grace period": false,
+  })) {
+    it(`closes a master that ${label}`, async (t) => {
+      const spawned = [];
+      let master;
+      let kills = 0;
+      const spawn = (command, args) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        const line = args.join(" ");
+        spawned.push(line);
+        if (args.includes("-M")) {
+          master = child;
+          child.kill = () => {
+            kills += 1;
+            child.emit("exit", null);
+          };
+          return child;
+        }
+        child.kill = () => child.emit("close", null);
+        setImmediate(() => {
+          if (line.includes("-O exit") && exitsWhenAsked) master.emit("exit", 0);
+          child.emit("close", 0);
+        });
+        return child;
+      };
+      const session = createSshSession({
+        destination: "my-ec2",
+        socketPath: "/tmp/s/m",
+        spawn,
+        pathExists: () => true,
+      });
+      await session.open();
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+
+      const closing = session.close();
+      // Let the exit request run, then end the grace period.
+      for (let turn = 0; turn < 2; turn += 1) {
+        // Sequential by design: each turn lets the next queued step run.
+        // oxlint-disable-next-line no-await-in-loop
+        await new Promise((resolve) => {
+          setImmediate(resolve);
+        });
+      }
+      // A master that hasn't exited yet still gets the whole grace period.
+      t.mock.timers.tick(1_999);
+      assert.equal(kills, 0);
+      t.mock.timers.tick(1);
+      await closing;
+
+      assert.ok(spawned.includes("-F /dev/null -S /tmp/s/m -O exit my-ec2"), spawned.join("\n"));
+      assert.equal(kills, exitsWhenAsked ? 0 : 1);
+    });
+  }
 
   it("opens one shared connection and sends forwards over it", async () => {
     const spawned = [];

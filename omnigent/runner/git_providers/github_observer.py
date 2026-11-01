@@ -92,6 +92,9 @@ def _api_endpoint(tokens: list[str]) -> str | None:
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if token == "--":
+            # Everything after the option terminator is positional.
+            return tokens[index + 1] if index + 1 < len(tokens) else None
         if not token.startswith("-"):
             return token
         if token in values:
@@ -325,6 +328,9 @@ def _positional_target(tokens: list[str]) -> str | None:
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if token == "--":
+            # Everything after the option terminator is positional.
+            return tokens[index + 1] if index + 1 < len(tokens) else None
         if not token.startswith("-"):
             return token
         if token in values:
@@ -360,6 +366,19 @@ def _command_target(tokens: list[str]) -> PullRequestRef | None:
             return ref
         if target and target.isdigit():
             return _target(_flag(tokens, "--repo", "-R"), target, host)
+    return None
+
+
+def _command_number(tokens: list[str]) -> int | None:
+    """Return the PR number a command selects, even when its repository is implicit."""
+    if tokens[0] == "api":
+        endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
+        match = re.match(r"/?repos/[^/]+/[^/]+/pulls/([1-9][0-9]{0,17})(?:/|$)", endpoint)
+        return int(match[1]) if match else None
+    if tokens[0] == "pr" and len(tokens) > 1 and tokens[1] != "create":
+        target = (_positional_target(tokens[2:]) or "").removeprefix("#")
+        # ASCII digits only ("²" passes ``isdigit``), and short enough for ``int``.
+        return int(target) if re.fullmatch(r"[0-9]{1,18}", target) else None
     return None
 
 
@@ -572,7 +591,7 @@ def _graphql_output_eligible(segments: Sequence[ShellSegment]) -> bool:
 
 
 def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
-    """Return ordered ``gh`` operations followed by a deferred push lookup.
+    """Return ordered ``gh`` operations followed by deferred created-PR and push lookups.
 
     Other ``gh`` commands produce no op. GraphQL output additionally requires
     known stdout producers and a stream without redirects or pipes.
@@ -631,8 +650,23 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
                 parse_result=parse_result,
             )
         )
+    from omnigent.runner.git_providers.github_created import created_lookup
     from omnigent.runner.git_providers.github_push import push_operation
 
+    if any(op.creates and op.target is None for op in ops):
+        # Reads beside a create make its printed URLs ambiguous; verify them instead.
+        ops.append(
+            created_lookup(
+                mixed=any(not op.tracks or op.content_only for op in ops),
+                excluded=explicit_targets,
+                excluded_numbers=frozenset(
+                    number
+                    for tokens, _, _ in commands
+                    if _command_target(tokens) is None
+                    and (number := _command_number(tokens)) is not None
+                ),
+            )
+        )
     if push := push_operation(segments):
         ops.append(push)
     return ops

@@ -59,6 +59,7 @@ export interface Branding {
 /** Release features understood by this frontend build. */
 export type FeatureKey =
   | "codex_plan_at_launch"
+  | "sandbox_profiles"
   | "usage_page"
   | "harness_install"
   | "canvas"
@@ -237,6 +238,8 @@ export interface ServerInfo {
    * ``false``.
    */
   request_managed_sandbox_host_id?: boolean;
+  /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
+  session_fork_workspaces?: boolean;
   /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
@@ -263,6 +266,61 @@ export interface ServerInfo {
   scheduled_task_projects?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
+  /**
+   * How the deployment curates the New Chat picker. Display only: it narrows
+   * what the picker offers, never what exists, so a session already bound to
+   * an unlisted agent keeps working and the API still reaches it. Absent on
+   * an older server, which means no restriction.
+   */
+  picker?: PickerCuration;
+}
+
+/** The deployment's New Chat picker curation, as reported by ``/v1/info``. */
+export interface PickerCuration {
+  /** Agent names the picker may offer, in config order. Empty means all. */
+  restrictToAgentNames: ReadonlySet<string>;
+  /** Agent a fresh New Chat starts on; a remembered pick still wins. */
+  defaultAgentName: string | null;
+}
+
+/** The unrestricted picker: what an older server, or a failed probe, means. */
+export const UNRESTRICTED_PICKER: PickerCuration = {
+  restrictToAgentNames: new Set<string>(),
+  defaultAgentName: null,
+};
+
+/**
+ * The picker curation a probe reported, or the unrestricted default.
+ *
+ * @param info Probe result, or "loading" before it resolves.
+ * @returns The curation to render with; unrestricted while loading, on an
+ *   older server, and on a failed probe.
+ */
+export function pickerCuration(info: ServerInfo | "loading"): PickerCuration {
+  return info === "loading" ? UNRESTRICTED_PICKER : (info.picker ?? UNRESTRICTED_PICKER);
+}
+
+function parsePicker(raw: unknown): PickerCuration {
+  if (raw === null || typeof raw !== "object") return UNRESTRICTED_PICKER;
+  const value = raw as Record<string, unknown>;
+  // Blank names read as unset, the same way the server strips them; a list with
+  // a non-string member is ignored whole, as the server ignores it.
+  const rawNames = value.restrict_to_agent_names;
+  const names =
+    Array.isArray(rawNames) && rawNames.every((name) => typeof name === "string")
+      ? rawNames.map((name) => name.trim()).filter((name) => name !== "")
+      : [];
+  const fallbackDefault =
+    typeof value.default_agent_name === "string" && value.default_agent_name.trim() !== ""
+      ? value.default_agent_name.trim()
+      : null;
+  // A default outside the restriction could never be selected; the server drops
+  // it too, so agreeing here keeps a stale payload from pinning an absent pick.
+  const defaultAgentName =
+    fallbackDefault !== null && names.length > 0 && !names.includes(fallbackDefault)
+      ? null
+      : fallbackDefault;
+  return { restrictToAgentNames: new Set(names), defaultAgentName };
 }
 
 /** The server's filesystem attachment policy, as reported by ``/v1/info``. */
@@ -342,7 +400,9 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_search_scope: false,
   scheduled_task_session_modes: false,
   request_managed_sandbox_host_id: false,
+  session_fork_workspaces: false,
   branding: null,
+  picker: UNRESTRICTED_PICKER,
 };
 
 /**
@@ -377,6 +437,14 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
   return info !== "loading" && info.features?.[feature] === true;
+}
+
+export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
+  return (
+    isFeatureEnabled(info, "sandbox_profiles") &&
+    info !== "loading" &&
+    info.managed_sandboxes_enabled
+  );
 }
 
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
@@ -457,6 +525,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
+          session_fork_workspaces: data.session_fork_workspaces === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,
@@ -467,6 +536,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           branding: parseBranding(data.branding),
+          picker: parsePicker(data.picker),
         };
         return cachedServerInfo;
       }

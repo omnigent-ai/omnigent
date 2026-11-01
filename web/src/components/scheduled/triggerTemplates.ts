@@ -91,8 +91,11 @@ export interface TriggerTemplate {
   title: string;
   /** Prefilled task name. */
   name: string;
-  /** The creation events the template can fire on; the first is the default. */
-  events: { id: string; label: string }[];
+  /**
+   * The creation events the template can fire on; the first is the default. `authorAction`
+   * names who can write what the event watches, e.g. "create a ticket in this project".
+   */
+  events: { id: string; label: string; authorAction: string }[];
   /** Words between the event and the scope, e.g. "in project". */
   scopeLabel: string;
   scopePlaceholder: string;
@@ -113,7 +116,9 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     iconClassName: "text-blue-600 dark:text-blue-400",
     title: "Jira tickets",
     name: "Jira tickets",
-    events: [{ id: "created", label: "Ticket created" }],
+    events: [
+      { id: "created", label: "Ticket created", authorAction: "create a ticket in this project" },
+    ],
     scopeLabel: "in project",
     scopePlaceholder: "ES",
     fields: [
@@ -146,7 +151,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     iconClassName: "text-purple-600 dark:text-purple-400",
     title: "Slack messages",
     name: "Slack messages",
-    events: [{ id: "posted", label: "Message posted" }],
+    events: [{ id: "posted", label: "Message posted", authorAction: "post in this channel" }],
     scopeLabel: "in channel",
     scopePlaceholder: "#eng-support",
     fields: [
@@ -171,9 +176,17 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     title: "GitHub issues",
     name: "GitHub issues",
     events: [
-      { id: "issue", label: "Issue opened" },
-      { id: "pr", label: "Pull request opened" },
-      { id: "any", label: "Issue or pull request opened" },
+      { id: "issue", label: "Issue opened", authorAction: "open an issue in this repository" },
+      {
+        id: "pr",
+        label: "Pull request opened",
+        authorAction: "open a pull request in this repository",
+      },
+      {
+        id: "any",
+        label: "Issue or pull request opened",
+        authorAction: "open an issue or pull request in this repository",
+      },
     ],
     scopeLabel: "in repo",
     scopePlaceholder: "owner/repo",
