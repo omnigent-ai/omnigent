@@ -16,13 +16,16 @@ They fail while the bug is live and pass once the generator stops emitting
 pillow's sdist.
 
 The rendered install method must also retain opt-in mirror setup so release
-regeneration cannot revert source-build fixes.
+regeneration cannot revert source-build fixes, and keep the `head` spec that
+`brew install --HEAD` builds from.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
+import tomllib
 from pathlib import Path
 from textwrap import dedent
 
@@ -231,6 +234,40 @@ def test_build_host_mirror_urls_are_not_baked_into_generated_formula(monkeypatch
     monkeypatch.setenv("HOMEBREW_CARGO_INDEX_URL", "https://cargo.example.com/index/")
 
     assert _generate_formula_with_pillow(monkeypatch) == original
+
+
+def test_generated_formula_declares_head_for_development_builds(monkeypatch) -> None:
+    """`brew install --HEAD` needs a head spec in the published formula."""
+    formula = _generate_formula_with_pillow(monkeypatch)
+
+    head_spec = re.compile(r'^\s*head\s+"https://github\.com/omnigent-ai/omnigent(\.git)?"', re.M)
+
+    assert head_spec.search(formula), "rendered formula declares no head spec"
+
+
+def test_head_build_installs_lockstep_sdks_from_its_checkout(monkeypatch) -> None:
+    """A HEAD build must not pair main's omnigent with the release's pinned SDKs."""
+    formula = _generate_formula_with_pillow(monkeypatch)
+    install = _install_stanza(formula)
+    sdk_paths = dict(re.findall(r'"(omnigent-[\w-]+)" => "(sdks/[\w/-]+)"', install))
+
+    assert set(sdk_paths) == set(gf.LOCKSTEP_PACKAGES) - gf.SELF_EXCLUSIONS
+    repo_root = _SCRIPT_DIR.parents[2]
+    for name, path in sdk_paths.items():
+        project = tomllib.loads((repo_root / path / "pyproject.toml").read_text())["project"]
+        assert project["name"] == name
+    assert (
+        "formula_resources = build.head? ? "
+        "resources.reject { |r| lockstep_sdks.key?(r.name) } : resources"
+    ) in install
+    assert "formula_resources.partition" in install
+    head_sdk_install = (
+        "venv.pip_install lockstep_sdks.values.map { |path| buildpath/path } if build.head?"
+    )
+    assert install.index(head_sdk_install) < install.index("venv.pip_install_and_link buildpath")
+    # setup.py builds the web UI from a checkout that has no prebuilt bundle.
+    assert 'depends_on "node" => :build' in formula
+    assert 'depends_on "pnpm" => :build' in formula
 
 
 def test_cooldown_exemptions_reads_dated_packages_from_uv_toml(tmp_path) -> None:
