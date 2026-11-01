@@ -11,6 +11,7 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseAgentsModule from "@/hooks/useAgents";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -71,6 +72,12 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHarnessInventoryModule>()),
   useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
+// /mcp reads the session's agent via a TanStack query; stub it (no agent loaded)
+// so these renders don't need a QueryClientProvider either.
+vi.mock("@/hooks/useAgents", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentsModule>()),
+  useSessionAgent: () => ({ data: undefined, isError: false }),
 }));
 
 // HostBadge now lives in the status-line tray (left of the worktree branch).

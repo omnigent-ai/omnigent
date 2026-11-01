@@ -241,6 +241,11 @@
             "title": "Id",
             "type": "string"
           },
+          "loads_user_settings": {
+            "default": true,
+            "title": "Loads User Settings",
+            "type": "boolean"
+          },
           "mcp_registry_editable": {
             "default": false,
             "title": "Mcp Registry Editable",
@@ -488,6 +493,12 @@
             "description": "Unique agent identifier, e.g. `\"ag_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "loads_user_settings": {
+            "default": true,
+            "description": "Whether a claude-sdk session for this agent loads the user's Claude settings and user-scope MCP servers. `False` when the spec's `skills: none` runs the CLI with no setting sources; `True` when the bundle cannot be loaded.",
+            "title": "Loads User Settings",
+            "type": "boolean"
           },
           "mcp_registry_editable": {
             "default": false,
