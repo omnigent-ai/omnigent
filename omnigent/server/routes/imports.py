@@ -461,6 +461,8 @@ def create_imports_router(
                 conversation_store.append, conversation.id, _anchor_compactions(items)
             )
             labels = {
+                # Project defaults, when the import names a project.
+                **resolved_create.body.labels,
                 **native_agent.presentation_labels,
                 IMPORT_SOURCE_LABEL_KEY: source,
                 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
