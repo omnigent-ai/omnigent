@@ -1,8 +1,17 @@
-import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  PanelLeftOpenIcon,
+  PanelRightOpenIcon,
+  SearchIcon,
+  SettingsIcon,
+} from "lucide-react";
 
 import {
   ARIA_MOD_KEY,
+  BACK_KEYS,
   COMMAND_PALETTE_KEYS,
+  FORWARD_KEYS,
   settingsAriaShortcut,
   settingsShortcutKeys,
   sidebarToggleAriaShortcut,
@@ -10,11 +19,15 @@ import {
 } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  requestHistoryNavigation,
+  useHistoryNavigationAvailability,
+} from "@/hooks/useHistoryNavigation";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
 /**
- * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
+ * Navigation, Search, Settings, and sidebar-toggle controls from the header row.
  *
  * Extracted so it can render in TWO places without duplicating the markup:
  * inside the sidebar (every browser and non-mac platform, and the macOS shell
@@ -24,7 +37,8 @@ import { cn } from "@/lib/utils";
  * `inert`, so a cluster living inside it would be clipped and unclickable, and
  * while peeking the card floats at `inset-2` and drags the cluster off the
  * traffic lights' centre line. Hoisting it out of the sidebar is what keeps the
- * three icons in one fixed place across open, collapsed, and peeking.
+ * available header actions in one fixed place across open, collapsed, and
+ * peeking. Current native shells move Settings to the profile footer.
  *
  * Only the toggle's meaning changes with state: it collapses an open sidebar and
  * opens a closed or peeking one, so the caller passes `expanded` and the icon
@@ -35,6 +49,7 @@ export function SidebarHeaderActions({
   onToggle,
   onOpenSearch,
   onSettingsClick,
+  showSettings = true,
   onTogglePointerEnter,
   onTogglePointerDown,
   onTogglePointerLeave,
@@ -54,6 +69,8 @@ export function SidebarHeaderActions({
    * list); navigation itself is the Link's job.
    */
   onSettingsClick?: () => void;
+  /** Whether Settings lives in this cluster instead of the native-shell footer. */
+  showSettings?: boolean;
   /**
    * Dwell-to-peek hooks for the toggle. On the macOS shell this cluster replaces
    * ChatHeader's collapsed-state button, which is where peek used to be armed,
@@ -63,10 +80,11 @@ export function SidebarHeaderActions({
   onTogglePointerDown?: () => void;
   onTogglePointerLeave?: () => void;
 }) {
+  const { canGoBack, canGoForward } = useHistoryNavigationAvailability();
+  const hasNavigationHistory = canGoBack || canGoForward;
+
   return (
     <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
-      <SidebarSearchButton onOpenSearch={onOpenSearch} />
-      <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -99,6 +117,53 @@ export function SidebarHeaderActions({
           <span>{expanded ? "Collapse sidebar" : "Open sidebar"}</span>
         </TooltipContent>
       </Tooltip>
+      {showSettings && (
+        <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
+      )}
+      <SidebarSearchButton onOpenSearch={onOpenSearch} />
+      <div
+        className={cn("flex items-center gap-1 max-md:hidden", !hasNavigationHistory && "hidden")}
+        data-testid="history-navigation-buttons"
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Back"
+              aria-keyshortcuts={`${ARIA_MOD_KEY}+[`}
+              disabled={!canGoBack}
+              className="size-6 text-muted-foreground hover:text-foreground"
+              onClick={() => requestHistoryNavigation(-1)}
+            >
+              <ArrowLeftIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" shortcut={BACK_KEYS}>
+            <span>Back</span>
+          </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Forward"
+              aria-keyshortcuts={`${ARIA_MOD_KEY}+]`}
+              disabled={!canGoForward}
+              className="size-6 text-muted-foreground hover:text-foreground"
+              onClick={() => requestHistoryNavigation(1)}
+            >
+              <ArrowRightIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" shortcut={FORWARD_KEYS}>
+            <span>Forward</span>
+          </TooltipContent>
+        </Tooltip>
+      </div>
     </div>
   );
 }
@@ -164,11 +229,16 @@ export function SidebarSettingsButton({
   onSettingsClick,
   className,
   testId = "settings-button",
+  to = "/settings",
+  label = "Settings",
 }: {
   onSettingsClick?: () => void;
   className?: string;
   /** Distinguishes the header-row copy from the mobile floating copy. */
   testId?: string;
+  /** Destination and accessible action name; the profile-footer copy toggles back home. */
+  to?: string;
+  label?: string;
 }) {
   return (
     <Tooltip delayDuration={750}>
@@ -177,17 +247,17 @@ export function SidebarSettingsButton({
           asChild
           variant="ghost"
           size="icon-xs"
-          aria-label="Settings"
+          aria-label={label}
           aria-keyshortcuts={settingsAriaShortcut()}
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
-          <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
+          <Link to={to} onClick={onSettingsClick} data-testid={testId}>
             <SettingsIcon className={SIDEBAR_FLOAT_ICON} />
           </Link>
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom" shortcut={settingsShortcutKeys()}>
-        <span>Settings</span>
+        <span>{label}</span>
       </TooltipContent>
     </Tooltip>
   );
