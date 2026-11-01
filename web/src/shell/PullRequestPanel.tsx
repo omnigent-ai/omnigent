@@ -1779,7 +1779,7 @@ export function PullRequestPanel({
       {showTrackingControls ? (
         !inMobileDrawer && (
           <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails} />}
+            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails || prs.length <= 1} />}
             <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
               {prs.length > 1 && showingDetails && (
                 <Button variant="ghost" size="sm" onClick={showPullRequestList}>
