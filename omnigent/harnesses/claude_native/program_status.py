@@ -22,6 +22,18 @@ _logger = logging.getLogger(__name__)
 ERROR_HOOK_GRACE_S = 5.0
 
 
+def _reports_failed_turn(report: ProgramStatus) -> bool:
+    """Whether a report describes a turn that already ended in an error.
+
+    Claude reports a turn that failed authentication as ``blocked`` with kind
+    ``auth`` until the user signs in again, so that report is not work in progress.
+
+    :param report: Current root report from the terminal's relay.
+    :returns: ``True`` for an error report or an authentication block.
+    """
+    return report.state == "error" or (report.state == "blocked" and report.kind == "auth")
+
+
 class ClaudeProgramStatusPoller:
     """Adapt one terminal's OSC snapshot to existing session-status callbacks."""
 
@@ -88,7 +100,7 @@ class ClaudeProgramStatusPoller:
         report = self._reader.status
         if self._retired:
             return
-        is_error = report is not None and report.state == "error"
+        is_error = report is not None and _reports_failed_turn(report)
         # Resync must not turn a standing error into repeated observations.
         if is_error and not self._error_observed:
             _logger.info(
@@ -109,7 +121,7 @@ class ClaudeProgramStatusPoller:
                 self._last = report
                 # The StopFailure hook owns the failed edge and carries the API
                 # error text; an error report here would fail the turn first, bare.
-                if report.state != "error":
+                if not is_error:
                     status = "running" if report.state in {"working", "blocked"} else "idle"
                     self._on_status(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
@@ -129,7 +141,7 @@ class ClaudeProgramStatusPoller:
         """
         if (
             report is None
-            or report.state != "error"
+            or not _reports_failed_turn(report)
             or self._turn_is_active is None
             or not self._turn_is_active()
         ):
