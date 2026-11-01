@@ -526,8 +526,8 @@ _STREAM_PROMPT = "Tell me a long story, streamed."
 # few seconds and the view has to keep up rather than jump once.
 _STREAM_CHUNK_DELAY_S = 0.03
 
-# Measure the newest text, not the scroll extent (which includes footer spacing),
-# in each frame as it paints: after layout and the transcript's own observers.
+# Sample the newest text's visibility and the distance from the scroll end in each
+# frame as it paints: after layout and the transcript's own observers.
 _TRACK_NEWEST_TEXT = """
 () => {
   const el = document.querySelector('[data-pw-scroller]');
