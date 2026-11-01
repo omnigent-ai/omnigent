@@ -10,18 +10,26 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VideoPlayer } from "./VideoPlayer";
 import { parseVideoChapters } from "@/lib/videoChapters";
+import { authenticatedFetch } from "@/lib/identity";
 
 vi.mock("@/lib/videoChapters", () => ({ parseVideoChapters: vi.fn() }));
 import {
   downloadWorkspaceFile,
   fetchWorkspaceFileBlob,
   useFileContent,
+  usesDirectFileDownload,
 } from "@/hooks/useFileContent";
 
-vi.mock("@/hooks/useFileContent", () => ({
+vi.mock(import("@/hooks/useFileContent"), async (importOriginal) => ({
+  ...(await importOriginal()),
   fetchWorkspaceFileBlob: vi.fn(),
   downloadWorkspaceFile: vi.fn(),
   useFileContent: vi.fn(),
+  usesDirectFileDownload: vi.fn(),
+}));
+vi.mock(import("@/lib/identity"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  authenticatedFetch: vi.fn(),
 }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
@@ -34,6 +42,7 @@ const revokeUrl = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(usesDirectFileDownload).mockReturnValue(false);
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
   vi.mocked(parseVideoChapters).mockResolvedValue([]);
@@ -53,11 +62,97 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+  delete window.__OMNIGENT_BASE_PATH__;
 });
 
 const props = { conversationId: "sess_1", path: "demo.webm", title: "Feature demo" };
 
 describe("VideoPlayer", () => {
+  it("streams the base-prefixed workspace URL only after Play without fetching a blob", () => {
+    vi.mocked(usesDirectFileDownload).mockReturnValue(true);
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    const { container, rerender, unmount } = render(<VideoPlayer {...props} path="my clip.webm" />);
+    expect(container.querySelector("video")).toBeNull();
+    expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+    expect(fetchBlob).not.toHaveBeenCalled();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    const video = container.querySelector("video")!;
+    expect(video).toHaveAttribute(
+      "src",
+      "/proxy/6767/v1/sessions/sess_1/resources/environments/default/filesystem/my%20clip.webm?download=true",
+    );
+    expect(video).toHaveAttribute("controls");
+    expect(video).toHaveAttribute("playsinline");
+    expect(video).not.toHaveAttribute("autoplay");
+    fireEvent.loadedData(video);
+    expect(video.play).toHaveBeenCalledOnce();
+
+    rerender(<VideoPlayer {...props} path="other.webm" />);
+    expect(video.pause).toHaveBeenCalledOnce();
+    expect(container.querySelector("video")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    const nextVideo = container.querySelector("video")!;
+    expect(nextVideo).toHaveAttribute(
+      "src",
+      "/proxy/6767/v1/sessions/sess_1/resources/environments/default/filesystem/other.webm?download=true",
+    );
+    vi.mocked(HTMLMediaElement.prototype.pause).mockClear();
+    unmount();
+    expect(nextVideo.pause).toHaveBeenCalledOnce();
+    expect(fetchBlob).not.toHaveBeenCalled();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(createUrl).not.toHaveBeenCalled();
+    expect(revokeUrl).not.toHaveBeenCalled();
+  });
+
+  it("fetches a playback blob when OSS host routing requires request headers", async () => {
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    vi.mocked(usesDirectFileDownload).mockReturnValue(true);
+    const { container, unmount } = render(<VideoPlayer {...props} />);
+    expect(fetchBlob).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    await waitFor(() =>
+      expect(container.querySelector("video")).toHaveAttribute("src", "blob:recording"),
+    );
+    expect(fetchBlob).toHaveBeenCalledWith("sess_1", "demo.webm", expect.any(AbortSignal));
+    unmount();
+    expect(revokeUrl).toHaveBeenCalledWith("blob:recording");
+  });
+
+  it("keeps direct downloads available after playback errors and waits for Play after Retry", () => {
+    vi.mocked(usesDirectFileDownload).mockReturnValue(true);
+    vi.mocked(downloadWorkspaceFile).mockResolvedValue();
+    const { container } = render(<VideoPlayer {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    const video = container.querySelector("video")!;
+    fireEvent.error(video);
+    expect(video.pause).toHaveBeenCalledOnce();
+    expect(container.querySelector("video")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Unable to play this video. Download it to watch locally.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Download video: Feature demo" }));
+    expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess_1", "demo.webm");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(container.querySelector("video")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    expect(container.querySelector("video")).toHaveAttribute(
+      "src",
+      "/v1/sessions/sess_1/resources/environments/default/filesystem/demo.webm?download=true",
+    );
+    expect(container.querySelector("video")).not.toBe(video);
+    expect(fetchBlob).not.toHaveBeenCalled();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(createUrl).not.toHaveBeenCalled();
+    expect(revokeUrl).not.toHaveBeenCalled();
+  });
+
   it("queues a chapter seek before loading and follows native seeking", async () => {
     vi.mocked(useFileContent).mockReturnValue({
       data: {
@@ -268,99 +363,114 @@ describe("VideoPlayer", () => {
     await waitFor(() => expect(fetchBlob).toHaveBeenCalledTimes(2));
   });
 
-  it("loads remote video only on Play and requires another Play after changing source", () => {
-    const firstSrc = "https://example.com/demo.mp4?signature=abc";
-    const nextSrc = "https://example.com/other.mp4?signature=def";
-    const { container, rerender } = render(<VideoPlayer src={firstSrc} title="Demo" />);
-    expect(container.querySelector("video")).toBeNull();
-    expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+  it.each([false, true])(
+    "loads remote video only on Play and requires another Play after changing source (direct=%s)",
+    (direct) => {
+      vi.mocked(usesDirectFileDownload).mockReturnValue(direct);
+      const firstSrc = "https://example.com/demo.mp4?signature=abc";
+      const nextSrc = "https://example.com/other.mp4?signature=def";
+      const { container, rerender } = render(<VideoPlayer src={firstSrc} title="Demo" />);
+      expect(container.querySelector("video")).toBeNull();
+      expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
-    const firstVideo = container.querySelector("video")!;
-    expect(firstVideo).toHaveAttribute("src", firstSrc);
-    expect(firstVideo).toHaveAttribute("controls");
-    expect(firstVideo).toHaveAttribute("playsinline");
-    expect(firstVideo).not.toHaveAttribute("autoplay");
-    expect(firstVideo).not.toHaveAttribute("crossorigin");
-    fireEvent.loadedData(firstVideo);
-    expect(firstVideo.play).toHaveBeenCalledOnce();
+      fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
+      const firstVideo = container.querySelector("video")!;
+      expect(firstVideo).toHaveAttribute("src", firstSrc);
+      expect(firstVideo).toHaveAttribute("controls");
+      expect(firstVideo).toHaveAttribute("playsinline");
+      expect(firstVideo).not.toHaveAttribute("autoplay");
+      expect(firstVideo).not.toHaveAttribute("crossorigin");
+      fireEvent.loadedData(firstVideo);
+      expect(firstVideo.play).toHaveBeenCalledOnce();
 
-    rerender(<VideoPlayer src={nextSrc} title="Demo" />);
-    expect(firstVideo.pause).toHaveBeenCalledOnce();
-    expect(container.querySelector("video")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
-    expect(container.querySelector("video")).toHaveAttribute("src", nextSrc);
-    expect(container.querySelector("video")).not.toBe(firstVideo);
-    expect(fetchBlob).not.toHaveBeenCalled();
-    expect(createUrl).not.toHaveBeenCalled();
-  });
+      rerender(<VideoPlayer src={nextSrc} title="Demo" />);
+      expect(firstVideo.pause).toHaveBeenCalledOnce();
+      expect(container.querySelector("video")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
+      expect(container.querySelector("video")).toHaveAttribute("src", nextSrc);
+      expect(container.querySelector("video")).not.toBe(firstVideo);
+      expect(fetchBlob).not.toHaveBeenCalled();
+      expect(createUrl).not.toHaveBeenCalled();
+    },
+  );
 
-  it("opens remote video in a new tab without claiming or fetching a download", () => {
-    const src = "https://example.com/demo.mp4?signature=abc";
-    const popupDocument = document.implementation.createHTMLDocument();
-    const popup = { opener: window, document: popupDocument } as Window;
-    const open = vi.spyOn(window, "open").mockReturnValue(popup);
-    const followedLinks: HTMLAnchorElement[] = [];
-    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
-      this: HTMLAnchorElement,
-    ) {
-      followedLinks.push(this);
-    });
-    const fetch = vi.fn();
-    vi.stubGlobal("fetch", fetch);
-    const { container } = render(<VideoPlayer src={src} title="Demo" />);
-    const link = screen.getByRole("link", { name: "Open video in new tab: Demo" });
-    expect(link).toHaveAttribute("href", src);
-    expect(link).toHaveAttribute("target", "_blank");
-    expect(link).toHaveAttribute("rel", "noopener noreferrer");
-    expect(link).toHaveAttribute("title", "Open video in new tab");
-    expect(link).not.toHaveAttribute("download");
-    expect(screen.queryByRole("link", { name: /Download/ })).toBeNull();
+  it.each([false, true])(
+    "opens remote video in a new tab without claiming or fetching a download (direct=%s)",
+    (direct) => {
+      vi.mocked(usesDirectFileDownload).mockReturnValue(direct);
+      const src = "https://example.com/demo.mp4?signature=abc";
+      const popupDocument = document.implementation.createHTMLDocument();
+      const popup = { opener: window, document: popupDocument } as Window;
+      const open = vi.spyOn(window, "open").mockReturnValue(popup);
+      const followedLinks: HTMLAnchorElement[] = [];
+      const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+        this: HTMLAnchorElement,
+      ) {
+        followedLinks.push(this);
+      });
+      const fetch = vi.fn();
+      vi.stubGlobal("fetch", fetch);
+      const { container } = render(<VideoPlayer src={src} title="Demo" />);
+      const link = screen.getByRole("link", { name: "Open video in new tab: Demo" });
+      expect(link).toHaveAttribute("href", src);
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noopener noreferrer");
+      expect(link).toHaveAttribute("title", "Open video in new tab");
+      expect(link).not.toHaveAttribute("download");
+      expect(screen.queryByRole("link", { name: /Download/ })).toBeNull();
 
-    fireEvent.click(link);
-    expect(open).toHaveBeenCalledWith("about:blank", "_blank");
-    expect(popup.opener).toBeNull();
-    expect(click).toHaveBeenCalledOnce();
-    const followedLink = followedLinks[0];
-    expect(followedLink.href).toBe(src);
-    expect(followedLink.ownerDocument).toBe(popupDocument);
-    expect(fetch).not.toHaveBeenCalled();
-    expect(fetchBlob).not.toHaveBeenCalled();
-    expect(downloadWorkspaceFile).not.toHaveBeenCalled();
-    expect(container.querySelector("video")).toBeNull();
-  });
+      fireEvent.click(link);
+      expect(open).toHaveBeenCalledWith("about:blank", "_blank");
+      expect(popup.opener).toBeNull();
+      expect(click).toHaveBeenCalledOnce();
+      const followedLink = followedLinks[0];
+      expect(followedLink.href).toBe(src);
+      expect(followedLink.ownerDocument).toBe(popupDocument);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(fetchBlob).not.toHaveBeenCalled();
+      expect(downloadWorkspaceFile).not.toHaveBeenCalled();
+      expect(container.querySelector("video")).toBeNull();
+    },
+  );
 
-  it("offers external opening after remote playback fails and leaves Retry idle until Play", () => {
-    const src = "https://example.com/demo.mov";
-    const { container, rerender } = render(<VideoPlayer src={src} title="Demo" />);
-    fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
-    const video = container.querySelector("video")!;
-    fireEvent.error(video);
-    expect(video.pause).toHaveBeenCalledOnce();
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Unable to play this video here. Try opening it in a new tab.",
-    );
-    expect(screen.getByRole("status")).not.toHaveTextContent(/Download/);
-    expect(screen.getByRole("link", { name: "Open video in new tab: Demo" })).toHaveAttribute(
-      "href",
-      src,
-    );
+  it.each([false, true])(
+    "offers external opening after remote playback fails and leaves Retry idle until Play (direct=%s)",
+    (direct) => {
+      vi.mocked(usesDirectFileDownload).mockReturnValue(direct);
+      const src = "https://example.com/demo.mov";
+      const { container, rerender } = render(<VideoPlayer src={src} title="Demo" />);
+      fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
+      const video = container.querySelector("video")!;
+      fireEvent.error(video);
+      expect(video.pause).toHaveBeenCalledOnce();
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Unable to play this video here. Try opening it in a new tab.",
+      );
+      expect(screen.getByRole("status")).not.toHaveTextContent(/Download/);
+      expect(screen.getByRole("link", { name: "Open video in new tab: Demo" })).toHaveAttribute(
+        "href",
+        src,
+      );
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(screen.queryByRole("status")).toBeNull();
-    expect(container.querySelector("video")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
-    expect(container.querySelector("video")).toHaveAttribute("src", src);
-    expect(container.querySelector("video")).not.toBe(video);
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(container.querySelector("video")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
+      expect(container.querySelector("video")).toHaveAttribute("src", src);
+      expect(container.querySelector("video")).not.toBe(video);
 
-    fireEvent.error(container.querySelector("video")!);
-    rerender(<VideoPlayer src="https://example.com/next.mp4" title="Next demo" />);
-    expect(screen.queryByRole("status")).toBeNull();
-    expect(container.querySelector("video")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Play video: Next demo" }));
-    expect(container.querySelector("video")).toHaveAttribute("src", "https://example.com/next.mp4");
-    expect(fetchBlob).not.toHaveBeenCalled();
-  });
+      fireEvent.error(container.querySelector("video")!);
+      rerender(<VideoPlayer src="https://example.com/next.mp4" title="Next demo" />);
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(container.querySelector("video")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Play video: Next demo" }));
+      expect(container.querySelector("video")).toHaveAttribute(
+        "src",
+        "https://example.com/next.mp4",
+      );
+      expect(fetchBlob).not.toHaveBeenCalled();
+    },
+  );
 
   it("cancels unfinished fetches when the source changes or the player closes", async () => {
     let finish!: (blob: Blob) => void;
