@@ -233,7 +233,7 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: claude
 
@@ -774,6 +774,11 @@ jobs:
   prioritize-v2:
     name: Classify and prioritize issue with v2
     needs: triage
+    # A called workflow cannot exceed this grant; it mirrors priority onto PRs.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     if: >-
       always() &&
       vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' &&

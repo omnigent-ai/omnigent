@@ -797,6 +797,33 @@ def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_restoring_a_removed_entry_preserves_its_missing_record_disposition(
+    hold: bool, uncertain: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An eviction or non-held drain must not turn an ambiguous receipt into a loss."""
+    now = [100.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    if uncertain:
+        pending_inputs.mark_uncertain("conv_a")
+    drained = pending_inputs.resolve_oldest("conv_a", hold=hold)
+    assert drained is not None
+    if hold:
+        now[0] += pending_inputs._TTL_S + 1
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+    pending_inputs.restore("conv_a", drained)
+    later = pending_inputs.record("conv_a", [_text_block("later")])
+    matched = pending_inputs.resolve_matching_text("conv_a", "later")
+
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert [entry.pending_id for entry in matched.uncertain] == ([first] if uncertain else [])
+    assert [entry.pending_id for entry in matched.skipped] == ([] if uncertain else [first])
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
 def test_pending_ids_lists_queued_unheld_entries_in_queue_order() -> None:
     """The interrupt route reads the queue before it forwards the Stop."""
     first = pending_inputs.record("conv_a", [_text_block("first")])
@@ -1083,3 +1110,49 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
 
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.pending_ids("conv_a") == []
+
+
+@pytest.mark.parametrize("command", ["/probe-cmd", "!git status", "exit", "QUIT", ":wq"])
+def test_queued_command_recorded_after_a_plain_follow_up_is_not_lost(command: str) -> None:
+    """
+    A command queued before a plain prompt can be recorded after it, or never.
+
+    Claude folds the plain prompt in at the next tool call but holds a "/" or
+    "!" command until the turn ends; an exit word quits without a record. So
+    the older entry is not known lost.
+    """
+    pending_inputs.record("conv", [_text_block(command)], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("plain follow-up")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "plain follow-up", claude_commands=True)
+
+    assert match.matched is not None
+    assert match.skipped == []
+    [uncertain] = match.uncertain
+    assert uncertain.content == [_text_block(command)]
+
+
+@pytest.mark.parametrize(
+    ("older", "claude_commands"),
+    [
+        ("first plain", True),
+        ("exit the loop early", True),
+        # Only Claude Code runs these itself; another harness records them in order.
+        ("!git status", False),
+        ("exit", False),
+    ],
+)
+def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
+    older: str, claude_commands: bool
+) -> None:
+    """A plain older entry jumped over is still reported as lost."""
+    pending_inputs.record("conv", [_text_block(older)], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("second plain")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text(
+        "conv", "second plain", claude_commands=claude_commands
+    )
+
+    [skipped] = match.skipped
+    assert skipped.content == [_text_block(older)]
+    assert match.uncertain == []

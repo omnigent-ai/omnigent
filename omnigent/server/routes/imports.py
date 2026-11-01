@@ -16,9 +16,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from omnigent.db.utils import builtin_agent_id
+from omnigent.db.utils import builtin_agent_id, generate_item_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.entities import NewConversationItem, parse_item_data
+from omnigent.entities import CompactionData, NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
@@ -32,6 +32,7 @@ from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
+    MAX_IMPORT_ITEMS,
     ImportSource,
     title_from_items,
 )
@@ -43,9 +44,6 @@ from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
-# Upper bound on items in one imported session, shared by the CLI-normalized
-# ``/imports`` body and the host-streamed ``/imports/local`` path.
-_MAX_IMPORT_ITEMS = 100_000
 _LOCAL_IMPORT_STREAM_ERROR_MESSAGE = (
     "The local session import stopped unexpectedly. Retry the import or contact an administrator."
 )
@@ -100,7 +98,10 @@ class ImportSessionRequest(BaseModel):
     # the transcript came from and resumes there. Bound only alongside a
     # workspace (the workspace-required-for-host check constraint).
     host_id: str | None = None
-    items: list[ImportItemInput] = Field(min_length=1, max_length=_MAX_IMPORT_ITEMS)
+    # The harness had archived this session (e.g. ``codex archive``); the
+    # imported conversation is archived too instead of landing in the sidebar.
+    archived: bool = False
+    items: list[ImportItemInput] = Field(min_length=1, max_length=MAX_IMPORT_ITEMS)
 
     @field_validator("external_session_id")
     @classmethod
@@ -259,9 +260,10 @@ async def _stream_local_sessions_from_host(
 
     Sends a recent or exact import frame and drains the per-request queue the
     tunnel fills: each ``host.import_local_session`` frame yields one session
-    dict (``{total, external_session_id, workspace, items, title, source}``); the
-    terminal ``host.import_local_done`` ends the stream. The caller persists each
-    session as it arrives, so a large batch never buffers in one frame.
+    dict (``{total, external_session_id, workspace, items, title, source,
+    archived}``); the terminal ``host.import_local_done`` ends the stream. The
+    caller persists each session as it arrives, so a large batch never buffers
+    in one frame.
 
     :raises OmnigentError: If the host connection drops, a frame times out, or
         the host reports a read failure.
@@ -329,6 +331,27 @@ async def _stream_local_sessions_from_host(
         host_conn.pending_import_local.pop(request_id, None)
 
 
+def _anchor_compactions(items: list[NewConversationItem]) -> list[NewConversationItem]:
+    """Point each imported compaction at the stored item it follows, or itself when first.
+
+    Only anchors get a minted ``stable_id``, since the store looks up every stable id.
+    """
+    anchored = list(items)
+    for index, item in enumerate(items):
+        if not isinstance(item.data, CompactionData):
+            continue
+        boundary = index - 1 if index else index
+        if anchored[boundary].stable_id is None:
+            anchored[boundary] = anchored[boundary].model_copy(
+                update={"stable_id": generate_item_id(anchored[boundary].type)}
+            )
+        boundary_id = anchored[boundary].stable_id
+        anchored[index] = anchored[index].model_copy(
+            update={"data": item.data.model_copy(update={"last_item_id": boundary_id})}
+        )
+    return anchored
+
+
 def create_imports_router(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -352,6 +375,7 @@ def create_imports_router(
         native_title: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        archived: bool = False,
         replace_conversation_id: str | None = None,
     ) -> tuple[str, str | None]:
         """Create the conversation, append items, stamp import labels, grant owner.
@@ -364,8 +388,10 @@ def create_imports_router(
         session to the host that read the transcript (``/imports/local``), so
         resuming defaults to the machine the workspace lives on; bound only
         alongside a workspace (the ``ck_conversations_workspace_required_for_host``
-        check constraint). Caller authorizes any ``replace_conversation_id``;
-        replacement waits until validation succeeds. Returns ``(conversation id, title)``.
+        check constraint). ``archived`` files the session under Archived
+        sessions when the harness had archived it. Caller authorizes any
+        ``replace_conversation_id``; replacement waits until validation
+        succeeds. Returns ``(conversation id, title)``.
         """
         native_agent = native_coding_agent_for_harness(f"{source}-native")
         if native_agent is None:
@@ -431,13 +457,21 @@ def create_imports_router(
                 conversation.id,
                 external_session_id,
             )
-            await asyncio.to_thread(conversation_store.append, conversation.id, items)
+            await asyncio.to_thread(
+                conversation_store.append, conversation.id, _anchor_compactions(items)
+            )
             labels = {
                 **native_agent.presentation_labels,
                 IMPORT_SOURCE_LABEL_KEY: source,
                 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
             }
             await asyncio.to_thread(conversation_store.set_labels, conversation.id, labels)
+            if archived:
+                await asyncio.to_thread(
+                    conversation_store.update_conversation_with_changes,
+                    conversation.id,
+                    archived=True,
+                )
             if permission_store is not None and user_id is not None:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(
@@ -496,6 +530,7 @@ def create_imports_router(
             native_title=body.title,
             project_id=body.project_id,
             host_id=body.host_id,
+            archived=body.archived,
             replace_conversation_id=existing.id if existing is not None else None,
         )
 
@@ -596,7 +631,7 @@ def create_imports_router(
                 or source is None
                 # Mirror the /imports item cap so one oversized transcript can't
                 # balloon a batch import's memory.
-                or len(raw_items) > _MAX_IMPORT_ITEMS
+                or len(raw_items) > MAX_IMPORT_ITEMS
             ):
                 _fail(
                     external_session_id,
@@ -627,6 +662,7 @@ def create_imports_router(
                     user_id=user_id,
                     native_title=native_title if isinstance(native_title, str) else None,
                     host_id=body.host_id,
+                    archived=session.get("archived") is True,
                 )
             except OmnigentError as exc:
                 # A create that lost the dedup race collides on the deterministic
