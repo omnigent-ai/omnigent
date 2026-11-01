@@ -211,7 +211,7 @@ jobs:
       - name: Review and publish findings
         if: steps.pr.outputs.head != ''
         id: ocr
-        uses: alibaba/open-code-review@cf64e7080f600d507888a26785ad6a8b7a13ab6a
+        uses: alibaba/open-code-review@216dcf513593055a70165f793e96b52589d71b1b
         with:
           pr_number: ${{ needs.request.outputs.pr }}
           base_ref: ${{ steps.pr.outputs.base }}
