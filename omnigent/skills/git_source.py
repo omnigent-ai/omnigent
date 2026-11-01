@@ -13,6 +13,7 @@ import contextlib
 import io
 import os
 import re
+import select
 import signal
 import subprocess
 import tarfile
@@ -304,6 +305,8 @@ class _BoundedPipe:
 
     git's diagnostics come from the repository side, so they are bounded like
     the checkout: once more than *limit* bytes arrive the caller stops git.
+    The pipe's descriptor is closed only once its reader has stopped, so the
+    number cannot be reused for another file while a read on it can still run.
     """
 
     def __init__(self, stream: IO[bytes] | None, limit: int) -> None:
@@ -311,6 +314,11 @@ class _BoundedPipe:
         self._limit = limit
         self._kept = bytearray()
         self.total = 0
+        # On POSIX the reader waits on the pipe and on this wake-up pipe together,
+        # so it can be told to stop without closing the pipe under it.
+        self._wake: tuple[int, int] | None = (
+            os.pipe() if stream is not None and os.name == "posix" else None
+        )
         self._thread = threading.Thread(target=self._read, daemon=True)
         self._thread.start()
 
@@ -319,7 +327,14 @@ class _BoundedPipe:
             return
         with contextlib.suppress(OSError, ValueError):
             descriptor = self._stream.fileno()
-            while chunk := os.read(descriptor, 65536):
+            while True:
+                if self._wake is not None:
+                    ready, _, _ = select.select([descriptor, self._wake[0]], [], [])
+                    if self._wake[0] in ready:
+                        return
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    return
                 self.total += len(chunk)
                 room = self._limit - len(self._kept)
                 if room > 0:
@@ -329,13 +344,31 @@ class _BoundedPipe:
     def over_limit(self) -> bool:
         return self.total > self._limit
 
-    def text(self, timeout: float) -> str:
-        """What was kept, once the writer closes the pipe or *timeout* passes."""
+    def close(self, timeout: float = 0.0) -> None:
+        """Stop the reader, then release the pipe once it has stopped.
+
+        A reader that does not stop in time (no wake-up pipe off POSIX) keeps
+        the descriptor open, rather than read from whatever reuses its number.
+        """
         self._thread.join(timeout)
-        if self._thread.is_alive() and self._stream is not None:
-            # Something outside the group still holds the pipe: stop reading.
+        if self._thread.is_alive() and self._wake is not None:
+            with contextlib.suppress(OSError):
+                os.write(self._wake[1], b"x")
+            self._thread.join(KILL_WAIT_S)
+        if self._thread.is_alive():
+            return
+        if self._stream is not None:
             with contextlib.suppress(OSError):
                 self._stream.close()
+        if self._wake is not None:
+            for descriptor in self._wake:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+            self._wake = None
+
+    def text(self, timeout: float) -> str:
+        """What was kept, once the writer closes the pipe or *timeout* passes."""
+        self.close(timeout)
         return self._kept.decode("utf-8", errors="replace")
 
 
@@ -380,20 +413,29 @@ def _run_clone(
     deadline = time.monotonic() + CLONE_TIMEOUT_S if deadline is None else deadline
     refusal: str | None = None
     timed_out = False
-    while True:
-        try:
-            proc.wait(timeout=CHECKOUT_POLL_S)
-            break
-        except subprocess.TimeoutExpired:
-            refusal = _over_budget(dest, max_bytes, max_entries)
-            if refusal is None and (out.over_limit or err.over_limit):
-                refusal = "git wrote more output than this server accepts; refusing it."
-            timed_out = time.monotonic() > deadline
-            if refusal is not None or timed_out:
-                _kill_process_group(proc)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=KILL_WAIT_S)
+    try:
+        while True:
+            try:
+                proc.wait(timeout=CHECKOUT_POLL_S)
                 break
+            except subprocess.TimeoutExpired:
+                refusal = _over_budget(dest, max_bytes, max_entries)
+                if refusal is None and (out.over_limit or err.over_limit):
+                    refusal = "git wrote more output than this server accepts; refusing it."
+                timed_out = time.monotonic() > deadline
+                if refusal is not None or timed_out:
+                    _kill_process_group(proc)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=KILL_WAIT_S)
+                    break
+    except BaseException:
+        # Ctrl-C never reaches git's own process group: stop it here, then re-raise.
+        _kill_process_group(proc)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=KILL_WAIT_S)
+        out.close()
+        err.close()
+        raise
     stdout, stderr = out.text(KILL_WAIT_S), err.text(KILL_WAIT_S)
     if refusal is None and (out.over_limit or err.over_limit):
         refusal = "git wrote more output than this server accepts; refusing it."

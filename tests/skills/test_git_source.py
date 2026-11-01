@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import os
 import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from pathlib import Path
 
@@ -296,6 +298,84 @@ def test_a_timed_out_clone_kills_the_helpers_holding_its_pipes(
         time.sleep(0.05)
     else:
         pytest.fail("the clone's helper process outlived the timeout")
+
+
+def test_an_interrupted_clone_stops_git_and_its_helpers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # git runs in its own process group, so Ctrl-C reaches only this process.
+    pids = tmp_path / "pids"
+    fake_git = _stand_in_git(
+        tmp_path / "busy-git.py",
+        "import subprocess, time\n"
+        "helper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        f"open({str(pids)!r}, 'w').write(f'{{os.getpid()}} {{helper.pid}}')\n"
+        "time.sleep(120)\n",
+    )
+    monkeypatch.setattr(git_source, "GIT", str(fake_git))
+    monkeypatch.setattr(git_source, "CHECKOUT_POLL_S", 0.05)
+    real_wait = subprocess.Popen.wait
+
+    def interrupted_wait(self: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        if timeout == git_source.CHECKOUT_POLL_S and pids.exists():
+            raise KeyboardInterrupt
+        return real_wait(self, timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", interrupted_wait)
+    with pytest.raises(KeyboardInterrupt):
+        git_source.clone_github_source("https://github.com/a/b.git", None, tmp_path / "r")
+    monkeypatch.undo()
+    for pid in map(int, pids.read_text().split()):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"process {pid} outlived the interrupted clone")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor reuse is a POSIX pipe property")
+def test_a_stopped_pipe_reader_never_reads_a_reused_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pipe is released only after its reader stops: otherwise a read still
+    # in flight could continue on whatever file reuses the descriptor number.
+    read_end, write_end = os.pipe()
+    stream = os.fdopen(read_end, "rb", buffering=0)
+    outstanding = threading.Event()
+    release = threading.Event()
+    real_read = os.read
+
+    def slow_first_read(descriptor: int, size: int) -> bytes:
+        if not outstanding.is_set():
+            outstanding.set()
+            release.wait(1)
+            return b"late"
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(git_source.os, "read", slow_first_read)
+    monkeypatch.setattr(git_source, "KILL_WAIT_S", 0.2)
+    pipe = git_source._BoundedPipe(stream, 1024)
+    os.write(write_end, b"x")  # wake a reader that waits for data first
+    assert outstanding.wait(5)
+    pipe.text(0.05)
+    replacement_read, replacement_write = os.pipe()
+    try:
+        os.write(replacement_write, b"replacement")
+        release.set()
+        pipe._thread.join(1)  # whatever the reader does next, it has had the chance
+        os.set_blocking(replacement_read, False)
+        assert real_read(replacement_read, 64) == b"replacement"
+    finally:
+        release.set()
+        for descriptor in (replacement_read, replacement_write, write_end):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
 
 def test_a_clone_fails_fast_on_a_stalled_transfer(
