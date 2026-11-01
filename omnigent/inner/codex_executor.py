@@ -2476,7 +2476,9 @@ def _build_initial_prompt(
     return "\n".join(lines)
 
 
-def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:
+def _prompt_for_turn(
+    messages: list[Message], *, is_new_thread: bool, after_interrupt: bool = False
+) -> str | list[CodexParams]:
     """
     Choose the prompt payload for a Codex turn.
 
@@ -2489,12 +2491,14 @@ def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | l
     :param messages: Conversation history.
     :param is_new_thread: ``True`` when starting a fresh Codex
         thread.
+    :param after_interrupt: ``True`` when the resumed thread's
+        previous turn was interrupted and no input has followed.
     :returns: A string prompt or a list of content block dicts.
     """
     if is_new_thread:
         return _build_initial_prompt(messages)
     latest_user_content = _extract_latest_user_content(messages)
-    marker = pending_interruption_marker(messages)
+    marker = pending_interruption_marker(messages) if after_interrupt else None
     if marker is None:
         return latest_user_content
     if isinstance(latest_user_content, list):
@@ -2842,6 +2846,8 @@ class _CodexAppServerSession:
         self._reader_started_turn: str | None = None
         self._reader_completed_turn: str | None = None
         self._interrupted_turn_id: str | None = None
+        # Whether the next turn's input must carry the runner's interruption marker.
+        self._interruption_marker_pending = False
         self._next_id = 1
         self._started = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -3735,7 +3741,11 @@ class _CodexAppServerSession:
                 if message.get("role") == "user":
                     message["content"] = goal_objective
                     break
-        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
+        after_interrupt = self._interruption_marker_pending
+        self._interruption_marker_pending = False
+        prompt = _prompt_for_turn(
+            prompt_messages, is_new_thread=is_new_thread, after_interrupt=after_interrupt
+        )
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
@@ -4269,6 +4279,7 @@ class _CodexAppServerSession:
         turn_id = self.active_turn_id
         if self.thread_id is None or turn_id is None:
             return False
+        self._interruption_marker_pending = True
         if turn_id in (self._interrupted_turn_id, self._reader_completed_turn):
             return True
         self._interrupted_turn_id = turn_id

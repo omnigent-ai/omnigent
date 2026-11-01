@@ -1678,7 +1678,9 @@ def _split_pi_prompt(blocks: list[_JsonObject]) -> tuple[str, list[dict[str, str
     return "\n".join(text_parts), images
 
 
-def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | list[_JsonObject]:
+def _build_pi_prompt(
+    messages: list[Message], *, is_first_turn: bool, after_interrupt: bool = False
+) -> str | list[_JsonObject]:
     """
     Build the prompt to send to Pi.
 
@@ -1694,6 +1696,8 @@ def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | l
     :param is_first_turn: ``True`` when this is the first turn
         against a freshly-started Pi subprocess, so the full
         history needs to be serialized into the prompt.
+    :param after_interrupt: ``True`` when the process's previous
+        prompt was aborted and no prompt has followed.
     :returns: A string prompt or a list of content block dicts.
     """
     user_messages = [m for m in messages if m.get("role") == "user"]
@@ -1711,7 +1715,7 @@ def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | l
         return "\n".join(lines)
 
     latest_user_content = _extract_latest_user_content(messages)
-    marker = pending_interruption_marker(messages)
+    marker = pending_interruption_marker(messages) if after_interrupt else None
     if marker is None:
         return latest_user_content
     if isinstance(latest_user_content, list):
@@ -3066,7 +3070,11 @@ class PiExecutor(Executor):
         state = self._session_states.get(session_key)
         is_first_turn = state is not None and not state._has_sent_prompt
 
-        prompt = _build_pi_prompt(messages, is_first_turn=is_first_turn)
+        prompt = _build_pi_prompt(
+            messages,
+            is_first_turn=is_first_turn,
+            after_interrupt=state is not None and state.abort_requested,
+        )
 
         if not prompt:
             # No prompt built (e.g. empty message list on a resumed session) —

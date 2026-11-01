@@ -417,16 +417,16 @@ class TestCodexExecutor(unittest.TestCase):
             {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
         ]
 
-        prompt = _prompt_for_turn(
-            [*interrupted_history, {"role": "user", "content": "Summarize instead."}],
-            is_new_thread=False,
-        )
+        follow_up = [*interrupted_history, {"role": "user", "content": "Summarize instead."}]
+        prompt = _prompt_for_turn(follow_up, is_new_thread=False, after_interrupt=True)
         self.assertEqual(prompt, f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        self.assertEqual(_prompt_for_turn(follow_up, is_new_thread=False), "Summarize instead.")
 
         image = {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}
         prompt = _prompt_for_turn(
             [*interrupted_history, {"role": "user", "content": [image]}],
             is_new_thread=False,
+            after_interrupt=True,
         )
         self.assertEqual(prompt, [{"type": "input_text", "text": INTERRUPTION_MARKER_TEXT}, image])
 
@@ -438,7 +438,77 @@ class TestCodexExecutor(unittest.TestCase):
             {"role": "assistant", "content": "Summary."},
             {"role": "user", "content": "Thanks."},
         ]
-        self.assertEqual(_prompt_for_turn(messages, is_new_thread=False), "Thanks.")
+        self.assertEqual(
+            _prompt_for_turn(messages, is_new_thread=False, after_interrupt=True), "Thanks."
+        )
+
+    def test_resumed_thread_sends_interruption_marker_once_after_textless_reply(self):
+        """A follow-up that ends without assistant text does not re-arm the marker."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {}},
+                    {"result": {"turn": {"id": "turn-2"}}},
+                    {"result": {"turn": {"id": "turn-3"}}},
+                ]
+            )
+            session._drain_turn_completed_tail = AsyncMock(return_value=None)
+            self.assertTrue(await session.interrupt_turn())
+
+            history = [
+                {"role": "user", "content": "Write a long essay."},
+                {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            ]
+            for turn_id, text in (("turn-2", "Summarize instead."), ("turn-3", "Thanks.")):
+                history.append({"role": "user", "content": text})
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": turn_id, "status": "completed"}},
+                    }
+                )
+                async with asyncio.timeout(10):
+                    events = [
+                        event
+                        async for event in session.run_turn(
+                            messages=list(history),
+                            tools=[],
+                            system_prompt="",
+                            model="gpt-5",
+                            cwd=".",
+                            sandbox="workspace-write",
+                        )
+                    ]
+                self.assertIsInstance(events[-1], TurnComplete)
+                self.assertFalse(events[-1].response)
+
+            turn_inputs = [
+                call.args[1]["input"]
+                for call in session._request.await_args_list
+                if call.args[0] == "turn/start"
+            ]
+            self.assertEqual(
+                turn_inputs,
+                [
+                    [
+                        {
+                            "type": "text",
+                            "text": f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.",
+                        }
+                    ],
+                    [{"type": "text", "text": "Thanks."}],
+                ],
+            )
+
+        _run(_t())
 
     def test_build_initial_prompt_keeps_user_attachments_as_native_blocks(self):
         # A fresh thread replaying multimodal history must keep image bytes as

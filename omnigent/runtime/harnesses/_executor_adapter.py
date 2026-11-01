@@ -227,6 +227,8 @@ class ExecutorAdapter(HarnessApp):
         # Set when the latest run_turn has unwound, so an interrupt can confirm the stop.
         self._turn_finished = asyncio.Event()
         self._turn_finished.set()
+        # The turn whose executor an unconfirmed interrupt already abandoned.
+        self._unconfirmed_interrupt_turn: asyncio.Event | None = None
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -618,17 +620,20 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
-            # Detach before background cleanup so a continuation cannot reuse this executor.
-            if not clean_exit:
-                abandoned_executor = self._executor
-                self._executor = None
-                interrupt_task = asyncio.create_task(
-                    self._safe_interrupt(abandoned_executor, self._session_key)
-                )
-                self._abandoned_executor_cleanup = interrupt_task
-                self._bg_tasks.add(interrupt_task)
-                interrupt_task.add_done_callback(self._bg_tasks.discard)
+            if self._unconfirmed_interrupt_turn is turn_finished:
+                self._unconfirmed_interrupt_turn = None
+            elif not clean_exit:
+                self._abandon_executor(self._executor)
             turn_finished.set()
+
+    def _abandon_executor(self, executor: Executor | None) -> None:
+        """Detach *executor*, then reap it in the background so no later turn can reuse it."""
+        if self._executor is executor:
+            self._executor = None
+        cleanup = asyncio.create_task(self._safe_interrupt(executor, self._session_key))
+        self._abandoned_executor_cleanup = cleanup
+        self._bg_tasks.add(cleanup)
+        cleanup.add_done_callback(self._bg_tasks.discard)
 
     async def _settle_interrupted_turn(
         self, event: ExecutorEvent, turn_events: AsyncIterator[ExecutorEvent]
@@ -665,7 +670,8 @@ class ExecutorAdapter(HarnessApp):
         Extends the base handler to also call ``interrupt_session`` — ensuring the in-flight
         generation stops even when the run loop is blocked awaiting the first token. When the
         executor keeps its native session, waits for the turn to end so the next turn cannot
-        reach a session that is still running; an unconfirmed stop closes that session.
+        reach a session that is still running; an unconfirmed stop drops the executor at once
+        and reaps it in the background, so the response stays within the runner's deadline.
         """
         response = await super()._handle_interrupt_event()
         executor = self._executor
@@ -680,13 +686,15 @@ class ExecutorAdapter(HarnessApp):
                 await executor.interrupt_session(self._session_key)
                 await turn_finished.wait()
         except Exception:
+            if turn_finished.is_set():
+                return response
             _logger.warning(
-                "inner session %s did not confirm the interrupt; closing it",
+                "inner session %s did not confirm the interrupt; dropping it",
                 self._session_key,
                 exc_info=True,
             )
-            with contextlib.suppress(Exception):
-                await executor.close_session(self._session_key)
+            self._unconfirmed_interrupt_turn = turn_finished
+            self._abandon_executor(executor)
         return response
 
     async def _prepare_turn_retry(self) -> bool:

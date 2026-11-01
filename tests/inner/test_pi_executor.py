@@ -6777,8 +6777,16 @@ def test_settled_aborted_message_evicts_session() -> None:
     _run(_test())
 
 
-def test_settled_requested_abort_keeps_session_and_next_prompt_sends_marker() -> None:
-    """A user abort reads on to settlement, so the kept process resumes with the marker."""
+@pytest.mark.parametrize("pi_version", [_SETTLED_PI_VERSION, (0, 80, 3), None])
+def test_settled_requested_abort_keeps_session_and_next_prompt_sends_marker(
+    pi_version: tuple[int, int, int] | None,
+) -> None:
+    """A user abort reads on to the run's boundary; the kept process gets the marker once."""
+
+    def at_boundary(lines: list[str]) -> list[str]:
+        if pi_version == _SETTLED_PI_VERSION:
+            return lines
+        return [line for line in lines if json.loads(line)["type"] != "agent_settled"]
 
     async def _test() -> None:
         aborted = _assistant_message("partial", stop_reason="aborted", error_message="aborted")
@@ -6787,7 +6795,8 @@ def test_settled_requested_abort_keeps_session_and_next_prompt_sends_marker() ->
                 _rpc_frame(type="response", success=True),
                 _rpc_frame(type="message_start", message={"role": "assistant"}),
                 _text_delta_frame("partial"),
-            ]
+            ],
+            pi_version=pi_version,
         )
         first_message = {
             "role": "user",
@@ -6799,34 +6808,33 @@ def test_settled_requested_abort_keeps_session_and_next_prompt_sends_marker() ->
 
         assert await executor.interrupt_session(_SESSION_KEY)
         assert await executor.interrupt_session(_SESSION_KEY)
-        for frame in (
-            _rpc_frame(type="response", command="abort", success=True),
-            _rpc_frame(type="message_end", message=aborted),
-            _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
-            _rpc_frame(type="agent_settled"),
-            *_plain_answer_frames("SUMMARY"),
+        for frame in at_boundary(
+            [
+                _rpc_frame(type="response", command="abort", success=True),
+                _rpc_frame(type="message_end", message=aborted),
+                _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+                _rpc_frame(type="agent_settled"),
+                *_plain_answer_frames(""),
+                *_plain_answer_frames("THANKS"),
+            ]
         ):
             rpc._line_queue.put_nowait(frame)
         first_rest = [event async for event in turn]
-        second_events = [
-            event
-            async for event in executor.run_turn(
-                [
-                    first_message,
-                    {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
-                    {"role": "user", "content": "Summarize instead.", "session_id": _SESSION_KEY},
-                ],
-                [],
-                "system",
+        history = [first_message, {"role": "user", "content": INTERRUPTION_MARKER_TEXT}]
+        follow_ups = []
+        for text in ("Summarize instead.", "Thanks."):
+            history.append({"role": "user", "content": text, "session_id": _SESSION_KEY})
+            follow_ups.append(
+                [event async for event in executor.run_turn(list(history), [], "system")]
             )
-        ]
 
         assert [type(e) for e in first_rest] == [TurnComplete]
-        assert [e.response for e in second_events if isinstance(e, TurnComplete)] == ["SUMMARY"]
+        assert [e.response for e in follow_ups[1] if isinstance(e, TurnComplete)] == ["THANKS"]
         assert _SESSION_KEY in executor._session_states
         commands = [json.loads(line) for line in rpc.process.stdin.data]
-        assert [command["type"] for command in commands] == ["prompt", "abort", "prompt"]
+        assert [command["type"] for command in commands] == ["prompt", "abort", "prompt", "prompt"]
         assert commands[2]["message"] == f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."
+        assert commands[3]["message"] == "Thanks."
         assert rpc._line_queue.empty()
 
     _run(_test())

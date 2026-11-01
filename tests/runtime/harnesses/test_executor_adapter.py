@@ -2795,9 +2795,10 @@ class _KeptSessionExecutor(Executor):
     """Executor that keeps its native session across an interrupt.
 
     :param stop_outcome: What the native turn yields once interrupted.
+    :param blocking_close: Whether ``close_session`` waits for ``close_released``.
     """
 
-    def __init__(self, stop_outcome: str) -> None:
+    def __init__(self, stop_outcome: str, *, blocking_close: bool = False) -> None:
         import asyncio
 
         super().__init__()
@@ -2807,6 +2808,10 @@ class _KeptSessionExecutor(Executor):
         self.turn_unwound = False
         self.interrupted: list[str] = []
         self.closed: list[str] = []
+        self.close_requested = asyncio.Event()
+        self.close_released = asyncio.Event()
+        if not blocking_close:
+            self.close_released.set()
 
     def resumes_after_interrupt(self) -> bool:
         return True
@@ -2829,6 +2834,9 @@ class _KeptSessionExecutor(Executor):
             elif self.stop_outcome == "keeps_streaming":
                 yield TextChunk(text=" more")
                 await asyncio.Event().wait()
+            elif self.stop_outcome == "ends_after_close":
+                await self.close_requested.wait()
+                yield TextChunk(text=" more")
         finally:
             self.turn_unwound = True
 
@@ -2838,10 +2846,12 @@ class _KeptSessionExecutor(Executor):
         return True
 
     async def close_session(self, session_key: str) -> None:
+        self.close_requested.set()
+        await self.close_released.wait()
         self.closed.append(session_key)
 
 
-async def _interrupt_kept_session_turn(stop_outcome: str):
+async def _interrupt_kept_session_turn(stop_outcome: str, *, blocking_close: bool = False):
     """Start a turn on a :class:`_KeptSessionExecutor`, interrupt it, and return the pieces."""
     import asyncio
 
@@ -2849,7 +2859,7 @@ async def _interrupt_kept_session_turn(stop_outcome: str):
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    executor = _KeptSessionExecutor(stop_outcome)
+    executor = _KeptSessionExecutor(stop_outcome, blocking_close=blocking_close)
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
     ctx = TurnContext(response_id="resp_1", event_queue=asyncio.Queue(), cancelled=asyncio.Event())
     adapter._in_flight["resp_1"] = ctx
@@ -2898,21 +2908,56 @@ async def test_interrupted_turn_that_does_not_end_cleanly_detaches_executor(
 async def test_interrupt_closes_kept_session_when_turn_never_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unconfirmed stop closes the native session before the interrupt returns."""
+    """An unconfirmed stop drops the executor and returns before its slow cleanup ends."""
     import asyncio
 
     monkeypatch.setattr(
         "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
     )
-    adapter, executor, run_task, response = await _interrupt_kept_session_turn("never_stops")
+    adapter, executor, run_task, response = await _interrupt_kept_session_turn(
+        "never_stops", blocking_close=True
+    )
 
     assert response.status_code == 204
+    assert adapter._executor is None
+    cleanup = adapter._abandoned_executor_cleanup
+    assert cleanup is not None
+    await asyncio.wait_for(executor.close_requested.wait(), timeout=5)
+    assert not cleanup.done()
+    executor.close_released.set()
+    assert await asyncio.wait_for(cleanup, timeout=5)
     assert executor.closed == ["sk"]
     assert not run_task.done()
     run_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await run_task
     assert adapter._executor is None
+
+
+@pytest.mark.asyncio
+async def test_turn_ending_after_unconfirmed_interrupt_detaches_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn ending after an unconfirmed interrupt leaves the next turn's executor attached."""
+    import asyncio
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
+    )
+    adapter, executor, run_task, response = await _interrupt_kept_session_turn("ends_after_close")
+
+    assert response.status_code == 204
+    assert adapter._executor is None, (
+        "the executor whose native session the interrupt closes must not serve the next turn"
+    )
+    replacement = _KeptSessionExecutor("completes")
+    adapter._executor_factory = lambda: replacement
+    assert adapter._ensure_executor() is replacement
+    await asyncio.wait_for(run_task, timeout=5)
+    assert executor.turn_unwound
+    assert executor.closed == ["sk"]
+    assert adapter._executor is replacement
+    assert replacement.closed == []
 
 
 def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None:

@@ -4,14 +4,13 @@ Real web SPA, live server and runner, real codex / claude / pi CLIs against the
 mock model. Turn 1 completes, turn 2 is interrupted from the composer while its
 model reply is still in flight, then turn 3 asks the agent to continue. A harness that started over
 sends its first model request as a ``Conversation so far:`` transcript replay;
-a continued session sends only the new message.
+a continued session sends only the new message, led by the interruption marker.
 """
 
 from __future__ import annotations
 
 import json
 import shutil
-import time
 import uuid
 
 import httpx
@@ -19,11 +18,13 @@ import pytest
 import yaml
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _FRESH_SESSION_REPLAY = "Conversation so far:"
+_INTERRUPTION_MARKER = "[System: interrupted]"
 _HARNESS_CLI = {"codex": "codex", "claude-sdk": "claude", "pi": "pi"}
 _LONG_REPLY = " ".join(f"section{index:02d}" for index in range(1, 61))
 # The mock sends Messages and Chat Completions text in one delta, so hold those replies instead.
@@ -76,13 +77,6 @@ def _requests_for_turn(mock_llm_server_url: str, token: str, later_tokens: list[
     return [body for body in bodies if token in body and not any(t in body for t in later_tokens)]
 
 
-def _wait_for_turn_request(mock_llm_server_url: str, token: str, timeout_s: float) -> None:
-    deadline = time.monotonic() + timeout_s
-    while not _requests_for_turn(mock_llm_server_url, token, []):
-        assert time.monotonic() < deadline, f"no model request for {token} within {timeout_s}s"
-        time.sleep(0.5)
-
-
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize("harness", ["codex", "claude-sdk", "pi"])
 def test_follow_up_after_interrupt_continues_harness_session(
@@ -123,7 +117,7 @@ def test_follow_up_after_interrupt_continues_harness_session(
 
     _send(page, f"Write the long report now. {tokens[1]}")
     expect(interrupt).to_be_visible(timeout=60_000)
-    _wait_for_turn_request(mock_llm_server_url, tokens[1], timeout_s=60)
+    poll_until(lambda: _requests_for_turn(mock_llm_server_url, tokens[1], []), timeout_s=60)
     if harness == "codex":
         expect(assistant.filter(has_text="section04")).to_be_visible(timeout=60_000)
     interrupt.click()
@@ -147,4 +141,13 @@ def test_follow_up_after_interrupt_continues_harness_session(
     assert not replays, (
         f"after Interrupt the {harness} follow-up started a fresh harness session: its model "
         f"request replays the transcript instead of continuing the session: {replays[0][:900]}"
+    )
+    marked = [
+        body
+        for body in continued_turn
+        if body.count(_INTERRUPTION_MARKER) == 1
+        and body.index(_INTERRUPTION_MARKER) < body.index(tokens[2])
+    ]
+    assert marked and all(body.count(_INTERRUPTION_MARKER) <= 1 for body in continued_turn), (
+        f"the {harness} follow-up must carry the interruption marker once, before the new input"
     )
