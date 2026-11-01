@@ -221,7 +221,7 @@ def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
 
 
 _STATE_VERSION = 1
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "opencode-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "opencode-native"
 _ID_HASH_CHARS = 32
 
 

@@ -41,6 +41,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
+    from omnigent.onboarding.sandboxes.profiles import (
+        ProviderSandboxProfile,
+        SandboxProfileContext,
+    )
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
@@ -689,6 +693,26 @@ class SandboxLifecycle(ABC):
             "own tooling."
         )
 
+    def stop(self, sandbox_id: str) -> None:
+        """
+        Stop a sandbox's compute without deleting it, so :meth:`resume` can
+        restart the SAME sandbox with its filesystem intact.
+
+        Optional capability: the default implementation raises
+        :class:`SandboxCapabilityError`. Providers that implement
+        :meth:`resume` may override it to park an idle sandbox at
+        storage-only cost. Implementations must treat an already stopped
+        or archived sandbox as success.
+
+        :param sandbox_id: The sandbox to stop, e.g. ``"sb-a1b2c3"``.
+        :raises SandboxCapabilityError: When the provider cannot stop a
+            sandbox without deleting it.
+        :raises SandboxGoneError: When the sandbox generation definitively no
+            longer exists.
+        :raises click.ClickException: If the stop fails.
+        """
+        raise self._capability_error("stop a sandbox without deleting it")
+
     def resume(self, sandbox_id: str) -> None:
         """
         Resume a stopped sandbox in place, reattaching its persistent
@@ -936,6 +960,35 @@ class SandboxHostLauncher(SandboxLifecycle):
     class directly and override :meth:`start_host` without needing any exec
     transport.
     """
+
+    manages_profiles: ClassVar[bool] = False
+    """Own profile discovery, permissions, and configuration; mirror in registry metadata."""
+
+    supports_sandbox_profile_lookup: ClassVar[bool] = False
+    """Whether sandbox-scoped discovery returns the durable assigned revision."""
+
+    def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile]:
+        """Return only profiles currently authorized for the trusted caller context.
+
+        Use bounded provider I/O, including explicit network timeouts. This
+        synchronous hook must not provision resources or perform launch preflight.
+        Return public metadata only; keep configuration and access rules private.
+        """
+        raise self._capability_error("list provider-managed sandbox profiles")
+
+    def select_profile(
+        self, context: SandboxProfileContext, profile: ProviderSandboxProfile
+    ) -> None:
+        """Re-authorize an exact revision and configure this launcher for its use.
+
+        Re-read current access and settings using bounded provider I/O. Raise
+        SandboxProfileAccessDenied for revoked access or SandboxProfileChanged
+        if the requested revision is unavailable; never silently use a newer one.
+        Configure this instance before prepare_for_launch, prepare, provision,
+        or resume. Do not provision resources or perform launch preflight here.
+        A previous list_profiles result is not proof of current authorization.
+        """
+        raise self._capability_error("select provider-managed sandbox profiles")
 
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.

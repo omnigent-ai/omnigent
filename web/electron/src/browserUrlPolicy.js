@@ -1,21 +1,18 @@
-// Allowlist for AGENT-driven browser navigation (the URL-bar path
-// stays permissive — it's a user gesture). An unguarded model-issued loadURL
-// could point the view at file:// / cloud-metadata / loopback / private hosts
-// and read the bytes back via screenshot (SSRF + local-file read + exfil).
-// Runs in the main process (gate holds regardless of caller); Electron-free,
-// with DNS injectable, so `node --test` can exercise it without Electron.
+// Policy for all renderer-issued browser navigation, including the URL bar.
+// Main enforces URL, DNS and connected-address checks so pages cannot expose
+// private hosts or privileged schemes through browser actions such as screenshots.
 
 "use strict";
 
 const dns = require("node:dns");
 
-// Schemes the agent may navigate to; everything else (file:, chrome:, data:,
+// Schemes a policy-enforced view may navigate to; everything else (file:, chrome:, data:,
 // javascript:, ...) is a privileged surface or code channel and is rejected.
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
-// The exact loopback hosts an eligible Arca agent context may open. Other
+// The exact loopback hosts an eligible session context may open. Other
 // loopback spellings and DNS names that resolve to loopback stay blocked.
-const ARCA_LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
  * Parse a dotted-quad IPv4 host into four octets, or null if not IPv4. The
@@ -170,8 +167,8 @@ function isBlockedHostname(hostname) {
 }
 
 /**
- * Decide whether an AGENT-issued navigation to `url` is allowed: `{ ok: true }`
- * for an http(s) URL to a non-internal host (or eligible Arca loopback), else
+ * Decide whether a renderer-issued navigation to `url` is allowed: `{ ok: true }`
+ * for an http(s) URL to a non-internal host (or eligible loopback), else
  * `{ ok: false, error }`. Never throws — an unparseable URL is a rejection.
  * Judges the URL alone; `checkAgentNavigation` adds DNS resolution.
  *
@@ -195,7 +192,7 @@ function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
     };
   }
   const hostname = parsed.hostname;
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) {
+  if (allowLocalhost && LOOPBACK_HOSTS.has(hostname)) {
     return { ok: true };
   }
   if (isBlockedHostname(hostname)) {
@@ -234,7 +231,7 @@ async function checkAgentNavigation(
   const verdict = isAgentNavigationAllowed(url, { allowLocalhost });
   if (!verdict.ok) return verdict;
   const { hostname } = new URL(url);
-  if ((allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
+  if ((allowLocalhost && LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
     return verdict;
   }
   let addresses = [];
@@ -271,7 +268,7 @@ function isAgentConnectionAllowed(url, ip, { allowLocalhost = false } = {}) {
   } catch {
     // Judge the address alone.
   }
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) return { ok: true };
+  if (allowLocalhost && LOOPBACK_HOSTS.has(hostname)) return { ok: true };
   if (!ip) {
     return {
       ok: false,
