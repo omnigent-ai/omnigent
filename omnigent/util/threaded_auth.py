@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import threading
 from collections.abc import AsyncGenerator
 
 import httpx
+
+from omnigent.util.dedicated_executor import DedicatedExecutor
+
+# Credential steps get their own threads so a backed-up default executor
+# cannot hold every authenticated request.
+_AUTH_EXECUTOR = DedicatedExecutor(max_workers=4, thread_name_prefix="threaded-auth")
 
 
 class ThreadedAuth(httpx.Auth):
@@ -35,11 +40,11 @@ class ThreadedAuth(httpx.Auth):
                 flow.close()
 
         try:
-            next_request = await asyncio.to_thread(advance, None)
+            next_request = await _AUTH_EXECUTOR.run(advance, None)
             while next_request is not None:
                 response = yield next_request
                 if self.requires_response_body:
                     await response.aread()
-                next_request = await asyncio.to_thread(advance, response)
+                next_request = await _AUTH_EXECUTOR.run(advance, response)
         finally:
-            await asyncio.to_thread(close)
+            await _AUTH_EXECUTOR.run(close)

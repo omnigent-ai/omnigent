@@ -524,6 +524,20 @@ def get_mock_requests(
     return resp.json()["requests"]
 
 
+def get_mock_message_requests(mock_llm_server_url: str, *, key: str | None = None) -> list[dict]:
+    """
+    Retrieve captured Anthropic Messages requests with their beta flags.
+
+    :param mock_llm_server_url: Mock server URL.
+    :param key: When set, only return requests whose ``model`` field matches this key.
+    :returns: Entries shaped ``{"body": <request body>, "betas": [<flag>, ...]}``.
+    """
+    params = {"key": key} if key is not None else {}
+    resp = httpx.get(f"{mock_llm_server_url}/mock/message_requests", params=params, timeout=5.0)
+    resp.raise_for_status()
+    return resp.json()["requests"]
+
+
 @pytest.fixture(scope="session")
 def openai_judge_api_key(
     llm_api_key: str,
