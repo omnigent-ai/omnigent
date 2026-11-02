@@ -14,6 +14,9 @@ the creation modal with its integration settings ready to customize.
   filtered-empty lists do not.
 - `create`: a gallery item or empty-state preview opens integration setup;
   New automation opens a blank form.
+- `workspace`: connected-host setup disables workspace browsing while the
+  selected host is offline and asks the user to connect it. Reconnecting enables
+  browsing again; saved paths and sandbox setup are preserved.
 - `capabilities`: Jira, Slack, and GitHub templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `responsive`: gallery items have icons, descriptions, hourly polling summaries,
@@ -27,6 +30,8 @@ the creation modal with its integration settings ready to customize.
 - **Empty state:** open Your automations with no saved automations and select
   a preview beneath the empty-state message.
 - **Creation modal:** click New automation on either tab to start from scratch.
+- **Editing:** open Edit automation from a row menu or a task's detail page;
+  the same connected-host workspace availability applies.
 - **Mobile web:** use the same tabs and creation paths after opening Automations.
 - **Managed embedded:** open Automations through the host navigation; tabs,
   gallery, and modal use the same components under the host's mount path.
@@ -43,6 +48,9 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
   filter preservation, deep links with an embedded mount prefix, load failures,
   capability gating, and both creation buttons' paths.
+- `web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx` covers offline
+  workspace browsing in create/edit setup, disconnect/reconnect, preserving a
+  saved workspace, and sandbox creation with offline connected hosts.
 - Manually repeat the three creation entry points at a narrow viewport, use
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
