@@ -87,8 +87,8 @@ export interface TriggerTemplate {
   source: TriggerSource;
   icon: LucideIcon;
   iconClassName: string;
-  /** Chip label on the Automations page. */
   title: string;
+  description: string;
   /** Prefilled task name. */
   name: string;
   /**
@@ -115,6 +115,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     icon: TicketIcon,
     iconClassName: "text-blue-600 dark:text-blue-400",
     title: "Jira tickets",
+    description:
+      "Watch for matching tickets and start a session to investigate or work on each one.",
     name: "Jira tickets",
     events: [
       { id: "created", label: "Ticket created", authorAction: "create a ticket in this project" },
@@ -150,6 +152,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     icon: HashIcon,
     iconClassName: "text-purple-600 dark:text-purple-400",
     title: "Slack messages",
+    description:
+      "Watch channels for matching messages and start a session to respond or investigate.",
     name: "Slack messages",
     events: [{ id: "posted", label: "Message posted", authorAction: "post in this channel" }],
     scopeLabel: "in channel",
@@ -174,6 +178,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     icon: CircleDotIcon,
     iconClassName: "text-emerald-600 dark:text-emerald-500",
     title: "GitHub issues",
+    description:
+      "Watch for new issues or pull requests and start a session to work on matching items.",
     name: "GitHub issues",
     events: [
       { id: "issue", label: "Issue opened", authorAction: "open an issue in this repository" },

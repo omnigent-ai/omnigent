@@ -265,7 +265,6 @@ def test_automations_introduction_first_visit(
     expect(intro).not_to_be_visible()
     expect(page.get_by_role("button", name="About automations")).to_be_focused()
     page.get_by_test_id("new-task-button").click()
-    page.get_by_role("menuitem", name="Create manually", exact=True).click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
     expect(intro).not_to_be_visible()
 
@@ -403,7 +402,6 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     _open_automations_page(page, live_server)
 
     page.get_by_test_id("new-task-button").click()
-    page.get_by_role("menuitem", name="Create manually", exact=True).click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(typed_name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
@@ -559,7 +557,6 @@ def _open_create_dialog(page: Page) -> None:
     :param page: Playwright page already navigated to ``/tasks``.
     """
     page.get_by_test_id("new-task-button").click()
-    page.get_by_role("menuitem", name="Create manually", exact=True).click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
         "new-chat-landing-agent-select"
@@ -1010,19 +1007,55 @@ def test_scheduled_task_create_persists_continuing_one_session(
 
 
 @pytest.mark.usefixtures("online_host")
+@pytest.mark.parametrize("entry", ["preview", "templates"])
 def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page: Page,
     live_server: str,
+    entry: str,
 ) -> None:
-    """The Jira trigger chip saves an hourly continue task with the rendered prompt."""
+    """Gallery and empty-state preview save the same hourly continuing task."""
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
     _open_automations_page(page, live_server)
-    page.get_by_test_id("new-task-button").click()
-    page.get_by_role("menuitem", name="Create from template", exact=True).click()
-    expect(page).to_have_url(f"{live_server}/tasks/templates")
-    page.reload()
-    expect(page.get_by_role("heading", name="Automation templates")).to_be_visible()
+    if entry == "templates":
+        page.set_viewport_size({"width": 1280, "height": 650})
+        heading = page.get_by_role("heading", name="Automations", exact=True)
+        original_heading = heading.bounding_box()
+        assert original_heading is not None
+        page.get_by_role("tab", name="Templates", exact=True).click()
+        expect(page).to_have_url(f"{live_server}/tasks?view=templates")
+        expect(page.get_by_role("region", name="Automation templates")).to_be_visible()
+        template_heading = heading.bounding_box()
+        assert template_heading is not None
+        assert template_heading["x"] == original_heading["x"]
+        assert template_heading["y"] == original_heading["y"]
+        templates_tab = page.get_by_role("tab", name="Templates", exact=True)
+        yours_tab = page.get_by_role("tab", name="Your automations", exact=True)
+        expect(templates_tab).to_have_css("outline-style", "none")
+        page.keyboard.press("ArrowLeft")
+        expect(yours_tab).to_be_focused()
+        expect(yours_tab).to_have_css("outline-style", "solid")
+        page.keyboard.press("ArrowRight")
+        expect(templates_tab).to_be_focused()
+        expect(templates_tab).to_have_css("outline-style", "solid")
+        templates_tab.click()
+        expect(templates_tab).to_have_css("outline-style", "none")
+        page.keyboard.press("Shift+Tab")
+        expect(page.get_by_test_id("new-task-button")).to_be_focused()
+        page.keyboard.press("Tab")
+        expect(templates_tab).to_be_focused()
+        expect(templates_tab).to_have_css("outline-style", "solid")
+        page.get_by_role("tab", name="Your automations", exact=True).click()
+        expect(yours_tab).to_have_css("outline-style", "none")
+        expect(page).to_have_url(f"{live_server}/tasks")
+        page.go_back()
+        expect(page).to_have_url(f"{live_server}/tasks?view=templates")
+        page.reload()
+        expect(page.get_by_role("tab", name="Templates", exact=True)).to_have_attribute(
+            "aria-selected", "true"
+        )
     page.get_by_test_id("suggestion-trigger-jira").click()
+    expect(page.get_by_test_id("task-name-input")).to_have_value("Jira tickets")
+    expect(page.get_by_test_id("task-template-trigger")).to_have_count(0)
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(name)
     page.get_by_test_id("task-trigger-scope").fill("ES")
@@ -1032,7 +1065,8 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(page.get_by_test_id("create-scheduled-task-dialog")).not_to_be_visible()
-    page.get_by_role("link", name="Back to automations").click()
+    if entry == "templates":
+        page.get_by_role("tab", name="Your automations", exact=True).click()
     expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)
