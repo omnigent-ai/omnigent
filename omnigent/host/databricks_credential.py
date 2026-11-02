@@ -39,6 +39,7 @@ import logging
 import os
 import shlex
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -184,17 +185,25 @@ def _write_sidecar(
         "host_token": host_token,
         "workspace_host": workspace_host,
     }
+    temporary_path: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Create 0600 atomically so the launch token is never briefly world/group
-        # readable, and fail closed if secure perms can't be guaranteed.
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # Keep complete coordinates available to helpers until the 0600 replacement
+        # is ready. A failed write must leave the previous sidecar intact.
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
             json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
     except OSError:
         return False
+    finally:
+        if temporary_path is not None:
+            with contextlib.suppress(OSError):
+                temporary_path.unlink()
     return True
 
 
