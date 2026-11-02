@@ -625,7 +625,8 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "evidence", ["permission_prompt", "pane_output", "pane_input", "no_evidence"]
+    "evidence",
+    ["permission_prompt", "background_agent", "pane_output", "pane_input", "no_evidence"],
 )
 async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     tmp_path: Path,
@@ -635,8 +636,9 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     """A pane that reads idle but shows live work keeps the idle watchdog open.
 
     The pane watcher publishes ``idle`` once the pane goes quiet, which a
-    permission prompt does too. The pane reaper spares such a pane for the
-    prompt marker or recent output and input; the watchdog must do the same.
+    permission prompt does too, and so does a turn that left a background agent
+    working. The pane reaper spares such a pane for the prompt marker, the agent,
+    or recent output and input; the watchdog must do the same.
 
     :param tmp_path: Pytest temp dir for the approval-wait marker root.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -693,6 +695,11 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
             spec_resolver=await _spec_resolver_returning(spec),
             server_client=server_client,
             terminal_registry=terminals,
+        )
+        monkeypatch.setattr(
+            app.state.session_resource_registry,
+            "session_has_background_agents",
+            lambda session_id: evidence == "background_agent" and session_id == conv_id,
         )
         async with _runner_client(app) as client:
             ensured = await client.post(

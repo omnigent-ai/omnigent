@@ -45,6 +45,7 @@ def _poller(
     turn_is_active: Callable[[], bool] | None = None,
     turn_activity_epoch: Callable[[], int] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    background_agents_after_turn: Callable[[], bool] | None = None,
 ) -> ClaudeProgramStatusPoller:
     def on_status(status: str, _reason: str | None) -> None:
         published.append(status)
@@ -61,7 +62,41 @@ def _poller(
         turn_is_active=turn_is_active,
         turn_activity_epoch=turn_activity_epoch,
         clock=clock,
+        background_agents_after_turn=background_agents_after_turn,
     )
+
+
+def test_working_report_reads_idle_while_a_settled_turn_runs_a_background_agent(
+    tmp_path: Path,
+) -> None:
+    """Claude reports working for a background agent that outlives its turn."""
+    path = tmp_path / "program-status.json"
+    _write_report(path, {"state": "working", "app": "claude-code"})
+    agent_after_turn = [False]
+    published: list[str] = []
+    poller = _poller(
+        tmp_path, path, published, background_agents_after_turn=lambda: agent_after_turn[0]
+    )
+    poller.tick()
+    assert published == ["running"]
+
+    agent_after_turn[0] = True
+    poller.tick()
+    poller.tick()
+    assert published == ["running", "idle"]
+    assert poller.holding_background_agents is True
+
+    _write_report(path, {"state": "blocked", "kind": "permission", "message": "allow?"})
+    poller.tick()
+    assert published == ["running", "idle", "running"]
+    assert poller.holding_background_agents is False
+
+    _write_report(path, {"state": "working", "app": "claude-code"})
+    poller.tick()
+    agent_after_turn[0] = False
+    poller.tick()
+    assert published == ["running", "idle", "running", "idle", "running"]
+    assert poller.holding_background_agents is False
 
 
 def test_error_report_without_a_hook_edge_fails_the_turn_once(tmp_path: Path) -> None:

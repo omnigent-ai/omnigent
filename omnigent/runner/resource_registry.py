@@ -739,6 +739,16 @@ class SessionResourceRegistry:
         with self._lock:
             return session_id in self._active_session_turns
 
+    def session_has_background_agents(self, session_id: str) -> bool:
+        """Whether a settled Claude turn still has a background agent working.
+
+        Such a session reads idle so it accepts follow-ups, but its pane holds
+        live work that idle shutdown and the pane reaper must spare.
+        """
+        with self._lock:
+            poller = self._status_pollers.get(session_id)
+        return poller is not None and poller.holding_background_agents
+
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
 
@@ -1791,6 +1801,7 @@ class SessionResourceRegistry:
         """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity."""
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
+            read_background_agents_after_turn,
             read_claude_session_id,
         )
         from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -1807,6 +1818,12 @@ class SessionResourceRegistry:
             except Exception:  # noqa: BLE001 - best-effort cross-check; never break the watcher.
                 return None
 
+        def _background_agents_after_turn() -> bool:
+            try:
+                return read_background_agents_after_turn(bridge_dir)
+            except Exception:  # noqa: BLE001 - an unreadable mark reports Claude's status as is.
+                return False
+
         reader = getattr(instance, "program_status", None)
         fallback = SessionStatusPoller(
             on_status=on_status,
@@ -1815,6 +1832,7 @@ class SessionResourceRegistry:
             ),
             session_id_getter=_session_id_getter,
             omnigent_session_id=session_id,
+            background_agents_after_turn=_background_agents_after_turn,
         )
         if reader is not None:
             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
@@ -1828,6 +1846,7 @@ class SessionResourceRegistry:
                 terminal_launch_id=instance.lifecycle_trace.launch_id,
                 turn_is_active=lambda: self.session_turn_is_active(session_id),
                 turn_activity_epoch=lambda: self.session_activity_epoch(session_id),
+                background_agents_after_turn=_background_agents_after_turn,
             )
         return fallback
 

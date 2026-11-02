@@ -59,6 +59,7 @@ from omnigent.harnesses.claude_native.bridge import (
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
+    read_background_agents_after_turn,
     read_claude_session_id,
     read_hook_events_from_offset,
     read_launch_model,
@@ -834,6 +835,56 @@ def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> No
 
     assert read_transcript_path(bridge_dir) == transcript_path
     assert read_claude_session_id(bridge_dir) == "claude-session"
+
+
+@pytest.mark.parametrize(
+    ("background_tasks", "agent_running"),
+    [
+        ([{"id": "a1", "type": "subagent", "status": "running"}], True),
+        ([{"id": "a1", "type": "local_agent"}], True),
+        ([{"id": "a1", "type": "agent", "status": "completed"}], False),
+        ([{"id": "b1", "type": "local_bash", "status": "running"}], False),
+        (None, False),
+    ],
+)
+def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
+    tmp_path: Path, background_tasks: list[dict[str, str]] | None, agent_running: bool
+) -> None:
+    """A main-session Stop records whether it left an unfinished background agent."""
+    bridge_dir = tmp_path / "bridge"
+    stop: dict[str, Any] = {"hook_event_name": "Stop", "session_id": "claude-session"}
+    if background_tasks is not None:
+        stop["background_tasks"] = background_tasks
+
+    record_hook_event(bridge_dir, stop)
+
+    assert read_background_agents_after_turn(bridge_dir) is agent_running
+
+
+@pytest.mark.parametrize("next_event", ["UserPromptSubmit", "StopFailure", "SessionStart"])
+def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
+    tmp_path: Path, next_event: str
+) -> None:
+    """Only the main session's next turn clears the mark; the agent's own hooks do not."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "background_tasks": [{"id": "a1", "type": "subagent", "status": "running"}],
+        },
+    )
+    for child_event in ("UserPromptSubmit", "Stop"):
+        record_hook_event(
+            bridge_dir,
+            {"hook_event_name": child_event, "session_id": "claude-session", "agent_id": "a1"},
+        )
+    assert read_background_agents_after_turn(bridge_dir) is True
+
+    record_hook_event(bridge_dir, {"hook_event_name": next_event, "session_id": "claude-session"})
+
+    assert read_background_agents_after_turn(bridge_dir) is False
 
 
 @pytest.mark.parametrize("updated_file", ["hook_identity", "model_vocabulary"])

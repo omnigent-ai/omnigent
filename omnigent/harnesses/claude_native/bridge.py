@@ -3046,6 +3046,12 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
                 seen = read_seen_claude_session_ids(bridge_dir)
                 seen.add(claude_session_id)
                 state["seen_claude_session_ids"] = sorted(seen)
+            if event_name == "Stop":
+                state["background_agents_after_turn"] = _has_running_background_agent(
+                    payload.get("background_tasks")
+                )
+            elif event_name in {"UserPromptSubmit", "StopFailure", "SessionStart"}:
+                state["background_agents_after_turn"] = False
         else:
             _logger.debug(
                 "Ignoring identity fields from side-channel hook event; "
@@ -3096,6 +3102,21 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     if not isinstance(raw, str) or not raw:
         return None
     return raw
+
+
+def read_background_agents_after_turn(bridge_dir: Path) -> bool:
+    """
+    Return whether the main session's last turn ended with a background agent running.
+
+    Claude keeps reporting itself busy for as long as such an agent runs,
+    although its prompt is free. Set by the main session's ``Stop`` hook and
+    cleared by its next ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: ``True`` between that ``Stop`` and the next main-session turn.
+    """
+    state = _read_json_file(bridge_dir / _STATE_FILE)
+    return isinstance(state, dict) and state.get("background_agents_after_turn") is True
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
@@ -3939,6 +3960,18 @@ def _is_background_shell(raw: object) -> bool:
     if not isinstance(raw, dict):
         return True
     return raw.get("type") not in _BACKGROUND_AGENT_TASK_TYPES
+
+
+def _has_running_background_agent(raw_tasks: object) -> bool:
+    """Return whether a ``Stop`` hook's ``background_tasks`` lists an unfinished agent."""
+    if not isinstance(raw_tasks, list):
+        return False
+    return any(
+        isinstance(task, dict)
+        and task.get("type") in _BACKGROUND_AGENT_TASK_TYPES
+        and task.get("status") not in _TERMINAL_BACKGROUND_TASK_STATUSES
+        for task in raw_tasks
+    )
 
 
 def _normalize_background_task(raw: object) -> _JsonObject | None:

@@ -1265,6 +1265,63 @@ async def test_queued_turn_republishes_running_after_stop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "poll_before_idle_edge", [False, True], ids=["edge-then-poll", "poll-then-edge"]
+)
+async def test_stop_leaving_a_background_agent_settles_a_busy_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poll_before_idle_edge: bool
+) -> None:
+    """A Stop that leaves a background agent running settles the turn despite a busy file.
+
+    Claude keeps its status file busy for the agent's lifetime, so the idle
+    edge's resync must not republish running; the next prompt's turn does.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        bridge_dir_for_conversation_id,
+        record_hook_event,
+    )
+
+    session_id = "conv_background_agent"
+    claude_session_id = "claude-background-agent"
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    bridge_dir = bridge_dir_for_conversation_id(session_id)
+
+    def hook(event_name: str, **fields: object) -> None:
+        record_hook_event(
+            bridge_dir, {"hook_event_name": event_name, "session_id": claude_session_id, **fields}
+        )
+
+    async def tick() -> None:
+        on_tick()
+        await asyncio.sleep(0)
+
+    record = {"pid": 123, "sessionId": claude_session_id, "kind": "interactive", "status": "busy"}
+    status_file.write_text(json.dumps(record), encoding="utf-8")
+    hook("UserPromptSubmit")
+    await tick()
+    assert statuses == ["running"]
+
+    hook("Stop", background_tasks=[{"id": "a1", "type": "subagent", "status": "running"}])
+    if poll_before_idle_edge:
+        await tick()
+    registry.note_external_session_status(session_id, "idle")
+    await tick()
+    await tick()
+    settled = ["running", "idle"] if poll_before_idle_edge else ["running"]
+    assert statuses == settled
+    assert not registry.session_turn_is_active(session_id)
+    assert registry.session_has_background_agents(session_id)
+
+    hook("UserPromptSubmit")
+    await tick()
+    assert statuses == [*settled, "running"]
+    assert registry.session_turn_is_active(session_id)
+    assert not registry.session_has_background_agents(session_id)
+
+
+@pytest.mark.asyncio
 async def test_failed_hook_does_not_republish_stale_running_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

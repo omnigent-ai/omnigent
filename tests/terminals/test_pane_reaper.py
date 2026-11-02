@@ -259,6 +259,34 @@ async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
     assert not await reaper._is_busy(other)
 
 
+async def test_runner_busy_check_spares_a_pane_whose_turn_left_a_background_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled turn reads idle while its background agent works; the pane stays."""
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    registry = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    agent_sessions: set[str] = set()
+    monkeypatch.setattr(resources, "session_has_background_agents", agent_sessions.__contains__)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    pane = PaneRef(
+        "conv_agent", terminal_resource_id("claude", "main"), "claude", tmp_path / "tmux.sock"
+    )
+
+    assert not await reaper._is_busy(pane)
+    agent_sessions.add("conv_agent")
+    assert await reaper._is_busy(pane)
+
+
 async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
