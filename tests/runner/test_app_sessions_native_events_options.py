@@ -19,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
 )
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
@@ -840,6 +841,71 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
     assert body.get("error") == "codex_native_compact_failed", (
         f"503 body must carry the codex bridge-failure error code; got {body!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_events_codex_native_approval_mode_change_during_a_turn_types_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    An approval-mode switch while Codex runs a turn is refused, not keyed in.
+
+    Codex disables /permissions during a turn, and the Escape that opens it
+    interrupts the turn and drops the message it carries. The 409 detail tells
+    the person why the mode did not change.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    tmux_calls: list[tuple[str, ...]] = []
+
+    def _recording_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        tmux_calls.append(args)
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        # Session creation would otherwise rewrite the bridge state below.
+        del args, kwargs
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _recording_run_tmux)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    conv_id = "3c1f6be0b1f04e45a8d9e2f7c6b5a4d3"
+    codex_native_bridge.write_bridge_state(
+        codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_running",
+        ),
+    )
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=terminal_registry
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_approval_mode_change", "approval_mode": "full-access"},
+        )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"] == "codex_native_approval_mode_busy"
+    assert tmux_calls == []
 
 
 @pytest.mark.asyncio
