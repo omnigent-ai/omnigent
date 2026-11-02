@@ -4,7 +4,7 @@
 
 ### The open-source meta-harness for all your AI agents.
 
-Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Hermes, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
+Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok Build, Hermes, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
 
 [![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
@@ -30,7 +30,8 @@ Omnigent lets you:
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
 - **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
-  Hermes, Pi, and custom agents (defined in YAML) together in the same
+  Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok
+  Build, Hermes, Pi, and custom agents (defined in YAML) together in the same
   session. Ask one agent to review another's work, or split a task across
   agents that are each good at different things.
 
@@ -293,6 +294,11 @@ omnigent codex                       # Codex
 omnigent cursor                      # Cursor
 omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
+omnigent goose                       # Goose
+omnigent kiro                        # Kiro
+omnigent qwen                        # Qwen Code
+omnigent kimi                        # Kimi Code
+omnigent devin                       # Devin
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
@@ -330,11 +336,11 @@ Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
 <details>
-<summary>Grok Build and Devin</summary>
+<summary>Grok Build and Jcode</summary>
 
 Two more coding agents are built in but have no `omnigent <name>` launcher of
-their own, because each ships a CLI that holds its own login. Install the vendor
-CLI, log in with it, then name the harness:
+their own, because each ships a CLI that owns its own login or provider
+config. Install the vendor CLI, set it up, then name the harness:
 
 ```bash
 # Grok Build (xAI)
@@ -342,17 +348,19 @@ curl -fsSL https://x.ai/cli/install.sh | bash
 grok login --device-auth              # xAI OAuth
 omnigent run --harness grok           # 'grok-build' also works
 
-# Devin (Cognition)
-curl -fsSL https://cli.devin.ai/install.sh | bash
-devin auth login
-omnigent run --harness devin
+# Jcode (https://jcode.sh)
+curl -fsSL https://jcode.sh/install | bash
+# configure a provider in ~/.jcode/config.toml
+omnigent run --harness jcode
 ```
 
 Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
 stdio, and Omnigent stores no credential for either — each CLI reads back the
-login it wrote to disk. That also means `--model` is refused rather than
-silently dropped: both run their account-default model. To pin one, configure an
-`acp:` agent whose command passes the vendor's own model flag.
+login or config it wrote to disk. That also means `--model` is refused rather
+than silently dropped: both run their own default model. To pin one, configure
+an `acp:` agent whose command passes the vendor's own model flag. Jcode's ACP
+server ignores session-scoped MCP servers, so Omnigent's MCP tools are not
+offered to it.
 
 Use the vendor login rather than an API key. A builtin ACP row has no
 `env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
@@ -662,8 +670,12 @@ prompt: You are a helpful data analyst.
 
 executor:
   harness: claude-sdk          # or: claude-native, codex, codex-native, cursor,
-                               # cursor-native, hermes, hermes-native, opencode,
-                               # pi, pi-native, openai-agents
+                               # cursor-native, opencode-native, goose,
+                               # goose-native, kiro-native, antigravity,
+                               # antigravity-native, copilot, devin-native,
+                               # qwen, qwen-native, kimi, kimi-native, hermes,
+                               # hermes-native, pi, pi-native, grok, jcode,
+                               # openai-agents, open-responses, acp:<slug>
 
 tools:
   # A local Python function (schema auto-generated from the signature)
