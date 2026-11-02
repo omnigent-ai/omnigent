@@ -189,9 +189,9 @@ const TILE_TONES = {
 
 // Compact action buttons inside an expanded card.
 const OUTLINE_ACTION =
-  "rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
 const PRIMARY_ACTION =
-  "rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
 
 export function InboxPage() {
   const queryClient = useQueryClient();
@@ -805,9 +805,17 @@ export function InboxPage() {
         componentId="inbox.filter"
         className="mb-4"
       >
-        <TabsList variant="pill" aria-label="Inbox filter" className="gap-1">
+        <TabsList
+          variant="pill"
+          aria-label="Inbox filter"
+          className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+        >
           {INBOX_TABS.map(({ value, label }) => (
-            <TabsTrigger key={value} value={value} className="h-7 flex-none px-3">
+            <TabsTrigger
+              key={value}
+              value={value}
+              className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
+            >
               {label}
             </TabsTrigger>
           ))}
@@ -993,7 +1001,11 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
 }
 
 function InboxActions({ children }: { children: ReactNode }) {
-  return <div className="flex items-center justify-end gap-1 pt-0.5">{children}</div>;
+  return (
+    <div className="flex items-center justify-end gap-1 pt-0.5 mobile-app:flex-wrap">
+      {children}
+    </div>
+  );
 }
 
 /**
