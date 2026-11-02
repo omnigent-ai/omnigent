@@ -1,0 +1,26 @@
+
+ ╭────────────────────────────────────────────────────────────────────────────╮
+ │                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                            │
+ │  ▐█████▌  Send /help for help information.                                 │
+ │                                                                            │
+ │  Directory: <scratch>/kimi-fixture-long-paste                             │
+ │  Session:                                                                  │
+ │  Model:     kimi-k3                                                        │
+ │  Version:   2.1.1                                                          │
+ │                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ╭──────────────────────────────── ↑ 10 more ─────────────────────────────────╮
+ │ > Section 2: Receive this harmless dispatch and preserve all its words.    │
+ │   Receive this harmless dispatch and preserve all its words. Receive       │
+ │   this harmless dispatch and preserve all its words. Receive this          │
+ │   harmless dispatch and preserve all its words. Receive this harmless      │
+ │   dispatch and preserve all its words.                                     │
+ │   Reply only ACK.                                                          │
+ │                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────╯
+ kimi-k3  <scratch>/kimi-fixture-long-paste
+                                                           context: 0% (0/256k)
