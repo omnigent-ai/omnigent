@@ -8387,6 +8387,112 @@ async def test_sys_session_create_requires_exactly_one_mode(
     assert "exactly one of 'agent_id'" in info["error"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["agent_id", "config_path"])
+@pytest.mark.parametrize(
+    ("error", "expected_error"),
+    [
+        pytest.param(
+            httpx.ReadTimeout(""),
+            "sys_session_create timed out after 240 s (ReadTimeout). "
+            "The child may still have been created; check sys_session_list before retrying.",
+            id="read-timeout",
+        ),
+        pytest.param(
+            httpx.ConnectTimeout(""),
+            "sys_session_create timed out after 10 s (ConnectTimeout): "
+            "the request did not complete, so no child was created by it.",
+            id="connect-timeout",
+        ),
+        pytest.param(
+            httpx.WriteTimeout(""),
+            "sys_session_create timed out after 240 s (WriteTimeout): "
+            "the request did not complete, so no child was created by it.",
+            id="write-timeout",
+        ),
+        pytest.param(
+            httpx.PoolTimeout(""),
+            "sys_session_create timed out after 240 s (PoolTimeout): "
+            "the request did not complete, so no child was created by it.",
+            id="pool-timeout",
+        ),
+        pytest.param(
+            RuntimeError(""),
+            "sys_session_create failed: RuntimeError",
+            id="empty-error",
+        ),
+        pytest.param(
+            RuntimeError("create unavailable"),
+            "sys_session_create failed: create unavailable",
+            id="message-error",
+        ),
+    ],
+)
+async def test_sys_session_create_reports_post_error(
+    tmp_path: Path, mode: str, error: Exception, expected_error: str
+) -> None:
+    """A bounded create reports ambiguous timeouts before callers risk duplicating children."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    arguments = {"agent_id": "ag_x"}
+    if mode == "config_path":
+        (tmp_path / "helper.yaml").write_text("name: helper\nprompt: do helpful things\n")
+        arguments = {"config_path": "helper.yaml"}
+    create_requests: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        create_requests.append(request)
+        raise error
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    assert json.loads(output) == {"error": expected_error}
+    assert len(create_requests) == 1
+    request = create_requests[0]
+    assert request.method == "POST"
+    assert request.url.path == "/v1/sessions"
+    assert request.extensions["timeout"] == {
+        "connect": 10.0,
+        "read": 240.0,
+        "write": 240.0,
+        "pool": 240.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_managed_preflight_timeout_is_not_a_create() -> None:
+    """A failed preflight never implies a child or independent session was created."""
+    from omnigent.runner.tool_dispatch import _execute_session_create
+
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise httpx.ReadTimeout("preflight unavailable", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        output = await _execute_session_create(
+            {"agent_id": "worker", "placement": "managed"},
+            server_client=client,
+            conversation_id="caller",
+            publish_event=None,
+        )
+
+    assert json.loads(output) == {"error": "sys_session_create failed: preflight unavailable"}
+    assert [(request.method, request.url.path) for request in requests] == [("GET", "/v1/info")]
+
+
 def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:
     """
     Decode a captured multipart ``POST /v1/sessions`` request body.
