@@ -110,6 +110,10 @@ _QUEUE_MAX_RECORDS = 10_000
 _TOKEN_REFRESH_SKEW_S = 300.0
 _HTTP_TIMEOUT_S = 10.0
 _SECRET_COMMAND_TIMEOUT_S = 30.0
+# Backoff between token mints after a failure; rows wait, bounded, meanwhile.
+_MINT_RETRY_INITIAL_S = 5.0
+_MINT_RETRY_MAX_S = 120.0
+_HELD_MAX_RECORDS = _QUEUE_MAX_RECORDS
 # At shutdown, don't start a request with less time than this left.
 _MIN_POST_BUDGET_S = 0.1
 # Transport errors raised before the request was fully sent, so a retry can't
@@ -826,11 +830,18 @@ class _TokenSource:
         except ValueError:
             _diag("token_decode", "token mint returned a non-JSON body")
             return None
+        if not isinstance(body, dict):
+            _diag("token_decode", "token mint returned a non-object JSON body")
+            return None
         token = body.get("access_token")
         if not token:
             _diag("token_missing", "token mint response had no access_token")
             return None
-        expires_in = float(body.get("expires_in", 3600))
+        try:
+            expires_in = float(body.get("expires_in", 3600))
+        except (TypeError, ValueError):
+            _diag("token_expiry", "token mint response had an invalid expires_in")
+            return None
         return token, time.time() + expires_in
 
 
@@ -951,7 +962,7 @@ class DebugLogHandler(logging.Handler):
             while not self._stop.is_set():
                 try:
                     batch = self._collect_batch(self._FLUSH_WAIT)
-                    if batch:
+                    if batch or self._has_held_rows():
                         self._send(batch)
                 except _ShutdownDeadline as exc:
                     dropped += exc.rows
@@ -971,6 +982,11 @@ class DebugLogHandler(logging.Handler):
                     self._send(remaining)
                 except _ShutdownDeadline as exc:
                     dropped += exc.rows
+            if self._has_held_rows():
+                try:
+                    self._send([])
+                except _ShutdownDeadline as exc:
+                    dropped += exc.rows
         except Exception:  # noqa: BLE001 — shutdown drain is best-effort
             pass
         if dropped:
@@ -979,6 +995,14 @@ class DebugLogHandler(logging.Handler):
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
     # Set per worker by close(); None outside the shutdown drain.
     _drain_deadline: float | None = None
+
+    def _has_held_rows(self) -> bool:
+        """Whether ``send`` holds rows from an earlier batch for a retry.
+
+        A sender that defers delivery overrides this so the worker calls
+        ``send`` with an empty batch on idle ticks and during the final drain.
+        """
+        return False
 
     def _collect_batch(self, wait: float) -> list[DebugLogRow]:
         batch: list[DebugLogRow] = []
@@ -1033,6 +1057,11 @@ class DebugLogHandler(logging.Handler):
 class ZerobusLogHandler(DebugLogHandler):
     """Default batched debug-log handler that delivers through ZeroBus."""
 
+    # Rows kept across a failed token mint, oldest first, and the mint backoff.
+    _held_rows: tuple[DebugLogRow, ...] = ()
+    _mint_retry_at = 0.0
+    _mint_backoff_s = 0.0
+
     def __init__(self, config: DebugLogConfig, source: str) -> None:
         self._config = config
         self._delivered_any = False
@@ -1043,7 +1072,14 @@ class ZerobusLogHandler(DebugLogHandler):
         # httpx/token locks may be indeterminate and must not be reused.
         self._client = httpx.Client(timeout=_HTTP_TIMEOUT_S)
         self._tokens = _TokenSource(self._config, self._client)
+        # A forked child must not resend its parent's held rows.
+        self._held_rows = ()
+        self._mint_retry_at = 0.0
+        self._mint_backoff_s = 0.0
         super()._start_worker()
+
+    def _has_held_rows(self) -> bool:
+        return bool(self._held_rows)
 
     def _run(self) -> None:
         # The worker owns the client captured at start, so close() never shuts
@@ -1061,11 +1097,62 @@ class ZerobusLogHandler(DebugLogHandler):
             raise _ShutdownDeadline(len(batch))
 
     def _post(self, batch: list[DebugLogRow]) -> None:
+        """Send *batch* after any rows held from a failed token mint.
+
+        Without a token the rows are held, bounded, and retried after a backoff
+        on a later batch or idle tick, so a slow or failing credential helper
+        delays delivery instead of losing the runner's startup rows.
+        """
+        if self._drain_deadline is None and time.monotonic() < self._mint_retry_at:
+            if batch:
+                self._hold([*self._held_rows, *batch])
+            return
+        rows = [*self._held_rows, *batch]
+        self._held_rows = ()
+        for start in range(0, len(rows), _BATCH_MAX_RECORDS):
+            try:
+                sent = self._post_chunk(rows[start : start + _BATCH_MAX_RECORDS])
+            except _ShutdownDeadline:
+                raise _ShutdownDeadline(len(rows) - start) from None
+            if not sent:
+                self._hold_after_mint_failure(rows[start:])
+                return
+
+    def _hold(self, rows: list[DebugLogRow]) -> None:
+        overflow = len(rows) - _HELD_MAX_RECORDS
+        if overflow > 0:
+            _diag(
+                "held_overflow", "token still unavailable; dropped %d oldest held row(s)", overflow
+            )
+            rows = rows[overflow:]
+        self._held_rows = tuple(rows)
+
+    def _hold_after_mint_failure(self, rows: list[DebugLogRow]) -> None:
+        if self._drain_deadline is not None:
+            # Shutting down: there is no later attempt to wait for.
+            # Own key, so a recent "holding" diag cannot throttle this one away.
+            _diag("held_dropped", "no auth token at shutdown; dropping %d held row(s)", len(rows))
+            return
+        self._hold(rows)
+        self._mint_backoff_s = min(
+            max(self._mint_backoff_s * 2, _MINT_RETRY_INITIAL_S), _MINT_RETRY_MAX_S
+        )
+        self._mint_retry_at = time.monotonic() + self._mint_backoff_s
+        _diag(
+            "no_token",
+            "no auth token (mint failing); holding %d row(s), retrying in %.0fs",
+            len(self._held_rows),
+            self._mint_backoff_s,
+        )
+
+    def _post_chunk(self, batch: list[DebugLogRow]) -> bool:
         """POST *batch*, retrying only while ZeroBus cannot have accepted it.
 
         Once close() sets a deadline, new requests and backoffs use the
         remaining budget; an in-flight request is not cancelled. Running out
         raises :class:`_ShutdownDeadline` for the worker to count.
+
+        :returns: ``False`` when no token could be minted, so nothing was sent.
         """
         payload = json.dumps(batch)
         for attempt in range(3):
@@ -1073,9 +1160,8 @@ class ZerobusLogHandler(DebugLogHandler):
             token = self._tokens.token(deadline=self._drain_deadline)
             self._require_budget(batch)  # a slow mint may have used it up
             if not token:
-                # Mint failed — _mint already logged why; note the data loss.
-                _diag("no_token", "no auth token (mint failing); dropping %d row(s)", len(batch))
-                return
+                return False
+            self._mint_backoff_s = 0.0
             deadline = self._drain_deadline
             try:
                 response = self._client.post(
@@ -1100,7 +1186,7 @@ class ZerobusLogHandler(DebugLogHandler):
                     exc,
                     len(batch),
                 )
-                return
+                return True
             if response.status_code == 200:
                 if not self._delivered_any:
                     self._delivered_any = True
@@ -1109,7 +1195,7 @@ class ZerobusLogHandler(DebugLogHandler):
                         self._config.table,
                         len(batch),
                     )
-                return
+                return True
             if response.status_code in (401, 403):
                 # Wrong/expired token audience shows up here (not at mint).
                 _diag(
@@ -1128,6 +1214,7 @@ class ZerobusLogHandler(DebugLogHandler):
             )
             _bounded_sleep(min(0.5 * 2**attempt, 3.0), self._drain_deadline)
         _diag("post_dropped", "dropped %d row(s) after 3 failed insert attempts", len(batch))
+        return True
 
 
 @dataclass(frozen=True, slots=True)
