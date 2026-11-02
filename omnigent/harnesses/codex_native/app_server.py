@@ -242,6 +242,23 @@ class CodexModelProviderMissingError(OmnigentError, RuntimeError):
         self.provider = provider
 
 
+def _config_model_provider_state(config_path: Path, provider: str) -> tuple[bool, bool]:
+    """
+    Whether one Codex config file selects and defines a model provider.
+
+    :param config_path: Codex ``config.toml`` to inspect, e.g. ``home / "config.toml"``.
+    :param provider: Provider id, e.g. ``"Databricks"``.
+    :returns: ``(selects, defines)``; ``(False, False)`` when the file is unreadable.
+    """
+    try:
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomlkit.exceptions.TOMLKitError):
+        return False, False
+    providers = document.get("model_providers")
+    defines = isinstance(providers, dict) and provider in providers
+    return document.get("model_provider") == provider, defines
+
+
 def _missing_model_provider(stderr_lines: Sequence[str]) -> str | None:
     """
     Return the provider id Codex reported missing at startup, if any.
@@ -2645,6 +2662,9 @@ class CodexNativeAppServer:
             diagnostics = collect_codex_startup_diagnostics(self)
         except Exception as diagnostics_error:  # noqa: BLE001 - never replace the startup error
             diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
+        if isinstance(exc, CodexModelProviderMissingError):
+            # Which layer selected the missing provider: a -c pin, or the config file.
+            attributes = {**self._model_provider_provenance(exc.provider), **attributes}
         event = debug_event(event_name, session_id=self.session_id)
         event["attributes"] = {
             "harness": "codex-native",
@@ -2654,6 +2674,29 @@ class CodexNativeAppServer:
             **attributes,
         }
         return event
+
+    def _model_provider_provenance(self, provider: str) -> dict[str, object]:
+        """
+        Name which config layers selected and defined a missing model provider.
+
+        :param provider: Missing provider id, e.g. ``"Databricks"``.
+        :returns: Boolean attributes for the startup-failure event.
+        """
+        home_selects, home_defines = _config_model_provider_state(
+            self.codex_home / "config.toml", provider
+        )
+        _, source_defines = _config_model_provider_state(
+            _codex_home_config_source_from_env() / "config.toml", provider
+        )
+        return {
+            "model_provider_pinned_by_override": any(
+                override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX)
+                for override in self.config_overrides
+            ),
+            "codex_home_selects_provider": home_selects,
+            "codex_home_defines_provider": home_defines,
+            "source_config_defines_provider": source_defines,
+        }
 
     def _log_startup_failure_snapshot(self, exc: Exception) -> None:
         """Record the owned child's state before ``close()`` discards it."""
