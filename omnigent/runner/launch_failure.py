@@ -113,6 +113,18 @@ _AUTH_MARKERS = (
     "not authenticated",
 )
 
+# --- dbcert client certificate missing ----------------------------------------
+# A launcher that authenticates with the user's dbcert client certificate exits
+# before the agent starts when the files are absent, carry no team memberships,
+# or are about to expire.
+_DBCERT_MARKERS = (
+    "noteamsfoundinyourcertificate",
+    "missingrequiredcredentialfiles",
+    "certificateexpirestoosoon",
+)
+# Pane captures wrap long lines and draw borders, which can split a marker.
+_PANE_WRAP = re.compile(r"[\s│┃]+")
+
 # --- binary missing -----------------------------------------------------------
 _MISSING_MARKERS = (
     "command not found",
@@ -134,8 +146,8 @@ _REJECTED_ARGUMENT_MARKERS = (
 )
 
 
-# Ordered most-specific first: the root case also reads like a permission /
-# auth problem, so it must win over the broader rules below it.
+# Ordered most-specific first: the root and dbcert cases also read like
+# permission / auth problems, so they must win over the broader rules below.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     _TerminalMatcher(
         "root_permission",
@@ -147,6 +159,21 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    _TerminalMatcher(
+        "dbcert_missing",
+        lambda s: (
+            "dbcert" in _PANE_WRAP.sub("", s.output)
+            and any(m in _PANE_WRAP.sub("", s.output) for m in _DBCERT_MARKERS)
+        ),
+        FailureDiagnosis(
+            title="Client certificate missing or expired",
+            cause=(
+                "The agent's launcher exited before the agent started because this "
+                "machine has no usable dbcert client certificate."
+            ),
+            remediation="Run `dbcert` on this machine, then retry.",
         ),
     ),
     _TerminalMatcher(
