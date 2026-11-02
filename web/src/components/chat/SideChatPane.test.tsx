@@ -1278,6 +1278,60 @@ describe("side chat sealed by the server", () => {
   });
 });
 
+describe("side-chat scroll position", () => {
+  it.each([
+    { name: "side chat", fullSession: false },
+    { name: "grid session", fullSession: true },
+  ])("keeps a scrolled-up $name reader in place until they send", ({ fullSession }) => {
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({
+      sessionStatus: "running",
+      activeResponse: { responseId: "turn_reply", state: "streaming", error: null },
+      blocks: itemsToBlocks([
+        {
+          id: "earlier",
+          response_id: "turn_earlier",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "Earlier side-chat answer" }],
+        },
+      ]),
+    });
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderPane(<SideChatPane childId={childId} fullSession={fullSession} />);
+    const transcript = screen.getByText("Earlier side-chat answer").closest(".overflow-y-auto")!;
+    Object.defineProperties(transcript, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 },
+    });
+    fireEvent.scroll(transcript);
+    scrollIntoView.mockClear();
+
+    act(() =>
+      entry.setState({
+        sessionStatus: "idle",
+        activeResponse: { responseId: "turn_reply", state: "completed", error: null },
+      }),
+    );
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "One more question" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send).toHaveBeenCalledOnce();
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+
+    scrollIntoView.mockClear();
+    act(() =>
+      entry.setState({
+        activeResponse: { responseId: "turn_follow_up", state: "completed", error: null },
+      }),
+    );
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+  });
+});
+
 describe("side-chat composer auto-grow", () => {
   it("shows the full reply after a seeded pending quote", () => {
     useChatStore.setState({ sideChatDrafts: { "pending:quoted": "Quoted passage" } });
