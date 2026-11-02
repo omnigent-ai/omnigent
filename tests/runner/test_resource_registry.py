@@ -37,6 +37,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.program_status import ProgramStatusReader
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import make_test_terminal_instance
 
@@ -953,8 +954,13 @@ async def _observe_native_with_real_poller(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     session_id: str,
+    *,
+    program_status_report: Path | None = None,
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
-    """Observe a Claude terminal with a real poller and caller-written status file."""
+    """Observe a Claude terminal with a real poller and caller-written status file.
+
+    With ``program_status_report``, the terminal also has a PTY relay's OSC status report.
+    """
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
     status_file.parent.mkdir(parents=True, exist_ok=True)
@@ -969,6 +975,8 @@ async def _observe_native_with_real_poller(
     watcher = Mock()
     monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
     monkeypatch.setattr(instance, "pane_pid_sync", lambda: 123)
+    if program_status_report is not None:
+        instance.program_status = ProgramStatusReader(program_status_report)
     statuses: list[str] = []
     registry.set_session_status_publisher(
         lambda _sid, status, _reason=None: statuses.append(status)
@@ -1268,14 +1276,18 @@ async def test_queued_turn_republishes_running_after_stop(
 @pytest.mark.parametrize(
     "poll_before_idle_edge", [False, True], ids=["edge-then-poll", "poll-then-edge"]
 )
+@pytest.mark.parametrize("status_source", ["status_file", "osc"])
 async def test_stop_leaving_a_background_agent_settles_a_busy_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poll_before_idle_edge: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    poll_before_idle_edge: bool,
+    status_source: str,
 ) -> None:
     """A Stop that leaves a background agent running settles the turn despite a busy file.
 
-    Claude keeps its status file busy for the agent's lifetime, so the idle
-    edge's resync must not republish running, nor may a restarted runner;
-    a blocking Stop hook's continuation or the next prompt's turn does.
+    Claude keeps its status file busy and its OSC report working for the agent's
+    lifetime, so the idle edge's resync must not republish running, nor may a
+    restarted runner; a blocking Stop hook's continuation or the next prompt's turn does.
     """
     from omnigent.harnesses.claude_native.bridge import (
         bridge_dir_for_conversation_id,
@@ -1284,8 +1296,20 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
 
     session_id = "conv_background_agent"
     claude_session_id = "claude-background-agent"
+    report: Path | None = None
+    if status_source == "osc":
+        report = tmp_path / "program-status.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "relay_pid": os.getpid(),
+                    "pid": 123,
+                    "status": {"state": "working", "app": "claude-code"},
+                }
+            )
+        )
     on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
-        tmp_path, monkeypatch, session_id
+        tmp_path, monkeypatch, session_id, program_status_report=report
     )
     bridge_dir = bridge_dir_for_conversation_id(session_id)
 
@@ -1329,7 +1353,7 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     assert statuses == settled
 
     restarted_tick, restarted_statuses, restarted, _ = await _observe_native_with_real_poller(
-        tmp_path, monkeypatch, session_id
+        tmp_path, monkeypatch, session_id, program_status_report=report
     )
     restarted_tick()
     await asyncio.sleep(0)

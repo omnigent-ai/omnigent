@@ -3153,16 +3153,16 @@ class BackgroundAgentsAfterTurnReader:
                 if identity != self._transcript_identity or status.st_size < self._scanned_to:
                     self._transcript_identity, self._scanned_to = identity, offset
                 handle.seek(self._scanned_to)
-                appended = handle.read()
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        break
+                    self._scanned_to += len(line)
+                    if _main_conversation_entry_type(line) in {"user", "assistant"}:
+                        self._released = True
+                        return False
         except OSError:
             return False
-        complete = appended[: appended.rfind(b"\n") + 1]
-        self._scanned_to += len(complete)
-        self._released = any(
-            _main_conversation_entry_type(line) in {"user", "assistant"}
-            for line in complete.splitlines()
-        )
-        return not self._released
+        return True
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:

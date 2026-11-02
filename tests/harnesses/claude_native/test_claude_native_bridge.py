@@ -882,10 +882,13 @@ def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
 def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
     tmp_path: Path, background_tasks: list[dict[str, str]] | None, agent_running: bool
 ) -> None:
-    """A main-session Stop records whether it left an unfinished background agent."""
+    """Each main-session Stop records whether it left an unfinished background agent."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "transcript.jsonl"
     _write_turn(transcript_path, {"type": "system", "subtype": "stop_hook_summary"})
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    assert reader.read() is True
     stop: dict[str, Any] = {
         "hook_event_name": "Stop",
         "session_id": "claude-session",
@@ -896,7 +899,7 @@ def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
 
     record_hook_event(bridge_dir, stop)
 
-    assert BackgroundAgentsAfterTurnReader(bridge_dir).read() is agent_running
+    assert reader.read() is agent_running
 
 
 @pytest.mark.parametrize("next_event", ["UserPromptSubmit", "StopFailure", "SessionStart"])
@@ -1023,7 +1026,7 @@ def test_background_agent_mark_parses_each_complete_appended_line_once(
         assert reader.read() is False
         assert reader.read() is False
 
-    assert parsed == [progress.encode(), reply.encode()]
+    assert parsed == [f"{progress}\n".encode(), f"{reply}\n".encode()]
 
 
 @pytest.mark.parametrize("rewrite", ["replaced", "truncated", "cut_before_turn_end"])
