@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:https": "node scripts/dev-https.mjs",
     "build": "vite build",
     "build:embed": "vite build --config vite.embed.config.ts",
     "type-check": "tsc -b",
