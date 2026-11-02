@@ -106,11 +106,15 @@ def _make_hello(
     name: str = "test-laptop",
     runners: list[str] | None = None,
     connection_id: str | None = None,
+    refreshed_name: str | None = None,
+    previous_host_id: str | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
     :param name: Human-readable host name.
     :param runners: Live runner IDs, defaults to empty.
+    :param refreshed_name: Hostname-derived replacement for *name*, if any.
+    :param previous_host_id: The host_id ``reset-id`` replaced, if any.
     :returns: JSON-encoded hello frame string.
     """
     return encode_host_frame(
@@ -120,6 +124,8 @@ def _make_hello(
             name=name,
             runners=runners or [],
             connection_id=connection_id,
+            refreshed_name=refreshed_name,
+            previous_host_id=previous_host_id,
         )
     )
 
@@ -149,6 +155,8 @@ async def _send_hello_and_wait(
     name: str = "test-laptop",
     runners: list[str] | None = None,
     connection_id: str | None = None,
+    refreshed_name: str | None = None,
+    previous_host_id: str | None = None,
 ) -> None:
     """Send hello and wait for registration.
 
@@ -157,9 +165,14 @@ async def _send_hello_and_wait(
     :param host_id: Expected host_id in the registry.
     :param name: Host name for the hello frame.
     :param runners: Live runner IDs for the hello frame.
+    :param refreshed_name: Hostname-derived replacement for *name*, if any.
+    :param previous_host_id: The host_id ``reset-id`` replaced, if any.
     """
     await communicator.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, runners, connection_id)},
+        {
+            "type": "websocket.receive",
+            "text": _make_hello(name, runners, connection_id, refreshed_name, previous_host_id),
+        },
     )
     await asyncio.wait_for(
         _wait_registered(registry, host_id),
@@ -891,6 +904,50 @@ async def test_host_tunnel_reports_registration_failure(
     assert close["type"] == "websocket.close"
     assert close["code"] == 4005
     assert registry.get(_HOST_ID) is None
+
+
+async def test_host_tunnel_registers_a_known_host_under_its_refreshed_name(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A hello's refreshed name renames the known host; ``name`` stays what older servers read."""
+    app, registry, store = host_app
+    store.upsert_on_connect(host_id=_HOST_ID, name="ip-10-90-45-193", user_id="local")
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(
+        comm, registry, name="ip-10-90-45-193", refreshed_name="ip-10-90-37-46"
+    )
+
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert (host.name, host.status) == ("ip-10-90-37-46", "online")
+
+
+async def test_host_tunnel_moves_a_refreshed_host_to_its_reset_host_id(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """After a refresh renamed the row, the hello's previous host id still identifies it."""
+    app, registry, store = host_app
+    previous_host_id = "a1ed1ab71de2311e20488a989e61701c"
+    store.upsert_on_connect(host_id=previous_host_id, name="ip-10-90-45-193", user_id="local")
+    store.upsert_on_connect(
+        host_id=previous_host_id,
+        name="ip-10-90-45-193",
+        user_id="local",
+        refreshed_name="ip-10-90-37-46",
+    )
+    store.set_offline(previous_host_id)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(
+        comm,
+        registry,
+        name="ip-10-90-45-193",
+        refreshed_name="ip-10-90-37-46",
+        previous_host_id="a1ed1ab7-1de2-311e-2048-8a989e61701c",
+    )
+
+    assert [(host.host_id, host.name) for host in store.list_hosts("local")] == [
+        (_HOST_ID, "ip-10-90-37-46")
+    ]
 
 
 async def test_registry_failure_marks_persisted_host_offline(

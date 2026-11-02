@@ -8411,6 +8411,58 @@ async def test_retryable_connection_error_escapes_live_receive_path() -> None:
     assert host._frame_tasks == set()
 
 
+@pytest.mark.parametrize(
+    ("identity", "registered_name", "refreshed_name", "banner"),
+    [
+        (
+            HostIdentity(
+                host_id="host_test_connect",
+                name="ip-10-90-37-46",
+                stored_name="ip-10-90-45-193",
+                previous_host_id="a1ed1ab71de2311e20488a989e61701c",
+            ),
+            "ip-10-90-45-193",
+            "ip-10-90-37-46",
+            "✓ Connected as 'ip-10-90-45-193' (host_test_connect), "
+            "requested rename to 'ip-10-90-37-46', 0 live runner(s).",
+        ),
+        (
+            HostIdentity(host_id="host_test_connect", name="dev-laptop"),
+            "dev-laptop",
+            None,
+            "✓ Connected as 'dev-laptop' (host_test_connect), 0 live runner(s).",
+        ),
+    ],
+    ids=["refreshed", "unchanged"],
+)
+async def test_hello_registers_the_stored_name_and_offers_the_refreshed_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    identity: HostIdentity,
+    registered_name: str,
+    refreshed_name: str | None,
+    banner: str,
+) -> None:
+    """Older servers read only ``name``, so a refreshed name travels in its own field."""
+    host = HostProcess(identity, "https://app.example.databricks.com")
+    monkeypatch.setattr(host, "_initialize_capabilities", AsyncMock())
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    output = ""
+    try:
+        async with asyncio.timeout(1.0):
+            while banner not in output:
+                await asyncio.sleep(0.01)
+                output += capsys.readouterr().out
+    finally:
+        await _cancel(serve_task)
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert (hello.name, hello.refreshed_name) == (registered_name, refreshed_name)
+    assert hello.previous_host_id == identity.previous_host_id
+
+
 async def test_capabilities_are_initialized_once_across_reconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

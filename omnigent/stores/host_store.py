@@ -269,6 +269,8 @@ class HostStore:
         name: str,
         user_id: str,
         *,
+        refreshed_name: str | None = None,
+        previous_host_id: str | None = None,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
         managed_token: str | None = None,
@@ -301,6 +303,12 @@ class HostStore:
             ``"corey-laptop"``.
         :param user_id: Authenticated user ID from the Bearer token,
             e.g. ``"corey.zumar@databricks.com"``.
+        :param refreshed_name: Current hostname replacing a generated *name*,
+            e.g. ``"ip-10-90-37-46"``. Used instead of *name* unless another
+            host holds it.
+        :param previous_host_id: The host_id this machine replaced with
+            *host_id*, e.g. ``"a1ed1ab71de2311e20488a989e61701c"``. A new
+            *host_id* takes over that external host's row when *user_id* owns it.
         :param allow_host_id_reown: When ``True`` and a row already
             exists for *host_id* under a different ``(user_id, name)``,
             re-own that row in place (preserving the ``host_id`` and its
@@ -367,11 +375,13 @@ class HostStore:
                         params={"host_id": host_id, "user_id": user_id},
                         orig=Exception("UNIQUE constraint failed: hosts.host_id"),
                     )
-                # Known host_id (same user_id, or reown opted in): update
-                # user_id/name in case they changed, then refresh status and timestamp.
+                # Known host_id (same user_id, or reown opted in): refresh owner, status,
+                # timestamp and name.
+                self._rename_unless_held(
+                    session, row, user_id=user_id, name=refreshed_name or name
+                )
                 row.user_id = user_id
                 row.account_generation = generation
-                row.name = name
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
@@ -395,6 +405,26 @@ class HostStore:
                 if reowned is not None:
                     return reowned
 
+            # The previous host_id identifies the row even after a refresh renamed it.
+            previous_row = (
+                session.get(
+                    SqlHost, (current_workspace_id(), previous_host_id), with_for_update=True
+                )
+                if previous_host_id is not None
+                else None
+            )
+            if (
+                previous_row is not None
+                and previous_row.user_id == user_id
+                and previous_row.deleted_at is None
+                and previous_row.sandbox_provider is None
+            ):
+                row = self._rotate_host_id(session, previous_row, host_id, now, harnesses_json)
+                self._rename_unless_held(
+                    session, row, user_id=user_id, name=refreshed_name or name
+                )
+                return _row_to_host(row)
+
             existing_by_name = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -415,13 +445,19 @@ class HostStore:
                     now,
                     harnesses_json,
                 )
+                self._rename_unless_held(
+                    session, row, user_id=user_id, name=refreshed_name or name
+                )
                 return _row_to_host(row)
 
             # Genuinely new host: plain INSERT.
+            refreshed_name_free = refreshed_name is not None and not self._name_held_by_other_host(
+                session, host_id=host_id, user_id=user_id, name=refreshed_name
+            )
             row = SqlHost(
                 account_generation=generation,
                 user_id=user_id,
-                name=name,
+                name=refreshed_name if refreshed_name_free else name,
                 host_id=host_id,
                 status=encode_host_status("online"),
                 created_at=now,
@@ -439,6 +475,46 @@ class HostStore:
             # A concurrent reservation or connection can win the first insert.
             # Retry in a fresh transaction, rechecking ownership and deletion.
             return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+
+    @classmethod
+    def _rename_unless_held(
+        cls, session: Session, row: SqlHost, *, user_id: str, name: str
+    ) -> None:
+        """Rename *row* to *name* unless another row holds it, including a deleted tombstone.
+
+        :param session: The active SQLAlchemy session.
+        :param row: The connecting host's row.
+        :param user_id: The owner the unique ``(user_id, name)`` key applies to.
+        :param name: The requested name, e.g. ``"ip-10-90-37-46"``.
+        """
+        if name != row.name and not cls._name_held_by_other_host(
+            session, host_id=row.host_id, user_id=user_id, name=name
+        ):
+            row.name = name
+
+    @staticmethod
+    def _name_held_by_other_host(
+        session: Session, *, host_id: str, user_id: str, name: str
+    ) -> bool:
+        """Whether another row holds *name* for *user_id*, including deleted tombstones.
+
+        :param session: The active SQLAlchemy session.
+        :param host_id: The host being renamed, excluded from the check.
+        :param user_id: The owner the unique ``(user_id, name)`` key applies to.
+        :param name: The requested name, e.g. ``"ip-10-90-37-46"``.
+        :returns: ``True`` when renaming *host_id* to *name* would collide.
+        """
+        held_by = session.execute(
+            select(SqlHost.host_id)
+            .where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.user_id == user_id,
+                SqlHost.name == name,
+                SqlHost.host_id != host_id,
+            )
+            .limit(1)
+        ).first()
+        return held_by is not None
 
     @staticmethod
     def _rotate_host_id(

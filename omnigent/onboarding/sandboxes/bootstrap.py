@@ -44,6 +44,7 @@ import click
 import httpx
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.host.identity import NAME_FROM_HOSTNAME_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -606,7 +607,8 @@ def set_sandbox_host_name(launcher: SandboxLauncher, sandbox_id: str, host_name:
     specific host name.
 
     The host's ``host_id`` is preserved across the edit — only the
-    ``name`` field is rewritten. If config.yaml doesn't exist yet,
+    ``name`` field is rewritten, marked as chosen so it never follows the
+    sandbox's hostname. If config.yaml doesn't exist yet,
     a minimal one is created with a fresh host_id; the next
     ``omnigent host`` will load that file as-is.
 
@@ -629,7 +631,7 @@ def set_sandbox_host_name(launcher: SandboxLauncher, sandbox_id: str, host_name:
         "os.makedirs(os.path.dirname(p), exist_ok=True); "
         "cfg=yaml.safe_load(open(p)) if os.path.exists(p) else {}; "
         "cfg=cfg or {}; "
-        f"h=cfg.get('host') or {{}}; h['name']='{safe_name}'; "
+        f"h=cfg.get('host') or {{}}; h['name']='{safe_name}'; h[{NAME_FROM_HOSTNAME_KEY!r}]=None; "
         "h.setdefault('host_id', uuid.uuid4().hex); "
         "cfg['host']=h; "
         "yaml.safe_dump(cfg, open(p,'w'), default_flow_style=False, sort_keys=True)"
