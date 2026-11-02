@@ -399,3 +399,33 @@ async def test_route_with_fallback_uses_the_judge_off_the_gateway() -> None:
 
 async def test_route_with_fallback_reports_an_unconfigured_deployment() -> None:
     assert await route_with_fallback(RoutingBackends(), "hi", _MENU, gateway_backed=True) is None
+
+
+async def test_route_with_fallback_drops_excluded_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``routing.exclude_models`` removes a model line from the menu, but never empties one."""
+    from omnigent.server.smart_routing import RoutingSettings
+
+    seen: list[dict[str, list[str]]] = []
+
+    class _Seen(_Recording):
+        async def route(self, _message: str, available: dict[str, list[str]]) -> Any:  # type: ignore[explicit-any]
+            seen.append(available)
+            return _VERDICT
+
+    monkeypatch.setattr(
+        "omnigent.runtime._globals._caps",
+        SimpleNamespace(routing_settings=RoutingSettings(exclude_models=("fable", "gpt-6-astra"))),
+    )
+    menu = {
+        "claude-native": ["claude-haiku-5-5", "claude-opus-5-5", "claude-fable-5-1[1m]"],
+        "codex-native": ["gpt-6-luna", "gpt-6-astra"],
+        "pi": ["claude-fable-5-1"],
+    }
+    await route_with_fallback(RoutingBackends(local=_Seen()), "hi", menu, gateway_backed=False)
+    assert seen == [
+        {
+            "claude-native": ["claude-haiku-5-5", "claude-opus-5-5"],
+            "codex-native": ["gpt-6-luna"],
+            "pi": ["claude-fable-5-1"],
+        }
+    ]
