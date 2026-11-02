@@ -804,6 +804,16 @@ Cross-harness journeys:
   retain their endpoint; history, model, effort and permissions survive.
   `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
   covers the CLI resume call site with configured and unpinned launches.
+  A machine-managed provider (`/etc/codex/managed_config.toml`) outranks the
+  launch's provider, and Codex 0.166+ refuses the resume with
+  `modelProviderMismatch`; the same test and
+  `tests/runner/test_app_sessions_native_wake_forwarders.py::test_auto_create_codex_terminal_retries_refused_resume_on_same_thread`
+  check the rollout restamp and retry under Codex's provider. Fresh launches
+  read Codex's effective provider at app-server start and hand it to the TUI,
+  whose thread Codex would otherwise refuse to run;
+  `tests/harnesses/codex_native/app_server/test_startup.py::test_start_pins_the_terminal_to_codex_effective_model_provider`
+  covers that. A real managed host check needs a private mount namespace for
+  `/etc/codex`.
 - **`resume`, Codex `/new` followed by Stop session and a new message:**
   `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
   (own environment, real server, host, runner, Codex and tmux; local model replies)

@@ -5866,7 +5866,12 @@ async def _auto_create_codex_terminal(
     )
     retained_resume_client: CodexAppServerClient | None = None
     if launch_config.external_session_id is not None:
+        from omnigent.harnesses.codex_native.main import _find_codex_rollout
+
         try:
+            resume_rollout = await asyncio.to_thread(
+                _find_codex_rollout, codex_home, launch_config.external_session_id
+            )
             # The rollout was written above, so a missing one is codex still
             # indexing it or skipping a file it cannot read: retry, then reset.
             for retry_delay_s in (*_CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S, None):
@@ -5884,6 +5889,7 @@ async def _auto_create_codex_terminal(
                         retain_client=codex_remote_resume_omits_permission_args(
                             app_server.codex_cli_version
                         ),
+                        rollout_path=resume_rollout,
                     )
                     break
                 except Exception as exc:
