@@ -322,6 +322,34 @@ def _waiting_step_at(
     return None
 
 
+async def _step_still_waiting(get_steps: GetSteps, interaction: PendingInteraction) -> bool:
+    """
+    Whether agy still shows *interaction* as WAITING, so its menu is still open.
+
+    :param get_steps: Re-reads the freshest trajectory steps.
+    :param interaction: The interaction an RPC verdict was just delivered to.
+    :returns: ``True`` only when the same step is WAITING; ``False`` when it was
+        answered or the state cannot be read (typing blind could become a prompt).
+    """
+    try:
+        steps = await get_steps()
+    except Exception as exc:
+        _logger.warning(
+            "agy step %d state unreadable after RPC delivery; not typing into the pane: %r",
+            interaction["step_index"],
+            exc,
+        )
+        return False
+    return (
+        _waiting_step_at(
+            steps,
+            trajectory_id=interaction["trajectory_id"],
+            step_index=interaction["step_index"],
+        )
+        is not None
+    )
+
+
 async def bridge_interaction(
     cascade_id: str,
     pending: PendingInteraction,
@@ -370,7 +398,7 @@ async def bridge_interaction(
         worker thread.
     :param inject_tui: Types the verdict into the native menu. This is the sole
         delivery channel for persistent approvals; other verdicts use it after
-        RPC delivery to dismiss legacy prompts. Failures are logged without
+        RPC delivery only while the step is still WAITING, to dismiss legacy prompts. Failures are logged without
         retrying or falling back to RPC, since keys may have partially arrived.
     :param max_retries: Upper bound on detect→deliver iterations.
     :returns: None. Never raises on the expected timeout/cancel/RPC-error paths —
@@ -466,8 +494,9 @@ async def bridge_interaction(
                 step_index=fresh["step_index"],
                 payload=payload,
             )
-            # Older agy versions can leave the attended prompt open after RPC.
-            if keys:
+            # Older agy versions can leave the attended prompt open after RPC;
+            # newer ones close it, and typing then submits a stray chat prompt.
+            if keys and await _step_still_waiting(get_steps, fresh):
                 try:
                     await inject_tui(keys)
                 except Exception as tui_exc:
