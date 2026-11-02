@@ -524,3 +524,88 @@ def test_an_uncleared_composer_logs_its_shape_without_text(
     assert attrs["composer_capture_empty"] == "False"
     assert attrs["error_type"] == "ClaudeComposerNotCleared"
     assert "private" not in json.dumps(row)
+
+
+@pytest.mark.parametrize(
+    ("marker", "reason", "exception_type", "exit_code"),
+    [
+        ("reason=cli_exit exception_type=none exit_code=7", "cli_exit", "none", 7),
+        (
+            "reason=missing_token exception_type=none exit_code=none",
+            "missing_token",
+            "none",
+            None,
+        ),
+        (
+            "reason=invalid_response exception_type=JSONDecodeError exit_code=none",
+            "invalid_response",
+            "JSONDecodeError",
+            None,
+        ),
+        (
+            "reason=timeout exception_type=TimeoutExpired exit_code=none",
+            "timeout",
+            "TimeoutExpired",
+            None,
+        ),
+        (
+            "reason=process_error exception_type=PermissionError exit_code=none",
+            "process_error",
+            "PermissionError",
+            None,
+        ),
+        (
+            "reason=cli_exit exception_type=none exit_code=-2147483648",
+            "cli_exit",
+            "none",
+            -(2**31),
+        ),
+        (
+            "reason=cli_exit exception_type=none exit_code=+2147483647",
+            "cli_exit",
+            "none",
+            2**31 - 1,
+        ),
+        ("reason=cli_exit exception_type=none exit_code=2147483648", "unknown", None, None),
+        ("reason=cli_exit exception_type=none exit_code=-2147483649", "unknown", None, None),
+        ("reason=cli_exit exception_type=none exit_code=12345678901", "unknown", None, None),
+        ("reason=private_token exception_type=none exit_code=none", "unknown", None, None),
+        ("reason=timeout exception_type=private_token exit_code=none", "unknown", None, None),
+        (
+            "reason=timeout exception_type=PermissionError:private_token exit_code=none",
+            "unknown",
+            None,
+            None,
+        ),
+        (f"reason=timeout exception_type={'X' * 81} exit_code=none", "unknown", None, None),
+        ("reason=cli_exit exception_type=none exit_code=7 private_token", "unknown", None, None),
+        ("reason=cli_exit exception_type=none", "unknown", None, None),
+        ("", "unknown", None, None),
+    ],
+)
+def test_launcher_auth_check_attributes(
+    marker: str, reason: str, exception_type: str | None, exit_code: int | None
+) -> None:
+    """Only the last complete, allowlisted marker supplies content-free metadata."""
+    pane = (
+        "ug_auth_check_failed reason=missing_token exception_type=none exit_code=none\n"
+        f"ug_auth_check_failed {marker}\n"
+        "Open https://signin.example.test/device?private_token and enter PRIVATE-CODE\n"
+    )
+    attributes = delivery_diagnostics.launcher_auth_check_attributes(pane)
+    expected: dict[str, object] = {
+        "launcher_auth_check_observation": "unknown" if reason == "unknown" else "last_observed",
+        "launcher_auth_check_reason": reason,
+    }
+    if reason != "unknown":
+        expected.update(
+            launcher_auth_check_exception_type=exception_type,
+            launcher_auth_check_exit_code=exit_code,
+        )
+    assert attributes == expected
+    assert "private_token" not in json.dumps(attributes)
+    assert "PRIVATE-CODE" not in json.dumps(attributes)
+    assert delivery_diagnostics.launcher_auth_check_attributes("unrelated output") == {
+        "launcher_auth_check_observation": "unknown",
+        "launcher_auth_check_reason": "unknown",
+    }
