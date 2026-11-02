@@ -376,6 +376,11 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 # create-time launches and outlasts the runner's 150s pending-sign-in wait.
 _RUNNER_CONNECT_DEADLINE_S = 180.0
 
+# After the server rejects this host's credentials, the tunnel stays up until no
+# launch has been starting for the settle window, so a waiting send gets the cause.
+_REJECTED_TUNNEL_SETTLE_S = 2.0
+_REJECTED_TUNNEL_DRAIN_CAP_S = 30.0
+
 
 def _connect_marker_path(log_path: Path) -> Path:
     """Return this launch's marker path next to its process log."""
@@ -1316,6 +1321,9 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
+        self._credential_check_running = False
+        # A tunnel the server no longer authenticates; launches on it are refused.
+        self._credentials_rejected_ws: websockets.asyncio.client.ClientConnection | None = None
         # This host's owning user, resolved once after the first accepted tunnel
         # upgrade (GET /v1/me). Injected into every runner it spawns and published
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
@@ -1996,6 +2004,10 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+        if self._ws is not None and self._ws is self._credentials_rejected_ws:
+            return self._launch_failed(
+                frame, self._credentials_rejected_error(), error_category=ErrorCategory.CONFIG
+            )
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -2657,11 +2669,7 @@ class HostProcess:
             handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE and had_connected is not True
         )
         if auth_rejected:
-            error = (
-                "The server rejected this host's credentials, so the runner could not "
-                f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
-                f"on this host, then retry. Details: {error}"
-            )
+            error = f"{self._credentials_rejected_error()} Details: {error}"
         _logger.warning(
             "Runner %s died unexpectedly: %s",
             runner_id,
@@ -2681,6 +2689,101 @@ class HostProcess:
             ),
         )
         await self._report_runner_exit(runner_id, error, had_connected=had_connected)
+        if auth_rejected:
+            await self._drop_tunnel_if_credentials_rejected()
+
+    async def _drop_tunnel_if_credentials_rejected(self) -> None:
+        """Reconnect when the server now refuses the credentials this host connects with.
+
+        The tunnel authenticates only at upgrade, so it can outlive a rejected credential.
+        Dropping it marks the host offline until a reconnect presents one that works.
+        Managed hosts are skipped because ``/v1/me`` does not accept their launch token.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        ws = self._ws
+        if (
+            ws is None
+            or ws is self._credentials_rejected_ws
+            or self._credential_check_running
+            or os.environ.get(HOST_TOKEN_ENV_VAR)
+        ):
+            return
+        self._credential_check_running = True
+        try:
+            rejected = await self._run_host_subprocess_in_thread(self._server_rejects_credentials)
+        except Exception:
+            _logger.debug("Could not check this host's credentials", exc_info=True)
+            return
+        finally:
+            self._credential_check_running = False
+        if not rejected or self._ws is not ws:
+            return
+        message = (
+            "The server now rejects this host's credentials, so its runners cannot "
+            f"connect. Reconnecting; if this persists, run `{cli_invocation()} login "
+            f"{self._login_hint_url()}` on this host."
+        )
+        _logger.warning("%s", message)
+        _print_host_status(f"⚠ {message}", stderr=True)
+        self._credentials_rejected_ws = ws
+        self._auth_token_factory = None
+        self._auth_token_factory_resolved = False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _REJECTED_TUNNEL_DRAIN_CAP_S
+        quiet_since = loop.time()
+        try:
+            while self._ws is ws and (now := loop.time()) < deadline:
+                if await self._has_starting_runners():
+                    quiet_since = now
+                elif now - quiet_since >= _REJECTED_TUNNEL_SETTLE_S:
+                    break
+                await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
+        finally:
+            # A tunnel left marked rejected would refuse every launch while staying online.
+            if self._ws is ws:
+                self._abort_live_tunnel()
+
+    async def _has_starting_runners(self) -> bool:
+        """Return whether a launch is in progress or a live runner has not connected yet."""
+        if self._pending_runner_launches:
+            return True
+        markers = [
+            handle.connect_marker
+            for handle in self._runners.values()
+            if handle.connect_marker is not None and not handle.stop_requested
+        ]
+
+        def any_unconnected() -> bool:
+            for marker in markers:
+                try:
+                    if not marker.exists():
+                        return True
+                except OSError:
+                    _logger.debug("Could not read connect marker %s", marker, exc_info=True)
+            return False
+
+        return await asyncio.to_thread(any_unconnected)
+
+    def _credentials_rejected_error(self) -> str:
+        """Return the sign-in instruction for a runner the server refused on credentials."""
+        return (
+            "The server rejected this host's credentials, so the runner could not "
+            f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
+            "on this host, then retry."
+        )
+
+    def _server_rejects_credentials(self) -> bool:
+        """Return whether ``GET /v1/me`` refuses the tunnel's own headers as unauthenticated."""
+        from omnigent.runner._entry import _is_login_redirect_or_unauthorized
+
+        response = httpx.get(
+            f"{self._server_url}/v1/me",
+            headers=self._build_connect_headers(),
+            timeout=10.0,
+            verify=client_ssl_context(),
+        )
+        return _is_login_redirect_or_unauthorized(response)
 
     async def _watch_runner_connect(
         self, runner_id: str, *, exit_watcher: asyncio.Task[None]

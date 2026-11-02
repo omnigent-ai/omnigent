@@ -114,6 +114,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 
 pytestmark = pytest.mark.asyncio
@@ -2118,14 +2119,30 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
     """A runner refused on credentials before connecting asks for a new sign-in.
 
     The exit is a setup problem the person must fix, so it is categorized as
-    config at launch; any other exit stays a runner fault.
+    config at launch; any other exit stays a runner fault. When the server also
+    refuses the host's own bearer, the host drops its tunnel to go offline.
     """
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
     from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
 
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", 0.0)
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    checks: list[httpx.Request] = []
+
+    def _refuse(_transport: object, request: httpx.Request) -> httpx.Response:
+        checks.append(request)
+        return httpx.Response(401, request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _refuse)
     host = _make_host_process()
+    host._auth_token_factory = lambda: "warm-host-token"
+    host._auth_token_factory_resolved = True
     tunnel = _FakeTunnel()
+    tunnel.transport = Mock()  # type: ignore[attr-defined]
     host._ws = tunnel  # type: ignore[assignment] — duck-typed send
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -2167,11 +2184,296 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
         assert not report.error.startswith("The server rejected")
         assert died.attributes["error_category"] == "runner"
         assert died.attributes["error_phase"] == "unknown"
+        assert checks == []
+        tunnel.transport.abort.assert_not_called()  # type: ignore[attr-defined]
     else:
         assert report.error.startswith("The server rejected this host's credentials")
         assert " login " in report.error
         assert died.attributes["error_category"] == "config"
         assert died.attributes["error_phase"] == "runner_launch"
+        [check] = checks
+        assert (check.method, check.url.path) == ("GET", "/v1/me")
+        assert check.headers["Authorization"] == "Bearer warm-host-token"
+        tunnel.transport.abort.assert_called_once_with()  # type: ignore[attr-defined]
+        assert host._auth_token_factory is None
+        assert host._auth_token_factory_resolved is False
+
+
+# Response classification is covered by the _is_login_redirect_or_unauthorized matrix.
+@pytest.mark.parametrize(
+    ("reply", "drops_tunnel"),
+    [
+        (401, True),
+        ("login_redirect", True),
+        (200, False),
+        (404, False),
+        ("network_error", False),
+    ],
+)
+async def test_host_drops_tunnel_only_when_server_refuses_its_credentials(
+    monkeypatch: pytest.MonkeyPatch, reply: int | str, drops_tunnel: bool
+) -> None:
+    """Only an authentication refusal drops the tunnel; other outcomes keep it."""
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", 0.0)
+
+    def _reply(_transport: object, request: httpx.Request) -> httpx.Response:
+        if reply == "network_error":
+            raise httpx.ConnectError("unreachable", request=request)
+        if reply == "login_redirect":
+            location = "/oidc/oauth2/v2.0/authorize"
+            return httpx.Response(302, headers={"location": location}, request=request)
+        return httpx.Response(int(reply), request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _reply)
+    host = _host()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    transport = Mock()
+    tunnel = SimpleNamespace(transport=transport)
+    host._ws = tunnel  # type: ignore[assignment]
+
+    await host._drop_tunnel_if_credentials_rejected()
+
+    assert transport.abort.called is drops_tunnel
+    assert host._auth_token_factory_resolved is not drops_tunnel
+    assert host._credentials_rejected_ws is (tunnel if drops_tunnel else None)
+    assert host._credential_check_running is False
+
+
+async def test_rejected_tunnel_refuses_launches_until_starting_runners_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunnel whose bearer the server rejects refuses launches before it drops.
+
+    It stays up while a runner is still starting, so that runner's exit report and
+    the refusal of any relaunch reach the server; a reconnected tunnel launches again.
+    """
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    settle_s = 0.05
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", settle_s)
+    monkeypatch.setattr(
+        httpx.HTTPTransport,
+        "handle_request",
+        lambda _transport, request: httpx.Response(401, request=request),
+    )
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    loop = asyncio.get_running_loop()
+    aborted_at: list[float] = []
+    transport = Mock()
+    transport.abort.side_effect = lambda: aborted_at.append(loop.time())
+    check_starting_runners = host._has_starting_runners
+    last_starting_check_at = 0.0
+
+    async def _record_starting_checks() -> bool:
+        nonlocal last_starting_check_at
+        checked_at = loop.time()
+        starting = await check_starting_runners()
+        if starting:
+            last_starting_check_at = checked_at
+        return starting
+
+    monkeypatch.setattr(host, "_has_starting_runners", _record_starting_checks)
+    rejected_tunnel = SimpleNamespace(transport=transport)
+    host._ws = rejected_tunnel  # type: ignore[assignment]
+    connected_marker = tmp_path / "connected.marker"
+    connected_marker.touch()
+    host._runners["runner_connected"] = _RunnerHandle(
+        proc=Mock(), log_path=tmp_path / "connected.log", connect_marker=connected_marker
+    )
+    host._runners["runner_starting"] = _RunnerHandle(
+        proc=Mock(),
+        log_path=tmp_path / "starting.log",
+        connect_marker=tmp_path / "starting.marker",
+    )
+    frame = HostLaunchRunnerFrame(
+        request_id="req_relaunch",
+        binding_token="tok_relaunch",
+        workspace=str(tmp_path / "gone" / "workspace"),
+    )
+
+    drop = asyncio.create_task(host._drop_tunnel_if_credentials_rejected())
+    await poll_until_async(
+        lambda: host._credentials_rejected_ws is rejected_tunnel, timeout_s=5, interval_s=0.01
+    )
+    with patch("omnigent.host.connect.subprocess.Popen") as popen:
+        refused = await host._handle_launch(frame)
+    assert refused.status == "failed"
+    assert refused.error is not None
+    assert refused.error.startswith("The server rejected this host's credentials")
+    assert refused.error_code is None
+    popen.assert_not_called()
+
+    await asyncio.sleep(0.2)
+    transport.abort.assert_not_called()
+    host._runners.pop("runner_starting")
+    await asyncio.wait_for(drop, timeout=5)
+    transport.abort.assert_called_once_with()
+    assert aborted_at[0] - last_starting_check_at >= settle_s
+
+    host._ws = SimpleNamespace(transport=Mock())  # type: ignore[assignment]
+    relaunched = await host._handle_launch(frame)
+    assert relaunched.error_code == WORKSPACE_MISSING_ERROR_CODE
+
+
+@pytest.mark.parametrize(
+    ("starting", "drain_cap_s", "expected_drop_s"),
+    [
+        # An unreadable marker counts as connected, so the quiet window ends the drain.
+        ("unreadable_marker", 30.0, 0.05),
+        ("pending_launch", 0.3, 0.3),
+        ("never_connects", 0.3, 0.3),
+    ],
+)
+async def test_rejected_tunnel_drain_always_drops_the_tunnel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    starting: str,
+    drain_cap_s: float,
+    expected_drop_s: float,
+) -> None:
+    """The drain drops the tunnel on time when starting work never settles or cannot be read."""
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", 0.05)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_DRAIN_CAP_S", drain_cap_s)
+    monkeypatch.setattr(
+        httpx.HTTPTransport,
+        "handle_request",
+        lambda _transport, request: httpx.Response(401, request=request),
+    )
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    loop = asyncio.get_running_loop()
+    aborted_at: list[float] = []
+    transport = Mock()
+    transport.abort.side_effect = lambda: aborted_at.append(loop.time())
+    host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+    check_starting_runners = host._has_starting_runners
+    checked_at: list[float] = []
+
+    async def _record_starting_checks() -> bool:
+        checked_at.append(loop.time())
+        return await check_starting_runners()
+
+    monkeypatch.setattr(host, "_has_starting_runners", _record_starting_checks)
+    marker: Path | Mock = tmp_path / "starting.marker"
+    if starting == "unreadable_marker":
+        marker = Mock(spec=Path)
+        marker.exists.side_effect = PermissionError("denied")
+    if starting == "pending_launch":
+        host._pending_runner_launches["runner_pending"] = set()
+    else:
+        host._runners["runner_starting"] = _RunnerHandle(
+            proc=Mock(), log_path=tmp_path / "starting.log", connect_marker=marker
+        )
+
+    started_at = loop.time()
+    await asyncio.wait_for(host._drop_tunnel_if_credentials_rejected(), timeout=5)
+
+    transport.abort.assert_called_once_with()
+    assert aborted_at[0] - started_at >= expected_drop_s
+    # The drain may overrun by one poll; the slack only absorbs a loaded runner.
+    assert aborted_at[0] - checked_at[0] < expected_drop_s + 0.5
+    host._ws = SimpleNamespace(transport=Mock())  # type: ignore[assignment]
+    frame = HostLaunchRunnerFrame(
+        request_id="req_after_drop",
+        binding_token="tok_after_drop",
+        workspace=str(tmp_path / "gone" / "workspace"),
+    )
+    relaunched = await host._handle_launch(frame)
+    assert relaunched.error_code == WORKSPACE_MISSING_ERROR_CODE
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [RuntimeError("scan failed"), asyncio.CancelledError()],
+    ids=["error", "cancelled"],
+)
+async def test_rejected_tunnel_drain_drops_the_tunnel_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch, interruption: BaseException
+) -> None:
+    """An error or cancellation during the drain still drops the rejected tunnel."""
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr(
+        httpx.HTTPTransport,
+        "handle_request",
+        lambda _transport, request: httpx.Response(401, request=request),
+    )
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    transport = Mock()
+    host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+
+    async def _interrupt() -> bool:
+        raise interruption
+
+    monkeypatch.setattr(host, "_has_starting_runners", _interrupt)
+
+    with pytest.raises(type(interruption)):
+        await host._drop_tunnel_if_credentials_rejected()
+    transport.abort.assert_called_once_with()
+
+
+async def test_credential_check_skips_managed_hosts_overlaps_and_replaced_tunnels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed hosts never probe, overlapping exits share one probe, and a new tunnel survives."""
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    host = _host()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    old_transport, new_transport = Mock(), Mock()
+    host._ws = SimpleNamespace(transport=old_transport)  # type: ignore[assignment]
+    checks: list[httpx.Request] = []
+    release = threading.Event()
+
+    def _refuse(_transport: object, request: httpx.Request) -> httpx.Response:
+        checks.append(request)
+        release.wait(timeout=5)
+        return httpx.Response(401, request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _refuse)
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-token")
+    await host._drop_tunnel_if_credentials_rejected()
+    assert checks == []
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR)
+    first = asyncio.create_task(host._drop_tunnel_if_credentials_rejected())
+    await poll_until_async(lambda: bool(checks), timeout_s=5, interval_s=0.01)
+    await host._drop_tunnel_if_credentials_rejected()
+    host._ws = SimpleNamespace(transport=new_transport)  # type: ignore[assignment]
+    release.set()
+    await first
+
+    assert len(checks) == 1
+    old_transport.abort.assert_not_called()
+    new_transport.abort.assert_not_called()
+    assert host._auth_token_factory_resolved is True
 
 
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
