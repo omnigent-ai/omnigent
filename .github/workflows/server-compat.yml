@@ -39,7 +39,6 @@ on:
     paths:
       - "omnigent/runner/**"
       - "omnigent/server/**"
-      - "sdks/python-client/omnigent_client/wire.py"
       - "omnigent/host/**"
       - "web/src/**"
       - "tests/e2e/**"

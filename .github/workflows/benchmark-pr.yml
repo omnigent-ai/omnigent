@@ -20,7 +20,6 @@ on:
       - "omnigent/server/routes/projects.py"
       - "omnigent/server/routes/sessions/**"
       - "omnigent/server/schemas.py"
-      - "sdks/python-client/omnigent_client/wire.py"
       - "omnigent/stores/**"
       - "dev/benchmarks/**"
       - ".github/workflows/benchmark-pr.yml"
