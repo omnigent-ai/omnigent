@@ -1111,6 +1111,33 @@ def codex_minimal_config_requested() -> bool:
     return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
+def _native_codex_borrow_home() -> Path | None:
+    """Opt-in native Codex profile; read by executor, independent of runner env filtering.
+
+    A plain UTF-8 absolute path in ~/.omnigent/native_codex_home.txt enables the
+    documented native-login route; removing the file disables it.
+    """
+    if sys.platform != "win32":
+        return None
+    selector = Path.home() / ".omnigent" / "native_codex_home.txt"
+    if not selector.exists():
+        return None
+    if selector.is_symlink() or not selector.is_file():
+        raise OSError("Invalid native Codex profile selector")
+    content = selector.read_text(encoding="utf-8-sig").strip()
+    if not content or "\n" in content or "\r" in content or not Path(content).is_absolute():
+        raise OSError("Invalid native Codex profile path")
+    raw = Path(content)
+    if raw.is_symlink() or not raw.is_dir():
+        raise OSError("Native Codex profile must be an existing real directory")
+    profile = raw.resolve(strict=True)
+    from .codex_windows_acl import verify_private_windows_directory
+    verify_private_windows_directory(profile)
+    if not (profile / "auth.json").is_file():
+        raise OSError("Native Codex profile is not authenticated")
+    return profile
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -1172,6 +1199,10 @@ def _populate_codex_home_config(
     :param required_brokered_probe: Codex path, working directory, and active
         sandbox used to write a network-denied bundled catalog.
     """
+    if sys.platform == "win32" and target_dir.resolve(strict=True) == source_dir.resolve(strict=True):
+        selected = _native_codex_borrow_home()
+        if selected is not None and target_dir.resolve(strict=True) == selected:
+            return  # Existing authenticated directory: do not copy its credentials.
     if required_brokered_probe is not None:
         codex_path, cwd, os_env = required_brokered_probe
         probe = prepare_codex_catalog_probe(
@@ -2921,27 +2952,53 @@ class _CodexAppServerSession:
             self._signer_watch_task = asyncio.create_task(self._watch_signer())
         codex_home_root = Path(tempfile.gettempdir())
         if self._signer is not None:
-            root_stat = codex_home_root.lstat()
-            unsafe_writable = bool(root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
-            if (
-                not stat.S_ISDIR(root_stat.st_mode)
-                or codex_home_root.is_symlink()
-                or (unsafe_writable and not root_stat.st_mode & stat.S_ISVTX)
-            ):
-                raise OSError("unsafe signer session temp root")
+            if sys.platform != "win32":
+                # Windows TEMP is a parent, not the private CODEX_HOME.
+                # Do not apply the private-home ACL policy to TEMP.
+                root_stat = codex_home_root.lstat()
+                unsafe_writable = bool(root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+                if (
+                    not stat.S_ISDIR(root_stat.st_mode)
+                    or codex_home_root.is_symlink()
+                    or (unsafe_writable and not root_stat.st_mode & stat.S_ISVTX)
+                ):
+                    raise OSError("unsafe signer session temp root")
         # Stage outside the workspace, falling back to a private temp home
         # when the shared staging root is unavailable.
-        with suppress(OSError):
-            codex_home_root = codex_home_staging_root()
-        self._codex_home_dir = Path(
-            tempfile.mkdtemp(prefix=CODEX_HOME_PREFIX, dir=str(codex_home_root))
-        )
+        if sys.platform != "win32":
+            with suppress(OSError):
+                codex_home_root = codex_home_staging_root()
+        # On Windows avoid the predictable shared staging root. Create a
+        # randomized session directory directly under the user's TEMP.
+        _native_profile = _native_codex_borrow_home()
+        _borrowed_home_path = str(_native_profile) if _native_profile is not None else None
+        self._borrowed_codex_home = _native_profile
+        if _borrowed_home_path:
+            # Borrow already-authenticated home, without moving credentials.
+            # The selector validates this profile; NEVER remove it on close.
+            self._codex_home_dir = Path(_borrowed_home_path).resolve(strict=True)
+            if not self._codex_home_dir.is_dir() or self._codex_home_dir.is_symlink():
+                raise OSError("Invalid borrowed Codex profile")
+        else:
+            self._codex_home_dir = Path(
+                tempfile.mkdtemp(prefix=CODEX_HOME_PREFIX, dir=str(codex_home_root))
+            )
         home_stat = self._codex_home_dir.lstat()
         self._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
-        os.chmod(self._codex_home_dir, 0o700)
-        home_stat = self._codex_home_dir.lstat()
-        if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
-            raise OSError("unsafe signer CODEX_HOME")
+        if sys.platform == "win32":
+            from .codex_windows_acl import (
+                harden_private_windows_directory,
+                verify_private_windows_directory,
+            )
+            # No credentials have been copied at this point. Fail closed.
+            if not _borrowed_home_path:
+                harden_private_windows_directory(self._codex_home_dir)
+            verify_private_windows_directory(self._codex_home_dir)
+        else:
+            os.chmod(self._codex_home_dir, 0o700)
+            home_stat = self._codex_home_dir.lstat()
+            if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
+                raise OSError("unsafe signer CODEX_HOME")
         # The runner grants only this session's skills directory to its tools.
         # Keep its inode stable so cached sandbox mounts survive worker restarts.
         if self._skills_dir is None:
@@ -2949,7 +3006,8 @@ class _CodexAppServerSession:
             self._skills_dir = Path(self._owned_skills_dir.name)
         self._skills_dir = prepare_codex_skills_dir(self._skills_dir)
         try:
-            link_codex_skills_dir(self._codex_home_dir / "skills", self._skills_dir)
+            if not _borrowed_home_path:
+                link_codex_skills_dir(self._codex_home_dir / "skills", self._skills_dir)
         except OSError as exc:
             # Skills are then copied into the home itself: still discoverable,
             # but outside the session's grant, so restricted reads can't open them.
@@ -2959,19 +3017,20 @@ class _CodexAppServerSession:
                 self._codex_home_dir / "skills",
                 exc,
             )
-        populate_codex_skills_from_bundle(
-            self._codex_home_dir,
-            self._bundle_dir,
-            self._skills_filter,
-            copy_skills=True,
-        )
+        if not _borrowed_home_path:
+            populate_codex_skills_from_bundle(
+                self._codex_home_dir,
+                self._bundle_dir,
+                self._skills_filter,
+                copy_skills=True,
+            )
         # Bridge the user's authentication and provider config into the
         # temp CODEX_HOME. The codex CLI reads ``auth.json`` (OAuth tokens
         # for subscription auth) and ``config.toml`` (model provider
         # definitions) from ``$CODEX_HOME``; without this step a freshly-
         # created temp dir has neither, causing 401 Unauthorized errors
         # for subscription-authenticated users.
-        config_source = _codex_home_config_source_from_env()
+        config_source = self._borrowed_codex_home if self._borrowed_codex_home is not None else _codex_home_config_source_from_env()
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched. Only an auto-harness
@@ -2988,9 +3047,13 @@ class _CodexAppServerSession:
             if skip_reason is not None:
                 logger.warning("%s", skip_reason)
                 router_bridge_dir = None
+        if _borrowed_home_path and router_bridge_dir is not None:
+            raise OSError("Native Codex profile cannot be modified with router hooks")
         # Off the loop: this copies/symlinks a home AND (on the routing path)
         # shells out to ``codex debug models`` with a 10s timeout. Run inline it
         # stalled every other session sharing this event loop for that long.
+        if sys.platform == "win32":
+            verify_private_windows_directory(self._codex_home_dir)
         await asyncio.to_thread(
             _populate_codex_home_config,
             self._codex_home_dir,
@@ -3009,11 +3072,14 @@ class _CodexAppServerSession:
                 else None
             ),
         )
-        self._codex_config_overrides = materialize_codex_provider_config(
-            self._codex_home_dir,
-            self._codex_config_overrides,
-            retry_policy=self._retry_policy,
-        )
+        if sys.platform == "win32":
+            verify_private_windows_directory(self._codex_home_dir)
+        if not _borrowed_home_path:
+            self._codex_config_overrides = materialize_codex_provider_config(
+                self._codex_home_dir,
+                self._codex_config_overrides,
+                retry_policy=self._retry_policy,
+            )
         if self._signer is not None:
             self._codex_config_overrides.extend(
                 [
@@ -3021,7 +3087,7 @@ class _CodexAppServerSession:
                     "features.memories=false",
                 ]
             )
-        if router_bridge_dir is not None:
+        if router_bridge_dir is not None and not _borrowed_home_path:
             write_codex_router_hooks_file(
                 self._codex_home_dir,
                 router_bridge_dir,
@@ -3477,7 +3543,10 @@ class _CodexAppServerSession:
             try:
                 current = self._codex_home_dir.lstat()
                 identity = (current.st_dev, current.st_ino)
-                if stat.S_ISDIR(current.st_mode) and identity == self._codex_home_identity:
+                _borrowed = getattr(self, "_borrowed_codex_home", None)
+                if _borrowed is not None and self._codex_home_dir.resolve() == _borrowed:
+                    pass  # NEVER delete the authenticated profile.
+                elif stat.S_ISDIR(current.st_mode) and identity == self._codex_home_identity:
                     shutil.rmtree(self._codex_home_dir, ignore_errors=True)
             except OSError:
                 pass
@@ -4678,6 +4747,23 @@ class CodexExecutor(Executor):
             each session and Codex is pinned to its endpoint and placeholder.
         :param skills_dir: Runtime-owned skills directory granted only to this session.
         """
+        # Explicit user-owned opt-in: native profile, no gateway credential transport.
+        _native_profile = _native_codex_borrow_home()
+        if _native_profile is not None:
+            if signer_launch_config is not None:
+                raise OSError("Native Codex profile refuses signer-backed routing")
+            if model_provider_override not in (None, "openai"):
+                raise OSError("Native Codex profile refuses custom model provider")
+            # On this explicitly opted-in *local* instance, use the Codex CLI's
+            # subscription login. No gateway auth shell command or API tokens.
+            gateway = False
+            gateway_host = None
+            base_url_override = None
+            gateway_auth_command = None
+            gateway_auth_refresh_interval_ms = None
+            model = None
+            model_provider_override = "openai"
+            logger.warning("Using explicitly selected native Codex profile; gateway disabled")
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
