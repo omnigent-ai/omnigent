@@ -845,6 +845,98 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
     assert composer.evaluate("el => el.scrollTop") > 0
 
 
+@pytest.mark.parametrize("surface", ["landing", "live"])
+def test_list_continuation_keeps_the_new_item_in_view(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    surface: str,
+) -> None:
+    _surface(page, chat_session_contract, surface, DESKTOP)
+    composer = _input(page, surface)
+    composer.click()
+    composer.press_sequentially("- item 1")
+    for index in range(2, 13):
+        composer.press("Shift+Enter")
+        composer.press_sequentially(f"item {index}")
+    assert composer.evaluate("el => el.scrollHeight > el.clientHeight")
+
+    composer.press("Shift+Enter")
+    expect(composer).to_have_value(re.compile(r"  - item 12\n  - $"))
+    line_height = composer.evaluate("el => parseFloat(getComputedStyle(el).lineHeight)")
+
+    def hidden_below_caret() -> float:
+        return composer.evaluate("el => el.scrollHeight - el.scrollTop - el.clientHeight")
+
+    try:
+        poll_until(lambda: hidden_below_caret() < line_height / 2, timeout_s=2, interval_s=0.05)
+    except AssertionError:
+        pytest.fail(
+            f"new list item is {hidden_below_caret():.0f}px below the visible box "
+            f"(line height {line_height}px)"
+        )
+
+
+_ITEMS = "\n".join(f"  - item {index}" for index in range(1, 13))
+_TEXT_BELOW = "\n\nmore\ntext\nbelow"
+
+
+@pytest.mark.parametrize(
+    ("edit", "expected"),
+    [
+        pytest.param("Alt+Enter", _ITEMS + "\n", id="alt-enter"),
+        pytest.param("paste", _ITEMS + "\nalpha\nbeta", id="paste"),
+        pytest.param(
+            "Shift+Enter above more text", _ITEMS + "\n  - " + _TEXT_BELOW, id="list-mid-draft"
+        ),
+    ],
+)
+def test_inserted_lines_scroll_in_without_jumping_past_the_caret(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    edit: str,
+    expected: str,
+) -> None:
+    chat = chat_session_contract
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=chat.base_url)
+    _surface(page, chat, "landing", DESKTOP)
+    composer = _input(page, "landing")
+    composer.click()
+    composer.fill(_ITEMS)
+    if edit.endswith("above more text"):
+        composer.evaluate(
+            """(el, below) => {
+              el.setRangeText(below, el.value.length, el.value.length, "preserve");
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+            }""",
+            _TEXT_BELOW,
+        )
+    line_height = composer.evaluate("el => parseFloat(getComputedStyle(el).lineHeight)")
+
+    def hidden_below() -> float:
+        return composer.evaluate("el => el.scrollHeight - el.scrollTop - el.clientHeight")
+
+    hidden_before = hidden_below()
+    assert composer.evaluate("el => el.scrollTop") > 0
+    if edit == "paste":
+        page.evaluate("text => navigator.clipboard.writeText(text)", "\nalpha\nbeta")
+        page.keyboard.press("ControlOrMeta+V")
+    else:
+        composer.press(edit.split()[0])
+    expect(composer).to_have_value(expected)
+
+    try:
+        poll_until(
+            lambda: abs(hidden_below() - hidden_before) < line_height / 2,
+            timeout_s=2,
+            interval_s=0.05,
+        )
+    except AssertionError:
+        pytest.fail(
+            f"{hidden_below():.0f}px is below the box after {edit}, "
+            f"{hidden_before:.0f}px before (line height {line_height}px)"
+        )
+
+
 @pytest.mark.browser_context_args(has_touch=True)
 def test_composer_growth_reflows_without_covering_output(
     page: Page,

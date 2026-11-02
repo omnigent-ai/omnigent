@@ -17,9 +17,25 @@ export function insertComposerText(
     (text || start === end
       ? document.execCommand("insertText", false, text)
       : document.execCommand("delete"));
-  if (inserted) return;
-  textarea.setRangeText(text, start, end, "end");
-  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  if (!inserted) {
+    textarea.setRangeText(text, start, end, "end");
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  revealCaretLine(textarea);
+}
+
+// Typing scrolls the caret's line into view, but Chromium skips that after a
+// script-run edit. A hidden copy of the text before the caret measures its depth.
+function revealCaretLine(textarea: HTMLTextAreaElement) {
+  if (textarea.scrollHeight <= textarea.clientHeight) return;
+  const probe = document.createElement("textarea");
+  probe.className = textarea.className;
+  probe.style.cssText = `position:absolute;visibility:hidden;height:0;min-height:0;width:${getComputedStyle(textarea).width}`;
+  probe.value = textarea.value.slice(0, textarea.selectionEnd);
+  textarea.after(probe);
+  const caretBottom = probe.scrollHeight;
+  probe.remove();
+  textarea.scrollTop = Math.max(textarea.scrollTop, caretBottom - textarea.clientHeight);
 }
 
 // Longer pastes stay native: the insertText command handles each line
