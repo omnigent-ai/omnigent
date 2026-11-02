@@ -4872,6 +4872,21 @@ async def test_codex_cli_version_parses_output(
     assert await _codex_cli_version("/usr/local/bin/codex") == expected
 
 
+async def test_codex_cli_version_runs_wrapper_prefix_before_version_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured wrapper is probed with its args ahead of ``--version``."""
+    calls: list[tuple[Any, ...]] = []
+
+    async def _fake_exec(*args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        calls.append(args)
+        return _FakeVersionProcess(stdout=b"codex-cli 0.154.0\n")
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+    assert await _codex_cli_version("isaac", "codex", "--") == (0, 154, 0)
+    assert calls == [("isaac", "codex", "--", "--version")]
+
+
 async def test_codex_cli_version_returns_none_on_oserror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
