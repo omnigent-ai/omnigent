@@ -268,13 +268,16 @@ class ClaudeNativeExecutor(Executor):
                 message=(
                     "Claude native session is no longer active after /clear; "
                     "open the latest conversation and retry."
-                )
+                ),
+                undelivered=True,
             )
             return
         text = _latest_user_text(messages, self._bridge_dir)
         notices = _latest_framework_notices(messages)
         if not text:
-            yield ExecutorError(message="Claude native turn had no user text to send")
+            yield ExecutorError(
+                message="Claude native turn had no user text to send", undelivered=True
+            )
             return
         if is_auth_slash_command(text):
             # Claude Code's sign-in is an interactive TUI handoff the bridge
