@@ -4270,6 +4270,10 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
             "Keep framework metadata separate.",
         ),
         (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt="),
+            "Keep framework metadata separate.",
+        ),
+        (
             ("--system-prompt", "--append-system-prompt", "--model", "sonnet"),
             "Keep framework metadata separate.",
         ),
@@ -4293,6 +4297,7 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
         "user-prompt-joined-value",
         "repeated-flags-last-wins",
         "final-empty-value-clears",
+        "final-empty-joined-value-clears",
         "owned-flag-before-user-option",
         "owned-flag-before-omnigent-options",
         "owned-joined-literal",
