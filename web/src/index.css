@@ -1058,9 +1058,10 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Native shells render beneath the status bar at every width. Keep floating
- * chat controls and the pinned Plan tracker below its safe area. */
+ * chat controls and the pinned Plan tracker below its safe area. Wide headers
+ * have too little space around 44px controls to overlap the status-bar inset. */
 :is([data-ios-native], [data-android-native]) .chat-header {
-  top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  top: max(0px, calc(var(--omnigent-safe-top) - var(--omnigent-header-top-overlap, 0px)));
 }
 :is([data-ios-native], [data-android-native]) .chat-plan-accordion {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
@@ -1103,6 +1104,10 @@ html[data-electron-mac] .breadcrumb-folder {
 
 /* Remaining native-shell adjustments are specific to the mobile layout. */
 @media (width < 48rem) {
+  :is([data-ios-native], [data-android-native]) .chat-header {
+    --omnigent-header-top-overlap: 0.5rem;
+  }
+
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
      button toggle (and the drag's resting open/closed state) is driven by
