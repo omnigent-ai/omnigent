@@ -28,7 +28,8 @@ export const UI_FONT_SIZE_MOBILE_DEFAULT = 14;
 export const UI_FONT_SIZE_MIN = 11;
 export const UI_FONT_SIZE_MAX = 18;
 export const UI_FONT_SIZE_STEP = 1;
-export const UI_FONT_SIZE_MOBILE_QUERY = "(width < 48rem)";
+// Legacy syntax keeps matchMedia compatible with the SPA's Safari 15 target.
+export const UI_FONT_SIZE_MOBILE_QUERY = "not all and (min-width: 48rem)";
 export const MESSAGE_FONT_SIZE_MOBILE_QUERY = `${UI_FONT_SIZE_MOBILE_QUERY}, (pointer: coarse)`;
 
 /** Clamp an arbitrary number into the supported px range. */
