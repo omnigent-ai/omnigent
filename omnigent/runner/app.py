@@ -203,8 +203,10 @@ from omnigent.runner.subagent_work import (
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    AUTOMATION_SESSION_INSTRUCTION,
     build_instructions,
     build_instructions_nullable,
+    is_automation_session,
     raw_author_instructions,
 )
 from omnigent.server.schemas import (
@@ -595,6 +597,8 @@ class _SessionSnapshot:
         a rebuilt work entry so wake suppression keyed on the child's
         ownership survives a reconnect / restart. ``None`` when unlabelled /
         the fetch failed.
+    :param automation_session: ``True`` when an automation run created the
+        session, so its turns get the unattended-run system instruction.
     """
 
     ok: bool
@@ -606,6 +610,7 @@ class _SessionSnapshot:
     parent_session_id: str | None = None
     agent_name: str | None = None
     wrapper_label: str | None = None
+    automation_session: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2178,6 +2183,7 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             wrapper_label: str | None = None
+            automation_session = False
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -2202,6 +2208,10 @@ def create_runner_app(
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
                     wrapper_label = wrapper_label_from_labels(body.get("labels"))
+                    raw_labels = body.get("labels")
+                    automation_session = is_automation_session(
+                        raw_labels if isinstance(raw_labels, dict) else None
+                    )
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -2214,6 +2224,7 @@ def create_runner_app(
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
                 wrapper_label=wrapper_label,
+                automation_session=automation_session,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -2300,6 +2311,7 @@ def create_runner_app(
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
             wrapper_label=wrapper_label_from_labels(snapshot.labels),
+            automation_session=is_automation_session(snapshot.labels),
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -5522,15 +5534,24 @@ def create_runner_app(
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
+            _framework_bg = (
+                (AUTOMATION_SESSION_INSTRUCTION,)
+                if (await _session_snapshot(conv)).automation_session
+                else ()
+            )
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
-                    cached_spec, _raw_per_request_instructions, []
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                    framework_instructions=_framework_bg,
                 )
             else:
                 instructions = build_instructions(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    framework_instructions=_framework_bg,
                 )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
@@ -6199,10 +6220,18 @@ def create_runner_app(
                     if _instr_spec_ds is not None:
                         _per_req_instr = cast(str | None, body.get("instructions"))
                         _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
+                        _framework_ds = (
+                            (AUTOMATION_SESSION_INSTRUCTION,)
+                            if (await _session_snapshot(conv_id)).automation_session
+                            else ()
+                        )
                         _ic_ds = InstructionComposition(
                             authored_present=_authored_ds,
                             composed=build_instructions_nullable(
-                                _instr_spec_ds, _per_req_instr, []
+                                _instr_spec_ds,
+                                _per_req_instr,
+                                [],
+                                framework_instructions=_framework_ds,
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
@@ -6214,7 +6243,10 @@ def create_runner_app(
                             _instr_body = {
                                 **body,
                                 "instructions": build_instructions(
-                                    _instr_spec_ds, _per_req_instr, []
+                                    _instr_spec_ds,
+                                    _per_req_instr,
+                                    [],
+                                    framework_instructions=_framework_ds,
                                 ),
                             }
                         if _authored_ds and harness_name:

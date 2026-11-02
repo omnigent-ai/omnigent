@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from omnigent.entities import (
@@ -57,6 +57,36 @@ EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
     "is unavailable (its tools fail because no Omnigent app window is "
     "attached) or for non-interactive bulk fetching."
 )
+
+# For sessions an automation started. Their runs arrive with no one watching,
+# so a question or a permission request stalls the run instead of reaching a
+# person. Sent as system instructions so it never shows in the transcript.
+AUTOMATION_SESSION_INSTRUCTION = (
+    "Automation session: an Omnigent automation started this session and sends its "
+    "prompt here on a schedule. No one is watching while a run works, so no one can "
+    "answer questions, approve requests or give input. Work toward the prompt's goal "
+    "on your own. Don't ask questions, wait for confirmation or stop to request "
+    "permission. When something is unclear, make a reasonable choice and keep going. "
+    "If an action is blocked or needs approval, skip it or find another way. End each "
+    "run with a reply that says what you did, what you assumed and anything you "
+    "couldn't do."
+)
+
+
+def is_automation_session(labels: Mapping[str, object] | None) -> bool:
+    """Whether a session's labels show that an automation started it.
+
+    The server stamps the origin label when a run creates the session, and
+    clients cannot set it. A session the owner picked for an automation to
+    continue has none: the owner chats in it too.
+
+    :param labels: The session's labels, or ``None`` when unknown.
+    :returns: ``True`` for a session an automation run created.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+
+    origin = labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if labels else None
+    return isinstance(origin, str) and origin != ""
 
 
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
