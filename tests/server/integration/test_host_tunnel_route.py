@@ -46,11 +46,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.server import tunnel_handshake
 from omnigent.server.auth import AuthProvider
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import HostStore, host_is_live
 from tests.budgets import budget
 
 pytestmark = pytest.mark.asyncio
@@ -212,6 +212,27 @@ async def _wait_offline(
         if host is not None and host.status == "offline":
             return
         await asyncio.sleep(0.01)
+
+
+async def _wait_count(
+    events: list[str],
+    count: int,
+    *,
+    timeout_s: float = 2.0,
+) -> None:
+    """Poll until *events* holds at least *count* entries.
+
+    :param events: Recorded callback announcements.
+    :param count: Number of entries to wait for.
+    :param timeout_s: Max seconds to poll before raising.
+    :raises asyncio.TimeoutError: If the count is not reached in time.
+    """
+
+    async def _poll() -> None:
+        while len(events) < count:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=timeout_s)
 
 
 async def _wait_deregistered(
@@ -1003,6 +1024,97 @@ async def test_host_tunnel_sets_offline_on_disconnect(
     host = store.get_host(_HOST_ID)
     assert host is not None
     assert host.status == "offline"
+
+
+def _announcing_app(
+    db_uri: str,
+) -> tuple[FastAPI, HostRegistry, HostStore, list[str], list[str]]:
+    """Build a host-tunnel app that records its connect/disconnect announcements.
+
+    :param db_uri: SQLite URI from the shared fixture.
+    :returns: Tuple of (app, registry, store, connects, disconnects),
+        the two lists collecting announced host ids in call order.
+    """
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    connects: list[str] = []
+    disconnects: list[str] = []
+
+    async def _on_host_connect(host_id: str, _owner: str | None) -> None:
+        connects.append(host_id)
+
+    async def _on_host_disconnect(host_id: str, _owner: str | None) -> None:
+        disconnects.append(host_id)
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            store,
+            on_host_connect=_on_host_connect,
+            on_host_disconnect=_on_host_disconnect,
+        ),
+        prefix="/v1",
+    )
+    return app, registry, store, connects, disconnects
+
+
+async def _overlap_tunnels(
+    app: FastAPI,
+    registry: HostRegistry,
+    connects: list[str],
+) -> tuple[ApplicationCommunicator, HostConnection]:
+    """Open a second tunnel for an already-connected host and let the first unwind.
+
+    The second connect announcement — not a registry poll — is the
+    "replacement is live" signal: a buggy cleanup can empty the registry
+    between polls, which would look like the takeover never happened.
+
+    :param app: App hosting the tunnel route.
+    :param registry: Registry the tunnels register in.
+    :param connects: Connect announcements recorded by the app.
+    :returns: Tuple of (surviving communicator, the superseded connection).
+    """
+    comm_old = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm_old, registry)
+    old_conn = registry.get(_HOST_ID)
+    assert old_conn is not None
+
+    comm_new = await _connect_route(app, _TUNNEL_PATH)
+    await comm_new.send_input({"type": "websocket.receive", "text": _make_hello()})
+    await _wait_count(connects, 2)
+
+    # Barrier: the superseded handler's task has finished, so whatever
+    # cleanup it does has already happened — no sleep-based guessing.
+    await asyncio.wait_for(comm_old.future, timeout=2.0)
+    return comm_new, old_conn
+
+
+async def test_host_tunnel_takeover_keeps_replacement_online(
+    db_uri: str,
+) -> None:
+    """A second tunnel for one host_id must not leave the live host offline.
+
+    Registration is newest-wins: the second tunnel poisons the first's
+    outbound queue and takes the registry slot. The first handler then
+    unwinds cleanly — and its cleanup must neither deregister the
+    replacement nor flip the DB row offline while a perfectly good tunnel
+    is up. Nothing rewrites ``status`` until the next reconnect, so the
+    host would read offline for the whole life of a working tunnel.
+    """
+    app, registry, store, connects, _disconnects = _announcing_app(db_uri)
+    comm_new, old_conn = await _overlap_tunnels(app, registry, connects)
+
+    live = registry.get(_HOST_ID)
+    assert live is not None, "superseded handler deregistered the live tunnel"
+    assert live is not old_conn, "the replacement should hold the registry slot"
+
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "online", "superseded handler flipped the live host offline"
+    assert host_is_live(host), "the live tunnel's host must still read as live"
+
+    await comm_new.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
 async def test_host_tunnel_rejects_bad_protocol_version(
