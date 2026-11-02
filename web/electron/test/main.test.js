@@ -167,6 +167,7 @@ function loadNavigationHarness({
   oidc = {},
   acceptedSessions = new Set(),
   deepLinks = null,
+  localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -643,6 +644,11 @@ function loadNavigationHarness({
       decideWindowOpen: () => ({ kind: "ignore" }),
       stripCrossOriginOpenerHeaders: () => {},
       WEB_SCHEMES: new Set(),
+    },
+    "./hostIdentity": {
+      ...require("../src/hostIdentity"),
+      isHostThisMachine: (context) =>
+        require("../src/hostIdentity").isHostThisMachine(context, localHostCli),
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
@@ -2558,7 +2564,7 @@ describe("browser permission wiring", () => {
     }
   });
 
-  it("guards each agent partition's document requests through its own Chromium session", async () => {
+  it("guards each agent partition's network requests through its own Chromium session", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
       const sessions = new Map();
@@ -2608,13 +2614,13 @@ describe("browser permission wiring", () => {
       const ses = sessions.get(partitions[0]);
       assert.deepEqual(
         // main.js runs in its own vm realm, so copy its arrays before deepEqual.
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
         [
-          ["request", ["mainFrame", "subFrame", "object"]],
-          ["sendHeaders", ["mainFrame", "subFrame", "object"]],
-          ["headers", ["mainFrame", "subFrame", "object"]],
+          ["request", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
+          ["sendHeaders", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
+          ["headers", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
         ],
-        "installed once per partition, for document requests only",
+        "installed once per partition, with every resource type reaching each network hook",
       );
       // Round-trip through JSON so objects from main.js's vm realm compare.
       const decide = (kind, details, session = ses, view = agent) =>
@@ -2633,6 +2639,30 @@ describe("browser permission wiring", () => {
         requestHeaders: { "Cache-Control": "no-cache" },
       });
       assert.deepEqual(await decide("headers", { url: next, ip: "127.0.0.1" }), { cancel: true });
+      ses.lookups.length = 0;
+      const worker = { webContentsId: 0, resourceType: "script" };
+      assert.deepEqual(
+        await decide("request", { ...worker, url: "http://169.254.169.254/worker.js" }),
+        { cancel: true },
+        "a worker without a view ID is guarded using its partition",
+      );
+      assert.deepEqual(await decide("sendHeaders", { ...worker, url: next, requestHeaders: {} }), {
+        requestHeaders: { "Cache-Control": "no-cache" },
+      });
+      assert.deepEqual(await decide("headers", { ...worker, url: next, ip: "127.0.0.1" }), {
+        cancel: true,
+      });
+      assert.deepEqual(await decide("request", { url: next, resourceType: "xhr" }), {
+        cancel: false,
+      });
+      assert.deepEqual(ses.lookups, ["example.com"], "subresources resolve DNS before sending");
+      ses.lookups.length = 0;
+      assert.deepEqual(
+        await decide("request", { url: "ws://lvh.me/live", resourceType: "webSocket" }),
+        { cancel: true },
+      );
+      assert.deepEqual(ses.lookups, ["lvh.me"], "WebSocket handshakes resolve DNS first");
+      ses.lookups.length = 0;
       ses.resolveProxy = async () => {
         throw new Error("proxy lookup failed");
       };
@@ -2650,9 +2680,9 @@ describe("browser permission wiring", () => {
       const otherSession = sessions.get(partitions[2]);
       assert.notEqual(otherSession, ses);
       assert.deepEqual(
-        otherSession.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        "each independent session receives all document hooks",
+        otherSession.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
+        "each independent session receives all network hooks",
       );
       otherSession.dns["example.com"] = "127.0.0.1";
       ses.lookups.length = 0;
@@ -4338,8 +4368,10 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     h.api.registerIpc();
     const registry = h.api.createBrowserRegistryForWindow(h.win);
     h.api.windows.get(h.win).browserRegistry = registry;
-    const context = h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId);
-    const eligible = h.browserRegistryDeps().isArcaAgentContext;
+    const context = h
+      .browserIpcDeps()
+      .getAgentContextForEvent({ sender: h.webContents }, { sourceHostId: hostId });
+    const eligible = h.browserRegistryDeps().allowsLocalhost;
     const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
     assert.equal(eligible(context), false);
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
@@ -4352,7 +4384,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.deepEqual(h.browserRegistryCalls.closeAll, ["server-changed"]);
     assert.equal(eligible(context), false);
     assert.equal(
-      eligible(h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId)),
+      eligible(
+        h
+          .browserIpcDeps()
+          .getAgentContextForEvent({ sender: h.webContents }, { sourceHostId: hostId }),
+      ),
       false,
     );
   });
@@ -5458,6 +5494,31 @@ describe("SSH connect IPC", () => {
     });
   }
 
+  // On the remote machine, localhost is that machine; a LAN address may be reachable.
+  const reachCases = {
+    "a server on localhost": ["http://localhost:5190", false],
+    "a server on 127.0.0.1": ["http://127.0.0.1:6767", false],
+    "a server on [::1]": ["http://[::1]:6767", false],
+    "a server on another machine in the network": ["http://192.168.1.20:6767", true],
+  };
+  for (const [label, [serverUrl, connects]] of Object.entries(reachCases)) {
+    it(`${connects ? "connects" : "refuses before connecting"} for ${label}`, async (t) => {
+      const h = sshHarness(t, { serverUrl });
+      const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+      const result = await h.ipc.get("omnigent:ssh-connect")(event, "devbox");
+
+      assert.equal(result.ok, connects);
+      assert.equal(h.calls.sshConnects.length, connects ? 1 : 0);
+      if (!connects) {
+        assert.equal(
+          result.error,
+          `devbox can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server devbox can reach, or, if devbox runs this server itself, run "omnigent host" there.`,
+        );
+      }
+    });
+  }
+
   it("gives no page a way to list the user's SSH hosts", (t) => {
     // Aliases can name internal machines, and the server page is untrusted.
     const h = sshHarness(t);
@@ -5465,6 +5526,67 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(
       [...h.ipc.keys()].filter((channel) => /ssh/i.test(channel)),
       ["omnigent:ssh-connect"],
+    );
+  });
+});
+
+describe("main-owned local host eligibility", () => {
+  it("denies local eligibility when the window loses its pinned origin or is destroyed", (t) => {
+    const h = loadNavigationHarness({ serverUrl: "https://server.example" });
+    t.after(h.cleanup);
+    h.api.createBrowserRegistryForWindow(h.win);
+    const eligible = h.browserRegistryDeps().allowsLocalhost;
+    const context = { hostIsThisMachine: true, sourceHostId: "local" };
+    assert.equal(eligible(context), true);
+    assert.equal(eligible({ ...context, revoked: true }), false);
+    h.api.windows.get(h.win).origin = null;
+    assert.equal(eligible(context), false);
+    h.api.windows.get(h.win).origin = "https://server.example";
+    h.win.isDestroyed = () => true;
+    assert.equal(eligible(context), false);
+  });
+
+  it("ignores page-supplied eligibility and requires enrollment plus the protocol marker", (t) => {
+    let live = true;
+    const serverUrl = "https://server.example";
+    const h = loadNavigationHarness({
+      serverUrl,
+      localHostCli: {
+        readLocalHostId: () => "local",
+        liveDaemonRecordFor: (target) => {
+          assert.equal(target, serverUrl);
+          return live ? { host_id: "local" } : null;
+        },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const context = (opts) =>
+      h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, opts);
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: false })
+        .hostIsThisMachine,
+      true,
+    );
+    assert.equal(
+      context({ sourceHostId: "remote", sessionHostProtocol: 1, hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
+    );
+    assert.equal(
+      context({ sourceHostId: "local", hostIsThisMachine: true }).hostIsThisMachine,
+      false,
+    );
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: "1", hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
+    );
+    live = false;
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
     );
   });
 });

@@ -83,6 +83,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     has_matching_hook_refusal,
 )
 from omnigent.harnesses.diagnostics import (
+    SIGN_IN_RESEND_STEP,
     detect_sign_in_prompt,
     launcher_install_prompt,
     launcher_password_prompt,
@@ -846,12 +847,10 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
 
     from omnigent.harnesses.opencode_native.bridge import bridge_root as opencode_bridge_root
 
-    # opencode-native keeps its bridge files below ``~/.omnigent/opencode-native``
-    # (the same ``$HOME/.omnigent/<harness>-native`` shape codex/antigravity use),
-    # so apply the identical anchor logic: in production trust ``$HOME`` and
-    # validate/chmod the two bridge-owned dirs below it (``.omnigent`` and
-    # ``opencode-native``); in tests the monkeypatched root may differ, so trust
-    # the direct parent.
+    # opencode-native keeps its bridge files below ``<data dir>/opencode-native``.
+    # With the default ``~/.omnigent`` data dir, trust ``$HOME`` and validate/chmod
+    # ``.omnigent`` and ``opencode-native`` (the codex/antigravity shape); with a
+    # custom ``OMNIGENT_DATA_DIR`` or a test root, trust the direct parent.
     opencode_root = _absolute_syntactic_path(opencode_bridge_root())
     if target.is_relative_to(opencode_root):
         trusted_parent = opencode_root.parent
@@ -7162,7 +7161,7 @@ def _wait_for_claude_prompt_ready(
                 remediation=(
                     "Finish the sign-in that another session opened, in your browser or in "
                     "that session's terminal. Claude Code continues on its own once it "
-                    "completes; then send your message again."
+                    f"completes{SIGN_IN_RESEND_STEP}"
                 ),
             )
         waited_on_sign_in = waiting_on_sign_in
