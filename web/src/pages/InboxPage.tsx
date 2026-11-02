@@ -1002,7 +1002,7 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
 
 function InboxActions({ children }: { children: ReactNode }) {
   return (
-    <div className="flex items-center justify-end gap-1 pt-0.5 mobile-app:flex-wrap">
+    <div className="flex items-center justify-end gap-1 pt-0.5 mobile-app:flex-col mobile-app:items-stretch">
       {children}
     </div>
   );
