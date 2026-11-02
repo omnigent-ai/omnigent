@@ -165,9 +165,9 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
     expect(keysFor("Cycle permission mode (in session)")).toEqual(["⇧", "Tab"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
-    expect(screen.getByText("Previous session")).toBeTruthy();
-    expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
-    expect(keysFor("Next session")).toEqual(["Ctrl", "]"]);
+    expect(screen.getByText("Go back")).toBeTruthy();
+    expect(keysFor("Go back")).toEqual(["Ctrl", "["]);
+    expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
     expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Focus or close workspace sidebar")).toBeTruthy();
