@@ -71,7 +71,13 @@ async def test_child_create_rejects_unavailable_harness(
 
 @pytest.mark.parametrize(
     "readiness",
-    [None, {}, {"jcode": True}, {"jcode": "needs-auth"}, {"jcode": "cli-unresponsive"}],
+    [
+        None,
+        {},
+        {"jcode": True},
+        {"jcode": "needs-auth"},
+        {"jcode": "cli-unresponsive", "claude-sdk": True},
+    ],
 )
 async def test_child_create_preserves_ready_and_unknown_hosts(
     client: httpx.AsyncClient,
