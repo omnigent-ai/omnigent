@@ -5384,6 +5384,7 @@ async def _auto_create_codex_terminal(
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
             codex_reprobed_launch_catalog,
+            databricks_profile_serves_codex_model,
         )
         from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.models.model_catalog_store import default_row
@@ -5425,6 +5426,19 @@ async def _auto_create_codex_terminal(
                     _codex_catalog = fresh_rows
                     _codex_catalog_was_stale = False
                     reachable = codex_reachable_model_slug(pick, fresh_rows)
+            if reachable is None and _codex_launch.profile is not None:
+                # Codex's list can lag the workspace, so the profile's workspace listing decides.
+                profile = _codex_launch.profile
+                if await asyncio.to_thread(databricks_profile_serves_codex_model, profile, pick):
+                    reachable = pick
+                    _logger.info(
+                        "codex-native: model pick %r for session %s is not in codex's "
+                        "model list, but profile %r serves it; launching on the pick",
+                        pick,
+                        session_id,
+                        profile,
+                        extra={"session_id": session_id},
+                    )
             if reachable is None:
                 # Re-resolve so provider overrides cannot retain the old model.
                 # A failed probe permits fallback, but cannot retire the pick.

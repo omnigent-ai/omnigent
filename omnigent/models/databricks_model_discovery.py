@@ -457,19 +457,22 @@ def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
 def select_servable_model(requested: str, servable: Iterable[str]) -> str | None:
     """Resolve *requested* against the ids a workspace actually serves.
 
-    Compared on the bare id, so a request naming the legacy ``databricks-``
-    spelling resolves to the ``system.ai.`` id serving that same model — only
-    the served spelling is routable.
+    Compared on the bare id with codex's dotted versions folded, so a request
+    naming the legacy ``databricks-`` spelling or a codex slug resolves to the
+    ``system.ai.`` id serving that same model — only the served spelling is
+    routable.
 
-    :param requested: Model id in either vocabulary, e.g.
-        ``"databricks-gpt-5-6-luna"``.
+    :param requested: Model id in any vocabulary, e.g.
+        ``"databricks-gpt-5-6-luna"`` or ``"gpt-5.6-luna"``.
     :param servable: Ids the workspace serves, e.g. the result of
         :func:`discover_databricks_codex_models`.
     :returns: The servable id for *requested*, or ``None`` when the workspace
         serves no such model.
     """
-    wanted = _bare_model_id(requested)
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+    wanted = comparable_model_id(requested)
     for model_id in servable:
-        if _bare_model_id(model_id) == wanted:
+        if comparable_model_id(model_id) == wanted:
             return model_id
     return None
