@@ -13518,6 +13518,81 @@ async def _run_runner_status_probe(
         _runner_status_probe_inflight.pop(session_id, None)
 
 
+# Claude's tool calls time out within minutes, so a Claude-native turn whose
+# transcript has gained nothing for this long is not still at work.
+_QUIET_NATIVE_TURN_SETTLE_S = 6 * 60 * 60
+# Transcript stamp (``updated_at``) of each session's last quiet-turn settle. A
+# runner that reports ``running`` again over the same silent transcript keeps
+# its status rather than flip-flopping with the settle.
+_quiet_turn_settled_at: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
+async def _settle_quiet_native_turn(conv: Conversation, conv_store: ConversationStore) -> bool:
+    """
+    Settle a Claude-native session still ``running`` long after its turn went quiet.
+
+    A turn can end without its ``idle`` edge reaching the server, leaving the
+    session ``running`` until the next turn. The runner counts that status as
+    work in flight, so it never idles out and its host never takes the daily
+    restart onto a newer runtime. Once the pane has been quiet, the runner asks
+    through a runner-owned read and adopts the answer; when the transcript has
+    also been silent for :data:`_QUIET_NATIVE_TURN_SETTLE_S`, the answer is
+    ``idle``.
+
+    A sub-agent is left to its parent's runtime, and a session holding a queued
+    message, an open question, or a sub-agent still at work is left running. So
+    is one this server already settled over the same silent transcript: its
+    runner reported ``running`` again, which a second settle would not change.
+
+    :param conv: The session row the snapshot read.
+    :param conv_store: Store used to read the session's sub-agents.
+    :returns: ``True`` when the session was settled to ``idle``.
+    """
+    session_id = conv.id
+    if (
+        _session_status_cache.get(session_id, conv.live_status) != "running"
+        or conv.kind == "sub_agent"
+        or conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+        or _quiet_turn_settled_at.get(session_id) == conv.updated_at
+    ):
+        return False
+    quiet_s = time.time() - conv.updated_at
+    if (
+        quiet_s < _QUIET_NATIVE_TURN_SETTLE_S
+        or pending_inputs.has_pending(session_id)
+        or pending_elicitations.counts_for([session_id]).get(session_id, 0) > 0
+    ):
+        return False
+    child_ids = (
+        await asyncio.to_thread(conv_store.list_child_conversation_ids_by_parent, [session_id])
+    ).get(session_id, [])
+    if child_ids:
+        children = await asyncio.to_thread(conv_store.get_conversations, child_ids)
+        if any(
+            _session_status_cache.get(child_id, child.live_status) in _MID_TURN_STATUSES
+            for child_id, child in children.items()
+        ):
+            return False
+    # The reads above yield the loop; a turn that started meanwhile wins.
+    if _session_status_cache.get(session_id, conv.live_status) != "running":
+        return False
+    _logger.info(
+        "Settling session=%s to idle: its runner still reports a turn, but the "
+        "transcript has been quiet for %.0fs",
+        session_id,
+        quiet_s,
+        extra=debug_event(
+            "native_quiet_turn_settled",
+            session_id=session_id,
+            runner_id=conv.runner_id,
+            quiet_s=str(int(quiet_s)),
+        ),
+    )
+    _quiet_turn_settled_at[session_id] = conv.updated_at
+    _publish_status(session_id, "idle")
+    return True
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -13667,6 +13742,12 @@ async def _get_session_snapshot(
                 is not None
             ):
                 status = _session_status_from_cache(session_id)
+    elif (
+        status == "running"
+        and not include_live_status
+        and await _settle_quiet_native_turn(conv, conv_store)
+    ):
+        status = "idle"
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None
