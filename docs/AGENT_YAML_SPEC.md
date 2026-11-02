@@ -380,9 +380,11 @@ executor:
 
 `harness: grok` (alias `grok-build`) and `harness: jcode` are builtin ACP CLI
 harnesses: Omnigent drives `grok agent stdio` or `jcode acp` through the same
-generic ACP wrap as `acp:<slug>`. Each CLI owns its auth and model selection
-(`grok login --device-auth`, or a provider in `~/.jcode/config.toml`), so a
-`model` override is refused. Jcode is not offered Omnigent's MCP tools. See the
+generic ACP wrap as `acp:<slug>`. By default each CLI owns its auth and model
+selection (`grok login --device-auth`, or a provider in `~/.jcode/config.toml`),
+so a `model` override is refused. When Omnigent's inference config binds
+`jcode` to an OpenAI-compatible provider, Omnigent writes a session-private Jcode
+config instead and forwards `model`. Jcode is not offered Omnigent's MCP tools. See the
 README's *Grok Build and Jcode* section for install steps.
 
 ```yaml

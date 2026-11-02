@@ -357,8 +357,11 @@ omnigent run --harness jcode
 Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
 stdio, and Omnigent stores no credential for either — each CLI reads back the
 login or config it wrote to disk. That also means `--model` is refused rather
-than silently dropped: both run their own default model. To pin one, configure
-an `acp:` agent whose command passes the vendor's own model flag. Jcode's ACP
+than silently dropped: each runs its own default model. To pin one, configure
+an `acp:` agent whose command passes the vendor's own model flag. The exception
+is Jcode bound to an OpenAI-compatible provider in Omnigent's inference config:
+Omnigent then writes a session-private Jcode config and forwards the agent's
+`model`. Jcode's ACP
 server ignores session-scoped MCP servers, so Omnigent's MCP tools are not
 offered to it.
 
