@@ -1,0 +1,18 @@
+name: markup-args-shell
+description: |
+  E2E fixture: a shell-capable agent whose tool-call arguments can contain
+  Rich-markup-like text (``[/dim]``), for REPL history-replay regressions.
+
+executor:
+  harness: openai-agents
+  model: mock-markup-args-shell
+
+prompt: |
+  You are a test agent. When the user asks you to run a shell command, call
+  `sys_os_shell` with exactly that command, then reply in one short sentence.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
