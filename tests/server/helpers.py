@@ -214,6 +214,11 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.idle_timeout_s: int | None = None
         self.network: str | None = None
         self.host_ports: list[int] | None = None
+        # Daytona ctor wiring (captured by install_fake_daytona_launcher).
+        self.cpu: int | None = None
+        self.memory: int | None = None
+        self.disk: int | None = None
+        self.auto_delete_interval: int | None = None
         # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
         self.namespace: str | None = None
         self.secret_name: str | None = None
@@ -367,18 +372,30 @@ def install_fake_daytona_launcher(
     Substitute the fake for ``DaytonaSandboxLauncher`` at its public seam.
 
     The managed flow constructs ``DaytonaSandboxLauncher(image=…,
-    env=…)``; the shim records both on the fake and hands the fake
-    back, so production code runs unmodified against it.
+    env=…, cpu=…, …)``; the shim records each on the fake and hands the
+    fake back, so production code runs unmodified against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
     :param fake: The fake launcher to substitute.
     """
     import omnigent.onboarding.sandboxes.daytona as daytona_mod
 
-    def _ctor(*, image: str | None = None, env: list[str] | None = None) -> FakeSandboxLauncher:
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        cpu: int | None = None,
+        memory: int | None = None,
+        disk: int | None = None,
+        auto_delete_interval: int | None = None,
+    ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
         fake.env = env
+        fake.cpu = cpu
+        fake.memory = memory
+        fake.disk = disk
+        fake.auto_delete_interval = auto_delete_interval
         return fake
 
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)
