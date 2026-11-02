@@ -430,7 +430,10 @@ def test_wake_stuck_on_stage_brings_reconnect_host_back(
     page.keyboard.press("Escape")
     expect(toasts).to_have_count(0)
 
-    # The released wake's late answer changes nothing.
+    # The released wake's late answer doesn't start it again: Reconnect host stays.
     wake.fulfill(status=200, json={"queued": False, "recovered": True})
     _expect_host_status(page, "starting", tooltip="Provisioning sandbox")
+    _open_host_menu(page, "starting")
+    expect(page.get_by_role("menuitem", name="Reconnect host")).to_be_visible()
+    page.keyboard.press("Escape")
     expect(toasts).to_have_count(0)

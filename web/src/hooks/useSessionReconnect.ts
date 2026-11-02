@@ -12,6 +12,7 @@ import {
   supportsArcaConnect,
 } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
+import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import type { SandboxStatus } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 
@@ -24,11 +25,6 @@ export const SANDBOX_WAKE_STAGE_LIMIT_MS = 5 * 60_000;
 /** Identifies a reported launch stage by value; snapshots rebuild the object. */
 function launchKey(launch: SandboxStatus | null): string {
   return launch ? JSON.stringify([launch.stage, launch.error, launch.details]) : "";
-}
-
-/** A launch that failed or waits on the user is no longer making progress. */
-function launchStopped(launch: SandboxStatus | null): boolean {
-  return launch?.stage === "failed" || launch?.stage === "action_required";
 }
 
 /**
@@ -61,7 +57,7 @@ export function useSessionReconnect({
   const inFlight = useRef<{ progressToast?: string | number } | null>(null);
   // The open session's launch stage, compared against its value at the wake's click.
   const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
-  const launchInProgress = launch !== null && !launchStopped(launch);
+  const launchInProgress = launch !== null && !isSandboxLaunchStopped(launch);
   const wakeStart = useRef<{ operation: object; launch: string; stageChanged: boolean } | null>(
     null,
   );
@@ -167,8 +163,10 @@ export function useSessionReconnect({
   // The count above waits on the launch, so a stage that never finishes would spin
   // with Reconnect host hidden. Let the wake go quietly: the server's stage keeps the
   // dot spinning, and Reconnect host returns as it does after a reload.
+  // Keyed on whether a wake is running, so the server answering mid-stage keeps the deadline.
+  const wakeRunning = sandboxWake !== null;
   useEffect(() => {
-    if (sandboxWake === null || !launchInProgress) return;
+    if (!wakeRunning || !launchInProgress) return;
     const timer = setTimeout(() => {
       const start = wakeStart.current;
       if (start && inFlight.current === start.operation) inFlight.current = null;
@@ -176,7 +174,7 @@ export function useSessionReconnect({
       setSandboxWake(null);
     }, SANDBOX_WAKE_STAGE_LIMIT_MS);
     return () => clearTimeout(timer);
-  }, [sandboxWake, launchInProgress]);
+  }, [wakeRunning, launchInProgress]);
 
   // A failed or waiting stage left over from before the click mustn't end the
   // wake; one reported since then does, even if it repeats the old one.
@@ -184,7 +182,7 @@ export function useSessionReconnect({
     const start = wakeStart.current;
     if (sandboxWake === null || !start) return;
     if (launchKey(launch) !== start.launch) start.stageChanged = true;
-    if (!start.stageChanged || !launchStopped(launch)) return;
+    if (!start.stageChanged || !isSandboxLaunchStopped(launch)) return;
     if (inFlight.current === start.operation) inFlight.current = null;
     wakeStart.current = null;
     setSandboxWake(null);

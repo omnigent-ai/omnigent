@@ -709,6 +709,36 @@ describe("useSessionReconnect", () => {
     },
   );
 
+  it("keeps the stage limit's deadline when the server answers partway through", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = deferred<PostEventResponse>();
+      vi.mocked(retrySession).mockReturnValue(pending.promise);
+      useChatStore.setState({
+        conversationId: "session",
+        sandboxStatus: { stage: "provisioning" },
+      });
+      const { result } = renderHook(() =>
+        useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+      );
+      let reconnect!: Promise<void>;
+      await act(async () => {
+        reconnect = result.current.reconnect();
+      });
+      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_STAGE_LIMIT_MS - 60_000));
+      await act(async () => {
+        pending.resolve({ queued: false, recovered: true });
+        await reconnect;
+      });
+      expect(result.current.sandboxStarting).toBe(true);
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(result.current.sandboxStarting).toBe(false);
+      expect(toast.error).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drops the stage limit once the launch stops reporting progress", async () => {
     vi.useFakeTimers();
     try {

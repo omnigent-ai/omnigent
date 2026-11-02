@@ -6,7 +6,7 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
-import { SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
+import { isSandboxLaunchStopped, SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
 import type { SandboxStatus } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { DisabledActionTooltip } from "./DisabledActionTooltip";
@@ -167,8 +167,7 @@ export function HostBadge({
     const launchStatus = launch && !host ? launchStatusWord(launch) : null;
     // A wake, or a launch or resume the server reports by stage, spins the status
     // dot until the host itself is online. A launch waiting on the user isn't progress.
-    const launchInProgress =
-      launch !== null && launch.stage !== "failed" && launch.stage !== "action_required";
+    const launchInProgress = launch !== null && !isSandboxLaunchStopped(launch);
     // The wake's owner ends `starting` when the launch reports a stop.
     const localWakeRunning = starting && !!badge;
     const hostStarting = (localWakeRunning || launchInProgress) && badge?.status !== "online";
