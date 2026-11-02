@@ -1056,13 +1056,9 @@ export class TerminalSession {
   /**
    * Paste a command at the shell's prompt without running it.
    *
-   * The bridge waits for the shell's prompt and pastes with tmux's
-   * ``paste-buffer -p``, which adds bracketed-paste markers whenever the
-   * shell enabled them, so every line stays in the edit buffer until the user
-   * presses Enter. It refuses a multi-line command it can't paste that way,
-   * and ``onRefused`` gets it. A runner that doesn't answer within
-   * {@link SHELL_PASTE_ACK_TIMEOUT_MS} gets an xterm paste instead, but only
-   * when that is safe.
+   * The bridge pastes once the prompt is ready, or refuses. A runner that
+   * doesn't answer within {@link SHELL_PASTE_ACK_TIMEOUT_MS} gets an xterm
+   * paste, only when that can't run a line.
    *
    * @param claim Takes the command; null means another view already pasted it.
    *   Called once, when the WebSocket is open.

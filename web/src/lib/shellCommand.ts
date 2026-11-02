@@ -55,11 +55,8 @@ function withoutControlCharacters(text: string): string {
 /**
  * The command text a shell code block hands to a new shell.
  *
- * When the block shows a session transcript (``$ cmd`` lines among output),
- * only the prompted lines are kept, without their ``$ `` prompt, along with any
- * backslash-continued lines that follow them. Surrounding blank lines and
- * trailing newlines are dropped so the paste never ends in an Enter, and
- * control characters other than tab are removed.
+ * A transcript keeps only its ``$ `` lines (and their continuations), without
+ * the prompt. Trailing newlines and control characters other than tab are dropped.
  *
  * @param code The code block's text, e.g. ``"$ npm test\\nok\\n"``.
  * @returns The command, e.g. ``"npm test"``; empty when nothing remains.
