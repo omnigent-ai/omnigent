@@ -228,7 +228,7 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-schedule").textContent).toContain("Weekdays at 8:00 AM");
     expect(screen.getByTestId("task-detail-agent")).toHaveTextContent("Polly");
     // Null hostId → resolve-at-fire label, not blank.
-    expect(screen.getByTestId("task-detail-host")).toHaveTextContent("Resolve at fire time");
+    expect(screen.getByTestId("task-detail-host")).toHaveTextContent("Most recently active host");
     expect(screen.getByTestId("task-detail-state-pill")).toHaveTextContent("Active");
   });
 

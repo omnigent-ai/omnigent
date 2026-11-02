@@ -25,6 +25,7 @@ def test_catalog_rows_render_for_every_native_picker(
 ) -> None:
     """The real chat page consumes runner-owned rows for every picker family."""
     chat = chat_session_contract
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
     for harness in (
         "claude-native",
         "codex-native",
@@ -35,15 +36,22 @@ def test_catalog_rows_render_for_every_native_picker(
         "devin-native",
         "acp",
     ):
+        wrapper = {
+            "claude-native": "claude-code-native-ui",
+            "codex-native": "codex-native-ui",
+        }.get(harness)
+        chat.update_session(labels={"omnigent.wrapper": wrapper} if wrapper else {})
         chat.set_catalog(
             harness=harness,
             models=[
                 model_option("primary", display_name="Primary", is_default=True),
                 model_option("alternate", display_name="Alternate"),
             ],
-            selected_model="primary",
+            selected_model="PRIMARY" if wrapper else "primary",
         )
         page.goto(chat.url)
+        if wrapper:
+            expect(page.get_by_test_id("composer-agent-model-value")).to_have_text("Primary")
         _open_models(page)
 
         rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
@@ -116,6 +124,95 @@ def test_selecting_a_catalog_row_patches_its_exact_id(
     expect(page.get_by_test_id("composer-agent-model-summary")).to_have_text("Alternate")
     assert patch_info.value.request.post_data_json == {"model_override": "provider/alternate"}
     assert chat.session_patches == [{"model_override": "provider/alternate"}]
+
+
+def test_long_catalog_groups_by_creator_and_searches_by_keyboard(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A long mixed catalog opens on the selected creator; search reaches a collapsed one."""
+    chat = chat_session_contract
+    rows = [
+        ("anthropic/claude-opus-5", "Claude Opus 5"),
+        ("anthropic/claude-sonnet-5", "Claude Sonnet 5"),
+        ("amazon-bedrock/us.anthropic.claude-sonnet-5", "Claude Sonnet 5"),
+        ("openai/gpt-5.5", "GPT-5.5"),
+        ("openai/gpt-5.5-mini", "GPT-5.5 mini"),
+        ("openai/gpt-5.5-nano", "GPT-5.5 nano"),
+        ("openai/gpt-5.4", "GPT-5.4"),
+        ("openai/gpt-5.4-mini", "GPT-5.4 mini"),
+        ("openrouter/google/gemini-3-pro", "Gemini 3 Pro"),
+        ("omnigent-openai/system.ai.glm-5-2", "GLM-5.2"),
+        ("omnigent/databricks-kimi-k2-7-code", "Kimi K2.7 Code"),
+        ("radius/balanced", "Balanced"),
+    ]
+    chat.set_catalog(
+        harness="pi-native",
+        models=[
+            model_option(model_id, display_name=name, is_default=model_id == "openai/gpt-5.5")
+            for model_id, name in rows
+        ],
+        selected_model="openai/gpt-5.5",
+    )
+    # Pi's picker selection is the session's requested model.
+    chat.update_session(model_override="openai/gpt-5.5")
+    page.goto(chat.url)
+    _open_models(page)
+    menu = page.get_by_test_id("composer-agent-config-menu")
+    expect(menu.get_by_role("menuitem", name="OpenAI 5")).to_have_attribute(
+        "aria-expanded", "true"
+    )
+    expect(menu.get_by_role("menuitem", name="Moonshot AI 1")).to_have_attribute(
+        "aria-expanded", "false"
+    )
+    kimi = menu.locator('[data-model-id="omnigent/databricks-kimi-k2-7-code"]')
+    expect(kimi).to_have_count(0)
+    # Row names start where their group label does, past the chevron.
+    label_left, row_left = menu.evaluate(
+        """menu => [
+            menu.querySelector('[aria-expanded="true"] span'),
+            menu.querySelector('[role="group"] [role="menuitemcheckbox"]'),
+        ].map(element => {
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            return range.getBoundingClientRect().left;
+        })"""
+    )
+    assert abs(label_left - row_left) < 0.5, (label_left, row_left)
+
+    # The menu keeps its height cap, and search stays reachable after scrolling.
+    scrolled = menu.evaluate(
+        "element => { element.scrollTop = element.scrollHeight; return element.scrollTop; }"
+    )
+    assert scrolled > 0
+    search = menu.get_by_role("textbox", name="Search models")
+    expect(search).to_be_in_viewport()
+    box = menu.bounding_box()
+    assert box is not None and box["height"] <= 576
+
+    # A broad search keeps the list scrollable; its first match must start
+    # below the pinned search rather than stay scrolled away beneath it.
+    search.fill("a")
+    search_box = search.bounding_box()
+    first_group = menu.get_by_role("group").first.bounding_box()
+    assert search_box is not None and first_group is not None
+    assert search_box["y"] + search_box["height"] <= first_group["y"] + 1
+
+    search.fill("moonshot")
+    search.press("ArrowDown")
+    expect(kimi).to_be_focused()
+    session_path = f"/v1/sessions/{chat.session_id}"
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == session_path
+            and response.status == 200
+        )
+    ):
+        page.keyboard.press("Enter")
+
+    expect(page.get_by_test_id("composer-agent-model-summary")).to_have_text("Kimi K2.7 Code")
+    assert chat.session_patches == [{"model_override": "omnigent/databricks-kimi-k2-7-code"}]
 
 
 def test_picker_open_and_selection_do_not_refetch_catalog_or_session(

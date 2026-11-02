@@ -220,12 +220,19 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     context_ring = control_bounds["composer-context-ring"]
     assert background["x"] + background["width"] == pytest.approx(subagent["x"], abs=0.5)
     assert subagent["x"] + subagent["width"] + 4 == pytest.approx(context_ring["x"], abs=0.5)
-    # A label that would have to truncate collapses the whole bar to icons
-    # instead — the full value stays in the title — and a bar with room shows
-    # every label untruncated. Neither state may show an ellipsis.
+    # Labels collapse when they no longer fit. The PR's full identity remains
+    # available in its hover preview, or its title on touch devices.
     collapsed = bar.get_attribute("data-labels") == "collapsed"
     assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_number)
-    expect(pr_label).to_have_attribute("title", f"#{pr_number}")
+    if is_mobile:
+        expect(pr_label).to_have_attribute("title", f"#{pr_number}")
+    else:
+        assert pr_label.get_attribute("title") is None
+        pr_link.hover()
+        preview = page.get_by_test_id("composer-pr-preview")
+        expect(preview.get_by_text(f"example/repo #{pr_number}", exact=True)).to_be_visible()
+        page.mouse.move(0, 0, steps=10)
+        expect(preview).to_be_hidden()
     # The PR number stays visible and the context ring stays accessible; a
     # crowded bar collapses only the directory and branch text to their icons.
     expect(pr_label).to_be_visible()
