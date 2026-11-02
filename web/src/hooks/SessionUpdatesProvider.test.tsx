@@ -229,6 +229,56 @@ function wireItem(id: string, commentsCount: number, commentsUpdatedAt: number |
   return { ...conv(id), comments_count: commentsCount, comments_updated_at: commentsUpdatedAt };
 }
 
+describe("SessionUpdatesProvider new-row insertion", () => {
+  const sharedKey = ["conversations", "", false, null, "shared"];
+
+  function sharedIds(client: QueryClient): string[] {
+    return client
+      .getQueryData<ConversationsInfiniteData>(sharedKey)!
+      .pages[0].data.map((c) => c.id);
+  }
+
+  function seedShared(client: QueryClient): void {
+    client.setQueryData(sharedKey, {
+      pages: [
+        {
+          data: [{ ...conv("listed"), owner: "bob" }],
+          first_id: "listed",
+          last_id: "listed",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    } satisfies ConversationsInfiniteData);
+  }
+
+  it("does not add another user's open session to the Shared list", () => {
+    // Opened by link; the server leaves it out of Shared (e.g. shared only with a
+    // group), so a snapshot of the open session must not insert it.
+    const client = new QueryClient();
+    seedShared(client);
+    renderProvider(client, ["/c/link-shared"]);
+
+    act(() =>
+      frameHandler()({ type: "snapshot", items: [{ ...conv("link-shared"), owner: "alice" }] }),
+    );
+
+    expect(sharedIds(client)).toEqual(["listed"]);
+  });
+
+  it("adds a session newly shared with the viewer while it is not open", () => {
+    const client = new QueryClient();
+    seedShared(client);
+    renderProvider(client, ["/"]);
+
+    act(() =>
+      frameHandler()({ type: "changed", items: [{ ...conv("new-share"), owner: "alice" }] }),
+    );
+
+    expect(sharedIds(client)).toEqual(["new-share", "listed"]);
+  });
+});
+
 describe("SessionUpdatesProvider host changes", () => {
   it("invalidates cached session agents so shell inventories refresh", () => {
     const client = new QueryClient();

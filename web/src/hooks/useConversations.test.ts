@@ -1033,6 +1033,41 @@ describe("recently-created keep-alive", () => {
     expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
   });
 
+  it.each([
+    ["mine", ["mine_new", "conv_old"]],
+    ["shared", ["shared_new", "conv_old"]],
+  ] as const)(
+    "keeps only %s-side rows alive in a tab-scoped list",
+    async (visibility, expected) => {
+      for (const [id, owner] of [
+        ["mine_new", undefined],
+        ["shared_new", "alice"],
+      ] as const) {
+        markRecentlyCreated({
+          id,
+          object: "conversation",
+          title: null,
+          created_at: 0,
+          updated_at: 9,
+          labels: {},
+          permission_level: null,
+          ...(owner ? { owner } : {}),
+        });
+      }
+      fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useConversations("", false, {}, undefined, visibility), {
+        wrapper,
+      });
+
+      await waitFor(() => expect(result.current.data).toBeDefined());
+      expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(expected);
+    },
+  );
+
   it("drops the keep-alive (no duplicate) once the fetch returns the row", async () => {
     markRecentlyCreated({
       id: "conv_new",
