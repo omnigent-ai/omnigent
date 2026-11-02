@@ -1,12 +1,15 @@
+import { createElement, type ReactNode } from "react";
 import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   STARTING_GRACE_S,
+  classifyRunnerLiveness,
   type LivenessRow,
   livenessRowFromSession,
   useSessionLiveness,
 } from "./useSessionLiveness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { RunnerHealthRefreshContext } from "@/hooks/runnerHealthFreshness";
 import type { Session } from "@/lib/types";
 
 // Drive the two split signals directly so the test pins the derivation
@@ -375,5 +378,76 @@ describe("useSessionLiveness — derivation truth table", () => {
       const row = livenessRowFromSession(session({ hostId: "h1", permissionLevel: null }));
       expect(derive(false, false, row)).toEqual({ kind: "host_offline", isOwner: true });
     });
+  });
+});
+
+describe("classifyRunnerLiveness (pure truth-table rows)", () => {
+  it.each([
+    // [runner, host, resumable, expected]
+    [true, true, false, "online"],
+    [true, false, false, "online"],
+    [true, undefined, false, "online"],
+    [false, false, true, "host_asleep"],
+    [undefined, false, true, "host_asleep"],
+    [false, false, false, "host_offline"],
+    [undefined, false, false, "host_offline"],
+    [false, true, false, "runner_asleep"],
+    [false, true, true, "runner_asleep"],
+    [undefined, true, false, null],
+    [undefined, undefined, false, null],
+    [false, undefined, false, null],
+    [false, null, false, null],
+  ] as const)(
+    "runner=%s host=%s resumable=%s -> %s",
+    (runnerOnline, hostOnline, hostResumable, want) => {
+      expect(classifyRunnerLiveness({ runnerOnline, hostOnline, hostResumable })).toBe(want);
+    },
+  );
+
+  it("defaults hostResumable to false", () => {
+    expect(classifyRunnerLiveness({ runnerOnline: false, hostOnline: false })).toBe("host_offline");
+  });
+});
+
+describe("useSessionLiveness — turn end keeps main's liveness kinds", () => {
+  const hostRow = conv({ host_id: "h1" });
+
+  function setup(row: LivenessRow = hostRow) {
+    const refresh = vi.fn();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(RunnerHealthRefreshContext.Provider, { value: refresh }, children);
+    const view = renderHook(
+      ({ turnActive }: { turnActive: boolean }) => useSessionLiveness(SID, row, { turnActive }),
+      { wrapper, initialProps: { turnActive: true } },
+    );
+    return { refresh, view };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runnerMock.mockReturnValue(false);
+    hostMock.mockReturnValue(true);
+  });
+
+  it("returns runner_asleep immediately after the turn ends (main parity) and re-polls", () => {
+    const { refresh, view } = setup();
+    expect(view.result.current).toEqual({ kind: "starting" });
+    view.rerender({ turnActive: false });
+    expect(view.result.current).toEqual({ kind: "runner_asleep" });
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("does not delay host_offline after a turn ends", () => {
+    hostMock.mockReturnValue(false);
+    const { view } = setup();
+    view.rerender({ turnActive: false });
+    expect(view.result.current).toEqual({ kind: "host_offline", isOwner: true });
+  });
+
+  it("does not delay local_stranded after a turn ends", () => {
+    hostMock.mockReturnValue(null);
+    const { view } = setup(conv({ host_id: null }));
+    view.rerender({ turnActive: false });
+    expect(view.result.current).toEqual({ kind: "local_stranded" });
   });
 });

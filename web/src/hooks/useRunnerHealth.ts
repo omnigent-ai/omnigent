@@ -13,6 +13,7 @@
 import { useEffect, useState } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { onHostStatusChanged } from "@/lib/nativeBridge";
+import { recordRunnerHealthSampleStart } from "@/hooks/runnerHealthFreshness";
 
 // Minimal shape the poller needs from each session: just its id. Both
 // the sidebar `Conversation` list and a single-session snapshot satisfy
@@ -65,11 +66,14 @@ interface BatchHealthResponse {
  *
  * @param sessions - Sessions to poll. Each entry needs only ``id``. Pass
  *   an empty array (or `undefined`) to poll nothing.
+ * @param refreshRevision - Bump to re-poll immediately (restarts the poll
+ *   loop) instead of waiting out the interval.
  * @returns A map keyed by session id. Missing entries mean "not yet
  *   polled" — consumers treat that as unknown.
  */
 export function useRunnerHealth(
   sessions: RunnerHealthInput[] | undefined,
+  refreshRevision = 0,
 ): Map<string, SessionLiveness> {
   const [statusMap, setStatusMap] = useState<Map<string, SessionLiveness>>(new Map());
   const [hostStatusRevision, setHostStatusRevision] = useState(0);
@@ -95,6 +99,7 @@ export function useRunnerHealth(
 
     async function poll() {
       let success = false;
+      const startedAt = Date.now();
       try {
         const param = ids.join(",");
         const resp = await authenticatedFetch(`/health?session_ids=${encodeURIComponent(param)}`);
@@ -114,6 +119,7 @@ export function useRunnerHealth(
                 });
               }
             }
+            recordRunnerHealthSampleStart(next, startedAt);
             setStatusMap(next);
             success = true;
           }
@@ -135,7 +141,7 @@ export function useRunnerHealth(
       cancelled = true;
       if (timer !== null) clearTimeout(timer);
     };
-  }, [sessions, hostStatusRevision]);
+  }, [sessions, hostStatusRevision, refreshRevision]);
 
   return statusMap;
 }

@@ -8,7 +8,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { SessionState } from "@/hooks/useSessionState";
 import { cn } from "@/lib/utils";
 import type { ReactElement } from "react";
-import { CircleAlertIcon } from "lucide-react";
+import { CircleAlertIcon, MoonIcon } from "lucide-react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
@@ -19,6 +19,15 @@ interface Visual {
   ariaLabel: string;
   tooltip: string;
   render: () => ReactElement;
+}
+
+const ASLEEP_TOOLTIP = "Agent asleep — your next message restarts it";
+// Read-only viewers cannot send, so no restart promise.
+const ASLEEP_READ_ONLY_TOOLTIP = "Agent asleep";
+
+/** The asleep wording shared by the badge and the sidebar row tooltip. */
+export function asleepTooltipText(readOnly: boolean | undefined): string {
+  return readOnly ? ASLEEP_READ_ONLY_TOOLTIP : ASLEEP_TOOLTIP;
 }
 
 function describe(state: SessionState): Visual {
@@ -61,6 +70,15 @@ function describe(state: SessionState): Visual {
           <CircleAlertIcon aria-hidden className="size-3.5 shrink-0 text-destructive" />
         ),
       };
+    case "asleep": {
+      const tooltip = asleepTooltipText(state.readOnly);
+      return {
+        kind: state.kind,
+        ariaLabel: tooltip,
+        tooltip,
+        render: () => <MoonIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />,
+      };
+    }
     case "disconnected":
       return {
         kind: state.kind,
