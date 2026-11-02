@@ -8,10 +8,12 @@ so a single instance is imported by reference across the package.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import math
 import re
 import time
+import uuid
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -627,6 +629,13 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# Sequence of each session's latest in-flight -> terminal status edge. The
+# prefix keeps finish ids from another replica or an earlier process distinct.
+_session_turn_finish_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+_turn_finish_sequence = itertools.count(1)
+_TURN_FINISH_ID_PREFIX = uuid.uuid4().hex[:12]
+
+
 @dataclass
 class _RunnerStatusProbeBackoff:
     """
@@ -672,6 +681,10 @@ _read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCach
 
 
 _read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCache()
+
+
+# Per user: the turn finish id last watched on some device with the session open.
+_read_watched_turn_finish: WorkspaceScopedCache[str, dict[str, str]] = WorkspaceScopedCache()
 
 
 _interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
@@ -1248,6 +1261,7 @@ __all__ = [
     "_SUBAGENT_STATUS_TYPE",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
+    "_TURN_FINISH_ID_PREFIX",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
     "_UPLOAD_READ_CHUNK_BYTES",
     "_WATCHER_TASKS",
@@ -1277,6 +1291,7 @@ __all__ = [
     "_pushed_model_options_cache",
     "_read_explicit_unread",
     "_read_last_seen",
+    "_read_watched_turn_finish",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
     "_runner_status_probe_backoff",
@@ -1290,6 +1305,8 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
+    "_session_turn_finish_cache",
+    "_turn_finish_sequence",
     "_unbound_managed_launch_tasks",
     "get_server_host_registry",
     "get_server_runner_router",

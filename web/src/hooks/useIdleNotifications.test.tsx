@@ -485,6 +485,66 @@ describe("useIdleNotifications active-view suppression", () => {
   });
 });
 
+describe("useIdleNotifications finish watched on another device", () => {
+  function withFinish(
+    conversation: Conversation,
+    finishId: string | null,
+    watchedFinishId: string | null,
+  ): Conversation {
+    return {
+      ...conversation,
+      last_turn_finish_id: finishId,
+      viewer_watched_turn_finish_id: watchedFinishId,
+    };
+  }
+
+  it("skips a turn end the user already watched on another device", async () => {
+    setConversations([withFinish(conv("a", "running"), null, null)]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([withFinish(conv("a", "idle"), "p-1", "p-1")]);
+    rerender();
+    await settle();
+
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("cancels a pending turn end once another device reports watching it", async () => {
+    setConversations([withFinish(conv("a", "running"), null, null)]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([withFinish(conv("a", "idle"), "p-1", null)]);
+    rerender();
+    setConversations([withFinish(conv("a", "idle"), "p-1", "p-1")]);
+    rerender();
+    await settle();
+
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("notifies when the other device acknowledged only an earlier finish", async () => {
+    setConversations([withFinish(conv("a", "running"), "p-1", "p-1")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([withFinish(conv("a", "idle"), "p-2", "p-1")]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
+  it("notifies when the server reports no new finish for the turn", async () => {
+    setConversations([withFinish(conv("a", "running"), "p-1", "p-1")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([withFinish(conv("a", "idle"), "p-1", "p-1")]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+});
+
 describe("useIdleNotifications badge (native shell)", () => {
   beforeEach(() => {
     isNativeMock.mockReturnValue(true);

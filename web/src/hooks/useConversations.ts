@@ -260,6 +260,17 @@ export interface Conversation {
    */
   viewer_unread?: boolean;
   /**
+   * Opaque id of the latest turn finish behind `status` (including direct
+   * sub-agent children); changes on each finish. Absent on older servers or
+   * when the serving process recorded no finish.
+   */
+  last_turn_finish_id?: string | null;
+  /**
+   * The `last_turn_finish_id` the requesting user last watched on any device
+   * with the session open. A turn-end notification for that finish is skipped.
+   */
+  viewer_watched_turn_finish_id?: string | null;
+  /**
    * Excerpt of the chat content that matched the current `search_query`,
    * centered on the match with `…` marking elided ends. Present only on
    * search responses where the query hit a message body rather than the
