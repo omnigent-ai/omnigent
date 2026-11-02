@@ -3,8 +3,10 @@ import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from 
 import {
   ARIA_MOD_KEY,
   COMMAND_PALETTE_KEYS,
+  settingsAriaShortcut,
   settingsShortcutKeys,
-  SIDEBAR_TOGGLE_KEYS,
+  sidebarToggleAriaShortcut,
+  sidebarToggleShortcutKeys,
 } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -72,7 +74,7 @@ export function SidebarHeaderActions({
             variant="ghost"
             size="icon-xs"
             aria-label={expanded ? "Close sidebar" : "Open sidebar"}
-            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+[`}
+            aria-keyshortcuts={sidebarToggleAriaShortcut()}
             onClick={onToggle}
             onPointerEnter={onTogglePointerEnter}
             onPointerDown={onTogglePointerDown}
@@ -93,7 +95,7 @@ export function SidebarHeaderActions({
             )}
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" shortcut={SIDEBAR_TOGGLE_KEYS}>
+        <TooltipContent side="bottom" shortcut={sidebarToggleShortcutKeys()}>
           <span>{expanded ? "Collapse sidebar" : "Open sidebar"}</span>
         </TooltipContent>
       </Tooltip>
@@ -176,7 +178,7 @@ export function SidebarSettingsButton({
           variant="ghost"
           size="icon-xs"
           aria-label="Settings"
-          aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+,`}
+          aria-keyshortcuts={settingsAriaShortcut()}
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
           <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>

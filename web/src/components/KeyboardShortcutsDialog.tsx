@@ -9,7 +9,7 @@
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
 // it without prop-drilling). Mount it once near the app shell.
 
-import { Fragment, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   ADDRESS_BAR_KEYS,
@@ -38,10 +38,13 @@ import {
   QUIT_KEYS,
   RELOAD_KEYS,
   REOPEN_TAB_KEYS,
+  rightSidebarToggleShortcutKeys,
   settingsShortcutKeys,
   SHIFT_KEY,
+  sidebarToggleShortcutKeys,
   SPLIT_TERMINAL_KEYS,
   VIEW_MODE_TOGGLE_KEYS,
+  workspaceTabShortcutKeys,
 } from "@/components/KeyboardShortcut";
 import {
   Dialog,
@@ -84,7 +87,6 @@ interface Shortcut {
   /** Keys rendered left→right as chips. A chord (held together) or, for the
    *  arrow-pairs, the two interchangeable keys for that action. */
   keys: string[];
-  lastKeySeparator?: string;
   /** Another chord for the same action, shown after "or". */
   alternateKeys?: string[];
   /** Hidden on touch and narrow layouts, where Enter inserts a newline instead of submitting. */
@@ -141,14 +143,10 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     title: "View",
     items: [
       { label: "Toggle Chat / Terminal view", keys: [...VIEW_MODE_TOGGLE_KEYS] },
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
-      { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Toggle conversations sidebar", keys: sidebarToggleShortcutKeys(false) },
+      { label: "Toggle workspace sidebar", keys: rightSidebarToggleShortcutKeys(false) },
       { label: "Search workspace contents", keys: [MOD_KEY, SHIFT_KEY, "F"] },
-      {
-        label: "Select a workspace tab",
-        keys: [MOD_KEY, ALT_KEY, "]", "1…4"],
-        lastKeySeparator: "+",
-      },
+      { label: "Select a workspace tab", keys: workspaceTabShortcutKeys("1…4") },
       { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
       {
         label: "Open a new shell",
@@ -284,7 +282,14 @@ function shortcutGroupsFor(
           )
           .map((item) => {
             if (contentSearch && item.label === "Select a workspace tab") {
-              return { ...item, keys: [MOD_KEY, ALT_KEY, "]", "1…5"] };
+              return { ...item, keys: workspaceTabShortcutKeys("1…5") };
+            }
+            // The desktop app uses ⌘B / ⇧⌘B, which a browser keeps for bookmarks.
+            if (item.label === "Toggle conversations sidebar") {
+              return { ...item, keys: sidebarToggleShortcutKeys(native) };
+            }
+            if (item.label === "Toggle workspace sidebar") {
+              return { ...item, keys: rightSidebarToggleShortcutKeys(native) };
             }
             // The desktop menu's New Browser Tab owns ⌘T; ⌘⌥B still works.
             if (desktopCommands && item.label === "Open a new browser tab") {
@@ -372,15 +377,8 @@ export function KeyboardShortcutsList({
               >
                 <span className="text-ui text-foreground">{item.label}</span>
                 <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key, index) => (
-                    <Fragment key={`${item.label}-${key}`}>
-                      {index === item.keys.length - 1 && item.lastKeySeparator ? (
-                        <span aria-hidden="true" className="text-muted-foreground/70">
-                          {item.lastKeySeparator}
-                        </span>
-                      ) : null}
-                      <Kbd>{key}</Kbd>
-                    </Fragment>
+                  {item.keys.map((key) => (
+                    <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
                   ))}
                   {item.alternateKeys ? (
                     <>

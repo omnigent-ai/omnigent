@@ -2967,7 +2967,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
 
-  it("focuses the tab strip without replacing its selected soft tab", async () => {
+  it("toggles the rail in one press and picks its fixed tabs by number from anywhere", async () => {
     writeWorkspacePanelDefault("collapsed");
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -2982,25 +2982,24 @@ describe("Right workspace card visibility", () => {
 
     const filesTab = await screen.findByRole("tab", { name: "Files" });
     await waitFor(() => expect(filesTab).toHaveFocus());
-    fireEvent.keyDown(filesTab, { key: "2" });
+    // Alt+2 here (⌃2 on macOS) shows the second fixed tab, wherever focus is.
+    screen.getByRole("button", { name: "Collapse right panel" }).focus();
+    fireEvent.keyDown(document.activeElement!, { code: "Digit2", key: "2", altKey: true });
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
-    const fileTab = screen.getByTitle("README.md");
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
-    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
 
+    // With focus outside the rail, the hotkey still closes the rail on screen.
     screen.getByRole("button", { name: "Collapse right panel" }).focus();
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
+    // Reopening keeps the selected file tab.
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    await waitFor(() => expect(fileTab).toHaveFocus());
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
-    expect(filesTab).toHaveAttribute("aria-selected", "false");
-
-    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
-    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
 
   it("reveals a collapsed workspace when the Browser hotkey opens a tab", async () => {
@@ -3149,7 +3148,7 @@ describe("Right workspace card visibility", () => {
     await waitFor(() => expect(screen.getByTitle("README.md")).toHaveFocus());
   });
 
-  it("focuses the workspace toolbar when its selected fixed tab is hidden", async () => {
+  it("focuses the workspace toolbar on reopen when its selected fixed tab is hidden", async () => {
     writeSessionWorkspaceState("conv_compact_workspace", {
       open: true,
       rightRailTab: "changes",
@@ -3164,6 +3163,9 @@ describe("Right workspace card visibility", () => {
     const selected = screen.getByRole("tab", { name: /changes/i });
     Object.defineProperty(selected, "checkVisibility", { value: () => false });
 
+    // The rail on screen closes; reopening focuses its toolbar, since the selected tab is hidden.
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
 
     await waitFor(() =>

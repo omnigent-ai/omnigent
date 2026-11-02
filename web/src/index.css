@@ -596,9 +596,9 @@
 
 .workspace-panel-motion[data-animate-visibility] {
   transition:
-    width 300ms ease-in-out,
-    opacity 300ms ease-in-out,
-    transform 300ms ease-in-out;
+    width 200ms ease-in-out,
+    opacity 200ms ease-in-out,
+    transform 200ms ease-in-out;
 }
 
 .workspace-panel-motion[data-state="open"] {
@@ -612,7 +612,17 @@
 }
 
 [data-workspace-panel-animate] .chat-header {
-  transition: right 300ms ease-in-out;
+  transition: right 200ms ease-in-out;
+}
+
+/* Sidebars keep their short open/close slide under reduced motion: without it
+   the whole layout jumps a sidebar's width at once. */
+@media (width >= 48rem) and (prefers-reduced-motion: reduce) {
+  .workspace-panel-motion[data-animate-visibility],
+  [data-workspace-panel-animate] .chat-header,
+  .conversations-sidebar[data-sidebar-motion] {
+    transition-duration: 200ms !important;
+  }
 }
 
 [data-workspace-panel-resizing] .chat-header {

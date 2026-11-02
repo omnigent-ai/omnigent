@@ -3371,6 +3371,23 @@ describe("Sidebar active-row auto-scroll", () => {
   });
 });
 
+describe("Sidebar open/close motion", () => {
+  it("animates opening and closing, but not a drag on the resize edge", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const { container } = renderSidebar(true);
+    const aside = container.querySelector("aside.conversations-sidebar")!;
+    // index.css keeps this 200 ms transition even under reduced motion.
+    expect(aside).toHaveAttribute("data-sidebar-motion");
+    expect(aside).toHaveClass("md:transition-[width,opacity]");
+
+    fireEvent.mouseDown(screen.getByRole("separator", { name: "Resize sidebar" }));
+    expect(aside).not.toHaveAttribute("data-sidebar-motion");
+    expect(aside).not.toHaveClass("md:transition-[width,opacity]");
+    fireEvent.mouseUp(window);
+    expect(aside).toHaveAttribute("data-sidebar-motion");
+  });
+});
+
 describe("Sidebar collapsed marker", () => {
   // The dark-mode glass rule in index.css keys its border/blur on
   // :not([data-collapsed]) — NOT on aria-hidden, which Radix also toggles
