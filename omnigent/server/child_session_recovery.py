@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+import math
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import ParamSpec, TypeVar
 from weakref import WeakValueDictionary
 
+import cachetools
 import httpx
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -30,6 +34,39 @@ _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScoped
 _restoration_tasks: WorkspaceScopedCache[tuple[str, str, int], asyncio.Task[None]] = (
     WorkspaceScopedCache()
 )
+
+
+# The runner-connect hook can run after the wake-only retry that launched it returns.
+_WAKE_ONLY_RECONNECT_GRACE_S = 60.0
+_wake_only_retries: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+_recent_wake_only_retries: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(
+        maxsize=math.inf, ttl=_WAKE_ONLY_RECONNECT_GRACE_S, timer=lambda: time.monotonic()
+    )
+)
+
+
+@contextmanager
+def defer_reconnect_recovery(session_id: str) -> Iterator[None]:
+    """Keep runner-connect recovery of *session_id*'s tree off during a wake-only retry.
+
+    The tree's interrupted turns then resume on its next message instead.
+    """
+    _wake_only_retries[session_id] = _wake_only_retries.get(session_id, 0) + 1
+    try:
+        yield
+    finally:
+        remaining = _wake_only_retries.get(session_id, 1) - 1
+        if remaining > 0:
+            _wake_only_retries[session_id] = remaining
+        else:
+            _wake_only_retries.pop(session_id, None)
+        _recent_wake_only_retries[session_id] = True
+
+
+def reconnect_recovery_deferred(session_id: str) -> bool:
+    """Whether a wake-only retry of *session_id* is running or just finished."""
+    return session_id in _wake_only_retries or session_id in _recent_wake_only_retries
 
 
 def schedule_child_restoration(

@@ -499,12 +499,14 @@ export function FilesPanel({
   // and a server that can wake without resuming an interrupted turn.
   const serverInfo = useServerInfo();
   const canWake =
-    isEditorLevel(session?.permissionLevel ?? null) &&
+    session != null &&
+    isEditorLevel(session.permissionLevel ?? null) &&
     serverInfo !== "loading" &&
     serverInfo.retry_session_wake_only === true;
   const sandboxWake = useSandboxAutoWake({
     conversationId,
     asleep: showAsleepHint,
+    awake: runnerOnline === true,
     active,
     canWake,
   });

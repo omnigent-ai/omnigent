@@ -672,8 +672,35 @@ async def _recover_retry_session(
 ) -> dict[str, bool | str]:
     """Recover runner/terminal readiness without creating transcript input.
 
-    *wake_only* reconnects the runner without resuming an interrupted turn.
+    *wake_only* reconnects the runner without resuming an interrupted turn,
+    the session's own or a descendant's.
     """
+    from omnigent.server.child_session_recovery import defer_reconnect_recovery
+
+    deferral = defer_reconnect_recovery(session_id) if wake_only else contextlib.nullcontext()
+    with deferral:
+        return await _recover_retry_session_once(
+            request=request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            user_id=user_id,
+            permission_store=permission_store,
+            wake_only=wake_only,
+        )
+
+
+async def _recover_retry_session_once(
+    *,
+    request: Request,
+    session_id: str,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    wake_only: bool = False,
+) -> dict[str, bool | str]:
+    """Run one recovery attempt for :func:`_recover_retry_session`."""
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
@@ -723,6 +750,7 @@ async def _recover_retry_session(
         initializer=getattr(request.app.state, "runner_session_initializer", None),
         suppress_recovery_turn=wake_only or was_connected or bool(saved_inputs),
         require_success=True,
+        restore_children=not wake_only,
         trigger="retry_session",
     )
 

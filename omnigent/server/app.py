@@ -4505,6 +4505,7 @@ def create_app(
             _interrupted,
             _restorable,
             is_parent_owned_subagent,
+            reconnect_recovery_deferred,
             restore_active_children,
         )
         from omnigent.server.routes._sessions.common import (
@@ -4579,6 +4580,13 @@ def create_app(
             root_id = independent_root_id(conv)
             if root_id is not None and not by_id[root_id].archived:
                 eager_root_ids.add(root_id)
+        # A wake-only retry initializes its tree itself, without resuming work.
+        wake_only_root_ids = {
+            root_id
+            for conv in convs
+            if reconnect_recovery_deferred(conv.id)
+            and (root_id := independent_root_id(conv)) is not None
+        }
 
         # Attach independent roots first; their recovery restores dependent sessions.
         convs.sort(key=lambda conv: not is_independent(conv))
@@ -4659,7 +4667,10 @@ def create_app(
         frontier = {
             conv.id: conv.id
             for conv, _ in roots
-            if conv.agent_id is not None and _restorable(conv) and conv.id not in eager_root_ids
+            if conv.agent_id is not None
+            and _restorable(conv)
+            and conv.id not in eager_root_ids
+            and conv.id not in wake_only_root_ids
         }
         idle_root_ids = set(frontier.values())
         try:
@@ -4728,12 +4739,15 @@ def create_app(
                     initialize_runtime = (
                         conv.agent_id is not None
                         and not conv.archived
+                        and conv.id not in wake_only_root_ids
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
                     if conv.agent_id is None:
                         reason = "no_agent"
                     elif conv.archived:
                         reason = "archived"
+                    elif conv.id in wake_only_root_ids:
+                        reason = "wake_only"
                     else:
                         reason = "recovery_required" if initialize_runtime else "idle"
                     runner_session_initializer.log_decision(

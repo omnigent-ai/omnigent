@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
 import { retrySession } from "@/lib/sessionsApi";
 
@@ -18,129 +18,145 @@ export interface SandboxAutoWake {
   wake: () => Promise<void>;
 }
 
-interface WakeState {
-  conversationId: string | undefined;
+interface WakeAttempt {
   /** `requesting`: the server is resuming it; `settling`: waiting for liveness to agree. */
-  step: "idle" | "requesting" | "settling" | "failed";
+  step: "requesting" | "settling" | "failed";
   error: string | null;
+  /** Fails a settling attempt that liveness never confirms. */
+  timer?: number;
 }
 
-interface Opening {
-  conversationId: string | undefined;
-  /** This opening already woke, or joined an in-flight wake. */
-  attempted: boolean;
-  pending: boolean;
-}
-
-const PHASE_BY_STEP: Record<WakeState["step"], SandboxWakePhase> = {
-  idle: "idle",
+const PHASE_BY_STEP: Record<WakeAttempt["step"], SandboxWakePhase> = {
   requesting: "waking",
   settling: "waking",
   failed: "failed",
 };
+
+// Per session, so an attempt outlives the view that started it: a remounted
+// view or a switch back to the session joins it instead of starting another.
+const attempts = new Map<string, WakeAttempt>();
+const listeners = new Set<() => void>();
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function setAttempt(conversationId: string, attempt: WakeAttempt | undefined): void {
+  const previous = attempts.get(conversationId);
+  if (previous?.timer !== undefined) window.clearTimeout(previous.timer);
+  if (attempt) attempts.set(conversationId, attempt);
+  else attempts.delete(conversationId);
+  for (const listener of listeners) listener();
+}
+
+/** Wake a session's sandbox, joining its attempt that is still in flight. */
+async function startSandboxWake(conversationId: string): Promise<void> {
+  const existing = attempts.get(conversationId);
+  if (existing && existing.step !== "failed") return;
+  const attempt: WakeAttempt = { step: "requesting", error: null };
+  setAttempt(conversationId, attempt);
+  try {
+    // "already_connected" also settles: liveness can lag a runner that is up.
+    await retrySession(conversationId, { wakeOnly: true });
+    if (attempts.get(conversationId) !== attempt) return;
+    const settling: WakeAttempt = { step: "settling", error: null };
+    settling.timer = window.setTimeout(() => {
+      if (attempts.get(conversationId) !== settling) return;
+      setAttempt(conversationId, { step: "failed", error: "The sandbox didn't come back online." });
+    }, SANDBOX_WAKE_SETTLE_MS);
+    setAttempt(conversationId, settling);
+  } catch (error) {
+    if (attempts.get(conversationId) !== attempt) return;
+    setAttempt(conversationId, {
+      step: "failed",
+      error:
+        error instanceof Error && error.message
+          ? `Couldn't start the sandbox: ${error.message}`
+          : "Couldn't start the sandbox.",
+    });
+  }
+}
+
+/** Forget every session's wake attempt and its pending timeout. */
+export function resetSandboxWakesForTesting(): void {
+  for (const attempt of attempts.values()) {
+    if (attempt.timer !== undefined) window.clearTimeout(attempt.timer);
+  }
+  attempts.clear();
+  for (const listener of listeners) listener();
+}
 
 /**
  * Wake a session's asleep managed sandbox when a view that needs it opens.
  *
  * Uses the same server recovery as **Reconnect host** (`retry_session`) in
  * wake-only mode, so the sandbox resumes and its runner starts without a chat
- * message, a resumed turn, or a retried startup input. Each
- * opening (`active` turning true) wakes at most once: a sandbox that idles
- * back to sleep while the view stays open waits for `wake()` or a reopen, so
- * an open panel never keeps a sandbox awake.
+ * message, a resumed turn, or a retried startup input. Each opening (`active`
+ * turning true) wakes at most once, and not at all if it first finds the
+ * sandbox awake: a sandbox that goes to sleep while the view stays open waits
+ * for `wake()` or a reopen, so an open panel never keeps a sandbox awake.
  *
  * @param conversationId Session whose sandbox to wake.
- * @param asleep Whether the session's sandbox is asleep (`host_asleep`).
+ * @param asleep Whether the view needs the session's asleep sandbox (`host_asleep`).
+ * @param awake Whether liveness reports the session's runner online.
  * @param active Whether the view is open and visible to the user.
  * @param canWake Whether the user may restart the session (edit access).
  */
 export function useSandboxAutoWake({
   conversationId,
   asleep,
+  awake,
   active,
   canWake,
 }: {
   conversationId: string | undefined;
   asleep: boolean;
+  awake: boolean;
   active: boolean;
   canWake: boolean;
 }): SandboxAutoWake {
-  const [state, setState] = useState<WakeState>({ conversationId, step: "idle", error: null });
-  const current: WakeState =
-    state.conversationId === conversationId ? state : { conversationId, step: "idle", error: null };
-  const openingRef = useRef<Opening>({ conversationId, attempted: false, pending: false });
-  // Read outside render: another session's view starts a fresh opening.
-  const openingFor = useCallback((id: string | undefined): Opening => {
-    if (openingRef.current.conversationId !== id) {
-      openingRef.current = { conversationId: id, attempted: false, pending: false };
-    }
-    return openingRef.current;
-  }, []);
-  const activeRef = useRef(active);
-  useEffect(() => {
-    activeRef.current = active;
-  }, [active]);
+  const getAttempt = useCallback(
+    () => (conversationId ? attempts.get(conversationId) : undefined),
+    [conversationId],
+  );
+  const attempt = useSyncExternalStore(subscribe, getAttempt);
+  // Whether the current opening has already woken, or found the sandbox awake.
+  const openingRef = useRef<{ conversationId: string | undefined; consumed: boolean }>({
+    conversationId,
+    consumed: false,
+  });
 
   const wake = useCallback(async () => {
-    const opening = openingFor(conversationId);
-    if (!conversationId || opening.pending) return;
-    opening.attempted = true;
-    opening.pending = true;
-    setState({ conversationId, step: "requesting", error: null });
-    try {
-      // "already_connected" also settles: liveness can lag a runner that is up.
-      await retrySession(conversationId, { wakeOnly: true });
-      if (openingRef.current === opening) {
-        setState({ conversationId, step: "settling", error: null });
-      }
-    } catch (error) {
-      if (openingRef.current === opening) {
-        setState({
-          conversationId,
-          step: "failed",
-          error:
-            error instanceof Error && error.message
-              ? `Couldn't start the sandbox: ${error.message}`
-              : "Couldn't start the sandbox.",
-        });
-      }
-    } finally {
-      opening.pending = false;
-      // The view closed mid-wake; let its next opening try again.
-      if (!activeRef.current) opening.attempted = false;
+    if (conversationId) await startSandboxWake(conversationId);
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (!active || openingRef.current.conversationId !== conversationId) {
+      openingRef.current = { conversationId, consumed: false };
     }
-  }, [conversationId, openingFor]);
-
-  // Closing the view ends this opening; the next one may wake again.
-  useEffect(() => {
-    const opening = openingFor(conversationId);
-    if (!active && !opening.pending) opening.attempted = false;
-  }, [active, conversationId, openingFor]);
-
-  const step = current.step;
-  useEffect(() => {
-    const opening = openingFor(conversationId);
-    if (!active || !asleep || !canWake || opening.attempted) return;
-    // Reopened while an earlier wake is still in flight: that wake counts.
-    if (step === "requesting" || step === "settling") {
-      opening.attempted = true;
+    const opening = openingRef.current;
+    if (!active || opening.consumed || !conversationId) return;
+    if (awake) {
+      opening.consumed = true;
       return;
     }
-    void wake();
-  }, [active, asleep, canWake, conversationId, openingFor, step, wake]);
+    if (!asleep || !canWake) return;
+    opening.consumed = true;
+    void startSandboxWake(conversationId);
+  }, [active, asleep, awake, canWake, conversationId]);
 
+  const step = attempt?.step;
   useEffect(() => {
     // Back online, by this wake or any other: forget the attempt's outcome.
-    if ((step === "settling" || step === "failed") && !asleep) {
-      setState({ conversationId, step: "idle", error: null });
-      return;
+    if (conversationId && !asleep && (step === "settling" || step === "failed")) {
+      setAttempt(conversationId, undefined);
     }
-    if (step !== "settling") return;
-    const timeout = window.setTimeout(() => {
-      setState({ conversationId, step: "failed", error: "The sandbox didn't come back online." });
-    }, SANDBOX_WAKE_SETTLE_MS);
-    return () => window.clearTimeout(timeout);
   }, [asleep, conversationId, step]);
 
-  return { phase: PHASE_BY_STEP[step], error: current.error, wake };
+  return {
+    phase: attempt ? PHASE_BY_STEP[attempt.step] : "idle",
+    error: attempt?.error ?? null,
+    wake,
+  };
 }

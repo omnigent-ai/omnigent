@@ -5918,6 +5918,7 @@ async def _ensure_runner_session_initialized(
     *,
     suppress_recovery_turn: bool = False,
     require_success: bool = False,
+    restore_children: bool = True,
     trigger: str = "session_ensure",
 ) -> bool:
     """
@@ -5969,6 +5970,8 @@ async def _ensure_runner_session_initialized(
         finishes.
     :param require_success: Raise ``runner_unavailable`` when the handshake
         fails instead of using the message path's best-effort fallback.
+    :param restore_children: Restore interrupted descendants after a required
+        handshake. ``False`` leaves them for the session's next message.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -6043,7 +6046,8 @@ async def _ensure_runner_session_initialized(
             await _ensure_runner_relay_ready(
                 session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
             )
-            await restore_active_children(conv, runner_client, conversation_store, initializer)
+            if restore_children:
+                await restore_active_children(conv, runner_client, conversation_store, initializer)
     try:
         payload = resp.json()
     except ValueError:

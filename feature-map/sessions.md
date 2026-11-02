@@ -387,7 +387,9 @@ Reloading during the wake keeps it spinning, with the stage (for example
 stays in the menu then, in case that stage never finishes.
 Opening Files or Changes on such a session wakes the sandbox for editors, in the
 desktop Workspace rail and the mobile Files drawer alike. The wake only
-reconnects: it resumes no interrupted turn and retries no failed startup input.
+reconnects: it resumes no interrupted turn, its own or a sub-agent's, and
+retries no failed startup input; interrupted work resumes on the next message.
+On a phone only the Files drawer counts as open, not the hidden desktop rail.
 The panel shows **Starting sandbox…**, then the file list; a failed wake shows
 the reason and **Try again**. If the sandbox sleeps again while the panel stays
 open, it shows **Start sandbox** rather than waking again. Read-only viewers,

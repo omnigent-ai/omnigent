@@ -3852,8 +3852,9 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     monkeypatch: pytest.MonkeyPatch,
     wake_only: bool,
 ) -> None:
-    """Retry relaunches one dead runner; a wake-only retry skips the recovery turn."""
+    """Retry relaunches one dead runner; a wake-only retry resumes no turn in its tree."""
     from omnigent.runtime import set_runner_client
+    from omnigent.server.child_session_recovery import reconnect_recovery_deferred
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
 
@@ -3865,7 +3866,14 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     before = await client.get(f"/v1/sessions/{session_id}/items")
     runner_client = object()
     wait_for_runner_client = AsyncMock(return_value=runner_client)
-    initialize = AsyncMock(return_value=False)
+    connect_recovery_deferred: list[bool] = []
+
+    async def _initialize(*_args: Any, **_kwargs: Any) -> bool:
+        # The relaunched runner's connect hook runs while this retry initializes.
+        connect_recovery_deferred.append(reconnect_recovery_deferred(session_id))
+        return False
+
+    initialize = AsyncMock(side_effect=_initialize)
     relay_ready = AsyncMock(return_value=None)
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", wait_for_runner_client)
     monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
@@ -3887,6 +3895,8 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     }
     initialize.assert_awaited_once()
     assert initialize.await_args.kwargs["suppress_recovery_turn"] is wake_only
+    assert initialize.await_args.kwargs["restore_children"] is not wake_only
+    assert connect_recovery_deferred == [wake_only]
     relay_ready.assert_awaited_once()
     after = await client.get(f"/v1/sessions/{session_id}/items")
     assert after.json() == before.json()
@@ -3896,16 +3906,19 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
 
 
 @pytest.mark.parametrize(
-    "second_data", [{}, {"wake_only": True}], ids=["same-mode", "mixed-wake-only"]
+    ("first_data", "second_data"),
+    [({}, {}), ({}, {"wake_only": True}), ({"wake_only": True}, {})],
+    ids=["same-mode", "resume-then-wake-only", "wake-only-then-resume"],
 )
 async def test_retry_session_single_flight_launches_and_rotates_once(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    first_data: dict[str, bool],
     second_data: dict[str, bool],
 ) -> None:
-    """Concurrent retries, wake-only or not, share one launch and one rotation."""
+    """Concurrent retries share one launch and rotation; the first caller picks the mode."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -3916,18 +3929,30 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     session_id = session["id"]
     original_runner_id = session["runner_id"]
     runner_client = object()
+    launched, second_joined = asyncio.Event(), asyncio.Event()
 
-    async def _runner_connects_after_launch(*args: Any, **kwargs: Any) -> object:
+    async def _runner_connects_after_second_caller(*args: Any, **kwargs: Any) -> object:
         del args, kwargs
-        await asyncio.sleep(0.05)
+        launched.set()
+        await second_joined.wait()
         return runner_client
 
-    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _runner_connects_after_launch)
+    callers = 0
+    single_flight = routes_events._retry_session_single_flight
+
+    async def _count_callers(**kwargs: Any) -> dict[str, bool | str]:
+        nonlocal callers
+        callers += 1
+        if callers == 2:
+            second_joined.set()
+        return await single_flight(**kwargs)
+
+    initialize = AsyncMock(return_value=False)
     monkeypatch.setattr(
-        routes_events,
-        "_ensure_runner_session_initialized",
-        AsyncMock(return_value=False),
+        sessions_module, "_wait_for_runner_client", _runner_connects_after_second_caller
     )
+    monkeypatch.setattr(routes_events, "_retry_session_single_flight", _count_callers)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
     monkeypatch.setattr(
         routes_events,
         "_ensure_runner_relay_ready",
@@ -3936,16 +3961,18 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     set_runner_client(None)
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-    responses = await asyncio.gather(
+    first = asyncio.create_task(
         client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": "retry_session", "data": {}},
-        ),
-        client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": "retry_session", "data": second_data},
-        ),
+            json={"type": "retry_session", "data": first_data},
+        )
     )
+    await asyncio.wait_for(launched.wait(), timeout=budget(5.0))
+    second = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "retry_session", "data": second_data},
+    )
+    responses = [await first, second]
     await responder
 
     expected = {
@@ -3955,6 +3982,10 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     }
     assert [response.json() for response in responses] == [expected, expected]
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+    first_wake_only = first_data.get("wake_only", False)
+    initialize.assert_awaited_once()
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is first_wake_only
+    assert initialize.await_args.kwargs["restore_children"] is not first_wake_only
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.runner_id != original_runner_id

@@ -720,6 +720,16 @@ describe("WorkspacePanel content area", () => {
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", "false");
   });
 
+  it.each([
+    ["the CSS-hidden rail on a phone", false, "false"],
+    ["a contained workspace on a phone", true, "true"],
+  ])("marks the FilesPanel active only while visible: %s", (_label, contained, active) => {
+    isMobileMock.mockReturnValue(true);
+    renderWorkspace({ rightRailTab: "files", selectedFilePath: null, contained });
+
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", active);
+  });
+
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
     renderWorkspace({ rightRailTab: "files", selectedFilePath: null });
 

@@ -31,6 +31,7 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { useSession } from "@/hooks/useSession";
+import { resetSandboxWakesForTesting, SANDBOX_WAKE_SETTLE_MS } from "@/hooks/useSandboxAutoWake";
 import { FilesPanel, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
@@ -297,6 +298,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  resetSandboxWakesForTesting();
   vi.clearAllMocks();
   vi.useRealTimers();
 });
@@ -445,7 +447,7 @@ describe("FilesPanel on an asleep sandbox", () => {
 
       expect(retrySessionMock).toHaveBeenCalledTimes(1);
       expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
-      expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Starting sandbox…");
       expect(screen.queryByText("Sandbox is offline")).not.toBeInTheDocument();
       expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
       expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
@@ -471,7 +473,10 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(retrySessionMock).toHaveBeenCalledTimes(1);
   });
 
-  it("starts the sandbox when the mobile Files drawer opens", async () => {
+  it("starts the sandbox once when the mobile Files drawer opens and reopens", async () => {
+    vi.useFakeTimers();
+    const wakeAnswer = Promise.withResolvers<{ queued: boolean; recovered: boolean }>();
+    retrySessionMock.mockReturnValueOnce(wakeAnswer.promise);
     useAsleepMock.mockReturnValue(true);
     useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
     useChangedFilesMock.mockReturnValue(
@@ -509,6 +514,32 @@ describe("FilesPanel on an asleep sandbox", () => {
     await act(async () => rerender(drawer(true)));
     expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+
+    // Reopening while the request is in flight, then while it settles, joins it.
+    await act(async () => rerender(drawer(false)));
+    await act(async () => rerender(drawer(true)));
+    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+    await act(async () => wakeAnswer.resolve({ queued: false, recovered: true }));
+    act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS / 2));
+    await act(async () => rerender(drawer(false)));
+    await act(async () => rerender(drawer(true)));
+    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+
+    act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS / 2));
+    expect(screen.getByRole("alert")).toHaveTextContent("The sandbox didn't come back online.");
+    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it("does not wake while the session is still loading", () => {
+    vi.mocked(useSession).mockReturnValue({ session: undefined } as unknown as ReturnType<
+      typeof useSession
+    >);
+    useAsleepMock.mockReturnValue(true);
+    renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
+
+    expect(retrySessionMock).not.toHaveBeenCalled();
   });
 
   it("does not wake the sandbox from a hidden panel, but offers to start it", async () => {

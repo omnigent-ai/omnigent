@@ -1027,9 +1027,11 @@ Request body matches `SessionEventInput`:
                                   recovery}`. Payload `{}`, or
                                   `{"wake_only": true}` to only reconnect:
                                   failed saved inputs stay failed and the
-                                  request resumes no interrupted turn (a
-                                  concurrent retry shares the in-flight
-                                  attempt, started by its first caller).
+                                  request resumes no interrupted turn, the
+                                  session's own or a sub-agent's; they
+                                  resume on the next message. A concurrent
+                                  retry shares the in-flight attempt,
+                                  started by its first caller.
                                   Send `wake_only` only when `/v1/info`
                                   reports `retry_session_wake_only: true`;
                                   older servers ignore it.

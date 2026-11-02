@@ -453,6 +453,54 @@ async def test_message_handshake_does_not_wait_for_child_initialization(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restore_children", [True, False], ids=["retry", "wake-only"])
+async def test_required_handshake_restores_interrupted_children_unless_waking_only(
+    recovery_tree: Any, restore_children: bool
+) -> None:
+    """A wake-only reconnect leaves an interrupted child for the next message."""
+    from omnigent.server.routes import sessions
+
+    store, parent, child, _, _, initializer = recovery_tree
+    interrupted = child("failed")
+    store.set_labels(
+        interrupted.id,
+        {
+            "omnigent.last_task_error_code": "runner_disconnected",
+            "omnigent.last_task_error_message": "Disconnected",
+        },
+    )
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(201, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        await sessions._ensure_runner_session_initialized(
+            parent.id,
+            parent,
+            client,
+            store,
+            initializer,
+            suppress_recovery_turn=True,
+            require_success=True,
+            restore_children=restore_children,
+        )
+
+    resumed = [
+        call["session_id"] for call in calls if call["session_init"]["resume_interrupted_turn"]
+    ]
+    assert [call["session_id"] for call in calls] == (
+        [parent.id, interrupted.id] if restore_children else [parent.id]
+    )
+    assert resumed == ([interrupted.id] if restore_children else [])
+    expected_runner = parent.runner_id if restore_children else "old"
+    assert store.get_conversation(interrupted.id).runner_id == expected_runner
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("child_owner", "mirrored"),
     [(owner, False) for owner in ("owner", "other", None, "read", "edit", "manage")]

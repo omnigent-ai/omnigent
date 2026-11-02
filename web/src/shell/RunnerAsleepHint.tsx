@@ -32,9 +32,12 @@ export function RunnerAsleepHint({
 }) {
   if (sandboxOffline && wake?.phase === "waking") {
     return (
-      <div className="flex flex-col items-start gap-1 px-2 py-1.5 text-muted-foreground text-sm">
+      <div
+        role="status"
+        className="flex flex-col items-start gap-1 px-2 py-1.5 text-muted-foreground text-sm"
+      >
         <span className="flex items-center gap-1.5 font-medium text-foreground">
-          <Spinner className="size-3.5 shrink-0" />
+          <Spinner aria-hidden className="size-3.5 shrink-0" />
           Starting sandbox…
         </span>
         <span>Files will load when it's back online.</span>
@@ -50,7 +53,7 @@ export function RunnerAsleepHint({
       </span>
       {sandboxOffline && wake ? (
         <>
-          {wake.error && <span>{wake.error}</span>}
+          {wake.error && <span role="alert">{wake.error}</span>}
           <Button type="button" variant="outline" size="sm" className="mt-1" onClick={wake.onWake}>
             {wake.phase === "failed" ? "Try again" : "Start sandbox"}
           </Button>
