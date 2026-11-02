@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
@@ -38,11 +39,13 @@ from omnigent.server.routes._sessions.common import (
 from omnigent.server.routes._sessions.orchestration import (
     _installed_native_harnesses,
     _pre_session_model_catalog,
+    _PreSessionCatalog,
 )
 from omnigent.server.smart_routing import (
     AUTO_NATIVE_ROUTING_HARNESSES,
     RoutePick,
     RoutingResult,
+    RoutingSettings,
     TaskV1RouteOptionSource,
     infer_models,
     route_session_harness,
@@ -1200,7 +1203,7 @@ async def test_auto_routing_falls_back_to_the_built_in_judge_off_the_gateway(
         patch.object(
             orchestration,
             "_pre_session_model_catalog",
-            AsyncMock(return_value=dict(_OFF_GATEWAY_CATALOG)),
+            AsyncMock(return_value=_PreSessionCatalog(_OFF_GATEWAY_CATALOG, _OFF_GATEWAY_CATALOG)),
         ),
     ):
         agent_name, model, verdict, error = await orchestration._resolve_native_smart_routing(
@@ -1341,7 +1344,7 @@ async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_
         patch.object(
             orchestration,
             "_pre_session_model_catalog",
-            AsyncMock(return_value=dict(_OFF_GATEWAY_CATALOG)),
+            AsyncMock(return_value=_PreSessionCatalog(_OFF_GATEWAY_CATALOG, _OFF_GATEWAY_CATALOG)),
         ),
     ):
         created = await _create_smart_routing_session(client, wrappers, routing_client, oss=True)
@@ -1393,7 +1396,7 @@ async def test_fixed_harness_routing_create_succeeds_off_the_gateway_with_the_ju
         patch.object(
             orchestration,
             "_pre_session_model_catalog",
-            AsyncMock(return_value={harness: [pick]}),
+            AsyncMock(return_value=_PreSessionCatalog({harness: [pick]}, {harness: [pick]})),
         ),
     ):
         created = await _create_fixed_harness_session(
@@ -1443,7 +1446,7 @@ async def test_a_pane_create_routes_with_the_judge_when_the_router_is_not_enable
         patch.object(
             orchestration,
             "_pre_session_model_catalog",
-            AsyncMock(return_value={harness: [pick]}),
+            AsyncMock(return_value=_PreSessionCatalog({harness: [pick]}, {harness: [pick]})),
         ),
     ):
         created = await client.post("/v1/sessions", json=body)
@@ -1647,46 +1650,18 @@ def test_static_candidates_serve_the_routers_current_codex_arms(arm: str, applie
     assert resolved.raw_model == arm
 
 
-@pytest.mark.parametrize(
-    ("has_registry", "answers", "expected"),
-    [
-        # The row's launchable ``model`` id, not its picker key; a harness the
-        # host cannot answer for is simply absent.
-        (
-            True,
-            {"claude-native": {"models": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}},
-            {"claude-native": ["databricks-claude-opus-4-8"]},
-        ),
-        # ``routable_models`` widens the catalog past the picker rows (which
-        # name the newest of each family only), so a frozen arm the workspace
-        # still serves stays routable.
-        (
-            True,
-            {
-                "claude-native": {
-                    "models": [{"id": "opus", "model": "databricks-claude-opus-5"}],
-                    "routable_models": [
-                        "databricks-claude-opus-5",
-                        "databricks-claude-opus-4-8",
-                    ],
-                }
-            },
-            {
-                "claude-native": [
-                    "databricks-claude-opus-5",
-                    "databricks-claude-opus-4-8",
-                ]
-            },
-        ),
-        # No live host: nothing to ask, so no catalog.
-        (False, {}, {}),
-    ],
-)
-async def test_pre_session_catalog_reads_the_hosts_model_options(
-    has_registry: bool,
-    answers: dict[str, dict[str, Any]],  # type: ignore[explicit-any]
-    expected: dict[str, list[str]],
-) -> None:
+def _model_options_request(  # type: ignore[explicit-any]
+    answers: dict[str, dict[str, Any]],
+    *,
+    host_online: bool = True,
+) -> tuple[Any, Any]:
+    """A request whose host registry's one live host answers model-options requests.
+
+    :param answers: Each harness's ``model/list`` payload; a harness absent
+        here is answered as unsupported.
+    :param host_online: ``False`` leaves the request with no host registry.
+    :returns: ``(connection, request)``.
+    """
     from omnigent.host.frames import decode_host_frame
 
     conn = SimpleNamespace(host_id="host_1", pending_model_options={})
@@ -1701,18 +1676,282 @@ async def test_pre_session_catalog_reads_the_hosts_model_options(
             else {"status": "failed", "error": "unsupported"}
         )
 
-    registry = (
-        SimpleNamespace(get=lambda host_id: conn, send_text=send_text) if has_registry else None
-    )
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(host_registry=registry)))
+    registry = SimpleNamespace(get=lambda host_id: conn, send_text=send_text)
+    state = SimpleNamespace(host_registry=registry if host_online else None)
+    return conn, SimpleNamespace(app=SimpleNamespace(state=state))
+
+
+@pytest.mark.parametrize(
+    ("has_registry", "answers", "expected", "current"),
+    [
+        # The row's launchable ``model`` id, not its picker key; a harness the
+        # host cannot answer for is simply absent.
+        (
+            True,
+            {"claude-native": {"models": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}},
+            {"claude-native": ["databricks-claude-opus-4-8"]},
+            {"claude-native": ["databricks-claude-opus-4-8"]},
+        ),
+        # routable_models keeps frozen arms launchable, least preferred first,
+        # but off the judge's menu, which holds the picker's current rows only.
+        (
+            True,
+            {
+                "claude-native": {
+                    "models": [{"id": "opus", "model": "databricks-claude-opus-5"}],
+                    "routable_models": [
+                        "databricks-claude-opus-5",
+                        "databricks-claude-opus-4-8",
+                    ],
+                }
+            },
+            {
+                "claude-native": [
+                    "databricks-claude-opus-4-8",
+                    "databricks-claude-opus-5",
+                ]
+            },
+            {"claude-native": ["databricks-claude-opus-5"]},
+        ),
+        # Spellings of one model keep the host's order, so resolution by
+        # comparison spelling still lands on the plain row before ``[1m]``;
+        # the judge's menu holds that spelling alone.
+        (
+            True,
+            {
+                "claude-native": {
+                    "models": [
+                        {"id": "sonnet", "model": "claude-sonnet-4-6"},
+                        {"id": "sonnet[1m]", "model": "claude-sonnet-4-6[1m]"},
+                        {"id": "haiku", "model": "claude-haiku-4-5"},
+                    ]
+                }
+            },
+            {
+                "claude-native": [
+                    "claude-haiku-4-5",
+                    "claude-sonnet-4-6",
+                    "claude-sonnet-4-6[1m]",
+                ]
+            },
+            {"claude-native": ["claude-haiku-4-5", "claude-sonnet-4-6"]},
+        ),
+        # A row whose declared successor is also listed is superseded; one
+        # whose successor is absent is still the current pick for its tier.
+        (
+            True,
+            {
+                "codex-native": {
+                    "models": [
+                        {"id": "gpt-6-sol", "model": "gpt-6-sol"},
+                        {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "upgrade": "gpt-6-sol"},
+                        {
+                            "id": "gpt-5.6-luna",
+                            "model": "gpt-5.6-luna",
+                            "upgradeInfo": {"model": "gpt-6-luna"},
+                        },
+                    ]
+                }
+            },
+            {"codex-native": ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-sol"]},
+            {"codex-native": ["gpt-5.6-luna", "gpt-6-sol"]},
+        ),
+        # No live host: nothing to ask, so no catalog.
+        (False, {}, {}, {}),
+    ],
+)
+async def test_pre_session_catalog_reads_the_hosts_model_options(
+    has_registry: bool,
+    answers: dict[str, dict[str, Any]],  # type: ignore[explicit-any]
+    expected: dict[str, list[str]],
+    current: dict[str, list[str]],
+) -> None:
+    conn, request = _model_options_request(answers, host_online=has_registry)
     catalog = await _pre_session_model_catalog(
         cast("Any", request),
         _host(None),
         AUTO_NATIVE_ROUTING_HARNESSES,
     )
-    assert catalog == expected
+    assert catalog == _PreSessionCatalog(expected, current)
     # No in-flight request is left behind on any path.
     assert conn.pending_model_options == {}
+
+
+async def test_pre_session_catalog_detects_supersession_under_a_configured_prefix() -> None:
+    answers = {
+        "codex-native": {
+            "models": [
+                {"id": "acme.gpt-6-sol", "model": "acme.gpt-6-sol"},
+                {"id": "acme.gpt-5.6-sol", "model": "acme.gpt-5.6-sol", "upgrade": "gpt-6-sol"},
+            ]
+        }
+    }
+    _conn, request = _model_options_request(answers, host_online=True)
+    caps = FakeCaps(routing_settings=RoutingSettings(model_prefixes=("acme.",)))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        catalog = await _pre_session_model_catalog(
+            cast("Any", request), _host(None), ("codex-native",)
+        )
+    assert catalog == _PreSessionCatalog(
+        {"codex-native": ["acme.gpt-5.6-sol", "acme.gpt-6-sol"]},
+        {"codex-native": ["acme.gpt-6-sol"]},
+    )
+
+
+# Codex CLI 0.158.0's ``model/list`` answer, in the order the CLI reports it.
+_CODEX_MODEL_LIST = [
+    ("gpt-6-astra", "Frontier intelligence for the most demanding work.", None),
+    ("gpt-6-sol", "Workhorse model for coding and everyday work.", None),
+    ("gpt-6-luna", "Fast and affordable model for easier tasks.", None),
+    ("gpt-5.6-sol", "Older coding model for complex work.", "gpt-6-sol"),
+    ("gpt-5.6-terra", "Older balanced model for straightforward work.", "gpt-6-sol"),
+    ("gpt-5.6-luna", "Older fast and efficient model.", "gpt-6-luna"),
+    ("gpt-5.5", "Legacy coding model.", "gpt-6-sol"),
+]
+_BACKPORT_REVIEW = (
+    "Assess whether PR 4821 (the session-restore crash fix) is worth backporting to the "
+    "release-1.8, release-1.9 and release-2.0 branches: check each branch for conflicts, "
+    "risk and test coverage before recommending."
+)
+
+
+class _RubricFollowingJudge:
+    """A judge model that classifies every task COMPLEX and obeys the rubric's rule for it."""
+
+    def __init__(self) -> None:
+        self.instructions: list[str] = []
+
+    async def create(self, *, instructions: str, **_kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        self.instructions.append(instructions)
+        menu = re.findall(r"^    - (\S+)$", instructions, re.MULTILINE)
+        rule = re.search(r"COMPLEX\s+→ \w+: (first|middle|last) available model", instructions)
+        assert rule is not None and menu
+        model = {"first": menu[0], "middle": menu[len(menu) // 2], "last": menu[-1]}[rule[1]]
+        verdict = {
+            "harness": "codex-native",
+            "model": model,
+            "rationale": f"This is a COMPLEX task (multi-branch review); "
+            f"selected most capable model {model}.",
+        }
+        text = SimpleNamespace(text=json.dumps(verdict))
+        return SimpleNamespace(output=[SimpleNamespace(content=[text])])
+
+
+async def test_built_in_judge_routes_a_complex_codex_task_to_codexs_frontier_model() -> None:
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routing_backend import RoutingBackends
+    from omnigent.server.smart_routing import LLMRoutingClient
+
+    rows = [
+        {"id": model, "model": model, "description": description, "upgrade": upgrade}
+        for model, description, upgrade in _CODEX_MODEL_LIST
+    ]
+    _conn, request = _model_options_request({"codex-native": {"models": rows}})
+    judge = _RubricFollowingJudge()
+    caps = FakeCaps(routing_backends=RoutingBackends(local=LLMRoutingClient(judge)))
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=_BACKPORT_REVIEW)
+    with (
+        patch("omnigent.runtime._globals._caps", new=caps),
+        patch.object(
+            orchestration,
+            "_routing_host_for_create",
+            return_value=_host_reporting({"codex-native": False}),
+        ),
+    ):
+        model, verdict, error = await orchestration._resolve_fixed_native_model_routing(
+            cast("Any", body),
+            cast("Any", request),
+            "alice@example.com",
+            "codex-native",
+        )
+
+    assert error is None and verdict is not None
+    assert verdict["router_source"] == "oss-llm"
+    assert len(judge.instructions) == 1
+    # The rationale says "most capable", so the pick must not be a superseded model.
+    assert model == "gpt-6-astra"
+
+
+class _TierJudge:
+    """A judge model that sizes every task at *tier* and applies the rubric's rule for it."""
+
+    def __init__(self, tier: str) -> None:
+        self.tier = tier
+        self.menus: list[list[str]] = []
+
+    async def create(self, *, instructions: str, **_kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        menu = re.findall(r"^    - (\S+)$", instructions, re.MULTILINE)
+        rule = re.search(
+            rf"{self.tier}\s+→ \w+: (first|middle|last) available model", instructions
+        )
+        assert rule is not None and menu
+        self.menus.append(menu)
+        model = {"first": menu[0], "middle": menu[len(menu) // 2], "last": menu[-1]}[rule[1]]
+        verdict = {"harness": "codex-native", "model": model, "rationale": f"A {self.tier} task."}
+        text = SimpleNamespace(text=json.dumps(verdict))
+        return SimpleNamespace(output=[SimpleNamespace(content=[text])])
+
+
+async def _route_codex_backport(  # type: ignore[explicit-any]
+    backends: Any, *, gateway: bool = False
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    """Route ``_BACKPORT_REVIEW`` for a Codex create on a host listing ``_CODEX_MODEL_LIST``."""
+    from omnigent.server.routes._sessions import orchestration
+
+    rows = [
+        {"id": model, "model": model, "description": description, "upgrade": upgrade}
+        for model, description, upgrade in _CODEX_MODEL_LIST
+    ]
+    _conn, request = _model_options_request({"codex-native": {"models": rows}})
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=_BACKPORT_REVIEW)
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_backends=backends)),
+        patch.object(
+            orchestration,
+            "_routing_host_for_create",
+            return_value=_host_reporting({"codex-native": gateway}),
+        ),
+    ):
+        return await orchestration._resolve_fixed_native_model_routing(
+            cast("Any", body), cast("Any", request), "alice@example.com", "codex-native"
+        )
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected"),
+    [("SIMPLE", "gpt-6-luna"), ("MODERATE", "gpt-6-sol"), ("COMPLEX", "gpt-6-astra")],
+)
+async def test_built_in_judge_ranks_only_codexs_current_models(tier: str, expected: str) -> None:
+    from omnigent.server.routing_backend import RoutingBackends
+    from omnigent.server.smart_routing import LLMRoutingClient
+
+    judge = _TierJudge(tier)
+    model, verdict, error = await _route_codex_backport(
+        RoutingBackends(local=LLMRoutingClient(judge))
+    )
+
+    assert error is None and verdict is not None
+    assert verdict["router_source"] == "oss-llm"
+    # Superseded rows stay off the menu the rubric ranks by position.
+    assert judge.menus == [["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]]
+    assert model == expected
+
+
+async def test_external_router_is_still_offered_superseded_codex_arms() -> None:
+    """The router's own arms can be superseded rows; it applies them only if offered."""
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(
+        RoutingResult(model="gpt-5.6-sol", rationale="task_v1 arm", harness="codex-native")
+    )
+    model, _verdict, error = await _route_codex_backport(
+        RoutingBackends(external=external), gateway=True
+    )
+
+    assert (model, error) == ("gpt-5.6-sol", None)
+    assert external.offered == [
+        {"codex-native": [row_model for row_model, _, _ in reversed(_CODEX_MODEL_LIST)]}
+    ]
 
 
 def _native_conv(  # type: ignore[explicit-any]
