@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyMacElectronShellAttribute,
   checkDbcert,
+  controlHost,
+  getHostIdentity,
   getServerPicker,
   hasDbcertPreflightBridge,
   isAndroidShell,
@@ -24,6 +26,7 @@ import {
   supportsBrowser,
   switchServer,
 } from "./nativeBridge";
+import { setOmnigentHostConfig } from "./host";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
 const electronSetBadge = vi.fn();
@@ -694,5 +697,36 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+});
+
+describe("host control bridge", () => {
+  afterEach(() => {
+    setOmnigentHostConfig({});
+  });
+
+  it("tells the desktop shell which connect-a-host command this page shows", async () => {
+    const nativeControl = vi.fn().mockResolvedValue({ ok: true });
+    const nativeIdentity = vi.fn().mockResolvedValue({ cliInstalled: true, hostId: "this-mac" });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      controlHost: nativeControl,
+      getHostIdentity: nativeIdentity,
+    };
+
+    await controlHost("start");
+    await getHostIdentity();
+    expect(nativeControl).toHaveBeenLastCalledWith("start", {});
+    expect(nativeIdentity).toHaveBeenLastCalledWith({});
+
+    setOmnigentHostConfig({ connectHostCommand: "isaac omni", cliServerUrlSuffix: "/?o=123" });
+    const hint = {
+      connectHostCommand: "isaac omni",
+      serverUrl: `${window.location.origin}/?o=123`,
+    };
+    expect(await controlHost("restart")).toEqual({ ok: true });
+    expect(await getHostIdentity()).toEqual({ cliInstalled: true, hostId: "this-mac" });
+    expect(nativeControl).toHaveBeenLastCalledWith("restart", hint);
+    expect(nativeIdentity).toHaveBeenLastCalledWith(hint);
   });
 });

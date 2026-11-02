@@ -1089,6 +1089,19 @@ next time; **Always Allow** records the origin in `settings.json`
 (`allowed_hosting_origins`) so later connects skip the prompt. `stop` is
 fail-safe and needs no confirmation. The same bridge exposes `stop` / `restart`.
 
+On a Databricks-managed server (`*.databricks.com`, `*.azuredatabricks.net`, or
+`*.databricksapps.com`), the launcher is `isaac omni` instead of the `omnigent`
+CLI when the `databricksInternalFeaturesEnabled` managed preference is set, or
+when the server page's connect-a-host command (the embed host config's
+`connectHostCommand`, passed with `controlHost` and `getHostIdentity`) is
+`isaac omni`. In the second case the shell runs the command the page shows,
+`isaac omni --server <url>` plus `--non-interactive`, which starts a background
+host and exits once the server reports it online; the shell then adopts that
+daemon. `<url>` is the URL the page shows (its `getCliServerUrl()`, passed as
+`serverUrl`) when it is on the window's origin, otherwise the window's own URL.
+The page can only select a launcher the shell knows; its command text is never
+run as given.
+
 Status is read live (host connected = a live daemon process **and** an online
 host tunnel; the shell never caches it). The host surface goes through the JS
 bridge — `window.omnigentDesktop` → `getHostStatus` / `getHostIdentity` /
@@ -1100,8 +1113,8 @@ the window's **pinned origin** like the badge/notification bridge.
 
 The desktop **owns the host processes it starts**: quitting the app SIGTERMs
 them (and stops a local server it started), so closing the app disconnects this
-machine. A daemon the shell merely _adopted_ (you started it in a terminal) is
-left running on quit. Hosting is **not** restored on the next launch — you
+machine. A daemon the shell merely _adopted_ (you started it in a terminal, or
+`isaac omni --server <url>` started it) is left running on quit. Hosting is **not** restored on the next launch — you
 reconnect this machine explicitly from the host menu when you want it.
 
 ## Passkeys (WebAuthn)

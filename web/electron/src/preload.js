@@ -144,14 +144,16 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this
    * machine" in the server's host list.
+   * @param {{ connectHostCommand?: string }} [options] The page's connect-a-host command.
    */
-  getHostIdentity: () => ipcRenderer.invoke("omnigent:host-get-identity"),
+  getHostIdentity: (options) => ipcRenderer.invoke("omnigent:host-get-identity", options),
   /**
    * Start / stop / restart this machine's host daemon for the window's server.
    * Resolves a `{ ok, error? }` result.
    * @param {"start" | "stop" | "restart"} action
+   * @param {{ connectHostCommand?: string }} [options] The page's connect-a-host command.
    */
-  controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
+  controlHost: (action, options) => ipcRenderer.invoke("omnigent:host-control", action, options),
   /**
    * Desktop feature gates the server can't know about — currently
    * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped

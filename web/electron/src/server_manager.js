@@ -20,6 +20,8 @@ const cli = require("./omnigent_cli");
 
 /** Max seconds to wait for `host` to print its connected marker before giving up. */
 const CONNECT_TIMEOUT_MS = 30000;
+/** Max wait for a background connect command; a first `isaac omni` run installs its runtime. */
+const BACKGROUND_CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
 /** Grace period after SIGTERM before escalating to SIGKILL on shutdown. */
 const KILL_GRACE_MS = 4000;
 /** The line `omnigent host` prints once the websocket tunnel is up. */
@@ -61,14 +63,15 @@ function onChange(cb) {
 /**
  * Heuristically classify a host-connect error as an authentication failure,
  * from `omnigent host`'s own messages (HostConnectError: "Authentication
- * failed", "HTTP 401", login-page redirect, or the `omnigent login` hint). Lets
- * the UI show a friendly "sign in" prompt instead of a scary raw error.
+ * failed", "HTTP 401", login-page redirect, or the `omnigent login` /
+ * `isaac omni login` hint). Lets the UI show a friendly "sign in" prompt
+ * instead of a scary raw error.
  *
  * @param {string | undefined} text
  * @returns {boolean}
  */
 function isAuthError(text) {
-  return /authentication failed|http 401|unauthor|login page|omnigent login/i.test(
+  return /authentication failed|http 401|unauthor|login page|omni(?:gent)? login/i.test(
     String(text || ""),
   );
 }
@@ -243,6 +246,7 @@ async function connectHost(cliCommand, serverUrl, key) {
   if (conn.connected) {
     return { ok: true, ownedByDesktop: false, adopted: true };
   }
+  if (cliCommand?.backgroundConnect === true) return connectInBackground(cliCommand, serverUrl);
 
   const spawned = await spawnHostChild(cliCommand, serverUrl);
   if (!spawned.ok) {
@@ -278,6 +282,89 @@ async function connectHost(cliCommand, serverUrl, key) {
     }
   });
   return { ok: true, ownedByDesktop: true };
+}
+
+/**
+ * Connect by running `<cli> --server <url>`, the connect command the server page
+ * shows, and adopt the background host daemon it leaves. That command (Omnigent
+ * `start`) exits 0 only once the server reports the host online, including when
+ * it reuses a daemon that reaches the same workspace through another URL, so its
+ * exit code is the result. Like a daemon started from a terminal, the host
+ * outlives the app. `--non-interactive` is added for the same reason as in
+ * {@link spawnHostChild}.
+ *
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
+ * @param {string} serverUrl
+ * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, adopted?: boolean, error?: string, authError?: boolean }>}
+ */
+async function connectInBackground(cliCommand, serverUrl) {
+  const run = await runToExit(
+    cliCommand,
+    ["--server", serverUrl, "--non-interactive"],
+    BACKGROUND_CONNECT_TIMEOUT_MS,
+  );
+  if (!run.ok) {
+    return {
+      ok: false,
+      ownedByDesktop: false,
+      error: run.error,
+      authError: isAuthError(run.error),
+    };
+  }
+  return { ok: true, ownedByDesktop: false, adopted: true };
+}
+
+/**
+ * Run `<cli> ...args` to completion. Never rejects. A run still going after
+ * `timeoutMs` is stopped and reported as a failure; it is tracked in
+ * `spawnedHostChildren` so a quit mid-connect stops it too.
+ *
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
+ * @param {string[]} args
+ * @param {number} timeoutMs
+ * @returns {Promise<{ ok: boolean, error?: string }>}
+ */
+function runToExit(cliCommand, args, timeoutMs) {
+  return new Promise((resolve) => {
+    const holder = { text: "" };
+    let child;
+    try {
+      const { executable, prefixArgs } = cli.cliCommandParts(cliCommand);
+      child = spawn(executable, [...prefixArgs, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      resolve({ ok: false, error: err.message });
+      return;
+    }
+    spawnedHostChildren.add(child);
+    child.once("exit", () => spawnedHostChildren.delete(child));
+
+    let settled = false;
+    let timedOut = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      void stopChild(child);
+    }, timeoutMs);
+
+    const onData = (buf) => appendLog(holder, buf.toString());
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("error", (err) => finish({ ok: false, error: err.message }));
+    child.on("exit", (code, signal) => {
+      if (timedOut) finish({ ok: false, error: "timed out waiting for the host to start" });
+      else if (code === 0) finish({ ok: true });
+      else
+        finish({
+          ok: false,
+          error: holder.text.trim() || `exited (code=${code}, signal=${signal})`,
+        });
+    });
+  });
 }
 
 /**
