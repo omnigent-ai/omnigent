@@ -651,21 +651,29 @@ class FilesystemRegistry(ABC):
     # ── Abstract: must be implemented by subclasses ───────────────
 
     @abstractmethod
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self, conversation_id: str, *, limit: int, check_disk: bool = True
+    ) -> list[dict[str, Any]]:
         """Return changed files visible to *conversation_id*, newest first.
 
         :param conversation_id: The session to query, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
+        :param check_disk: Whether recorded changes may be compared with the
+            workspace on disk. Pass ``False`` when the session's writes land in
+            a copy-on-write overlay this process cannot read.
         :returns: List of file-record dicts with ``path``, ``status``,
             ``bytes``, and ``modified_at`` fields, newest first.
         """
 
     @abstractmethod
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self, session_id: str, path: str, *, check_disk: bool = True
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
         :param session_id: The session to query, e.g. ``"conv_abc123"``.
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param check_disk: As for :meth:`list_changed_files`.
         :returns: A file-record dict with ``path``, ``status``, ``bytes``, and
             ``modified_at`` fields, or ``None`` when the file has no changes.
         """
@@ -689,7 +697,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
     Changes are recorded via :meth:`record_change`, which is called by the
     file-write (PUT) and file-edit (PATCH) handlers after a successful
     operation.  No filesystem-watcher thread is started — only tool-call
-    operations appear in the Files panel.
+    operations appear in the Files panel.  Reads compare those records with
+    the disk, so a file reverted or deleted outside a tool call drops out or
+    shows as deleted.
 
     Each session maintains its own event list so changes are naturally isolated
     between sessions.  Events are not persisted; they are lost on server restart
@@ -717,6 +727,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # registered by that session.  Used by ``unregister_conversation`` to
         # evict snapshot entries when a session ends, preventing unbounded growth.
         self._snapshot_sessions: dict[str, set[str]] = {}
+        # Per-session originals for disk reconciliation: session_id → {normalized
+        # path → content before its first change, or ``None`` if not snapshotted}.
+        self._session_snapshots: dict[str, dict[str, str | None]] = {}
 
     def record_change(
         self,
@@ -766,6 +779,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             bytes=bytes_,
             modified_at=modified_at,
         )
+        with self._snapshots_lock:
+            self._session_snapshots.setdefault(session_id, {}).setdefault(norm, None)
         with self._lock:
             self._session_events.setdefault(session_id, []).append(fe)
 
@@ -778,16 +793,21 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._lock:
             self._session_events.pop(conversation_id, None)
         with self._snapshots_lock:
+            self._session_snapshots.pop(conversation_id, None)
             paths = self._snapshot_sessions.pop(conversation_id, set())
             for p in paths:
                 self._snapshots.pop(p, None)
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self, conversation_id: str, *, limit: int, check_disk: bool = True
+    ) -> list[dict[str, Any]]:
         """Return files changed by the agent in *conversation_id*'s session.
 
         :param conversation_id: The session to query, e.g.
             ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
+        :param check_disk: Whether to reconcile records with the disk; see
+            :meth:`_change_record`.
         :returns: List of file-record dicts suitable for the
             ``workspace.changed_files`` API response, newest first.
         """
@@ -825,22 +845,18 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             for path, event in by_path.items()
             if (op := _net_operation(first_op[path], last_op[path])) is not None
         }
-        records = sorted(
-            by_path.values(),
-            key=lambda e: (e.modified_at or 0, e.path),
-            reverse=True,
-        )
-        return [
-            {
-                "path": r.path,
-                "status": r.operation,
-                "bytes": r.bytes,
-                "modified_at": r.modified_at,
-            }
-            for r in records[:limit]
+        records = [
+            record
+            for event in by_path.values()
+            if (record := self._change_record(conversation_id, event, check_disk=check_disk))
+            is not None
         ]
+        records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
+        return records[:limit]
 
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self, session_id: str, path: str, *, check_disk: bool = True
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
         Equivalent to scanning :meth:`list_changed_files` for a specific path
@@ -851,9 +867,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         :param session_id: The conversation to query, e.g. ``"conv_abc123"``.
         :param path: Path relative to the workspace root, e.g.
             ``"src/foo.py"``.
+        :param check_disk: As for :meth:`list_changed_files`.
         :returns: A file-record dict (``path``, ``status``, ``bytes``,
             ``modified_at``) when the file was changed this session, or
-            ``None`` when it was not touched.
+            ``None`` when it was not touched or no longer differs.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -864,18 +881,54 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             events = [e for e in self._session_events.get(session_id, []) if e.path == norm]
         if not events:
             return None
-        first_op = events[0].operation
-        last_op = events[-1].operation
-        last_event = events[-1]
-        op = _net_operation(first_op, last_op)
+        op = _net_operation(events[0].operation, events[-1].operation)
         if op is None:
             return None
-        return {
-            "path": norm,
-            "status": op,
-            "bytes": last_event.bytes,
-            "modified_at": last_event.modified_at,
-        }
+        return self._change_record(
+            session_id, dataclasses.replace(events[-1], operation=op), check_disk=check_disk
+        )
+
+    def _change_record(
+        self, session_id: str, event: _FileEvent, *, check_disk: bool
+    ) -> dict[str, Any] | None:
+        """Return the file record for *event*'s net change, or ``None`` if nothing differs.
+
+        Reverts and deletes made outside a tool call record no event, so with
+        *check_disk* the net operation is checked against the file now on disk.
+        A file whose content matches the snapshot *session_id* took has no
+        change left to show.
+        """
+        from omnigent.runner.environment_filesystem import compare_file_beneath
+
+        status, size, modified_at = event.operation, event.bytes, event.modified_at
+        if check_disk:
+            baseline = (
+                None if status == "created" else self._session_baseline(session_id, event.path)
+            )
+            try:
+                stat, matches = compare_file_beneath(self._cwd, event.path, baseline)
+            except (FileNotFoundError, NotADirectoryError):
+                if status == "created":
+                    return None
+                status, size, modified_at = "deleted", None, None
+            except OSError:
+                pass
+            else:
+                if matches:
+                    return None
+                if status != "created":
+                    status = "modified"
+                size, modified_at = stat.st_size, int(stat.st_mtime)
+        return {"path": event.path, "status": status, "bytes": size, "modified_at": modified_at}
+
+    def _session_baseline(self, session_id: str, path: str) -> bytes | None:
+        """Return the bytes *session_id* saw in *path* before its first change."""
+        with self._snapshots_lock:
+            baseline = self._session_snapshots.get(session_id, {}).get(path)
+        try:
+            return None if baseline is None else baseline.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
 
     def get_baseline(self, path: str) -> str | None:
         """Return the pre-modification baseline content of *path*, or ``None``.
@@ -907,7 +960,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 
         Must be called **before** writing new content to the file so the
         snapshot captures the original (pre-modification) state.  If a
-        snapshot for *path* already exists this is a no-op.
+        snapshot for *path* already exists this is a no-op.  *session_id*
+        compares the disk only with a snapshot taken before its first change.
 
         :param path: Normalized path relative to the workspace root,
             e.g. ``"src/foo.py"``.
@@ -924,6 +978,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
                 self._snapshots[norm] = content
             if session_id:
                 self._snapshot_sessions.setdefault(session_id, set()).add(norm)
+                self._session_snapshots.setdefault(session_id, {}).setdefault(norm, content)
 
 
 # ── Git-backed implementation ─────────────────────────────────────────────────
@@ -1138,7 +1193,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
     def last_changed_files(self) -> list[str] | None:
         return self._last_changes
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self, conversation_id: str, *, limit: int, check_disk: bool = True
+    ) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
 
         *conversation_id* is accepted for API compatibility but is not used
@@ -1147,6 +1204,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         :param conversation_id: Ignored for git-backed registries.
         :param limit: Maximum number of records to return.
+        :param check_disk: Ignored; git status always reads the working tree.
         :returns: List of file-record dicts, newest first.
         """
         # ``--untracked-files=all`` forces git to expand entirely-untracked
@@ -1228,7 +1286,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
 
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self, session_id: str, path: str, *, check_disk: bool = True
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
         Queries ``git status --porcelain -- <path>`` for the specific file
@@ -1236,6 +1296,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         :param session_id: Ignored for git-backed registries.
         :param path: Path relative to the workspace root.
+        :param check_disk: Ignored; git status always reads the working tree.
         :returns: A file-record dict or ``None`` when the file has no
             uncommitted changes.
         """

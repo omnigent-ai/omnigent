@@ -2671,8 +2671,10 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
         def start(self) -> None:
             return None
 
-        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
-            del session_id, limit
+        def list_changed_files(
+            self, session_id: str, *, limit: int = 10_000, check_disk: bool = True
+        ) -> list[Any]:
+            del session_id, limit, check_disk
             return []
 
     def _fake_create_filesystem_registry(
@@ -2756,8 +2758,10 @@ async def test_slow_changed_files_listing_leaves_the_default_executor_free(
         def start(self) -> None:
             return None
 
-        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
-            del session_id, limit
+        def list_changed_files(
+            self, session_id: str, *, limit: int = 10_000, check_disk: bool = True
+        ) -> list[Any]:
+            del session_id, limit, check_disk
             listing_threads.append(threading.current_thread().name)
             release_git.wait(budget(10))
             return []

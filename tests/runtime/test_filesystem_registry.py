@@ -7,12 +7,13 @@ Covers the ``list_changed_files`` merge logic for :class:`AgentEditFilesystemReg
 Also covers ``seed_snapshot``, ``get_baseline`` for both implementations, and
 ``_normalize_path``.
 
-Events are injected via :func:`_inject`, which calls :meth:`record_change` on
-the registry so tests exercise the same code path as real tool calls.
+Events are injected via :func:`_inject`, which applies the operation to disk and
+calls :meth:`record_change` so tests exercise the same path as real tool calls.
 """
 
 import logging
 import os
+import shutil
 import subprocess
 import threading
 from contextlib import nullcontext
@@ -21,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from omnigent.runner import environment_filesystem
 from omnigent.runtime.filesystem_registry import (
     _CURSOR_PLUMBING_PATHS,
     AgentEditFilesystemRegistry,
@@ -41,10 +43,10 @@ def _inject(
     operation: str,
     conv_id: str,
 ) -> None:
-    """Inject a synthetic file-change event into *registry* via :meth:`record_change`.
+    """Apply *operation* to *path* on disk, then record it via :meth:`record_change`.
 
-    Uses the public API so tests exercise the same recording path as real
-    tool calls, rather than writing directly to internal state.
+    Mirrors a real tool call, which changes the file before the handler
+    records the event, rather than writing directly to internal state.
 
     :param registry: The registry to inject into.
     :param path: Relative file path, e.g. ``"src/foo.py"``.
@@ -52,6 +54,12 @@ def _inject(
     :param conv_id: The session to attribute the event to,
         e.g. ``"conv_abc123"``.
     """
+    target = registry.cwd / path
+    if operation == "deleted":
+        target.unlink(missing_ok=True)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("written by a tool call\n")
     registry.record_change(path, operation, conv_id)
 
 
@@ -112,7 +120,10 @@ def test_modified_only_shows_modified(registry: AgentEditFilesystemRegistry) -> 
     )
 
 
-def test_created_then_deleted_is_hidden(registry: AgentEditFilesystemRegistry) -> None:
+@pytest.mark.parametrize("check_disk", [True, False])
+def test_created_then_deleted_is_hidden(
+    registry: AgentEditFilesystemRegistry, check_disk: bool
+) -> None:
     """A file created and then deleted in the same session must not appear at all.
 
     The file never existed before the session started, and it is gone now —
@@ -123,7 +134,7 @@ def test_created_then_deleted_is_hidden(registry: AgentEditFilesystemRegistry) -
     _inject(registry, "gone.md", "created", conv_id)
     _inject(registry, "gone.md", "deleted", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=10)
+    results = registry.list_changed_files(conv_id, limit=10, check_disk=check_disk)
 
     assert results == [], (
         f"Expected no results for a file created then deleted this session, got {results}. "
@@ -188,7 +199,10 @@ def test_created_modified_multiple_times_stays_added(
     )
 
 
-def test_modified_then_deleted_shows_deleted(registry: AgentEditFilesystemRegistry) -> None:
+@pytest.mark.parametrize("check_disk", [True, False])
+def test_modified_then_deleted_shows_deleted(
+    registry: AgentEditFilesystemRegistry, check_disk: bool
+) -> None:
     """A pre-existing file that is modified then deleted must show status ``"deleted"``.
 
     Exercises the ``_net_operation("modified", "deleted") -> "deleted"`` branch.
@@ -199,7 +213,7 @@ def test_modified_then_deleted_shows_deleted(registry: AgentEditFilesystemRegist
     _inject(registry, "removed.md", "modified", conv_id)
     _inject(registry, "removed.md", "deleted", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=10)
+    results = registry.list_changed_files(conv_id, limit=10, check_disk=check_disk)
 
     assert len(results) == 1, f"Expected 1 record for removed.md, got {len(results)}."
     assert results[0]["status"] == "deleted", (
@@ -263,6 +277,36 @@ def test_session_isolation_events_not_shared_between_sessions(
     )
 
 
+@pytest.mark.parametrize(
+    ("reverted_to", "expected_paths_a", "expected_paths_b"),
+    [
+        pytest.param("first\n", [], ["shared.md"], id="reverted-to-first-session-baseline"),
+        pytest.param("second\n", ["shared.md"], [], id="reverted-to-second-session-baseline"),
+    ],
+)
+def test_each_session_compares_the_disk_with_its_own_baseline(
+    registry: AgentEditFilesystemRegistry,
+    reverted_to: str,
+    expected_paths_a: list[str],
+    expected_paths_b: list[str],
+) -> None:
+    """Sessions sharing a workspace started from different content, so each keeps its own."""
+    conv_a, conv_b = "conv_baseline_A", "conv_baseline_B"
+    target = registry.cwd / "shared.md"
+    target.write_text("first\n")
+    registry.seed_snapshot("shared.md", "first\n", session_id=conv_a)
+    target.write_text("second\n")
+    registry.record_change("shared.md", "modified", conv_a)
+    registry.seed_snapshot("shared.md", "second\n", session_id=conv_b)
+    target.write_text("third\n")
+    registry.record_change("shared.md", "modified", conv_b)
+
+    target.write_text(reverted_to)
+
+    assert [r["path"] for r in registry.list_changed_files(conv_a, limit=10)] == expected_paths_a
+    assert [r["path"] for r in registry.list_changed_files(conv_b, limit=10)] == expected_paths_b
+
+
 def test_limit_parameter_caps_results(registry: AgentEditFilesystemRegistry) -> None:
     """``list_changed_files`` honours the ``limit`` parameter.
 
@@ -282,6 +326,216 @@ def test_limit_parameter_caps_results(registry: AgentEditFilesystemRegistry) -> 
         f"Expected at most 3 results with limit=3, got {len(results)}. "
         "The limit parameter is not being respected."
     )
+
+
+@pytest.mark.parametrize(
+    ("operation", "baseline", "outside_edit", "expected_status"),
+    [
+        pytest.param("modified", "original\n", b"original\n", None, id="edit-reverted"),
+        pytest.param("modified", None, b"original\n", "modified", id="revert-without-baseline"),
+        pytest.param("modified", "original\n", b"other\n", "modified", id="edited-again"),
+        pytest.param("modified", "original\n", None, "deleted", id="edited-file-deleted"),
+        pytest.param("created", None, None, None, id="new-file-deleted"),
+        pytest.param("deleted", "original\n", b"original\n", None, id="deleted-file-restored"),
+        pytest.param("deleted", "original\n", b"other\n", "modified", id="deleted-file-replaced"),
+    ],
+)
+def test_changes_follow_edits_made_outside_tool_calls(
+    registry: AgentEditFilesystemRegistry,
+    operation: str,
+    baseline: str | None,
+    outside_edit: bytes | None,
+    expected_status: str | None,
+) -> None:
+    """A revert or delete outside a tool call records no event, so Changes must match the disk.
+
+    ``outside_edit`` is the file's final content, or ``None`` when it is deleted.
+    """
+    conv_id = "conv_outside_edit"
+    target = registry.cwd / "notes.md"
+    if operation != "created":
+        target.write_bytes(b"original\n")
+    if baseline is not None:
+        registry.seed_snapshot("notes.md", baseline, session_id=conv_id)
+    _inject(registry, "notes.md", operation, conv_id)
+    if outside_edit is None:
+        target.unlink()
+    else:
+        target.write_bytes(outside_edit)
+        os.utime(target, (1_700_000_000, 1_700_000_000))
+
+    listed = registry.list_changed_files(conv_id, limit=10)
+    single = registry.get_changed_file(conv_id, "notes.md")
+
+    if expected_status is None:
+        assert listed == []
+        assert single is None
+        return
+    expected_bytes, expected_mtime = (
+        (None, None) if outside_edit is None else (len(outside_edit), 1_700_000_000)
+    )
+    assert listed == [
+        {
+            "path": "notes.md",
+            "status": expected_status,
+            "bytes": expected_bytes,
+            "modified_at": expected_mtime,
+        }
+    ]
+    assert single == listed[0]
+
+
+def test_disk_check_can_be_skipped_when_the_runner_cannot_see_the_edits(
+    registry: AgentEditFilesystemRegistry,
+) -> None:
+    """Copy-on-write sessions write into an overlay, leaving the runner's view unchanged."""
+    conv_id = "conv_overlay"
+    (registry.cwd / "notes.md").write_text("original\n")
+    registry.seed_snapshot("notes.md", "original\n", session_id=conv_id)
+    registry.record_change("notes.md", "modified", conv_id)
+    registry.record_change("new.md", "created", conv_id)
+
+    listed = registry.list_changed_files(conv_id, limit=10, check_disk=False)
+
+    assert sorted((r["path"], r["status"]) for r in listed) == [
+        ("new.md", "created"),
+        ("notes.md", "modified"),
+    ]
+    assert registry.get_changed_file(conv_id, "notes.md", check_disk=False) == next(
+        r for r in listed if r["path"] == "notes.md"
+    )
+    assert registry.list_changed_files(conv_id, limit=10) == []
+
+
+def test_a_snapshot_taken_after_the_first_change_never_becomes_the_original(
+    registry: AgentEditFilesystemRegistry,
+) -> None:
+    """Once a session changes a file with no snapshot, its original stays unknown."""
+    conv_id = "conv_late_snapshot"
+    (registry.cwd / "notes.md").write_text("original\n")
+    _inject(registry, "notes.md", "modified", conv_id)
+
+    registry.seed_snapshot("notes.md", "written by a tool call\n", session_id=conv_id)
+    _inject(registry, "notes.md", "modified", conv_id)
+
+    listed = registry.list_changed_files(conv_id, limit=10)
+    assert [(r["path"], r["status"]) for r in listed] == [("notes.md", "modified")]
+    # The diff view still shows the first snapshot any call took.
+    assert registry.get_baseline("notes.md") == "written by a tool call\n"
+
+
+def test_changes_keep_recorded_entries_where_lookups_cannot_be_confined(
+    registry: AgentEditFilesystemRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without dir-fd support a parent can be swapped between any check and lookup."""
+    monkeypatch.setattr(environment_filesystem, "_BENEATH_SUPPORTED", False)
+    conv_id = "conv_no_dir_fd"
+    _inject(registry, "docs/notes.md", "modified", conv_id)
+    recorded = registry.list_changed_files(conv_id, limit=10, check_disk=False)
+    shutil.rmtree(registry.cwd / "docs")
+
+    assert registry.list_changed_files(conv_id, limit=10) == recorded
+
+
+@pytest.mark.parametrize("beneath_supported", [True, False], ids=["dir-fd", "path-fallback"])
+@pytest.mark.parametrize(
+    ("path", "swapped"),
+    [
+        pytest.param("notes.md", "notes.md", id="leaf"),
+        pytest.param("docs/notes.md", "docs", id="parent"),
+    ],
+)
+def test_changes_never_read_through_a_symlink_out_of_the_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    beneath_supported: bool,
+    path: str,
+    swapped: str,
+) -> None:
+    """A path swapped for a symlink must not reveal the size, time or content of its target."""
+    monkeypatch.setattr(
+        environment_filesystem,
+        "_BENEATH_SUPPORTED",
+        beneath_supported and environment_filesystem._BENEATH_SUPPORTED,
+    )
+    workspace, outside = tmp_path / "workspace", tmp_path / "outside"
+    (workspace / "docs").mkdir(parents=True)
+    outside.mkdir()
+    registry = AgentEditFilesystemRegistry(watch_path=workspace)
+    conv_id = "conv_symlink"
+    (workspace / path).write_text("secret\n")
+    registry.seed_snapshot(path, "secret\n", session_id=conv_id)
+    _inject(registry, path, "modified", conv_id)
+    recorded = registry.list_changed_files(conv_id, limit=10, check_disk=False)
+    (outside / "notes.md").write_text("secret\n")
+    os.utime(outside / "notes.md", (1_600_000_000, 1_600_000_000))
+    swapped_path = workspace / swapped
+    if swapped == "docs":
+        shutil.rmtree(swapped_path)
+        swapped_path.symlink_to(outside, target_is_directory=True)
+    else:
+        swapped_path.unlink()
+        swapped_path.symlink_to(outside / "notes.md")
+
+    listed = registry.list_changed_files(conv_id, limit=10)
+
+    if swapped == "docs" or not environment_filesystem._BENEATH_SUPPORTED:
+        assert listed == recorded
+    else:
+        link = os.lstat(swapped_path)
+        assert listed == [
+            {
+                "path": path,
+                "status": "modified",
+                "bytes": link.st_size,
+                "modified_at": int(link.st_mtime),
+            }
+        ]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
+@pytest.mark.parametrize("swapped_at_open", [False, True], ids=["before-listing", "at-open"])
+def test_changes_report_a_fifo_without_waiting_for_a_writer(
+    registry: AgentEditFilesystemRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    swapped_at_open: bool,
+) -> None:
+    """A FIFO left where an empty file was edited must not block the Changes listing."""
+    conv_id = "conv_fifo"
+    target = registry.cwd / "empty.txt"
+    target.write_text("")
+    registry.seed_snapshot("empty.txt", "", session_id=conv_id)
+    _inject(registry, "empty.txt", "modified", conv_id)
+
+    def replace_with_fifo() -> None:
+        target.unlink()
+        os.mkfifo(target)
+
+    if swapped_at_open:
+        open_path = os.open
+
+        def swap_then_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            if path == "empty.txt" and target.is_file():
+                replace_with_fifo()
+            return open_path(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", swap_then_open)
+    else:
+        replace_with_fifo()
+    listed: list[dict[str, object]] = []
+    worker = threading.Thread(
+        target=lambda: listed.extend(registry.list_changed_files(conv_id, limit=10)), daemon=True
+    )
+
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        os.close(os.open(target, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(timeout=10)
+        pytest.fail("Listing changes blocked opening a FIFO")
+
+    assert [(r["path"], r["status"], r["bytes"]) for r in listed] == [("empty.txt", "modified", 0)]
 
 
 # ── seed_snapshot / get_baseline ─────────────────────────────────────────────
