@@ -1,4 +1,5 @@
 import type { ClipboardEvent } from "react";
+import { createTextFieldMirror } from "@/lib/textFieldMirror";
 
 /**
  * Replace ``[start, end)`` (default: the selection) as typed input, so onChange
@@ -25,19 +26,27 @@ export function insertComposerText(
 }
 
 // Typing scrolls the caret's line into view, but Chromium skips that after a
-// script-run edit. A hidden copy of the text before the caret measures its depth.
+// script-run edit. The mirror keeps the text after the caret so words wrap as in
+// the field; at the end a space keeps a trailing blank line.
 function revealCaretLine(textarea: HTMLTextAreaElement) {
   if (textarea.scrollHeight <= textarea.clientHeight) return;
-  const probe = document.createElement("textarea");
-  probe.className = textarea.className;
-  probe.style.cssText = `position:absolute;visibility:hidden;height:0;min-height:0;width:${getComputedStyle(textarea).width}`;
-  textarea.after(probe);
-  const firstLineBottom = probe.scrollHeight;
-  probe.value = textarea.value.slice(0, textarea.selectionEnd);
-  const caretBottom = probe.scrollHeight;
-  probe.remove();
-  const scrollTop = Math.max(textarea.scrollTop, caretBottom - textarea.clientHeight);
-  textarea.scrollTop = Math.min(scrollTop, caretBottom - firstLineBottom);
+  const style = getComputedStyle(textarea);
+  const mirror = createTextFieldMirror(textarea, style);
+  const caret = document.createElement("span");
+  mirror.textContent = textarea.value.slice(0, textarea.selectionEnd);
+  caret.textContent = textarea.value.slice(textarea.selectionEnd) || " ";
+  mirror.append(caret);
+  document.body.append(mirror);
+  const caretRect = caret.getClientRects()[0];
+  const mirrorTop = mirror.getBoundingClientRect().top;
+  mirror.remove();
+  if (!caretRect) return;
+  // Lines share one height, so the middle of the caret's glyph box picks out its line.
+  const lineHeight = parseFloat(style.lineHeight) || caretRect.height;
+  const line = Math.floor((caretRect.top + caretRect.height / 2 - mirrorTop) / lineHeight);
+  const lineTop = parseFloat(style.paddingTop) + line * lineHeight;
+  const scrollTop = Math.max(textarea.scrollTop, lineTop + lineHeight - textarea.clientHeight);
+  textarea.scrollTop = Math.min(scrollTop, lineTop);
 }
 
 // Longer pastes stay native: the insertText command handles each line

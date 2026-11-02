@@ -876,18 +876,55 @@ _ITEMS = "\n".join(f"  - item {index}" for index in range(1, 13))
 _TEXT_BELOW = "\n\nmore\ntext\nbelow"
 
 
-def _line_in_view(composer: Locator, line: int) -> bool:
-    """Whether unwrapped ``line`` (0-based) is fully inside the box's scrolled view."""
+def _line_box(composer: Locator, line: int) -> dict[str, float]:
+    """Visual ``line``'s (0-based) top and bottom in scroll coordinates, and the box's view."""
     return composer.evaluate(
-        """(el, [line, tolerance]) => {
+        """(el, line) => {
           const style = getComputedStyle(el);
           const lineHeight = parseFloat(style.lineHeight);
           const top = parseFloat(style.paddingTop) + line * lineHeight;
-          return el.scrollTop <= top + tolerance
-            && top + lineHeight <= el.scrollTop + el.clientHeight + tolerance;
+          return {top, bottom: top + lineHeight, scrollTop: el.scrollTop,
+            clientHeight: el.clientHeight};
         }""",
-        [line, TOLERANCE],
+        line,
     )
+
+
+def _line_in_view(composer: Locator, line: int) -> bool:
+    """Whether visual ``line`` (0-based) is fully inside the box's scrolled view."""
+    box = _line_box(composer, line)
+    return (
+        box["scrollTop"] <= box["top"] + TOLERANCE
+        and box["bottom"] <= box["scrollTop"] + box["clientHeight"] + TOLERANCE
+    )
+
+
+def _align_line(composer: Locator, line: int, edge: str) -> float:
+    """Scroll visual ``line`` flush with the box's ``edge`` and return the new scrollTop."""
+    box = _line_box(composer, line)
+    top = box["top"] if edge == "top" else box["bottom"] - box["clientHeight"]
+    scroll_top = composer.evaluate(
+        "(el, top) => { el.scrollTop = top; return el.scrollTop; }", top
+    )
+    assert scroll_top == pytest.approx(top, abs=TOLERANCE), f"line {line} cannot reach the {edge}"
+    return scroll_top
+
+
+def _assert_scrolls_to_reveal(composer: Locator, line: int, scroll_before: float) -> None:
+    """Wait for the nearest scrollTop to ``scroll_before`` that shows visual ``line`` fully."""
+    box = _line_box(composer, line)
+    expected = min(max(scroll_before, box["bottom"] - box["clientHeight"]), box["top"])
+
+    def scroll_top() -> float:
+        return composer.evaluate("el => el.scrollTop")
+
+    try:
+        poll_until(lambda: abs(scroll_top() - expected) <= TOLERANCE, timeout_s=2, interval_s=0.05)
+    except AssertionError:
+        pytest.fail(
+            f"scrollTop is {scroll_top():.1f} ({scroll_before:.1f} before); "
+            f"{expected:.1f} shows line {line} with the least scrolling"
+        )
 
 
 @pytest.mark.parametrize(
@@ -947,44 +984,73 @@ def test_inserted_lines_scroll_in_without_jumping_past_the_caret(
 
 
 @pytest.mark.parametrize(
-    ("caret_line", "caret_in_view"),
+    ("caret_line", "aligned_line", "padding", "scrolls"),
     [
-        pytest.param(0, False, id="caret-above-the-box"),
-        pytest.param(11, True, id="caret-in-view"),
+        pytest.param(0, 15, None, True, id="caret-above-the-box"),
+        pytest.param(11, 15, None, False, id="caret-in-view"),
+        # Padding like the Inbox reply box's; the new line is flush with or just below the bottom.
+        pytest.param(10, 11, "8px 10px", False, id="padded-new-line-at-the-bottom-edge"),
+        pytest.param(10, 10, "8px 10px", True, id="padded-new-line-below-the-box"),
     ],
 )
 def test_alt_enter_scrolls_only_as_far_as_the_caret_line(
     page: Page,
     chat_session_contract: ChatSessionContract,
     caret_line: int,
-    caret_in_view: bool,
+    aligned_line: int,
+    padding: str | None,
+    scrolls: bool,
 ) -> None:
     _surface(page, chat_session_contract, "landing", DESKTOP)
     composer = _input(page, "landing")
     composer.click()
     draft = _ITEMS + _TEXT_BELOW
     composer.fill(draft)
+    if padding:
+        composer.evaluate("(el, padding) => { el.style.padding = padding; }", padding)
     caret = len("\n".join(draft.split("\n")[: caret_line + 1]))
-    composer.evaluate(
-        "(el, caret) => { el.setSelectionRange(caret, caret); el.scrollTop = el.scrollHeight; }",
-        caret,
-    )
-    scroll_before = composer.evaluate("el => el.scrollTop")
-    assert _line_in_view(composer, caret_line) is caret_in_view
+    composer.evaluate("(el, caret) => el.setSelectionRange(caret, caret)", caret)
+    scroll_before = _align_line(composer, aligned_line, "bottom")
+    assert _line_in_view(composer, caret_line + 1) is not scrolls
 
     composer.press("Alt+Enter")
     expect(composer).to_have_value(draft[:caret] + "\n" + draft[caret:])
-    try:
-        poll_until(lambda: _line_in_view(composer, caret_line + 1), timeout_s=2, interval_s=0.05)
-    except AssertionError:
-        pytest.fail(
-            f"new line {caret_line + 1} is outside the box at scrollTop "
-            f"{composer.evaluate('el => el.scrollTop')} ({scroll_before} before)"
-        )
-    if caret_in_view:
-        assert composer.evaluate("el => el.scrollTop") == pytest.approx(
-            scroll_before, abs=TOLERANCE
-        )
+    _assert_scrolls_to_reveal(composer, caret_line + 1, scroll_before)
+
+
+@pytest.mark.parametrize(
+    ("aligned_line", "edge", "scrolls"),
+    [
+        pytest.param(12, "bottom", True, id="caret-below-the-box"),
+        pytest.param(13, "top", False, id="caret-in-view"),
+    ],
+)
+def test_paste_inside_a_wrapped_word_scrolls_only_as_far_as_its_line(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    aligned_line: int,
+    edge: str,
+    scrolls: bool,
+) -> None:
+    chat = chat_session_contract
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=chat.base_url)
+    _surface(page, chat, "landing", DESKTOP)
+    composer = _input(page, "landing")
+    composer.click()
+    # Too long for one line, the word moves below "wrap" (line 12) before it breaks,
+    # though the text up to the caret alone would fit after "wrap".
+    draft = _ITEMS + "\nwrap " + "x" * 400 + "\n" + _ITEMS
+    caret = len(_ITEMS + "\nwrap x")
+    composer.fill(draft)
+    composer.evaluate("(el, caret) => el.setSelectionRange(caret, caret)", caret)
+    scroll_before = _align_line(composer, aligned_line, edge)
+    assert _line_in_view(composer, 13) is not scrolls
+    assert _line_in_view(composer, 12) is scrolls
+
+    page.evaluate("text => navigator.clipboard.writeText(text)", "y")
+    page.keyboard.press("ControlOrMeta+V")
+    expect(composer).to_have_value(draft[:caret] + "y" + draft[caret:])
+    _assert_scrolls_to_reveal(composer, 13, scroll_before)
 
 
 @pytest.mark.browser_context_args(has_touch=True)
