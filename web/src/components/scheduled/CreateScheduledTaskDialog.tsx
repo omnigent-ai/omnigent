@@ -498,7 +498,7 @@ export function CreateScheduledTaskDialog({
         resolveProjectId,
       );
       if (editingTask) {
-        // Explicit null clears an override; unsupported settings stay untouched.
+        // Continued-session edits omit launch settings; new targets clear stale overrides.
         const overrides = reusesExistingSession ? {} : {
           ...(supportsModel || !originalTargetSelected
             ? {

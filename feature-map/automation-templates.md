@@ -22,6 +22,7 @@ the creation modal with its integration settings ready to customize.
   levels. Connected hosts and sandboxes supply their own catalogs. Default keeps
   agent settings, and switching harnesses clears incompatible overrides. Catalogs
   are cached per server, user, target, and harness for reopening while offline.
+  Shared model queries also separate servers when an embedded workspace changes.
   Persisted catalogs expire after 24 hours; an open dialog may retain its in-memory
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog

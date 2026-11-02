@@ -20,12 +20,12 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.feature_flags import resolve_feature_flags
@@ -623,6 +623,44 @@ async def test_create_persists_permission_mode(
         )
         assert changed.status_code == 200, changed.text
         assert changed.json()["permission_mode"] == "read-only"
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_permission_save_requires_resolved_harness(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(permission_mode="acceptEdits"),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    monkeypatch.setattr(
+        AgentCache,
+        "load",
+        Mock(side_effect=PermissionError("agent cache directory is inaccessible")),
+    )
+
+    if operation == "create":
+        response = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(permission_mode="plan"), headers=_headers()
+        )
+    else:
+        response = await auth_client.patch(
+            task_url, json={"permission_mode": "plan"}, headers=_headers()
+        )
+    assert response.status_code == 400, response.text
+    assert "Cannot resolve the agent's harness" in response.text
+    saved = await auth_client.get(task_url, headers=_headers())
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["permission_mode"] == "acceptEdits"
+
+    cleared = await auth_client.patch(task_url, json={"permission_mode": None}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["permission_mode"] is None
 
 
 @pytest.mark.parametrize("permission_mode", ["yolo", "--danger", "Auto"])

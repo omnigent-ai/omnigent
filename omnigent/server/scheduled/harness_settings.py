@@ -43,7 +43,12 @@ async def validate_scheduled_permission_support(
     if permission_mode is None:
         return
     harness = await scheduled_agent_harness(agent, agent_cache)
-    if harness is not None and permission_mode not in PERMISSION_LAUNCH_ARGS.get(harness, {}):
+    if harness is None:
+        raise OmnigentError(
+            "Cannot resolve the agent's harness to validate permission_mode; try again later",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if permission_mode not in PERMISSION_LAUNCH_ARGS.get(harness, {}):
         raise OmnigentError(
             f"permission_mode {permission_mode!r} is not supported for {harness!r}",
             code=ErrorCode.INVALID_INPUT,

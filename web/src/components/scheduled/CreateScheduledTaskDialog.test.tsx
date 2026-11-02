@@ -2312,7 +2312,7 @@ describe("automation harness settings", () => {
       supportedReasoningEfforts: [{ reasoningEffort: "low" }],
     },
   ];
-  function useHarness(harness: string) {
+  function mockHarness(harness: string) {
     const agent = testAgent("selected-agent", `${harness}-ui`, { harness });
     vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({ data: [agent] } as ReturnType<
       typeof agentsHook.useAvailableAgents
@@ -2335,7 +2335,7 @@ describe("automation harness settings", () => {
     ["antigravity-native", false, false, true],
     ["opencode-native", false, false, false],
   ])("shows independent settings for %s", (harness, model, effort, permission) => {
-    useHarness(harness);
+    mockHarness(harness);
     renderDialog();
     expect(!!screen.queryByTestId("task-model-trigger")).toBe(model);
     expect(!!screen.queryByTestId("task-effort-trigger")).toBe(effort);
@@ -2344,7 +2344,7 @@ describe("automation harness settings", () => {
   });
 
   it("creates Codex settings and resets an effort the next model cannot support", async () => {
-    useHarness("codex-native");
+    mockHarness("codex-native");
     render(
       <CreateScheduledTaskDialog
         open
@@ -2369,7 +2369,7 @@ describe("automation harness settings", () => {
   });
 
   it("preserves saved Codex settings while offline, and can clear them", async () => {
-    const agent = useHarness("codex-native");
+    const agent = mockHarness("codex-native");
     vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
       typeof hostsHook.useHostModelOptions
     >);
@@ -2405,7 +2405,7 @@ describe("automation harness settings", () => {
   });
 
   it("clears Codex overrides when switching to a permission-only harness", async () => {
-    const codex = useHarness("codex-native");
+    const codex = mockHarness("codex-native");
     const cursor = testAgent("cursor-agent", "cursor-native-ui", { harness: "cursor-native" });
     vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
       data: [codex, cursor],
@@ -2438,7 +2438,7 @@ describe("automation harness settings", () => {
   it.each(["codex-native", "cursor-native", "claude-native", "pi-native"])(
     "uses the sandbox catalog for %s instead of the connected host's",
     async (harness) => {
-      const agent = useHarness(harness);
+      const agent = mockHarness(harness);
       vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
         data: {
           models: [
@@ -2453,27 +2453,7 @@ describe("automation harness settings", () => {
           status: "ready",
         },
       } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
-      render(
-        <CapabilitiesProvider
-          info={{
-            ...SERVER_INFO_OFFLINE_FALLBACK,
-            managed_sandboxes_enabled: true,
-            sandbox_provider: "company",
-            sandbox_provider_capabilities: { company: { default_models: true } },
-            scheduled_task_harness_settings: true,
-          }}
-        >
-          <CreateScheduledTaskDialog
-            open
-            onOpenChange={vi.fn()}
-            editingTask={scheduledTask({
-              agentId: agent.id,
-              executionTarget: "managed_sandbox",
-              hostId: null,
-            })}
-          />
-        </CapabilitiesProvider>,
-      );
+      render(sandboxDialog(agent.id, true));
       expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith(null, harness, false);
       await choose("model", "Sandbox model");
       expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sandbox model");
@@ -2490,7 +2470,11 @@ describe("automation harness settings", () => {
     },
   );
 
-  function sandboxDialog(agentId: string, editing = false) {
+  function sandboxDialog(
+    agentId: string,
+    editing = false,
+    overrides: Partial<ScheduledTasksApiModule.ScheduledTask> = {},
+  ) {
     return (
       <CapabilitiesProvider
         info={{
@@ -2508,7 +2492,12 @@ describe("automation harness settings", () => {
           initialPrompt="Review work"
           editingTask={
             editing
-              ? scheduledTask({ agentId, executionTarget: "managed_sandbox", hostId: null })
+              ? scheduledTask({
+                  agentId,
+                  executionTarget: "managed_sandbox",
+                  hostId: null,
+                  ...overrides,
+                })
               : null
           }
         />
@@ -2519,7 +2508,7 @@ describe("automation harness settings", () => {
   it.each(["claude-native", "pi-native"])(
     "uses provider effort support for %s sandbox models",
     (harness) => {
-      const agent = useHarness(harness);
+      const agent = mockHarness(harness);
       vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
         data: {
           models: [{ id: "provider-model", isDefault: true }],
@@ -2536,7 +2525,7 @@ describe("automation harness settings", () => {
   it.each(["host", "sandbox"])(
     "clears target-specific overrides when moving to another %s",
     async (target) => {
-      const agent = useHarness("codex-native");
+      const agent = mockHarness("codex-native");
       vi.mocked(hostsHook.useHosts).mockReturnValue({
         data: [
           { host_id: "host_1", name: "laptop", status: "online" },
@@ -2585,8 +2574,13 @@ describe("automation harness settings", () => {
   );
 
   it("clears sandbox model settings when the connected-host harness has no model controls", async () => {
-    const agent = useHarness("cursor-native");
-    render(sandboxDialog(agent.id, true));
+    const agent = mockHarness("cursor-native");
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models, configured: false, status: "ready" },
+    } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    render(sandboxDialog(agent.id, true, { modelOverride: "model-a", reasoningEffort: "high" }));
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
     await choose("host", "laptop");
     expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -2601,7 +2595,7 @@ describe("automation harness settings", () => {
     ["codex-native", null],
     ["claude-native", "default"],
   ])("normalizes a saved default permission for %s", async (harness, expected) => {
-    const agent = useHarness(harness!);
+    const agent = mockHarness(harness!);
     render(
       <CreateScheduledTaskDialog
         open
@@ -2617,7 +2611,7 @@ describe("automation harness settings", () => {
   it.each([false, true])(
     "blocks an explicitly unsupported sandbox in edit=%s, but recovers after a failed preview",
     async (editing) => {
-      const agent = useHarness("codex-native");
+      const agent = mockHarness("codex-native");
       const data = {
         models: [],
         configured: false,
@@ -2652,7 +2646,7 @@ describe("automation harness settings", () => {
 
   it("restores host models and efforts across reopening while offline, and respects a fresh empty catalog", async () => {
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
-    useHarness("codex-native");
+    mockHarness("codex-native");
     const first = renderDialog();
     expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
     first.unmount();
@@ -2684,7 +2678,7 @@ describe("automation harness settings", () => {
 
   it("does not renew expired host choices just by reopening the dialog", async () => {
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
-    useHarness("codex-native");
+    mockHarness("codex-native");
     const fetchedAt = Date.now() - 23 * 60 * 60 * 1000;
     vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({
       data: models,
@@ -2705,7 +2699,7 @@ describe("automation harness settings", () => {
 
   it("restores a provider catalog during an outage but discards it when the provider reports unsupported", async () => {
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
-    const agent = useHarness("codex-native");
+    const agent = mockHarness("codex-native");
     vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
       data: { models, configured: false, status: "ready" },
     } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
@@ -2740,7 +2734,7 @@ describe("automation harness settings", () => {
   ] as const)(
     "preserves older-server permission support for %s",
     (harness, supportsPermissions) => {
-      useHarness(harness);
+      mockHarness(harness);
       render(
         <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
           <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />

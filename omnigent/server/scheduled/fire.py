@@ -99,7 +99,10 @@ from omnigent.server.scheduled.harness_settings import (
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 
 if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
@@ -1153,8 +1156,6 @@ async def _permission_mode_launch_options(
         )
     labels = {}
     if harness == "codex-native" and task.permission_mode == "bypass":
-        from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
-
         labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
     return list(args) or None, labels
 
@@ -1567,8 +1568,7 @@ async def _validate_fire_session_inputs(
             reasoning_effort=task.reasoning_effort,
         )
         validate_scheduled_permission_mode(task.permission_mode)
-        # Launch options are applied only after confirming the saved agent
-        # supports this mode; incompatible legacy rows receive no flags.
+        # An unresolvable or incompatible mode fails session creation.
         if validate_workspace:
             if task.host_id is None or task.workspace is None:
                 return (
