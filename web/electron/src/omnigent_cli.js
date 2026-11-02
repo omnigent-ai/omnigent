@@ -66,9 +66,9 @@ function isLoopbackServer(serverUrl) {
 
 /**
  * True when two URLs refer to the same local server — both loopback hosts on
- * the same port (so ``localhost:6767`` and ``127.0.0.1:6767`` match, but
- * ``localhost:8000`` does not). Used to confirm the CLI's local server is the
- * one a window is actually connected to before showing its controls.
+ * the same endpoint with only the loopback hostname substituted. Used to
+ * confirm the CLI's local server is the one a window is actually connected
+ * to before showing its controls.
  *
  * @param {string} a
  * @param {string} b
@@ -79,7 +79,8 @@ function sameLoopbackServer(a, b) {
     const ua = new URL(a);
     const ub = new URL(b);
     if (!url.LOCAL_HOSTS.has(ua.hostname) || !url.LOCAL_HOSTS.has(ub.hostname)) return false;
-    return ua.port === ub.port;
+    ua.hostname = ub.hostname;
+    return normalizeServerUrl(ua.href) === normalizeServerUrl(ub.href);
   } catch {
     return false;
   }
@@ -152,14 +153,20 @@ let cachedHostId = null;
  */
 function localHostId() {
   if (cachedHostId) return cachedHostId;
+  cachedHostId = readLocalHostId();
+  return cachedHostId;
+}
+
+/** Read the current machine identity without retaining a stale config value. */
+function readLocalHostId() {
   try {
     const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
     const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
-    if (typeof id === "string" && id) cachedHostId = id.replace(/^host_/, "");
+    if (typeof id === "string" && id) return id.replace(/^host_/, "") || null;
   } catch {
     // No config yet, or unparseable.
   }
-  return cachedHostId;
+  return null;
 }
 
 /**
@@ -808,25 +815,14 @@ async function stopHost(cliPath, serverUrl) {
   return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
 }
 
-/**
- * True when a daemon record refers to the given server URL. Compares its
- * `server_url`, `target`, AND `resolved_server_url` (after trailing-slash
- * normalization) — the last matters for a local-mode daemon (target `"local"`,
- * server_url null) whose loopback URL only appears as `resolved_server_url`, so
- * connecting by that loopback URL still recognizes it.
- *
- * @param {Record<string, unknown>} daemon One entry from the daemons array.
- * @param {string} serverUrl
- * @returns {boolean}
- */
+/** True when any recorded server URL matches, including loopback aliases.
+ * Local-mode records may carry the URL only in resolved_server_url. */
 function matchesServer(daemon, serverUrl) {
   if (!daemon || typeof daemon !== "object") return false;
   const want = normalizeServerUrl(serverUrl);
   if (want === "") return false;
-  return (
-    normalizeServerUrl(daemon.server_url) === want ||
-    normalizeServerUrl(daemon.target) === want ||
-    normalizeServerUrl(daemon.resolved_server_url) === want
+  return [daemon.server_url, daemon.target, daemon.resolved_server_url].some(
+    (field) => normalizeServerUrl(field) === want || sameLoopbackServer(field, serverUrl),
   );
 }
 
@@ -1080,23 +1076,13 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
  * }>}
  */
 async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000 } = {}) {
-  const match = readDaemonRecords().find((r) => matchesServer(r, serverUrl)) || null;
+  const match = liveDaemonRecordFor(serverUrl);
   if (!match) {
     return {
       connected: false,
       process: "offline",
       hostStatus: null,
       pid: null,
-      error: null,
-      verified: true,
-    };
-  }
-  if (!isPidAlive(match.pid)) {
-    return {
-      connected: false,
-      process: "offline",
-      hostStatus: null,
-      pid: match.pid,
       error: null,
       verified: true,
     };
@@ -1156,6 +1142,15 @@ async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000
   };
 }
 
+/** Find a live daemon enrolled with this server, including loopback URL aliases. */
+function liveDaemonRecordFor(serverUrl) {
+  return (
+    readDaemonRecords().find(
+      (record) => isPidAlive(record.pid) && matchesServer(record, serverUrl),
+    ) ?? null
+  );
+}
+
 module.exports = {
   INSTALL_COMMAND,
   DEFAULT_TIMEOUT_MS,
@@ -1163,6 +1158,8 @@ module.exports = {
   isLoopbackServer,
   sameLoopbackServer,
   localHostId,
+  readLocalHostId,
+  liveDaemonRecordFor,
   parseLocalServerPidfile,
   isPidAlive,
   readLocalServerPidfile,

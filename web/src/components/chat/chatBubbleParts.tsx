@@ -1112,6 +1112,8 @@ function AssistantBubble({
   const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
   const spansFullColumn = isWide || hasError;
   const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
+  // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
+  const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
 
   return (
     <>
@@ -1126,7 +1128,7 @@ function AssistantBubble({
         {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
-            (spansFullColumn || foldOnly || hasSubagentNotice) && "w-full",
+            (spansFullColumn || foldOnly || hasSubagentNotice || hasToolRows) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
         >

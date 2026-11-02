@@ -41,7 +41,8 @@ from omnigent.runner.native import (
     _claude_native_bridge_id_for_session,
     _codex_native_model_from_spec,
     _CodexNativeModelOptionsNotReady,
-    _resolve_opencode_compact_model,
+    _opencode_model_options_from_catalog,
+    _opencode_model_ref,
 )
 from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE, SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
@@ -802,30 +803,8 @@ def build_native_controls(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
-        from omnigent.harnesses.codex_native.bridge import (
-            DeveloperInstructionsReadState,
-            read_codex_config_developer_instructions_state_from_home,
-        )
-
-        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
-        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
-            _logger.warning(
-                "Codex-native plan-mode update skipped for %s: developer_instructions "
-                "config unreadable — refusing to guess and risk wiping live state.",
-                conv_id,
-                extra={"session_id": conv_id},
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "codex_native_settings_update_failed",
-                    "detail": (
-                        "Codex-native plan-mode update requires reading the current "
-                        "developer_instructions config; it could not be read."
-                    ),
-                },
-            )
-        developer_instructions = _di_read.value
+        # A non-null developer_instructions here replaces the mode's built-in
+        # prompt; the agent's instructions already ride the additive config key.
         return await _handle_codex_native_settings_update(
             conv_id,
             {
@@ -834,7 +813,7 @@ def build_native_controls(
                     "settings": {
                         "model": model,
                         "reasoning_effort": effort,
-                        "developer_instructions": developer_instructions,
+                        "developer_instructions": None,
                     },
                 },
             },
@@ -1048,14 +1027,17 @@ def build_native_controls(
             bridge_dir_for_session_id,
             enqueue_model_change,
         )
+        from omnigent.util.reasoning_effort import to_pi_thinking_level
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        effort = _session_reasoning_effort.get(conv_id)
         try:
             await asyncio.to_thread(
                 enqueue_model_change,
                 bridge_dir_for_session_id(conv_id),
                 model.strip(),
+                thinking_level=to_pi_thinking_level(effort) if effort else None,
             )
         except OSError as exc:
             _logger.warning(
@@ -1897,22 +1879,7 @@ def build_native_controls(
             )
         client = server.client()
         try:
-            session = await client.get_session(state.opencode_session_id)
-            messages = await client.list_messages(state.opencode_session_id)
-            provider_id, model_id = _resolve_opencode_compact_model(
-                session, messages, state.model_override
-            )
-            if not provider_id or not model_id:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "opencode_native_compact_failed",
-                        "detail": "Could not resolve a compaction model; try switching the model.",
-                    },
-                )
-            await client.summarize(
-                state.opencode_session_id, provider_id=provider_id, model_id=model_id
-            )
+            await client.compact(state.opencode_session_id)
         except (httpx.HTTPError, OpenCodeClientError, RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
@@ -1926,49 +1893,34 @@ def build_native_controls(
         return Response(status_code=200)
 
     async def _opencode_native_model_options(conv_id: str) -> list[_JsonObject]:
-        from omnigent.harnesses.opencode_native.app_server import (
-            filtered_server_env,
-            list_opencode_cli_model_options,
-        )
+        from omnigent.harnesses.opencode_native import app_server as opencode_app_server
         from omnigent.harnesses.opencode_native.bridge import (
             bridge_dir_for_bridge_id,
             read_bridge_state,
         )
-        from omnigent.harnesses.opencode_native.client import OpenCodeClient
 
-        bridge_dir = bridge_dir_for_bridge_id(conv_id)
-        state = read_bridge_state(bridge_dir)
+        state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
         if state is None or not state.server_base_url:
             raise _CodexNativeModelOptionsNotReady("OpenCode-native app-server is not ready yet.")
-
-        cli_env = filtered_server_env(
-            bridge_dir=bridge_dir,
-            auth_secret=state.auth_secret or "",
-        )
-        try:
-            return await asyncio.to_thread(list_opencode_cli_model_options, env=cli_env)
-        except Exception as exc:  # noqa: BLE001 - fall back to the server catalog.
-            _logger.debug(
-                "OpenCode CLI model list failed for %s: %r",
-                conv_id,
-                exc,
-                extra={"session_id": conv_id},
-            )
-
-        client = OpenCodeClient(
+        client = opencode_app_server.client_for_state(
             base_url=state.server_base_url,
-            headers=state.auth_headers(),
+            auth_secret=state.auth_secret,
+            directory=state.workspace,
         )
         try:
-            return await client.list_models()
+            models = await client.list_models()
         finally:
             await client.aclose()
+        return _opencode_model_options_from_catalog(models)
 
     async def _handle_opencode_native_model_change(conv_id: str, model: str | None) -> Response:
         from omnigent.harnesses.opencode_native.bridge import (
             bridge_dir_for_bridge_id,
+            read_bridge_state,
+            update_last_applied_model,
             update_model_override,
         )
+        from omnigent.harnesses.opencode_native.client import OpenCodeClientError
         from omnigent.inference_config import (
             binding_for_harness,
             load_runtime_inference_config,
@@ -1979,9 +1931,34 @@ def build_native_controls(
         if binding_for_harness(inference_config, "opencode-native") is not None:
             selected = resolve_bound_model(inference_config, "opencode-native", model)
             model = f"omnigent/{selected}" if selected is not None else None
-        updated = await asyncio.to_thread(
-            update_model_override, bridge_dir_for_bridge_id(conv_id), model
+        bridge_dir = bridge_dir_for_bridge_id(conv_id)
+        updated = await asyncio.to_thread(update_model_override, bridge_dir, model)
+        model_ref = _opencode_model_ref(model)
+        server = _AUTO_OPENCODE_SERVERS.get(conv_id)
+        state = (
+            await asyncio.to_thread(read_bridge_state, bridge_dir) if server is not None else None
         )
+        if model_ref is not None and server is not None and state is not None:
+            # The TUI and the next turn pick the model up from the session.
+            client = server.client()
+            try:
+                await client.set_model(
+                    state.opencode_session_id,
+                    provider_id=model_ref["providerID"],
+                    model_id=model_ref["id"],
+                    variant=model_ref.get("variant"),
+                )
+            except (httpx.HTTPError, OpenCodeClientError):
+                _logger.warning(
+                    "OpenCode set_model failed for %s; the next prompt retries it",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+            else:
+                await asyncio.to_thread(update_last_applied_model, bridge_dir, model)
+            finally:
+                await client.aclose()
         return Response(status_code=200 if updated else 204)
 
     async def _handle_opencode_native_clear(conv_id: str) -> Response:
@@ -2009,6 +1986,7 @@ def build_native_controls(
                     agent_spec=spec,
                     server_client=server_client,
                     ensure_comment_relay=_ensure_comment_relay_started,
+                    fresh=True,
                 )
         except Exception as exc:  # noqa: BLE001 - report relaunch failure to caller.
             return JSONResponse(

@@ -129,7 +129,7 @@ describe("getFileEditDiff", () => {
   it("returns null for a no-op, malformed, or non-edit call", () => {
     expect(getFileEditDiff("Edit", { old_string: "same", new_string: "same" })).toBeNull();
     expect(getFileEditDiff("Edit", { file_path: "a.py" })).toBeNull();
-    expect(getFileEditDiff("Write", { file_path: "a.py", content: "x" })).toBeNull();
+    expect(getFileEditDiff("Read", { file_path: "a.py" })).toBeNull();
     expect(getFileEditDiff("mcp__linear__edit", { oldText: "a", newText: "b" })).toBeNull();
   });
 
@@ -292,5 +292,63 @@ describe("getFileEditDiff", () => {
   it("returns null for an apply_patch without usable changes", () => {
     expect(getFileEditDiff("apply_patch", {})).toBeNull();
     expect(getFileEditDiff("apply_patch", { changes: [{ kind: { type: "add" } }] })).toBeNull();
+  });
+
+  describe("full-file writes", () => {
+    const content = "def greet(name):\n    return name\n";
+    it.each([
+      ["Write", { file_path: "/repo/a.py", content }, "File created successfully at: /repo/a.py"],
+      [
+        "mcp__omnigent__sys_os_write",
+        { path: "/repo/a.py", content },
+        JSON.stringify([{ type: "text", text: '{"path": "/repo/a.py", "created": true}' }]),
+      ],
+      ["write", { filePath: "/repo/a.py", content }, "Created file successfully: /repo/a.py"],
+    ])("shows a %s that created its file as all added lines", (name, args, output) => {
+      expect(getFileEditDiff(name, args, output)).toEqual({
+        files: [
+          {
+            path: "/repo/a.py",
+            kind: "add",
+            text: "+def greet(name):\n+    return name",
+            additions: 2,
+            removals: 0,
+          },
+        ],
+        additions: 2,
+        removals: 0,
+        countsArePerMatch: false,
+        countsAreInexact: false,
+      });
+    });
+
+    it.each([
+      ["Write", { file_path: "/repo/a.py", content }, "The file /repo/a.py has been updated."],
+      ["sys_os_write", { path: "/repo/a.py", content }, '{"path": "/repo/a.py", "created": false}'],
+      ["write", { path: "/repo/a.py", content }, "Successfully wrote 33 bytes to /repo/a.py"],
+      ["write", { filePath: "/repo/a.py", content }, "Wrote file successfully."],
+      ["Write", { file_path: "/repo/a.py", content }, null],
+    ])(
+      "shows a %s that may have replaced a file as its content, uncounted",
+      (name, args, output) => {
+        // WHY: the arguments hold only the new content, so lines it replaced are unknown.
+        expect(getFileEditDiff(name, args, output)).toMatchObject({
+          files: [
+            {
+              path: "/repo/a.py",
+              kind: "write",
+              text: "def greet(name):\n    return name",
+              additions: 0,
+            },
+          ],
+          additions: 0,
+          removals: 0,
+        });
+      },
+    );
+
+    it("returns null for a write without content", () => {
+      expect(getFileEditDiff("Write", { file_path: "/repo/a.py" }, "File created")).toBeNull();
+    });
   });
 });
